@@ -4353,6 +4353,18 @@ fn chunk_ops(chunk: &BatchCreate, namespace: &str) -> Vec<AppliedOp> {
         .collect()
 }
 
+impl std::fmt::Debug for PreparedApply<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedApply(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for PreparedFullReplace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedFullReplace(<redacted>)")
+    }
+}
+
 #[cfg(test)]
 mod prepared_apply_tests {
     use super::*;
@@ -4494,17 +4506,5 @@ mod prepared_apply_tests {
             state.last_applied_commit.as_deref(),
             Some("previous-complete-commit")
         );
-    }
-}
-
-impl std::fmt::Debug for PreparedApply<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PreparedApply(<redacted>)")
-    }
-}
-
-impl std::fmt::Debug for PreparedFullReplace {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PreparedFullReplace(<redacted>)")
     }
 }

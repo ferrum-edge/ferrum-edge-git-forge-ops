@@ -74,10 +74,13 @@ released binary contains or enforces the capability. The
 `conditional-overwrite` scenario must pass against the exact released build to
 qualify it, including the CLI's namespace and credential checks. This
 qualification also covers the gateway's backup and consumer representations.
-The new consumer-verification and coherent replacement scenarios require the
-upcoming qualified owner build. The existing v0.9.10 pin cannot certify them;
-no scenario is skipped to make that pin pass. Root must finish exact-byte
-qualification after publication.
+The consumer-verification and coherent replacement scenarios target published
+Edge v0.9.11 at `c764084b3b51c3f7ffde268c039688d35e49c553`, with the exact approved
+x86_64 binary recorded in `release/baseline.json`. Hosted qualification of this
+client revision against those bytes remains required. The old v0.9.10 fixture
+cannot certify these endpoints; no scenario is skipped to make an older pin pass.
+The first-release record stays pending until its lifecycle and external acceptance
+gates are complete.
 
 The Python harness checks its admin and data-plane URLs before use and sends
 credentials only over HTTPS or HTTP to literal loopback IPs (`127.0.0.0/8`,
@@ -246,5 +249,5 @@ The conditional trust fixture is public test material copied verbatim from
 `c764084b3b51c3f7ffde268c039688d35e49c553`; it contains no private key.
 `conditional-full-replace` seeds a real spec-owned proxy/upstream/plugin graph
 and trust bundle, verifies document and trust preservation, and then exercises
-client-confirmed spec deletion. These checks must run on the upcoming qualified
+client-confirmed spec deletion. These checks must run on the published v0.9.11
 release bytes, without skipping old-pin incompatibilities.

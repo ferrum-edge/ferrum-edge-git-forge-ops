@@ -327,7 +327,7 @@ fragments are covered in [Writing resources](docs/resources.md).
 [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts) is Ferrum's central store for
 shared vocabularies, JSON schemas and fixtures. GitForgeOps consumes its plugin catalog,
 `provisioned-by` vocabulary and resource fixtures, and publishes its `gitforgeops-resource` schema.
-These files are pinned to `contracts-edge-0.9.9` in
+These files are pinned to `contracts-edge-0.9.11` in
 [`contracts/ferrum-contracts/PIN`](contracts/ferrum-contracts/PIN) and vendored under
 `contracts/ferrum-contracts/`.
 See the [contracts guide](docs/contracts.md) for the pin and conformance checks.
@@ -570,8 +570,9 @@ ownership and field safety before broker publication and uses row `If-Match`.
 GET-only doctor probes report capability availability, while qualification must
 establish enforcement on the exact released gateway bytes. See
 [conditional apply behavior](docs/apply.md#changes-made-during-an-apply). The new
-owner contract still needs the upcoming final release artifact; existing pins are
-not evidence of that qualification.
+owner contract is published in Edge v0.9.11, and the candidate pairing pins its
+verified binary and image bytes. Hosted qualification against those exact bytes
+remains required; the [first-release record](release/README.md) stays pending.
 
 ### What if apply fails after merge?
 

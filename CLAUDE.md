@@ -444,8 +444,9 @@ namespace payload is built before the first mutation.
   establish server enforcement. Edge's released v0.9.6 source includes the
   capability, with no minimum-version claim; it does not certify the full
   backup/consumer wire contract. The namespace, ownership and credential
-  checks still apply; pending gateway representation fixes are not assumed
-  released.
+  checks still apply. Published Edge v0.9.11 source defines the complete consumer
+  verification and coherent conditional backup/restore contracts; exact-byte
+  hosted qualification is still required, and the first-release record is pending.
 - **Credentials travel only over TLS or loopback.** Every admin request is
   built through `AdminClient::authorize` / `Authorized::request`, the only
   place the bearer token is minted and attached; it refuses a target that is

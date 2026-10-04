@@ -14,7 +14,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GET-only capability probes and reports unavailable evidence as unknown.
 - Lifecycle coverage for hidden consumer edits and namespace restore conditions,
   including ABA, empty replacement and confirmed spec deletion. Qualification on
-  the upcoming immutable Edge release bytes remains required; an older fixture or
+  the published immutable Edge v0.9.11 bytes remains required; an older fixture or
   passing parser tests do not establish first-release acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
   resource trees ([Alloy #27](https://github.com/ferrum-edge/ferrum-alloy/issues/27)).
@@ -116,10 +116,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   "requires an authoritative configuration export (GET /config/export)".
 - `EnvConfig`'s `Debug` output redacts the admin and viewer JWT secrets, the
   GitHub tokens, the inline credential bundle and the mTLS client key.
-- Pin the Ferrum Edge validator and bundled gateway to v0.9.10, keeping earlier
-  approved validator digests in the allowlist for in-flight pull requests.
-  The gateway refuses MCP requests with non-UTF-8 charsets and fails closed on
-  uninspectable or over-nested JSON-RPC batches (GHSA-4f9m-cfqg-fhx9,
+- Pin the Ferrum Edge validator and bundled gateway to published v0.9.11, keeping
+  earlier approved validator digests in the allowlist for in-flight pull requests.
+  The release baseline remains pending until exact-byte hosted qualification and
+  external acceptance complete. The gateway retains v0.9.10 MCP charset and
+  uninspectable or over-nested JSON-RPC batch hardening (GHSA-4f9m-cfqg-fhx9,
   GHSA-f2jp-59r9-fp64).
 - Report an authenticator-loss breaking change when an HTTP proxy is changed to
   passthrough, which Ferrum Edge rejects on non-stream proxies.
@@ -129,8 +130,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Include `CHANGELOG.md` and `.env.example` in downstream template updates so adopters receive
   release notes and current environment-variable examples.
 - Pin the plugin catalog, `provisioned-by` vocabulary, GitForgeOps resource-envelope fixtures,
-  and the GitForgeOps-owned resource schema to ferrum-contracts `contracts-edge-0.9.9`; unit tests
-  check vendored hashes, fixture deserialization, schema envelope fields, and compatibility with
+  and the GitForgeOps-owned resource schema to published ferrum-contracts
+  `contracts-edge-0.9.11` at `390edbd5b2485af0988e02f7827fde778d76ae0a`; unit tests check
+  vendored hashes, fixture deserialization, schema envelope fields, and compatibility with
   the qualified Ferrum Edge version.
 
 ### Security

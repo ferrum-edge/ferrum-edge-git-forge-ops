@@ -14,30 +14,30 @@ finalized record on upstream `main` when adopting the tag. The
 [release notes](notes-v0.1.0.md) are committed here so the pairing stays
 discoverable after Actions artifacts expire.
 
-The intended first pairing is GitForgeOps v0.1.0 with Ferrum Edge v0.9.10:
+The intended first pairing is GitForgeOps v0.1.0 with Ferrum Edge v0.9.11:
 
 | Artifact | Digest |
 | --- | --- |
-| v0.9.10 Linux x86_64 binary: the approved validator and the lifecycle suite's gateway | `52745149de09932b54bef79cbe5524e2376cb84d0fa7a4d8436ae0bcd19d6559` (SHA-256) |
-| Docker Hub v0.9.10 multi-platform index, used by the Dockerfile's gateway stage | `sha256:430d6a7d41361de5ad12562786481f97f1e97fef72a0b5f1a0699eced7cdd4cc` |
+| v0.9.11 Linux x86_64 binary: the approved validator and the lifecycle suite's gateway | `97cbd7cd277feee8f661e9d2cd97a6383be969fd2fc2b61143601614922f988f` (SHA-256) |
+| Docker Hub v0.9.11 multi-platform index, used by the Dockerfile's gateway stage | `sha256:2476b502855940e28157858fc24008545cb3baeb3084c9610e1d4505cbe0d36e` |
 
 They differ because a binary and an OCI index are different artifacts. See the
-[upstream release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.10)
-and the [Docker Hub version tag](https://hub.docker.com/r/ferrumedge/ferrum-edge/tags?name=v0.9.10).
+[upstream release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.11)
+and the [Docker Hub version tag](https://hub.docker.com/r/ferrumedge/ferrum-edge/tags?name=v0.9.11).
 Because the Dockerfile pins the index digest, the GitForgeOps image bundles
-this tested gateway.
+this verified gateway candidate; hosted lifecycle qualification remains required.
 
 ## Support and compatibility
 
 | Combination or profile | Initial support boundary |
 | --- | --- |
-| GitForgeOps v0.1.0 source/template with Ferrum Edge v0.9.10 | Intended first pairing; supported only after the record is finalized against passing exact-revision lifecycle evidence. The validator is the checked-in v0.9.10 x86_64 asset. |
-| GitForgeOps container | Linux AMD64 and ARM64 image at the recorded immutable GitForgeOps digest. The bundled gateway comes from the v0.9.10 OCI index above. The x86_64 standalone validator pin describes GitHub's Linux x86_64 runners, not an ARM64 binary checksum. |
-| Earlier or later Ferrum Edge versions | Not a supported pair. v0.9.4 and earlier cannot accept the resource labels GitForgeOps emits. A newer validator added to the checksum allowlist is not automatically a new supported pairing. Upstream v0.9.6 was tagged but never published. Older allowlist entries, including v0.9.5, v0.9.7, v0.9.8 and v0.9.9, are kept only so in-flight pull requests keep validating; they are not part of this pairing. |
+| GitForgeOps v0.1.0 source/template with Ferrum Edge v0.9.11 | Intended first pairing; supported only after the record is finalized against passing exact-revision lifecycle evidence. The validator is the checked-in v0.9.11 x86_64 asset. |
+| GitForgeOps container | Linux AMD64 and ARM64 image at the recorded immutable GitForgeOps digest. The bundled gateway comes from the v0.9.11 OCI index above. The x86_64 standalone validator pin describes GitHub's Linux x86_64 runners, not an ARM64 binary checksum. |
+| Earlier or later Ferrum Edge versions | Not a supported pair. v0.9.4 and earlier cannot accept the resource labels GitForgeOps emits. A newer validator added to the checksum allowlist is not automatically a new supported pairing. Upstream v0.9.6 was tagged but never published. Older allowlist entries, including v0.9.5, v0.9.7, v0.9.8, v0.9.9 and v0.9.10, are kept only so in-flight pull requests keep validating; they are not part of this pairing. |
 | API mode, one namespace, shared ownership, incremental apply | The first customer deployment profile. It includes PR validation/review, human-approved apply, credential delivery, traffic verification, and ownership ledger publication. See the [quickstart](../docs/quickstart.md). |
 | File mode and mesh | Supported as assembly, validation, placeholder-preserving publication, and separate encrypted materialization. File output and mesh documents are **not** delivered to nodes by the bundled workflows; mesh has no admin API. Live fleet rollout and file-mode drift monitoring need an external delivery/observation system. Set `live_review: false` for file-only environments. |
 | Multiple environments | Independent matrix jobs can run in parallel, each with its own GitHub Environment approval, concurrency group, and ledger. For ordering, set `promotion.requires: staging` and declare traffic checks in `.gitforgeops/smoke.yaml`; promotion waits for successful staging apply and verify for the same eligible revision. Parallel jobs alone provide no promotion gate. |
-| Drift monitoring | By default, the scheduled API diff uses the approval-gated deployment environment. Until approved, it reports `Not completed`, never `In sync`. `monitoring.unattended: true` binds a separate `<env>-monitor` environment limited to the exact default branch and GitHub-side read inputs. Its JWT signing secret remains gateway-write-equivalent because Ferrum Edge has no read-only admin credential. See [launch controls §3.1](../docs/github-launch-controls.md#31-unattended-drift-monitoring). |
+| Drift monitoring | By default, the scheduled API diff uses the approval-gated deployment environment. Until approved, it reports `Not completed`, never `In sync`. `monitoring.unattended: true` binds a separate `<env>-monitor` environment limited to the exact default branch and GitHub-side read inputs. The workflow binds the distinct viewer-capped `FERRUM_ADMIN_JWT_VIEWER_SECRET` for `GET /config/export`; provision that key and remove the admin key from monitor environments before deployment. Unverified secrets never certify an in-sync result. See [launch controls §3.1](../docs/github-launch-controls.md#31-unattended-drift-monitoring). |
 
 The lifecycle suite's file/mesh scenario certifies the assembly boundary, not
 production fleet delivery. Its GitHub acceptance scenarios cover environment
@@ -132,14 +132,21 @@ formats from before the first release.
 
 ## Conditional API adoption qualification (#462)
 
-This implementation adopts the immutable Edge owner contract
-`c764084b3b51c3f7ffde268c039688d35e49c553`. It does not publish a new gateway
-pin, checksum/index entry or first-release acceptance claim. Root must bind the
-final canonical release and actual artifact bytes serially, then run hosted
-qualification with complete consumer verification, hidden credential conflicts,
-rotation conflicts before and after broker delivery, and the required
-`conditional-full-replace` lifecycle scenario. The old v0.9.10 fixture cannot
-qualify these endpoints and must not be made green by skipping the new scenario.
+The candidate pairing adopts published Edge v0.9.11 at immutable owner
+`c764084b3b51c3f7ffde268c039688d35e49c553`, the verified x86_64 asset and default
+multi-platform image index listed above, and published `contracts-edge-0.9.11`
+at `390edbd5b2485af0988e02f7827fde778d76ae0a`. All scoped canonical copies and
+PIN hashes match that tag; prepared-publication descriptions and historical
+observations remain unchanged. See the [contracts guide](../docs/contracts.md)
+for the adoption scope and authority limits.
+
+Hosted qualification must exercise complete consumer verification, hidden
+credential conflicts, rotation conflicts before and after broker delivery, and
+the required `conditional-full-replace` lifecycle scenario against these exact
+released bytes. The old v0.9.10 fixture cannot qualify these endpoints and must
+not be made green by skipping the new scenario. This pin update does not record
+passing lifecycle evidence or first-release acceptance: `baseline.json` remains
+`pending`, with GitForgeOps source SHA, image digest and lifecycle URL unset.
 
 Qualification must cover original-token restore, spec-owned graph and verbatim
 documents, trust preservation, ABA, empty namespaces and confirmed spec deletion;
@@ -147,4 +154,6 @@ exact-token/body precommit retry; and no replay after ambiguous commit, audit or
 fence refusal, unsupported topology or `applied:false`. Seal the exact client SHA
 and released server bytes. Source/parser evidence alone is not enforcement.
 Existing eight advisory fixes and #458/#440 provisioning remain required; #266
-retains its external human/App/template/HTTPS acceptance blockers.
+still requires a second human reviewer, the state-writer GitHub App, a disposable
+customer template repository and an HTTPS gateway acceptance run. No GitForgeOps
+tag or supported release is established by this candidate.

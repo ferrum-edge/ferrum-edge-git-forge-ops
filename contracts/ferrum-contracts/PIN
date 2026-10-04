@@ -1,6 +1,6 @@
-tag=contracts-edge-0.9.9
-commit=25c4e9e00033d7941a1dd0ab733fa74e735546ae
-edge_version=v0.9.10
+tag=contracts-edge-0.9.11
+commit=390edbd5b2485af0988e02f7827fde778d76ae0a
+edge_version=v0.9.11
 sha256 fixtures/gitforgeops-resource/invalid/consumer-missing-username.json 76ab80b5556083d451e213f6764619d28b4ff5c4e43bfa91ca312d81d41f91a1
 sha256 fixtures/gitforgeops-resource/invalid/lowercase-kind.json 54e01060c01ef659794667e4c53a207269bb7ba46e20142576ef9e2b2b94652d
 sha256 fixtures/gitforgeops-resource/invalid/missing-spec.json e5eb220d18cc0a90f605fe77f4168ae5c0e9666267092df6b6be0929a8009edf
@@ -12,5 +12,5 @@ sha256 fixtures/gitforgeops-resource/valid/quickstart-plugin-config.json bd4d6bf
 sha256 fixtures/gitforgeops-resource/valid/quickstart-proxy.json e9e1e8a5907560931dd33bb3e7310c85735b1550cc56d3ef7cf0a6aa0d1d1d14
 sha256 fixtures/gitforgeops-resource/valid/quickstart-upstream.json acaf75dc9c1427a5ccbf71d864ab432e28803c26b34a2e51001285a9ac638ce2
 sha256 schemas/gitforgeops-resource/v1.schema.json b52b8f1f8623e7c1e0d3ae9a920789f7ee954777d7266b2deaa9250a60015392
-sha256 vocabularies/plugin-catalog.json bba27e2beb6c0a4b48875b499e49f9f70a5debe53793f26cdc124c4251025494
-sha256 vocabularies/provisioned-by.json 60f6df5cabead31dc456c3fefb01f4191f0a48ad6f8406a58481e033aa1ac061
+sha256 vocabularies/plugin-catalog.json 3c9060b0152d65cc5b0fa8ef68038b8194d36eed7dbf1e09fe11954e46964807
+sha256 vocabularies/provisioned-by.json 672be61219e507b7611a888634126f25dd7e054312d980e5956737318039dd6c
