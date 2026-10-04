@@ -81,6 +81,38 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Capture one bounded, regular-file data snapshot for the cargo-audit gate's
+  manifest, source reachability, Cargo graph, audit and independent yanked
+  checks (#454). Original-file replacements can no longer redirect Cargo or
+  split the checks across different lockfiles. Refuse symlinked source
+  directories/files, special files, oversized source trees and local path
+  dependencies. Check RSA reachability with all features and all targets,
+  including optional direct RSA paths; hosted regressions cover a real offline
+  Cargo graph, deterministic replacements and dangerous source inputs.
+- Fail the cargo-audit gate closed when yanked-package verification cannot
+  complete (#455). Independently verify every locked crates.io version's
+  checksum and explicit yanked status against fresh sparse-index records;
+  cargo-audit 0.22.1's JSON and exit status can otherwise omit an index or
+  package-lookup failure. Reject workspace redirection for this single-package
+  repository so Cargo's effective graph uses the audited root lockfile, and
+  validate both bounded, regular-file Cargo inputs before any content read or
+  Cargo invocation (#454). Isolate `HOME` alongside `CARGO_HOME` while keeping
+  the runner's trusted rustup toolchain store. Complete-gate regression tests
+  cover unsafe inputs, workspace redirects and incomplete index evidence.
+- The cargo-audit policy gate no longer runs `cargo` from the candidate
+  checkout (#448). `cargo tree` and `cargo audit` run from a fresh temporary
+  directory with a fresh `CARGO_HOME`, take captured copies of the candidate's
+  `Cargo.toml` and `Cargo.lock` through `--manifest-path` and `--file`, and drop
+  inherited `CARGO_*`, `__CARGO_*`, `RUSTUP_TOOLCHAIN`, `RUSTC_BOOTSTRAP` and rustc
+  wrapper variables. A pull request's
+  `.cargo/config[.toml]` aliases or `[env]`, `.cargo/audit.toml` ignore list or
+  advisory-database settings, and `rust-toolchain[.toml]` therefore cannot
+  change the audit verdict or the RSA dependency-path check; the gate lists
+  the candidate files it ignored. A missing or symlinked `Cargo.lock` or
+  `Cargo.toml` is refused, and so is a temporary directory inside the
+  checkout or below cargo or rustup configuration. Local runs of the checker
+  therefore re-download the index, crates and advisory database each time
+  and use the rustup default toolchain, not `rust-toolchain.toml`.
 - New `supply-chain-policy.yml` reports a `trusted-supply-chain-policy` check
   whose definition the pull request under review cannot edit. It runs on
   `pull_request_target`, checks out the pull request's head as data, and runs
