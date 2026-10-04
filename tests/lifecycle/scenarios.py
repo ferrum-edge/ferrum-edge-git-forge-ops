@@ -27,6 +27,8 @@ Run it through `run.sh`, which owns starting the gateway and the test upstream.
 from __future__ import annotations
 
 import argparse
+import http.client
+import ipaddress
 import json
 import os
 import shutil
@@ -35,6 +37,7 @@ import sys
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -54,6 +57,81 @@ class ScenarioFailure(AssertionError):
     """A scenario's assertion did not hold."""
 
 
+class _NoRedirect(urllib.request.HTTPErrorProcessor):
+    def http_response(self, request, response):
+        # The redirect handler parses Location/URI before redirect_request.
+        # Keep every 3xx out of that handler, including malformed targets that
+        # could reflect credentials in a parser exception. Return the original
+        # status, headers and body without making another request.
+        if 300 <= response.code < 400:
+            return response
+        return super().http_response(request, response)
+
+    https_response = http_response
+
+
+def _credential_target(target: str) -> str:
+    """Check the exact URL before constructing a request with credentials."""
+    message = (
+        "lifecycle requests require https:// or http:// to a literal loopback "
+        "IP (127.0.0.0/8 or [::1]), without embedded URL credentials; "
+        "target withheld"
+    )
+    try:
+        # urlsplit strips some controls; reject them before parsing so the
+        # checked target cannot differ from the one the operator supplied.
+        if any(ord(char) <= 32 or ord(char) == 127 for char in target):
+            raise ValueError("control or whitespace in URL")
+        parsed = urllib.parse.urlsplit(target)
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("unusable URL")
+        # Accessing port also rejects a malformed or out-of-range port.
+        _ = parsed.port
+        if parsed.scheme == "http":
+            if "%" in parsed.hostname or not ipaddress.ip_address(parsed.hostname).is_loopback:
+                raise ValueError("non-loopback HTTP target")
+        elif parsed.scheme != "https":
+            raise ValueError("unsupported scheme")
+    except ValueError:
+        raise ScenarioFailure(message) from None
+    return urllib.parse.urlunsplit(parsed)
+
+
+def _safe_exchange(
+    target: str,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: dict | None = None,
+) -> tuple[int, str | None, str]:
+    """The common admin and data-plane HTTP boundary, with no redirects."""
+    target = _credential_target(target)
+    # A proxy would turn literal-loopback cleartext into a remote credential
+    # transmission. Use a fresh opener rather than urlopen's global opener.
+    proxies = {} if urllib.parse.urlsplit(target).scheme == "http" else None
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), _NoRedirect())
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(target, data=data, method=method, headers=headers or {})
+        try:
+            response = opener.open(request, timeout=10)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            text = response.read().decode("utf-8", "replace")
+            return response.code, response.headers.get("ETag"), text
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+        # Transport/parser errors can contain backend-controlled URLs or bytes.
+        # Never expose their text or exception chain to scenario diagnostics.
+        raise ScenarioFailure(
+            "lifecycle HTTP exchange failed; target and backend details withheld"
+        ) from None
+
+
 class Harness:
     """Everything a scenario needs, and nothing it should not have."""
 
@@ -68,11 +146,11 @@ class Harness:
     ):
         self.workdir = workdir
         # The admin API. Writes configuration.
-        self.gateway_url = gateway_url.rstrip("/")
+        self.gateway_url = _credential_target(gateway_url.rstrip("/"))
         # The data plane. Serves traffic. A different listener on a different
         # port — sending a route check at the admin API would get a 404 that
         # looks exactly like a routing failure.
-        self.proxy_url = proxy_url.rstrip("/")
+        self.proxy_url = _credential_target(proxy_url.rstrip("/"))
         self.upstream_url = upstream_url.rstrip("/")
         self.binary = binary
         # The broker bundle the seeded `alloc=require` slot resolves from.
@@ -82,6 +160,7 @@ class Harness:
         # Every secret this run has seen, for `redact`. Populated as
         # credentials are allocated; never written to disk.
         self._secrets: set[str] = set()
+        self.remember_secret(os.environ.get("GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN", ""))
 
     # -- redaction ---------------------------------------------------------
 
@@ -144,16 +223,8 @@ class Harness:
 
     def request(self, path: str, headers: dict[str, str] | None = None) -> int:
         """A client request through the DATA plane."""
-        request = urllib.request.Request(
-            f"{self.proxy_url}{path}", headers=headers or {}
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                return response.status
-        except urllib.error.HTTPError as error:
-            return error.code
-        except urllib.error.URLError as error:
-            raise ScenarioFailure(f"{path} was unreachable: {error.reason}") from error
+        status, _, _ = _safe_exchange(f"{self.proxy_url}{path}", headers=headers)
+        return status
 
     def expect_status(self, path: str, status: int, headers=None, attempts: int = 10):
         """Poll until the route answers as expected, or fail with what it said.
@@ -359,6 +430,83 @@ def scenario_modify_and_delete_in_order(harness: Harness) -> str:
     )
 
 
+def scenario_conditional_overwrite(harness: Harness) -> str:
+    ensure_deployed(harness)
+
+    # The gateway half: every kind incremental apply overwrites carries a
+    # strong entity-tag. Apply refuses to overwrite a row without one.
+    for path in (
+        "/proxies/orders-proxy",
+        "/upstreams/orders-upstream",
+        "/plugins/config/orders-key-auth",
+        "/consumers/orders-client",
+    ):
+        status, etag, _ = _admin_exchange(harness, "GET", path)
+        if status != 200 or not etag or not etag.startswith('"'):
+            raise ScenarioFailure(
+                f"GET {path} answered {status} with ETag {etag!r}; incremental "
+                "apply refuses every overwrite of a row without a strong entity-tag"
+            )
+
+    # ...and a write carrying a superseded tag is refused, writing nothing.
+    _, planned_tag, _ = _admin_exchange(harness, "GET", "/proxies/orders-proxy")
+    mutate_proxy_out_of_band(harness)
+    stale = out_of_band_proxy("A write planned before the out-of-band edit")
+    status, _, _ = _admin_exchange(
+        harness, "PUT", "/proxies/orders-proxy", stale, if_match=planned_tag
+    )
+    if status != 412:
+        raise ScenarioFailure(
+            f"a PUT carrying a superseded If-Match answered {status}, expected "
+            "412; the gateway cannot fence a write planned from a stale read"
+        )
+    _, _, body = _admin_exchange(harness, "GET", "/proxies/orders-proxy")
+    if json.loads(body).get("name") != OUT_OF_BAND_PROXY_NAME:
+        raise ScenarioFailure("the refused conditional PUT changed the proxy anyway")
+
+    # The client half: apply plans from the edited row and sends conditional
+    # writes that the real gateway accepts, for every kind it overwrites. A
+    # consumer update takes the redacted read plus the /backup that carries
+    # its credentials. Each single-row read must agree with the /backup row
+    # the plan came from, or apply would refuse a row nobody changed.
+    edit_resource(
+        harness,
+        "consumers/orders-client.yaml",
+        'username: "orders-client"',
+        'username: "orders-client"\n  acl_groups: ["orders"]',
+    )
+    edit_resource(
+        harness,
+        "upstreams/orders.yaml",
+        'name: "Orders service"',
+        'name: "Orders service v2"',
+    )
+    edit_resource(
+        harness,
+        "plugins/orders-key-auth.yaml",
+        'plugin_name: "key_auth"',
+        'plugin_name: "key_auth"\n  labels:\n    team: "orders"',
+    )
+    harness.run("apply", "--auto-approve")
+    harness.run("diff", "--exit-on-drift")
+    harness.expect_status("/orders/status/200", 200, {"X-API-Key": harness_key(harness)})
+    return (
+        "the gateway tags every overwritten kind and refuses a superseded If-Match "
+        "with 412; apply re-planned over an out-of-band edit and updated a proxy, "
+        "an upstream, a plugin config and a consumer through If-Match, converging "
+        "with no drift"
+    )
+
+
+def edit_resource(harness: Harness, relative: str, old: str, new: str) -> None:
+    """Rewrite one seeded resource file, failing loudly if `old` is absent."""
+    path = harness.workdir / f"resources/{NAMESPACE}/{relative}"
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        raise ScenarioFailure(f"the seeded {relative} no longer contains {old!r}")
+    harness.write(f"resources/{NAMESPACE}/{relative}", text.replace(old, new))
+
+
 def scenario_credentials_generate_and_rotate(harness: Harness) -> str:
     raise NotImplementedError(
         "needs a disposable GitHub Environment for the credential broker; run "
@@ -508,6 +656,7 @@ SCENARIOS = {
     "create-and-route": scenario_create_and_route,
     "reapply-is-a-no-op": scenario_reapply_is_a_no_op,
     "modify-and-delete-in-order": scenario_modify_and_delete_in_order,
+    "conditional-overwrite": scenario_conditional_overwrite,
     "credentials-generate-and-rotate": scenario_credentials_generate_and_rotate,
     "partial-failure-recovery": scenario_partial_failure_recovery,
     "ledger-publication-failure": scenario_ledger_publication_failure,
@@ -555,23 +704,35 @@ def _admin(
 
 
 def __admin(harness: Harness, method: str, path: str, body: dict | None = None) -> int:
+    status, _, _ = _admin_exchange(harness, method, path, body)
+    return status
+
+
+def _admin_exchange(
+    harness: Harness,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    if_match: str | None = None,
+) -> tuple[int, str | None, str]:
+    """An out-of-band admin call returning its status, `ETag` and body.
+
+    For the conditional-write probe, whose outcomes (a 412 included) are the
+    findings, so it asserts nothing itself. `if_match` is sent verbatim.
+    """
     token = os.environ["GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN"]
-    data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(
-        f"{harness.gateway_url}{path}",
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "X-Ferrum-Namespace": NAMESPACE,
-        },
+    # Register the token actually supplied, including one changed since init.
+    harness.remember_secret(token)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-Ferrum-Namespace": NAMESPACE,
+    }
+    if if_match is not None:
+        headers["If-Match"] = if_match
+    return _safe_exchange(
+        f"{harness.gateway_url}{path}", method=method, headers=headers, body=body
     )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return response.status
-    except urllib.error.HTTPError as error:
-        return error.code
 
 
 def create_unmanaged_proxy(harness: Harness) -> None:
@@ -596,20 +757,28 @@ def unmanaged_proxy_exists(harness: Harness) -> bool:
     return __admin(harness, "GET", "/proxies/admin-owned-proxy") == 200
 
 
+OUT_OF_BAND_PROXY_NAME = "Edited on the gateway, behind the repository's back"
+
+
+def out_of_band_proxy(name: str) -> dict:
+    """The orders proxy as an administrator rewrites it, outside the repository."""
+    return {
+        "id": "orders-proxy",
+        "name": name,
+        "listen_path": "/orders",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 1,
+        "namespace": NAMESPACE,
+    }
+
+
 def mutate_proxy_out_of_band(harness: Harness) -> None:
     _admin(
         harness,
         "PUT",
         "/proxies/orders-proxy",
-        {
-            "id": "orders-proxy",
-            "name": "Edited on the gateway, behind the repository's back",
-            "listen_path": "/orders",
-            "backend_scheme": "http",
-            "backend_host": "127.0.0.1",
-            "backend_port": 1,
-            "namespace": NAMESPACE,
-        },
+        out_of_band_proxy(OUT_OF_BAND_PROXY_NAME),
     )
 
 
@@ -628,12 +797,13 @@ def run_scenarios(harness: Harness, result_path: Path, only: list[str]) -> int:
         except NotImplementedError as reason:
             status, detail = lifecycle_result.SKIPPED, str(reason)
         except ScenarioFailure as error:
-            status, detail = lifecycle_result.FAILED, harness.redact(str(error))
+            status, detail = lifecycle_result.FAILED, str(error)
             failures += 1
         except Exception as error:  # noqa: BLE001 - a crash is a failed scenario
             status = lifecycle_result.FAILED
-            detail = harness.redact(f"{type(error).__name__}: {error}")
+            detail = f"{type(error).__name__}: {error}"
             failures += 1
+        detail = harness.redact(detail)
         print(f"{status:<8} {identifier}: {detail.splitlines()[0] if detail else ''}")
         if status == lifecycle_result.FAILED:
             print(textwrap.indent(detail, "         "))
