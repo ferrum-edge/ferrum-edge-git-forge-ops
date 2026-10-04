@@ -91,6 +91,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Release waits up to 900 seconds for pending or missing checks on the exact
+  merged PR head, preserving source-bound required checks and lifecycle
+  qualification. Every poll requires complete check-run history with consistent
+  page counts and distinct, consistent run identities; passing CLI output cannot
+  hide a missing newer retry (#459).
 - Lifecycle admin and data-plane requests share a transport boundary that
   refuses all redirects, permits credentials only over HTTPS or HTTP to a
   literal loopback IP, and bypasses environment proxies for plaintext

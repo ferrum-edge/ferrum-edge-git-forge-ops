@@ -102,6 +102,15 @@ def passing_runs() -> list[dict]:
     ]
 
 
+def full_run_page() -> list[dict]:
+    """A full 100-record page with launch checks and older failed retries."""
+    history = passing_runs()
+    return history + [
+        dict(history[2], id=identifier, conclusion="failure")
+        for identifier in range(1, 96)
+    ]
+
+
 GATE = re.compile(
     r"--argjson required '(?P<required>\[.*?\])' "
     r"--argjson accepted '(?P<accepted>\[.*?\])'",
@@ -921,6 +930,159 @@ class ReleaseGateTests(unittest.TestCase):
         ])
         self.assert_gate(PASSING_CHECKS, False, responses={"RUNS": [response]})
         self.assertEqual(self.sleeps, [])
+
+    def test_passing_cli_cannot_authorize_incomplete_run_history(self) -> None:
+        incomplete = json.dumps([{"total_count": 6, "check_runs": passing_runs()}])
+        complete = json.dumps([{"total_count": 5, "check_runs": passing_runs()}])
+        result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [incomplete, complete]})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("incomplete check-run evidence", result.stderr)
+        self.assertEqual(self.sleeps, [])
+        run_reads = [
+            call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+        ]
+        self.assertEqual(len(run_reads), 1)
+
+    def test_passing_cli_requires_consistent_check_run_page_counts(self) -> None:
+        history = full_run_page()
+        retry = dict(history[2], id=900)
+        for counts in ((100, 101), (101, 100), (101, 102)):
+            with self.subTest(counts=counts):
+                response = json.dumps([
+                    {"total_count": counts[0], "check_runs": history},
+                    {"total_count": counts[1], "check_runs": [retry]},
+                ])
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("inconsistent check-run page counts", result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_passing_cli_cannot_authorize_a_truncated_paginated_history(self) -> None:
+        page = {"total_count": 101, "check_runs": full_run_page()}
+        for pages in ([page], [page, {"total_count": 101, "check_runs": []}]):
+            with self.subTest(pages=len(pages)):
+                result = self.run_gate(
+                    PASSING_CHECKS, responses={"RUNS": [json.dumps(pages)]}
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("incomplete check-run evidence", result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_history_completeness_is_required_again_after_waiting(self) -> None:
+        history = passing_runs()
+        retry = dict(history[2], id=900, status="queued", conclusion=None)
+        pending = json.dumps([{"total_count": 6, "check_runs": history + [retry]}])
+        complete = json.dumps([{
+            "total_count": 6,
+            "check_runs": history + [dict(retry, status="completed", conclusion="success")],
+        }])
+        incomplete = json.dumps([{"total_count": 6, "check_runs": history}])
+        inconsistent = json.dumps([
+            {"total_count": 5, "check_runs": history},
+            {"total_count": 6, "check_runs": []},
+        ])
+        for evidence in (incomplete, inconsistent):
+            with self.subTest(evidence=evidence):
+                result = self.run_gate(
+                    PASSING_CHECKS, responses={"RUNS": [pending, evidence, complete]}
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+                self.assertNotIn("has successful source-bound checks", result.stdout)
+                run_reads = [
+                    call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+                ]
+                self.assertEqual(len(run_reads), 2)
+
+    def test_duplicate_run_ids_cannot_complete_the_advertised_count(self) -> None:
+        history = passing_runs()
+        long_history = full_run_page()
+        pages = (
+            [{"total_count": 6, "check_runs": history + [history[2]]}],
+            [
+                {"total_count": 6, "check_runs": history},
+                {"total_count": 6, "check_runs": [history[2]]},
+            ],
+            [
+                {"total_count": 101, "check_runs": long_history},
+                {"total_count": 101, "check_runs": [long_history[2]]},
+            ],
+            # Even when all five distinct IDs are accounted for, overlapping
+            # pages are inconsistent evidence and must fail closed.
+            [{"total_count": 5, "check_runs": history + [history[2]]}],
+        )
+        for response in pages:
+            with self.subTest(response=response):
+                result = self.run_gate(
+                    PASSING_CHECKS, responses={"RUNS": [json.dumps(response)]}
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("duplicate check-run identities", result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_conflicting_run_identities_across_pages_fail_closed(self) -> None:
+        history = full_run_page()
+        changes = (
+            {"name": "coverage"},
+            {"app": {"id": 42}},
+            {"conclusion": "failure"},
+            {"status": "queued", "conclusion": None},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                response = json.dumps([
+                    {"total_count": 101, "check_runs": history},
+                    {"total_count": 101, "check_runs": [dict(history[2], **change)]},
+                ])
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("conflicting check-run identities", result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_complete_paginated_history_accepts_the_newest_green_retry(self) -> None:
+        history = full_run_page()
+        history[2]["conclusion"] = "failure"
+        history.append(dict(history[2], id=900, conclusion="success"))
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                ordered = sorted(history, key=lambda run: run["id"], reverse=reverse)
+                response = json.dumps([
+                    {"total_count": 101, "check_runs": ordered[:100]},
+                    {"total_count": 101, "check_runs": ordered[100:]},
+                ])
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"has successful source-bound checks on {HEAD_SHA}", result.stdout)
+                self.assertEqual(self.sleeps, [])
+
+    def test_complete_paginated_history_uses_the_newest_pending_or_terminal_retry(self) -> None:
+        history = full_run_page()
+        pending = dict(history[2], id=900, status="queued", conclusion=None)
+        for conclusion in ("success", "failure", "cancelled"):
+            with self.subTest(conclusion=conclusion):
+                responses = [
+                    json.dumps([
+                        {"total_count": 101, "check_runs": history},
+                        {"total_count": 101, "check_runs": [retry]},
+                    ])
+                    for retry in (
+                        pending,
+                        dict(pending, status="completed", conclusion=conclusion),
+                    )
+                ]
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": responses})
+                self.assertEqual(
+                    result.returncode == 0, conclusion == "success", result.stdout + result.stderr
+                )
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_passing_cli_requires_a_valid_exact_check_run_count(self) -> None:
+        for count in (None, True, "5", -1, 5.5, 0, 4):
+            with self.subTest(count=count):
+                response = json.dumps([{"total_count": count, "check_runs": passing_runs()}])
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [])
 
     def test_required_sources_cannot_be_replaced_by_another_app(self) -> None:
         settings = rules(*REQUIRED)

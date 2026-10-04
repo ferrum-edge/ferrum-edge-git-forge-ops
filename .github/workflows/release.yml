@@ -310,12 +310,20 @@ jobs:
                           else .conclusion == null end | not)
                       then error("invalid or wrong-head check run") else . end
                   )) as $history
-                | if ($required_missing != "" or $all_missing != "") and
-                    any($runs[0][]; .total_count != ($history | length)) then
-                    error("incomplete check-run evidence for empty checks")
+                # Pagination can race a new retry even when both CLI samples
+                # pass. Every page must agree on the total, and distinct IDs
+                # must account for it before selecting any newest result.
+                | ($runs[0] | map(.total_count) | unique) as $counts
+                | ($history | group_by(.id)) as $identities
+                | if ($counts | length) != 1 then
+                    error("inconsistent check-run page counts")
+                  elif ($identities | any(.[]; (unique | length) != 1)) then
+                    error("conflicting check-run identities")
+                  elif ($identities | any(.[]; length != 1)) then
+                    error("duplicate check-run identities")
+                  elif ($identities | length) != $counts[0] then
+                    error("incomplete check-run evidence")
                   else . end
-                | if ($history | group_by(.id) | any(.[]; (unique | length) != 1)) then
-                    error("conflicting check-run identities") else . end
                 | ($watched | map(. as $setting |
                     ($history | map(select(.name == $setting.name and .app.id == $setting.app))
                       | if length == 0 then null else max_by(.id) end) as $latest
