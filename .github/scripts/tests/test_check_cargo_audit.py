@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -1077,14 +1078,43 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
             write_reviewed_tree(root)
             rsa, age = locked_package(), locked_package("age", "0.12.1")
             write_lockfile(root, [rsa, age])
+
+            lookup_order = []
+            age_lookup_completed = threading.Event()
+
+            class CompletedAgeResponse(IndexResponse):
+                def read(self, *args, **kwargs):
+                    data = super().read(*args, **kwargs)
+                    lookup_order.append(self.geturl())
+                    age_lookup_completed.set()
+                    return data
+
+            def fetch(request, **_kwargs):
+                name = request.full_url.rsplit("/", 1)[-1]
+                if name == "rsa":
+                    if not age_lookup_completed.wait(timeout=5):
+                        raise AssertionError("age index lookup did not complete first")
+                    lookup_order.append(request.full_url)
+                    raise OSError("lookup failed")
+                data = json.dumps(index_entry(age)).encode("utf-8") + b"\n"
+                return CompletedAgeResponse(request.full_url, data)
+
             status, stdout, stderr, _calls, http = self.run_gate(
                 root,
-                entries={"rsa": [index_entry(rsa)], "age": OSError("lookup failed")},
+                http=fetch,
                 audit_stderr="error: couldn't check if the package is yanked\n",
             )
             self.assertEqual(status, 2, stderr)
-            self.assertIn("lookup failed", stderr)
+            self.assertIn("complete yanked scan cannot read index for rsa: lookup failed", stderr)
             self.assertNotIn("policy passed", stdout)
+            self.assertNotIn("yanked scan complete:", stdout)
+            self.assertEqual(
+                lookup_order,
+                [
+                    "https://index.crates.io/3/a/age",
+                    "https://index.crates.io/3/r/rsa",
+                ],
+            )
             self.assertEqual(http.call_count, 2)
 
     def test_incomplete_or_ambiguous_version_evidence_is_fatal(self):
