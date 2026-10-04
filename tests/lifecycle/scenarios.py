@@ -471,6 +471,10 @@ def scenario_conditional_overwrite(harness: Harness) -> str:
     consumer = json.loads(body)
     if consumer.get("credentials", {}).get("keyauth", [{}])[0].get("key") != harness_key(harness):
         raise ScenarioFailure("consumer verification did not return the exact stored key")
+    original_credentials = consumer.get("credentials")
+    if not isinstance(original_credentials, dict) or "custom_fixture" in original_credentials:
+        raise ScenarioFailure("hidden credential fixture setup was not isolated")
+    original_credentials = dict(original_credentials)
     consumer["credentials"]["custom_fixture"] = [{"opaque": "lifecycle-hidden-field"}]
     status, _, _ = _admin_exchange(harness, "PUT", "/consumers/orders-client", consumer, if_match=consumer_tag)
     if status != 200:
@@ -506,8 +510,14 @@ def scenario_conditional_overwrite(harness: Harness) -> str:
     # Remove isolated test setup before the following replacement scenario. This
     # endpoint is deliberately not a conditional deletion shortcut in the client.
     status, _, _ = _admin_exchange(harness, "DELETE", "/consumers/orders-client/credentials/custom_fixture")
-    if status != 200:
+    if status != 204:
         raise ScenarioFailure("hidden credential fixture cleanup failed")
+    status, _, body = _admin_exchange(harness, "GET", "/consumers/orders-client/verification")
+    if status != 200:
+        raise ScenarioFailure("complete consumer verification after cleanup failed")
+    cleaned_consumer = json.loads(body)
+    if cleaned_consumer.get("credentials") != original_credentials:
+        raise ScenarioFailure("hidden credential cleanup did not preserve stored credentials")
     harness.run("diff", "--exit-on-drift")
     return (
         "the gateway tags every overwritten kind and refuses a superseded If-Match "
@@ -634,9 +644,29 @@ def scenario_conditional_full_replace(harness: Harness) -> str:
         raise ScenarioFailure("client confirmed deletion left spec-owned rows")
     if final["gateway_trust_bundles"] != snapshot["gateway_trust_bundles"]:
         raise ScenarioFailure("client confirmed deletion rewrote live trust")
+    trust_before_cleanup = final["gateway_trust_bundles"]
+    fixture_rows = [
+        row for row in trust_before_cleanup if row.get("trust_domain") == "conditional.fixture"
+    ]
+    if len(fixture_rows) != 1:
+        raise ScenarioFailure("trust fixture lookup before cleanup was incomplete")
     status, _, _ = _admin_exchange(harness, "DELETE", f"/gateway-trust-bundles/{NAMESPACE}")
-    if status != 200:
+    if status != 204:
         raise ScenarioFailure("trust fixture cleanup failed")
+    status, cleanup_token, body = _admin_exchange(harness, "GET", "/backup?conditional=true")
+    if status != 200 or not cleanup_token:
+        raise ScenarioFailure("complete snapshot after trust cleanup is unavailable")
+    cleaned_snapshot = json.loads(body)
+    if not isinstance(cleaned_snapshot.get("gateway_trust_bundles"), list):
+        raise ScenarioFailure("complete snapshot after trust cleanup omitted trust bundles")
+    remaining_trust = [
+        row for row in trust_before_cleanup if row.get("trust_domain") != "conditional.fixture"
+    ]
+    if cleaned_snapshot["gateway_trust_bundles"] != remaining_trust:
+        raise ScenarioFailure("trust cleanup did not remove only the fixture bundle")
+    for section in ("version", "proxies", "consumers", "upstreams", "plugin_configs", "api_specs"):
+        if cleaned_snapshot.get(section) != final.get(section):
+            raise ScenarioFailure("trust cleanup changed unrelated backup sections")
     seed_repository(harness)
     return "coherent namespace If-Match enforced ABA, empty/spec deletion, spec graph and verbatim documents; trust survived and client converged"
 
