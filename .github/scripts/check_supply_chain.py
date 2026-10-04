@@ -2236,6 +2236,91 @@ def _shell_operation_lines(script: str) -> tuple[str, ...]:
     )
 
 
+def _literal_env_scope(node: dict):
+    scopes = [value for key, value in node.items() if key.casefold() == "env"]
+    return scopes[0] if len(scopes) == 1 else ({} if not scopes else None)
+
+
+def _expand_static_run_env(script: str, context: tuple) -> tuple[str, list[str]]:
+    """Substitute only proven literals, before any shell comment filtering.
+
+    Shell metacharacters, controls and expressions in an alias source are
+    unsupported. Missing/dynamic sources and ambiguous case variants fail
+    closed. A step-local literal overrides inherited runtime env-file values;
+    workflow/job literals do not prove a value after an env-file write.
+    """
+    scopes, runtime_names = context
+    invalid: list[str] = []
+
+    def substitute(match) -> str:
+        body = match.group(1).strip()
+        if not re.match(r"env\b", body, re.IGNORECASE):
+            return match.group(0)
+        alias = re.fullmatch(r"env\s*\.\s*([A-Za-z_][A-Za-z0-9_-]*)", body, re.IGNORECASE)
+        if alias:
+            name = alias.group(1).casefold()
+            for index in range(len(scopes) - 1, -1, -1):
+                scope = scopes[index]
+                if not isinstance(scope, dict):
+                    break
+                values = [value for key, value in scope.items() if key.casefold() == name]
+                if not values:
+                    continue
+                if index < 2 and (runtime_names is None or name in runtime_names):
+                    break
+                if (
+                    len(values) == 1
+                    and isinstance(values[0], str)
+                    and re.fullmatch(r"[A-Za-z0-9_./:@%+,= -]*", values[0])
+                ):
+                    return values[0]
+                break
+        invalid.append(body)
+        return match.group(0)
+
+    return WORKFLOW_EXPRESSION.sub(substitute, script), invalid
+
+
+def _run_env_contexts(workflow: str, document: dict) -> dict[int, tuple]:
+    """Workflow < job < step precedence, with inherited env-file uncertainty.
+
+    This models declared bindings and visible file-channel references, not
+    arbitrary behavior inside invoked programs or source-bound actions.
+    """
+    contexts: dict[int, tuple] = {}
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return contexts
+    for job in jobs.values():
+        if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+            continue
+        runtime_names: frozenset[str] | None = frozenset()
+        for step in job["steps"]:
+            if not isinstance(step, dict):
+                continue
+            scopes = tuple(_literal_env_scope(node) for node in (document, job, step))
+            context = (scopes, runtime_names)
+            contexts[id(step)] = context
+            script = step.get("run")
+            if not isinstance(script, str):
+                continue
+            expanded, _ = _expand_static_run_env(script, context)
+            lines = _shell_operation_lines(expanded)
+            compact = "\n".join(lines).translate(str.maketrans("", "", "'\"\\\n"))
+            if not re.search(r"\bGITHUB_ENV\b|\bgithub\s*\.\s*env\b", compact, re.IGNORECASE):
+                continue
+            if (
+                workflow == ".github/workflows/apply-on-merge.yml"
+                and step.get("name") == BUNDLE_LOADER_STEP
+                and _shell_operation_lines(script) == CREDENTIAL_HANDOFF_RUN
+                and runtime_names is not None
+            ):
+                runtime_names = runtime_names | {"ferrum_creds_json_file"}
+            else:
+                runtime_names = None
+    return contexts
+
+
 def github_context_access_violations(workflow: str, document: dict) -> list[str]:
     """Protected workflows may not compute or alias GitHub file channels."""
     violations: list[str] = []
@@ -2248,14 +2333,15 @@ def github_context_access_violations(workflow: str, document: dict) -> list[str]
         r"(?:github|matrix|needs|steps|runner|env|vars|inputs|secrets)"
         r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)+", re.IGNORECASE
     )
+    run_contexts = _run_env_contexts(workflow, document)
 
-    def visit(node, path: str, key: str = "") -> None:
+    def visit(node, path: str, key: str = "", context: tuple = ((), None)) -> None:
         if isinstance(node, dict):
             for child_key, value in node.items():
-                visit(value, f"{path}.{child_key}", child_key)
+                visit(value, f"{path}.{child_key}", child_key, run_contexts.get(id(node), ((), None)))
         elif isinstance(node, list):
             for index, value in enumerate(node):
-                visit(value, f"{path}[{index}]", key)
+                visit(value, f"{path}[{index}]", key, context)
         elif isinstance(node, str):
             # Inspect the original decoded scalar before removing any shell
             # comments or joining lines: an expression in a # line can emit a
@@ -2265,6 +2351,14 @@ def github_context_access_violations(workflow: str, document: dict) -> list[str]
                 violations.append(
                     f"{workflow}: {path}: unrecognized GitHub expression syntax is forbidden"
                 )
+            if key.casefold() == "run":
+                _, invalid_aliases = _expand_static_run_env(node, context)
+                for alias in invalid_aliases:
+                    violations.append(
+                        f"{workflow}: {path}: run env alias {alias!r} must resolve to a "
+                        "static shell-safe literal in workflow/job/step env; "
+                        "computed or unknown shell text is forbidden"
+                    )
             # `if:` is also an expression without explicit delimiters.
             if key.casefold() == "if" and not bodies:
                 bodies = [node]
@@ -2304,6 +2398,7 @@ def guarded_environment_violations(
     This fences workflow bindings, not arbitrary behavior of invoked programs.
     """
     context_violations = github_context_access_violations(workflow, document)
+    run_contexts = _run_env_contexts(workflow, document)
     violations: list[str] = []
     allowed: dict[int, dict] = {}
     jobs = document.get("jobs")
@@ -2338,28 +2433,33 @@ def guarded_environment_violations(
     )
     file_destination = re.compile(r"\bGITHUB_(?:ENV|PATH|OUTPUT)\b", re.IGNORECASE)
 
-    def check_scalar(value: str, key: str, label: str, step_name: str | None) -> None:
-        # Plain script comments are not operations. Expressions in them run
-        # before the shell, so retain them when judging protected references
-        # and the exact admitted credential/Verify script shapes.
-        lines = [line.strip() for line in value.splitlines()]
+    def check_scalar(
+        value: str, key: str, label: str, step_name: str | None, context: tuple = ((), None)
+    ) -> None:
+        # Expand proven literals before removing comments. Keep the original
+        # references too, and judge pinned script shapes against original lines.
         if key.casefold() == "run":
+            expanded, _ = _expand_static_run_env(value, context)
             lines = list(_shell_operation_lines(value))
-        content = "\n".join(lines)
-        compact = content.translate(str.maketrans("", "", "'\"\\\n"))
+            content = "\n".join(_shell_operation_lines(expanded))
+        else:
+            lines = [line.strip() for line in value.splitlines()]
+            content = "\n".join(lines)
+        contents = ("\n".join(lines), content)
         verify_read_allowed = (
             workflow == ".github/workflows/apply-on-merge.yml"
             and step_name == "Verify traffic"
             and key == "run"
             and tuple(lines) == PROBE_VERIFY_RUN
         )
-        protected_content = (
-            content.replace("FERRUM_ENV", "") if verify_read_allowed else content
+        protected_contents = (
+            tuple(part.replace("FERRUM_ENV", "") for part in contents)
+            if verify_read_allowed else contents
         )
-        protected_compact = protected_content.translate(str.maketrans("", "", "'\"\\\n"))
-        if (
-            protected_reference.search(protected_content)
-            or protected_reference.search(protected_compact)
+        if any(
+            protected_reference.search(part)
+            or protected_reference.search(part.translate(str.maketrans("", "", "'\"\\\n")))
+            for part in protected_contents
         ):
             violations.append(
                 f"{label}: protected variable references/rebinding outside step env are forbidden"
@@ -2370,8 +2470,10 @@ def guarded_environment_violations(
             and key == "run"
             and tuple(lines) == CREDENTIAL_HANDOFF_RUN
         )
-        if (
-            env_file_reference.search(content) or env_file_reference.search(compact)
+        if any(
+            env_file_reference.search(part)
+            or env_file_reference.search(part.translate(str.maketrans("", "", "'\"\\\n")))
+            for part in contents
         ) and not handoff_allowed:
             violations.append(
                 f"{label}: GITHUB_ENV/GITHUB_PATH or GitHub file-context references/writes "
@@ -2402,7 +2504,7 @@ def guarded_environment_violations(
             if key.casefold() in ("bash_env", "env") and path.casefold().endswith(".env"):
                 violations.append(f"{label}: shell startup env sources are forbidden")
             if isinstance(value, str) and key not in permitted:
-                check_scalar(value, key, label, step_name)
+                check_scalar(value, key, label, step_name, run_contexts.get(id(node), ((), None)))
             if file_destination.search(key):
                 violations.append(f"{label}: rebinding a GitHub file destination is forbidden")
             if isinstance(value, (dict, list)):
@@ -2522,6 +2624,7 @@ def probe_validation_gate_violations(workflow: str, document: dict) -> list[str]
                 )
     # Added/renamed inline mutations must not escape the guarded pair. This
     # does not attempt to judge arbitrary behavior inside invoked programs.
+    run_contexts = _run_env_contexts(workflow, document)
     for job_name, job in jobs.items():
         steps = job.get("steps") if isinstance(job, dict) else None
         for step in steps if isinstance(steps, list) else []:
@@ -2530,16 +2633,19 @@ def probe_validation_gate_violations(workflow: str, document: dict) -> list[str]
             script = step.get("run")
             if not isinstance(script, str):
                 continue
-            active = "\n".join(
-                line for line in script.splitlines() if not line.lstrip().startswith("#")
-            )
-            compact = active.translate(str.maketrans("", "", "'\"\\\n"))
-            if re.search(r"\bgitforgeops\b[^\n]*\b(?:apply|rotate)\b", active) or re.search(
-                r"\bgitforgeops\b[^\n]*\b(?:apply|rotate)\b", compact
-            ):
-                violations.append(
-                    f"{workflow}: job {job_name!r}: mutations may only run in the guarded Apply steps"
+            expanded, _ = _expand_static_run_env(script, run_contexts.get(id(step), ((), None)))
+            for rendered in (script, expanded):
+                active = "\n".join(
+                    line for line in rendered.splitlines() if not line.lstrip().startswith("#")
                 )
+                compact = active.translate(str.maketrans("", "", "'\"\\\n"))
+                if re.search(r"\bgitforgeops\b[^\n]*\b(?:apply|rotate)\b", active) or re.search(
+                    r"\bgitforgeops\b[^\n]*\b(?:apply|rotate)\b", compact
+                ):
+                    violations.append(
+                        f"{workflow}: job {job_name!r}: mutations may only run in the guarded Apply steps"
+                    )
+                    break
     return violations
 
 

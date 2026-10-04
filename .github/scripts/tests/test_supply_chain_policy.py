@@ -52,6 +52,218 @@ class SupplyChainPolicyTests(unittest.TestCase):
             return check_supply_chain.github_context_access_violations(workflow, document)
         return check_supply_chain.probe_consumer_binding_violations(workflow, document)
 
+    def _env_alias_fixture(self, workflow, source, script, scope):
+        document = self._probe_document(workflow)
+        job = next(iter(document["jobs"].values()))
+        step = {"name": "Render static alias", "run": script}
+        job["steps"].insert(0, step)
+        owner = {"workflow": document, "job": job, "step": step}[scope]
+        owner.setdefault("env", {})["INJECT"] = source
+        return document, owner["env"]
+
+    def test_run_env_alias_sources_are_checked_before_shell_filtering(self):
+        workflows = (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        )
+        sources = (
+            '\necho FERRUM_NAMESPACE=other >> "$GITHUB_ENV"',
+            '\r\necho BASH_ENV=inject.sh >> "$GITHUB_ENV"',
+            'EOF\necho FERRUM_NAMESPACE=other >> "$GITHUB_ENV"\ncat <<EOF',
+            "$(echo injected)", "`echo injected`", "';echo injected;#",
+            r'''${{ fromJSON('"\necho FERRUM_\u004eAMESPACE=other >> \"$GITHUB_\u0045NV\""') }}''',
+            r'''${{ fromJSON('"\u000aecho BASH_\u0045NV=inject.sh >> \"$GITHUB_\u0045NV\""') }}''',
+            r'''${{ fromJSON('"\u000aEOF\u000aecho injected\u000acat <<EOF"') }}''',
+            r'''${{ format('{0}{1}', fromJSON('"\n"'), 'echo injected') }}''',
+            "${{ vars.INJECT }}", "${{ steps.payload.outputs.code }}", "${{ env.OTHER }}",
+        )
+        scripts = (
+            "# ${{ env.INJECT }}\ntrue",
+            "true # ${{ env.INJECT }}\ntrue",
+            "echo '${{ env.INJECT }}'",
+            "cat <<'EOF'\n${{ env.INJECT }}\nEOF",
+            "${{ env.INJECT }}\ntrue",
+        )
+        for workflow in workflows:
+            for scope in ("workflow", "job", "step"):
+                for source in sources:
+                    for script in scripts:
+                        with self.subTest(
+                            workflow=workflow, scope=scope, source=source, script=script
+                        ):
+                            document, environment = self._env_alias_fixture(
+                                workflow, source, script, scope
+                            )
+                            violations = self._guarded_bindings(workflow, document)
+                            self.assertTrue(
+                                any("run env alias" in item for item in violations), violations
+                            )
+                            # Same real operational workflow and insertion
+                            # context; only the alias source becomes literal.
+                            environment["INJECT"] = "echo static-mode-v1"
+                            self.assertEqual(self._guarded_bindings(workflow, document), [])
+
+    def test_legitimate_static_env_aliases_remain_accepted(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for scope in ("workflow", "job", "step"):
+            for source in (
+                "", "release v1.2", "out/static.yaml", "https://static.invalid/v1",
+                "mode=api", "user@example.invalid", "--format=json",
+            ):
+                with self.subTest(scope=scope, source=source):
+                    document, _ = self._env_alias_fixture(
+                        workflow, source, "echo '${{ env.INJECT }}'", scope
+                    )
+                    self.assertEqual(self._guarded_bindings(workflow, document), [])
+
+    def test_static_env_aliases_follow_workflow_job_step_precedence(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        unsafe = r'''${{ fromJSON('"\u000aecho injected"') }}'''
+        document, environment = self._env_alias_fixture(
+            workflow, unsafe, "echo '${{ ENV . INJECT }}'", "workflow"
+        )
+        job = next(iter(document["jobs"].values()))
+        step = job["steps"][0]
+        job["env"] = {"INJECT": "job-value"}
+        self.assertEqual(self._guarded_bindings(workflow, document), [])
+        context = check_supply_chain._run_env_contexts(workflow, document)[id(step)]
+        self.assertEqual(
+            check_supply_chain._expand_static_run_env(step["run"], context),
+            ("echo 'job-value'", []),
+        )
+        job["env"]["INJECT"] = unsafe
+        step["env"] = {"INJECT": "step-value"}
+        self.assertEqual(self._guarded_bindings(workflow, document), [])
+        context = check_supply_chain._run_env_contexts(workflow, document)[id(step)]
+        self.assertEqual(
+            check_supply_chain._expand_static_run_env(step["run"], context),
+            ("echo 'step-value'", []),
+        )
+        environment["INJECT"] = "workflow-value"
+        job["env"]["INJECT"] = "job-value"
+        step["env"]["INJECT"] = unsafe
+        self.assertTrue(any(
+            "run env alias" in item for item in self._guarded_bindings(workflow, document)
+        ))
+        step["env"]["INJECT"] = "step-value"
+        self.assertEqual(self._guarded_bindings(workflow, document), [])
+
+    def test_unknown_dynamic_or_ambiguous_env_alias_sources_fail_closed(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for scope in ("workflow", "job", "step"):
+            for source in (None, 1, {"value": "literal"}, ["literal"]):
+                with self.subTest(scope=scope, source=source):
+                    document, _ = self._env_alias_fixture(
+                        workflow, source, "# ${{ env.INJECT }}\ntrue", scope
+                    )
+                    self.assertTrue(any(
+                        "run env alias" in item
+                        for item in self._guarded_bindings(workflow, document)
+                    ))
+            for environment in ({}, {"INJECT": "safe", "inject": "unsafe"}, "${{ vars.ENV }}"):
+                with self.subTest(scope=scope, environment=environment):
+                    document, _ = self._env_alias_fixture(
+                        workflow, "safe", "echo '${{ env.INJECT }}'", scope
+                    )
+                    job = next(iter(document["jobs"].values()))
+                    owner = {"workflow": document, "job": job, "step": job["steps"][0]}[scope]
+                    owner["env"] = environment
+                    self.assertTrue(any(
+                        "run env alias" in item
+                        for item in self._guarded_bindings(workflow, document)
+                    ))
+        for expression in ("env.INJECT.property", "env['INJECT']", "env.UNKNOWN"):
+            with self.subTest(expression=expression):
+                document, _ = self._env_alias_fixture(
+                    workflow, "safe", "# ${{ " + expression + " }}\ntrue", "step"
+                )
+                self.assertTrue(any(
+                    "run env alias" in item
+                    for item in self._guarded_bindings(workflow, document)
+                ))
+
+    def test_static_alias_substitution_cannot_hide_guarded_identifiers(self):
+        for workflow in (*check_supply_chain.PROBE_WORKFLOW_STEPS, ".github/workflows/drift-check.yml"):
+            protected_suffix = (
+                "ADMIN_JWT_SECRET" if workflow.endswith("drift-check.yml")
+                else "VERIFY_PROBE_CONSUMERS"
+            )
+            for value, script, diagnostic in (
+                ("ENV", 'echo BASH_ENV=inject.sh >> "$GITHUB_${{ env.INJECT }}"', "GITHUB_ENV/"),
+                ("ENV", 'echo injected >> "$GITHUB_${{ env.INJECT }}"', "GITHUB_ENV/"),
+                (protected_suffix, "export FERRUM_${{ env.INJECT }}=other", "protected variable"),
+            ):
+                with self.subTest(workflow=workflow, value=value, script=script):
+                    document, _ = self._env_alias_fixture(workflow, value, script, "step")
+                    violations = self._guarded_bindings(workflow, document)
+                    self.assertTrue(any(diagnostic in item for item in violations), violations)
+                    job = next(iter(document["jobs"].values()))
+                    job["steps"][0]["run"] = "# " + script + "\ntrue"
+                    self.assertEqual(self._guarded_bindings(workflow, document), [])
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for value in ("ENV", "NAMESPACE"):
+            for script in (
+                "export FERRUM_${{ env.INJECT }}=other",
+                "cat <<'EOF'\nFERRUM_${{ env.INJECT }}=other\nEOF",
+            ):
+                with self.subTest(value=value, script=script):
+                    document, _ = self._env_alias_fixture(workflow, value, script, "step")
+                    self.assertTrue(any(
+                        "protected variable references/rebinding" in item
+                        for item in self._guarded_bindings(workflow, document)
+                    ))
+        for script in (
+            "gitforgeops ${{ env.INJECT }} --auto-approve",
+            "${{ env.INJECT }} --auto-approve",
+        ):
+            with self.subTest(script=script):
+                source = "gitforgeops apply" if script.startswith("${{") else "apply"
+                document, environment = self._env_alias_fixture(workflow, source, script, "step")
+                self.assertTrue(any(
+                    "mutations may only run in the guarded Apply steps" in item
+                    for item in self._guarded_bindings(workflow, document)
+                ))
+                environment["INJECT"] = "echo" if script.startswith("${{") else "version"
+                self.assertEqual(self._guarded_bindings(workflow, document), [])
+        workflow = ".github/workflows/trusted-pr-review.yml"
+        document = self._probe_document(workflow)
+        review = self._step(document, "live-review", "Post trusted live review")
+        review["run"] += '\necho "${{ env.FERRUM_VERIFY_PROBE_CONSUMERS_BOUND }}"'
+        self.assertTrue(any(
+            "protected variable references/rebinding" in item
+            for item in self._guarded_bindings(workflow, document)
+        ))
+
+    def test_inherited_aliases_are_unknown_after_visible_env_file_writes(self):
+        workflow = ".github/workflows/rotate.yml"
+        document, _ = self._env_alias_fixture(
+            workflow, "inherited-value", "echo '${{ env.INJECT }}'", "job"
+        )
+        job = next(iter(document["jobs"].values()))
+        job["steps"].insert(0, {"run": 'echo "INJECT=changed" >> "$GITHUB_ENV"'})
+        self.assertTrue(any(
+            "run env alias" in item
+            for item in check_supply_chain.github_context_access_violations(workflow, document)
+        ))
+        job["steps"][1]["env"] = {"INJECT": "step-value"}
+        self.assertEqual(check_supply_chain.github_context_access_violations(workflow, document), [])
+
+        workflow = ".github/workflows/apply-on-merge.yml"
+        document = self._probe_document(workflow)
+        job = document["jobs"]["apply"]
+        loader = self._step(document, "apply", check_supply_chain.BUNDLE_LOADER_STEP)
+        alias = {"run": "echo '${{ env.INJECT }}'"}
+        job["env"] = {"INJECT": "static-mode-v1", "FERRUM_CREDS_JSON_FILE": "not-runtime"}
+        job["steps"].insert(job["steps"].index(loader) + 1, alias)
+        self.assertEqual(check_supply_chain.github_context_access_violations(workflow, document), [])
+        alias["run"] = "echo '${{ env.FERRUM_CREDS_JSON_FILE }}'"
+        self.assertTrue(any(
+            "run env alias" in item
+            for item in check_supply_chain.github_context_access_violations(workflow, document)
+        ))
+
     def test_computed_github_file_access_fails_closed_in_every_guarded_workflow(self):
         workflows = (
             *check_supply_chain.PROBE_WORKFLOW_STEPS,
@@ -496,6 +708,59 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     any("GitHub context access is forbidden" in item for item in violations),
                     violations,
                 )
+
+    def test_protected_checker_rejects_encoded_alias_injection_with_paired_static_sources(self):
+        source = (
+            r'''${{ fromJSON('"\necho FERRUM_\u004eAMESPACE=other '''
+            r'''>> \"$GITHUB_\u0045NV\""') }}'''
+        )
+        script = json.dumps("# ${{ env.INJECT }}\ntrue").replace("#", r"\u0023")
+        for workflow in (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        ):
+            for scope in ("workflow", "job", "step"):
+                with (
+                    self.subTest(workflow=workflow, scope=scope),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root = self._mirror_repo(Path(directory))
+                    path = root / workflow
+                    original = path.read_text(encoding="utf-8")
+
+                    def fixture(value):
+                        scalar = json.dumps(value)
+                        step = "      - name: Render alias\n"
+                        if scope == "step":
+                            step += "        env:\n          INJECT: " + scalar + "\n"
+                        step += "        run: " + script + "\n"
+                        text = original.replace("    steps:\n", "    steps:\n" + step, 1)
+                        if scope == "workflow":
+                            text = text.replace(
+                                "jobs:\n", "env:\n  INJECT: " + scalar + "\njobs:\n", 1
+                            )
+                        elif scope == "job":
+                            text = text.replace(
+                                "    steps:\n",
+                                "    env:\n      INJECT: " + scalar + "\n    steps:\n", 1,
+                            )
+                        return text
+
+                    path.write_text(fixture(source), encoding="utf-8")
+                    # The candidate's own checker cannot approve its alias.
+                    (root / ".github/scripts/check_supply_chain.py").write_text(
+                        "raise SystemExit(0)\n", encoding="utf-8"
+                    )
+                    violations = self._violations(root)
+                    self.assertTrue(any("run env alias" in item for item in violations), violations)
+                    path.write_text(fixture("echo static-mode-v1"), encoding="utf-8")
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPT), "--root", str(root)],
+                        check=False, text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_protected_checker_rejects_comment_injection_and_validate_env_changes(self):
         payload = (
