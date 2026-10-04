@@ -2984,9 +2984,21 @@ async fn delete_404_acknowledgements_gate_plugin_pruning_ledger_and_completion()
                 expected.push("DELETE /plugins/config/pc1 HTTP/1.1");
             }
             assert_eq!(mutation_lines(&requests), expected, "{context}");
-            assert_eq!(result.deleted, if acknowledged { 2 } else { 0 }, "{context}");
-            assert_eq!(result.deletes_missing, usize::from(acknowledged), "{context}");
-            assert_eq!(result.applied_incremental.len(), result.deleted, "{context}");
+            assert_eq!(
+                result.deleted,
+                if acknowledged { 2 } else { 0 },
+                "{context}"
+            );
+            assert_eq!(
+                result.deletes_missing,
+                usize::from(acknowledged),
+                "{context}"
+            );
+            assert_eq!(
+                result.applied_incremental.len(),
+                result.deleted,
+                "{context}"
+            );
             assert!(result.adopted.is_empty(), "{context}");
             assert!(!format!("{:?} {:?}", result.errors, result.fatal_error).contains(SECRET));
             assert_eq!(result.fatal_error.is_none(), acknowledged, "{context}");
