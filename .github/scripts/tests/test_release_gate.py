@@ -68,7 +68,7 @@ MERGED_PR = {
     "state": "closed",
     "merged": True,
     "base": {"ref": "main", "repo": {"full_name": REPO}},
-    "head": {"sha": HEAD_SHA},
+    "head": {"sha": HEAD_SHA, "ref": "feature"},
     "merged_at": "2026-10-04T00:00:00Z",
     "merge_commit_sha": RELEASE_SHA,
 }
@@ -150,6 +150,7 @@ state_path = Path(os.environ["STUB_STATE"])
 state = json.loads(state_path.read_text(encoding="utf-8"))
 sample = min(state["sample"], len(scenario["checks"]) - 1)
 checks = scenario["checks"][sample]
+reported_checks = checks
 
 if arguments[0] == "api":
     endpoint = arguments[1]
@@ -159,9 +160,9 @@ if arguments[0] == "api":
     elif endpoint == f"repos/{os.environ['REPO']}/pulls/452":
         mode = "PR"
         response = scenario["pr"]
-    elif endpoint == f"repos/{os.environ['REPO']}/rules/branches/main":
+    elif endpoint == f"repos/{os.environ['REPO']}/rules/branches/main?per_page=100":
         mode = "RULES"
-        response = scenario["rules"]
+        response = scenario.get("rule_pages", [scenario["rules"]])
     elif endpoint == f"repos/{os.environ['REPO']}/commits/{scenario['pr']['head']['sha']}/check-runs?per_page=100&filter=all":
         mode = "RUNS"
         if "runs" in scenario:
@@ -197,13 +198,25 @@ state["calls"][mode] = count + 1
 state["clock"] += scenario.get("api_seconds", 0)
 state_path.write_text(json.dumps(state), encoding="utf-8")
 responses = scenario.get("responses", {}).get(mode)
+status = scenario.get("statuses", {}).get(mode, 0)
+diagnostic = "lookup failed\n" if status else ""
 if responses is not None:
     sys.stdout.write(responses[min(count, len(responses) - 1)])
+elif mode in ("REQUIRED", "ALL") and not response and status == 0:
+    # Real gh returns an error before JSON export for an empty rollup, or an
+    # empty --required projection. Preserve stdout emptiness and exit code 1.
+    modifier = "required " if required and reported_checks else ""
+    diagnostic = f"no {modifier}checks reported on the '{scenario['pr']['head']['ref']}' branch\n"
+    status = 1
 else:
     print(json.dumps(response))
+errors = scenario.get("errors", {}).get(mode)
+if errors is not None:
+    diagnostic = errors[min(count, len(errors) - 1)]
+sys.stderr.write(diagnostic)
 # gh JSON mode exports buckets without an outcome-based exit status.
 # Lookup/export errors are separate, even with valid JSON stdout.
-raise SystemExit(scenario.get("statuses", {}).get(mode, 0))
+raise SystemExit(status)
 """
 
 STUB_TIME = r"""#!/usr/bin/env python3
@@ -266,8 +279,10 @@ class ReleaseGateTests(unittest.TestCase):
         samples: list[list[dict]] | None = None,
         run_samples: list[list[dict]] | None = None,
         settings: list[dict] | None = None,
+        rule_pages: list[list[dict]] | None = None,
         responses: dict[str, list[str]] | None = None,
         statuses: dict[str, int] | None = None,
+        errors: dict[str, list[str]] | None = None,
         sleep_advance: int | None = None,
         api_seconds: int = 0,
     ) -> subprocess.CompletedProcess[str]:
@@ -292,8 +307,11 @@ class ReleaseGateTests(unittest.TestCase):
                 "rules": rules(*default_contexts) if settings is None else settings,
                 "responses": dict(responses or {}),
                 "statuses": {"REQUIRED": required_status, "ALL": all_status, **(statuses or {})},
+                "errors": dict(errors or {}),
                 "api_seconds": api_seconds,
             }
+            if rule_pages is not None:
+                scenario["rule_pages"] = rule_pages
             if run_samples is not None:
                 scenario["runs"] = run_samples
             for mode, response in (("REQUIRED", required_response), ("ALL", all_response)):
@@ -348,6 +366,9 @@ class ReleaseGateTests(unittest.TestCase):
                     self.assertIn(call, (required_call, all_call), result.stderr)
                 elif call[0] == "api" and "/check-runs?" in call[1]:
                     self.assertIn(f"/commits/{HEAD_SHA}/", call[1], result.stderr)
+                    self.assertEqual(call[2:], ["--paginate", "--slurp"], result.stderr)
+                elif call[0] == "api" and "/rules/branches/" in call[1]:
+                    self.assertEqual(call[1], f"repos/{REPO}/rules/branches/main?per_page=100")
                     self.assertEqual(call[2:], ["--paginate", "--slurp"], result.stderr)
             return result
 
@@ -472,6 +493,132 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
 
+    def test_empty_cli_errors_wait_then_pass(self) -> None:
+        result = self.run_gate(PASSING_CHECKS, samples=[[], PASSING_CHECKS])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        self.assertIn("pending or missing", result.stdout)
+        check_calls = [call for call in self.calls if call[:2] == ["pr", "checks"]]
+        self.assertEqual(len(check_calls), 4)
+
+    def test_no_required_cli_error_waits_then_passes(self) -> None:
+        optional = [{"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}]
+        result = self.run_gate(PASSING_CHECKS, samples=[optional, PASSING_CHECKS])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_empty_cli_errors_time_out_instead_of_aborting_the_first_sample(self) -> None:
+        optional = [{"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}]
+        for checks in ([], optional):
+            with self.subTest(checks=checks):
+                result = self.run_gate(checks, sleep_advance=900)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+                self.assertIn("pending or missing", result.stdout)
+                self.assertIn("Timed out", result.stderr)
+
+    def test_an_empty_full_lookup_cannot_authorize_a_passing_required_lookup(self) -> None:
+        result = self.run_gate(
+            PASSING_CHECKS,
+            all_status=1,
+            all_response="",
+            errors={"ALL": ["no checks reported on the 'feature' branch\n"]},
+            sleep_advance=900,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        self.assertIn("Timed out", result.stderr)
+
+    def test_empty_stdout_query_failures_are_not_treated_as_missing_checks(self) -> None:
+        for mode in ("required", "all"):
+            for diagnostic in ("HTTP 502: Bad Gateway\n", "GraphQL: Could not resolve PR\n"):
+                with self.subTest(mode=mode, diagnostic=diagnostic):
+                    result = self.run_gate(
+                        [],
+                        **{f"{mode}_status": 1, f"{mode}_response": ""},
+                        errors={mode.upper(): [diagnostic]},
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.sleeps, [])
+                    self.assertIn(diagnostic.strip(), result.stderr)
+
+    def test_empty_diagnostics_require_empty_stdout_and_exit_code_one(self) -> None:
+        diagnostic = "no checks reported on the 'feature' branch\n"
+        for mode in ("required", "all"):
+            for status, response in ((1, "[]"), (2, ""), (8, ""), (124, "")):
+                with self.subTest(mode=mode, status=status, response=response):
+                    result = self.run_gate(
+                        [],
+                        **{f"{mode}_status": status, f"{mode}_response": response},
+                        errors={mode.upper(): [diagnostic]},
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.sleeps, [])
+
+    def test_empty_diagnostics_must_match_the_verified_head_branch_and_lookup(self) -> None:
+        for mode, diagnostic in (
+            ("required", "no checks reported on the 'other' branch\n"),
+            ("all", "no required checks reported on the 'feature' branch\n"),
+            ("required", "no checks reported on the 'feature' branch\nHTTP 502\n"),
+        ):
+            with self.subTest(mode=mode, diagnostic=diagnostic):
+                result = self.run_gate(
+                    [],
+                    **{f"{mode}_status": 1, f"{mode}_response": ""},
+                    errors={mode.upper(): [diagnostic]},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [])
+
+    def test_empty_cli_errors_require_valid_complete_same_head_evidence(self) -> None:
+        history = [dict(passing_runs()[0], head_sha="c" * 40)]
+        result = self.run_gate([], run_samples=[history])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [])
+        incomplete = json.dumps([{"total_count": 1, "check_runs": []}])
+        result = self.run_gate([], responses={"RUNS": [incomplete]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [])
+
+    def test_runs_arriving_after_an_empty_cli_sample_require_another_poll(self) -> None:
+        optional = [{"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}]
+        for initial in ([], optional):
+            with self.subTest(initial=initial):
+                result = self.run_gate(
+                    PASSING_CHECKS,
+                    samples=[initial, PASSING_CHECKS],
+                    run_samples=[passing_runs()],
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_empty_cli_errors_cannot_hide_a_newer_source_bound_failure(self) -> None:
+        optional = [{"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}]
+        for initial in ([], optional):
+            for conclusion in ("failure", "cancelled"):
+                with self.subTest(initial=initial, conclusion=conclusion):
+                    history = passing_runs()
+                    history.append(dict(history[0], id=900, conclusion=conclusion))
+                    result = self.run_gate(initial, run_samples=[history])
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.sleeps, [])
+
+    def test_empty_cli_errors_do_not_hide_evidence_api_failures(self) -> None:
+        for mode in ("RULES", "RUNS"):
+            with self.subTest(mode=mode):
+                result = self.run_gate([], statuses={mode: 1})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [])
+
+    def test_empty_cli_errors_do_not_allow_a_head_change(self) -> None:
+        changed = dict(MERGED_PR, head={"sha": "c" * 40, "ref": "feature"})
+        result = self.run_gate(
+            [], responses={"PR": [json.dumps(MERGED_PR), json.dumps(changed)]}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("changed", result.stdout)
+
     def test_pending_required_checks_wait_then_fail_without_retrying_failure(self) -> None:
         for bucket in ("fail", "cancel", "skipping"):
             with self.subTest(bucket=bucket):
@@ -561,6 +708,72 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
 
+    def test_missing_required_contexts_on_page_two_cannot_pass_by_absence(self) -> None:
+        first_page = rules(*REQUIRED) + [{"type": "deletion"}] * 99
+        for context in (*ACCEPTED, "Rust CI / coverage"):
+            with self.subTest(context=context):
+                result = self.run_gate(
+                    PASSING_CHECKS,
+                    rule_pages=[first_page, rules(context)],
+                    sleep_advance=900,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+                self.assertIn("Timed out", result.stderr)
+
+    def test_required_contexts_on_page_two_wait_then_pass(self) -> None:
+        first_page = rules(*REQUIRED) + [{"type": "deletion"}] * 99
+        extra = {"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}
+        for check in (TRUSTED_POLICY_CHECK, extra):
+            with self.subTest(check=check):
+                required = dict(check, required=True)
+                context = f"{check['workflow']} / {check['name']}"
+                result = self.run_gate(
+                    PASSING_CHECKS,
+                    rule_pages=[first_page, rules(context)],
+                    samples=[PASSING_CHECKS, PASSING_CHECKS + [required]],
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_malformed_later_rule_pages_fail_immediately(self) -> None:
+        for page in (None, {}, "not an array", [None], [{}], [{"type": 42}]):
+            with self.subTest(page=page):
+                response = json.dumps([rules(*REQUIRED), page])
+                self.assert_gate(PASSING_CHECKS, False, responses={"RULES": [response]})
+                self.assertEqual(self.sleeps, [])
+
+    def test_later_required_settings_are_validated_and_source_bound(self) -> None:
+        for context, app in ((ACCEPTED[0], 42), ("Rust CI / coverage", None)):
+            with self.subTest(context=context, app=app):
+                later = rules(context)
+                later[0]["parameters"]["required_status_checks"][0]["integration_id"] = app
+                self.assert_gate(PASSING_CHECKS, False, rule_pages=[rules(*REQUIRED), later])
+                self.assertEqual(self.sleeps, [])
+        for settings in (None, {}, [None], [{"context": "", "integration_id": 15368}]):
+            with self.subTest(settings=settings):
+                later = rules("Rust CI / coverage")
+                later[0]["parameters"]["required_status_checks"] = settings
+                self.assert_gate(PASSING_CHECKS, False, rule_pages=[rules(*REQUIRED), later])
+                self.assertEqual(self.sleeps, [])
+
+    def test_an_additional_app_binding_on_a_later_page_is_enforced(self) -> None:
+        extra = {"bucket": "pass", "name": "coverage", "workflow": "Rust CI", "required": True}
+        later = rules("Rust CI / coverage")
+        later[0]["parameters"]["required_status_checks"][0]["integration_id"] = 42
+        for app in (15368, 42):
+            with self.subTest(app=app):
+                history = passing_runs() + [
+                    dict(passing_runs()[0], id=900, name="coverage", app={"id": app})
+                ]
+                self.assert_gate(
+                    PASSING_CHECKS + [extra],
+                    app == 42,
+                    rule_pages=[rules(*REQUIRED), later],
+                    run_samples=[history],
+                )
+                self.assertEqual(self.sleeps, [] if app == 42 else [["sleep", "15"]])
+
     def test_a_required_trusted_check_must_also_appear_in_the_required_lookup(self) -> None:
         result = self.run_gate(
             PASSING_CHECKS + [TRUSTED_POLICY_CHECK],
@@ -577,7 +790,9 @@ class ReleaseGateTests(unittest.TestCase):
         result = self.run_gate(
             PASSING_CHECKS,
             samples=[pending, PASSING_CHECKS],
-            responses={"RULES": [json.dumps(rules(*REQUIRED)), json.dumps(rules(*REQUIRED, *ACCEPTED))]},
+            responses={"RULES": [
+                json.dumps([rules(*REQUIRED)]), json.dumps([rules(*REQUIRED, *ACCEPTED)])
+            ]},
             sleep_advance=450,
         )
         self.assertNotEqual(result.returncode, 0)

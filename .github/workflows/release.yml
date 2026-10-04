@@ -56,11 +56,13 @@ jobs:
           pulls_file=$(mktemp)
           checks_file=$(mktemp)
           all_checks_file=$(mktemp)
+          checks_error_file=$(mktemp)
+          all_checks_error_file=$(mktemp)
           association_file=$(mktemp)
           pr_file=$(mktemp)
           rules_file=$(mktemp)
           runs_file=$(mktemp)
-          trap 'rm -f "$pulls_file" "$checks_file" "$all_checks_file" "$association_file" "$pr_file" "$rules_file" "$runs_file"' EXIT
+          trap 'rm -f "$pulls_file" "$checks_file" "$all_checks_file" "$checks_error_file" "$all_checks_error_file" "$association_file" "$pr_file" "$rules_file" "$runs_file"' EXIT
 
           deadline=$(( $(date +%s) + 900 ))
           remaining_budget() {
@@ -162,6 +164,28 @@ jobs:
           }
 
           branch_path=$(jq -nr --arg branch "$DEFAULT_BRANCH" '$branch | @uri')
+          classify_check_lookup() {
+            local status=$1 output=$2 errors=$3 mode=$4 head_branch diagnostic
+            [ "$status" -ne 0 ] || return 0
+            # gh errors before exporting JSON for an empty rollup. Accept only
+            # that diagnostic; validate same-head evidence before waiting.
+            head_branch=$(jq -er '.head.ref | select(type == "string" and length > 0)' "$pr_file") || return 1
+            diagnostic=$(cat "$errors")
+            if [ "$status" -eq 1 ] && [ ! -s "$output" ]; then
+              if [ "$diagnostic" = "no checks reported on the '${head_branch}' branch" ]; then
+                echo all
+              elif [ "$mode" = required ] && [ "$diagnostic" = "no required checks reported on the '${head_branch}' branch" ]; then
+                echo required
+              else
+                cat "$errors" >&2
+                return 1
+              fi
+              echo '[]' > "$output"
+            else
+              cat "$errors" >&2
+              return 1
+            fi
+          }
           while :; do
             verify_pr_identity || {
               echo "::error::Merged PR #${pr} changed identity, head or default-branch association."
@@ -171,28 +195,31 @@ jobs:
             # pass by absence after the ruleset makes it required. Preserve the
             # ruleset's App binding when checking the immutable head below.
             timeout --kill-after=5s "$(remaining_budget)s" \
-              gh api "repos/${REPO}/rules/branches/${branch_path}" > "$rules_file" || {
+              gh api "repos/${REPO}/rules/branches/${branch_path}?per_page=100" \
+              --paginate --slurp > "$rules_file" || {
               echo "::error::Required-check settings could not be read."
               exit 1
             }
             status=0
             timeout --kill-after=5s "$(remaining_budget)s" \
               gh pr checks "$pr" --repo "$REPO" --required \
-              --json bucket,name,workflow > "$checks_file" || status=$?
-            [ "$status" -eq 0 ] || {
+              --json bucket,name,workflow > "$checks_file" 2> "$checks_error_file" || status=$?
+            required_missing=$(classify_check_lookup "$status" "$checks_file" "$checks_error_file" required) || {
               echo "::error::Required checks for merged PR #${pr} could not be read."
               cat "$checks_file"
               exit 1
             }
 
-            # --required hides transitional results. JSON mode exports buckets;
-            # a nonzero exit is a lookup error, not evidence of pending checks.
-            if ! timeout --kill-after=5s "$(remaining_budget)s" \
+            # --required hides transitional results. Inspect the full rollup
+            # too; every error other than verified absence fails closed.
+            status=0
+            timeout --kill-after=5s "$(remaining_budget)s" \
               gh pr checks "$pr" --repo "$REPO" \
-              --json bucket,name,workflow > "$all_checks_file"; then
+              --json bucket,name,workflow > "$all_checks_file" 2> "$all_checks_error_file" || status=$?
+            all_missing=$(classify_check_lookup "$status" "$all_checks_file" "$all_checks_error_file" all) || {
               echo "::error::All checks for merged PR #${pr} could not be read."
               exit 1
-            fi
+            }
 
             # gh deduplicates by startedAt: a queued retry can disappear behind
             # an older success. Read every run on the expected head and select
@@ -213,7 +240,8 @@ jobs:
             ]' --argjson accepted '[
               "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy"
             ]' --slurpfile all_checks "$all_checks_file" \
-              --slurpfile rules "$rules_file" --slurpfile runs "$runs_file" --arg head "$expected_head" '
+              --slurpfile rules "$rules_file" --slurpfile runs "$runs_file" --arg head "$expected_head" \
+              --arg required_missing "$required_missing" --arg all_missing "$all_missing" '
               def positive_integer: type == "number" and . > 0 and . == floor;
               def check_contexts:
                 if type != "array" then error("invalid checks response") else . end
@@ -232,13 +260,15 @@ jobs:
                   });
               if length != 1 or ($all_checks | length) != 1 or
                   ($rules | length) != 1 or ($rules[0] | type) != "array" or
+                  ($rules[0] | length) == 0 or
                   ($runs | length) != 1 or ($runs[0] | type) != "array" or ($runs[0] | length) == 0 then
                 error("expected one response per checks lookup")
               else
                 (.[0] | check_contexts) as $checks
                 | ($all_checks[0] | check_contexts) as $reported
                 | ($rules[0] | map(
-                    if type != "object" or (.type | type) != "string" then
+                    if type != "array" then error("invalid rules page") else .[] end
+                    | if type != "object" or (.type | type) != "string" then
                       error("invalid rule record")
                     elif .type == "required_status_checks" then
                       .parameters.required_status_checks
@@ -280,6 +310,10 @@ jobs:
                           else .conclusion == null end | not)
                       then error("invalid or wrong-head check run") else . end
                   )) as $history
+                | if ($required_missing != "" or $all_missing != "") and
+                    any($runs[0][]; .total_count != ($history | length)) then
+                    error("incomplete check-run evidence for empty checks")
+                  else . end
                 | if ($history | group_by(.id) | any(.[]; (unique | length) != 1)) then
                     error("conflicting check-run identities") else . end
                 | ($watched | map(. as $setting |
@@ -288,10 +322,13 @@ jobs:
                     | {name, app, latest: $latest}
                   )) as $latest
                 | ($checks + ($reported | map(select(.context as $context | ($required + $accepted | index($context)) != null)))) as $guarded
+                # Runs may arrive after an empty CLI sample. They still cannot
+                # authorize it: an empty lookup must be sampled again.
                 | if any($guarded[]; .bucket != "pass" and .bucket != "pending") or
                     any($latest[]; .latest != null and .latest.status == "completed" and .latest.conclusion != "success") then
                     error("required or transitional check failed, was cancelled or skipped")
-                  elif any($checks[]; .bucket == "pending") or
+                  elif $required_missing != "" or $all_missing != "" or
+                    any($checks[]; .bucket == "pending") or
                     ($required_contexts | any(. as $wanted | all($checks[]; .context != $wanted))) or
                     any($guarded[]; .bucket == "pending") or
                     any($latest[]; (. as $check | ($settings | any(.name == $check.name and .app == $check.app))) and .latest == null) or
