@@ -6,7 +6,7 @@ use gitforgeops::http_client::{
     build_restore_body, classify_retry, delete_succeeded, is_read_only_refusal, map_api_error,
     merge_pages, next_page_offset, resource_id_is_path_safe, split_batch, write_block_reason,
     AdminClient, ApiErrorBody, BackupExtras, BackupSnapshot, BatchCreate, ClusterStatus,
-    DeleteOutcome, HealthStatus, RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
+    DeleteOutcome, ExportEndpoint, HealthStatus, RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -131,14 +131,16 @@ async fn admin_client_get_backup_sends_namespace_and_bearer_token() {
     });
 
     let mut env = base_env();
-    env.gateway_url = Some(format!("http://{addr}"));
+    env.gateway_url = Some(format!("HTTP://{addr}/admin/"));
+    env.gateway_request_timeout_secs = 5;
+    env.gateway_max_retries = 0;
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let backup = client.get_backup("team-alpha").await.unwrap();
     assert!(backup.proxies.is_empty());
 
     let request = rx.recv().unwrap();
-    assert!(request.starts_with("GET /backup HTTP/1.1"));
+    assert!(request.starts_with("GET /admin/backup HTTP/1.1"));
     assert!(request.contains("authorization: Bearer "));
     assert!(request.contains("x-ferrum-namespace: team-alpha"));
 }
@@ -2052,4 +2054,143 @@ fn scoped_backup_requires_explicit_matching_namespace_for_every_resource_kind() 
             }
         }
     }
+}
+
+/// The admin token, and the consumer credentials in request bodies, never
+/// travel in cleartext to anything but a literal loopback IP, whatever was
+/// configured. The refusal names no part of the secret-backed URL.
+#[test]
+fn the_admin_client_never_sends_its_token_in_cleartext_to_a_remote_host() {
+    for (url, accepted) in [
+        ("https://gateway.example:9000", true),
+        ("HTTPS://gateway.example:9000/admin/", true),
+        ("http://127.0.0.1:9000", true),
+        ("http://127.255.255.254:9000", true),
+        ("http://[::1]:9000", true),
+        ("http://localhost:9000", false),
+        ("http://localhost.:9000", false),
+        ("http://127.0.0.1.example:9000", false),
+        ("http://[::ffff:127.0.0.1]:9000", false),
+        ("http://gateway.example:9000", false),
+        ("http://10.0.0.5:9000", false),
+        ("http://192.168.1.5:9000", false),
+        ("http://[::]:9000", false),
+        ("ftp://127.0.0.1:9000", false),
+    ] {
+        for viewer in [false, true] {
+            let mut env = base_env();
+            env.gateway_url = Some(url.to_string());
+            env.allow_insecure_http = true;
+            env.tls_no_verify = true;
+            env.admin_jwt_viewer_secret = Some("test-viewer-secret-at-least-32-chars".to_string());
+            let built = if viewer {
+                env.admin_jwt_secret = None;
+                AdminClient::new_viewer_scoped(&env, TEST_NAMESPACES)
+            } else {
+                AdminClient::new_scoped(&env, TEST_NAMESPACES)
+            };
+            assert_eq!(built.is_ok(), accepted, "{url}, viewer={viewer}");
+            if let Err(error) = built {
+                let message = error.to_string();
+                assert!(message.contains("literal loopback IP"), "{message}");
+                assert!(!message.contains("gateway.example"), "{message}");
+                assert!(!message.contains("10.0.0.5"), "{message}");
+            }
+        }
+    }
+}
+
+#[test]
+fn both_admin_credential_tiers_refuse_embedded_url_credentials() {
+    for url in [
+        "https://private-user:private-password@gateway.example:9000",
+        "http://private-user:private-password@127.0.0.1:9000",
+    ] {
+        let mut env = base_env();
+        env.gateway_url = Some(url.to_string());
+        env.admin_jwt_viewer_secret = Some("test-viewer-secret-at-least-32-chars".to_string());
+        for built in [
+            AdminClient::new_scoped(&env, TEST_NAMESPACES),
+            AdminClient::new_viewer_scoped(&env, TEST_NAMESPACES),
+        ] {
+            let message = match built {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("embedded URL credentials must be refused"),
+            };
+            assert!(message.contains("must not embed credentials"), "{message}");
+            assert!(!message.contains("private-user"), "{message}");
+            assert!(!message.contains("private-password"), "{message}");
+            assert!(!message.contains("gateway.example"), "{message}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn https_clients_refuse_a_plaintext_export_endpoint_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let endpoint = ExportEndpoint::from_gateway_url(&format!("http://{addr}")).unwrap();
+
+    for viewer in [false, true] {
+        let mut env = base_env();
+        env.gateway_url = Some(format!("https://{addr}"));
+        env.allow_insecure_http = true;
+        env.admin_jwt_viewer_secret = Some("test-viewer-secret-at-least-32-chars".to_string());
+        let client = if viewer {
+            AdminClient::new_viewer_scoped(&env, TEST_NAMESPACES)
+        } else {
+            AdminClient::new_scoped(&env, TEST_NAMESPACES)
+        }
+        .unwrap();
+        let error = client
+            .get_config_export(&endpoint, "team-alpha")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, gitforgeops::error::Error::HttpClient(_)));
+        assert!(!error.to_string().contains(&addr.to_string()));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "an HTTPS client must never open a plaintext connection"
+        );
+    }
+}
+
+#[test]
+fn loopback_backup_bypasses_environment_proxies() {
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    // Isolate proxy variables in a child test process so concurrent tests do
+    // not inherit them. The child serves and verifies a real loopback backup.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unit::http_client_tests::admin_client_get_backup_sends_namespace_and_bearer_token",
+        ])
+        .envs([
+            ("HTTP_PROXY", proxy_url.as_str()),
+            ("http_proxy", proxy_url.as_str()),
+            ("HTTPS_PROXY", proxy_url.as_str()),
+            ("https_proxy", proxy_url.as_str()),
+            ("ALL_PROXY", proxy_url.as_str()),
+            ("all_proxy", proxy_url.as_str()),
+            ("NO_PROXY", ""),
+            ("no_proxy", ""),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    assert_eq!(
+        proxy.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a proxy must never receive loopback credentials"
+    );
 }

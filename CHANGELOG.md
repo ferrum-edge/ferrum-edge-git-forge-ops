@@ -55,6 +55,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Incremental `apply` needs Ferrum Edge v0.9.9 or later to modify or delete
+  existing rows: every such write is sent with `If-Match`, and an older
+  gateway issues no `ETag`. The apply preflight reads one row the run will
+  overwrite and refuses such a gateway before any credential is allocated or
+  any row written; creates alone still work. `doctor --scope gateway` reports
+  it as `gateway-conditional-writes`. Each modify or delete now costs one
+  extra `GET`. v0.9.9 is the minimum for this capability, not qualification
+  of all backup and consumer representations; the lifecycle suite must pass
+  against the exact gateway build and no pending representation fix is assumed
+  released.
 - `diff --format json` gains two fields on every path: `live_source`
   (`backup` or `config_export`) and `secret_fingerprints` (`null` on the
   `/backup` path). The cached-read warning now names the source it came from,
@@ -98,6 +108,47 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outside the candidate tree, and positive coverage retains the real pinned
   operations and safe step outputs (#453, #440).
 
+- Lifecycle admin and data-plane requests share a transport boundary that
+  refuses all redirects, permits credentials only over HTTPS or HTTP to a
+  literal loopback IP, and bypasses environment proxies for plaintext
+  loopback. This covers both out-of-band admin helpers and consumer traffic
+  probes without changing the gateway's conditional-write assertions.
+- Incremental `apply` no longer overwrites or deletes a row from a stale plan.
+  The plan comes from the `/backup` read before credential allocation and
+  delivery, so every `PUT` or `DELETE` of an existing row (a modify, a delete,
+  a pending-create, ambiguous-create or adoption ownership assertion, and a
+  proxy update after scoped-plugin writes) is now conditional: apply reads the
+  row with `GET /<kind>/{id}`, refuses it when it gained, lost or changed its
+  `api_spec_id` or changed content since the plan, and sends the write with
+  `If-Match` on the strong `ETag` Ferrum Edge v0.9.9+ returned. Edge refuses a
+  row changed after that read with `412`, atomically with the write. A refusal
+  is a per-resource error and withholds every later write in that namespace
+  (its deletes are deferred and adoption is skipped); the run exits non-zero.
+  A delete whose row is already gone is not sent. When the read differs from
+  the plan only because `/backup` normalizes rows the read returns as stored,
+  a `/backup` taken after the read settles it, so such a row is not refused
+  forever. Consumers are always checked against that later `/backup`, since
+  Edge redacts their credentials on a single-row read. A proxy read after
+  this run's plugin writes ignores only the associations to plugin configs
+  this run wrote, so a plugin someone else attached is never detached, and a
+  scoped plugin can move off a proxy deleted in the same apply. A `412` that
+  answers a retried `PUT` whose earlier attempt committed, shown by a re-read
+  of the desired row, counts as applied. A cached read stops the run, and so
+  does a read without a strong `ETag` (`ConditionalWriteUnavailable`), since
+  an older gateway would ignore `If-Match`. An ambiguous create whose readback
+  finds the declared content under an `api_spec_id` no longer claims that
+  row. A new `conditional-overwrite` lifecycle scenario certifies the
+  gateway's tags and `412` and an apply through them for every overwritten
+  kind (GHSA-fh5w-5x4f-86gh).
+- The admin client sends its bearer token, and the resolved credentials in
+  request bodies, over cleartext `http://` only to a literal loopback IP
+  (`127.0.0.0/8`, `::1`), never a hostname such as `localhost`. Every admin
+  request retains the parsed, checked target through request construction,
+  and the client refuses to build for a remote `http://` gateway or embedded
+  URL credentials. HTTPS clients also enforce HTTPS at send time. Plaintext
+  loopback clients bypass environment proxies, which could otherwise forward
+  credentials to a remote host. `FERRUM_ALLOW_INSECURE_HTTP=true` no longer
+  makes a remote cleartext gateway usable (CodeQL alert #298, PR #450).
 - Capture one bounded, regular-file data snapshot for the cargo-audit gate's
   manifest, source reachability, Cargo graph, audit and independent yanked
   checks (#454). Original-file replacements can no longer redirect Cargo or

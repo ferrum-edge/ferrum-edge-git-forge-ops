@@ -200,6 +200,17 @@ repository. See [GitHub launch controls](github-launch-controls.md).
 
 ## Environment variables
 
+Incremental API overwrites require a strong `ETag` and a gateway that honors
+`If-Match`. The client probes only for the tag and always sends the condition;
+it does not detect a server that returns tags but ignores `If-Match`. The
+operator must qualify the exact released gateway build to establish server
+enforcement. Released Ferrum Edge v0.9.6 source includes the capability, with
+no minimum-version claim. Apply preflight and `doctor --scope gateway` check
+for a strong tag; a version number alone does not prove backup or consumer
+compatibility. See
+[Changes made during an apply](apply.md#changes-made-during-an-apply) for the
+remaining checks and exact-build lifecycle qualification.
+
 Blank values count as unset. Present values are validated before anything else
 runs: unknown modes, bad booleans (accepted: `true`, `false`, `1`, `0`,
 case-insensitive), malformed or zero numbers, and bad URLs are errors. See
@@ -256,6 +267,13 @@ exists:
   under `GITHUB_ACTIONS=true` are refused unless the host is literally
   loopback (`localhost`, `127.0.0.0/8`, `::1`). Put a private CA in
   `FERRUM_GATEWAY_CA_CERT` instead.
+- The admin client itself sends the admin token over cleartext `http://` only
+  to a literal loopback IP (`127.0.0.0/8`, `::1`), whatever was
+  configured: it refuses to build, and every request refuses to attach the
+  token, for a remote `http://` gateway or a hostname such as `localhost`.
+  HTTPS clients enforce HTTPS at send time; plaintext loopback clients bypass
+  environment proxies. `FERRUM_ALLOW_INSECURE_HTTP=true` therefore makes a
+  cleartext gateway usable only at a literal loopback IP.
 
 See also [GitHub launch controls](github-launch-controls.md#the-gateway-url-must-be-https).
 
@@ -406,9 +424,8 @@ with the admin credential.
   `diff` warns, reports no authoritative result and refuses `--exit-on-drift`.
 - **Transport.** The viewer token is sent only to an `https://` gateway URL,
   or over `http://` to a literal loopback IP address (`127.0.0.0/8`, `[::1]`;
-  not `localhost`). This is stricter than the admin client, whose opted-in
-  `http://` (`FERRUM_ALLOW_INSECURE_HTTP=true`) may name any host outside
-  GitHub Actions. Any other URL is refused before a request is made.
+  not `localhost`). The admin client enforces the same rule for both credential
+  tiers. Any other URL is refused before a request is made.
 - **Refusals.** `404` means the gateway predates the export, `401` a viewer key
   or claim mismatch, `403` a namespace outside
   `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` or the token's `ns` claim. Each message

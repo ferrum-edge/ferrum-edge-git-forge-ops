@@ -2,7 +2,7 @@
 //!
 //! Everything below is a **read**. `AdminClient` construction validates the
 //! transport configuration (scheme, CA, mTLS pairing) before a socket opens;
-//! then two calls answer two different questions:
+//! then three questions are asked:
 //!
 //! * `GET /health` — is the gateway reachable over this transport, and does it
 //!   accept admin writes? Ferrum Edge serves `/health` **without
@@ -12,9 +12,12 @@
 //!   signing secret or a claim being wrong, and a 200 proves the gateway
 //!   accepts the token. It does not prove the role: `/backup` and every write
 //!   need `admin`, which the local `admin-jwt-claims` check enforces.
+//! * `GET /namespaces`, one list page and one single-resource `GET` — does the
+//!   gateway issue the strong `ETag` incremental apply needs to send every
+//!   overwrite conditionally? This checks for the tag only; it does not test
+//!   whether the gateway honors `If-Match`.
 //!
-//! No mutating endpoint is reachable from here, which is why the module exposes
-//! only these two calls.
+//! No mutating endpoint is reachable from here: every call is a `GET`.
 //!
 //! The point of running it at all is that presence is not correctness. A
 //! `FERRUM_ADMIN_JWT_SECRET` that is set but wrong passes every local check and
@@ -228,5 +231,51 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
         }
     }
 
+    let conditional = conditional_write_check(&client).await;
+    checks.push(conditional.for_environment(environment));
     checks
+}
+
+/// Does the gateway issue the strong `ETag` every incremental overwrite is
+/// made conditional on?
+async fn conditional_write_check(client: &AdminClient) -> Check {
+    const ID: &str = "gateway-conditional-writes";
+    const TITLE: &str = "Gateway issues strong entity tags";
+    match client.issues_entity_tags().await {
+        Ok(Some(true)) => Check::pass(
+            ID,
+            TITLE,
+            Scope::Gateway,
+            "a single-resource GET returned a strong ETag, so apply can send every modify \
+             and delete with If-Match",
+        ),
+        Ok(Some(false)) => Check::new(
+            ID,
+            TITLE,
+            Scope::Gateway,
+            Status::Fail,
+            "a single-resource GET returned no strong ETag",
+        )
+        .remedy(
+            "Use a gateway that issues a strong ETag for single-resource reads. Incremental \
+             apply sends every modify and delete with If-Match on the row it validated. \
+             Qualify the exact released gateway build to confirm it honors If-Match; this \
+             check tests for the tag only.",
+        ),
+        Ok(None) => Check::new(
+            ID,
+            TITLE,
+            Scope::Gateway,
+            Status::Unknown,
+            "no proxy, upstream, plugin config or consumer exists yet to read, so there is \
+             nothing to overwrite",
+        ),
+        Err(error) => Check::new(
+            ID,
+            TITLE,
+            Scope::Gateway,
+            Status::Unknown,
+            format!("the entity-tag read did not complete: {error}"),
+        ),
+    }
 }
