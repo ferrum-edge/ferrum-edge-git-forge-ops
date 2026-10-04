@@ -3212,6 +3212,27 @@ class SupplyChainPolicyTests(unittest.TestCase):
         self.assertIn('[ "$(grep -c \': test$\' <<< "$listed")" -eq 1 ]', qualify["run"])
         self.assertIn('grep -Fxq "$test_name: test" <<< "$listed"', qualify["run"])
         self.assertIn('-- --ignored --exact --nocapture', qualify["run"])
+        tls_run = qualify["run"]
+        self.assertIn("umask 077", tls_run)
+        self.assertIn("sudo mkdir --mode=0700 /etc/ferrum", tls_run)
+        self.assertNotIn("mkdir -p /etc/ferrum", tls_run)
+        self.assertIn('sudo chown "$(id -u):$(id -g)" /etc/ferrum', tls_run)
+        self.assertIn("trap cleanup_tls EXIT", tls_run)
+        self.assertIn("sudo rmdir -- /etc/ferrum", tls_run)
+        self.assertIn("openssl req -x509 -newkey rsa:2048", tls_run)
+        self.assertIn("openssl req -new -newkey rsa:2048", tls_run)
+        self.assertIn("-copy_extensions copy", tls_run)
+        self.assertIn("-purpose sslclient", tls_run)
+        self.assertEqual(tls_run.count(">/dev/null 2>&1"), 4)
+        self.assertIn("chmod 0600 /etc/ferrum/alloy-ca.key /etc/ferrum/edge-client.key", tls_run)
+        for name in ("edge-client.pem", "edge-client.key", "alloy-ca.pem",
+                     "alloy-ca.key", "edge-client.csr"):
+            self.assertIn(f"/etc/ferrum/{name}", tls_run.split("sudo mkdir", 1)[0])
+        self.assertLess(tls_run.index("sudo mkdir"), tls_run.index("trap cleanup_tls EXIT"))
+        self.assertLess(tls_run.index("trap cleanup_tls EXIT"), tls_run.index("sudo chown"))
+        self.assertLess(tls_run.index("sudo chown"), tls_run.index("openssl req"))
+        self.assertLess(tls_run.index("openssl verify"), tls_run.index("test_name="))
+        self.assertNotIn("/etc/ferrum", generate["run"])
         for step in job["steps"]:
             self.assertNotIn("if", step)
             self.assertNotIn("continue-on-error", step)

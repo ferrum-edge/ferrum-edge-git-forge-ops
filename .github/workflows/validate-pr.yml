@@ -281,6 +281,34 @@ jobs:
           GITFORGEOPS_ALLOY_VALIDATOR: ${{ runner.temp }}/gitforgeops-validator-bin/ferrum-edge
         run: |
           set -euo pipefail
+          # Edge validates the original orders fixture's TLS file contents.
+          # Claim a new directory exclusively; never overwrite existing material.
+          umask 077
+          cleanup_tls() {
+            sudo rm -f -- /etc/ferrum/edge-client.pem /etc/ferrum/edge-client.key \
+              /etc/ferrum/alloy-ca.pem /etc/ferrum/alloy-ca.key /etc/ferrum/edge-client.csr
+            sudo rmdir -- /etc/ferrum
+          }
+          sudo mkdir --mode=0700 /etc/ferrum
+          trap cleanup_tls EXIT
+          sudo chown "$(id -u):$(id -g)" /etc/ferrum
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -keyout /etc/ferrum/alloy-ca.key -out /etc/ferrum/alloy-ca.pem \
+            -subj '/CN=alloy-ci-ca' -addext 'basicConstraints=critical,CA:TRUE' \
+            -addext 'keyUsage=critical,keyCertSign,cRLSign' >/dev/null 2>&1
+          openssl req -new -newkey rsa:2048 -nodes \
+            -keyout /etc/ferrum/edge-client.key -out /etc/ferrum/edge-client.csr \
+            -subj '/CN=alloy-ci-client' -addext 'basicConstraints=critical,CA:FALSE' \
+            -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+            -addext 'extendedKeyUsage=clientAuth' >/dev/null 2>&1
+          openssl x509 -req -in /etc/ferrum/edge-client.csr \
+            -CA /etc/ferrum/alloy-ca.pem -CAkey /etc/ferrum/alloy-ca.key \
+            -set_serial 2 -days 365 -copy_extensions copy \
+            -out /etc/ferrum/edge-client.pem >/dev/null 2>&1
+          chmod 0600 /etc/ferrum/alloy-ca.key /etc/ferrum/edge-client.key \
+            /etc/ferrum/alloy-ca.pem /etc/ferrum/edge-client.pem /etc/ferrum/edge-client.csr
+          openssl verify -CAfile /etc/ferrum/alloy-ca.pem -purpose sslclient \
+            /etc/ferrum/edge-client.pem >/dev/null 2>&1
           test_name=unit::companion_schema_tests::alloy_generated_resources_load_assemble_and_validate
           listed=$(cargo test --locked --test unit_tests "$test_name" -- --ignored --exact --list --format terse)
           [ "$(grep -c ': test$' <<< "$listed")" -eq 1 ]

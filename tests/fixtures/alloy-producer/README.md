@@ -15,6 +15,13 @@ validation runner and the `gitforgeops validate` command with the installed,
 allowlisted Edge validator. It checks exact non-empty inventories and prints
 the generated files' SHA-256 hashes into the job log.
 
+The original orders TLS paths are populated only during hosted qualification
+with disposable OpenSSL-generated CA/client material. The job uses private
+permissions and an exit trap for cleanup; it never rewrites a manifest or
+generated resource to avoid TLS validation, and no private key is vendored.
+Generated-tree mutations cover required and unknown null values, with positive
+controls for supported nullable fields and the explicit top-level opt-in.
+
 The hosted test is explicitly selected with `--ignored --exact`; the CI step
 first requires it to list exactly one test. It fails when fixture or validator
 paths are missing. Ordinary unit tests verify the input provenance without

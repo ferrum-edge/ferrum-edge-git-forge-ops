@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use gitforgeops::config::schema::{BackendScheme, Resource};
-use gitforgeops::config::{assemble, load_resources};
+use gitforgeops::config::{assemble, load_resources, load_resources_with_options, LoadOptions};
 use gitforgeops::validate::run_validation;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 fn fixture_dir() -> PathBuf {
@@ -509,7 +510,14 @@ fn alloy_generated_resources_load_assemble_and_validate() {
     }
 
     let orders = root.join("orders-api");
+    let original = alloy_tree_hashes(&orders);
     alloy_generated_negative_cases(&orders, &validator);
+    alloy_generated_nullable_cases(&orders, &validator);
+    assert_eq!(
+        alloy_tree_hashes(&orders),
+        original,
+        "mutations must leave the producer output unchanged"
+    );
 }
 
 fn alloy_generated_negative_cases(project: &Path, validator: &Path) {
@@ -535,14 +543,65 @@ fn alloy_generated_negative_cases(project: &Path, validator: &Path) {
         assert!(error.to_string().contains(diagnostic), "{error}");
     }
 
+    for (field, diagnostic) in [
+        ("kind", "missing 'kind'"),
+        ("spec", "invalid resource spec"),
+        ("spec.id", "invalid resource spec"),
+        ("spec.backend_port", "invalid resource spec"),
+        ("alloy_unknown_wrapper", ".alloy_unknown_wrapper"),
+        ("spec.alloy_unknown_field", ".spec.alloy_unknown_field"),
+    ] {
+        let copy = alloy_mutated_tree(project, proxy_path, |document| {
+            if let Some(spec_field) = field.strip_prefix("spec.") {
+                document["spec"][spec_field] = Value::Null;
+            } else {
+                document[field] = Value::Null;
+            }
+        });
+        let error = load_resources(&copy.path().join("resources")).unwrap_err();
+        if diagnostic.starts_with('.') {
+            match error {
+                gitforgeops::error::Error::UnknownFields { fields, .. } => {
+                    assert_eq!(fields, diagnostic);
+                }
+                other => panic!("expected an unknown-field refusal: {other}"),
+            }
+        } else {
+            assert!(error.to_string().contains(diagnostic), "{error}");
+        }
+    }
+
+    let plugin_path = "resources/ferrum/plugins/orders-api-correlation-id.yaml";
+    for field in ["plugin_name", "scope"] {
+        let copy = alloy_mutated_tree(project, plugin_path, |document| {
+            document["spec"][field] = Value::Null;
+        });
+        let error = load_resources(&copy.path().join("resources")).unwrap_err();
+        assert!(error.to_string().contains("invalid resource spec"), "{error}");
+    }
+
     let upstream_path = "resources/ferrum/upstreams/orders-api-upstream.yaml";
+    for value in [Value::Bool(true), Value::Null] {
+        let copy = alloy_mutated_tree(project, upstream_path, |document| {
+            document["spec"]["targets"][0]["alloy_unknown_field"] = value;
+        });
+        let resource_root = copy.path().join("resources");
+        for options in [LoadOptions::STRICT, LoadOptions::ALLOW_UNKNOWN_FIELDS] {
+            let error = load_resources_with_options(&resource_root, options).unwrap_err();
+            match error {
+                gitforgeops::error::Error::UnknownFields { fields, .. } => {
+                    assert_eq!(fields, ".spec.targets[0].alloy_unknown_field");
+                }
+                other => panic!("expected a nested unknown-field refusal: {other}"),
+            }
+        }
+    }
+
     let copy = alloy_mutated_tree(project, upstream_path, |document| {
-        document["spec"]["targets"][0]["alloy_unknown_field"] = true.into();
+        document["spec"]["targets"][0]["host"] = Value::Null;
     });
     let error = load_resources(&copy.path().join("resources")).unwrap_err();
-    assert!(error
-        .to_string()
-        .contains(".spec.targets[0].alloy_unknown_field"));
+    assert!(error.to_string().contains("invalid resource spec"), "{error}");
 
     // Explicit namespace overrides remain supported. Moving only an upstream
     // breaks the same-namespace graph and must fail authoritative validation.
@@ -586,5 +645,71 @@ fn alloy_generated_negative_cases(project: &Path, validator: &Path) {
             Err(gitforgeops::error::Error::ConfigSymlink(_))
         ));
         assert_eq!(std::fs::read(&target).unwrap(), before);
+    }
+}
+
+fn alloy_generated_nullable_cases(project: &Path, validator: &Path) {
+    let proxy_path = "resources/ferrum/proxies/orders-api.yaml";
+    let copy = alloy_mutated_tree(project, proxy_path, |document| {
+        document["spec"]["name"] = Value::Null;
+        document["spec"]["backend_scheme"] = Value::Null;
+        document["spec"]["backend_path"] = Value::Null;
+        document["spec"]["circuit_breaker"] = Value::Null;
+    });
+    let resources = load_resources(&copy.path().join("resources")).unwrap();
+    let assembled = assemble(resources).unwrap();
+    let proxy = &assembled.gateway.proxies[0];
+    assert!(proxy.name.is_none());
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Https));
+    assert!(proxy.backend_path.is_none());
+    assert!(proxy.circuit_breaker.is_none());
+    let output = alloy_validate_cli(copy.path(), validator, None);
+    assert!(output.status.success(), "{output:?}");
+
+    let upstream_path = "resources/ferrum/upstreams/orders-api-upstream.yaml";
+    let copy = alloy_mutated_tree(project, upstream_path, |document| {
+        document["spec"]["targets"][0]["path"] = Value::Null;
+        document["spec"]["health_checks"]["passive"] = Value::Null;
+    });
+    let resources = load_resources(&copy.path().join("resources")).unwrap();
+    let assembled = assemble(resources).unwrap();
+    let upstream = &assembled.gateway.upstreams[0];
+    assert!(upstream.targets[0].path.is_none());
+    let health_checks = upstream.health_checks.as_ref().unwrap();
+    assert!(health_checks.passive.is_none());
+    let output = alloy_validate_cli(copy.path(), validator, None);
+    assert!(output.status.success(), "{output:?}");
+
+    // The documented opt-in still carries unknown top-level values verbatim,
+    // including null. It never permits an unknown wrapper or nested field.
+    let copy = alloy_mutated_tree(project, proxy_path, |document| {
+        document["spec"]["alloy_unknown_field"] = Value::Null;
+    });
+    let resources = load_resources_with_options(
+        &copy.path().join("resources"),
+        LoadOptions::ALLOW_UNKNOWN_FIELDS,
+    )
+    .unwrap();
+    let assembled = assemble(resources).unwrap();
+    let proxy = &assembled.gateway.proxies[0];
+    assert_eq!(proxy.extra.get("alloy_unknown_field"), Some(&Value::Null));
+    let exported = serde_json::to_value(proxy).unwrap();
+    let object = exported.as_object().unwrap();
+    assert!(object.contains_key("alloy_unknown_field"));
+    assert_eq!(exported["alloy_unknown_field"], Value::Null);
+
+    let copy = alloy_mutated_tree(project, proxy_path, |document| {
+        document["alloy_unknown_wrapper"] = Value::Null;
+    });
+    let error = load_resources_with_options(
+        &copy.path().join("resources"),
+        LoadOptions::ALLOW_UNKNOWN_FIELDS,
+    )
+    .unwrap_err();
+    match error {
+        gitforgeops::error::Error::UnknownFields { fields, .. } => {
+            assert_eq!(fields, ".alloy_unknown_wrapper");
+        }
+        other => panic!("expected a wrapper unknown-field refusal: {other}"),
     }
 }

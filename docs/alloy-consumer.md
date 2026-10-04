@@ -35,6 +35,20 @@ installer's read-only token is scoped to its existing download step; producer
 builds and generation receive no token binding. No protected checker admission
 or guarded workflow binding is changed by this consumer check.
 
+The original orders manifest references `/etc/ferrum/edge-client.pem`,
+`/etc/ferrum/edge-client.key` and `/etc/ferrum/alloy-ca.pem`. Released Edge
+v0.9.10 reads and validates these files during schema validation. The hosted
+qualification step creates a disposable CA and matching client certificate/key
+with explicit OpenSSL commands at those paths. It refuses an existing
+`/etc/ferrum` directory, gives the runner ownership of the new directory with
+mode 0700, and keeps all files, including both private keys, at mode 0600.
+OpenSSL output is suppressed; key material is never committed, cached or
+uploaded. An exit trap removes only the job-created files and directory on
+success or failure; the job's 30-minute limit and disposable hosted runner bound
+their lifetime if the process is killed. The producer inputs and generated YAML
+remain byte-for-byte unchanged. This exercises TLS material validation without
+making a connection or proving a TLS handshake.
+
 The fixtures exercise two output graphs:
 
 | Producer input | Consumer coverage |
@@ -47,12 +61,19 @@ non-empty inventories and namespace-scoped associations, preserves Alloy's
 `generated-by` label alongside GitForgeOps attribution, invokes the shared Edge
 validation runner, and invokes the actual `gitforgeops validate --format json`
 CLI. It prints SHA-256 hashes of the generated files and verifies validation
-does not rewrite them. Mutated copies exercise unknown kinds, unknown top-level
-and nested fields, unsupported `h2c` transport, an upstream moved outside its
+does not rewrite them. Mutated copies exercise unknown kinds, unknown wrapper,
+top-level and nested fields (including null values), null required wrapper and
+spec fields, unsupported `h2c` transport, an upstream moved outside its
 proxy's namespace, a typoed namespace filter, forged `api_spec_id` ownership,
 path-traversing resource IDs and symlinks escaping the resource tree. Explicit
 namespace overrides retain their existing semantics; Edge rejects the broken
 cross-namespace graph.
+
+Positive controls keep known optional proxy and nested upstream fields nullable
+and validate those copies through the real CLI. The explicit unknown-field
+opt-in still preserves top-level null values verbatim while refusing unknown
+wrapper and nested fields. These checks use the existing strict loader without
+relaxing the schema or changing runtime behavior.
 
 This check qualifies resource consumption only. Alloy's pinned exporter emits
 no Consumers, mesh fragments or credential slots. It does not qualify gateway
