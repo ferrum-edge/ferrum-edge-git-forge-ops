@@ -36,6 +36,15 @@ STDIN_CLASSIFIER = (
     '            "$TRIGGER_SHA" "$fresh_head" --branch "$DEFAULT_BRANCH"\n'
 )
 
+NESTED_ARITHMETIC_PATH_WRITE = """echo "$(
+: $(( (1 + (2)) + 3 ))
+: '
+"
+# '; echo "PATH=$PWD/inject:$PATH" >> "$GITHUB_ENV"; : '
+'
+)"
+"""
+
 
 class SupplyChainPolicyTests(unittest.TestCase):
     def _probe_document(self, workflow):
@@ -153,7 +162,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
     def test_unknown_dynamic_or_ambiguous_env_alias_sources_fail_closed(self):
         workflow = ".github/workflows/apply-on-merge.yml"
         for scope in ("workflow", "job", "step"):
-            for source in (None, 1, {"value": "literal"}, ["literal"]):
+            for source in (1, {"value": "literal"}, ["literal"]):
                 with self.subTest(scope=scope, source=source):
                     document, _ = self._env_alias_fixture(
                         workflow, source, "# ${{ env.INJECT }}\ntrue", scope
@@ -183,6 +192,30 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     "run env alias" in item
                     for item in self._guarded_bindings(workflow, document)
                 ))
+
+    def test_null_env_aliases_render_empty_and_expose_guarded_file_writes(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for scope in ("workflow", "job", "step"):
+            for script, expected, malicious in (
+                ("# ${{ env.INJECT }}\ntrue", "# \ntrue", False),
+                ('echo BASH_ENV=inject.sh >> "$GITHUB_${{ env.INJECT }}ENV"',
+                 'echo BASH_ENV=inject.sh >> "$GITHUB_ENV"', True),
+            ):
+                with self.subTest(scope=scope, malicious=malicious):
+                    document, _ = self._env_alias_fixture(workflow, None, script, scope)
+                    step = next(iter(document["jobs"].values()))["steps"][0]
+                    context = check_supply_chain._run_env_contexts(workflow, document)[id(step)]
+                    rendered, invalid = check_supply_chain._render_run_expressions(script, context)
+                    self.assertEqual(invalid, [])
+                    self.assertEqual(rendered, (expected,))
+                    self._assert_bash_file_effects(
+                        expected, "BASH_ENV=inject.sh\n" if malicious else ""
+                    )
+                    violations = self._guarded_bindings(workflow, document)
+                    if malicious:
+                        self.assertTrue(any("GITHUB_ENV/" in item for item in violations), violations)
+                    else:
+                        self.assertEqual(violations, [])
 
     def test_static_alias_substitution_cannot_hide_guarded_identifiers(self):
         for workflow in (*check_supply_chain.PROBE_WORKFLOW_STEPS, ".github/workflows/drift-check.yml"):
@@ -745,6 +778,169 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     "run env alias" in item
                     for item in check_supply_chain.github_context_access_violations(workflow, document)
                 ))
+
+    def test_nested_arithmetic_cannot_hide_real_path_writes(self):
+        # Run the exact review11 bypass and deeper/multiline variants only in
+        # hosted CI, with builtins and a private working directory/env file.
+        arithmetic = "$(( (1 + (2)) + 3 ))"
+        scripts = [NESTED_ARITHMETIC_PATH_WRITE.replace(arithmetic, value) for value in (
+            arithmetic,
+            "$(((1 + ((2))) + 3))",
+            "$((\n(1 + (2))\n+ 3\n))",
+            "$(( (1 << 2) + (3 * (4 - 1)) ))",
+        )]
+        scripts.append('echo "$(\n' + NESTED_ARITHMETIC_PATH_WRITE + ')"')
+        write = 'echo "PATH=$PWD/inject:$PATH" >> "$GITHUB_ENV"'
+        for script in scripts:
+            with self.subTest(script=script), tempfile.TemporaryDirectory() as directory:
+                destination = Path(directory) / "github-env"
+                result = subprocess.run(
+                    ["bash", "--noprofile", "--norc", "-e", "-c", script],
+                    cwd=directory,
+                    env={"PATH": "/usr/bin:/bin", "GITHUB_ENV": str(destination)},
+                    check=False, text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(
+                    destination.read_text(), "PATH=" + directory + "/inject:/usr/bin:/bin\n"
+                )
+                self.assertIn(write, "\n".join(check_supply_chain._shell_operation_lines(script)))
+                # The same projection must refuse a producer proof that would
+                # match only if the active hash line were discarded.
+                hidden_line_shape = tuple(
+                    line.strip(" \t") for line in script.splitlines()
+                    if line and not line.startswith("#")
+                )
+                self.assertFalse(check_supply_chain._has_run_shape(
+                    {"run": script}, hidden_line_shape, {}
+                ))
+                for workflow in (
+                    *check_supply_chain.PROBE_WORKFLOW_STEPS,
+                    ".github/workflows/drift-check.yml",
+                ):
+                    document = self._probe_document(workflow)
+                    next(iter(document["jobs"].values()))["steps"].insert(0, {"run": script})
+                    violations = self._guarded_bindings(workflow, document)
+                    self.assertTrue(any("GITHUB_ENV/" in item for item in violations), violations)
+
+                workflow = ".github/workflows/rotate.yml"
+                document, _ = self._env_alias_fixture(
+                    workflow, "inherited", "echo '${{ env.INJECT }}'", "job"
+                )
+                job = next(iter(document["jobs"].values()))
+                consumer = job["steps"][0]
+                job["steps"].insert(0, {"run": script})
+                context = check_supply_chain._run_env_contexts(workflow, document)[id(consumer)]
+                self.assertIsNone(context[1])
+                self.assertTrue(any(
+                    "run env alias" in item
+                    for item in check_supply_chain.github_context_access_violations(workflow, document)
+                ))
+                consumer["env"] = {"INJECT": "step-override"}
+                self.assertEqual(check_supply_chain.github_context_access_violations(workflow, document), [])
+
+    def test_balanced_arithmetic_keeps_real_comments_and_literal_quotes_benign(self):
+        comment = '# \'; echo BASH_ENV=inject.sh >> "$GITHUB_ENV"; : \' "'
+        for script in (
+            ': "$(( (1 + (2)) + 3 ))"\n' + comment + "\ntrue",
+            'echo "$(\n: $(((1 + ((2))) + 3))\n' + comment + '\n: safe\n)"',
+            'echo "$(\n: $((\n(1 + (2))\n+ 3\n))\n' + comment + '\n: safe\n)"',
+            'echo "$(\n: $(( (1 + (2)) + 3 ))\n: \'literal\n'
+            '# harmless " $(( unmatched literal text\n\'\n' + comment + '\n)"',
+        ):
+            with self.subTest(script=script):
+                self._assert_bash_file_effects(script, "")
+                projection = check_supply_chain._shell_operation_lines(script)
+                expected = tuple(
+                    line.strip(" \t") for line in script.splitlines()
+                    if line and line != comment
+                )
+                self.assertEqual(projection, expected)
+                self.assertNotIn("BASH_ENV", "\n".join(projection))
+                self.assertTrue(check_supply_chain._has_run_shape({"run": script}, expected, {}))
+                for workflow in (
+                    *check_supply_chain.PROBE_WORKFLOW_STEPS,
+                    ".github/workflows/drift-check.yml",
+                ):
+                    document = self._probe_document(workflow)
+                    next(iter(document["jobs"].values()))["steps"].insert(0, {"run": script})
+                    self.assertEqual(self._guarded_bindings(workflow, document), [])
+
+    def test_unsupported_nested_arithmetic_retains_context_escape_writes(self):
+        arithmetic = "$(( (1 + (2)) + 3 ))"
+        write = 'echo BASH_ENV=inject.sh >> "$GITHUB_ENV"'
+        for value in (
+            "$(( (1 + (2)) + $(printf 3) ))",
+            "$(( (1 + (2)) + ${VALUE:-3} ))",
+            "$(( (1 + (2)) + $((3 + 4)) ))",
+            "$(( (1 + (2)) + (3 ? 4 : 5) ))",
+            "$(( (1 + (2)) + (3, 4) ))",
+            "$(( (1 + (2)) + values[0] ))",
+            '$(( "1" + (2) ))',
+            "$(( (1 + (2)) + 3 \\\n))",
+        ):
+            script = NESTED_ARITHMETIC_PATH_WRITE.replace(arithmetic, value).replace(
+                'echo "PATH=$PWD/inject:$PATH" >> "$GITHUB_ENV"', write
+            )
+            with self.subTest(arithmetic=value):
+                self._assert_bash_file_effects(script, "BASH_ENV=inject.sh\n")
+                self.assertIsNone(check_supply_chain._shell_arithmetic_end(value, 0))
+                projection = check_supply_chain._shell_operation_lines(script)
+                self.assertIn(write, "\n".join(projection))
+                workflow = ".github/workflows/drift-check.yml"
+                document = self._probe_document(workflow)
+                document["jobs"]["drift"]["steps"].insert(0, {"run": script})
+                violations = self._guarded_bindings(workflow, document)
+                self.assertTrue(any("GITHUB_ENV/" in item for item in violations), violations)
+
+    def test_malformed_arithmetic_never_discards_remaining_hash_lines(self):
+        # Deliberately malformed boundaries are projection tests, not Bash
+        # execution evidence. No close/quote state is inferred after refusal.
+        write = 'echo BASH_ENV=inject.sh >> "$GITHUB_ENV"'
+        for arithmetic in (
+            "$(( (1 + (2)) + 3 )",
+            "$(( (1 + (2)) + 3",
+            "$(( (1 + (2)) + 3 ) )",
+            "$(( 1 + (2)",
+            "$((1) + 2 )",
+        ):
+            script = 'echo "$(\n: ' + arithmetic + "\n# '; " + write + "; : '\n'\n)\""
+            with self.subTest(arithmetic=arithmetic):
+                self.assertIsNone(check_supply_chain._shell_arithmetic_end(arithmetic, 0))
+                self.assertIn(write, "\n".join(check_supply_chain._shell_operation_lines(script)))
+                self.assertFalse(check_supply_chain._has_run_shape({"run": script}, ("true",), {}))
+
+    def test_trusted_checker_rejects_nested_arithmetic_path_bypass_before_drift(self):
+        workflow = ".github/workflows/drift-check.yml"
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / workflow
+            original = path.read_text(encoding="utf-8")
+            (root / ".github/scripts/check_supply_chain.py").write_text(
+                "raise SystemExit(0)\n", encoding="utf-8"
+            )
+            for malicious in (True, False):
+                script = (
+                    NESTED_ARITHMETIC_PATH_WRITE if malicious else
+                    ': "$(( (1 + (2)) + 3 ))"\n'
+                    '# \'; echo "PATH=$PWD/inject:$PATH" >> "$GITHUB_ENV"; : \'\ntrue'
+                )
+                text = original.replace(
+                    "      - name: Check drift\n",
+                    "      - name: Arithmetic regression fixture\n        run: " + json.dumps(script)
+                    + "\n      - name: Check drift\n", 1
+                )
+                self.assertNotEqual(text, original)
+                path.write_text(text, encoding="utf-8")
+                if malicious:
+                    violations = self._violations(root)
+                    self.assertTrue(any("GITHUB_ENV/" in item for item in violations), violations)
+                else:
+                    result = subprocess.run(
+                        [sys.executable, "-I", str(SCRIPT), "--root", str(root)],
+                        check=False, text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_real_comments_do_not_supply_quote_state_or_guarded_operations(self):
         comment = '# \'; echo BASH_ENV=inject.sh >> "$GITHUB_ENV"; gitforgeops apply; : \' "'

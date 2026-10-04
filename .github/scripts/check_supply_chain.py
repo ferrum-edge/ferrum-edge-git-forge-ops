@@ -2387,15 +2387,43 @@ def workflow_action_references(document: dict) -> list[str]:
     ]
 
 
+def _shell_arithmetic_end(script: str, position: int) -> int | None:
+    """End of a balanced, expansion-free arithmetic subset, or no proof.
+
+    Grouping parentheses belong to arithmetic, never to the surrounding
+    command substitution. Quotes, escapes, nested expansions and other
+    unsupported grammar require retaining the rest of the script instead of
+    guessing where arithmetic ends (or whether Bash treats it as arithmetic).
+    """
+    depth = 0
+    cursor = position + 3  # The caller has recognized '$(('.
+    while cursor < len(script):
+        character = script[cursor]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            if depth:
+                depth -= 1
+            elif script.startswith("))", cursor):
+                return cursor + 2
+            else:
+                return None
+        elif not re.fullmatch(r"[A-Za-z0-9_ \t\n+*/%<>=!&|^~-]", character):
+            return None
+        cursor += 1
+    return None
+
+
 def _shell_operation_lines(script: str) -> tuple[str, ...]:
     """Remove only proven Bash comments, keeping lexical state across lines.
 
     A physical # line can start inside a quoted word and close it before an
     active command. Quotes in an actual comment cannot change lexical state.
     Command substitutions have their own quote context. For unsupported
-    here-documents, backticks and complex parameter expansions, retain the
-    remaining text conservatively; it cannot satisfy a pinned producer shape
-    by hiding active lines. This is a scan projection, not a Bash interpreter.
+    here-documents, backticks, complex parameter expansions and unsupported
+    arithmetic, retain the remaining text conservatively; it cannot satisfy a
+    pinned producer shape by hiding active lines. This is a scan projection,
+    not a Bash interpreter.
     """
     frames = [{"quote": "", "depth": 0, "word_start": True}]
     out: list[str] = []
@@ -2448,14 +2476,13 @@ def _shell_operation_lines(script: str) -> tuple[str, ...]:
             position = end + 1
             continue
         elif script.startswith("$((", position):
-            end = script.find("))", position + 3)
-            body = script[position + 3:end] if end >= 0 else ""
-            if end < 0 or not re.fullmatch(r"[A-Za-z0-9_ \t+*/%<>=!&|^~()-]+", body):
+            end = _shell_arithmetic_end(script, position)
+            if end is None:
                 out.append(script[position:])
                 break
-            out.append(script[position:end + 2])
+            out.append(script[position:end])
             frame["word_start"] = False
-            position = end + 2
+            position = end
             continue
         elif script.startswith("$(", position):
             out.append("$(")
