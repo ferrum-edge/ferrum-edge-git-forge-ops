@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 from pathlib import Path
@@ -222,6 +223,155 @@ CREDENTIAL_HANDOFF_RUN = (
     'rm -f "$applied_file"',
     'echo "applied_file=$applied_file" >> "$GITHUB_OUTPUT"',
 )
+
+# Exact producer/consumer shapes for the shipped dynamic run interpolations.
+# Never read these shapes from the candidate checkout: it is the data being judged.
+APPLY_ENVIRONMENT_LIST_RUN = (
+    'set -euo pipefail',
+    'if [[ ! -f .gitforgeops/config.yaml ]]; then',
+    'echo "::notice::No .gitforgeops/config.yaml on the protected branch; skipping apply. See docs/github-launch-controls.md to configure deployment environments."',
+    'echo "envs=[]" >> "$GITHUB_OUTPUT"',
+    'echo "promotions=[]" >> "$GITHUB_OUTPUT"',
+    'exit 0',
+    'fi',
+    'scopes=$(gitforgeops envs --format json --include-scopes | jq -c .)',
+    "jq -e '",
+    'type == "array" and',
+    'all(.[];',
+    '(.environment | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))',
+    'and ((.promotion_requires // "x") | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")))',
+    '\' <<< "$scopes" >/dev/null || {',
+    'echo "::error::Every environment must be a single safe path component."',
+    'exit 1',
+    '}',
+    'envs=$(jq -c \'[.[] | select(.promotion_requires == null) | .environment]\' <<< "$scopes")',
+    "promotions=$(jq -c '[.[] | select(.promotion_requires != null)",
+    '| {environment, requires: .promotion_requires}]\' <<< "$scopes")',
+    'echo "envs=$envs" >> "$GITHUB_OUTPUT"',
+    'echo "promotions=$promotions" >> "$GITHUB_OUTPUT"',
+)
+REVIEW_METADATA_RUN = (
+    'set -euo pipefail',
+    '[[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid head SHA" >&2; exit 1; }',
+    'run_path=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq \'.path\')',
+    '[ "$run_path" = "$EXPECTED_WORKFLOW_PATH" ] || {',
+    'echo "Triggering run is \'${run_path}\', not ${EXPECTED_WORKFLOW_PATH}." >&2',
+    'exit 1',
+    '}',
+    'trusted_sha=$(git -C trusted rev-parse HEAD)',
+    'if [ "$EVENT_HEAD_REPO" != "$REPO" ]; then',
+    '{',
+    'echo "head_sha=$EVENT_HEAD_SHA"',
+    'echo "trusted_sha=$trusted_sha"',
+    'echo "privileged=false"',
+    '} >> "$GITHUB_OUTPUT"',
+    'echo "Fork PR: static validation is complete; privileged live review is disabled."',
+    'exit 0',
+    'fi',
+    "matches='[]'",
+    'match_count=0',
+    'for attempt in 1 2 3 4 5; do',
+    'if associated=$(gh api "repos/${REPO}/commits/${EVENT_HEAD_SHA}/pulls?per_page=100" --paginate --slurp); then',
+    'matches=$(jq -c --arg sha "$EVENT_HEAD_SHA" --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" \'',
+    '[.[][]',
+    '| select(.state == "open")',
+    '| select(.head.sha == $sha)',
+    '| select(.head.repo.full_name == $head_repo)',
+    '| select(.base.ref == $base)]',
+    '\' <<< "$associated")',
+    'match_count=$(jq \'length\' <<< "$matches")',
+    '[ "$match_count" -eq 1 ] && break',
+    'fi',
+    'echo "PR association is not yet available and unambiguous; retrying ($attempt/5)." >&2',
+    'if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi',
+    'done',
+    '[ "$match_count" -eq 1 ] || { echo "Expected one open PR for workflow head; found $match_count." >&2; exit 1; }',
+    'event_pr=$(jq -r \'.[0].number\' <<< "$matches")',
+    '[[ "$event_pr" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid resolved PR number" >&2; exit 1; }',
+    'current=$(gh api "repos/${REPO}/pulls/${event_pr}")',
+    'current_sha=$(jq -r \'.head.sha\' <<< "$current")',
+    'current_repo=$(jq -r \'.head.repo.full_name\' <<< "$current")',
+    'current_base=$(jq -r \'.base.ref\' <<< "$current")',
+    'current_base_sha=$(jq -r \'.base.sha\' <<< "$current")',
+    'declared_changed=$(jq -r \'.changed_files\' <<< "$current")',
+    '[ "$current_sha" = "$EVENT_HEAD_SHA" ] || { echo "PR head changed after static validation; wait for the new run." >&2; exit 1; }',
+    '[ "$current_repo" = "$EVENT_HEAD_REPO" ] || { echo "PR source repository changed." >&2; exit 1; }',
+    '[ "$current_base" = "$DEFAULT_BRANCH" ] || { echo "PR no longer targets the protected default branch." >&2; exit 1; }',
+    'pages_file=$(mktemp)',
+    'trap \'rm -f "$pages_file"\' EXIT',
+    'gh api "repos/${REPO}/pulls/${event_pr}/files?per_page=100" \\',
+    '--paginate --slurp > "$pages_file"',
+    '[[ "$declared_changed" =~ ^[0-9]+$ ]] || { echo "Invalid changed-file count" >&2; exit 1; }',
+    'current_after=$(gh api "repos/${REPO}/pulls/${event_pr}")',
+    '[ "$(jq -r \'.head.sha\' <<< "$current_after")" = "$current_sha" ] && \\',
+    '[ "$(jq -r \'.base.sha\' <<< "$current_after")" = "$current_base_sha" ] && \\',
+    '[ "$(jq -r \'.base.ref\' <<< "$current_after")" = "$current_base" ] && \\',
+    '[ "$(jq -r \'.changed_files\' <<< "$current_after")" = "$declared_changed" ] || {',
+    'echo "PR file metadata changed during trusted classification; wait for the new run." >&2',
+    'exit 1',
+    '}',
+    'classification=$(python3 trusted/.github/scripts/changed_files.py \\',
+    '"$pages_file" "$declared_changed" declarative)',
+    '[ "$(jq -r \'.complete\' <<< "$classification")" = true ] || {',
+    'echo "Changed-file pagination was incomplete; trusted review fails closed." >&2',
+    'exit 1',
+    '}',
+    'relevant=$(jq -r \'.matches\' <<< "$classification")',
+    'umask 077',
+    'jq -c \'.matched_paths\' <<< "$classification" > "$RUNNER_TEMP/trusted-changed-paths.json"',
+    'same_repo=false',
+    '[ "$EVENT_HEAD_REPO" = "$REPO" ] && same_repo=true',
+    'privileged=false',
+    '[ "$same_repo" = true ] && [ "$relevant" = true ] && privileged=true',
+    'artifact_name="trusted-pr-input-${RUN_ID}-${RUN_ATTEMPT}"',
+    'binary_artifact_name="trusted-gitforgeops-${RUN_ID}-${RUN_ATTEMPT}"',
+    '{',
+    'echo "pr_number=$event_pr"',
+    'echo "head_sha=$EVENT_HEAD_SHA"',
+    'echo "trusted_sha=$trusted_sha"',
+    'echo "privileged=$privileged"',
+    'echo "artifact_name=$artifact_name"',
+    'echo "binary_artifact_name=$binary_artifact_name"',
+    '} >> "$GITHUB_OUTPUT"',
+)
+APPLY_STATE_COMMIT_RUN = (
+    'set -euo pipefail',
+    'auth=$(printf \'x-access-token:%s\' "$STATE_WRITER_TOKEN" | base64 | tr -d \'\\n\')',
+    'git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"',
+    "trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT",
+    'git config user.name "gitforgeops[bot]"',
+    'git config user.email "gitforgeops[bot]@users.noreply.github.com"',
+    'mkdir -p .state assembled',
+    'for path in \\',
+    '".state/${{ matrix.environment }}.json" \\',
+    '"assembled/${{ matrix.environment }}.yaml" \\',
+    '"assembled/${{ matrix.environment }}-mesh.yaml"; do',
+    '[ -f "$path" ] || continue',
+    'git add "$path"',
+    'done',
+    'if git diff --cached --quiet; then',
+    'echo "No state changes to commit."',
+    'exit 0',
+    'fi',
+    'git commit -m "chore(gitforgeops): state update for ${{ matrix.environment }}"',
+    'for attempt in 1 2 3 4 5; do',
+    'if git push origin "HEAD:$DEFAULT_BRANCH"; then',
+    'echo "Pushed state on attempt $attempt."',
+    'exit 0',
+    'fi',
+    'echo "Push rejected on attempt $attempt; fetching + rebasing..."',
+    'git fetch origin "$DEFAULT_BRANCH"',
+    'git rebase "origin/$DEFAULT_BRANCH" || {',
+    'git rebase --abort',
+    'echo "Rebase failed" >&2',
+    'exit 1',
+    '}',
+    'sleep $((attempt * 2))',
+    'done',
+    'echo "ERROR: failed to push state for ${{ matrix.environment }} after 5 attempts" >&2',
+    'exit 1',
+)
+
 # The revision a recorded credential allocation is bound to, which lets the
 # retry of a failed apply keep the slots it already wrote. It must be the
 # triggering merge: the applied head moves when the failed attempt pushes its
@@ -2241,83 +2391,404 @@ def _literal_env_scope(node: dict):
     return scopes[0] if len(scopes) == 1 else ({} if not scopes else None)
 
 
-def _expand_static_run_env(script: str, context: tuple) -> tuple[str, list[str]]:
-    """Substitute only proven literals, before any shell comment filtering.
+_SHELL_SAFE_LITERAL = re.compile(r"[A-Za-z0-9_./:@%+,= -]*")
+_NAMED_RUN_VALUE = re.compile(
+    r"(?:github|matrix|needs|steps|runner|env|vars|inputs|secrets)"
+    r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)+", re.IGNORECASE
+)
+_RUN_RENDER_LIMIT = 128
 
-    Shell metacharacters, controls and expressions in an alias source are
-    unsupported. Missing/dynamic sources and ambiguous case variants fail
-    closed. A step-local literal overrides inherited runtime env-file values;
-    workflow/job literals do not prove a value after an env-file write.
+
+def _shell_scan_text(script: str) -> str:
+    """Join actual continuations; keep every other physical token boundary."""
+    return script.replace("\\\r\n", "").replace("\\\n", "").translate(
+        str.maketrans("", "", "'\"\\")
+    )
+
+
+def _static_env_value(body: str, context: tuple) -> tuple[str, ...] | None:
+    scopes, runtime_names = context[:2]
+    alias = re.fullmatch(r"env\s*\.\s*([A-Za-z_][A-Za-z0-9_-]*)", body, re.IGNORECASE)
+    if not alias:
+        return None
+    name = alias.group(1).casefold()
+    for index in range(len(scopes) - 1, -1, -1):
+        scope = scopes[index]
+        if not isinstance(scope, dict):
+            return None
+        values = [value for key, value in scope.items() if key.casefold() == name]
+        if not values:
+            continue
+        if index < 2 and (runtime_names is None or name in runtime_names):
+            return None
+        if len(values) == 1 and isinstance(values[0], str) and _SHELL_SAFE_LITERAL.fullmatch(values[0]):
+            return (values[0],)
+        return None
+    return None
+
+
+def _named_run_values(body: str, context: tuple) -> tuple[str, ...] | None:
+    if not _NAMED_RUN_VALUE.fullmatch(body):
+        return None
+    name = re.sub(r"\s+", "", body).casefold()
+    if name.startswith("env."):
+        return _static_env_value(body, context)
+    values = context[2] if len(context) > 2 else {}
+    if name in values:
+        return values[name]
+    parts = name.split(".")
+    # GitHub exposes only completed, preceding steps. A not-yet-run or
+    # nonexistent step has no outputs (property dereference renders empty).
+    # A preceding unknown producer is explicitly marked, and fails closed.
+    if len(parts) == 4 and parts[0] == "steps" and parts[2] == "outputs":
+        producer = "steps." + parts[1]
+        if producer not in values or values[producer] == ():
+            return ("",)
+    return None
+
+
+def _render_run_expressions(script: str, context: tuple) -> tuple[tuple[str, ...], list[str]]:
+    """Prove all substitutions before Bash gets to interpret its comments.
+
+    Literal matrices are overapproximated across every axis/include value,
+    so every possible rendered string is scanned, including combinations of
+    different aliases. Unbounded or computed sources never become shell text.
     """
-    scopes, runtime_names = context
+    rendered: list[tuple[str, dict[str, str]]] = [("", {})]
     invalid: list[str] = []
-
-    def substitute(match) -> str:
+    offset = 0
+    resolved: dict[str, tuple[str, ...] | None] = {}
+    for match in WORKFLOW_EXPRESSION.finditer(script):
         body = match.group(1).strip()
-        if not re.match(r"env\b", body, re.IGNORECASE):
-            return match.group(0)
-        alias = re.fullmatch(r"env\s*\.\s*([A-Za-z_][A-Za-z0-9_-]*)", body, re.IGNORECASE)
-        if alias:
-            name = alias.group(1).casefold()
-            for index in range(len(scopes) - 1, -1, -1):
-                scope = scopes[index]
-                if not isinstance(scope, dict):
-                    break
-                values = [value for key, value in scope.items() if key.casefold() == name]
-                if not values:
-                    continue
-                if index < 2 and (runtime_names is None or name in runtime_names):
-                    break
-                if (
-                    len(values) == 1
-                    and isinstance(values[0], str)
-                    and re.fullmatch(r"[A-Za-z0-9_./:@%+,= -]*", values[0])
-                ):
-                    return values[0]
-                break
-        invalid.append(body)
-        return match.group(0)
+        name = re.sub(r"\s+", "", body).casefold()
+        if name not in resolved:
+            resolved[name] = _named_run_values(body, context)
+        values = resolved[name]
+        repeated = name in rendered[0][1]
+        if values is None or (not repeated and len(rendered) * len(values) > _RUN_RENDER_LIMIT):
+            invalid.append(body)
+            values = (match.group(0),)
+        prefix = script[offset:match.start()]
+        rendered = [
+            (part + prefix + value, {**bindings, name: value})
+            for part, bindings in rendered
+            for value in ((bindings[name],) if repeated else values)
+        ]
+        offset = match.end()
+    return tuple(part + script[offset:] for part, _ in rendered), invalid
 
-    return WORKFLOW_EXPRESSION.sub(substitute, script), invalid
+
+def _expand_static_run_env(script: str, context: tuple) -> tuple[str, list[str]]:
+    """Single-valued projection used by the static-env proof's callers."""
+    rendered, invalid = _render_run_expressions(script, context)
+    return rendered[0], invalid
+
+
+def _platform_run_values() -> dict[str, tuple[str, ...]]:
+    # Decimal IDs and full hex object IDs cannot supply shell separators or
+    # letters completing any guarded identifier/command. These witnesses are
+    # for those alphabets, not a claimed literal value for the triggering run.
+    # Actor/ref/workflow/event strings, vars, inputs and secrets are unbounded
+    # text; named dot notation alone is no proof of their contents.
+    values = {
+        "github." + name: ("0",)
+        for name in ("run_id", "run_number", "run_attempt", "repository_id", "repository_owner_id")
+    }
+    values["github.sha"] = ("0" * 40,)
+    values["runner.os"] = ("Linux", "Windows", "macOS")
+    values["runner.arch"] = ("X86", "X64", "ARM", "ARM64")
+    values["runner.debug"] = ("", "1")
+    return values
+
+
+def _one_case_value(mapping, name: str):
+    if not isinstance(mapping, dict):
+        return None
+    found = [value for key, value in mapping.items() if key.casefold() == name.casefold()]
+    return found[0] if len(found) == 1 else None
+
+
+def _source_step(job: dict, step_id: str):
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return None
+    found = [
+        step for step in steps
+        if isinstance(step, dict) and isinstance(step.get("id"), str)
+        and step["id"].casefold() == step_id.casefold()
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def _has_run_shape(step, shape: tuple[str, ...], environment: dict) -> bool:
+    return (
+        isinstance(step, dict) and isinstance(step.get("run"), str)
+        and _shell_operation_lines(step["run"]) == shape
+        and _literal_env_scope(step) == environment
+        and not any(key in step for key in ("uses", "shell", "working-directory"))
+    )
+
+
+def _standard_run_defaults(document: dict, job: dict) -> bool:
+    return not any(key.casefold() == "defaults" for node in (document, job) for key in node)
+
+
+def _step_output_values(workflow: str, job_name: str, step: dict, context: tuple) -> dict:
+    """Only complete producer shapes can prove an output's rendered contents."""
+    metadata_env = {
+        "GH_TOKEN": "${{ github.token }}",
+        "REPO": "${{ github.repository }}",
+        "EVENT_HEAD_REPO": "${{ github.event.workflow_run.head_repository.full_name }}",
+        "EVENT_HEAD_SHA": "${{ github.event.workflow_run.head_sha }}",
+        "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+        "RUN_ID": "${{ github.event.workflow_run.id }}",
+        "RUN_ATTEMPT": "${{ github.event.workflow_run.run_attempt }}",
+        "EXPECTED_WORKFLOW_PATH": ".github/workflows/validate-pr.yml",
+    }
+    if (
+        workflow == ".github/workflows/trusted-pr-review.yml" and job_name == "prepare"
+        and step.get("id") == "metadata"
+        and _has_run_shape(step, REVIEW_METADATA_RUN, metadata_env)
+    ):
+        # EVENT_HEAD_SHA has a whole-string hex guard before either output
+        # path. trusted_sha is a git object ID, never PR/event-supplied text.
+        return {"head_sha": ("", "0" * 40), "trusted_sha": ("", "0" * 40)}
+    script = step.get("run")
+    if not isinstance(script, str) or any(
+        key in step for key in ("uses", "shell", "working-directory")
+    ):
+        return {}
+    scripts, invalid = _render_run_expressions(script, context)
+    if invalid:
+        return {}
+    outputs: dict[str, tuple[str, ...]] = {}
+    for rendered in scripts:
+        current: dict[str, str] = {}
+        for line in _shell_operation_lines(rendered):
+            if line == "set -euo pipefail":
+                continue
+            match = re.fullmatch(
+                r'''echo (["'])([A-Za-z_][A-Za-z0-9_-]*)=([A-Za-z0-9_./:@%+,= -]*)\1 >> "\$GITHUB_OUTPUT"''',
+                line,
+            )
+            if not match:
+                return {}
+            current[match.group(2).casefold()] = match.group(3)
+        for name, value in current.items():
+            outputs[name] = tuple(dict.fromkeys((*outputs.get(name, ("",)), value)))
+    return outputs
+
+
+def _matrix_run_values(job: dict, sources: dict) -> dict:
+    """Literal axes/includes and simple aliases to already-proven job sources."""
+    matrix = _one_case_value(_one_case_value(job, "strategy"), "matrix")
+    if not isinstance(matrix, dict):
+        return {}
+    values: dict[str, tuple[str, ...] | None] = {}
+    has_include = False
+
+    def collect(node, path: str) -> dict:
+        if isinstance(node, dict):
+            result = {path: None}  # A composite value is not a simple scalar alias.
+            names = [name.casefold() for name in node]
+            for name, value in node.items():
+                child = path + "." + name.casefold()
+                if names.count(name.casefold()) != 1:
+                    result[child] = None
+                else:
+                    result.update(collect(value, child))
+            return result
+        elif isinstance(node, list):
+            alternatives = [collect(item, path) for item in node]
+            result = {}
+            for name in set().union(*(set(item) for item in alternatives)):
+                choices = [item.get(name, ("",)) for item in alternatives]
+                result[name] = (
+                    None if any(item is None for item in choices) else
+                    tuple(dict.fromkeys(value for item in choices for value in item))
+                )
+            return result or {path: None}
+        else:
+            choices = (node,) if isinstance(node, str) and _SHELL_SAFE_LITERAL.fullmatch(node) else None
+            if isinstance(node, str) and (alias := WORKFLOW_EXPRESSION.fullmatch(node.strip())):
+                choices = _named_run_values(alias.group(1).strip(), ((), None, sources))
+            return {path: choices}
+
+    if len({name.casefold() for name in matrix}) != len(matrix):
+        return {}
+    for name, node in matrix.items():
+        if name.casefold() == "exclude":
+            continue  # Exclusion only removes combinations from the proof set.
+        if name.casefold() == "include":
+            if not isinstance(node, list) or not all(isinstance(item, dict) for item in node):
+                return {}  # A computed include can override any axis.
+            has_include = bool(node)
+            for item in node:
+                for path, choices in collect(item, "matrix").items():
+                    previous = values.get(path, ())
+                    values[path] = (
+                        tuple(dict.fromkeys((*previous, *choices)))
+                        if previous is not None and choices is not None else None
+                    )
+        else:
+            for path, choices in collect(node, "matrix." + name.casefold()).items():
+                previous = values.get(path, ())
+                values[path] = (
+                    tuple(dict.fromkeys((*previous, *choices)))
+                    if previous is not None and choices is not None else None
+                )
+    if has_include:
+        # An added include-only combination may omit any other property.
+        values = {
+            name: tuple(dict.fromkeys(("", *choices))) if choices is not None else None
+            for name, choices in values.items()
+        }
+    return values
+
+
+def _credential_handoff_allowed(workflow: str, step: dict, context: tuple) -> bool:
+    scopes, runtime_names = context[:2]
+    drivers = {"runner_temp", "github_run_id", "github_job"}
+    return (
+        workflow == ".github/workflows/apply-on-merge.yml"
+        and step.get("name") == BUNDLE_LOADER_STEP and step.get("id") == "load-bundles"
+        and runtime_names is not None
+        and len(context) > 4 and context[4]
+        and _has_run_shape(step, CREDENTIAL_HANDOFF_RUN, {
+            BUNDLE_SECRET_PREFIX + ("_" + str(index) if index else ""):
+                "${{ secrets." + BUNDLE_SECRET_PREFIX + ("_" + str(index) if index else "") + " }}"
+            for index in range(16)
+        })
+        and all(
+            isinstance(scope, dict) and not drivers.intersection(key.casefold() for key in scope)
+            for scope in scopes
+        )
+    )
 
 
 def _run_env_contexts(workflow: str, document: dict) -> dict[int, tuple]:
-    """Workflow < job < step precedence, with inherited env-file uncertainty.
+    """Proven sources and workflow < job < step env-file precedence.
 
-    This models declared bindings and visible file-channel references, not
-    arbitrary behavior inside invoked programs or source-bound actions.
+    This fences visible workflow declarations, not arbitrary behavior inside
+    invoked programs/actions. A complete, pinned producer is a source proof;
+    a candidate-chosen step ID or dot-property spelling is never one.
     """
     contexts: dict[int, tuple] = {}
     jobs = document.get("jobs")
     if not isinstance(jobs, dict):
         return contexts
-    for job in jobs.values():
+    completed: dict[str, dict] = {}
+    visiting: set[str] = set()
+
+    def job_outputs(job_name: str) -> dict:
+        if job_name in completed:
+            return completed[job_name]
+        if job_name in visiting:
+            return {}
+        visiting.add(job_name)
+        job = _one_case_value(jobs, job_name)
         if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
-            continue
+            visiting.remove(job_name)
+            return {}
+        standard_run = _standard_run_defaults(document, job)
+        sources = _platform_run_values()
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        for dependency in needs if isinstance(needs, list) else []:
+            if not isinstance(dependency, str):
+                continue
+            for name, choices in job_outputs(dependency.casefold()).items():
+                sources[f"needs.{dependency.casefold()}.outputs.{name}"] = choices
+            sources[f"needs.{dependency.casefold()}.result"] = (
+                "success", "failure", "cancelled", "skipped",
+            )
+        sources.update(_matrix_run_values(job, sources))
+        # Environment names are unbounded ASCII components. Admit them only
+        # in the complete shipped consumer, where each interpolation is a
+        # quoted path suffix or message and cannot form a command/channel.
+        # The enumerator's CLI validates every name before emitting its JSON.
+        list_job = _one_case_value(jobs, "list-envs")
+        list_step = _source_step(list_job, "list") if isinstance(list_job, dict) else None
+        matrix = _one_case_value(_one_case_value(job, "strategy"), "matrix")
+        axis = "environment" if job_name == "apply" else "scope"
+        list_output = "envs" if job_name == "apply" else "promotions"
+        pinned_matrix = (
+            workflow == ".github/workflows/apply-on-merge.yml"
+            and job_name in ("apply", "promote")
+            and _has_run_shape(list_step, APPLY_ENVIRONMENT_LIST_RUN, {})
+            and _standard_run_defaults(document, list_job)
+            and _one_case_value(list_job.get("outputs"), list_output)
+                == "${{ steps.list.outputs." + list_output + " }}"
+            and matrix == {axis: "${{ fromJson(needs.list-envs.outputs." + list_output + ") }}"}
+            and "list-envs" in needs
+        )
         runtime_names: frozenset[str] | None = frozenset()
         for step in job["steps"]:
             if not isinstance(step, dict):
                 continue
             scopes = tuple(_literal_env_scope(node) for node in (document, job, step))
-            context = (scopes, runtime_names)
-            contexts[id(step)] = context
+            step_sources = dict(sources)
             script = step.get("run")
+            if (
+                pinned_matrix and standard_run and isinstance(script, str)
+                and _has_run_shape(step, tuple(
+                    line.replace("${{ matrix.environment }}", PROBE_RUNTIME_ENVIRONMENTS[job_name])
+                    for line in APPLY_STATE_COMMIT_RUN
+                ), {
+                    "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+                    "STATE_WRITER_TOKEN": "${{ steps.state-writer.outputs.token }}",
+                })
+            ):
+                name = "matrix.environment" if job_name == "apply" else "matrix.scope.environment"
+                step_sources[name] = ("environment",)
+            context = (scopes, runtime_names, step_sources, False, standard_run)
+            context = (*context[:3], _credential_handoff_allowed(workflow, step, context), standard_run)
+            contexts[id(step)] = context
+            step_id = step.get("id")
+            if isinstance(step_id, str):
+                prefix = "steps." + step_id.casefold()
+                sources[prefix] = None  # Unknown producer, including an action.
+                sources[prefix + ".outcome"] = ("success", "failure", "cancelled", "skipped")
+                sources[prefix + ".conclusion"] = sources[prefix + ".outcome"]
+                if standard_run and _source_step(job, step_id) is step:
+                    outputs = _step_output_values(workflow, job_name, step, context)
+                    for name, choices in outputs.items():
+                        sources[prefix + ".outputs." + name] = choices
             if not isinstance(script, str):
                 continue
-            expanded, _ = _expand_static_run_env(script, context)
-            lines = _shell_operation_lines(expanded)
-            compact = "\n".join(lines).translate(str.maketrans("", "", "'\"\\\n"))
-            if not re.search(r"\bGITHUB_ENV\b|\bgithub\s*\.\s*env\b", compact, re.IGNORECASE):
+            scripts, invalid = _render_run_expressions(script, context)
+            if invalid:
+                runtime_names = None  # Unknown rendered text could write any inherited binding.
                 continue
-            if (
-                workflow == ".github/workflows/apply-on-merge.yml"
-                and step.get("name") == BUNDLE_LOADER_STEP
-                and _shell_operation_lines(script) == CREDENTIAL_HANDOFF_RUN
-                and runtime_names is not None
+            channel = re.compile(r"\bGITHUB_ENV\b|\bgithub\s*\.\s*env\b", re.IGNORECASE)
+            if not any(
+                channel.search(content) or channel.search(_shell_scan_text(content))
+                for rendered in scripts
+                for content in ("\n".join(_shell_operation_lines(rendered)),)
             ):
+                continue
+            if context[3]:
                 runtime_names = runtime_names | {"ferrum_creds_json_file"}
             else:
                 runtime_names = None
+        outputs = {}
+        declared = job.get("outputs")
+        if isinstance(declared, dict):
+            for name, value in declared.items():
+                if _one_case_value(declared, name) != value or not isinstance(value, str):
+                    continue
+                alias = WORKFLOW_EXPRESSION.fullmatch(value.strip())
+                outputs[name.casefold()] = (
+                    _named_run_values(alias.group(1).strip(), ((), None, sources))
+                    if alias else ((value,) if _SHELL_SAFE_LITERAL.fullmatch(value) else None)
+                )
+        visiting.remove(job_name)
+        completed[job_name] = outputs
+        return outputs
+
+    for job_name in jobs:
+        job_outputs(job_name.casefold())
     return contexts
 
 
@@ -2329,10 +2800,6 @@ def github_context_access_violations(workflow: str, document: dict) -> list[str]
         r"\bgithub(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)*\s*\[", re.IGNORECASE
     )
     file_context = re.compile(r"\bgithub\s*\.\s*(?:env|path|output)\b", re.IGNORECASE)
-    named_run_value = re.compile(
-        r"(?:github|matrix|needs|steps|runner|env|vars|inputs|secrets)"
-        r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)+", re.IGNORECASE
-    )
     run_contexts = _run_env_contexts(workflow, document)
 
     def visit(node, path: str, key: str = "", context: tuple = ((), None)) -> None:
@@ -2352,11 +2819,12 @@ def github_context_access_violations(workflow: str, document: dict) -> list[str]
                     f"{workflow}: {path}: unrecognized GitHub expression syntax is forbidden"
                 )
             if key.casefold() == "run":
-                _, invalid_aliases = _expand_static_run_env(node, context)
+                _, invalid_aliases = _render_run_expressions(node, context)
                 for alias in invalid_aliases:
+                    source = "run env alias" if re.match(r"env\b", alias, re.IGNORECASE) else "run value"
                     violations.append(
-                        f"{workflow}: {path}: run env alias {alias!r} must resolve to a "
-                        "static shell-safe literal in workflow/job/step env; "
+                        f"{workflow}: {path}: {source} {alias!r} must resolve to a "
+                        "proven shell-safe source before interpolation; "
                         "computed or unknown shell text is forbidden"
                     )
             # `if:` is also an expression without explicit delimiters.
@@ -2372,7 +2840,7 @@ def github_context_access_violations(workflow: str, document: dict) -> list[str]
                         f"{workflow}: {path}: computed/indexed, whole or file-channel "
                         "GitHub context access is forbidden; use named dot properties"
                     )
-                if key.casefold() == "run" and not named_run_value.fullmatch(body.strip()):
+                if key.casefold() == "run" and not _NAMED_RUN_VALUE.fullmatch(body.strip()):
                     violations.append(
                         f"{workflow}: {path}: run expressions must use named dot properties; "
                         "computed shell text is forbidden"
@@ -2439,13 +2907,14 @@ def guarded_environment_violations(
         # Expand proven literals before removing comments. Keep the original
         # references too, and judge pinned script shapes against original lines.
         if key.casefold() == "run":
-            expanded, _ = _expand_static_run_env(value, context)
+            rendered, _ = _render_run_expressions(value, context)
             lines = list(_shell_operation_lines(value))
-            content = "\n".join(_shell_operation_lines(expanded))
+            contents = ("\n".join(lines), *(
+                "\n".join(_shell_operation_lines(script)) for script in rendered
+            ))
         else:
             lines = [line.strip() for line in value.splitlines()]
-            content = "\n".join(lines)
-        contents = ("\n".join(lines), content)
+            contents = ("\n".join(lines),)
         verify_read_allowed = (
             workflow == ".github/workflows/apply-on-merge.yml"
             and step_name == "Verify traffic"
@@ -2458,7 +2927,7 @@ def guarded_environment_violations(
         )
         if any(
             protected_reference.search(part)
-            or protected_reference.search(part.translate(str.maketrans("", "", "'\"\\\n")))
+            or protected_reference.search(_shell_scan_text(part))
             for part in protected_contents
         ):
             violations.append(
@@ -2469,10 +2938,11 @@ def guarded_environment_violations(
             and step_name == BUNDLE_LOADER_STEP
             and key == "run"
             and tuple(lines) == CREDENTIAL_HANDOFF_RUN
+            and len(context) > 3 and context[3]
         )
         if any(
             env_file_reference.search(part)
-            or env_file_reference.search(part.translate(str.maketrans("", "", "'\"\\\n")))
+            or env_file_reference.search(_shell_scan_text(part))
             for part in contents
         ) and not handoff_allowed:
             violations.append(
@@ -2525,6 +2995,84 @@ def _workflow_condition(value) -> str | None:
         lambda match: match.group(0) if match.group(0).startswith("'") else "",
         body,
     )
+
+
+def _read_only_gitforgeops_arguments(arguments: list[str]) -> bool:
+    """Classify the subcommand and its flags, never later diagnostic words."""
+    global_flags = {"--no-color", "--allow-empty-namespace", "--allow-credential-slot-remap"}
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token in global_flags or re.fullmatch(r"-v+", token):
+            index += 1
+        elif token == "--env" and index + 1 < len(arguments):
+            index += 2
+        elif token.startswith("--env="):
+            index += 1
+        else:
+            break
+    if index == len(arguments):
+        return True  # No subcommand: Clap prints usage without dispatching a write.
+    command = arguments[index]
+    if command in ("--version", "-V", "--help", "-h"):
+        return index + 1 == len(arguments)
+    formats = {
+        "envs": ("json", "text"), "version": ("json", "text"),
+        "validate": ("text", "json", "github", "github-annotations"),
+        "plan": ("text", "json"), "diff": ("text", "json"),
+        "doctor": ("text", "json"), "verify": ("text", "json"),
+    }
+    if command not in formats:
+        return False
+    flags = {
+        "envs": {"--include-scopes"},
+        "diff": {"--exit-on-drift", "--accept-unverified-secrets"},
+    }.get(command, set())
+    index += 1
+    while index < len(arguments):
+        token = arguments[index]
+        if token in flags or token in global_flags or re.fullmatch(r"-v+", token):
+            index += 1
+            continue
+        name, separator, value = token.partition("=")
+        if not separator:
+            if index + 1 >= len(arguments):
+                return False
+            value = arguments[index + 1]
+        if name == "--format":
+            accepted = value in formats[command]
+        elif name == "--env":
+            accepted = bool(value)
+        elif name == "--fingerprint-baseline" and command == "diff":
+            accepted = bool(value)
+        elif command == "doctor" and name in ("--scope", "--repo", "--state-writer-app-id"):
+            accepted = (
+                value in ("local", "github", "gateway", "all") if name == "--scope" else bool(value)
+            )
+        else:
+            return False
+        if not accepted:
+            return False
+        index += 1 if separator else 2
+    return True
+
+
+def _has_unguarded_gitforgeops_write(script: str) -> bool:
+    active = "\n".join(_shell_operation_lines(script))
+    command = re.compile(r"\bgitforgeops\b[\"']*(?:[ \t]+|(?=\$|`|\\))")
+    for content in (active, _shell_scan_text(active)):
+        for match in command.finditer(content):
+            # Keep shell command boundaries, particularly physical newlines.
+            # Scan every invocation, so a read-only call cannot hide a second
+            # apply/rotate, including inside a command substitution or pipe.
+            tail = re.split(r"[\n;|&<>()]", content[match.end():], maxsplit=1)[0]
+            try:
+                arguments = shlex.split(tail, comments=True)
+            except ValueError:
+                return True  # Unsupported/ambiguous argument spelling.
+            if not _read_only_gitforgeops_arguments(arguments):
+                return True
+    return False
 
 
 def probe_validation_gate_violations(workflow: str, document: dict) -> list[str]:
@@ -2633,19 +3181,19 @@ def probe_validation_gate_violations(workflow: str, document: dict) -> list[str]
             script = step.get("run")
             if not isinstance(script, str):
                 continue
-            expanded, _ = _expand_static_run_env(script, run_contexts.get(id(step), ((), None)))
-            for rendered in (script, expanded):
-                active = "\n".join(
-                    line for line in rendered.splitlines() if not line.lstrip().startswith("#")
+            rendered, invalid = _render_run_expressions(
+                script, run_contexts.get(id(step), ((), None))
+            )
+            if invalid:
+                violations.append(
+                    f"{workflow}: job {job_name!r}: computed or unknown shell text is forbidden"
                 )
-                compact = active.translate(str.maketrans("", "", "'\"\\\n"))
-                if re.search(r"\bgitforgeops\b[^\n]*\b(?:apply|rotate)\b", active) or re.search(
-                    r"\bgitforgeops\b[^\n]*\b(?:apply|rotate)\b", compact
-                ):
-                    violations.append(
-                        f"{workflow}: job {job_name!r}: mutations may only run in the guarded Apply steps"
-                    )
-                    break
+            # Judge rendered scripts: unresolved expressions have already
+            # failed closed, and proven expressions cannot change comments.
+            if any(_has_unguarded_gitforgeops_write(content) for content in rendered):
+                violations.append(
+                    f"{workflow}: job {job_name!r}: mutations may only run in the guarded Apply steps"
+                )
     return violations
 
 

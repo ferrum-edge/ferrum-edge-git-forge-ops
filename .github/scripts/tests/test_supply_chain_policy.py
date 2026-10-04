@@ -226,6 +226,12 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     for item in self._guarded_bindings(workflow, document)
                 ))
                 environment["INJECT"] = "echo" if script.startswith("${{") else "version"
+                if not script.startswith("${{"):
+                    # Keep the positive an actual supported read-only call;
+                    # version has no apply-only --auto-approve flag.
+                    next(iter(document["jobs"].values()))["steps"][0]["run"] = script.replace(
+                        "--auto-approve", "--format json"
+                    )
                 self.assertEqual(self._guarded_bindings(workflow, document), [])
         workflow = ".github/workflows/trusted-pr-review.yml"
         document = self._probe_document(workflow)
@@ -263,6 +269,429 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "run env alias" in item
             for item in check_supply_chain.github_context_access_violations(workflow, document)
         ))
+
+    def _assert_rendered_comment_writes_env(self, script, expression, payload):
+        # This runs only in the hosted test suite. Decode/render first, exactly
+        # the ordering that lets GitHub turn a Bash comment into a command.
+        rendered = script.replace("${{ " + expression + " }}", payload)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "github-env"
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-e", "-c", rendered],
+                env={"GITHUB_ENV": str(destination)},
+                check=False, text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(destination.read_text(), "BASH_ENV=inject.sh\n")
+
+    def test_encoded_matrix_and_step_outputs_cannot_render_env_writes_from_comments(self):
+        workflows = (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        )
+        payload = '\necho BASH_ENV=inject.sh >> "$GITHUB_ENV"'
+        for workflow in workflows:
+            for source in ("matrix", "step-output"):
+                for prefix in ("# ", "true # ", ""):
+                    with self.subTest(workflow=workflow, source=source, prefix=prefix):
+                        document = self._probe_document(workflow)
+                        job = next(iter(document["jobs"].values()))
+                        expression = "matrix.INJECT" if source == "matrix" else "steps.payload.outputs.code"
+                        consumer = {"run": prefix + "${{ " + expression + " }}\ntrue"}
+                        encoded = json.dumps([payload] if source == "matrix" else payload)
+                        encoded = encoded.replace("BASH_ENV", r"BASH_\u0045NV").replace(
+                            "GITHUB_ENV", r"GITHUB_\u0045NV"
+                        )
+                        decoded = json.loads(encoded)
+                        self.assertEqual(decoded[0] if source == "matrix" else decoded, payload)
+                        if source == "matrix":
+                            matrix = job.setdefault("strategy", {}).setdefault("matrix", {})
+                            matrix["INJECT"] = "${{ fromJSON('" + encoded + "') }}"
+                            job["steps"].insert(0, consumer)
+                        else:
+                            producer = {
+                                "id": "payload",
+                                "env": {"INJECT": "${{ fromJSON('" + encoded + "') }}"},
+                                "run": 'echo "code<<EOF" >> "$GITHUB_OUTPUT"\n'
+                                       'printf "%s\\n" "$INJECT" >> "$GITHUB_OUTPUT"\n'
+                                       'echo EOF >> "$GITHUB_OUTPUT"',
+                            }
+                            job["steps"][0:0] = [producer, consumer]
+                            # Exercise the multiline output channel too, so
+                            # the consumer payload comes from its real bytes.
+                            with tempfile.TemporaryDirectory() as directory:
+                                output = Path(directory) / "github-output"
+                                result = subprocess.run(
+                                    ["bash", "--noprofile", "--norc", "-e", "-c", producer["run"]],
+                                    env={"GITHUB_OUTPUT": str(output), "INJECT": decoded},
+                                    check=False, text=True, capture_output=True,
+                                )
+                                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                                contents = output.read_text()
+                                self.assertTrue(contents.startswith("code<<EOF\n"), contents)
+                                self.assertTrue(contents.endswith("\nEOF\n"), contents)
+                                decoded = contents[len("code<<EOF\n"):-len("\nEOF\n")]
+                                self.assertEqual(decoded, payload)
+                        self._assert_rendered_comment_writes_env(
+                            consumer["run"], expression, payload
+                        )
+                        violations = self._guarded_bindings(workflow, document)
+                        self.assertTrue(any("run value" in item for item in violations), violations)
+                        if source == "matrix":
+                            matrix["INJECT"] = ["static-mode-v1", "static-mode-v2"]
+                        else:
+                            producer["run"] = 'echo "code=static-mode-v1" >> "$GITHUB_OUTPUT"'
+                        self.assertEqual(self._guarded_bindings(workflow, document), [])
+
+    def test_generated_named_sources_cannot_hide_mutations_or_guarded_references(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for payload in (
+            "\ngitforgeops apply --auto-approve",
+            "\ngitforgeops rotate --consumer probe --credential jwt.secret",
+            "\nexport FERRUM_VERIFY_PROBE_CONSUMERS=other",
+        ):
+            for source in ("matrix", "step-output"):
+                with self.subTest(payload=payload, source=source):
+                    document = self._probe_document(workflow)
+                    job = document["jobs"]["list-envs"]
+                    encoded = json.dumps([payload] if source == "matrix" else payload).replace(
+                        "FERRUM_VERIFY_PROBE_CONSUMERS", r"FERRUM_VERIFY_PROBE_\u0043ONSUMERS"
+                    )
+                    decoded = json.loads(encoded)
+                    self.assertEqual(decoded[0] if source == "matrix" else decoded, payload)
+                    expression = "matrix.INJECT" if source == "matrix" else "steps.payload.outputs.code"
+                    consumer = {"run": "# ${{ " + expression + " }}\ntrue"}
+                    if source == "matrix":
+                        job["strategy"] = {"matrix": {"INJECT": "${{ fromJSON('" + encoded + "') }}"}}
+                        job["steps"].insert(0, consumer)
+                    else:
+                        job["steps"][0:0] = [{
+                            "id": "payload", "env": {"INJECT": "${{ fromJSON('" + encoded + "') }}"},
+                            "run": 'echo "code<<EOF" >> "$GITHUB_OUTPUT"\n'
+                                   'printf "%s\\n" "$INJECT" >> "$GITHUB_OUTPUT"\n'
+                                   'echo EOF >> "$GITHUB_OUTPUT"',
+                        }, consumer]
+                    rendered = consumer["run"].replace("${{ " + expression + " }}", payload)
+                    self.assertIn(payload.lstrip("\n"), check_supply_chain._shell_operation_lines(rendered))
+                    self.assertTrue(any(
+                        "computed or unknown shell text" in item
+                        for item in check_supply_chain.probe_validation_gate_violations(workflow, document)
+                    ))
+
+    def test_protected_checker_judges_encoded_named_sources_outside_candidate_tree(self):
+        payload = '\necho BASH_ENV=inject.sh >> "$GITHUB_ENV"'
+        encoded = json.dumps(payload).replace("BASH_ENV", r"BASH_\u0045NV").replace(
+            "GITHUB_ENV", r"GITHUB_\u0045NV"
+        )
+        for workflow in (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        ):
+            for source in ("matrix", "step-output"):
+                with self.subTest(workflow=workflow, source=source), tempfile.TemporaryDirectory() as directory:
+                    root = self._mirror_repo(Path(directory))
+                    path = root / workflow
+                    original = path.read_text(encoding="utf-8")
+                    (root / ".github/scripts/check_supply_chain.py").write_text(
+                        "raise SystemExit(0)\n", encoding="utf-8"
+                    )
+
+                    def fixture(safe):
+                        if source == "matrix":
+                            expression = "matrix.INJECT"
+                            value = (
+                                "            - static-mode-v1\n" if safe else
+                                "          INJECT: " + json.dumps(
+                                    "${{ fromJSON('[" + encoded + "]') }}"
+                                ) + "\n"
+                            )
+                            matrix = (
+                                "    strategy:\n      matrix:\n"
+                                + ("          INJECT:\n" if safe else "") + value
+                            )
+                            producer = ""
+                        else:
+                            matrix = ""
+                            expression = "steps.payload.outputs.code"
+                            script = (
+                                'echo "code=static-mode-v1" >> "$GITHUB_OUTPUT"' if safe else
+                                'echo "code<<EOF" >> "$GITHUB_OUTPUT"\n'
+                                'printf "%s\\n" "$INJECT" >> "$GITHUB_OUTPUT"\n'
+                                'echo EOF >> "$GITHUB_OUTPUT"'
+                            )
+                            producer = (
+                                "      - name: Generate text\n        id: payload\n        env:\n"
+                                "          INJECT: " + json.dumps("${{ fromJSON('" + encoded + "') }}")
+                                + "\n        run: " + json.dumps(script) + "\n"
+                            )
+                        consumer = (
+                            "      - name: Render named source\n        run: "
+                            + json.dumps("# ${{ " + expression + " }}\ntrue") + "\n"
+                        )
+                        return original.replace(
+                            "    steps:\n", matrix + "    steps:\n" + producer + consumer, 1
+                        )
+
+                    path.write_text(fixture(False), encoding="utf-8")
+                    violations = self._violations(root)
+                    self.assertTrue(any("run value" in item for item in violations), violations)
+                    path.write_text(fixture(True), encoding="utf-8")
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPT), "--root", str(root)],
+                        check=False, text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_fully_proven_named_contexts_preserve_real_operational_workflows(self):
+        for workflow in (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        ):
+            with self.subTest(workflow=workflow):
+                document = self._probe_document(workflow)
+                job = next(iter(document["jobs"].values()))
+                job["needs"] = ["safe"]
+                document["jobs"]["safe"] = {
+                    "runs-on": "ubuntu-24.04",
+                    "outputs": {"code": "trusted-data"}, "steps": [{"run": "true"}],
+                }
+                job["strategy"] = {"matrix": {
+                    "INJECT": ["static-v1", "static-v2"],
+                    "nested": [{"label": "static-nested"}],
+                    "alias": ["${{ needs.safe.outputs.code }}"],
+                }}
+                producer = {"id": "literal", "run": 'echo "code=static-output" >> "$GITHUB_OUTPUT"'}
+                expressions = (
+                    "MATRIX . INJECT", "matrix.nested.label", "matrix.alias",
+                    "steps.literal.outputs.code", "steps.literal.outcome", "steps.literal.conclusion",
+                    "needs.safe.outputs.code", "needs.safe.result", "github.run_id", "github.sha",
+                    "runner.os", "runner.arch", "runner.debug",
+                )
+                job["steps"][0:0] = [producer, {"run": "\n".join(
+                    "# ${{ " + expression + " }}\necho '${{ " + expression + " }}'"
+                    for expression in expressions[:3]
+                )}]
+                # Keep the bounded cross-product in each independently
+                # executable step rather than exceeding the render limit.
+                job["steps"][2:2] = [
+                    {"run": "# ${{ " + expression + " }}\necho '${{ " + expression + " }}'"}
+                    for expression in expressions[3:]
+                ]
+                self.assertEqual(self._guarded_bindings(workflow, document), [])
+
+    def test_unbounded_named_contexts_and_unknown_producers_fail_closed(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for expression in (
+            "github.event.head_commit.message", "github.ref", "github.workflow", "github.actor",
+            "runner.name", "runner.temp", "vars.INJECT", "inputs.INJECT", "secrets.INJECT",
+            "steps.payload.outputs.code", "needs.dynamic.outputs.code",
+        ):
+            with self.subTest(expression=expression):
+                document = self._probe_document(workflow)
+                document["jobs"]["dynamic"] = {
+                    "runs-on": "ubuntu-24.04",
+                    "outputs": {"code": "${{ vars.INJECT }}"}, "steps": [{"run": "true"}],
+                }
+                job = document["jobs"]["list-envs"]
+                job["needs"] = ["dynamic"]
+                job["steps"][0:0] = [
+                    {"id": "payload", "uses": "actions/checkout@" + "a" * 40},
+                    {"run": "# ${{ " + expression + " }}\ntrue"},
+                ]
+                violations = self._guarded_bindings(workflow, document)
+                self.assertTrue(any("run value" in item for item in violations), violations)
+
+    def test_all_static_matrix_values_and_includes_are_scanned_after_rendering(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for matrix in (
+            {"INJECT": ["OS", "ENV"]},
+            {"INJECT": ["OS"], "include": [{"INJECT": "ENV"}]},
+            {"INJECT": ["OS"], "include": "${{ fromJSON(vars.INCLUDE) }}"},
+            {"INJECT": ["OS"], "inject": ["ENV"]},
+        ):
+            with self.subTest(matrix=matrix):
+                document = self._probe_document(workflow)
+                job = document["jobs"]["list-envs"]
+                job["strategy"] = {"matrix": matrix}
+                job["steps"].insert(0, {"run": 'echo injected >> "$GITHUB_${{ matrix.INJECT }}"'})
+                self.assertTrue(self._guarded_bindings(workflow, document))
+        for expression, producer in (
+            ("matrix.INJECT", None),
+            ("steps.payload.outputs.code", {"id": "payload", "run": 'echo "code=apply" >> "$GITHUB_OUTPUT"'}),
+        ):
+            document = self._probe_document(workflow)
+            job = document["jobs"]["list-envs"]
+            job["strategy"] = {"matrix": {"INJECT": ["version", "apply"]}}
+            job["steps"][0:0] = ([producer] if producer else []) + [{
+                "run": "gitforgeops ${{ " + expression + " }}",
+            }]
+            self.assertTrue(any(
+                "mutations may only run" in item for item in self._guarded_bindings(workflow, document)
+            ))
+            if producer:
+                producer["run"] = 'echo "code=version" >> "$GITHUB_OUTPUT"'
+            else:
+                job["strategy"]["matrix"]["INJECT"] = ["version"]
+            self.assertEqual(self._guarded_bindings(workflow, document), [])
+        document = self._probe_document(workflow)
+        job = document["jobs"]["list-envs"]
+        job["strategy"] = {"matrix": {"nested": [{"suffix": "OS"}, {"other": "safe"}]}}
+        job["steps"].insert(0, {
+            "run": 'echo injected >> "$GITHUB_${{ matrix.nested.suffix }}ENV"',
+        })
+        # The missing nested property renders empty, assembling GITHUB_ENV.
+        self.assertTrue(any("GITHUB_ENV/" in item for item in self._guarded_bindings(workflow, document)))
+        document = self._probe_document(workflow)
+        job = document["jobs"]["list-envs"]
+        job["steps"][0:0] = [{
+            "id": "payload",
+            "run": 'echo "code=VERIFY_PROBE_CONSUMERS" >> "$GITHUB_OUTPUT"',
+        }, {"run": "export FERRUM_${{ steps.payload.outputs.code }}=other"}]
+        self.assertTrue(any(
+            "protected variable references/rebinding" in item
+            for item in self._guarded_bindings(workflow, document)
+        ))
+
+    def test_repeated_proven_aliases_keep_one_value_and_large_products_fail_closed(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        document = self._probe_document(workflow)
+        job = document["jobs"]["list-envs"]
+        job["strategy"] = {"matrix": {"INJECT": ["static-v1", "static-v2"]}}
+        consumer = {"run": "\n".join("echo '${{ matrix.INJECT }}'" for _ in range(20))}
+        job["steps"].insert(0, consumer)
+        context = check_supply_chain._run_env_contexts(workflow, document)[id(consumer)]
+        rendered, invalid = check_supply_chain._render_run_expressions(consumer["run"], context)
+        self.assertEqual(invalid, [])
+        self.assertEqual(len(rendered), 2)
+        self.assertEqual(self._guarded_bindings(workflow, document), [])
+        job["strategy"]["matrix"]["INJECT"] = [
+            "static-" + str(index) for index in range(check_supply_chain._RUN_RENDER_LIMIT + 1)
+        ]
+        self.assertTrue(any("run value" in item for item in self._guarded_bindings(workflow, document)))
+
+    def test_dynamic_shipped_interpolations_require_complete_source_and_consumer_shapes(self):
+        workflow = ".github/workflows/trusted-pr-review.yml"
+        for mutation in ("append-output", "remove-sha-guard", "env", "duplicate-id", "shell", "defaults"):
+            with self.subTest(workflow=workflow, mutation=mutation):
+                document = self._probe_document(workflow)
+                metadata = self._step(document, "prepare", "Validate workflow-run metadata")
+                if mutation == "append-output":
+                    metadata["run"] += '\necho "head_sha=$PAYLOAD" >> "$GITHUB_OUTPUT"'
+                elif mutation == "remove-sha-guard":
+                    metadata["run"] = metadata["run"].replace(
+                        check_supply_chain.REVIEW_METADATA_RUN[1], "true"
+                    )
+                elif mutation == "env":
+                    metadata["env"]["EXPECTED_WORKFLOW_PATH"] = "candidate.yml"
+                elif mutation == "duplicate-id":
+                    document["jobs"]["prepare"]["steps"].append({"id": "METADATA", "run": "true"})
+                elif mutation == "shell":
+                    metadata["shell"] = "bash {0}"
+                else:
+                    document["jobs"]["prepare"]["defaults"] = {"run": {"shell": "bash {0}"}}
+                self.assertTrue(any(
+                    "run value" in item for item in self._guarded_bindings(workflow, document)
+                ))
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for mutation in ("producer", "matrix", "consumer", "producer-defaults"):
+            with self.subTest(workflow=workflow, mutation=mutation):
+                document = self._probe_document(workflow)
+                if mutation == "producer":
+                    enumerator = self._step(document, "list-envs", "Enumerate environments")
+                    enumerator["run"] += '\necho "envs=$PAYLOAD" >> "$GITHUB_OUTPUT"'
+                elif mutation == "matrix":
+                    document["jobs"]["apply"]["strategy"]["matrix"]["include"] = [
+                        {"environment": "${{ vars.INJECT }}"},
+                    ]
+                elif mutation == "consumer":
+                    commit = next(step for step in document["jobs"]["apply"]["steps"]
+                                  if "git commit -m" in step.get("run", ""))
+                    commit["run"] += '\necho "${{ matrix.environment }}"'
+                else:
+                    document["jobs"]["list-envs"]["defaults"] = {"run": {"shell": "bash {0}"}}
+                self.assertTrue(any(
+                    "run value" in item for item in self._guarded_bindings(workflow, document)
+                ))
+
+    def test_runtime_env_tracking_preserves_physical_boundaries_and_step_overrides(self):
+        workflow = ".github/workflows/rotate.yml"
+        for script in (
+            'echo "INJECT=runtime" >> "$GITHUB_ENV"\napplied_file=next',
+            'echo "INJECT=runtime" >> "$GITHUB_ENV"\necho next',
+            'echo "INJECT=runtime" >> "$GITHUB_""ENV"\necho next',
+            'echo "INJECT=runtime" >> "$GITHUB_E\\\nNV"\necho next',
+        ):
+            with self.subTest(script=script):
+                document, _ = self._env_alias_fixture(
+                    workflow, "inherited", "echo '${{ env.INJECT }}'", "job"
+                )
+                job = next(iter(document["jobs"].values()))
+                alias = job["steps"][0]
+                job["steps"].insert(0, {"run": script})
+                self.assertTrue(any(
+                    "run env alias" in item
+                    for item in check_supply_chain.github_context_access_violations(workflow, document)
+                ))
+                alias["env"] = {"INJECT": "step-override"}
+                self.assertEqual(check_supply_chain.github_context_access_violations(workflow, document), [])
+
+    def test_credential_handoff_proof_requires_exact_execution_shape_and_safe_drivers(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for mutation in ("shell", "id", "driver", "unknown-write"):
+            with self.subTest(mutation=mutation):
+                document = self._probe_document(workflow)
+                job = document["jobs"]["apply"]
+                loader = self._step(document, "apply", check_supply_chain.BUNDLE_LOADER_STEP)
+                if mutation == "shell":
+                    loader["shell"] = "bash {0}"
+                elif mutation == "id":
+                    loader["id"] = "untrusted-loader"
+                elif mutation == "driver":
+                    job["env"] = {"RUNNER_TEMP": "\nBASH_ENV=inject.sh"}
+                else:
+                    job["steps"].insert(0, {"run": 'echo "OTHER=x" >> "$GITHUB_ENV"'})
+                violations = self._guarded_bindings(workflow, document)
+                self.assertTrue(any("outside the credential hand-off" in item for item in violations), violations)
+
+    def test_read_only_cli_classification_keeps_list_envs_and_refuses_other_writes(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        document = self._probe_document(workflow)
+        self.assertEqual(check_supply_chain.probe_validation_gate_violations(workflow, document), [])
+        for script in (
+            'scopes=$(gitforgeops envs --format json --include-scopes | jq -c .)\necho apply rotate',
+            'gitforgeops envs --format=json --include-scopes | jq -c . # apply rotate',
+            'gitforgeops --env apply envs --format json\necho rotate',
+            'gitforgeops envs --env rotate --format text\necho apply',
+            'gitforgeops version\necho apply rotate',
+        ):
+            with self.subTest(read_only=script):
+                document = self._probe_document(workflow)
+                document["jobs"]["list-envs"]["steps"].insert(0, {"run": script})
+                self.assertEqual(check_supply_chain.probe_validation_gate_violations(workflow, document), [])
+        for script in (
+            'gitforgeops envs --format json\ngitforgeops apply --auto-approve',
+            'gitforgeops envs --format json; gitforgeops rotate --consumer x --credential jwt.secret',
+            'gitforgeops envs --format json | gitforgeops apply --auto-approve',
+            'echo "$(gitforgeops apply --auto-approve)"',
+            'gitforgeops --env staging ap""ply --auto-approve',
+            'gitforgeops envs --materialize', 'gitforgeops envs apply',
+            'gitforgeops export --materialize', 'gitforgeops import --from-api --output-dir out',
+            'gitforgeops diff --write-fingerprint-baseline baseline.json',
+            'gitforgeops${IFS}apply --auto-approve',
+        ):
+            with self.subTest(write=script):
+                document = self._probe_document(workflow)
+                document["jobs"]["list-envs"]["steps"].insert(0, {"run": script})
+                self.assertTrue(any(
+                    "mutations may only run" in item
+                    for item in check_supply_chain.probe_validation_gate_violations(workflow, document)
+                ))
 
     def test_computed_github_file_access_fails_closed_in_every_guarded_workflow(self):
         workflows = (
