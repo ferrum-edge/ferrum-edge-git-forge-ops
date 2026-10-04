@@ -1,6 +1,6 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate parallel gpt-6-sol codex CLI subagents (medium/high/xhigh effort) for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate parallel gpt-6.1-sol codex CLI subagents (medium/high/xhigh effort) for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Fast mode is optional and requires an explicit user request. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
 ---
 
 # sol-agents: codex CLI subagent orchestration
@@ -37,9 +37,13 @@ origin/main`). For an existing PR, fetch its head into a dedicated worktree; for
 reuse that verified PR worktree. Never launch a write-enabled worker in the orchestrator checkout
 or another worker's worktree.
 
-Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet. Never
-infer it from urgency, deadlines, task size, or available credits. Omit it otherwise; the launcher
-pins `service_tier="default"` without the flag and the model's Fast `priority` tier with it.
+Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet,
+for example "Sol high with fast mode". Use `--no-fast` for "fast mode off", "without fast mode",
+or "standard mode". Omit both flags for standard mode when no speed is specified. Carry an
+explicit choice through continuations of the same task until the user changes it; never pass both
+flags. The shared launcher pins `gpt-6.1-sol`, `service_tier="default"` and
+`features.fast_mode=false` normally, or `service_tier="fast"` and `features.fast_mode=true` with
+`--fast`. Keep the selected reasoning effort unchanged and report an unavailable tier.
 
 Non-negotiables:
 - Go through the launcher, not a bare `codex exec`. It resolves the binary, verifies the worktree
@@ -49,8 +53,8 @@ Non-negotiables:
   `/usr/local/bin/codex` / `~/.local/bin/codex`, then `PATH`. Any candidate under
   `com.conductor.app` is refused — Conductor's bundle lags the standalone release.
 - The launcher clears inherited `CODEX_HOME` and OpenAI endpoint/auth overrides, then runs
-  `codex exec --model gpt-6-sol --ignore-user-config --ignore-rules --config
-  model_reasoning_effort="<effort>" --config service_tier="<default|priority>" --sandbox
+  `codex exec --model gpt-6.1-sol --ignore-user-config --ignore-rules --config
+  model_reasoning_effort="<effort>" --config service_tier="<default|fast>" --sandbox
   danger-full-access --cd <worktree> -`. Worktree isolation prevents git collisions; it is not a
   host sandbox.
 - Run each dispatch as a **background task** (`run_in_background`); prefer one task
