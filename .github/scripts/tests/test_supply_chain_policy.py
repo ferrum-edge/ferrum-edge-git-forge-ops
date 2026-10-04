@@ -44,6 +44,280 @@ class SupplyChainPolicyTests(unittest.TestCase):
     def _step(self, document, job, name):
         return next(step for step in document["jobs"][job]["steps"] if step.get("name") == name)
 
+    def _guarded_bindings(self, workflow, document):
+        if workflow == ".github/workflows/drift-check.yml":
+            return check_supply_chain.monitoring_jwt_binding_violations(workflow, document)
+        if workflow not in check_supply_chain.PROBE_WORKFLOW_STEPS:
+            return check_supply_chain.github_context_access_violations(workflow, document)
+        return check_supply_chain.probe_consumer_binding_violations(workflow, document)
+
+    def test_computed_github_file_access_fails_closed_in_every_guarded_workflow(self):
+        workflows = (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        )
+        expressions = (
+            "github[format('{0}{1}', 'e', 'nv')]",
+            "github[format('{0}{1}', 'pa', 'th')]",
+            "github[format('{0}{1}', 'out', 'put')]",
+            "GITHUB [ format('{0}{1}', 'E', 'NV') ]",
+            "github[join(fromJSON('[\"e\",\"nv\"]'), '')]",
+            "github[vars.CHANNEL]",
+            "github[env.CHANNEL]",
+            "github.event[vars.CHANNEL]",
+            "format('{1}', '}}', github[format('{0}{1}', 'e', 'nv')])",
+            "fromJSON(format('{1}', '}}', toJSON(github))).env",
+            "toJSON(github)",
+            "github.*",
+            "github.env", "github.path", "github.output",
+            "github['env']", "github['path']", "github['output']",
+        )
+        for workflow in workflows:
+            for expression in expressions:
+                for source in ("run", "env", "with", "sequence", "if"):
+                    with self.subTest(workflow=workflow, expression=expression, source=source):
+                        document = self._probe_document(workflow)
+                        step = {"name": "Inject startup", "run": "true"}
+                        destination = "${{ " + expression + " }}"
+                        if source == "run":
+                            # No protected variable name is in this payload.
+                            # The file channel itself must be refused before
+                            # Bash can source a later BASH_ENV override.
+                            step["run"] = 'echo "BASH_ENV=inject.sh" >> "' + destination + '"'
+                        elif source == "sequence":
+                            step["with"] = {"destinations": [destination]}
+                        elif source == "if":
+                            step["if"] = expression + " != ''"
+                        else:
+                            step[source] = {"destination": destination}
+                        job = next(iter(document["jobs"].values()))
+                        job["steps"].insert(0, step)
+                        violations = self._guarded_bindings(workflow, document)
+                        self.assertTrue(
+                            any("GitHub context access is forbidden" in item for item in violations),
+                            violations,
+                        )
+
+    def test_literal_file_channels_and_decoded_computed_forms_are_refused(self):
+        workflows = (*check_supply_chain.PROBE_WORKFLOW_STEPS, ".github/workflows/drift-check.yml")
+        for workflow in workflows:
+            for destination in (
+                "$GITHUB_ENV", "${GITHUB_ENV}", '$GITHUB_""ENV', "$GITHUB_PATH",
+                "${{ github.env }}", "${{ GITHUB . ENV }}", "${{ github['env'] }}",
+                "${{ github.path }}", "${{ github['path'] }}",
+                "${{ github.output }}", "${{ github['output'] }}",
+            ):
+                with self.subTest(workflow=workflow, destination=destination):
+                    document = self._probe_document(workflow)
+                    next(iter(document["jobs"].values()))["steps"].insert(0, {
+                        "name": "Inject startup",
+                        "run": 'echo "BASH_ENV=inject.sh" >> "' + destination + '"',
+                    })
+                    self.assertTrue(self._guarded_bindings(workflow, document))
+            for run in (
+                "|\n          echo BASH_ENV=inject.sh >> "
+                "${{ github[format('{0}{1}', 'e', 'nv')] }}",
+                r'''"echo BASH_ENV=inject.sh >> ${{ \x67ithub[format('{0}{1}', 'e', 'nv')] }}"''',
+            ):
+                with self.subTest(workflow=workflow, run=run):
+                    text = (ROOT / workflow).read_text(encoding="utf-8")
+                    text = text.replace(
+                        "    steps:\n",
+                        "    steps:\n      - name: Inject startup\n        run: " + run + "\n",
+                        1,
+                    )
+                    violations = self._guarded_bindings(
+                        workflow, check_supply_chain.parse_workflow(text)
+                    )
+                    self.assertTrue(
+                        any("GitHub context access is forbidden" in item for item in violations),
+                        violations,
+                    )
+            for channel in ("GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT"):
+                with self.subTest(workflow=workflow, rebound_channel=channel):
+                    document = self._probe_document(workflow)
+                    document["env"] = {channel: "candidate/inject"}
+                    self.assertTrue(self._guarded_bindings(workflow, document))
+
+    def test_bound_validate_cannot_be_skipped_or_lose_its_exit_status(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for job in ("apply", "promote"):
+            for key, value in (
+                ("if", "false"), ("if", "${{ false }}"),
+                ("if", "${{ vars.RUN_VALIDATE }}"),
+                ("continue-on-error", "true"), ("continue-on-error", "${{ true }}"),
+                ("run", "true"), ("run", "gitforgeops validate || true"),
+                ("run", "gitforgeops validate\ntrue"),
+                ("shell", "true {0}"), ("working-directory", "empty-resources"),
+                ("uses", "acme/skip@" + "a" * 40),
+            ):
+                with self.subTest(job=job, key=key, value=value):
+                    document = self._probe_document(workflow)
+                    self._step(document, job, "Validate")[key] = value
+                    self.assertEqual(
+                        self._step(document, job, "Apply")["run"],
+                        "gitforgeops apply --auto-approve",
+                    )
+                    violations = self._guarded_bindings(workflow, document)
+                    self.assertTrue(
+                        any("Validate must run gitforgeops validate" in item for item in violations),
+                        violations,
+                    )
+
+    def test_validate_apply_flow_cannot_be_bypassed_by_step_or_job_gates(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for job in ("apply", "promote"):
+            for mutation in (
+                "reorder", "removed", "job-if", "job-needs", "job-nonblocking",
+                "workflow-defaults", "job-defaults", "extra-step", "other-job",
+            ):
+                with self.subTest(job=job, mutation=mutation):
+                    document = self._probe_document(workflow)
+                    job_document = document["jobs"][job]
+                    steps = job_document["steps"]
+                    validate = self._step(document, job, "Validate")
+                    if mutation == "reorder":
+                        steps.remove(validate)
+                        steps.append(validate)
+                    elif mutation == "removed":
+                        steps.remove(validate)
+                    elif mutation == "job-if":
+                        job_document["if"] = "${{ always() }}"
+                    elif mutation == "job-needs":
+                        job_document.pop("needs")
+                    elif mutation == "job-nonblocking":
+                        job_document["continue-on-error"] = "true"
+                    elif mutation == "workflow-defaults":
+                        document["defaults"] = {"run": {"shell": "true {0}"}}
+                    elif mutation == "job-defaults":
+                        job_document["defaults"] = {"run": {"working-directory": "empty"}}
+                    elif mutation == "extra-step":
+                        steps.insert(0, {
+                            "name": "Early mutation", "run": "gitforgeops apply --auto-approve",
+                        })
+                    else:
+                        document["jobs"]["unguarded"] = {"steps": [{
+                            "run": 'gitforgeops --env staging ap""ply --auto-approve',
+                        }]}
+                    self.assertTrue(self._guarded_bindings(workflow, document))
+            for name in ("Apply", "Apply (file mode)"):
+                for gate in (None, "${{ always() }}", "${{ !cancelled() }}", "failure()"):
+                    with self.subTest(job=job, name=name, gate=gate):
+                        document = self._probe_document(workflow)
+                        step = self._step(document, job, name)
+                        if gate is None:
+                            step.pop("if")
+                        else:
+                            step["if"] = gate
+                        violations = self._guarded_bindings(workflow, document)
+                        self.assertTrue(
+                            any("must run after successful Validate" in item for item in violations),
+                            violations,
+                        )
+
+    def test_equivalent_yaml_gates_are_checked_by_the_protected_checker(self):
+        for field in ('if: "${{ false }}"', 'continue-on-error: "true"'):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows/apply-on-merge.yml"
+                text = path.read_text(encoding="utf-8").replace(
+                    "      - name: Validate\n",
+                    "      - name: Validate\n        " + field + "\n",
+                    1,
+                )
+                path.write_text(text, encoding="utf-8")
+                (root / ".github/scripts/check_supply_chain.py").write_text(
+                    "raise SystemExit(0)\n", encoding="utf-8"
+                )
+                violations = self._violations(root)
+                self.assertTrue(
+                    any("Validate must run gitforgeops validate" in item for item in violations),
+                    violations,
+                )
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/apply-on-merge.yml"
+            text = path.read_text(encoding="utf-8").replace(
+                "    steps:\n",
+                "    steps:\n      - name: Inject startup\n        run: |\n"
+                '          echo "BASH_ENV=inject.sh" >> "'
+                "${{ github[format('{0}{1}', 'e', 'nv')] }}\"\n",
+                1,
+            )
+            path.write_text(text, encoding="utf-8")
+            (root / ".github/scripts/check_supply_chain.py").write_text(
+                "raise SystemExit(0)\n", encoding="utf-8"
+            )
+            violations = self._violations(root)
+            self.assertTrue(
+                any("GitHub context access is forbidden" in item for item in violations),
+                violations,
+            )
+        for workflow in ("rotate.yml", "materialize-file.yml"):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / workflow
+                path.write_text(path.read_text(encoding="utf-8").replace(
+                    "    steps:\n",
+                    "    steps:\n      - name: Inject startup\n        run: |\n"
+                    '          echo "BASH_ENV=inject.sh" >> "'
+                    "${{ github[format('{0}{1}', 'e', 'nv')] }}\"\n",
+                    1,
+                ), encoding="utf-8")
+                violations = self._violations(root)
+                self.assertTrue(
+                    any("GitHub context access is forbidden" in item for item in violations),
+                    violations,
+                )
+
+    def test_pinned_operations_accept_equivalent_yaml_and_safe_outputs(self):
+        # Keep actual Validate, Apply, Verify and viewer-diff operations in the
+        # positive; an empty document or `run: true` would prove no binding.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            for workflow in (
+                *check_supply_chain.PROBE_WORKFLOW_STEPS,
+                ".github/workflows/drift-check.yml",
+                ".github/workflows/rotate.yml",
+                ".github/workflows/materialize-file.yml",
+            ):
+                path = root / workflow
+                text = path.read_text(encoding="utf-8")
+                text = text.replace("run: gitforgeops validate\n", 'run: "gitforgeops validate"\n')
+                text = text.replace(
+                    "      - name: Validate\n",
+                    "      - name: Validate\n        continue-on-error: false\n",
+                )
+                for condition in check_supply_chain.PROBE_APPLY_STEP_GATES.values():
+                    text = text.replace("if: " + condition, "if: ${{ " + condition + " }}")
+                for _, condition in check_supply_chain.PROBE_APPLY_JOB_GATES.values():
+                    text = text.replace("if: " + condition, "if: ${{ " + condition + " }}")
+                text = text.replace(
+                    "    steps:\n",
+                    "    steps:\n      - name: Read named GitHub property\n        run: |\n"
+                    '          echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"\n',
+                    1,
+                )
+                path.write_text(text, encoding="utf-8")
+                document = check_supply_chain.parse_workflow(text)
+                self.assertEqual(self._guarded_bindings(workflow, document), [])
+                if workflow.endswith("apply-on-merge.yml"):
+                    for job in ("apply", "promote"):
+                        self.assertEqual(
+                            self._step(document, job, "Validate")["run"], "gitforgeops validate"
+                        )
+                        self.assertEqual(
+                            self._step(document, job, "Apply")["run"],
+                            "gitforgeops apply --auto-approve",
+                        )
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root)],
+                check=False, text=True, capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_probe_bindings_are_required_in_every_protected_step(self):
         for workflow, required in check_supply_chain.PROBE_WORKFLOW_STEPS.items():
             self.assertEqual(

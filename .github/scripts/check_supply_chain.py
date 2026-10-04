@@ -146,6 +146,23 @@ PROBE_WORKFLOW_STEPS = {
         }),
     ),
 }
+# These jobs validate inside the same Environment before either publication
+# mode mutates it. Pin the flow as well as the bindings: a skipped/nonblocking
+# Validate or an Apply using always()/failure() loses that ordering guarantee.
+PROBE_APPLY_JOB_GATES = {
+    "apply": (
+        ["list-envs"],
+        "needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''",
+    ),
+    "promote": (
+        ["list-envs", "apply"],
+        "needs.list-envs.outputs.promotions != '[]' && needs.list-envs.outputs.promotions != ''",
+    ),
+}
+PROBE_APPLY_STEP_GATES = {
+    "Apply": "steps.deployment-mode.outputs.mode == 'api'",
+    "Apply (file mode)": "steps.deployment-mode.outputs.mode == 'file'",
+}
 # Pin the complete script that writes the one permitted env-file entry, not
 # only its echo: rebinding creds_file to a multiline value would inject more
 # variables through an otherwise unchanged echo. Comments are not script shape.
@@ -2163,6 +2180,52 @@ def workflow_action_references(document: dict) -> list[str]:
     ]
 
 
+def github_context_access_violations(workflow: str, document: dict) -> list[str]:
+    """Protected workflows may not compute or alias GitHub file channels."""
+    violations: list[str] = []
+    named_github = re.compile(r"\bgithub\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*", re.IGNORECASE)
+    indexed_github = re.compile(
+        r"\bgithub(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)*\s*\[", re.IGNORECASE
+    )
+    file_context = re.compile(r"\bgithub\s*\.\s*(?:env|path|output)\b", re.IGNORECASE)
+    # A closing delimiter inside an expression's single-quoted literal is
+    # data. In particular, format('{1}', '}}', github[...]) still reads the
+    # computed context: the unused argument must not hide it from this guard.
+    expressions = re.compile(
+        r"\$\{\{((?:'(?:[^']|'')*'|(?!\}\})[^'])*)\}\}", re.DOTALL
+    )
+
+    def visit(node, path: str, key: str = "") -> None:
+        if isinstance(node, dict):
+            for child_key, value in node.items():
+                visit(value, f"{path}.{child_key}", child_key)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                visit(value, f"{path}[{index}]", key)
+        elif isinstance(node, str):
+            lines = node.splitlines()
+            if key.casefold() == "run":
+                lines = [line for line in lines if not line.lstrip().startswith("#")]
+            content = "\n".join(lines)
+            bodies = [match.group(1) for match in expressions.finditer(content)]
+            # `if:` is also an expression without explicit delimiters.
+            if key.casefold() == "if" and not bodies:
+                bodies = [content]
+            for body in bodies:
+                if (
+                    re.search(r"\bgithub\b", named_github.sub("", body), re.IGNORECASE)
+                    or indexed_github.search(body)
+                    or file_context.search(body)
+                ):
+                    violations.append(
+                        f"{workflow}: {path}: computed/indexed, whole or file-channel "
+                        "GitHub context access is forbidden; use named dot properties"
+                    )
+
+    visit(document, "workflow")
+    return violations
+
+
 def guarded_environment_violations(
     workflow: str, document: dict, required_steps: tuple, protected: tuple[str, ...]
 ) -> list[str]:
@@ -2173,6 +2236,9 @@ def guarded_environment_violations(
     environment maps are refused at every scope. The only permitted env-file
     reference is the existing credential-file hand-off in apply's bundle
     loader; no other reference (including an alias for a later write) is safe.
+    GitHub context references must use named dot properties. Indexed or whole
+    context access is unsupported and fails closed, since an expression can
+    compute the env/path/output file name without spelling it in the workflow.
     This fences workflow bindings, not arbitrary behavior of invoked programs.
     """
     violations: list[str] = []
@@ -2204,15 +2270,44 @@ def guarded_environment_violations(
         re.IGNORECASE,
     )
     env_file_reference = re.compile(
-        r"\bGITHUB_ENV\b|\bgithub\s*\.\s*env\b|"
-        r"\bgithub\s*\[\s*['\"]env['\"]\s*\]",
+        r"\bGITHUB_(?:ENV|PATH)\b|\bgithub\s*\.\s*(?:env|path|output)\b",
         re.IGNORECASE,
     )
+    file_destination = re.compile(r"\bGITHUB_(?:ENV|PATH|OUTPUT)\b", re.IGNORECASE)
+
+    def check_scalar(value: str, key: str, label: str, step_name: str | None) -> None:
+        # Script comments are not operations; YAML comments were removed by
+        # the reader. Inspect decoded scalars, including items in sequences.
+        lines = [line.strip() for line in value.splitlines()]
+        if key.casefold() == "run":
+            lines = [line for line in lines if line and not line.startswith("#")]
+        content = "\n".join(lines)
+        compact = content.translate(str.maketrans("", "", "'\"\\\n"))
+        if protected_reference.search(content) or protected_reference.search(compact):
+            violations.append(
+                f"{label}: protected variable references/rebinding outside step env are forbidden"
+            )
+        handoff_allowed = (
+            workflow == ".github/workflows/apply-on-merge.yml"
+            and step_name == BUNDLE_LOADER_STEP
+            and key == "run"
+            and tuple(lines) == CREDENTIAL_HANDOFF_RUN
+        )
+        if (
+            env_file_reference.search(content) or env_file_reference.search(compact)
+        ) and not handoff_allowed:
+            violations.append(
+                f"{label}: GITHUB_ENV/GITHUB_PATH or GitHub file-context references/writes "
+                "outside the credential hand-off are forbidden"
+            )
 
     def visit(node, path: str, step_name: str | None = None) -> None:
         if isinstance(node, list):
             for index, item in enumerate(node):
                 visit(item, f"{path}[{index}]", step_name)
+            return
+        if isinstance(node, str):
+            check_scalar(node, "", f"{workflow}: {path}", step_name)
             return
         if not isinstance(node, dict):
             return
@@ -2230,35 +2325,123 @@ def guarded_environment_violations(
             if key.casefold() in ("bash_env", "env") and path.casefold().endswith(".env"):
                 violations.append(f"{label}: shell startup env sources are forbidden")
             if isinstance(value, str) and key not in permitted:
-                # Ignore script comments, not YAML comments masquerading as
-                # keys: the latter have already been removed by the reader.
-                lines = [line.strip() for line in value.splitlines()]
-                if key.casefold() == "run":
-                    lines = [line for line in lines if line and not line.startswith("#")]
-                content = "\n".join(lines)
-                # Shell quote concatenation and line continuations must not
-                # turn a forbidden name into an alternate spelling.
-                compact = content.translate(str.maketrans("", "", "'\"\\\n"))
-                if protected_reference.search(content) or protected_reference.search(compact):
-                    violations.append(
-                        f"{label}: protected variable references/rebinding outside step env are forbidden"
-                    )
-                env_lines = [line for line in lines if env_file_reference.search(line)]
-                handoff_allowed = (
-                    workflow == ".github/workflows/apply-on-merge.yml"
-                    and step_name == BUNDLE_LOADER_STEP
-                    and key == "run"
-                    and tuple(lines) == CREDENTIAL_HANDOFF_RUN
-                )
-                if (env_lines or env_file_reference.search(compact)) and not handoff_allowed:
-                    violations.append(
-                        f"{label}: GITHUB_ENV references/writes outside the credential hand-off are forbidden"
-                    )
-            if env_file_reference.search(key):
-                violations.append(f"{label}: rebinding the GITHUB_ENV destination is forbidden")
-            visit(value, f"{path}.{key}", step_name)
+                check_scalar(value, key, label, step_name)
+            if file_destination.search(key):
+                violations.append(f"{label}: rebinding a GitHub file destination is forbidden")
+            if isinstance(value, (dict, list)):
+                visit(value, f"{path}.{key}", step_name)
 
     visit(document, "workflow")
+    return violations + github_context_access_violations(workflow, document)
+
+
+def _workflow_condition(value) -> str | None:
+    """Compare a pinned expression with optional delimiters and whitespace."""
+    if not isinstance(value, str):
+        return None
+    expression = EXPRESSION.fullmatch(value.strip())
+    body = expression.group(1) if expression else value
+    return re.sub(
+        r"'(?:[^']|'')*'|\s+",
+        lambda match: match.group(0) if match.group(0).startswith("'") else "",
+        body,
+    )
+
+
+def probe_validation_gate_violations(workflow: str, document: dict) -> list[str]:
+    """A successful bound Validate must precede every recognized Apply call."""
+    if workflow != ".github/workflows/apply-on-merge.yml":
+        return []
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return [f"{workflow}: bound Validate/Apply jobs must exist"]
+    allowed_mutations: set[int] = set()
+    for job_name, (expected_needs, condition) in PROBE_APPLY_JOB_GATES.items():
+        job = jobs.get(job_name)
+        label = f"{workflow}: job {job_name!r}"
+        if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+            violations.append(f"{label}: bound Validate/Apply steps must exist")
+            continue
+        needs = job.get("needs")
+        if isinstance(needs, str):
+            needs = [needs]
+        if (
+            needs != expected_needs
+            or _workflow_condition(job.get("if")) != _workflow_condition(condition)
+        ):
+            violations.append(
+                f"{label}: Validate/Apply job flow must retain its blocking dependencies and gate"
+            )
+        if job.get("continue-on-error", "false") != "false":
+            violations.append(
+                f"{label}: Validate failure must propagate; job continue-on-error is forbidden"
+            )
+        # A default shell can swallow the exit code; a default directory can
+        # validate a different resource tree. Neither is needed by these jobs.
+        if "defaults" in document or "defaults" in job:
+            violations.append(
+                f"{label}: inherited run defaults may not change Validate/Apply execution"
+            )
+        steps = job["steps"]
+        validations = [
+            index
+            for index, step in enumerate(steps)
+            if isinstance(step, dict) and step.get("name") == "Validate"
+        ]
+        if len(validations) != 1:
+            violations.append(f"{label}: exactly one blocking Validate must precede Apply")
+            continue
+        validation_index = validations[0]
+        validation = steps[validation_index]
+        if (
+            validation.get("run") != "gitforgeops validate"
+            or any(key in validation for key in ("if", "uses", "shell", "working-directory"))
+            or validation.get("continue-on-error", "false") != "false"
+        ):
+            violations.append(
+                f"{label}: Validate must run gitforgeops validate unconditionally and propagate failure"
+            )
+        for step_name, step_condition in PROBE_APPLY_STEP_GATES.items():
+            mutations = [
+                (index, step)
+                for index, step in enumerate(steps)
+                if isinstance(step, dict) and step.get("name") == step_name
+            ]
+            if len(mutations) != 1:
+                violations.append(f"{label}: {step_name!r} must exist exactly once after Validate")
+                continue
+            index, step = mutations[0]
+            allowed_mutations.add(id(step))
+            if (
+                index <= validation_index
+                or step.get("run") != "gitforgeops apply --auto-approve"
+                or any(key in step for key in ("uses", "shell", "working-directory"))
+                or _workflow_condition(step.get("if")) != _workflow_condition(step_condition)
+            ):
+                violations.append(
+                    f"{label}: {step_name!r} must run after successful Validate with its mode gate"
+                )
+    # Added/renamed inline mutations must not escape the guarded pair. This
+    # does not attempt to judge arbitrary behavior inside invoked programs.
+    for job_name, job in jobs.items():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        for step in steps if isinstance(steps, list) else []:
+            if not isinstance(step, dict) or id(step) in allowed_mutations:
+                continue
+            script = step.get("run")
+            if not isinstance(script, str):
+                continue
+            active = "\n".join(
+                line for line in script.splitlines() if not line.lstrip().startswith("#")
+            )
+            compact = active.translate(str.maketrans("", "", "'\"\\\n"))
+            if re.search(r"\bgitforgeops\b[^\n]*\b(?:apply|rotate)\b", active) or re.search(
+                r"\bgitforgeops\b[^\n]*\b(?:apply|rotate)\b", compact
+            ):
+                violations.append(
+                    f"{workflow}: job {job_name!r}: mutations may only run in the guarded Apply steps"
+                )
     return violations
 
 
@@ -2271,7 +2454,7 @@ def probe_consumer_binding_violations(workflow: str, document: dict) -> list[str
         document,
         PROBE_WORKFLOW_STEPS[workflow],
         (PROBE_CONSUMERS_ENV, PROBE_BOUND_ENV),
-    )
+    ) + probe_validation_gate_violations(workflow, document)
 
 
 def monitoring_jwt_binding_violations(workflow: str, document: dict) -> list[str]:
@@ -2657,6 +2840,12 @@ def main(argv: list[str] | None = None) -> int:
             viewer_jwt_scope_violations(workflow.relative_to(root).as_posix(), text)
         )
         if document is not None:
+            # Apply, trusted review and drift call this through their binding
+            # guard. Cover the remaining Environment-bound workflows too.
+            if workflow.name in ("rotate.yml", "materialize-file.yml"):
+                violations.extend(
+                    github_context_access_violations(workflow.relative_to(root).as_posix(), document)
+                )
             violations.extend(
                 probe_consumer_binding_violations(
                     workflow.relative_to(root).as_posix(), document

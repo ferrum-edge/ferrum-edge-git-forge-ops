@@ -83,6 +83,11 @@ AUDIT_TOKEN_SECRET = (
     "SETTINGS_AUDIT_TOKEN",
     "fine-grained PAT or App token with Administration: read",
 )
+VIEWER_JWT_ENVIRONMENT_SECRET = (
+    "FERRUM_ADMIN_JWT_VIEWER_SECRET",
+    "required for api drift monitoring; the gateway's distinct viewer-capped "
+    "signing key, at least 32 characters and different from the admin key",
+)
 ENVIRONMENT_SECRETS = (
     ("FERRUM_GATEWAY_URL", "required for api mode; must be an https:// URL"),
     ("FERRUM_ADMIN_JWT_SECRET", "required for api mode; at least 32 characters"),
@@ -127,17 +132,14 @@ ENVIRONMENT_SECRETS = (
 # a nightly drift check into no drift check at all.
 MONITORING_ENVIRONMENT_SUFFIX = "-monitor"
 # Everything a `gitforgeops diff` needs, and nothing more. Notably absent:
-# GITFORGEOPS_STATE_APP_PRIVATE_KEY (ledger writes), FERRUM_GH_PROVISIONER_TOKEN
+# FERRUM_ADMIN_JWT_SECRET (gateway writes), GITFORGEOPS_STATE_APP_PRIVATE_KEY
+# (ledger writes), FERRUM_GH_PROVISIONER_TOKEN
 # (credential-broker writes) and FERRUM_CREDS_BUNDLE[_N] (credential values a
 # comparison does not need). `audit_settings.py` fails the audit if any of them
 # is added later, and `check_supply_chain.py` refuses the workflow binding.
 MONITORING_ENVIRONMENT_SECRETS = (
     ("FERRUM_GATEWAY_URL", "required; must be an https:// URL"),
-    (
-        "FERRUM_ADMIN_JWT_VIEWER_SECRET",
-        "required; the gateway's distinct viewer-capped signing key, at least 32 "
-        "characters and different from the admin key",
-    ),
+    VIEWER_JWT_ENVIRONMENT_SECRET,
     (
         "FERRUM_ADMIN_JWT_ISSUER",
         "optional; default ferrum-edge, must equal the gateway's issuer",
@@ -1329,6 +1331,12 @@ def secret_remainder(
                 f"  gh secret set {name} --repo {repo} --env {environment}"
                 f"   # {note}"
             )
+        if environment not in monitoring:
+            name, note = VIEWER_JWT_ENVIRONMENT_SECRET
+            lines.append(
+                f"  gh secret set {name} --repo {repo} --env {environment}"
+                f"   # {note}; scheduled drift here waits for approval"
+            )
     for environment in monitoring:
         monitor = f"{environment}{MONITORING_ENVIRONMENT_SUFFIX}"
         lines.append(f"  # environment {monitor} (viewer-only drift monitoring)")
@@ -1345,7 +1353,7 @@ def secret_remainder(
         )
         lines.append(
             f"  # Do NOT set GITFORGEOPS_STATE_APP_PRIVATE_KEY, "
-            f"FERRUM_GH_PROVISIONER_TOKEN or FERRUM_CREDS_BUNDLE[_N] on "
+            f"FERRUM_GH_PROVISIONER_TOKEN, FERRUM_ADMIN_JWT_SECRET or FERRUM_CREDS_BUNDLE[_N] on "
             f"{monitor}: the settings audit fails when a monitoring environment "
             "holds deployment, broker or state-writing authority."
         )

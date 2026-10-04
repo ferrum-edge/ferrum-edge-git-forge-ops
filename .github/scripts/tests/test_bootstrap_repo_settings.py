@@ -422,19 +422,36 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
         notes = "\n".join(plan.notes)
         self.assertIn("--env staging-monitor", notes)
         self.assertIn("FERRUM_ADMIN_JWT_VIEWER_SECRET", notes)
-        self.assertNotIn("gh secret set FERRUM_ADMIN_JWT_SECRET", notes)
-        self.assertNotIn("gh secret set FERRUM_ADMIN_JWT_ROLE", notes)
+        self.assertIn("gh secret set FERRUM_ADMIN_JWT_SECRET --repo acme/repo --env staging ", notes)
+        for name in ("FERRUM_ADMIN_JWT_SECRET", "FERRUM_ADMIN_JWT_ROLE"):
+            self.assertNotIn(f"gh secret set {name} --repo acme/repo --env staging-monitor", notes)
+        self.assertNotIn(
+            "gh secret set FERRUM_ADMIN_JWT_VIEWER_SECRET --repo acme/repo --env staging ",
+            notes,
+        )
         self.assertIn("FERRUM_ADMIN_JWT_ISSUER", notes)
         self.assertIn("FERRUM_ADMIN_JWT_AUDIENCE", notes)
         self.assertIn("FERRUM_ADMIN_JWT_TTL_SECS", notes)
         self.assertIn("FERRUM_ADMIN_JWT_VIEWER_NAMESPACES", notes)
         self.assertIn("required namespaces", notes)
         self.assertIn("Do NOT set GITFORGEOPS_STATE_APP_PRIVATE_KEY", notes)
+        self.assertIn("FERRUM_GH_PROVISIONER_TOKEN, FERRUM_ADMIN_JWT_SECRET", notes)
         # The credential bundle is not read material for a comparison.
         self.assertNotIn(
             "gh secret set FERRUM_CREDS_BUNDLE --repo acme/repo --env staging-monitor",
             notes,
         )
+
+    def test_approval_gated_drift_gets_the_viewer_key_in_its_deployment_environment(self):
+        plan, _ = self._plan("version: 1\nenvironments:\n  staging:\n    overlay: staging\n")
+        notes = "\n".join(plan.notes)
+        self.assertIn(
+            "gh secret set FERRUM_ADMIN_JWT_VIEWER_SECRET --repo acme/repo --env staging ",
+            notes,
+        )
+        self.assertIn("gh secret set FERRUM_ADMIN_JWT_SECRET --repo acme/repo --env staging ", notes)
+        self.assertIn("scheduled drift here waits for approval", notes)
+        self.assertNotIn("--env staging-monitor", notes)
 
     def test_the_viewer_signing_key_caveat_is_stated_accurately(self):
         plan, _ = self._plan(
