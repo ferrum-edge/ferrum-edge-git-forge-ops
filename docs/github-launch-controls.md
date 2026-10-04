@@ -542,6 +542,24 @@ migrate, then reject the old one). The baseline ruleset has no human bypass,
 so merging past that red required check takes a deliberate admin decision.
 The next run on `main` uses the new policy.
 
+Guarded `run:` interpolation requires a proven source and is inspected after
+GitHub scalar conversion, before Bash comment removal. The reader preserves
+plain versus quoted YAML provenance: plain `null`, `Null`, `NULL` and `~`
+render empty, while quoted `"null"` remains literal text. Plain booleans render
+lowercase. Numeric interpolation fails closed because GitHub reformats numbers;
+quote a numeric value when its literal spelling is intended. These conversions
+follow the runner's [YAML reader](https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs)
+and [expression string conversion](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/EvaluationResult.cs).
+The shell scan keeps quote and command-substitution context across physical
+lines, so a line starting with `#` inside a multiline quote cannot hide an
+active command. Unsupported shell contexts retain text conservatively. Binding
+checks, output-producer proofs and runtime env-file tracking use the same scan.
+
+Review and merge tighter guard logic into the protected branch first. If the
+workflow binding form must change, do that in a subsequent pull request judged
+by that trusted checker. New checker logic requires fresh exact-head review;
+a green verdict from the previous protected checker does not validate it.
+
 That is not a complete boundary on its own. The check runs under
 `pull_request`, so GitHub executes the pull request's own copy of
 `security.yml`. The trusted checker inspects that copy with substring rules,

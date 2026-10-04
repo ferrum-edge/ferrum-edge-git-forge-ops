@@ -2085,6 +2085,15 @@ def _cut_comment(text: str) -> str:
     return (text if position < 0 else text[:position]).rstrip(" ")
 
 
+class _PlainWorkflowScalar(str):
+    """Keep plain-style provenance while preserving textual shape comparisons.
+
+    GitHub's YAML 1.2 core reader types plain null/boolean/number tokens,
+    whereas quoted and block scalars remain strings. Shell source proofs
+    must account for that conversion instead of trusting the source spelling.
+    """
+
+
 class _WorkflowReader:
     def __init__(self, text: str) -> None:
         forbidden = _FORBIDDEN_WORKFLOW_CHARACTER.search(text)
@@ -2227,7 +2236,7 @@ class _WorkflowReader:
             return value
         value = _cut_comment(text)
         self.check_plain(value)
-        return value
+        return _PlainWorkflowScalar(value)
 
     def check_plain(self, value: str) -> None:
         if (
@@ -2302,6 +2311,7 @@ class _WorkflowReader:
                     if any(mark in value for mark in "[]{}") or " #" in value:
                         self.fail("a flow sequence item must be a plain or quoted scalar")
                     self.check_plain(value)
+                    value = _PlainWorkflowScalar(value)
                     position = end
                 items.append(value)
                 position = self.skip_spaces(text, position)
@@ -2378,11 +2388,130 @@ def workflow_action_references(document: dict) -> list[str]:
 
 
 def _shell_operation_lines(script: str) -> tuple[str, ...]:
-    """Ignore plain comments, retaining comments that GitHub can expand."""
+    """Remove only proven Bash comments, keeping lexical state across lines.
+
+    A physical # line can start inside a quoted word and close it before an
+    active command. Quotes in an actual comment cannot change lexical state.
+    Command substitutions have their own quote context. For unsupported
+    here-documents, backticks and complex parameter expansions, retain the
+    remaining text conservatively; it cannot satisfy a pinned producer shape
+    by hiding active lines. This is a scan projection, not a Bash interpreter.
+    """
+    frames = [{"quote": "", "depth": 0, "word_start": True}]
+    out: list[str] = []
+    position = 0
+    while position < len(script):
+        frame = frames[-1]
+        quote = frame["quote"]
+        character = script[position]
+        expression = WORKFLOW_EXPRESSION.match(script, position)
+        if expression:
+            # Shape checks inspect the original expressions; rendered scans
+            # inspect the substitutions. Expression-literal quotes are not Bash.
+            out.append(expression.group())
+            frame["word_start"] = False
+            position = expression.end()
+            continue
+        if character == "\\" and quote != "'":
+            following = script[position + 1:position + 2]
+            if quote != '"' or following in ('$', '`', '"', '\\', '\n'):
+                out.append(script[position:position + 2])
+                if following != "\n":
+                    frame["word_start"] = False
+                position += 2
+                continue
+        if quote in ("'", "$'"):
+            if character == "'":
+                frame["quote"] = ""
+        elif character == '"':
+            frame["quote"] = "" if quote else '"'
+            frame["word_start"] = False
+        elif not quote and script.startswith("<<<", position):
+            out.append("<<<")
+            frame["word_start"] = True
+            position += 3
+            continue
+        elif character == "`" or (
+            not quote and script.startswith("<<", position)
+            and not script.startswith("<<<", position)
+        ):
+            out.append(script[position:])
+            break
+        elif script.startswith("${", position):
+            end = script.find("}", position + 2)
+            body = script[position + 2:end] if end >= 0 else ""
+            if end < 0 or any(mark in body for mark in ("'", '"', "`", "\\", "$", "\n")):
+                out.append(script[position:])
+                break
+            out.append(script[position:end + 1])
+            frame["word_start"] = False
+            position = end + 1
+            continue
+        elif script.startswith("$((", position):
+            end = script.find("))", position + 3)
+            body = script[position + 3:end] if end >= 0 else ""
+            if end < 0 or not re.fullmatch(r"[A-Za-z0-9_ \t+*/%<>=!&|^~()-]+", body):
+                out.append(script[position:])
+                break
+            out.append(script[position:end + 2])
+            frame["word_start"] = False
+            position = end + 2
+            continue
+        elif script.startswith("$(", position):
+            out.append("$(")
+            frame["word_start"] = False
+            frames.append({"quote": "", "depth": 1, "word_start": True})
+            position += 2
+            continue
+        elif not quote:
+            if (
+                frame["depth"] and frame["word_start"]
+                and script.startswith("case", position)
+                and (position + 4 == len(script) or script[position + 4].isspace())
+            ) or (character in "?*+@!" and script[position + 1:position + 2] == "("):
+                # case pattern ')' and extglob tokens need a grammar parser;
+                # do not mistake them for command-substitution boundaries.
+                out.append(script[position:])
+                break
+            if script.startswith("$'", position):
+                out.append("$'")
+                frame["quote"] = "$'"
+                frame["word_start"] = False
+                position += 2
+                continue
+            if character == "'":
+                frame["quote"] = "'"
+                frame["word_start"] = False
+            elif character == "#" and frame["word_start"]:
+                end = script.find("\n", position)
+                end = len(script) if end < 0 else end
+                comment = script[position:end]
+                if "${{" in comment:
+                    out.append(comment)  # GitHub renders before Bash sees comments.
+                position = end
+                continue
+            elif character in " \t\n;|&<>()":
+                if frame["depth"] and character == "(":
+                    frame["depth"] += 1
+                elif frame["depth"] and character == ")":
+                    frame["depth"] -= 1
+                    if not frame["depth"]:
+                        frames.pop()
+                frame["word_start"] = True
+            else:
+                frame["word_start"] = False
+        out.append(character)
+        position += 1
+    lines = [
+        line.lstrip(" \t") if line.rstrip(" \t").endswith("\\") else line.strip(" \t")
+        for line in "".join(out).split("\n")
+    ]
+    # A blank after a continuation terminates it; trailing whitespace after a
+    # backslash means it was never a continuation. Do not change either into
+    # a join when these lines are reused by scans and exact producer proofs.
     return tuple(
-        line.strip()
-        for line in script.splitlines()
-        if line.strip() and (not line.lstrip().startswith("#") or "${{" in line)
+        line for index, line in enumerate(lines)
+        if line or (index and lines[index - 1].endswith("\\"))
     )
 
 
@@ -2397,6 +2526,36 @@ _NAMED_RUN_VALUE = re.compile(
     r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)+", re.IGNORECASE
 )
 _RUN_RENDER_LIMIT = 128
+
+
+_PLAIN_WORKFLOW_NUMBER = re.compile(
+    r"(?:[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
+    r"|0x[0-9a-fA-F]+|0o[0-7]+|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))"
+)
+
+
+def _shell_literal_values(value) -> tuple[str, ...] | None:
+    """GitHub scalar-to-string conversion, refusing unmodeled number spelling.
+
+    Numeric YAML tokens become doubles and are reformatted by GitHub. Do not
+    substitute their source spelling or a guessed numeric witness in a string
+    that could assemble a protected identifier or command. Quote them to use
+    their literal text. Null and booleans have exact documented conversions.
+    """
+    if value is None:
+        return ("",)
+    if isinstance(value, bool):
+        return ("true" if value else "false",)
+    if not isinstance(value, str):
+        return None
+    if isinstance(value, _PlainWorkflowScalar):
+        if value in ("null", "Null", "NULL", "~"):
+            return ("",)
+        if value in ("true", "True", "TRUE", "false", "False", "FALSE"):
+            return (value.casefold(),)
+        if _PLAIN_WORKFLOW_NUMBER.fullmatch(value):
+            return None
+    return (str(value),) if _SHELL_SAFE_LITERAL.fullmatch(value) else None
 
 
 def _shell_scan_text(script: str) -> str:
@@ -2421,9 +2580,7 @@ def _static_env_value(body: str, context: tuple) -> tuple[str, ...] | None:
             continue
         if index < 2 and (runtime_names is None or name in runtime_names):
             return None
-        if len(values) == 1 and isinstance(values[0], str) and _SHELL_SAFE_LITERAL.fullmatch(values[0]):
-            return (values[0],)
-        return None
+        return _shell_literal_values(values[0]) if len(values) == 1 else None
     return None
 
 
@@ -2609,7 +2766,7 @@ def _matrix_run_values(job: dict, sources: dict) -> dict:
                 )
             return result or {path: None}
         else:
-            choices = (node,) if isinstance(node, str) and _SHELL_SAFE_LITERAL.fullmatch(node) else None
+            choices = _shell_literal_values(node)
             if isinstance(node, str) and (alias := WORKFLOW_EXPRESSION.fullmatch(node.strip())):
                 choices = _named_run_values(alias.group(1).strip(), ((), None, sources))
             return {path: choices}
@@ -2776,12 +2933,12 @@ def _run_env_contexts(workflow: str, document: dict) -> dict[int, tuple]:
         declared = job.get("outputs")
         if isinstance(declared, dict):
             for name, value in declared.items():
-                if _one_case_value(declared, name) != value or not isinstance(value, str):
+                if _one_case_value(declared, name) != value:
                     continue
-                alias = WORKFLOW_EXPRESSION.fullmatch(value.strip())
+                alias = WORKFLOW_EXPRESSION.fullmatch(value.strip()) if isinstance(value, str) else None
                 outputs[name.casefold()] = (
                     _named_run_values(alias.group(1).strip(), ((), None, sources))
-                    if alias else ((value,) if _SHELL_SAFE_LITERAL.fullmatch(value) else None)
+                    if alias else _shell_literal_values(value)
                 )
         visiting.remove(job_name)
         completed[job_name] = outputs
