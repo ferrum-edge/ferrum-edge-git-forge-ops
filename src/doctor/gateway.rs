@@ -14,7 +14,7 @@
 //!   need `admin`, which the local `admin-jwt-claims` check enforces.
 //! * `GET /namespaces`, one list page and one single-resource `GET` — does the
 //!   gateway issue the strong `ETag` incremental apply makes every overwrite
-//!   conditional on? Ferrum Edge before v0.9.10 does not, and apply refuses to
+//!   conditional on? Ferrum Edge before v0.9.9 does not, and apply refuses to
 //!   modify or delete there.
 //!
 //! No mutating endpoint is reachable from here: every call is a `GET`.
@@ -257,7 +257,7 @@ async fn conditional_write_check(client: &AdminClient) -> Check {
             "a single-resource GET returned no strong ETag",
         )
         .remedy(
-            "Upgrade Ferrum Edge to v0.9.10 or later. Incremental apply sends every \
+            "Upgrade Ferrum Edge to v0.9.9 or later. Incremental apply sends every \
              modify and delete with If-Match on the row it validated, and refuses to \
              overwrite anything on a gateway that issues no entity-tag.",
         ),

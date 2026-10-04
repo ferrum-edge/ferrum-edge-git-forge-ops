@@ -927,7 +927,7 @@ impl AdminClient {
             return Err(crate::error::Error::ConditionalWriteUnavailable(format!(
                 "GET {path} in namespace `{namespace}` returned no strong ETag, so a write to \
                  {kind} `{id}` cannot be made conditional (If-Match) on the row this run \
-                 validated. Ferrum Edge v0.9.10 and later issue one for proxies, consumers, \
+                 validated. Ferrum Edge v0.9.9 and later issue one for proxies, consumers, \
                  upstreams and plugin configs. No overwrite was attempted."
             )));
         };
@@ -974,7 +974,7 @@ impl AdminClient {
 
     /// Whether the gateway issues the strong `ETag` every conditional
     /// overwrite needs, learned from one existing row: `Some(true)` or
-    /// `Some(false)` (Ferrum Edge before v0.9.10), or `None` when no row was
+    /// `Some(false)` (Ferrum Edge before v0.9.9), or `None` when no row was
     /// found to read. Reads only: a list page and one single-resource read.
     pub async fn issues_entity_tags(&self) -> crate::error::Result<Option<bool>> {
         let namespaces = self.list_namespaces().await?;

@@ -64,6 +64,19 @@ deletes. The suite uses the approved validator binary as the gateway too, so it
 certifies the build this repository already trusts and adds no second
 artifact to pin.
 
+Ferrum Edge v0.9.9 introduced the `ETag` / `If-Match` capability the
+`conditional-overwrite` scenario requires. That minimum does not certify a
+build's backup and consumer representations: the scenario must pass against
+the exact build, including the CLI's namespace and credential checks.
+
+The Python harness checks its admin and data-plane URLs before use and sends
+credentials only over HTTPS or HTTP to literal loopback IPs (`127.0.0.0/8`,
+`::1`). It refuses every redirect and ignores environment proxies for plaintext
+loopback requests. Both out-of-band admin helpers and traffic probes share
+this boundary. HTTP hostnames, including `localhost`, are refused, matching
+the CLI's admin transport policy. The external-gateway mode above still uses
+`127.0.0.1` and disposable credentials.
+
 ### Commands
 
 Scenarios run in sequence and change shared state (one deletes the proxy), so

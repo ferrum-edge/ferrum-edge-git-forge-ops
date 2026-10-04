@@ -200,6 +200,12 @@ repository. See [GitHub launch controls](github-launch-controls.md).
 
 ## Environment variables
 
+Incremental API overwrites require the strong `ETag` / `If-Match` capability
+released in Ferrum Edge v0.9.9. Apply preflight and `doctor --scope gateway`
+probe it; a version number alone does not prove backup or consumer
+compatibility. See [Changes made during an apply](apply.md#changes-made-during-an-apply)
+for the remaining checks and exact-build lifecycle qualification.
+
 Blank values count as unset. Present values are validated before anything else
 runs: unknown modes, bad booleans (accepted: `true`, `false`, `1`, `0`,
 case-insensitive), malformed or zero numbers, and bad URLs are errors. See

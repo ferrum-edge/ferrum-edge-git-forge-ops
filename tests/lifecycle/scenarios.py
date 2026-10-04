@@ -27,6 +27,7 @@ Run it through `run.sh`, which owns starting the gateway and the test upstream.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import shutil
@@ -35,6 +36,7 @@ import sys
 import textwrap
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -54,6 +56,68 @@ class ScenarioFailure(AssertionError):
     """A scenario's assertion did not hold."""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Returning None makes urllib expose the original 3xx as an HTTPError.
+        # Never spend an admin token or consumer key on a redirected request.
+        return None
+
+
+def _credential_target(target: str) -> str:
+    """Check the exact URL before constructing a request with credentials."""
+    message = (
+        "lifecycle requests require https:// or http:// to a literal loopback "
+        "IP (127.0.0.0/8 or [::1]), without embedded URL credentials; "
+        "target withheld"
+    )
+    try:
+        # urlsplit strips some controls; reject them before parsing so the
+        # checked target cannot differ from the one the operator supplied.
+        if any(ord(char) <= 32 or ord(char) == 127 for char in target):
+            raise ValueError("control or whitespace in URL")
+        parsed = urllib.parse.urlsplit(target)
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("unusable URL")
+        # Accessing port also rejects a malformed or out-of-range port.
+        _ = parsed.port
+        if parsed.scheme == "http":
+            if "%" in parsed.hostname or not ipaddress.ip_address(parsed.hostname).is_loopback:
+                raise ValueError("non-loopback HTTP target")
+        elif parsed.scheme != "https":
+            raise ValueError("unsupported scheme")
+    except ValueError:
+        raise ScenarioFailure(message) from None
+    return urllib.parse.urlunsplit(parsed)
+
+
+def _safe_exchange(
+    target: str,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: dict | None = None,
+) -> tuple[int, str | None, str]:
+    """The common admin and data-plane HTTP boundary, with no redirects."""
+    target = _credential_target(target)
+    # A proxy would turn literal-loopback cleartext into a remote credential
+    # transmission. Use a fresh opener rather than urlopen's global opener.
+    proxies = {} if urllib.parse.urlsplit(target).scheme == "http" else None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), _NoRedirect())
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(target, data=data, method=method, headers=headers or {})
+    try:
+        response = opener.open(request, timeout=10)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        text = response.read().decode("utf-8", "replace")
+        return response.code, response.headers.get("ETag"), text
+
+
 class Harness:
     """Everything a scenario needs, and nothing it should not have."""
 
@@ -68,11 +132,11 @@ class Harness:
     ):
         self.workdir = workdir
         # The admin API. Writes configuration.
-        self.gateway_url = gateway_url.rstrip("/")
+        self.gateway_url = _credential_target(gateway_url.rstrip("/"))
         # The data plane. Serves traffic. A different listener on a different
         # port — sending a route check at the admin API would get a 404 that
         # looks exactly like a routing failure.
-        self.proxy_url = proxy_url.rstrip("/")
+        self.proxy_url = _credential_target(proxy_url.rstrip("/"))
         self.upstream_url = upstream_url.rstrip("/")
         self.binary = binary
         # The broker bundle the seeded `alloc=require` slot resolves from.
@@ -144,14 +208,9 @@ class Harness:
 
     def request(self, path: str, headers: dict[str, str] | None = None) -> int:
         """A client request through the DATA plane."""
-        request = urllib.request.Request(
-            f"{self.proxy_url}{path}", headers=headers or {}
-        )
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                return response.status
-        except urllib.error.HTTPError as error:
-            return error.code
+            status, _, _ = _safe_exchange(f"{self.proxy_url}{path}", headers=headers)
+            return status
         except urllib.error.URLError as error:
             raise ScenarioFailure(f"{path} was unreachable: {error.reason}") from error
 
@@ -633,23 +692,8 @@ def _admin(
 
 
 def __admin(harness: Harness, method: str, path: str, body: dict | None = None) -> int:
-    token = os.environ["GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN"]
-    data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(
-        f"{harness.gateway_url}{path}",
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "X-Ferrum-Namespace": NAMESPACE,
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return response.status
-    except urllib.error.HTTPError as error:
-        return error.code
+    status, _, _ = _admin_exchange(harness, method, path, body)
+    return status
 
 
 def _admin_exchange(
@@ -672,17 +716,9 @@ def _admin_exchange(
     }
     if if_match is not None:
         headers["If-Match"] = if_match
-    data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(
-        f"{harness.gateway_url}{path}", data=data, method=method, headers=headers
+    return _safe_exchange(
+        f"{harness.gateway_url}{path}", method=method, headers=headers, body=body
     )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            text = response.read().decode("utf-8", "replace")
-            return response.status, response.headers.get("ETag"), text
-    except urllib.error.HTTPError as error:
-        text = error.read().decode("utf-8", "replace")
-        return error.code, error.headers.get("ETag"), text
 
 
 def create_unmanaged_proxy(harness: Harness) -> None:
