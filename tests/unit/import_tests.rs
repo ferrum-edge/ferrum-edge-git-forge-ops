@@ -1673,7 +1673,10 @@ fn file_import_parses_and_reports_the_full_backup_envelope() {
     assert_eq!(result.sources.len(), 1);
     assert_eq!(result.sources[0].source_kind, "file");
     assert_eq!(result.sources[0].config_version, "1");
-    assert_eq!(result.sources[0].credential_representation, "canonical-or-file");
+    assert_eq!(
+        result.sources[0].credential_representation,
+        "canonical-or-file"
+    );
     assert_eq!(result.sources[0].ferrum_version.as_deref(), Some("2.4.0"));
     assert_eq!(result.sources[0].source.as_deref(), Some("database"));
     let source_notice = result.source_metadata_notice().unwrap();
@@ -1751,7 +1754,10 @@ async fn api_import_rejects_cross_namespace_resources_before_writing() {
     .await
     .unwrap_err()
     .to_string();
-    assert!(error.contains("conditional evidence unavailable or invalid"), "{error}");
+    assert!(
+        error.contains("conditional evidence unavailable or invalid"),
+        "{error}"
+    );
     assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
 }
 

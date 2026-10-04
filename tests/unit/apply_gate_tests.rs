@@ -1868,7 +1868,10 @@ fn rotate_reaches_gateway_preflight(kind: &str, field: &str, slots: serde_json::
         "the proxy deliberately never responds"
     );
     let (mut request, _) = listener.accept().unwrap_or_else(|_| {
-        panic!("{credential} did not reach gateway health: {}", stderr(&output))
+        panic!(
+            "{credential} did not reach gateway health: {}",
+            stderr(&output)
+        )
     });
     let mut bytes = [0; 4096];
     let count = request.read(&mut bytes).unwrap();

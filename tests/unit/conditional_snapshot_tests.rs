@@ -102,15 +102,9 @@ fn verification_refuses_wrong_identity_cache_weak_or_missing_tags_and_duplicate_
         (NS, "c1", Some(ROW_TAG), Some("replica"), Some("no-store")),
         (NS, "c1", Some(ROW_TAG), None, None),
     ] {
-        let error = ConsumerEvidence::from_response(
-            &row.to_string(),
-            namespace,
-            id,
-            tag,
-            source,
-            cache,
-        )
-        .unwrap_err();
+        let error =
+            ConsumerEvidence::from_response(&row.to_string(), namespace, id, tag, source, cache)
+                .unwrap_err();
         assert!(!format!("{error:?} {error}").contains(SECRET));
     }
     for body in [
@@ -118,15 +112,9 @@ fn verification_refuses_wrong_identity_cache_weak_or_missing_tags_and_duplicate_
         format!(r#"{{"username": "{SECRET}", "credentials": "{SECRET}"}}"#),
         format!(r#"{{"{SECRET}": "{SECRET}""#),
     ] {
-        let error = ConsumerEvidence::from_response(
-            &body,
-            NS,
-            "c1",
-            Some(ROW_TAG),
-            None,
-            Some("no-store"),
-        )
-        .unwrap_err();
+        let error =
+            ConsumerEvidence::from_response(&body, NS, "c1", Some(ROW_TAG), None, Some("no-store"))
+                .unwrap_err();
         assert!(!format!("{error:?} {error}").contains(SECRET));
     }
 }
@@ -174,7 +162,10 @@ fn coherent_snapshot_requires_all_maps_exact_coverage_seals_and_header_agreement
     mutations.push(changed);
     for field in ["id", "namespace"] {
         let mut changed = good.clone();
-        changed["consumers"][0].as_object_mut().unwrap().remove(field);
+        changed["consumers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
         mutations.push(changed);
     }
     for (field, value) in [
@@ -314,10 +305,9 @@ fn verified(row: &Value, tag: &str) -> Reply {
 #[tokio::test]
 async fn preallocation_capture_checks_archival_projection_but_retains_exact_hidden_fields() {
     let mut archival = config();
-    archival.consumers[0].credentials.insert(
-        "jwt".to_string(),
-        json!([{"secret": SECRET}]),
-    );
+    archival.consumers[0]
+        .credentials
+        .insert("jwt".to_string(), json!([{"secret": SECRET}]));
     let mut raw = serde_json::to_value(&archival.consumers[0]).unwrap();
     raw["credentials"]["jwt"] = json!({"secret": SECRET, "legacy": "hidden"});
     let complete = evidence(&raw, ROW_TAG);
@@ -331,8 +321,8 @@ async fn preallocation_capture_checks_archival_projection_but_retains_exact_hidd
             served["username"] = json!("concurrent");
         }
         let (client, requests) = gateway(move |_, _| verified(&served, ROW_TAG));
-        let mut planned = BackupSnapshot::from_value(serde_json::to_value(&archival).unwrap())
-            .unwrap();
+        let mut planned =
+            BackupSnapshot::from_value(serde_json::to_value(&archival).unwrap()).unwrap();
         let result = client
             .capture_consumer_evidence(&mut planned, NS, &BTreeSet::from(["c1".to_string()]))
             .await;
@@ -352,7 +342,10 @@ async fn sensitive_http_reads_refuse_duplicate_headers_and_cached_evidence_stays
         headers.push(("ETag".to_string(), ROW_TAG.to_string()));
         (status, body, headers)
     });
-    let error = client.get_consumer_verification("c1", NS).await.unwrap_err();
+    let error = client
+        .get_consumer_verification("c1", NS)
+        .await
+        .unwrap_err();
     assert!(!format!("{error:?} {error}").contains(ROW_TAG));
     let mut raw = envelope(&config(), &BackupExtras::default(), NS_TAG);
     raw["source"] = json!("cached");
@@ -385,7 +378,9 @@ async fn hidden_only_consumer_conflicts_refuse_modify_delete_and_pending_claim()
             "modify" => desired.consumers[0].username = "new-name".to_string(),
             "delete" => desired.consumers.clear(),
             _ => {
-                options.pending_create_assertions.insert(format!("{NS}:Consumer:c1"));
+                options
+                    .pending_create_assertions
+                    .insert(format!("{NS}:Consumer:c1"));
             }
         }
         let result = apply_api(
@@ -401,7 +396,11 @@ async fn hidden_only_consumer_conflicts_refuse_modify_delete_and_pending_claim()
         .unwrap();
         assert!(!result.errors.is_empty());
         assert!(result.applied_incremental.is_empty());
-        assert!(requests.lock().unwrap().iter().all(|request| request.starts_with("GET ")));
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
     }
 }
 
@@ -444,7 +443,11 @@ async fn shared_consumer_claim_conflict_withholds_later_claims_and_delete_author
     assert!(result.adopted.is_empty());
     assert!(!result.errors.is_empty());
     assert!(!result.errors.join(" ").contains(SECRET));
-    assert!(requests.lock().unwrap().iter().all(|request| request.starts_with("GET ")));
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.starts_with("GET ")));
 }
 
 #[tokio::test]
@@ -454,19 +457,14 @@ async fn ambiguous_consumer_create_and_batch_preserve_complete_rows_and_refuse_b
             let mut desired = config();
             let mut stored = serde_json::to_value(consumer()).unwrap();
             if profile == "basic" {
-                desired.consumers[0].credentials = BTreeMap::from([(
-                    "basicauth".to_string(),
-                    json!([{"password": SECRET}]),
-                )]);
+                desired.consumers[0].credentials =
+                    BTreeMap::from([("basicauth".to_string(), json!([{"password": SECRET}]))]);
                 stored["credentials"] = json!({"basicauth": basic()});
             } else {
                 stored["credentials"]["custom"] = json!([{"hidden": "retained"}]);
             }
-            let mut complete = envelope(
-                &GatewayConfig::default(),
-                &BackupExtras::default(),
-                NS_TAG,
-            );
+            let mut complete =
+                envelope(&GatewayConfig::default(), &BackupExtras::default(), NS_TAG);
             complete["consumers"] = json!([stored.clone()]);
             complete["counts"]["consumers"] = json!(1);
             complete["conditional"]["row_etags"]["consumers"] = json!({"c1": ROW_TAG});
@@ -527,10 +525,18 @@ async fn ambiguous_consumer_create_and_batch_preserve_complete_rows_and_refuse_b
             if let Some(write) = writes.first() {
                 let body: Value =
                     serde_json::from_str(write.split_once("\r\n\r\n").unwrap().1).unwrap();
-                assert_eq!(body["credentials"]["custom"], json!([{"hidden": "retained"}]));
+                assert_eq!(
+                    body["credentials"]["custom"],
+                    json!([{"hidden": "retained"}])
+                );
                 assert!(write.contains(&format!("if-match: {ROW_TAG}\r\n")));
             }
-            assert_eq!(seen.iter().filter(|request| request.starts_with("POST /batch")).count(), 1);
+            assert_eq!(
+                seen.iter()
+                    .filter(|request| request.starts_with("POST /batch"))
+                    .count(),
+                1
+            );
         }
     }
 }
@@ -554,20 +560,25 @@ async fn rotation_establishes_health_and_exact_fields_before_delivery_and_fences
                 panic!("unexpected request; body withheld")
             }
         });
-        let prepared = PreparedConsumerRotation::prepare(
-            &client,
-            &current,
-            "keyauth/key",
-            Some(SECRET),
-        )
-        .await
-        .unwrap();
+        let prepared =
+            PreparedConsumerRotation::prepare(&client, &current, "keyauth/key", Some(SECRET))
+                .await
+                .unwrap();
         // Broker publication occurs here, after every preparatory GET.
-        assert!(requests.lock().unwrap().iter().all(|request| request.starts_with("GET ")));
-        let result = prepared.publish(&client, "new-delivered-fixture-value").await;
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
+        let result = prepared
+            .publish(&client, "new-delivered-fixture-value")
+            .await;
         assert_eq!(result.is_err(), conflict);
         let seen = requests.lock().unwrap();
-        let write = seen.iter().find(|request| request.starts_with("PUT ")).unwrap();
+        let write = seen
+            .iter()
+            .find(|request| request.starts_with("PUT "))
+            .unwrap();
         assert!(write.contains(&format!("if-match: {ROW_TAG}\r\n")));
         let body: Value = serde_json::from_str(write.split_once("\r\n\r\n").unwrap().1).unwrap();
         let mut expected = raw.clone();
@@ -598,23 +609,25 @@ async fn rotation_establishes_health_and_exact_fields_before_delivery_and_fences
                 verified(&served, ROW_TAG)
             }
         });
-        let error = PreparedConsumerRotation::prepare(
-            &client,
-            &current,
-            "keyauth/key",
-            Some(SECRET),
-        )
-        .await
-        .unwrap_err();
+        let error =
+            PreparedConsumerRotation::prepare(&client, &current, "keyauth/key", Some(SECRET))
+                .await
+                .unwrap_err();
         assert!(!format!("{error:?} {error}").contains(SECRET));
-        assert!(requests.lock().unwrap().iter().all(|request| request.starts_with("GET ")));
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.starts_with("GET ")));
     }
 }
 
 #[tokio::test]
 async fn basic_rotation_keeps_hmac_opaque_and_committed_not_live_never_records_completion() {
     let mut current = consumer();
-    current.credentials.insert("basicauth".to_string(), json!([{ "password": SECRET }]));
+    current
+        .credentials
+        .insert("basicauth".to_string(), json!([{ "password": SECRET }]));
     let mut raw = serde_json::to_value(&current).unwrap();
     raw["credentials"]["basicauth"] = basic();
     for applied in [true, false] {
@@ -625,7 +638,11 @@ async fn basic_rotation_keeps_hmac_opaque_and_committed_not_live_never_records_c
             } else if request.starts_with("GET /consumers/c1/verification ") {
                 verified(&served, ROW_TAG)
             } else if request.starts_with("PUT /consumers/c1 ") {
-                (200, json!({"applied": applied, "error": SECRET}).to_string(), vec![])
+                (
+                    200,
+                    json!({"applied": applied, "error": SECRET}).to_string(),
+                    vec![],
+                )
             } else {
                 panic!("rotation must preserve its preparation boundary")
             }
@@ -641,7 +658,10 @@ async fn basic_rotation_keeps_hmac_opaque_and_committed_not_live_never_records_c
         let result = prepared.publish(&client, "delivered-basic-password").await;
         assert_eq!(result.is_ok(), applied);
         let seen = requests.lock().unwrap();
-        let writes = seen.iter().filter(|request| request.starts_with("PUT ")).collect::<Vec<_>>();
+        let writes = seen
+            .iter()
+            .filter(|request| request.starts_with("PUT "))
+            .collect::<Vec<_>>();
         assert_eq!(writes.len(), 1);
         let body: Value =
             serde_json::from_str(writes[0].split_once("\r\n\r\n").unwrap().1).unwrap();
@@ -649,7 +669,10 @@ async fn basic_rotation_keeps_hmac_opaque_and_committed_not_live_never_records_c
         expected["credentials"]["basicauth"] = json!([{ "password": "delivered-basic-password" }]);
         assert_eq!(body, expected);
         if let Err(error) = result {
-            assert!(matches!(error, gitforgeops::error::Error::CommittedNotLive { .. }));
+            assert!(matches!(
+                error,
+                gitforgeops::error::Error::CommittedNotLive { .. }
+            ));
             assert!(!format!("{error:?} {error}").contains(SECRET));
         }
     }
@@ -672,7 +695,9 @@ async fn restore_retries_only_proven_precommit_failure_with_the_exact_original_b
             }
         });
         let extras = planned_extras(&GatewayConfig::default(), NS, BackupExtras::default());
-        let result = client.post_restore(&GatewayConfig::default(), NS, &extras, true).await;
+        let result = client
+            .post_restore(&GatewayConfig::default(), NS, &extras, true)
+            .await;
         assert_eq!(result.is_ok(), refusal == 200);
         let seen = requests.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -680,8 +705,12 @@ async fn restore_retries_only_proven_precommit_failure_with_the_exact_original_b
             seen[0].split_once("\r\n\r\n").unwrap().1,
             seen[1].split_once("\r\n\r\n").unwrap().1,
         );
-        assert!(seen.iter().all(|request| request.contains(&format!("if-match: {NS_TAG}\r\n"))));
-        assert!(seen.iter().all(|request| request.starts_with("POST /restore")));
+        assert!(seen
+            .iter()
+            .all(|request| request.contains(&format!("if-match: {NS_TAG}\r\n"))));
+        assert!(seen
+            .iter()
+            .all(|request| request.starts_with("POST /restore")));
         if let Err(error) = result {
             assert!(!format!("{error:?} {error}").contains(SECRET));
         }
@@ -691,23 +720,42 @@ async fn restore_retries_only_proven_precommit_failure_with_the_exact_original_b
 #[tokio::test]
 async fn restore_uncertain_admission_fence_and_bad_seal_responses_are_never_replayed() {
     for (status, body) in [
-        (503, json!({"failure_class": "connectivity", "rollback": "incomplete"}).to_string()),
-        (503, json!({"failure_class": "audit_admission", "error": SECRET}).to_string()),
+        (
+            503,
+            json!({"failure_class": "connectivity", "rollback": "incomplete"}).to_string(),
+        ),
+        (
+            503,
+            json!({"failure_class": "audit_admission", "error": SECRET}).to_string(),
+        ),
         (
             503,
             json!({"failure_class": "connectivity", "reason": "fence_release_failed"}).to_string(),
         ),
-        (503, json!({"failure_class": "connectivity", "applied": true}).to_string()),
-        (500, json!({"rollback": "unknown_outcome", "error": SECRET}).to_string()),
-        (200, json!({"applied": false, "reason": "reload_timeout", "error": SECRET}).to_string()),
+        (
+            503,
+            json!({"failure_class": "connectivity", "applied": true}).to_string(),
+        ),
+        (
+            500,
+            json!({"rollback": "unknown_outcome", "error": SECRET}).to_string(),
+        ),
+        (
+            200,
+            json!({"applied": false, "reason": "reload_timeout", "error": SECRET}).to_string(),
+        ),
         (200, json!({"restored": {"consumers": 0}}).to_string()),
         (
             200,
             json!({"restored": {"proxies": 0, "consumers": 0, "upstreams": 0,
                 "plugin_configs": 0, "api_specs": 0, "gateway_trust_bundles": 0},
-                "reason": "fence_release_failed"}).to_string(),
+                "reason": "fence_release_failed"})
+            .to_string(),
         ),
-        (503, r#"{"failure_class":"audit_admission","failure_class":"connectivity"}"#.to_string()),
+        (
+            503,
+            r#"{"failure_class":"audit_admission","failure_class":"connectivity"}"#.to_string(),
+        ),
     ] {
         let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));
         let extras = planned_extras(&GatewayConfig::default(), NS, BackupExtras::default());
@@ -770,8 +818,15 @@ async fn coherent_full_replace_empty_and_confirmed_deletion_keep_the_original_to
         assert!(result.fully_replaced_namespaces.is_empty());
         assert!(!result.errors.is_empty());
         let seen = requests.lock().unwrap();
-        assert_eq!(seen.iter().filter(|request| request.starts_with("POST /restore")).count(), 1);
-        assert!(seen.iter().any(|request| request.contains(&format!("if-match: {NS_TAG}\r\n"))));
+        assert_eq!(
+            seen.iter()
+                .filter(|request| request.starts_with("POST /restore"))
+                .count(),
+            1
+        );
+        assert!(seen
+            .iter()
+            .any(|request| request.contains(&format!("if-match: {NS_TAG}\r\n"))));
     }
 }
 
@@ -834,7 +889,11 @@ async fn doctor_is_get_only_and_reports_missing_consumer_capability_as_unknown()
     assert!(checks.iter().any(|check| {
         check.id == "gateway-consumer-verification" && check.status == Status::Unknown
     }));
-    assert!(requests.lock().unwrap().iter().all(|request| request.starts_with("GET ")));
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.starts_with("GET ")));
 }
 
 #[tokio::test]
@@ -878,7 +937,10 @@ async fn exact_api_import_records_provenance_and_conditional_file_import_refuses
     )
     .await
     .unwrap();
-    assert_eq!(imported.sources[0].credential_representation, "exact-stored");
+    assert_eq!(
+        imported.sources[0].credential_representation,
+        "exact-stored"
+    );
     assert!(bundle.exists());
     let source = private.path().join("conditional.json");
     std::fs::write(&source, raw.to_string()).unwrap();

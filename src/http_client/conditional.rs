@@ -76,8 +76,8 @@ impl ConsumerEvidence {
 
     /// Compare only against the canonical archival projection used by ordinary `/backup`.
     /// The stored row and its token remain untouched and are used for every later precondition.
-    pub fn matches_archival(&self, planned: &crate::config::Consumer) -> Result<bool> {
-        let mut canonical: crate::config::Consumer =
+    pub fn matches_archival(&self, planned: &crate::config::schema::Consumer) -> Result<bool> {
+        let mut canonical: crate::config::schema::Consumer =
             serde_json::from_value(self.row.clone()).map_err(|_| invalid())?;
         for (kind, entries) in &mut canonical.credentials {
             if entries.is_object() {
@@ -111,7 +111,7 @@ impl ConsumerEvidence {
 /// but restore is a replacement and must carry them explicitly or refuse.
 pub fn require_preserved_credentials(
     raw: &Value,
-    desired: &crate::config::Consumer,
+    desired: &crate::config::schema::Consumer,
     replacement: bool,
 ) -> Result<()> {
     let credentials = raw
@@ -140,8 +140,7 @@ pub fn require_preserved_credentials(
                     && !(kind == "basicauth"
                         && key == "password_hash"
                         && declared.contains_key("password"))
-            })
-            {
+            }) {
                 return Err(unrepresentable());
             }
         }
@@ -225,7 +224,7 @@ impl PreparedConsumerRotation {
     /// All remote and field safety checks precede broker publication.
     pub async fn prepare(
         client: &super::AdminClient,
-        current: &crate::config::Consumer,
+        current: &crate::config::schema::Consumer,
         credential: &str,
         expected_target: Option<&str>,
     ) -> Result<Self> {
@@ -274,16 +273,15 @@ impl PreparedConsumerRotation {
         // An absent old bundle value cannot establish equality. The complete stored
         // evidence still authorizes only this leaf, and its token fences publication.
         if kind != "basicauth"
-            && expected_target.is_some_and(|expected| {
-                stored.get(field).and_then(Value::as_str) != Some(expected)
-            })
+            && expected_target
+                .is_some_and(|expected| stored.get(field).and_then(Value::as_str) != Some(expected))
         {
             return Err(Error::StalePlan(
                 "rotation target differs from the current bundle; reconcile before rotation"
                     .to_string(),
             ));
         }
-        let live: crate::config::Consumer =
+        let live: crate::config::schema::Consumer =
             serde_json::from_value(evidence.row.clone()).map_err(|_| invalid())?;
         if live.username != current.username || live.custom_id != current.custom_id {
             return Err(Error::StalePlan(
@@ -420,7 +418,10 @@ pub fn conditional_backup(
             .get(section)
             .and_then(Value::as_array)
             .ok_or_else(invalid)?;
-        let tags = maps.get(section).and_then(Value::as_object).ok_or_else(invalid)?;
+        let tags = maps
+            .get(section)
+            .and_then(Value::as_object)
+            .ok_or_else(invalid)?;
         let mut ids = BTreeSet::new();
         let mut tokens = BTreeMap::new();
         let mut raw = BTreeMap::new();
@@ -531,12 +532,15 @@ fn validate_consumer(row: &Value, namespace: &str, id: &str) -> Result<()> {
     ];
     if object.keys().any(|key| !FIELDS.contains(&key.as_str()))
         || object.get("username").and_then(Value::as_str).is_none()
-        || object.get("credentials").and_then(Value::as_object).is_none()
+        || object
+            .get("credentials")
+            .and_then(Value::as_object)
+            .is_none()
     {
         return Err(invalid());
     }
     // Credentials are deliberately opaque. The desired schema remains closed.
-    serde_json::from_value::<crate::config::Consumer>(row.clone()).map_err(|_| invalid())?;
+    serde_json::from_value::<crate::config::schema::Consumer>(row.clone()).map_err(|_| invalid())?;
     Ok(())
 }
 

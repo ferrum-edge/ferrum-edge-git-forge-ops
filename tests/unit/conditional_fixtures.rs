@@ -82,7 +82,10 @@ pub fn restore_seal(request: &str) -> String {
         } else {
             &body[section]
         };
-        counts.insert(section.to_string(), json!(rows.as_array().map_or(0, Vec::len)));
+        counts.insert(
+            section.to_string(),
+            json!(rows.as_array().map_or(0, Vec::len)),
+        );
     }
     json!({"restored": counts}).to_string()
 }

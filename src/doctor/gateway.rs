@@ -296,9 +296,8 @@ async fn snapshot_checks(client: &AdminClient, namespace: Option<&str>) -> Vec<C
         Some(namespace) => Ok(vec![namespace.to_string()]),
         None => client.list_namespaces().await,
     };
-    let unknown = |id, title, message: &str| {
-        Check::new(id, title, Scope::Gateway, Status::Unknown, message)
-    };
+    let unknown =
+        |id, title, message: &str| Check::new(id, title, Scope::Gateway, Status::Unknown, message);
     let namespace = namespaces
         .ok()
         .and_then(|namespaces| namespaces.into_iter().next());
@@ -328,7 +327,10 @@ async fn snapshot_checks(client: &AdminClient, namespace: Option<&str>) -> Vec<C
             )];
             let check = match snapshot.config.consumers.first() {
                 Some(consumer) => {
-                    match client.get_consumer_verification(&consumer.id, &namespace).await {
+                    match client
+                        .get_consumer_verification(&consumer.id, &namespace)
+                        .await
+                    {
                         Ok(Some(_)) => Check::pass(
                             CONSUMER,
                             CONSUMER_TITLE,

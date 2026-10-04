@@ -14,7 +14,7 @@ use crate::diagnostics::{safe, safe_line};
 use crate::jwt::{self, JwtOptions};
 
 pub mod conditional;
-use conditional::{ConsumerEvidence, ConditionalMetadata};
+use conditional::{ConditionalMetadata, ConsumerEvidence};
 
 /// Most namespaces [`AdminClient::issues_entity_tags`] looks in for a row.
 const ENTITY_TAG_PROBE_NAMESPACES: usize = 20;
@@ -321,7 +321,9 @@ impl AdminClient {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
                     if resp.headers().get_all("x-data-source").iter().any(|value| {
-                        value.to_str().is_ok_and(|source| source.eq_ignore_ascii_case("cached"))
+                        value
+                            .to_str()
+                            .is_ok_and(|source| source.eq_ignore_ascii_case("cached"))
                     }) {
                         self.saw_cached_backup.store(true, Ordering::Relaxed);
                     }
@@ -684,7 +686,10 @@ impl AdminClient {
                         .to_string(),
                 ));
             }
-            snapshot.extras.consumer_evidence.insert(id.clone(), evidence);
+            snapshot
+                .extras
+                .consumer_evidence
+                .insert(id.clone(), evidence);
         }
         Ok(())
     }

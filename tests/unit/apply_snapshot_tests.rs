@@ -328,7 +328,12 @@ fn read_route(kind: Kind, id: &str, body: String, headers: &[(&str, &str)]) -> R
     if matches!(kind, Kind::Consumer) {
         headers.push(("Cache-Control".to_string(), "no-store".to_string()));
     }
-    (format!("GET {}/{id}{suffix} ", kind.path()), 200, body, headers)
+    (
+        format!("GET {}/{id}{suffix} ", kind.path()),
+        200,
+        body,
+        headers,
+    )
 }
 
 /// Serve the row `id` of `config` on `GET /<kind>/{id}` with `etag`, the way
@@ -346,7 +351,12 @@ fn missing(kind: Kind, id: &str) -> RecordingRoute {
     } else {
         ""
     };
-    (format!("GET {}/{id}{suffix} ", kind.path()), 404, body, vec![])
+    (
+        format!("GET {}/{id}{suffix} ", kind.path()),
+        404,
+        body,
+        vec![],
+    )
 }
 
 /// Every route that lets `id`'s row read as `config`: consumers also need the
@@ -429,7 +439,9 @@ async fn apply(
             .iter()
             .find(|(needle, _, _, _)| needle.ends_with(&route))
             .and_then(|(_, _, _, headers)| {
-                headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("etag"))
+                headers
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case("etag"))
             })
             .map(|(_, tag)| tag.as_str())
             .filter(|tag| tag.starts_with('"'))
@@ -679,7 +691,12 @@ async fn a_consumer_whose_credentials_changed_after_the_plan_is_not_overwritten(
     for (backup_key, refused) in [("rotated-key-value", true), ("planned-key-value", false)] {
         let routes = vec![
             health(),
-            tagged(Kind::Consumer, "c1", &keyed_consumer("user-1", backup_key), TAG),
+            tagged(
+                Kind::Consumer,
+                "c1",
+                &keyed_consumer("user-1", backup_key),
+                TAG,
+            ),
         ];
 
         let run = apply_exclusive(&desired, planned.clone(), routes).await;
@@ -811,7 +828,14 @@ async fn a_failed_read_refuses_the_overwrite_and_defers_deletes() {
         r#"{"error":"private diagnostic withheld"}"#.into(),
         vec![],
     );
-    let run = apply(&desired, planned, vec![health(), failed], false, Default::default()).await;
+    let run = apply(
+        &desired,
+        planned,
+        vec![health(), failed],
+        false,
+        Default::default(),
+    )
+    .await;
     assert!(run.result.fatal_error.is_some());
     assert!(run.mutations().is_empty());
 }

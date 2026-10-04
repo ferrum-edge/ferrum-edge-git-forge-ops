@@ -25,3 +25,10 @@ c26ba4c059be2d78f4044a3768ebfed5be4e7eb5640620fa93ea9199776b0902  ferrum-edge-li
 00beb6b8c6cce424fb9d9be290285a9b1c4968e13d9cf78ea671ab37ef32269d  ferrum-edge-linux-x86_64  # 2026-09-27T13:50:22Z release v0.9.8
 e628f60a7d12ad526781cedbd0b15ab3447d99f37222c46a2cda4c3bc3e955c5  ferrum-edge-linux-x86_64  # 2026-10-01T07:09:54Z release v0.9.9
 52745149de09932b54bef79cbe5524e2376cb84d0fa7a4d8436ae0bcd19d6559  ferrum-edge-linux-x86_64  # release v0.9.10
+97cbd7cd277feee8f661e9d2cd97a6383be969fd2fc2b61143601614922f988f  ferrum-edge-linux-x86_64  # release v0.9.11; verified ferrum-edge-linux-x86_64
+3f0c4a7334878963792c8c277f49f8b91af24bf2db59996e41ec3f7e41c7fbac  ferrum-edge-linux-x86_64  # release v0.9.11; verified ferrum-edge-linux-aarch64
+d9a535fda68f17c67e7a44de4c6c0d037145d8772067c7051fa9bd47a30e12ea  ferrum-edge-linux-x86_64  # release v0.9.11; verified ferrum-edge-macos-aarch64
+83a59079dd5661af431c8dcacbc1139c6e3963f9a755e6f13b8e93b1570f59c8  ferrum-edge-linux-x86_64  # release v0.9.11; verified ferrum-edge-macos-x86_64
+9bc7c9240fa0898a9efeb6e2dabb74c696772af0bb0ba2f7e57ab70c3d0a86e9  ferrum-edge-linux-x86_64  # release v0.9.11; verified ferrum-edge-windows-x86_64.exe
+d70b1a273eaf4d5e30d07ef41a07764f13cd9fe4274d9348b4b710172fc1a7ef  ferrum-edge-linux-x86_64  # release v0.9.11; verified ferrum-cni-linux-x86_64
+c54b68605132a42eab941ce43d595cca878f3be79e8ae1ecda5cf05dd6450b8a  ferrum-edge-linux-x86_64  # release v0.9.11; verified ferrum-cni-linux-aarch64

@@ -2523,7 +2523,11 @@ async fn cmd_plan(
         reportln!(json_mode);
     }
 
-    reportln!(json_mode, "{}", gitforgeops::verdict::CONDITIONAL_APPLY_NOTICE);
+    reportln!(
+        json_mode,
+        "{}",
+        gitforgeops::verdict::CONDITIONAL_APPLY_NOTICE
+    );
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
         reportln!(json_mode, "{}\n", safe_block(note));
     }

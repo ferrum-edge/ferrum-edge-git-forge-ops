@@ -1837,7 +1837,8 @@ async fn full_replace_aborts_when_a_spec_changed_since_the_payload_was_built() {
             .unwrap()
             .iter()
             .filter(|request| request.starts_with("POST /restore"))
-            .count() == 1,
+            .count()
+            == 1,
         "a stale spec snapshot must never be replayed"
     );
     assert!(requests
@@ -1894,7 +1895,8 @@ async fn full_replace_aborts_when_a_spec_was_created_since_the_payload_was_built
             .unwrap()
             .iter()
             .filter(|request| request.starts_with("POST /restore"))
-            .count() == 1,
+            .count()
+            == 1,
         "a snapshot that no longer describes the namespace must not be replayed"
     );
     assert!(requests

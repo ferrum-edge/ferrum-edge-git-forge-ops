@@ -759,13 +759,12 @@ async fn prepare_apply<'a>(
             && (supplied_actual.is_none() || supplied_extras.is_none());
 
         if needs_paired_snapshot || supplied_actual.is_none() {
-            let mut snapshot = if require_evidence
-                && matches!(options.strategy, ApplyStrategy::FullReplace)
-            {
-                client.get_conditional_backup(namespace).await?
-            } else {
-                client.get_backup_snapshot_for_mutation(namespace).await?
-            };
+            let mut snapshot =
+                if require_evidence && matches!(options.strategy, ApplyStrategy::FullReplace) {
+                    client.get_conditional_backup(namespace).await?
+                } else {
+                    client.get_backup_snapshot_for_mutation(namespace).await?
+                };
             if require_evidence && matches!(options.strategy, ApplyStrategy::Incremental) {
                 let selected = consumer_evidence_targets(
                     desired,
@@ -891,10 +890,7 @@ async fn prepare_apply<'a>(
                             .to_string(),
                     )
                 })?;
-                if let Some(consumer) = desired_namespace
-                    .consumers
-                    .iter()
-                    .find(|row| &row.id == id)
+                if let Some(consumer) = desired_namespace.consumers.iter().find(|row| &row.id == id)
                 {
                     http_client::conditional::require_preserved_credentials(
                         &evidence.row,
@@ -1223,11 +1219,7 @@ fn prepare_full_replace(
     }
     for consumer in &desired.consumers {
         if let Some(evidence) = live_extras.consumer_evidence.get(&consumer.id) {
-            http_client::conditional::require_preserved_credentials(
-                &evidence.row,
-                consumer,
-                true,
-            )?;
+            http_client::conditional::require_preserved_credentials(&evidence.row, consumer, true)?;
         }
     }
     if options.confirm_api_spec_deletion {
@@ -2421,7 +2413,11 @@ impl<'a> Preconditions<'a> {
                 "complete planned consumer evidence was not captured before allocation".to_string(),
             )
         })?;
-        let Some(live) = self.client.get_consumer_verification(id, self.namespace).await? else {
+        let Some(live) = self
+            .client
+            .get_consumer_verification(id, self.namespace)
+            .await?
+        else {
             return Ok(None);
         };
         if !planned.same_row(&live) {
@@ -2900,8 +2896,7 @@ async fn adopt_matching_rows(
                             .consumer_evidence
                             .and_then(|evidence| evidence.get(id))
                             .is_some_and(|planned| {
-                                planned.row == tagged.body
-                                    && planned.token.as_str() == tagged.etag
+                                planned.row == tagged.body && planned.token.as_str() == tagged.etag
                             })) =>
             {
                 tagged.etag
