@@ -19,6 +19,11 @@ FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+# Closing delimiters inside single-quoted expression literals are data, even
+# in shell comments. GitHub expands expressions before Bash reads the script.
+WORKFLOW_EXPRESSION = re.compile(
+    r"\$\{\{((?:'(?:[^']|'')*'|(?!\}\})[^'])*)\}\}", re.DOTALL
+)
 # GitHub resolves contexts and secret names without regard to case:
 # `${{ secrets.ferrum_admin_jwt_secret }}` and `${{ SECRETS.FERRUM_ADMIN_JWT_SECRET }}`
 # both read FERRUM_ADMIN_JWT_SECRET. Every secret-name match below is therefore
@@ -126,18 +131,34 @@ MONITORING_JWT_SECRET_BINDINGS = (VIEWER_JWT_SECRET_BINDING,)
 PROBE_CONSUMERS_ENV = "FERRUM_VERIFY_PROBE_CONSUMERS"
 PROBE_BOUND_ENV = "FERRUM_VERIFY_PROBE_CONSUMERS_BOUND"
 PROBE_CONSUMERS_VALUE = "${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}"
+PROBE_RUNTIME_ENVIRONMENTS = {
+    "apply": "${{ matrix.environment }}",
+    "promote": "${{ matrix.scope.environment }}",
+}
 PROBE_WORKFLOW_STEPS = {
     ".github/workflows/apply-on-merge.yml": (
         ("apply", "Validate", {
+            "FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["apply"],
             PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
             PROBE_BOUND_ENV: "true",
         }),
-        ("apply", "Verify traffic", {PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE}),
+        ("apply", "Apply", {"FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["apply"]}),
+        ("apply", "Apply (file mode)", {"FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["apply"]}),
+        ("apply", "Verify traffic", {
+            "FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["apply"],
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+        }),
         ("promote", "Validate", {
+            "FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["promote"],
             PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
             PROBE_BOUND_ENV: "true",
         }),
-        ("promote", "Verify traffic", {PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE}),
+        ("promote", "Apply", {"FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["promote"]}),
+        ("promote", "Apply (file mode)", {"FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["promote"]}),
+        ("promote", "Verify traffic", {
+            "FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["promote"],
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+        }),
     ),
     ".github/workflows/trusted-pr-review.yml": (
         ("live-review", "Post trusted live review", {
@@ -163,6 +184,32 @@ PROBE_APPLY_STEP_GATES = {
     "Apply": "steps.deployment-mode.outputs.mode == 'api'",
     "Apply (file mode)": "steps.deployment-mode.outputs.mode == 'file'",
 }
+# Verify may read FERRUM_ENV for its notice, but may not override that binding
+# or add CLI environment/namespace selectors. Pin the admitted script while
+# allowing plain shell comments, as for the credential hand-off below.
+PROBE_VERIFY_RUN = (
+    "set -euo pipefail",
+    'if [ -z "$APPLIED_CREDS_FILE" ] || [ ! -s "$APPLIED_CREDS_FILE" ]; then',
+    'echo "::error::The apply step left no finalized credential bundle, '
+    'so traffic cannot be verified against what it deployed."',
+    "exit 1",
+    "fi",
+    "status=0",
+    'FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify || status=$?',
+    'case "$status" in',
+    "0)",
+    'echo "result=passed" >> "$GITHUB_OUTPUT"',
+    ";;",
+    "5)",
+    'echo "result=skipped" >> "$GITHUB_OUTPUT"',
+    'echo "::notice::Traffic verification skipped: .gitforgeops/smoke.yaml declares '
+    'no checks for $FERRUM_ENV. Nothing was verified; this environment authorizes no promotion."',
+    ";;",
+    "*)",
+    'exit "$status"',
+    ";;",
+    "esac",
+)
 # Pin the complete script that writes the one permitted env-file entry, not
 # only its echo: rebinding creds_file to a multiline value would inject more
 # variables through an otherwise unchanged echo. Comments are not script shape.
@@ -2180,6 +2227,15 @@ def workflow_action_references(document: dict) -> list[str]:
     ]
 
 
+def _shell_operation_lines(script: str) -> tuple[str, ...]:
+    """Ignore plain comments, retaining comments that GitHub can expand."""
+    return tuple(
+        line.strip()
+        for line in script.splitlines()
+        if line.strip() and (not line.lstrip().startswith("#") or "${{" in line)
+    )
+
+
 def github_context_access_violations(workflow: str, document: dict) -> list[str]:
     """Protected workflows may not compute or alias GitHub file channels."""
     violations: list[str] = []
@@ -2188,11 +2244,9 @@ def github_context_access_violations(workflow: str, document: dict) -> list[str]
         r"\bgithub(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)*\s*\[", re.IGNORECASE
     )
     file_context = re.compile(r"\bgithub\s*\.\s*(?:env|path|output)\b", re.IGNORECASE)
-    # A closing delimiter inside an expression's single-quoted literal is
-    # data. In particular, format('{1}', '}}', github[...]) still reads the
-    # computed context: the unused argument must not hide it from this guard.
-    expressions = re.compile(
-        r"\$\{\{((?:'(?:[^']|'')*'|(?!\}\})[^'])*)\}\}", re.DOTALL
+    named_run_value = re.compile(
+        r"(?:github|matrix|needs|steps|runner|env|vars|inputs|secrets)"
+        r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)+", re.IGNORECASE
     )
 
     def visit(node, path: str, key: str = "") -> None:
@@ -2203,14 +2257,17 @@ def github_context_access_violations(workflow: str, document: dict) -> list[str]
             for index, value in enumerate(node):
                 visit(value, f"{path}[{index}]", key)
         elif isinstance(node, str):
-            lines = node.splitlines()
-            if key.casefold() == "run":
-                lines = [line for line in lines if not line.lstrip().startswith("#")]
-            content = "\n".join(lines)
-            bodies = [match.group(1) for match in expressions.finditer(content)]
+            # Inspect the original decoded scalar before removing any shell
+            # comments or joining lines: an expression in a # line can emit a
+            # newline and an active command, including a computed file write.
+            bodies = [match.group(1) for match in WORKFLOW_EXPRESSION.finditer(node)]
+            if "${{" in WORKFLOW_EXPRESSION.sub("", node):
+                violations.append(
+                    f"{workflow}: {path}: unrecognized GitHub expression syntax is forbidden"
+                )
             # `if:` is also an expression without explicit delimiters.
             if key.casefold() == "if" and not bodies:
-                bodies = [content]
+                bodies = [node]
             for body in bodies:
                 if (
                     re.search(r"\bgithub\b", named_github.sub("", body), re.IGNORECASE)
@@ -2220,6 +2277,11 @@ def github_context_access_violations(workflow: str, document: dict) -> list[str]
                     violations.append(
                         f"{workflow}: {path}: computed/indexed, whole or file-channel "
                         "GitHub context access is forbidden; use named dot properties"
+                    )
+                if key.casefold() == "run" and not named_run_value.fullmatch(body.strip()):
+                    violations.append(
+                        f"{workflow}: {path}: run expressions must use named dot properties; "
+                        "computed shell text is forbidden"
                     )
 
     visit(document, "workflow")
@@ -2241,6 +2303,7 @@ def guarded_environment_violations(
     compute the env/path/output file name without spelling it in the workflow.
     This fences workflow bindings, not arbitrary behavior of invoked programs.
     """
+    context_violations = github_context_access_violations(workflow, document)
     violations: list[str] = []
     allowed: dict[int, dict] = {}
     jobs = document.get("jobs")
@@ -2276,14 +2339,28 @@ def guarded_environment_violations(
     file_destination = re.compile(r"\bGITHUB_(?:ENV|PATH|OUTPUT)\b", re.IGNORECASE)
 
     def check_scalar(value: str, key: str, label: str, step_name: str | None) -> None:
-        # Script comments are not operations; YAML comments were removed by
-        # the reader. Inspect decoded scalars, including items in sequences.
+        # Plain script comments are not operations. Expressions in them run
+        # before the shell, so retain them when judging protected references
+        # and the exact admitted credential/Verify script shapes.
         lines = [line.strip() for line in value.splitlines()]
         if key.casefold() == "run":
-            lines = [line for line in lines if line and not line.startswith("#")]
+            lines = list(_shell_operation_lines(value))
         content = "\n".join(lines)
         compact = content.translate(str.maketrans("", "", "'\"\\\n"))
-        if protected_reference.search(content) or protected_reference.search(compact):
+        verify_read_allowed = (
+            workflow == ".github/workflows/apply-on-merge.yml"
+            and step_name == "Verify traffic"
+            and key == "run"
+            and tuple(lines) == PROBE_VERIFY_RUN
+        )
+        protected_content = (
+            content.replace("FERRUM_ENV", "") if verify_read_allowed else content
+        )
+        protected_compact = protected_content.translate(str.maketrans("", "", "'\"\\\n"))
+        if (
+            protected_reference.search(protected_content)
+            or protected_reference.search(protected_compact)
+        ):
             violations.append(
                 f"{label}: protected variable references/rebinding outside step env are forbidden"
             )
@@ -2332,7 +2409,7 @@ def guarded_environment_violations(
                 visit(value, f"{path}.{key}", step_name)
 
     visit(document, "workflow")
-    return violations + github_context_access_violations(workflow, document)
+    return violations + context_violations
 
 
 def _workflow_condition(value) -> str | None:
@@ -2384,6 +2461,27 @@ def probe_validation_gate_violations(workflow: str, document: dict) -> list[str]
                 f"{label}: inherited run defaults may not change Validate/Apply execution"
             )
         steps = job["steps"]
+        if job.get("environment") != PROBE_RUNTIME_ENVIRONMENTS[job_name]:
+            violations.append(
+                f"{label}: GitHub Environment must match the pinned runtime FERRUM_ENV binding"
+            )
+        verifications = [
+            step for step in steps
+            if isinstance(step, dict) and step.get("name") == "Verify traffic"
+        ]
+        if len(verifications) != 1:
+            violations.append(f"{label}: exactly one Verify traffic must retain its runtime scope")
+        else:
+            verify = verifications[0]
+            script = verify.get("run")
+            if (
+                not isinstance(script, str)
+                or _shell_operation_lines(script) != PROBE_VERIFY_RUN
+                or any(key in verify for key in ("uses", "shell", "working-directory"))
+            ):
+                violations.append(
+                    f"{label}: Verify traffic must retain the pinned command and runtime scope"
+                )
         validations = [
             index
             for index, step in enumerate(steps)
@@ -2449,11 +2547,16 @@ def probe_consumer_binding_violations(workflow: str, document: dict) -> list[str
     """The operator-held probe allowlist cannot be replaced by candidate data."""
     if workflow not in PROBE_WORKFLOW_STEPS:
         return []
+    protected = (PROBE_CONSUMERS_ENV, PROBE_BOUND_ENV)
+    if workflow == ".github/workflows/apply-on-merge.yml":
+        # These jobs publish the environment's complete scope. An ad-hoc
+        # namespace filter can exempt slots from Validate's authorization.
+        protected += ("FERRUM_ENV", "FERRUM_NAMESPACE")
     return guarded_environment_violations(
         workflow,
         document,
         PROBE_WORKFLOW_STEPS[workflow],
-        (PROBE_CONSUMERS_ENV, PROBE_BOUND_ENV),
+        protected,
     ) + probe_validation_gate_violations(workflow, document)
 
 

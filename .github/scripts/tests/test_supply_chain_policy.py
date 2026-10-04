@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -76,7 +77,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
         )
         for workflow in workflows:
             for expression in expressions:
-                for source in ("run", "env", "with", "sequence", "if"):
+                for source in (
+                    "run", "comment", "inline-comment", "env", "with", "sequence", "if",
+                ):
                     with self.subTest(workflow=workflow, expression=expression, source=source):
                         document = self._probe_document(workflow)
                         step = {"name": "Inject startup", "run": "true"}
@@ -86,6 +89,10 @@ class SupplyChainPolicyTests(unittest.TestCase):
                             # The file channel itself must be refused before
                             # Bash can source a later BASH_ENV override.
                             step["run"] = 'echo "BASH_ENV=inject.sh" >> "' + destination + '"'
+                        elif source == "comment":
+                            step["run"] = "# " + destination + "\ntrue"
+                        elif source == "inline-comment":
+                            step["run"] = "true # " + destination
                         elif source == "sequence":
                             step["with"] = {"destinations": [destination]}
                         elif source == "if":
@@ -99,6 +106,87 @@ class SupplyChainPolicyTests(unittest.TestCase):
                             any("GitHub context access is forbidden" in item for item in violations),
                             violations,
                         )
+
+    def test_commented_computed_shell_text_is_refused_before_shell_filtering(self):
+        workflows = (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        )
+        expressions = (
+            r'''format('{0}echo "BASH_ENV=inject.sh" >>"{1}"', '''
+            r'''fromJSON('"\n"'), github[format('{0}{1}', 'e', 'nv')])''',
+            r'''fromJSON('"\u000aecho \"BASH_ENV=inject.sh\" >> \"$GITHUB_\u0045NV\""')''',
+            r'''format('{1}', '}}', fromJSON('"\nexport FERRUM_VERIFY_PROBE_CONSUMERS=x"'))''',
+            "format('{0}{1}', '\n', 'export FERRUM_VERIFY_PROBE_CONSUMERS=x')",
+            "steps[format('{0}{1}', 'load-', 'bundles')].outputs.channel",
+            "fromJSON(toJSON(steps)).load-bundles.outputs.channel",
+        )
+        for workflow in workflows:
+            for expression in expressions:
+                for prefix in ("# ", "true # ", ""):
+                    with self.subTest(workflow=workflow, expression=expression, prefix=prefix):
+                        document = self._probe_document(workflow)
+                        next(iter(document["jobs"].values()))["steps"].insert(0, {
+                            "name": "Inject startup",
+                            "run": prefix + "${{ " + expression + " }}\ntrue",
+                        })
+                        violations = self._guarded_bindings(workflow, document)
+                        self.assertTrue(
+                            any(
+                                "computed shell text is forbidden" in item
+                                for item in violations
+                            ),
+                            violations,
+                        )
+
+    def test_comment_expressions_are_read_from_decoded_yaml_scalars(self):
+        workflows = (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        )
+        payload = (
+            "# ${{ format('{0}echo BASH_ENV=inject.sh >>{1}', "
+            "fromJSON('\"\\n\"'), github[format('{0}{1}', 'e', 'nv')]) }}\ntrue"
+        )
+        for workflow in workflows:
+            for scalar in (
+                "|\n          " + payload.replace("\n", "\n          "),
+                json.dumps(payload),
+                json.dumps(payload).replace("github", r"\u0067ithub"),
+                json.dumps(payload).replace("#", r"\u0023"),
+                json.dumps(r'''# ${{ fromJSON('"\u000aecho injected"') }}'''),
+            ):
+                with self.subTest(workflow=workflow, scalar=scalar):
+                    text = (ROOT / workflow).read_text(encoding="utf-8").replace(
+                        "    steps:\n",
+                        "    steps:\n      - name: Inject startup\n        run: " + scalar + "\n",
+                        1,
+                    )
+                    violations = self._guarded_bindings(
+                        workflow, check_supply_chain.parse_workflow(text)
+                    )
+                    self.assertTrue(
+                        any("computed shell text is forbidden" in item for item in violations),
+                        violations,
+                    )
+
+    def test_unrecognized_raw_expressions_fail_closed(self):
+        for script in (
+            "# ${{ github[vars.CHANNEL] }\ntrue",
+            "true # ${{ format('unterminated) }}",
+        ):
+            with self.subTest(script=script):
+                violations = check_supply_chain.github_context_access_violations(
+                    "guarded.yml", {"jobs": {"job": {"steps": [{"run": script}]}}}
+                )
+                self.assertTrue(
+                    any("unrecognized GitHub expression syntax" in item for item in violations),
+                    violations,
+                )
 
     def test_literal_file_channels_and_decoded_computed_forms_are_refused(self):
         workflows = (*check_supply_chain.PROBE_WORKFLOW_STEPS, ".github/workflows/drift-check.yml")
@@ -163,6 +251,143 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     violations = self._guarded_bindings(workflow, document)
                     self.assertTrue(
                         any("Validate must run gitforgeops validate" in item for item in violations),
+                        violations,
+                    )
+
+    def test_changed_validate_only_environment_is_refused(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for job, expected in check_supply_chain.PROBE_RUNTIME_ENVIRONMENTS.items():
+            with self.subTest(job=job):
+                document = self._probe_document(workflow)
+                self._step(document, job, "Validate")["env"]["FERRUM_ENV"] = "staging"
+                for name in ("Apply", "Apply (file mode)", "Verify traffic"):
+                    self.assertEqual(self._step(document, job, name)["env"]["FERRUM_ENV"], expected)
+                violations = self._guarded_bindings(workflow, document)
+                self.assertTrue(
+                    any("'Validate' must bind exactly FERRUM_ENV" in item for item in violations),
+                    violations,
+                )
+
+    def test_runtime_environment_is_pinned_across_validate_apply_and_verify(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        replacements = (
+            None, "staging", "${{ env.FERRUM_ENV }}", "${{ vars.ENVIRONMENT }}",
+            "${{ matrix.other_environment }}", "${{ matrix['environment'] }}",
+            "${{ steps.routing.outputs.environment }}",
+            "${{ format('{0}', matrix.environment) }}",
+            "${{ fromJSON(toJSON(matrix)).environment }}",
+        )
+        for job in check_supply_chain.PROBE_RUNTIME_ENVIRONMENTS:
+            for name in ("Validate", "Apply", "Apply (file mode)", "Verify traffic"):
+                for replacement in replacements:
+                    with self.subTest(job=job, name=name, replacement=replacement):
+                        document = self._probe_document(workflow)
+                        environment = self._step(document, job, name)["env"]
+                        if replacement is None:
+                            environment.pop("FERRUM_ENV")
+                        else:
+                            environment["FERRUM_ENV"] = replacement
+                        violations = self._guarded_bindings(workflow, document)
+                        self.assertTrue(
+                            any("must bind exactly FERRUM_ENV" in item for item in violations),
+                            violations,
+                        )
+            for replacement in (
+                None, "staging", "${{ vars.ENVIRONMENT }}",
+                {"name": "${{ matrix.environment }}"},
+            ):
+                with self.subTest(job=job, github_environment=replacement):
+                    document = self._probe_document(workflow)
+                    if replacement is None:
+                        document["jobs"][job].pop("environment")
+                    else:
+                        document["jobs"][job]["environment"] = replacement
+                    violations = self._guarded_bindings(workflow, document)
+                    self.assertTrue(
+                        any("GitHub Environment must match" in item for item in violations),
+                        violations,
+                    )
+
+    def test_runtime_scope_cannot_be_inherited_narrowed_or_rebound(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for job, expected in check_supply_chain.PROBE_RUNTIME_ENVIRONMENTS.items():
+            for variable, value in (("FERRUM_ENV", expected), ("FERRUM_NAMESPACE", "other")):
+                for scope in ("workflow", "job", "other-step", "with"):
+                    with self.subTest(job=job, variable=variable, scope=scope):
+                        document = self._probe_document(workflow)
+                        if scope == "workflow":
+                            document["env"] = {variable: value}
+                        elif scope == "job":
+                            document["jobs"][job]["env"] = {variable: value}
+                        elif scope == "other-step":
+                            document["jobs"][job]["steps"].insert(0, {
+                                "run": "true", "env": {variable: value},
+                            })
+                        else:
+                            self._step(document, job, "Validate")["with"] = {variable: value}
+                        violations = self._guarded_bindings(workflow, document)
+                        self.assertTrue(
+                            any(
+                                "protected variable may only be bound" in item
+                                for item in violations
+                            ),
+                            violations,
+                        )
+            for name in ("Validate", "Apply", "Apply (file mode)", "Verify traffic"):
+                for namespace in (
+                    "other", "${{ matrix.namespace }}", "${{ env.NAMESPACE }}",
+                    "${{ format('{0}', 'other') }}", "${{ steps.routing.outputs.namespace }}",
+                ):
+                    with self.subTest(job=job, name=name, namespace=namespace):
+                        document = self._probe_document(workflow)
+                        self._step(document, job, name)["env"]["FERRUM_NAMESPACE"] = namespace
+                        self.assertTrue(self._guarded_bindings(workflow, document))
+            for script in (
+                "export FERRUM_ENV=staging", "unset FERRUM_ENV",
+                "export FERRUM_NAMESPACE=other", "unset FERRUM_NAMESPACE",
+                'export FERRUM_NAM""ESPACE=other',
+                "export FERRUM_NAM\\\nESPACE=other",
+                "# ${{ env.FERRUM_NAMESPACE }}\ntrue",
+                "# ${{ env.FERRUM_ENV }}\ntrue",
+            ):
+                with self.subTest(job=job, script=script):
+                    document = self._probe_document(workflow)
+                    document["jobs"][job]["steps"].insert(0, {"run": script})
+                    violations = self._guarded_bindings(workflow, document)
+                    self.assertTrue(
+                        any("protected variable references/rebinding" in item for item in violations),
+                        violations,
+                    )
+
+    def test_verify_cannot_change_scope_in_its_script_or_execution_context(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for job in check_supply_chain.PROBE_RUNTIME_ENVIRONMENTS:
+            for change in (
+                "--env staging", "--env ${{ steps.routing.outputs.environment }}",
+                "--env ${{ format('{0}', 'staging') }}", "namespace", "inline-env",
+                "shell", "working-directory", "uses",
+            ):
+                with self.subTest(job=job, change=change):
+                    document = self._probe_document(workflow)
+                    verify = self._step(document, job, "Verify traffic")
+                    if change.startswith("--env"):
+                        verify["run"] = verify["run"].replace(
+                            "gitforgeops verify", "gitforgeops " + change + " verify"
+                        )
+                    elif change == "namespace":
+                        verify["run"] = "export FERRUM_NAMESPACE=other\n" + verify["run"]
+                    elif change == "inline-env":
+                        verify["run"] = verify["run"].replace(
+                            "gitforgeops verify", "FERRUM_ENV=staging gitforgeops verify"
+                        )
+                    else:
+                        verify[change] = "alternate"
+                    violations = self._guarded_bindings(workflow, document)
+                    self.assertTrue(
+                        any(
+                            "Verify traffic must retain the pinned command" in item
+                            for item in violations
+                        ),
                         violations,
                     )
 
@@ -272,6 +497,53 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     violations,
                 )
 
+    def test_protected_checker_rejects_comment_injection_and_validate_env_changes(self):
+        payload = (
+            "# ${{ format('{0}echo BASH_ENV=inject.sh >>{1}', "
+            "fromJSON('\"\\n\"'), github[format('{0}{1}', 'e', 'nv')]) }}"
+        )
+        for workflow in (
+            *check_supply_chain.PROBE_WORKFLOW_STEPS,
+            ".github/workflows/drift-check.yml",
+            ".github/workflows/rotate.yml",
+            ".github/workflows/materialize-file.yml",
+        ):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / workflow
+                path.write_text(path.read_text(encoding="utf-8").replace(
+                    "    steps:\n",
+                    "    steps:\n      - name: Inject startup\n        run: "
+                    + json.dumps(payload).replace("github", r"\u0067ithub") + "\n",
+                    1,
+                ), encoding="utf-8")
+                (root / ".github/scripts/check_supply_chain.py").write_text(
+                    "raise SystemExit(0)\n", encoding="utf-8"
+                )
+                violations = self._violations(root)
+                self.assertTrue(
+                    any("GitHub context access is forbidden" in item for item in violations),
+                    violations,
+                )
+        for job, expected in check_supply_chain.PROBE_RUNTIME_ENVIRONMENTS.items():
+            with self.subTest(job=job), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows/apply-on-merge.yml"
+                binding = "      - name: Validate\n        env:\n          FERRUM_ENV: "
+                original = path.read_text(encoding="utf-8")
+                self.assertIn(binding + expected, original)
+                path.write_text(original.replace(
+                    binding + expected, binding + '"\\x73taging"', 1
+                ), encoding="utf-8")
+                (root / ".github/scripts/check_supply_chain.py").write_text(
+                    "raise SystemExit(0)\n", encoding="utf-8"
+                )
+                violations = self._violations(root)
+                self.assertTrue(
+                    any("'Validate' must bind exactly FERRUM_ENV" in item for item in violations),
+                    violations,
+                )
+
     def test_pinned_operations_accept_equivalent_yaml_and_safe_outputs(self):
         # Keep actual Validate, Apply, Verify and viewer-diff operations in the
         # positive; an empty document or `run: true` would prove no binding.
@@ -294,9 +566,17 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     text = text.replace("if: " + condition, "if: ${{ " + condition + " }}")
                 for _, condition in check_supply_chain.PROBE_APPLY_JOB_GATES.values():
                     text = text.replace("if: " + condition, "if: ${{ " + condition + " }}")
+                for environment in check_supply_chain.PROBE_RUNTIME_ENVIRONMENTS.values():
+                    text = text.replace(
+                        "FERRUM_ENV: " + environment,
+                        "FERRUM_ENV: " + json.dumps(environment).replace("matrix", r"\x6datrix"),
+                    )
                 text = text.replace(
                     "    steps:\n",
                     "    steps:\n      - name: Read named GitHub property\n        run: |\n"
+                    "          # FERRUM_ENV, FERRUM_NAMESPACE, GITHUB_ENV and github['env']\n"
+                    "          # ${{ steps.deployment-mode.outputs.mode }}\n"
+                    '          echo "mode=${{ steps.deployment-mode.outputs.mode }}"\n'
                     '          echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"\n',
                     1,
                 )
@@ -312,6 +592,24 @@ class SupplyChainPolicyTests(unittest.TestCase):
                             self._step(document, job, "Apply")["run"],
                             "gitforgeops apply --auto-approve",
                         )
+                        self.assertEqual(
+                            self._step(document, job, "Apply (file mode)")["run"],
+                            "gitforgeops apply --auto-approve",
+                        )
+                        self.assertIn(
+                            'FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify',
+                            self._step(document, job, "Verify traffic")["run"],
+                        )
+                        for name in ("Validate", "Apply", "Apply (file mode)", "Verify traffic"):
+                            self.assertEqual(
+                                self._step(document, job, name)["env"]["FERRUM_ENV"],
+                                check_supply_chain.PROBE_RUNTIME_ENVIRONMENTS[job],
+                            )
+                elif workflow.endswith("drift-check.yml"):
+                    self.assertIn(
+                        "gitforgeops diff --exit-on-drift",
+                        self._step(document, "drift", "Check drift")["run"],
+                    )
             result = subprocess.run(
                 [sys.executable, str(SCRIPT), "--root", str(root)],
                 check=False, text=True, capture_output=True,
