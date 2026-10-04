@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -100,6 +101,7 @@ def write_reviewed_tree(
     """Lay out a minimal repository that satisfies the RSA reachability premise."""
     (root / "src" / "secrets").mkdir(parents=True, exist_ok=True)
     (root / "Cargo.toml").write_text(manifest, encoding="utf-8")
+    (root / "Cargo.lock").write_text("version = 4\n", encoding="utf-8")
     (root / "src" / "secrets" / "delivery.rs").write_text(source, encoding="utf-8")
     for relative, text in (extra_sources or {}).items():
         path = root / relative
@@ -175,6 +177,8 @@ with open(os.environ["FAKE_CARGO_RECORD"], "a", encoding="utf-8") as record:
                 "args": sys.argv[1:],
                 "cwd": os.getcwd(),
                 "cargo_home": os.environ.get("CARGO_HOME"),
+                "home": os.environ.get("HOME"),
+                "rustup_home": os.environ.get("RUSTUP_HOME"),
                 "mode": mode,
             }
         )
@@ -673,8 +677,11 @@ class CandidateCargoIsolationTests(unittest.TestCase):
         root = candidate.resolve()
         workdir = Path(call["cwd"]).resolve()
         cargo_home = Path(call["cargo_home"]).resolve()
+        home = Path(call["home"]).resolve()
         self.assertNotIn(root, (workdir, *workdir.parents))
         self.assertNotIn(root, (cargo_home, *cargo_home.parents))
+        self.assertNotIn(root, (home, *home.parents))
+        self.assertNotIn(root, Path(call["rustup_home"]).resolve().parents)
         self.assertEqual(call["mode"], "honest")
 
     def test_candidate_configuration_cannot_forge_a_clean_audit(self):
@@ -741,6 +748,7 @@ class CandidateCargoIsolationTests(unittest.TestCase):
     def test_inherited_cargo_selection_variables_are_scrubbed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "Cargo.toml").write_text(REVIEWED_MANIFEST, encoding="utf-8")
             write_hostile_cargo_inputs(root)
             hostile_environment = {
                 "CARGO": "/bin/false",
@@ -789,7 +797,13 @@ class CandidateCargoIsolationTests(unittest.TestCase):
                 "only the isolated CARGO_HOME reaches cargo",
             )
             cargo_home = Path(environment["CARGO_HOME"]).resolve()
+            home = Path(environment["HOME"]).resolve()
             self.assertNotIn(root.resolve(), (cargo_home, *cargo_home.parents))
+            self.assertNotIn(root.resolve(), (home, *home.parents))
+            self.assertEqual(
+                environment["RUSTUP_HOME"],
+                str(Path(os.environ.get("RUSTUP_HOME") or Path.home() / ".rustup").resolve()),
+            )
             self.assertEqual(environment.get("PATH"), inherited_path)
             self.assertEqual(seen["cwd_entries"], [])
             self.assertEqual(seen["home_entries"], [])
@@ -841,6 +855,460 @@ class CandidateCargoIsolationTests(unittest.TestCase):
                         with check_cargo_audit.isolated_cargo(candidate):
                             self.fail("isolation must refuse before cargo runs")
                 self.assertIn("cargo would read", str(raised.exception))
+
+
+def locked_package(name="rsa", version="0.9.10", checksum="a" * 64, **overrides):
+    package = {
+        "name": name,
+        "version": version,
+        "source": check_cargo_audit.CRATES_IO_SOURCE,
+        "checksum": checksum,
+    }
+    package.update(overrides)
+    return package
+
+
+def write_lockfile(root, packages):
+    text = "version = 4\n"
+    for package in packages:
+        text += "\n[[package]]\n"
+        for key, value in package.items():
+            text += f"{key} = {json.dumps(value)}\n"
+    (root / "Cargo.lock").write_text(text, encoding="utf-8")
+
+
+def index_entry(package, yanked=False):
+    return {
+        "name": package["name"],
+        "vers": package["version"],
+        "cksum": package["checksum"],
+        "yanked": yanked,
+    }
+
+
+class IndexResponse(io.BytesIO):
+    def __init__(self, url, data, status=200, headers=None):
+        super().__init__(data)
+        self.url = url
+        self.status = status
+        self.headers = {} if headers is None else headers
+
+    def geturl(self):
+        return self.url
+
+
+class CompleteCargoAuditGateTests(unittest.TestCase):
+    """Drive main, including real input validation, reachability and scan logic.
+
+    Only external Cargo and HTTP calls are replaced. A reviewed RSA report
+    and an unchanged inverse tree cannot hide an incomplete yanked scan.
+    """
+
+    def run_gate(
+        self, root, entries=None, audit_report=None, audit_stderr="", http=None, audit_status=1
+    ):
+        policy = root / "policy.json"
+        policy.write_text(
+            json.dumps({"schema_version": 1, "exceptions": [exception()]}),
+            encoding="utf-8",
+        )
+        argv = [
+            str(SCRIPT),
+            "--source-root",
+            str(root),
+            "--policy",
+            str(policy),
+            "--today",
+            TODAY,
+        ]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        calls = []
+
+        def cargo(command, **kwargs):
+            calls.append((command, kwargs))
+            if command[1] == "tree":
+                return subprocess.CompletedProcess(command, 0, REVIEWED_RSA_TREE, "")
+            return subprocess.CompletedProcess(
+                command,
+                audit_status,
+                json.dumps(report([vulnerability()]) if audit_report is None else audit_report),
+                audit_stderr,
+            )
+
+        def fetch(request, **kwargs):
+            name = request.full_url.rsplit("/", 1)[-1]
+            value = entries[name]
+            if isinstance(value, Exception):
+                raise value
+            data = "\n".join(json.dumps(entry) for entry in value).encode("utf-8") + b"\n"
+            return IndexResponse(request.full_url, data)
+
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(sys, "stdout", stdout),
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(check_cargo_audit.subprocess, "run", side_effect=cargo),
+            mock.patch.object(
+                check_cargo_audit.urllib.request, "urlopen", side_effect=http or fetch
+            ) as urlopen,
+        ):
+            status = check_cargo_audit.main()
+        return status, stdout.getvalue(), stderr.getvalue(), calls, urlopen
+
+    def test_workspace_redirect_cannot_hide_an_effective_lockfile_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = REVIEWED_MANIFEST.replace(
+                '[package]\n', '[package]\nworkspace = "audit-workspace"\n'
+            )
+            write_reviewed_tree(root, manifest=manifest)
+            write_lockfile(root, [locked_package()])
+            workspace = root / "audit-workspace"
+            workspace.mkdir()
+            (workspace / "Cargo.toml").write_text(
+                '[workspace]\nmembers = [".."]\n', encoding="utf-8"
+            )
+            write_lockfile(
+                workspace, [locked_package(), locked_package("vulnerable", "1.0.0")]
+            )
+
+            status, stdout, stderr, calls, http = self.run_gate(root)
+
+            self.assertEqual(status, 2, stderr)
+            self.assertIn("single-package", stderr)
+            self.assertIn("different dependency graph or lockfile", stderr)
+            self.assertNotIn("policy passed", stdout)
+            self.assertEqual(calls, [])
+            http.assert_not_called()
+
+    def test_workspace_table_and_implicit_ancestor_workspace_are_refused(self):
+        for kind in ("root", "ancestor"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                outer = Path(directory)
+                root = outer / "candidate"
+                root.mkdir()
+                write_reviewed_tree(root)
+                if kind == "root":
+                    (root / "Cargo.toml").write_text(
+                        REVIEWED_MANIFEST + "\n[workspace]\n", encoding="utf-8"
+                    )
+                else:
+                    (outer / "Cargo.toml").write_text(
+                        '[workspace]\nmembers = ["candidate"]\n', encoding="utf-8"
+                    )
+                status, _stdout, stderr, calls, http = self.run_gate(root)
+                self.assertEqual(status, 2, stderr)
+                self.assertIn("workspace", stderr)
+                self.assertEqual(calls, [])
+                http.assert_not_called()
+
+    def test_both_inputs_are_validated_before_any_content_read_or_subprocess(self):
+        for name in ("Cargo.toml", "Cargo.lock"):
+            for kind in ("missing", "symlink", "directory", "fifo", "oversized"):
+                with self.subTest(name=name, kind=kind):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        write_reviewed_tree(root)
+                        path = root / name
+                        path.unlink()
+                        if kind == "symlink":
+                            # Reading this target would never reach EOF.
+                            path.symlink_to("/dev/zero")
+                        elif kind == "directory":
+                            path.mkdir()
+                        elif kind == "fifo":
+                            os.mkfifo(path)
+                        elif kind == "oversized":
+                            limit = (
+                                check_cargo_audit.MAX_MANIFEST_BYTES
+                                if name == "Cargo.toml"
+                                else check_cargo_audit.MAX_LOCKFILE_BYTES
+                            )
+                            with path.open("wb") as stream:
+                                stream.truncate(limit + 1)
+                        with mock.patch.object(check_cargo_audit, "_read_regular_text") as read:
+                            status, _stdout, stderr, calls, http = self.run_gate(root)
+                        self.assertEqual(status, 2, stderr)
+                        read.assert_not_called()
+                        self.assertEqual(calls, [])
+                        http.assert_not_called()
+
+    def test_replaced_file_and_growth_cannot_turn_validation_into_an_unbounded_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "Cargo.toml"
+            path.symlink_to("/dev/zero")
+            with self.assertRaises(check_cargo_audit.PolicyError):
+                check_cargo_audit._read_regular_text(path, 32)
+            path.unlink()
+            os.mkfifo(path)
+            with self.assertRaises(check_cargo_audit.PolicyError):
+                check_cargo_audit._read_regular_text(path, 32)
+            path.unlink()
+            path.write_bytes(b"x" * 33)
+            with self.assertRaises(check_cargo_audit.PolicyError) as raised:
+                check_cargo_audit._read_regular_text(path, 32)
+            self.assertIn("byte limit", str(raised.exception))
+        # Even an unexpected device input is refused before reading bytes.
+        with self.assertRaises(check_cargo_audit.PolicyError):
+            check_cargo_audit._read_regular_text(Path("/dev/zero"), 32)
+
+    def test_whole_index_failure_is_fatal_with_or_without_upstream_warning(self):
+        for upstream_stderr in ("", "warning: couldn't update crates.io index\n"):
+            with self.subTest(stderr=upstream_stderr), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_reviewed_tree(root)
+                write_lockfile(root, [locked_package()])
+                status, stdout, stderr, calls, _http = self.run_gate(
+                    root,
+                    entries={"rsa": OSError("index unavailable")},
+                    audit_stderr=upstream_stderr,
+                )
+                self.assertEqual(status, 2, stderr)
+                self.assertIn("complete yanked scan", stderr)
+                self.assertIn("index unavailable", stderr)
+                self.assertNotIn("policy passed", stdout)
+                self.assertNotIn("yanked scan complete:", stdout)
+                self.assertEqual([call[0][1] for call in calls], ["tree", "audit"])
+
+    def test_one_failed_lookup_cannot_pass_with_a_reviewed_rsa_advisory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_reviewed_tree(root)
+            rsa, age = locked_package(), locked_package("age", "0.12.1")
+            write_lockfile(root, [rsa, age])
+            status, stdout, stderr, _calls, http = self.run_gate(
+                root,
+                entries={"rsa": [index_entry(rsa)], "age": OSError("lookup failed")},
+                audit_stderr="error: couldn't check if the package is yanked\n",
+            )
+            self.assertEqual(status, 2, stderr)
+            self.assertIn("lookup failed", stderr)
+            self.assertNotIn("policy passed", stdout)
+            self.assertEqual(http.call_count, 2)
+
+    def test_incomplete_or_ambiguous_version_evidence_is_fatal(self):
+        package = locked_package()
+        valid = index_entry(package)
+        cases = {
+            "missing version": [dict(valid, vers="0.9.9")],
+            "missing crate": [dict(valid, name="other")],
+            "missing status": [{key: value for key, value in valid.items() if key != "yanked"}],
+            "nonboolean status": [dict(valid, yanked=0)],
+            "wrong checksum": [dict(valid, cksum="b" * 64)],
+            "duplicate version": [valid, valid],
+        }
+        for kind, entries in cases.items():
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_reviewed_tree(root)
+                write_lockfile(root, [package])
+                status, stdout, stderr, _calls, _http = self.run_gate(
+                    root, entries={"rsa": entries}
+                )
+                self.assertEqual(status, 2, stderr)
+                self.assertNotIn("policy passed", stdout)
+
+    def test_complete_scan_passes_and_covers_multiple_locked_versions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_reviewed_tree(root)
+            rsa = locked_package()
+            old, new = locked_package("dep", "1.0.0"), locked_package("dep", "2.0.0")
+            write_lockfile(root, [rsa, old, new])
+            status, stdout, stderr, calls, http = self.run_gate(
+                root,
+                entries={"rsa": [index_entry(rsa)], "dep": [index_entry(old), index_entry(new)]},
+            )
+            self.assertEqual(status, 0, stderr)
+            self.assertIn("yanked scan complete: 3 crates.io package version(s), 0 yanked", stdout)
+            self.assertIn("1 reviewed exception(s)", stdout)
+            self.assertEqual(http.call_count, 2, "one fresh request per crate")
+            for _command, options in calls:
+                environment = options["env"]
+                self.assertNotIn(root, Path(environment["HOME"]).parents)
+                self.assertNotIn(root, Path(environment["CARGO_HOME"]).parents)
+                self.assertNotIn("RUSTUP_TOOLCHAIN", environment)
+
+    def test_yanked_version_blocks_even_when_cargo_audit_omits_the_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_reviewed_tree(root)
+            package = locked_package()
+            write_lockfile(root, [package])
+            status, stdout, stderr, _calls, _http = self.run_gate(
+                root, entries={"rsa": [index_entry(package, yanked=True)]}
+            )
+            self.assertEqual(status, 1, stderr)
+            self.assertIn("yanked scan complete: 1 crates.io package version(s), 1 yanked", stdout)
+            self.assertIn("yanked: rsa 0.9.10", stderr)
+
+    def test_existing_yanked_warning_is_not_counted_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_reviewed_tree(root)
+            package = locked_package()
+            write_lockfile(root, [package])
+            status, _stdout, stderr, _calls, _http = self.run_gate(
+                root,
+                entries={"rsa": [index_entry(package, yanked=True)]},
+                audit_report=report(
+                    [vulnerability()], {"yanked": [warning("yanked", "rsa", "0.9.10")]}
+                ),
+            )
+            self.assertEqual(status, 1, stderr)
+            self.assertEqual(stderr.count("yanked: rsa 0.9.10"), 1)
+
+    def test_saved_audit_json_still_requires_complete_yanked_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree = write_reviewed_tree(root)
+            write_lockfile(root, [locked_package()])
+            policy, saved = root / "policy.json", root / "audit.json"
+            policy.write_text(json.dumps({"schema_version": 1, "exceptions": [exception()]}))
+            saved.write_text(json.dumps(report([vulnerability()])))
+            argv = [
+                str(SCRIPT),
+                "--source-root",
+                str(root),
+                "--policy",
+                str(policy),
+                "--today",
+                TODAY,
+                "--audit-json",
+                str(saved),
+                "--dependency-tree",
+                str(tree),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(sys, "stderr", io.StringIO()) as stderr,
+                mock.patch.object(check_cargo_audit.subprocess, "run") as cargo,
+                mock.patch.object(
+                    check_cargo_audit.urllib.request, "urlopen", side_effect=OSError("offline")
+                ),
+            ):
+                self.assertEqual(check_cargo_audit.main(), 2)
+            self.assertIn("complete yanked scan", stderr.getvalue())
+            cargo.assert_not_called()
+
+    def test_unsupported_registry_or_malformed_lockfile_fails_before_cargo(self):
+        packages = [
+            locked_package(source="registry+https://registry.example.invalid/index"),
+            locked_package(checksum=""),
+            locked_package(name="../escape"),
+            locked_package(version="invalid"),
+            locked_package(source=42),
+        ]
+        for package in packages:
+            with self.subTest(package=package), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_reviewed_tree(root)
+                write_lockfile(root, [package])
+                status, stdout, stderr, calls, http = self.run_gate(root)
+                self.assertEqual(status, 2, stderr)
+                self.assertNotIn("policy passed", stdout)
+                self.assertEqual(calls, [])
+                http.assert_not_called()
+
+    def test_registry_response_errors_never_produce_complete_scan_evidence(self):
+        package = locked_package()
+        data = json.dumps(index_entry(package)).encode("utf-8") + b"\n"
+        cases = {
+            "invalid JSON": (b"not JSON", 200, {}, None),
+            "empty body": (b"", 200, {}, None),
+            "nonobject row": (b"[]\n", 200, {}, None),
+            "HTTP failure": (data, 503, {}, None),
+            "truncated body": (data, 200, {"Content-Length": str(len(data) + 1)}, None),
+            "unexpected redirect": (data, 200, {}, "https://example.invalid/forged"),
+        }
+        for kind, (body, status_code, headers, redirect) in cases.items():
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_reviewed_tree(root)
+                write_lockfile(root, [package])
+
+                def fetch(request, **kwargs):
+                    return IndexResponse(redirect or request.full_url, body, status_code, headers)
+
+                status, stdout, stderr, _calls, _http = self.run_gate(root, http=fetch)
+                self.assertEqual(status, 2, stderr)
+                self.assertNotIn("yanked scan complete:", stdout)
+
+    def test_sparse_path_rules_timeout_and_response_bound(self):
+        cases = (("a", "1/a"), ("ab", "2/ab"), ("Abc", "3/a/abc"), ("Cargo", "ca/rg/cargo"))
+        for name, suffix in cases:
+            with self.subTest(name=name):
+                def fetch(request, **kwargs):
+                    self.assertEqual(request.full_url, f"https://index.crates.io/{suffix}")
+                    self.assertEqual(kwargs["timeout"], check_cargo_audit.INDEX_TIMEOUT_SECONDS)
+                    self.assertEqual(request.get_header("Cache-control"), "no-cache")
+                    return IndexResponse(request.full_url, b"{}\n")
+
+                with mock.patch.object(
+                    check_cargo_audit.urllib.request, "urlopen", side_effect=fetch
+                ):
+                    self.assertEqual(check_cargo_audit._fetch_crate_index(name), [{}])
+        response = IndexResponse("https://index.crates.io/3/r/rsa", b"x" * 33)
+        with (
+            mock.patch.object(check_cargo_audit, "MAX_INDEX_BYTES", 32),
+            mock.patch.object(check_cargo_audit.urllib.request, "urlopen", return_value=response),
+        ):
+            with self.assertRaises(check_cargo_audit.PolicyError) as raised:
+                check_cargo_audit._fetch_crate_index("rsa")
+        self.assertIn("byte limit", str(raised.exception))
+
+    def test_independent_findings_cannot_hide_an_unparseable_or_failed_audit(self):
+        cases = ((report(), 1), (report([vulnerability()]), 2), ([], 0), (report(count=2), 1))
+        for audit_report, audit_status in cases:
+            with self.subTest(report=audit_report, status=audit_status):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_reviewed_tree(root)
+                    package = locked_package()
+                    write_lockfile(root, [package])
+                    status, stdout, stderr, _calls, http = self.run_gate(
+                        root,
+                        entries={"rsa": [index_entry(package, yanked=True)]},
+                        audit_report=audit_report,
+                        audit_status=audit_status,
+                    )
+                    self.assertEqual(status, 2, stderr)
+                    self.assertNotIn("policy passed", stdout)
+                    http.assert_not_called()
+
+    def test_local_and_git_packages_do_not_require_registry_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_reviewed_tree(root)
+            rsa = locked_package()
+            write_lockfile(
+                root,
+                [
+                    rsa,
+                    {"name": "gitforgeops", "version": "0.1.0"},
+                    {
+                        "name": "git-dep",
+                        "version": "1.0.0",
+                        "source": "git+https://example.invalid/repo#abc",
+                    },
+                ],
+            )
+            status, stdout, stderr, _calls, http = self.run_gate(
+                root, entries={"rsa": [index_entry(rsa)]}
+            )
+            self.assertEqual(status, 0, stderr)
+            self.assertIn("yanked scan complete: 1 crates.io package version(s)", stdout)
+            self.assertEqual(http.call_count, 1)
+
+    def test_candidate_rustup_store_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.dict(os.environ, {"RUSTUP_HOME": str(root / "toolchain")}):
+                with self.assertRaises(check_cargo_audit.PolicyError) as raised:
+                    with check_cargo_audit.isolated_cargo(root):
+                        self.fail("candidate toolchains must not run")
+            self.assertIn("RUSTUP_HOME", str(raised.exception))
 
 
 class RustSourceStrippingTests(unittest.TestCase):

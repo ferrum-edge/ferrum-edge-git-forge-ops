@@ -57,14 +57,24 @@ So `check_cargo_audit.py` never runs cargo from the candidate checkout:
 
 - `cargo tree --manifest-path <candidate>/Cargo.toml` and
   `cargo audit --file <candidate>/Cargo.lock` run from a fresh temporary
-  directory with a fresh, empty `CARGO_HOME`;
+  directory with fresh, empty `HOME` and `CARGO_HOME` directories; `RUSTUP_HOME`
+  retains the runner's installed toolchain store outside the candidate tree;
 - inherited `CARGO_*` variables (including `CARGO_ALIAS_<name>`), cargo's
   internal `__CARGO_*` overrides, `RUSTUP_TOOLCHAIN`, `RUSTC`,
   `RUSTC_BOOTSTRAP`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTFLAGS`
   and `RUSTDOCFLAGS` are removed from their environment, so the toolchain is
   the runner's default from the workflow's pinned toolchain step;
 - `Cargo.toml` and `Cargo.lock` must be regular files, not symlinks, and a
-  missing lockfile is refused rather than generated;
+  missing lockfile is refused rather than generated. Both files are checked
+  before any content read, reachability check or Cargo invocation. Reads refuse
+  symlinks and special files at open time and are bounded to 1 MiB for the
+  manifest and 8 MiB for the lockfile;
+- this single-package repository must keep `gitforgeops` and its audited
+  `Cargo.lock` at the root. `package.workspace`, any `[workspace]` table and an
+  ancestor `Cargo.toml` are refused. Cargo can otherwise select a different
+  workspace's graph and lockfile, leaving the root audit disconnected from the
+  compiled dependencies. Introducing a workspace requires a reviewed change
+  to this policy that establishes and audits the effective workspace graph;
 - the gate refuses to run when the temporary directory is inside the
   checkout, or when any of those configuration files exists at or above it
   (point `TMPDIR` elsewhere).
@@ -110,6 +120,39 @@ needs to be tracked to a deadline.
 The gate also fails when `cargo audit` exits 1 but no findings were parsed, or
 when `vulnerabilities.count` disagrees with the parsed list. A change in the
 report format fails loudly instead of reading as clean.
+
+### Complete yanked checks
+
+`--deny yanked` alone does not prove that cargo-audit 0.22.1 checked the locked
+versions. In the [published crate](https://crates.io/crates/cargo-audit/0.22.1),
+`src/auditor.rs` turns an index-fetch error into `None`, then skips the yanked
+scan when the index is absent. `src/config.rs::OutputConfig::is_quiet` treats
+JSON output as quiet, suppressing the fetch warning. Individual
+`find_yanked` errors are printed and discarded without failing the report.
+The corresponding [upstream auditor source](https://github.com/RustSec/rustsec/blob/efcde93a237dc51f8c32d84d880bf97b442835c8/cargo-audit/src/auditor.rs)
+and [output configuration](https://github.com/RustSec/rustsec/blob/efcde93a237dc51f8c32d84d880bf97b442835c8/cargo-audit/src/config.rs)
+show these paths. Matching stderr cannot catch the quiet fetch failure.
+
+The checker therefore performs an independent, mandatory scan of
+`https://index.crates.io/`, using Cargo's documented
+[sparse-index paths and record format](https://doc.rust-lang.org/cargo/reference/registry-index.html).
+It fetches each crate once with at most eight concurrent requests and verifies
+every locked crates.io version against exactly one record with a matching
+name, version and checksum and an explicit boolean `yanked` field. There is
+no local index cache or offline fallback. Each request has a 30-second socket
+timeout and a 16 MiB response limit; failed, redirected, truncated, malformed,
+missing or ambiguous records are operational failures (exit 2), even when the
+only advisory is the reviewed RSA exception. An outage may therefore block
+Security until crates.io is available again.
+
+Only a completed scan prints `yanked scan complete` with the number of checked
+package versions. Independently found yanked versions join the existing
+blocking findings without duplicating cargo-audit warnings. The registry source
+must be crates.io's canonical lockfile source; other registries are refused
+until a reviewed scanner supports them. Local and Git dependencies have no
+registry yanked status. Saved `--audit-json` reports still require the scan.
+The tests exercise the complete gate with both whole-index and per-package
+failures, including quiet JSON and an otherwise reviewed RSA report.
 
 ## Exceptions
 
@@ -206,13 +249,16 @@ cargo test --test unit_tests
 ```
 
 Run locally, `check_cargo_audit.py` behaves exactly as it does in CI. Each
-`cargo tree` and `cargo audit` call gets a fresh, empty `CARGO_HOME`, so every
-run downloads the crates.io index, the needed crate manifests and the RustSec
-advisory database again; your `~/.cargo` cache, registry configuration and
-`~/.cargo/audit.toml` are not used. It also runs from a temporary directory, so
+`cargo tree` and `cargo audit` call gets fresh, empty `HOME` and `CARGO_HOME`
+directories, so every run downloads the crates.io index, the needed crate
+manifests and the RustSec advisory database again. Your `~/.cargo` cache,
+registry configuration and `~/.cargo/audit.toml` are not used. Each call also
+runs from a temporary directory, so
 the repository's `rust-toolchain.toml` does not apply: cargo comes from your
 rustup default toolchain (or `PATH`), and `RUSTUP_TOOLCHAIN` is ignored. To
 match CI, make the channel pinned in `rust-toolchain.toml` your rustup default.
+The independent yanked scan also fetches fresh sparse-index records and
+requires connectivity to `index.crates.io`.
 
 `cargo audit` reads the committed `Cargo.lock` as-is. Run `cargo update` only
 when you mean to move the lockfile; it is an upgrade, not a check.

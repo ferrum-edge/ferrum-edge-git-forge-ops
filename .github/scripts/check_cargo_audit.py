@@ -6,13 +6,18 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import http.client
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import tomllib
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -99,6 +104,15 @@ SCRUBBED_ENVIRONMENT = frozenset(
     }
 )
 SCRUBBED_ENVIRONMENT_PREFIXES = ("CARGO_", "__CARGO_")
+
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_LOCKFILE_BYTES = 8 * 1024 * 1024
+MAX_INDEX_BYTES = 16 * 1024 * 1024
+INDEX_TIMEOUT_SECONDS = 30
+CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+CRATE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+CRATE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?$")
+CHECKSUM = re.compile(r"^[0-9a-f]{64}$")
 
 _RAW_STRING_START = re.compile(r'b?r(?P<hashes>#*)"')
 _CHAR_LITERAL = re.compile(r"b?'(?:\\.|[^\\'\n])'")
@@ -210,6 +224,8 @@ def _finding_key(finding: dict[str, Any]) -> tuple[str, str, str, str, str]:
 
 def collect_findings(report: dict[str, Any]) -> list[dict[str, str | None]]:
     """Flatten cargo-audit's vulnerability and warning buckets."""
+    if not isinstance(report, dict):
+        raise PolicyError("cargo-audit report must be a JSON object")
     findings: list[dict[str, str | None]] = []
 
     vulnerability_section = report.get("vulnerabilities", {})
@@ -386,21 +402,80 @@ def ignored_candidate_cargo_inputs(source_root: Path) -> list[str]:
     return [name for name in CARGO_CONTROL_FILES if os.path.lexists(source_root / name)]
 
 
-def _candidate_regular_file(source_root: Path, name: str) -> Path:
+def _candidate_regular_file(source_root: Path, name: str, limit: int) -> Path:
     """Return a candidate input that must be a regular file, never a link."""
     path = source_root / name
-    if path.is_symlink() or not path.is_file():
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise PolicyError(f"candidate {name} must be a regular file: {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
         raise PolicyError(f"candidate {name} must be a regular file: {path}")
+    if metadata.st_size > limit:
+        raise PolicyError(f"candidate {name} exceeds the {limit}-byte limit")
     return path
 
 
-def _scrubbed_cargo_environment(cargo_home: Path) -> dict[str, str]:
+def _read_regular_text(path: Path, limit: int) -> str:
+    """Bound reads and refuse links/devices even if the checked path is replaced."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise PolicyError(f"candidate input must be a regular file: {path}")
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise PolicyError(f"candidate input exceeds the {limit}-byte limit: {path}")
+        return data.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PolicyError(f"cannot inspect {path}: {exc}") from exc
+
+
+def validate_candidate_inputs(source_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate BOTH files before any content read or Cargo subprocess."""
+    manifest_path = _candidate_regular_file(source_root, "Cargo.toml", MAX_MANIFEST_BYTES)
+    lockfile_path = _candidate_regular_file(source_root, "Cargo.lock", MAX_LOCKFILE_BYTES)
+    try:
+        manifest = tomllib.loads(_read_regular_text(manifest_path, MAX_MANIFEST_BYTES))
+        lockfile = tomllib.loads(_read_regular_text(lockfile_path, MAX_LOCKFILE_BYTES))
+    except tomllib.TOMLDecodeError as exc:
+        raise PolicyError(f"cannot parse candidate Cargo inputs: {exc}") from exc
+    package = manifest.get("package")
+    if not isinstance(package, dict) or package.get("name") != "gitforgeops":
+        raise PolicyError("audit gate requires the single gitforgeops root package")
+    if "workspace" in package or "workspace" in manifest:
+        raise PolicyError(
+            "audit gate requires a single-package repository; package.workspace and "
+            "[workspace] are refused because Cargo could use a different dependency "
+            "graph or lockfile than the audited root Cargo.lock"
+        )
+    # Cargo also discovers an implicit workspace through ancestor manifests.
+    # Refuse conservatively without reading files outside the candidate tree.
+    for ancestor in source_root.resolve().parents:
+        if os.path.lexists(ancestor / "Cargo.toml"):
+            raise PolicyError(
+                "audit gate requires a standalone checkout without an ancestor "
+                f"Cargo.toml that could select a workspace: {ancestor / 'Cargo.toml'}"
+            )
+    if lockfile.get("version") not in (3, 4):
+        raise PolicyError("audit gate requires a version 3 or 4 Cargo.lock")
+    return manifest, lockfile
+
+
+def _scrubbed_cargo_environment(cargo_home: Path, home: Path) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
         if key not in SCRUBBED_ENVIRONMENT
         and not key.startswith(SCRUBBED_ENVIRONMENT_PREFIXES)
     }
+    # HOME must not expose Git/user configuration. Rustup still needs the
+    # runner's installed default toolchain, so retain only its trusted store.
+    environment["RUSTUP_HOME"] = str(
+        Path(os.environ.get("RUSTUP_HOME") or Path.home() / ".rustup").resolve()
+    )
+    environment["HOME"] = str(home)
     environment["CARGO_HOME"] = str(cargo_home)
     return environment
 
@@ -411,7 +486,7 @@ def isolated_cargo(source_root: Path) -> Iterator[tuple[Path, dict[str, str]]]:
 
     Cargo, rustup and cargo-audit all read configuration relative to the
     working directory, not to `--manifest-path` or `--file`. Running from a
-    fresh directory outside the candidate tree, with a fresh `CARGO_HOME` and
+    fresh directory outside the candidate tree, with fresh `HOME`/`CARGO_HOME` and
     no inherited cargo/rustup selection variables, leaves the candidate's
     manifest and lockfile as the only inputs. The toolchain is the runner's
     default, installed by the workflow's pinned toolchain step.
@@ -425,8 +500,10 @@ def isolated_cargo(source_root: Path) -> Iterator[tuple[Path, dict[str, str]]]:
         base = Path(directory).resolve()
         workdir = base / "work"
         cargo_home = base / "cargo-home"
+        home = base / "home"
         workdir.mkdir()
         cargo_home.mkdir()
+        home.mkdir()
         if root == workdir or root in workdir.parents:
             raise PolicyError(
                 f"the isolated cargo directory {workdir} is inside the candidate "
@@ -440,7 +517,11 @@ def isolated_cargo(source_root: Path) -> Iterator[tuple[Path, dict[str, str]]]:
                         "working directory; point TMPDIR at a directory without "
                         "cargo or rustup configuration above it"
                     )
-        yield workdir, _scrubbed_cargo_environment(cargo_home)
+        environment = _scrubbed_cargo_environment(cargo_home, home)
+        rustup_home = Path(environment["RUSTUP_HOME"])
+        if root == rustup_home or root in rustup_home.parents:
+            raise PolicyError("RUSTUP_HOME must not point inside the candidate tree")
+        yield workdir, environment
 
 
 def _read_dependency_tree(
@@ -455,7 +536,8 @@ def _read_dependency_tree(
             ) from exc
 
     spec = f"{package}@{version}"
-    manifest = _candidate_regular_file(source_root, "Cargo.toml")
+    validate_candidate_inputs(source_root)
+    manifest = source_root / "Cargo.toml"
     try:
         with isolated_cargo(source_root) as (workdir, environment):
             result = subprocess.run(
@@ -498,11 +580,7 @@ def verify_age_encryption_only(
     exception: dict[str, Any], source_root: Path, dependency_tree_path: Path | None
 ) -> None:
     """Fail closed if the RSA exception outlives its encryption-only premise."""
-    manifest_path = source_root / "Cargo.toml"
-    try:
-        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise PolicyError(f"cannot inspect {manifest_path}: {exc}") from exc
+    manifest, _lockfile = validate_candidate_inputs(source_root)
     age_dependency = manifest.get("dependencies", {}).get("age")
     if not isinstance(age_dependency, dict):
         raise PolicyError("RSA exception requires age to use an explicit dependency table")
@@ -630,7 +708,8 @@ def run_cargo_audit(source_root: Path) -> tuple[dict[str, Any], int]:
     # An explicit `--file` also stops cargo-audit from generating a lockfile
     # when the candidate has none: a missing lockfile is a refusal, not a
     # fresh resolution.
-    lockfile = _candidate_regular_file(source_root, "Cargo.lock")
+    validate_candidate_inputs(source_root)
+    lockfile = source_root / "Cargo.lock"
     try:
         with isolated_cargo(source_root) as (workdir, environment):
             result = subprocess.run(
@@ -659,6 +738,120 @@ def run_cargo_audit(source_root: Path) -> tuple[dict[str, Any], int]:
     except json.JSONDecodeError as exc:
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise PolicyError(f"cargo audit did not return JSON: {detail}") from exc
+
+
+def _registry_packages(lockfile: dict[str, Any]) -> list[dict[str, str]]:
+    packages = lockfile.get("package", [])
+    if not isinstance(packages, list):
+        raise PolicyError("Cargo.lock package entries must be a list")
+    registry_packages = []
+    identities = set()
+    for package in packages:
+        if not isinstance(package, dict):
+            raise PolicyError("Cargo.lock contains a malformed package")
+        name, version, source = (package.get(key) for key in ("name", "version", "source"))
+        if not isinstance(name, str) or not CRATE_NAME.fullmatch(name):
+            raise PolicyError("Cargo.lock contains an invalid package name")
+        if not isinstance(version, str) or not CRATE_VERSION.fullmatch(version):
+            raise PolicyError(f"Cargo.lock contains an invalid version for {name}")
+        if source is not None and not isinstance(source, str):
+            raise PolicyError(f"Cargo.lock contains an invalid source for {name}")
+        identity = (name, version, source)
+        if identity in identities:
+            raise PolicyError(f"Cargo.lock repeats package {name}@{version}")
+        identities.add(identity)
+        if source is None or source.startswith("git+"):
+            # Local and Git dependencies have no registry yanked status.
+            continue
+        if source != CRATES_IO_SOURCE:
+            raise PolicyError(
+                f"complete yanked scan does not support source {source!r} for "
+                f"{name}@{version}; this repository uses only the crates.io registry"
+            )
+        checksum = package.get("checksum")
+        if not isinstance(checksum, str) or not CHECKSUM.fullmatch(checksum):
+            raise PolicyError(f"Cargo.lock lacks a valid checksum for {name}@{version}")
+        registry_packages.append(
+            {"name": name, "version": version, "source": source, "checksum": checksum}
+        )
+    return registry_packages
+
+
+def _fetch_crate_index(name: str) -> list[dict[str, Any]]:
+    lower = name.lower()
+    if len(lower) <= 2:
+        prefix = str(len(lower))
+    elif len(lower) == 3:
+        prefix = f"3/{lower[0]}"
+    else:
+        prefix = f"{lower[:2]}/{lower[2:4]}"
+    url = f"https://index.crates.io/{prefix}/{lower}"
+    request = urllib.request.Request(
+        url, headers={"Accept": "text/plain", "Cache-Control": "no-cache"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=INDEX_TIMEOUT_SECONDS) as response:
+            if response.status != 200 or response.geturl() != url:
+                raise PolicyError(f"unexpected crates.io index response for {name}")
+            data = response.read(MAX_INDEX_BYTES + 1)
+            if len(data) > MAX_INDEX_BYTES:
+                raise PolicyError(f"crates.io index entry exceeds the byte limit for {name}")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and int(content_length) != len(data):
+                raise PolicyError(f"incomplete crates.io index response for {name}")
+        entries = [json.loads(line) for line in data.decode("utf-8").splitlines()]
+    except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as exc:
+        raise PolicyError(f"complete yanked scan cannot read index for {name}: {exc}") from exc
+    if not entries or not all(isinstance(entry, dict) for entry in entries):
+        raise PolicyError(f"malformed crates.io index entry for {name}")
+    return entries
+
+
+def scan_yanked_packages(lockfile: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    """Require positive index evidence for EVERY locked registry package version.
+
+    cargo-audit 0.22.1 can return successful JSON without an index and after
+    individual lookup errors. Its warning list is not completeness evidence.
+    Query the published crates.io sparse index independently, without Cargo
+    configuration, local cache or fallback. Any unavailable or missing record
+    is an operational failure, even when all advisories have exceptions.
+    """
+    packages = _registry_packages(lockfile)
+    names = sorted({package["name"] for package in packages})
+    # Fetch each crate once, including crates with multiple locked versions.
+    # Executor.map preserves deterministic processing and propagates failures.
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        indices = dict(zip(names, executor.map(_fetch_crate_index, names)))
+    yanked = []
+    for package in packages:
+        name, version = package["name"], package["version"]
+        matching = [
+            entry
+            for entry in indices[name]
+            if entry.get("name") == name and entry.get("vers") == version
+        ]
+        if len(matching) != 1:
+            raise PolicyError(f"complete yanked scan lacks a unique record for {name}@{version}")
+        entry = matching[0]
+        if entry.get("cksum") != package["checksum"]:
+            raise PolicyError(f"crates.io checksum differs from Cargo.lock for {name}@{version}")
+        if not isinstance(entry.get("yanked"), bool):
+            raise PolicyError(f"complete yanked scan lacks a boolean status for {name}@{version}")
+        if entry["yanked"]:
+            yanked.append({"kind": "yanked", "package": package, "advisory": None})
+    return yanked, len(packages)
+
+
+def merge_yanked_findings(report: dict[str, Any], yanked: list[dict[str, Any]]) -> None:
+    # Validate the original report before adding independently verified rows.
+    findings = collect_findings(report)
+    seen = {_finding_key(finding) for finding in findings if finding["kind"] == "yanked"}
+    for item in yanked:
+        package = item["package"]
+        key = ("yanked", "", package["name"], package["version"], package["source"])
+        if key not in seen:
+            report.setdefault("warnings", {}).setdefault("yanked", []).append(item)
+            seen.add(key)
 
 
 def parse_args() -> argparse.Namespace:
@@ -710,6 +903,9 @@ def main() -> int:
             f"toolchain configuration: {', '.join(ignored)}"
         )
     try:
+        _manifest, lockfile = validate_candidate_inputs(source_root)
+        # Refuse unsupported/incomplete lockfile rows before reachability or Cargo.
+        _registry_packages(lockfile)
         policy = load_policy(args.policy, args.today)
         verify_exception_reachability(policy, source_root, args.dependency_tree)
         if args.audit_json:
@@ -717,11 +913,22 @@ def main() -> int:
             audit_status = args.audit_exit_status
         else:
             report, audit_status = run_cargo_audit(source_root)
+        audit_findings = collect_findings(report)
+        if audit_status == 1 and not audit_findings:
+            raise PolicyError("cargo audit reported findings this gate could not parse")
+        if audit_status not in (0, 1):
+            raise PolicyError(f"cargo audit failed operationally with exit {audit_status}")
+        yanked, checked_packages = scan_yanked_packages(lockfile)
+        merge_yanked_findings(report, yanked)
         reviewed, blocked, stale, informational = evaluate(report, policy)
     except (OSError, json.JSONDecodeError, PolicyError) as exc:
         print(f"cargo-audit policy error: {exc}", file=sys.stderr)
         return 2
 
+    print(
+        f"yanked scan complete: {checked_packages} crates.io package version(s), "
+        f"{len(yanked)} yanked"
+    )
     for annotation in review_deadline_warnings(policy, args.today):
         print(annotation)
 
@@ -737,17 +944,6 @@ def main() -> int:
             f"::warning::cargo-audit {finding['kind']} {advisory} affects "
             f"{finding['package']} {finding['version']} (reported, not blocking)"
         )
-
-    parsed_findings = len(reviewed) + len(blocked) + len(informational)
-    if audit_status == 1 and parsed_findings == 0:
-        print(
-            "cargo audit reported findings this gate could not parse",
-            file=sys.stderr,
-        )
-        return 2
-    if audit_status not in (0, 1):
-        print(f"cargo audit failed operationally with exit {audit_status}", file=sys.stderr)
-        return 2
 
     if blocked:
         print("Unreviewed cargo-audit findings:", file=sys.stderr)

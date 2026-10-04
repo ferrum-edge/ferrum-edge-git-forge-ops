@@ -81,6 +81,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Fail the cargo-audit gate closed when yanked-package verification cannot
+  complete (#455). Independently verify every locked crates.io version's
+  checksum and explicit yanked status against fresh sparse-index records;
+  cargo-audit 0.22.1's JSON and exit status can otherwise omit an index or
+  package-lookup failure. Reject workspace redirection for this single-package
+  repository so Cargo's effective graph uses the audited root lockfile, and
+  validate both bounded, regular-file Cargo inputs before any content read or
+  Cargo invocation (#454). Isolate `HOME` alongside `CARGO_HOME` while keeping
+  the runner's trusted rustup toolchain store. Complete-gate regression tests
+  cover unsafe inputs, workspace redirects and incomplete index evidence.
 - The cargo-audit policy gate no longer runs `cargo` from the candidate
   checkout (#448). `cargo tree` and `cargo audit` run from a fresh temporary
   directory with a fresh `CARGO_HOME`, take the candidate's `Cargo.toml` and
