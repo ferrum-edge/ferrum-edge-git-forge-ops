@@ -392,8 +392,8 @@ namespace payload is built before the first mutation.
   assertion, post-plugin proxy update, shared adoption claim, ambiguous-create
   and ambiguous-batch ownership assertions — goes through
   `api_target::Preconditions` (or the same steps inline):
-  1. `GET /<kind>/{id}` (`AdminClient::get_tagged`); Edge v0.9.9+
-     (`src/admin/preconditions.rs`) returns a strong `ETag` for the stored row;
+  1. `GET /<kind>/{id}` (`AdminClient::get_tagged`); released Edge v0.9.6
+     source includes `src/admin/preconditions.rs` for strong `ETag` support;
   2. the row must still be the planned one (`Preconditions::confirm_content`):
      same `api_spec_id` (`ownership_refusal`), same content minus server
      timestamps, and for an update no nested field the typed mirror drops
@@ -419,8 +419,8 @@ namespace payload is built before the first mutation.
   re-read shows the desired row unowned (`CreateResource::wrote_itself`;
   never for consumers). A gone row: delete not sent (already gone), update
   refused. A cached single read is `StaleGatewayView`; a missing or weak
-  `ETag` (pre-0.9.9 gateway, which would also ignore `If-Match`) is the
-  run-stopping `ConditionalWriteUnavailable`, which `preflight_api_apply`
+  `ETag`, or a gateway that does not honor `If-Match`, is the run-stopping
+  `ConditionalWriteUnavailable`, which `preflight_api_apply`
   (before allocation and any write) and `doctor`'s
   `gateway-conditional-writes` check also probe for. Edge redacts consumer
   credentials on `GET /consumers/{id}` while its tag covers them, so a
@@ -429,10 +429,11 @@ namespace payload is built before the first mutation.
   backup, one after it fails `If-Match`. Only `rotate`'s consumer `PUT` and
   `/restore` stay unconditional. `plan` does not probe: it reads `/backup`
   only.
-  v0.9.9 is the minimum for tags and `If-Match`, not a certification of the
-  full backup/consumer wire contract. Exact-build lifecycle qualification and
-  the namespace, ownership and credential checks still apply; pending gateway
-  representation fixes are not assumed released.
+  Conditional writes require a probed strong `ETag` and honored `If-Match`.
+  Edge's released v0.9.6 source includes this capability; it does not certify
+  the full backup/consumer wire contract. Exact-build lifecycle qualification
+  and the namespace, ownership and credential checks still apply; pending
+  gateway representation fixes are not assumed released.
 - **Credentials travel only over TLS or loopback.** Every admin request is
   built through `AdminClient::authorize` / `Authorized::request`, the only
   place the bearer token is minted and attached; it refuses a target that is

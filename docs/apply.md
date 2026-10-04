@@ -95,7 +95,7 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
   writes are withheld. See
   [Changes made during an apply](#changes-made-during-an-apply).
 - **`ConditionalWriteUnavailable`.** The gateway returned no strong `ETag` for
-  a row apply must overwrite (Ferrum Edge before v0.9.9). It stops the run.
+  a row apply must overwrite, or did not honor `If-Match`. It stops the run.
 - **Namespace-scoped backups** must carry an explicit, matching `namespace` on
   every row, and must not contain duplicate `(namespace, id)` rows within a
   kind. Otherwise the snapshot is rejected before diffing: `diff`, `plan` and
@@ -175,19 +175,20 @@ writes go out. Incremental apply therefore never overwrites or deletes an
 existing row unconditionally. For every modify, delete, pending-create
 ownership assertion, adoption claim and ambiguous-create ownership assertion it:
 
-1. reads the row with `GET /<kind>/{id}`, which Ferrum Edge (v0.9.9 and later)
-   answers with a strong `ETag` for the stored row;
+1. reads the row with `GET /<kind>/{id}` and requires a strong `ETag` for the
+   stored row;
 2. compares that row with the row it planned against; and
 3. sends the `PUT` or `DELETE` with `If-Match: <etag>`.
 
-v0.9.9 is the minimum release for this conditional-write capability
-([release source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.9/src/admin/preconditions.rs),
-[Edge PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)). It does
+Released Ferrum Edge v0.9.6 source includes this conditional-write capability
+([release source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
+[Edge PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)). Apply
+requires a probed strong `ETag` and honored `If-Match`. This capability does
 not certify the rest of the gateway's backup or consumer representation for
 this client. Apply still requires explicit matching namespaces, authoritative
 ownership metadata and comparable consumer credentials; the lifecycle suite
 must pass against the exact gateway build. Pending gateway fixes to those
-representations are not implied by this minimum.
+representations are not implied by the v0.9.6 source.
 
 Edge compares the tag and commits the write under one namespace admission lease
 that every admin writer (CRUD, `/batch`, `/restore`, `/api-specs`, credential
@@ -228,13 +229,13 @@ Consumers are never counted that way, because their read redacts credentials;
 their refusal says the earlier attempt may have committed, and the re-run
 reconciles it.
 
-A read served from cache (`X-Data-Source: cached`), or one without a strong
-`ETag` (a gateway older than v0.9.9), stops the run: no write can be made
-conditional on it. The apply preflight, before any credential is allocated or
-any row written, reads one row the run will overwrite, so such a gateway is
-refused up front rather than after earlier creates landed; `doctor --scope
-gateway` reports it too. A read that fails refuses that write like any failed
-write.
+A read served from cache (`X-Data-Source: cached`), one without a strong
+`ETag`, or a gateway that does not honor `If-Match` stops the run: no write can
+be made conditional on it. The apply preflight, before any credential is
+allocated or any row written, reads one row the run will overwrite, so such a
+gateway is refused up front rather than after earlier creates landed;
+`doctor --scope gateway` reports it too. A read that fails refuses that write
+like any failed write.
 
 **Consumers** take one more read. Edge redacts consumer credentials on a
 single-resource `GET`, although its tag covers them, so that read cannot show
