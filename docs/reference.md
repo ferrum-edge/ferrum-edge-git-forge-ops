@@ -112,8 +112,8 @@ and prints an `=== Apply Blockers ===` section for:
   (`publication-path-collision`);
 - a `.gitforgeops/smoke.yaml` that does not load, or names a slot `verify`
   would refuse (`invalid-smoke-checks`);
-- in a run bound to the environment, a check that sends a slot while
-  `FERRUM_VERIFY_PROBE_CONSUMERS` is unset, blank or malformed
+- a check that sends a slot while `FERRUM_VERIFY_PROBE_CONSUMERS` is malformed
+  in any run, or unset/blank in an environment-bound run
   (`probe-consumer-allowlist`, a repository administrator's fix);
 - a live comparison finding declarations that collide with API-spec-owned
   rows.
@@ -161,7 +161,7 @@ Set these per deployment environment (Settings → Environments, or
 |---|---|---|
 | `FERRUM_GATEWAY_URL` | api mode | Admin API base URL; must be `https://`. |
 | `FERRUM_ADMIN_JWT_SECRET` | api mode | HS256 signing secret, at least 32 characters. |
-| `FERRUM_ADMIN_JWT_VIEWER_SECRET` | optional | The gateway's `FERRUM_ADMIN_JWT_VIEWER_SECRET` (Ferrum Edge v0.9.9+), at least 32 characters and different from the admin secret. `diff` then reads with it and never uses the admin secret. Not bound by the bundled workflows yet. |
+| `FERRUM_ADMIN_JWT_VIEWER_SECRET` | api drift monitoring | The gateway's `FERRUM_ADMIN_JWT_VIEWER_SECRET` (Ferrum Edge v0.9.9+), at least 32 characters and different from the admin secret. `diff` then reads with it and never uses the admin secret. Required by the bundled drift workflow; see [Scheduled monitoring](#scheduled-monitoring). |
 | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | yes | State-writer App private key. |
 | `FERRUM_GH_PROVISIONER_TOKEN` | to allocate or rotate | App installation token (preferred) or fine-grained PAT with `Secrets: write` + `Environments: write`. |
 | `FERRUM_ADMIN_JWT_ISSUER` | optional | `iss` claim; default `ferrum-edge`. |
@@ -227,7 +227,7 @@ case-insensitive), malformed or zero numbers, and bad URLs are errors. See
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validator binary. |
 | `FERRUM_VERIFY_BASE_URL` | — | Data-plane URL for `verify`. |
 | `FERRUM_VERIFY_PROBE_CONSUMERS` | — | Operator allowlist of probe Consumers (`<namespace>/<consumer-id>`, comma-separated). `verify` refuses every check that sends a slot while it is unset; `validate`, `plan`, `apply` and `review` check it when set. |
-| `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set (`true`) only by workflow steps bound to the environment. Then an unset, blank or malformed allowlist refuses a slot-sending check in `validate`, `plan`, `apply` and `review`, as `verify` refuses it, instead of reading as "not visible". |
+| `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set (`true`) only by workflow steps bound to the environment. Then an unset or blank allowlist refuses a slot-sending check in `validate`, `plan`, `apply` and `review`, as `verify` refuses it, instead of reading as "not visible". A malformed allowlist refuses any run that sends a slot, with or without this marker. |
 | `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown top-level `spec` fields. See [Writing resources](resources.md#supported-fields-and-unknown-fields). |
 | `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `false` | Same as `apply --allow-nontransactional-plugin-attach`. |
 | `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `false` | Same as `review --fail-on-blockers`. |
@@ -413,6 +413,37 @@ with the admin credential.
   or claim mismatch, `403` a namespace outside
   `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES` or the token's `ns` claim. Each message
   says what to check.
+
+### Scheduled monitoring
+
+`drift-check.yml` binds only `FERRUM_ADMIN_JWT_VIEWER_SECRET`, with the optional
+issuer, audience and TTL settings. The protected checker requires those exact
+step-local secret bindings and forbids the admin key, inherited/dynamic env
+sources, rebinding and environment-file injection. Namespace filters from the
+repository configuration and the gateway's `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`
+continue to limit the comparison; neither scope is widened by the key change.
+
+A repository administrator must configure the gateway's distinct viewer key
+(Ferrum Edge v0.9.9+) and, before deploying this workflow, provision the matching
+`FERRUM_ADMIN_JWT_VIEWER_SECRET` through GitHub's **Settings → Environments →
+selected environment → Environment secrets**. Do this for every API environment
+the drift matrix binds: `<env>-monitor` when `monitoring.unattended: true`,
+otherwise `<env>` itself. After the workflow switch, delete
+`FERRUM_ADMIN_JWT_SECRET` from each `<env>-monitor`; keep the admin key in
+deployment environments for apply, trusted review and rotate. The settings audit
+checks only secret names, requires the viewer name in `<env>-monitor`, and
+rejects an admin name there even alongside the viewer. No secret values are
+read, printed or copied by the migration tooling. An operator provisions the
+value through the protected secret-entry UI.
+
+The workflow keeps `diff --exit-on-drift` without
+`--accept-unverified-secrets` or automatic fingerprint-baseline storage. A fresh
+viewer export with no drift but unverified secrets exits `1` and reports a failed
+comparison; it never certifies "in sync". The CLI's explicit acceptance flag
+still permits exit `0` for unverified secret leaves, while JSON remains
+`in_sync: false`; it cannot accept a cached read or masked ancestors. The
+settings-audit environment and secretless template mode are unchanged. File-mode
+drift jobs still skip before receiving gateway credentials.
 
 **Breaking changes** (also in `plan`):
 

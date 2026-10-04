@@ -74,11 +74,11 @@ pub enum BlockerKind {
     /// `gitforgeops/verify-probe: "true"` and, when the run can see
     /// `FERRUM_VERIFY_PROBE_CONSUMERS`, listed there.
     InvalidSmokeChecks,
-    /// The run is bound to the environment and a declared check sends a
-    /// credential slot, but the operator's `FERRUM_VERIFY_PROBE_CONSUMERS`
-    /// is unset, empty or malformed: `verify` would refuse after `apply`
-    /// changed the gateway. An operator action, not a pull-request fix, so it
-    /// is not reported as [`BlockerKind::InvalidSmokeChecks`].
+    /// A declared check sends a credential slot, but the operator's
+    /// `FERRUM_VERIFY_PROBE_CONSUMERS` is malformed in any run, or unset/empty
+    /// in an environment-bound run: `verify` would refuse after `apply`
+    /// changed the gateway. An operator action, not a pull-request fix, so
+    /// it is not reported as [`BlockerKind::InvalidSmokeChecks`].
     ProbeConsumerAllowlist,
 }
 

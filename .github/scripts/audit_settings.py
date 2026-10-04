@@ -98,20 +98,16 @@ MONITORING_ENVIRONMENT_SUFFIX = "-monitor"
 # of a name is not proof a value is correct, but absence is proof the job
 # cannot reach that authority.
 MONITORING_FORBIDDEN_SECRETS = (
+    "FERRUM_ADMIN_JWT_SECRET",
     "FERRUM_GH_PROVISIONER_TOKEN",
     "GITFORGEOPS_STATE_APP_PRIVATE_KEY",
     "SETTINGS_AUDIT_TOKEN",
 )
 MONITORING_FORBIDDEN_SECRET_PREFIXES = ("FERRUM_CREDS_BUNDLE",)
 
-# The gateway signing keys a monitoring environment may hold. The viewer key
-# (Ferrum Edge's `FERRUM_ADMIN_JWT_VIEWER_SECRET`) is capped at `viewer` by the
-# gateway and is what `diff` reads with whenever it is set; the admin key is
-# write-equivalent. TRANSITIONAL (#440, step 1 of 2): both are allowed, like
-# any other gateway read material, and holding both is a warning because the
-# admin key then goes unused. Step 2 moves `drift-check.yml` to the viewer key.
+# Monitoring needs the gateway's viewer-capped key. The admin key grants
+# write-equivalent authority and is forbidden even alongside the viewer key.
 MONITORING_VIEWER_JWT_SECRET = "FERRUM_ADMIN_JWT_VIEWER_SECRET"
-MONITORING_ADMIN_JWT_SECRET = "FERRUM_ADMIN_JWT_SECRET"
 
 # The drift workflow whose last successful run is the monitoring evidence.
 MONITORING_WORKFLOW_FILE = "drift-check.yml"
@@ -390,8 +386,7 @@ def audit_monitoring_secrets(audit: Audit, repo: str, name: str) -> None:
 
     Only secret *names* are read — never values, and never through a path that
     could print one. A name present is not proof its value is correct, which is
-    why this check only ever proves the negative: the job cannot reach an
-    authority whose secret is not bound to it.
+    why this check proves only presence and absence, never key validity.
     """
     encoded_name = quote(name, safe="")
     pages = gh_json(
@@ -423,25 +418,13 @@ def audit_monitoring_secrets(audit: Audit, repo: str, name: str) -> None:
 
 
 def audit_monitoring_jwt_keys(audit: Audit, name: str, secret_names: set[str]) -> None:
-    """Report which gateway signing key a monitoring environment holds.
-
-    Neither key is forbidden here: both are gateway read material for `diff`.
-    TRANSITIONAL (#440): holding both is a warning, never a violation, because
-    `diff` reads with the viewer key whenever it is set and the admin key then
-    sits unused in an unattended job.
-    """
-    has_viewer = MONITORING_VIEWER_JWT_SECRET in secret_names
-    has_admin = MONITORING_ADMIN_JWT_SECRET in secret_names
-    if has_viewer:
-        audit.evidence.append(
-            f"environment {name}: holds the viewer-capped {MONITORING_VIEWER_JWT_SECRET}"
-        )
-    if has_viewer and has_admin:
-        audit.warnings.append(
-            f"monitoring environment {name!r} holds both {MONITORING_VIEWER_JWT_SECRET} "
-            f"and {MONITORING_ADMIN_JWT_SECRET}; once drift-check.yml binds the viewer "
-            f"key (#440), remove {MONITORING_ADMIN_JWT_SECRET} from this environment"
-        )
+    """Require the viewer secret's name without requesting its value."""
+    audit.require(
+        MONITORING_VIEWER_JWT_SECRET in secret_names,
+        f"monitoring environment {name!r} must hold {MONITORING_VIEWER_JWT_SECRET}; "
+        "a repository administrator must provision the gateway's viewer-capped key",
+        f"environment {name}: holds the viewer-capped {MONITORING_VIEWER_JWT_SECRET}",
+    )
 
 
 def audit_monitoring_coverage(

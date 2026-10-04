@@ -63,6 +63,8 @@ BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
 # nothing else.
 MONITORING_WORKFLOW = "drift-check.yml"
 MONITORING_FORBIDDEN_SECRETS = (
+    # Write-equivalent gateway authority; monitoring uses the viewer key.
+    "FERRUM_ADMIN_JWT_SECRET",
     # Writes GitHub Environment Secrets — the credential broker's authority.
     "FERRUM_GH_PROVISIONER_TOKEN",
     # Mints a Contents: write token for the ownership ledger.
@@ -110,7 +112,6 @@ VIEWER_JWT_SECRET_BINDING = (
 VIEWER_JWT_SECRET_REFERENCE = re.compile(
     r"\bsecrets\.FERRUM_ADMIN_JWT_VIEWER_SECRET\b", re.IGNORECASE
 )
-ADMIN_JWT_SECRET_REFERENCE = re.compile(r"\bsecrets\.FERRUM_ADMIN_JWT_SECRET\b", re.IGNORECASE)
 VIEWER_JWT_WORKFLOW_PATHS = (f".github/workflows/{MONITORING_WORKFLOW}",)
 # The viewer key's tokens carry the configured issuer, audience and TTL; the
 # role claim is always `viewer`, so `FERRUM_ADMIN_JWT_ROLE` does not apply.
@@ -119,14 +120,44 @@ VIEWER_JWT_OPTIONAL_SETTINGS = (
     "FERRUM_ADMIN_JWT_AUDIENCE",
     "FERRUM_ADMIN_JWT_TTL_SECS",
 )
-# TRANSITIONAL (#440, step 1 of 2). The monitoring workflow may bind the viewer
-# key, and may still bind the admin key while the workflow change lands in its
-# own PR (this checker judges every PR from the default branch, so a PR that
-# changed both the rule and the workflow would be judged by the old rule).
-# Binding both is reported as a warning, not a violation. Step 2 binds the
-# viewer key in `drift-check.yml`, drops the admin key from this tuple, and
-# makes "admin secret in drift-check" a violation.
-MONITORING_JWT_SECRET_BINDINGS = (VIEWER_JWT_SECRET_BINDING, ADMIN_JWT_SECRET_BINDING)
+# The protected checker already accepted the viewer binding before the
+# workflow switched (#440). Monitoring must now hold only that signing key.
+MONITORING_JWT_SECRET_BINDINGS = (VIEWER_JWT_SECRET_BINDING,)
+PROBE_CONSUMERS_ENV = "FERRUM_VERIFY_PROBE_CONSUMERS"
+PROBE_BOUND_ENV = "FERRUM_VERIFY_PROBE_CONSUMERS_BOUND"
+PROBE_CONSUMERS_VALUE = "${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}"
+PROBE_WORKFLOW_STEPS = {
+    ".github/workflows/apply-on-merge.yml": (
+        ("apply", "Validate", {
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+            PROBE_BOUND_ENV: "true",
+        }),
+        ("apply", "Verify traffic", {PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE}),
+        ("promote", "Validate", {
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+            PROBE_BOUND_ENV: "true",
+        }),
+        ("promote", "Verify traffic", {PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE}),
+    ),
+    ".github/workflows/trusted-pr-review.yml": (
+        ("live-review", "Post trusted live review", {
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+            PROBE_BOUND_ENV: "true",
+        }),
+    ),
+}
+# Pin the complete script that writes the one permitted env-file entry, not
+# only its echo: rebinding creds_file to a multiline value would inject more
+# variables through an otherwise unchanged echo. Comments are not script shape.
+CREDENTIAL_HANDOFF_RUN = (
+    "set -euo pipefail",
+    'creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"',
+    'python3 .github/scripts/credential_bundles.py "$creds_file"',
+    'echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"',
+    'applied_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-applied-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"',
+    'rm -f "$applied_file"',
+    'echo "applied_file=$applied_file" >> "$GITHUB_OUTPUT"',
+)
 # The revision a recorded credential allocation is bound to, which lets the
 # retry of a failed apply keep the slots it already wrote. It must be the
 # triggering merge: the applied head moves when the failed attempt pushes its
@@ -487,8 +518,8 @@ def admin_jwt_binding_violations(workflow: str, text: str) -> list[str]:
 def admin_api_jwt_bindings(workflow: str) -> tuple[str, ...]:
     """The signing-key bindings that satisfy one admin-API workflow.
 
-    Monitoring may authenticate with the viewer key (or, until step 2 of #440,
-    the admin key); every other admin-API workflow needs the admin key.
+    Monitoring must authenticate with the viewer key; every other admin-API
+    workflow needs the admin key.
     """
     if workflow == MONITORING_WORKFLOW:
         return MONITORING_JWT_SECRET_BINDINGS
@@ -840,25 +871,6 @@ def monitoring_workflow_violations(text: str) -> list[str]:
             "cannot be reported as in sync"
         )
     return violations
-
-
-def monitoring_jwt_warnings(text: str) -> list[str]:
-    """TRANSITIONAL (#440): binding both gateway keys in monitoring is a warning.
-
-    With the viewer key set, `diff` reads `GET /config/export` with it and never
-    uses the admin key, so a monitoring job holding both carries write-equivalent
-    gateway authority it does not use. Step 2 of #440 binds only the viewer key
-    in `drift-check.yml` and turns any admin-key binding there into a violation.
-    """
-    if VIEWER_JWT_SECRET_REFERENCE.search(text) and ADMIN_JWT_SECRET_REFERENCE.search(text):
-        return [
-            f"{MONITORING_WORKFLOW}: binds both {VIEWER_JWT_SECRET} and "
-            "FERRUM_ADMIN_JWT_SECRET; diff reads with the viewer key whenever it "
-            "is set, so the admin key is unused write-equivalent authority. Drop "
-            "FERRUM_ADMIN_JWT_SECRET: step 2 of #440 makes binding it in "
-            f"{MONITORING_WORKFLOW} a violation"
-        ]
-    return []
 
 
 def trusted_classifier_violations(
@@ -2151,6 +2163,133 @@ def workflow_action_references(document: dict) -> list[str]:
     ]
 
 
+def guarded_environment_violations(
+    workflow: str, document: dict, required_steps: tuple, protected: tuple[str, ...]
+) -> list[str]:
+    """Require step-local bindings and refuse other sources in the parsed tree.
+
+    A line in a comment, `run:` or `with:` is not an environment binding.
+    Quoted/escaped scalar values are read as GitHub reads them, and dynamic
+    environment maps are refused at every scope. The only permitted env-file
+    reference is the existing credential-file hand-off in apply's bundle
+    loader; no other reference (including an alias for a later write) is safe.
+    This fences workflow bindings, not arbitrary behavior of invoked programs.
+    """
+    violations: list[str] = []
+    allowed: dict[int, dict] = {}
+    jobs = document.get("jobs")
+    for job_name, step_name, bindings in required_steps:
+        job = jobs.get(job_name) if isinstance(jobs, dict) else None
+        steps = job.get("steps") if isinstance(job, dict) else None
+        found = (
+            [step for step in steps if isinstance(step, dict) and step.get("name") == step_name]
+            if isinstance(steps, list) else []
+        )
+        label = f"{workflow}: job {job_name!r}, step {step_name!r}"
+        if len(found) != 1:
+            violations.append(f"{label} must exist exactly once with protected env bindings")
+            continue
+        environment = found[0].get("env")
+        if not isinstance(environment, dict):
+            violations.append(f"{label} must have a literal env mapping")
+            continue
+        allowed[id(environment)] = bindings
+        for variable, expected in bindings.items():
+            if environment.get(variable) != expected:
+                violations.append(f"{label} must bind exactly {variable}: {expected}")
+
+    protected_names = {name.casefold() for name in protected}
+    protected_reference = re.compile(
+        r"\b(?:" + "|".join(re.escape(name) for name in protected) + r")\b",
+        re.IGNORECASE,
+    )
+    env_file_reference = re.compile(
+        r"\bGITHUB_ENV\b|\bgithub\s*\.\s*env\b|"
+        r"\bgithub\s*\[\s*['\"]env['\"]\s*\]",
+        re.IGNORECASE,
+    )
+
+    def visit(node, path: str, step_name: str | None = None) -> None:
+        if isinstance(node, list):
+            for index, item in enumerate(node):
+                visit(item, f"{path}[{index}]", step_name)
+            return
+        if not isinstance(node, dict):
+            return
+        if "run" in node or "uses" in node:
+            step_name = node.get("name")
+        for key, value in node.items():
+            label = f"{workflow}: {path}.{key}"
+            permitted = allowed.get(id(node), {})
+            if key.casefold() in protected_names and key not in permitted:
+                violations.append(
+                    f"{label}: protected variable may only be bound in its required step env"
+                )
+            if key.casefold() == "env" and not isinstance(value, dict):
+                violations.append(f"{label}: dynamic env sources are forbidden")
+            if key.casefold() in ("bash_env", "env") and path.casefold().endswith(".env"):
+                violations.append(f"{label}: shell startup env sources are forbidden")
+            if isinstance(value, str) and key not in permitted:
+                # Ignore script comments, not YAML comments masquerading as
+                # keys: the latter have already been removed by the reader.
+                lines = [line.strip() for line in value.splitlines()]
+                if key.casefold() == "run":
+                    lines = [line for line in lines if line and not line.startswith("#")]
+                content = "\n".join(lines)
+                # Shell quote concatenation and line continuations must not
+                # turn a forbidden name into an alternate spelling.
+                compact = content.translate(str.maketrans("", "", "'\"\\\n"))
+                if protected_reference.search(content) or protected_reference.search(compact):
+                    violations.append(
+                        f"{label}: protected variable references/rebinding outside step env are forbidden"
+                    )
+                env_lines = [line for line in lines if env_file_reference.search(line)]
+                handoff_allowed = (
+                    workflow == ".github/workflows/apply-on-merge.yml"
+                    and step_name == BUNDLE_LOADER_STEP
+                    and key == "run"
+                    and tuple(lines) == CREDENTIAL_HANDOFF_RUN
+                )
+                if (env_lines or env_file_reference.search(compact)) and not handoff_allowed:
+                    violations.append(
+                        f"{label}: GITHUB_ENV references/writes outside the credential hand-off are forbidden"
+                    )
+            if env_file_reference.search(key):
+                violations.append(f"{label}: rebinding the GITHUB_ENV destination is forbidden")
+            visit(value, f"{path}.{key}", step_name)
+
+    visit(document, "workflow")
+    return violations
+
+
+def probe_consumer_binding_violations(workflow: str, document: dict) -> list[str]:
+    """The operator-held probe allowlist cannot be replaced by candidate data."""
+    if workflow not in PROBE_WORKFLOW_STEPS:
+        return []
+    return guarded_environment_violations(
+        workflow,
+        document,
+        PROBE_WORKFLOW_STEPS[workflow],
+        (PROBE_CONSUMERS_ENV, PROBE_BOUND_ENV),
+    )
+
+
+def monitoring_jwt_binding_violations(workflow: str, document: dict) -> list[str]:
+    """Monitoring binds the viewer key and cannot reintroduce the admin key."""
+    if workflow != f".github/workflows/{MONITORING_WORKFLOW}":
+        return []
+    bindings = {VIEWER_JWT_SECRET: "${{ secrets.FERRUM_ADMIN_JWT_VIEWER_SECRET }}"}
+    bindings.update({
+        setting: f"${{{{ secrets.{setting} }}}}" for setting in VIEWER_JWT_OPTIONAL_SETTINGS
+    })
+    return guarded_environment_violations(
+        workflow,
+        document,
+        (("drift", "Check drift", bindings),),
+        (VIEWER_JWT_SECRET, "FERRUM_ADMIN_JWT_SECRET"),
+    )
+
+
 def policy_check_impersonation_violations(workflow: str, document: dict) -> list[str]:
     """Only the protected policy workflow may report `trusted-supply-chain-policy`.
 
@@ -2519,6 +2658,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         if document is not None:
             violations.extend(
+                probe_consumer_binding_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
+                monitoring_jwt_binding_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
                 policy_check_impersonation_violations(
                     workflow.relative_to(root).as_posix(), document
                 )
@@ -2701,7 +2850,6 @@ def main(argv: list[str] | None = None) -> int:
 
     monitoring_text = (workflows / MONITORING_WORKFLOW).read_text(encoding="utf-8")
     violations.extend(monitoring_workflow_violations(monitoring_text))
-    warnings = monitoring_jwt_warnings(monitoring_text)
 
     for state_writer_workflow in ("apply-on-merge.yml", "rotate.yml"):
         violations.extend(
@@ -3045,10 +3193,6 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(digest_allowlist_violations(allowlist_text))
     approved_digests = allowlisted_validator_digests(allowlist_text)
 
-    # Warnings name a transitional state the policy still accepts. They are
-    # GitHub annotations on stdout, so they never read as a violation line.
-    for warning in warnings:
-        print(f"::warning::{warning}")
     if violations:
         print("Supply-chain policy violations:", file=sys.stderr)
         for violation in violations:

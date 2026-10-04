@@ -37,6 +37,172 @@ STDIN_CLASSIFIER = (
 
 
 class SupplyChainPolicyTests(unittest.TestCase):
+    def _probe_document(self, workflow):
+        text = (ROOT / workflow).read_text(encoding="utf-8")
+        return check_supply_chain.parse_workflow(text)
+
+    def _step(self, document, job, name):
+        return next(step for step in document["jobs"][job]["steps"] if step.get("name") == name)
+
+    def test_probe_bindings_are_required_in_every_protected_step(self):
+        for workflow, required in check_supply_chain.PROBE_WORKFLOW_STEPS.items():
+            self.assertEqual(
+                check_supply_chain.probe_consumer_binding_violations(
+                    workflow, self._probe_document(workflow)
+                ),
+                [],
+            )
+            for job, name, bindings in required:
+                for variable in bindings:
+                    for replacement in (None, "ferrum/customer", "${{ env.ALLOWLIST }}", "false"):
+                        with self.subTest(workflow=workflow, job=job, name=name,
+                                          variable=variable, replacement=replacement):
+                            document = self._probe_document(workflow)
+                            environment = self._step(document, job, name)["env"]
+                            if replacement is None:
+                                environment.pop(variable)
+                            else:
+                                environment[variable] = replacement
+                            violations = check_supply_chain.probe_consumer_binding_violations(
+                                workflow, document
+                            )
+                            self.assertTrue(
+                                any("must bind exactly " + variable in item for item in violations),
+                                violations,
+                            )
+
+    def test_probe_bindings_cannot_be_inherited_or_rebound_elsewhere(self):
+        for workflow, required in check_supply_chain.PROBE_WORKFLOW_STEPS.items():
+            job, name, bindings = required[0]
+            for variable, expected in bindings.items():
+                for scope in ("workflow", "job", "other-step", "with", "dynamic"):
+                    with self.subTest(workflow=workflow, variable=variable, scope=scope):
+                        document = self._probe_document(workflow)
+                        step = self._step(document, job, name)
+                        if scope == "workflow":
+                            document["env"] = {variable: expected}
+                        elif scope == "job":
+                            document["jobs"][job]["env"] = {variable: expected}
+                        elif scope == "other-step":
+                            document["jobs"][job]["steps"].append({
+                                "name": "Rebind", "env": {variable: expected}, "run": "true",
+                            })
+                        elif scope == "with":
+                            step["with"] = {variable: step["env"].pop(variable)}
+                        else:
+                            document["jobs"][job]["env"] = "${{ fromJSON(vars.ENVIRONMENT) }}"
+                        self.assertTrue(
+                            check_supply_chain.probe_consumer_binding_violations(workflow, document)
+                        )
+            for mutation in ("missing", "duplicate", "renamed"):
+                with self.subTest(workflow=workflow, mutation=mutation):
+                    document = self._probe_document(workflow)
+                    step = self._step(document, job, name)
+                    steps = document["jobs"][job]["steps"]
+                    if mutation == "missing":
+                        steps.remove(step)
+                    elif mutation == "duplicate":
+                        steps.append(step)
+                    else:
+                        step["name"] = "Replacement"
+                    self.assertTrue(
+                        check_supply_chain.probe_consumer_binding_violations(workflow, document)
+                    )
+
+    def test_probe_bindings_refuse_shell_rebinding_and_mutable_env_files(self):
+        variable = check_supply_chain.PROBE_CONSUMERS_ENV
+        scripts = (
+            f'{variable}=ferrum/customer gitforgeops validate',
+            f'export {variable}=ferrum/customer',
+            f'unset {check_supply_chain.PROBE_BOUND_ENV}',
+            f'echo "{variable}=ferrum/customer" >> "$GITHUB_ENV"',
+            f'printf "%s\\n" "{variable}=ferrum/customer" >> "${{GITHUB_ENV}}"',
+            f'printf "%s\\n" "{variable}<<EOF" ferrum/customer EOF >> "$GITHUB_ENV"',
+            'destination="$GITHUB_ENV"\necho "$PAYLOAD" >> "$destination"',
+            'cat payload >> "${{ github.env }}"',
+            'cat payload >> "${{ github[\'env\'] }}"',
+            'echo "$PAYLOAD" >> "$GITHUB_""ENV"',
+            'env FERRUM_VERIFY_PROBE_""CONSUMERS=ferrum/customer gitforgeops validate',
+            'export FERRUM_VERIFY_PROBE_CONSU\\\nMERS=ferrum/customer',
+        )
+        for workflow, required in check_supply_chain.PROBE_WORKFLOW_STEPS.items():
+            job, name, _ = required[0]
+            for script in scripts:
+                with self.subTest(workflow=workflow, script=script):
+                    document = self._probe_document(workflow)
+                    self._step(document, job, name)["run"] = script
+                    self.assertTrue(
+                        check_supply_chain.probe_consumer_binding_violations(workflow, document)
+                    )
+            for startup in ("BASH_ENV", "ENV", "GITHUB_ENV"):
+                with self.subTest(workflow=workflow, startup=startup):
+                    document = self._probe_document(workflow)
+                    document["env"] = {startup: "candidate/inject.sh"}
+                    self.assertTrue(
+                        check_supply_chain.probe_consumer_binding_violations(workflow, document)
+                    )
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for write in (
+            'echo "$PAYLOAD" >> "$GITHUB_ENV"',
+            'echo "$PAYLOAD" >> "$GITHUB_""ENV"',
+            'cat payload >> "${{ github[\'env\'] }}"',
+            'creds_file="$PAYLOAD"',
+        ):
+            with self.subTest(loader_write=write):
+                document = self._probe_document(workflow)
+                loader = self._step(document, "apply", check_supply_chain.BUNDLE_LOADER_STEP)
+                loader["run"] += "\n" + write
+                self.assertTrue(
+                    check_supply_chain.probe_consumer_binding_violations(workflow, document)
+                )
+
+    def test_probe_bindings_read_decoded_yaml_values_and_ignore_decoys(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        text = (ROOT / workflow).read_text(encoding="utf-8")
+        binding = check_supply_chain.PROBE_CONSUMERS_ENV + ": " + check_supply_chain.PROBE_CONSUMERS_VALUE
+        # Quoting a correct scalar preserves its meaning. An escaped hostile
+        # value, a comment or a run string cannot supply the env binding.
+        quoted = text.replace(binding, binding.split(": ")[0] + ': "' + check_supply_chain.PROBE_CONSUMERS_VALUE + '"')
+        self.assertEqual(
+            check_supply_chain.probe_consumer_binding_violations(
+                workflow, check_supply_chain.parse_workflow(quoted)
+            ),
+            [],
+        )
+        for replacement in (
+            binding.split(": ")[0] + ': "\\x66errum/customer"',
+            "# " + binding,
+        ):
+            with self.subTest(replacement=replacement):
+                changed = text.replace(binding, replacement, 1)
+                self.assertTrue(check_supply_chain.probe_consumer_binding_violations(
+                    workflow, check_supply_chain.parse_workflow(changed)
+                ))
+        for replacement in (
+            '"' + binding.split(": ")[0] + '": ferrum/customer',
+            binding.split(": ")[0] + ': &source ferrum/customer',
+            binding.split(": ")[0] + ': {source: ferrum/customer}',
+        ):
+            with self.subTest(replacement=replacement):
+                with self.assertRaises(check_supply_chain.WorkflowSyntaxError):
+                    check_supply_chain.parse_workflow(text.replace(binding, replacement, 1))
+
+    def test_candidate_checker_cannot_approve_its_probe_binding_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            (root / ".github/scripts/check_supply_chain.py").write_text(
+                "print('candidate approves itself')\n", encoding="utf-8"
+            )
+            path = root / ".github/workflows/trusted-pr-review.yml"
+            path.write_text(path.read_text(encoding="utf-8").replace(
+                check_supply_chain.PROBE_CONSUMERS_VALUE, "ferrum/customer", 1
+            ), encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("must bind exactly FERRUM_VERIFY_PROBE_CONSUMERS" in item for item in violations),
+            violations,
+        )
+
     def test_codeowners_must_explicitly_cover_exact_state_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self._mirror_repo(Path(temporary))
@@ -2404,8 +2570,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             path = root / ".github/workflows/drift-check.yml"
             text = path.read_text(encoding="utf-8")
             for setting in (
-                "FERRUM_ADMIN_JWT_SECRET",
-                *check_supply_chain.ADMIN_JWT_OPTIONAL_SETTINGS,
+                "FERRUM_ADMIN_JWT_VIEWER_SECRET",
+                *check_supply_chain.VIEWER_JWT_OPTIONAL_SETTINGS,
             ):
                 text = text.replace(
                     f"          {setting}: ${{{{ secrets.{setting} }}}}\n", "", 1
@@ -2413,21 +2579,21 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             path.write_text(text, encoding="utf-8")
             violations = self._violations(root)
         self.assertTrue(
-            any("must bind" in item and "FERRUM_ADMIN_JWT_SECRET" in item for item in violations),
+            any("must bind" in item and "FERRUM_ADMIN_JWT_VIEWER_SECRET" in item for item in violations),
             violations,
         )
-        # Monitoring is satisfied by either key, and the violation names both.
+        # Monitoring requires the viewer key; the admin form is retired.
         self.assertTrue(
             any(
                 item.startswith("drift-check.yml: an admin-API workflow must bind")
                 and repr(check_supply_chain.VIEWER_JWT_SECRET_BINDING) in item
-                and repr(check_supply_chain.ADMIN_JWT_SECRET_BINDING) in item
+                and repr(check_supply_chain.ADMIN_JWT_SECRET_BINDING) not in item
                 for item in violations
             ),
             violations,
         )
 
-    # -- viewer-capped monitoring credential (#440, step 1 of 2) -------------
+    # -- viewer-only monitoring credential (#440) --------------------------
 
     ADMIN_LINE = (
         "          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}\n"
@@ -2442,8 +2608,9 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
 
     def test_viewer_secret_is_allowed_in_the_monitoring_workflow(self):
         workflow = self._drift_check()
-        self.assertIn(self.ADMIN_LINE, workflow)
-        viewer_only = workflow.replace(self.ADMIN_LINE, self.VIEWER_LINE, 1)
+        self.assertIn(self.VIEWER_LINE, workflow)
+        self.assertNotIn(self.ADMIN_LINE, workflow)
+        viewer_only = workflow
         self.assertEqual(
             check_supply_chain.viewer_jwt_scope_violations(
                 ".github/workflows/drift-check.yml", viewer_only
@@ -2453,13 +2620,12 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertEqual(
             check_supply_chain.monitoring_workflow_violations(viewer_only), []
         )
-        self.assertEqual(check_supply_chain.monitoring_jwt_warnings(viewer_only), [])
         self.assertEqual(
             check_supply_chain.admin_jwt_binding_violations("drift-check.yml", viewer_only),
             [],
         )
 
-        # The step-2 shape (viewer key only) passes the whole trusted checker.
+        # The shipped viewer-only shape passes the whole trusted checker.
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
             path = root / ".github/workflows/drift-check.yml"
@@ -2520,30 +2686,24 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
-    def test_monitoring_binding_both_keys_is_a_transitional_warning(self):
-        # TRANSITIONAL: step 2 of #440 turns the admin key in drift-check.yml
-        # into a violation. Until then both keys pass, with a warning.
+    def test_monitoring_admin_key_is_refused_alone_or_with_the_viewer(self):
         workflow = self._drift_check()
-        self.assertEqual(check_supply_chain.monitoring_jwt_warnings(workflow), [])
-        both = workflow.replace(self.ADMIN_LINE, self.ADMIN_LINE + self.VIEWER_LINE, 1)
-        warnings = check_supply_chain.monitoring_jwt_warnings(both)
-        self.assertEqual(len(warnings), 1, warnings)
-        self.assertIn("step 2 of #440", warnings[0])
-        self.assertEqual(check_supply_chain.monitoring_workflow_violations(both), [])
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = self._mirror_repo(Path(directory))
-            path = root / ".github/workflows/drift-check.yml"
-            path.write_text(both, encoding="utf-8")
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT), "--root", str(root)],
-                check=False,
-                text=True,
-                capture_output=True,
-            )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"::warning::{warnings[0]}", result.stdout)
-        self.assertNotIn("Supply-chain policy violations", result.stderr)
+        for binding in (self.ADMIN_LINE, self.VIEWER_LINE + self.ADMIN_LINE):
+            with self.subTest(binding=binding):
+                mutated = workflow.replace(self.VIEWER_LINE, binding, 1)
+                violations = check_supply_chain.monitoring_workflow_violations(mutated)
+                self.assertTrue(
+                    any("may not reach 'FERRUM_ADMIN_JWT_SECRET'" in item for item in violations),
+                    violations,
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    root = self._mirror_repo(Path(directory))
+                    path = root / ".github/workflows/drift-check.yml"
+                    path.write_text(mutated, encoding="utf-8")
+                    violations = self._violations(root)
+                self.assertTrue(
+                    any("FERRUM_ADMIN_JWT_SECRET" in item for item in violations), violations
+                )
 
     def test_viewer_step_must_bind_issuer_audience_and_ttl(self):
         secure = "\n".join(
@@ -2578,12 +2738,11 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     violations,
                 )
 
-    def test_monitoring_with_neither_key_names_both_accepted_bindings(self):
+    def test_monitoring_requires_only_the_viewer_binding(self):
         self.assertEqual(
             check_supply_chain.admin_api_jwt_bindings("drift-check.yml"),
             (
                 check_supply_chain.VIEWER_JWT_SECRET_BINDING,
-                check_supply_chain.ADMIN_JWT_SECRET_BINDING,
             ),
         )
         for workflow in ("apply-on-merge.yml", "rotate.yml", "trusted-pr-review.yml"):
@@ -2592,6 +2751,64 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     check_supply_chain.admin_api_jwt_bindings(workflow),
                     (check_supply_chain.ADMIN_JWT_SECRET_BINDING,),
                 )
+
+    def test_monitoring_key_binding_is_structural_and_cannot_be_rebound(self):
+        workflow = ".github/workflows/drift-check.yml"
+        text = self._drift_check()
+        document = check_supply_chain.parse_workflow(text)
+        self.assertEqual(
+            check_supply_chain.monitoring_jwt_binding_violations(workflow, document), []
+        )
+        # No implicit acceptance of secrets is added with the viewer switch.
+        self.assertIn("gitforgeops diff --exit-on-drift || status=$?", text)
+        self.assertNotIn("--accept-unverified-secrets", text)
+        self.assertNotIn("--fingerprint-baseline", text)
+        for replacement in (
+            self.VIEWER_LINE.replace("${{ secrets.FERRUM_ADMIN_JWT_VIEWER_SECRET }}", "literal-key"),
+            self.VIEWER_LINE.replace("${{ secrets.FERRUM_ADMIN_JWT_VIEWER_SECRET }}", "${{ vars.KEY }}"),
+            "          # " + self.VIEWER_LINE.strip() + "\n",
+            '          ALIAS: "${{ secrets.FERRUM_ADMIN_JWT_\\x53ECRET }}"\n',
+            '          FERRUM_ADMIN_JWT_SECRET: "unused-but-held"\n' + self.VIEWER_LINE,
+        ):
+            with self.subTest(replacement=replacement):
+                changed = text.replace(self.VIEWER_LINE, replacement, 1)
+                self.assertTrue(check_supply_chain.monitoring_jwt_binding_violations(
+                    workflow, check_supply_chain.parse_workflow(changed)
+                ))
+        for scope in ("workflow", "job", "other-step", "shell", "env-file"):
+            with self.subTest(scope=scope):
+                document = check_supply_chain.parse_workflow(text)
+                admin = {"FERRUM_ADMIN_JWT_SECRET": "${{ secrets.FERRUM_ADMIN_JWT_SECRET }}"}
+                if scope == "workflow":
+                    document["env"] = admin
+                elif scope == "job":
+                    document["jobs"]["drift"]["env"] = admin
+                elif scope == "other-step":
+                    document["jobs"]["drift"]["steps"].append({"name": "Rebind", "env": admin})
+                elif scope == "shell":
+                    self._step(document, "drift", "Check drift")["run"] = (
+                        "FERRUM_ADMIN_JWT_SECRET=key gitforgeops diff --exit-on-drift"
+                    )
+                else:
+                    document["jobs"]["drift"]["steps"].append({
+                        "name": "Rebind", "run": 'cat payload >> "$GITHUB_ENV"',
+                    })
+                self.assertTrue(check_supply_chain.monitoring_jwt_binding_violations(workflow, document))
+
+    def test_candidate_checker_cannot_approve_an_admin_monitoring_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            (root / ".github/scripts/check_supply_chain.py").write_text(
+                "print('candidate approves itself')\n", encoding="utf-8"
+            )
+            path = root / ".github/workflows/drift-check.yml"
+            path.write_text(self._drift_check().replace(
+                self.VIEWER_LINE, self.VIEWER_LINE + self.ADMIN_LINE, 1
+            ), encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("FERRUM_ADMIN_JWT_SECRET" in item for item in violations), violations
+        )
 
     # -- secret names are case-insensitive at GitHub ------------------------
 
@@ -2698,11 +2915,11 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("binds FERRUM_ADMIN_JWT_SECRET but not" in item for item in violations),
             violations,
         )
-        # Both keys in monitoring, one spelled in lower case, still warns.
+        # Both keys in monitoring, one spelled in lower case, still refuse.
         both = self._drift_check().replace(
-            self.ADMIN_LINE, lower_admin + self.VIEWER_LINE, 1
+            self.VIEWER_LINE, lower_admin + self.VIEWER_LINE, 1
         )
-        self.assertEqual(len(check_supply_chain.monitoring_jwt_warnings(both)), 1)
+        self.assertTrue(check_supply_chain.monitoring_workflow_violations(both))
         # And the audit token stays fenced to the settings audit.
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))

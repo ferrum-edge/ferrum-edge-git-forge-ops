@@ -565,14 +565,18 @@ Fences on the reviewer-free environment:
 - Its deployment policy admits only the repo's exact default branch.
 - `audit_settings.py` rejects a `<env>-monitor` holding
   `GITFORGEOPS_STATE_APP_PRIVATE_KEY`, `FERRUM_GH_PROVISIONER_TOKEN`,
-  `SETTINGS_AUDIT_TOKEN` or `FERRUM_CREDS_BUNDLE[_N]` (names only, never values),
+  `SETTINGS_AUDIT_TOKEN`, `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_CREDS_BUNDLE[_N]`
+  (names only, never values), requires `FERRUM_ADMIN_JWT_VIEWER_SECRET`,
   and requires its base environment to exist.
-- `check_supply_chain.py::monitoring_workflow_violations` rejects a
-  `drift-check.yml` that binds any of those, holds a write permission, omits the
+- `check_supply_chain.py` rejects a
+  `drift-check.yml` that binds any of those, lacks the exact step-local viewer
+  key and issuer/audience/TTL bindings, holds a write permission, omits the
   outcome classifier, or runs any subcommand other than `diff`.
-- `drift-check.yml` binds no credential bundle; `diff` excludes unresolved broker
-  leaves per leaf. That is why `CREDENTIAL_BUNDLE_WORKFLOWS` is a subset of
-  `PRIVILEGED_WORKFLOWS`.
+- `drift-check.yml` binds only the viewer signing key and no credential bundle;
+  `diff` excludes unresolved broker leaves per leaf. An operator must provision
+  that key in each bound environment and remove the admin key from each
+  `<env>-monitor` (see `docs/reference.md`, Scheduled monitoring). That is why
+  `CREDENTIAL_BUNDLE_WORKFLOWS` is a subset of `PRIVILEGED_WORKFLOWS`.
 
 Outcomes come from `.github/scripts/drift_report.py`: `in_sync`, `drift`,
 `failed`, `skipped` (file mode), `not_completed`. Only `in_sync` is a successful
@@ -702,7 +706,7 @@ environment's whole bundle. A `slot:` is sent only when all hold, else
   (`verify::ProbeConsumerAllowlist`, comma-separated `<ns>/<consumer-id>`).
   This operator-held GitHub Environment **variable** is the authorization: no
   change to `resources/` or `.gitforgeops/` can change it (the workflow lines
-  binding it are guarded by review; a trusted-checker pin is a follow-up).
+  binding it are pinned by the protected supply-chain checker).
   Unset or empty while a check sends a slot is a refusal; a malformed entry
   (anything but exactly one `/`) is an error;
 - the Consumer carries `gitforgeops/verify-probe: "true"` in the unresolved
@@ -722,14 +726,23 @@ Consumer plus every labelled Consumer, names only
 (`review::pr_comment::render_probe_bindings`).
 
 - `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND=true` (`EnvConfig::verify_probe_consumers_bound`)
-  marks a run bound to the environment. There an unset, blank or malformed
-  allowlist (`ProbeAllowlistState::Unset` / `Malformed`) is refused while a
-  check sends a slot, as `verify` refuses it (`missing_allowlist_error`);
+  marks a run bound to the environment. There an unset or blank allowlist
+  (`ProbeAllowlistState::Unset`) is refused while a check sends a slot, as
+  `verify` refuses it (`missing_allowlist_error`). A malformed allowlist
+  (`Malformed`) refuses any run that sends a slot, even without the marker;
   `review` reports it as the separate `ProbeConsumerAllowlist` blocker
   (`probe-consumer-allowlist`), an operator action, never
   `invalid-smoke-checks`.
-- Without the marker the allowlist half reads `AllowlistNotVisible` and does
-  not refuse (`ProbeAllowlistState::NotVisible`).
+- Without the marker an unset or blank allowlist reads `AllowlistNotVisible`
+  and does not refuse (`ProbeAllowlistState::NotVisible`). Review rows mark
+  missing or malformed allowlists as refused rather than not visible.
+- `check_supply_chain.py::probe_consumer_binding_violations` reads the parsed
+  workflow tree and pins `${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}` in both
+  apply and promote Validate/Verify traffic steps and trusted live review,
+  plus `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` in Validate and live review.
+  Workflow/job env, dynamic maps, other step bindings, shell rebinding and
+  alternate `GITHUB_ENV` writes are refused. The bundle loader's credential-file
+  hand-off remains the only permitted env-file reference.
 - Only an ad-hoc `FERRUM_NAMESPACE` (not `namespace_filter_is_environment_scope`)
   makes an out-of-scope slot `OutsideNamespaceScope`, which does not refuse.
   Under the environment's own scope it is `NotAConsumerSecret`, as at verify.
@@ -1159,7 +1172,7 @@ gateway, as `Vec<ApplyBlocker>` over eleven `BlockerKind`s:
 | `NarrowedFilePublication` | file-mode apply narrowed by ad-hoc `FERRUM_NAMESPACE` |
 | `PublicationPathCollision` | gateway and mesh destinations resolve to one file |
 | `InvalidSmokeChecks` | `.gitforgeops/smoke.yaml` does not load, or names a slot `verify` would refuse |
-| `ProbeConsumerAllowlist` | environment-bound run, a check sends a slot, `FERRUM_VERIFY_PROBE_CONSUMERS` unset/blank/malformed |
+| `ProbeConsumerAllowlist` | a check sends a slot, `FERRUM_VERIFY_PROBE_CONSUMERS` malformed in any run or unset/blank in an environment-bound run |
 
 - `plan` evaluates the whole set, prints `=== Apply Blockers ===` (class, count,
   remedy) plus a summary, and exits 1 when non-empty.
