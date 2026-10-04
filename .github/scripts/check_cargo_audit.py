@@ -4,14 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import http.client
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 
 MAX_REVIEW_HORIZON_DAYS = 120
@@ -63,6 +72,52 @@ ALLOWED_AGE_REFERENCES = {
 }
 AGE_REFERENCE = re.compile(r"\bage(?:::[A-Za-z_][A-Za-z0-9_]*)+")
 CARGO_TREE_NO_MATCH = "did not match any packages"
+
+# Files that steer `cargo` or `cargo audit` from the working directory: cargo
+# discovers `.cargo/config[.toml]` (aliases, `[env]`, source replacement) in the
+# working directory and every ancestor, rustup discovers `rust-toolchain[.toml]`
+# (including a `path` toolchain) the same way, and cargo-audit reads
+# `./.cargo/audit.toml` (ignore lists, advisory database location, yanked
+# checks). None of them is looked up next to `--manifest-path` or `--file`, so
+# the gate runs cargo from an isolated directory: candidate copies are ignored
+# (and only listed in the log), and none may exist at or above that directory.
+CARGO_CONTROL_FILES = (
+    ".cargo/config",
+    ".cargo/config.toml",
+    ".cargo/audit.toml",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+)
+# Inherited variables that would otherwise select a toolchain, wrap rustc,
+# unlock nightly-only behaviour (`RUSTC_BOOTSTRAP`, cargo's internal
+# `__CARGO_*` overrides) or configure cargo (`CARGO_ALIAS_<name>`,
+# `CARGO_HOME`, ...) for the gate.
+SCRUBBED_ENVIRONMENT = frozenset(
+    {
+        "CARGO",
+        "RUSTC",
+        "RUSTC_BOOTSTRAP",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTDOCFLAGS",
+        "RUSTFLAGS",
+        "RUSTUP_TOOLCHAIN",
+    }
+)
+SCRUBBED_ENVIRONMENT_PREFIXES = ("CARGO_", "__CARGO_")
+
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_LOCKFILE_BYTES = 8 * 1024 * 1024
+MAX_SOURCE_BYTES = 1024 * 1024
+MAX_SOURCE_TOTAL_BYTES = 32 * 1024 * 1024
+MAX_SOURCE_ENTRIES = 4096
+MAX_SOURCE_DEPTH = 32
+MAX_INDEX_BYTES = 16 * 1024 * 1024
+INDEX_TIMEOUT_SECONDS = 30
+CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+CRATE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+CRATE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?$")
+CHECKSUM = re.compile(r"^[0-9a-f]{64}$")
 
 _RAW_STRING_START = re.compile(r'b?r(?P<hashes>#*)"')
 _CHAR_LITERAL = re.compile(r"b?'(?:\\.|[^\\'\n])'")
@@ -174,6 +229,8 @@ def _finding_key(finding: dict[str, Any]) -> tuple[str, str, str, str, str]:
 
 def collect_findings(report: dict[str, Any]) -> list[dict[str, str | None]]:
     """Flatten cargo-audit's vulnerability and warning buckets."""
+    if not isinstance(report, dict):
+        raise PolicyError("cargo-audit report must be a JSON object")
     findings: list[dict[str, str | None]] = []
 
     vulnerability_section = report.get("vulnerabilities", {})
@@ -345,8 +402,273 @@ def evaluate(
     return reviewed, blocked, stale, informational
 
 
+def ignored_candidate_cargo_inputs(source_root: Path) -> list[str]:
+    """Candidate cargo/toolchain control files this gate deliberately ignores."""
+    return [name for name in CARGO_CONTROL_FILES if os.path.lexists(source_root / name)]
+
+
+def _candidate_regular_file(
+    source_root: Path, name: str, limit: int, directory_fd: int
+) -> None:
+    """Check initial metadata; the bounded descriptor read checks again at open."""
+    path = source_root / name
+    try:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise PolicyError(f"candidate {name} must be a regular file: {path}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PolicyError(f"candidate {name} must be a regular file: {path}")
+    if metadata.st_size > limit:
+        raise PolicyError(f"candidate {name} exceeds the {limit}-byte limit")
+
+
+def _read_regular_text(path: Path, limit: int, directory_fd: int | None = None) -> str:
+    """Bound reads and refuse links/devices even if the checked path is replaced."""
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise PolicyError(f"candidate input must be a regular file: {path}")
+            if metadata.st_size > limit:
+                raise PolicyError(f"candidate input exceeds the {limit}-byte limit: {path}")
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise PolicyError(f"candidate input exceeds the {limit}-byte limit: {path}")
+        return data.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PolicyError(f"cannot inspect {path}: {exc}") from exc
+
+
+@contextlib.contextmanager
+def _directory_descriptor(path: Path, parent_fd: int | None = None) -> Iterator[int]:
+    """Pin directories before descending and refuse symlinked child directories."""
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise PolicyError(f"candidate source must be a real directory: {path}: {exc}") from exc
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _capture_sources(root_fd: int) -> dict[Path, str] | None:
+    """Read Rust sources once through pinned directories, with per-tree bounds."""
+    try:
+        metadata = os.stat("src", dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PolicyError("candidate src must be a real directory, never a symlink")
+    sources: dict[Path, str] = {}
+    entries_seen = 0
+    total_bytes = 0
+
+    def visit(directory_fd: int, relative: Path, depth: int) -> None:
+        nonlocal entries_seen, total_bytes
+        if depth > MAX_SOURCE_DEPTH:
+            raise PolicyError("candidate source tree exceeds the directory depth limit")
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                entries_seen += 1
+                if entries_seen > MAX_SOURCE_ENTRIES:
+                    raise PolicyError("candidate source tree exceeds the entry limit")
+                path = relative / entry.name
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(metadata.st_mode):
+                    with _directory_descriptor(Path(entry.name), directory_fd) as child_fd:
+                        visit(child_fd, path, depth + 1)
+                elif not stat.S_ISREG(metadata.st_mode):
+                    raise PolicyError(
+                        f"candidate source must be a regular file or real directory: {path}"
+                    )
+                elif path.suffix == ".rs":
+                    text = _read_regular_text(
+                        Path(entry.name), MAX_SOURCE_BYTES, directory_fd
+                    )
+                    total_bytes += len(text.encode("utf-8"))
+                    if total_bytes > MAX_SOURCE_TOTAL_BYTES:
+                        raise PolicyError("candidate source tree exceeds the total byte limit")
+                    sources[path] = text
+
+    with _directory_descriptor(Path("src"), root_fd) as source_fd:
+        visit(source_fd, Path("src"), 0)
+    return sources
+
+
+def _refuse_ancestor_manifests(root: Path) -> None:
+    # Cargo discovers implicit workspaces even outside --manifest-path's tree.
+    # Refuse without reading any ancestor's contents.
+    for ancestor in root.resolve().parents:
+        if os.path.lexists(ancestor / "Cargo.toml"):
+            raise PolicyError(
+                "audit gate requires a standalone checkout without an ancestor "
+                f"Cargo.toml that could select a workspace: {ancestor / 'Cargo.toml'}"
+            )
+
+
+def _validate_manifest_and_lockfile(
+    source_root: Path, manifest_text: str, lockfile_text: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        manifest = tomllib.loads(manifest_text)
+        lockfile = tomllib.loads(lockfile_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise PolicyError(f"cannot parse candidate Cargo inputs: {exc}") from exc
+    package = manifest.get("package")
+    if not isinstance(package, dict) or package.get("name") != "gitforgeops":
+        raise PolicyError("audit gate requires the single gitforgeops root package")
+    if "workspace" in package or "workspace" in manifest:
+        raise PolicyError(
+            "audit gate requires a single-package repository; package.workspace and "
+            "[workspace] are refused because Cargo could use a different dependency "
+            "graph or lockfile than the audited root Cargo.lock"
+        )
+    _refuse_ancestor_manifests(source_root)
+    if lockfile.get("version") not in (3, 4):
+        raise PolicyError("audit gate requires a version 3 or 4 Cargo.lock")
+    # A data-only snapshot must not send Cargo back into candidate-controlled
+    # local dependency manifests (including target deps, patches and replaces).
+    def table_values(value: Any) -> list[Any]:
+        if not isinstance(value, dict):
+            raise PolicyError("audit snapshot requires Cargo dependency tables")
+        return list(value.values())
+
+    dependency_tables = [manifest, *table_values(manifest.get("target", {}))]
+    dependencies = []
+    for table in dependency_tables:
+        if not isinstance(table, dict):
+            raise PolicyError("audit snapshot requires Cargo dependency tables")
+        for section in (
+            "dependencies",
+            "dev-dependencies",
+            "dev_dependencies",
+            "build-dependencies",
+            "build_dependencies",
+        ):
+            dependencies.extend(table_values(table.get(section, {})))
+    for table in table_values(manifest.get("patch", {})):
+        dependencies.extend(table_values(table))
+    dependencies.extend(table_values(manifest.get("replace", {})))
+    if any(isinstance(dependency, dict) and "path" in dependency for dependency in dependencies):
+        raise PolicyError("audit snapshot does not support local path dependencies")
+    return manifest, lockfile
+
+
+@dataclass(frozen=True)
+class CandidateSnapshot:
+    root: Path
+    manifest: dict[str, Any]
+    lockfile: dict[str, Any]
+    sources: dict[Path, str] | None
+    workdir: Path
+    environment: dict[str, str]
+
+
+@contextlib.contextmanager
+def candidate_snapshot(source_root: Path) -> Iterator[CandidateSnapshot]:
+    """Capture bounded data once; every verifier and Cargo command uses this copy."""
+    with _directory_descriptor(source_root) as root_fd:
+        # Reject BOTH invalid inputs before reading either one's contents.
+        _candidate_regular_file(source_root, "Cargo.toml", MAX_MANIFEST_BYTES, root_fd)
+        _candidate_regular_file(source_root, "Cargo.lock", MAX_LOCKFILE_BYTES, root_fd)
+        manifest_text = _read_regular_text(Path("Cargo.toml"), MAX_MANIFEST_BYTES, root_fd)
+        lockfile_text = _read_regular_text(Path("Cargo.lock"), MAX_LOCKFILE_BYTES, root_fd)
+        manifest, lockfile = _validate_manifest_and_lockfile(
+            source_root, manifest_text, lockfile_text
+        )
+        _registry_packages(lockfile)
+        sources = _capture_sources(root_fd)
+    with isolated_cargo(source_root) as (workdir, environment):
+        root = workdir.parent / "snapshot"
+        _refuse_ancestor_manifests(root)
+        root.mkdir()
+        (root / "Cargo.toml").write_text(manifest_text, encoding="utf-8")
+        (root / "Cargo.lock").write_text(lockfile_text, encoding="utf-8")
+        for relative, text in (sources or {}).items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        # No configuration, scripts, executables or arbitrary repository files
+        # are copied. cargo tree only needs target discovery, never compilation.
+        yield CandidateSnapshot(root, manifest, lockfile, sources, workdir, environment)
+
+
+def _scrubbed_cargo_environment(cargo_home: Path, home: Path) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in SCRUBBED_ENVIRONMENT
+        and not key.startswith(SCRUBBED_ENVIRONMENT_PREFIXES)
+    }
+    # HOME must not expose Git/user configuration. Rustup still needs the
+    # runner's installed default toolchain, so retain only its trusted store.
+    environment["RUSTUP_HOME"] = str(
+        Path(os.environ.get("RUSTUP_HOME") or Path.home() / ".rustup").resolve()
+    )
+    environment["HOME"] = str(home)
+    environment["CARGO_HOME"] = str(cargo_home)
+    return environment
+
+
+@contextlib.contextmanager
+def isolated_cargo(source_root: Path) -> Iterator[tuple[Path, dict[str, str]]]:
+    """Yield a working directory and environment that no candidate file reaches.
+
+    Cargo, rustup and cargo-audit all read configuration relative to the
+    working directory, not to `--manifest-path` or `--file`. Running from a
+    fresh directory outside the candidate tree, with fresh `HOME`/`CARGO_HOME` and
+    no inherited cargo/rustup selection variables, keeps candidate control
+    files out of the data snapshot. The toolchain is the runner's
+    default, installed by the workflow's pinned toolchain step.
+    """
+    root = source_root.resolve()
+    # Downloaded crate sources and the advisory database land in this
+    # CARGO_HOME; failing to delete them afterwards must not fail the gate.
+    with tempfile.TemporaryDirectory(
+        prefix="cargo-audit-isolated-", ignore_cleanup_errors=True
+    ) as directory:
+        base = Path(directory).resolve()
+        workdir = base / "work"
+        cargo_home = base / "cargo-home"
+        home = base / "home"
+        workdir.mkdir()
+        cargo_home.mkdir()
+        home.mkdir()
+        if root == workdir or root in workdir.parents:
+            raise PolicyError(
+                f"the isolated cargo directory {workdir} is inside the candidate "
+                f"tree {root}; point TMPDIR outside the checkout"
+            )
+        for ancestor in (workdir, *workdir.parents):
+            for name in CARGO_CONTROL_FILES:
+                if os.path.lexists(ancestor / name):
+                    raise PolicyError(
+                        f"cargo would read {ancestor / name} from the isolated "
+                        "working directory; point TMPDIR at a directory without "
+                        "cargo or rustup configuration above it"
+                    )
+        environment = _scrubbed_cargo_environment(cargo_home, home)
+        rustup_home = Path(environment["RUSTUP_HOME"])
+        if root == rustup_home or root in rustup_home.parents:
+            raise PolicyError("RUSTUP_HOME must not point inside the candidate tree")
+        yield workdir, environment
+
+
 def _read_dependency_tree(
-    package: str, version: str, source_root: Path, dependency_tree_path: Path | None
+    package: str,
+    version: str,
+    snapshot: CandidateSnapshot,
+    dependency_tree_path: Path | None,
 ) -> str:
     if dependency_tree_path is not None:
         try:
@@ -357,20 +679,25 @@ def _read_dependency_tree(
             ) from exc
 
     spec = f"{package}@{version}"
+    manifest = snapshot.root / "Cargo.toml"
     try:
         result = subprocess.run(
             [
                 "cargo",
                 "tree",
+                "--manifest-path",
+                str(manifest),
                 "--color",
                 "never",
                 "--locked",
+                "--all-features",
                 "--target",
                 "all",
                 "-i",
                 spec,
             ],
-            cwd=source_root,
+            cwd=snapshot.workdir,
+            env=snapshot.environment,
             check=False,
             capture_output=True,
             text=True,
@@ -392,14 +719,10 @@ def _read_dependency_tree(
 
 
 def verify_age_encryption_only(
-    exception: dict[str, Any], source_root: Path, dependency_tree_path: Path | None
+    exception: dict[str, Any], snapshot: CandidateSnapshot, dependency_tree_path: Path | None
 ) -> None:
     """Fail closed if the RSA exception outlives its encryption-only premise."""
-    manifest_path = source_root / "Cargo.toml"
-    try:
-        manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise PolicyError(f"cannot inspect {manifest_path}: {exc}") from exc
+    manifest = snapshot.manifest
     age_dependency = manifest.get("dependencies", {}).get("age")
     if not isinstance(age_dependency, dict):
         raise PolicyError("RSA exception requires age to use an explicit dependency table")
@@ -416,17 +739,11 @@ def verify_age_encryption_only(
             "ssh and armor features"
         )
 
-    source_dir = source_root / "src"
-    if not source_dir.is_dir():
-        raise PolicyError(f"RSA exception source directory is missing: {source_dir}")
-    for path in sorted(source_dir.rglob("*.rs")):
-        try:
-            raw_text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise PolicyError(f"cannot inspect {path}: {exc}") from exc
+    if snapshot.sources is None:
+        raise PolicyError("RSA exception source directory is missing: src")
+    for relative, raw_text in sorted(snapshot.sources.items()):
         # Comments and string literals are prose, not reachable calls.
         text = strip_rust_comments_and_strings(raw_text)
-        relative = path.relative_to(source_root)
         references = set(AGE_REFERENCE.findall(text))
         if references and relative != REVIEWED_AGE_MODULE:
             raise PolicyError(
@@ -460,7 +777,7 @@ def verify_age_encryption_only(
     dependency_tree = _read_dependency_tree(
         str(exception["package"]),
         str(exception["version"]),
-        source_root,
+        snapshot,
         dependency_tree_path,
     )
     if not EXPECTED_RSA_TREE.fullmatch(dependency_tree):
@@ -471,7 +788,7 @@ def verify_age_encryption_only(
 
 
 REACHABILITY_VERIFIERS: dict[
-    str, Callable[[dict[str, Any], Path, Path | None], None]
+    str, Callable[[dict[str, Any], CandidateSnapshot, Path | None], None]
 ] = {
     AGE_ENCRYPTION_ONLY: verify_age_encryption_only,
 }
@@ -489,7 +806,7 @@ def _reachability_verifier_name(
 
 def verify_exception_reachability(
     policy: dict[tuple[str, str, str, str, str], dict[str, Any]],
-    source_root: Path,
+    snapshot: CandidateSnapshot,
     dependency_tree_path: Path | None,
 ) -> None:
     """Run every exception's reachability verifier, or refuse to accept it."""
@@ -512,7 +829,7 @@ def verify_exception_reachability(
                 f"verifier {name!r}; known verifiers are "
                 f"{sorted(REACHABILITY_VERIFIERS)}"
             )
-        verifier(exception, source_root, dependency_tree_path)
+        verifier(exception, snapshot, dependency_tree_path)
 
 
 def _format_finding(finding: dict[str, str | None]) -> str:
@@ -523,11 +840,26 @@ def _format_finding(finding: dict[str, str | None]) -> str:
     )
 
 
-def run_cargo_audit(source_root: Path) -> tuple[dict[str, Any], int]:
+def run_cargo_audit(snapshot: CandidateSnapshot) -> tuple[dict[str, Any], int]:
+    # An explicit `--file` also stops cargo-audit from generating a lockfile
+    # when the candidate has none: a missing lockfile is a refusal, not a
+    # fresh resolution.
+    lockfile = snapshot.root / "Cargo.lock"
     try:
         result = subprocess.run(
-            ["cargo", "audit", "--json", "--deny", "unsound", "--deny", "yanked"],
-            cwd=source_root,
+            [
+                "cargo",
+                "audit",
+                "--json",
+                "--deny",
+                "unsound",
+                "--deny",
+                "yanked",
+                "--file",
+                str(lockfile),
+            ],
+            cwd=snapshot.workdir,
+            env=snapshot.environment,
             check=False,
             capture_output=True,
             text=True,
@@ -540,6 +872,120 @@ def run_cargo_audit(source_root: Path) -> tuple[dict[str, Any], int]:
     except json.JSONDecodeError as exc:
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise PolicyError(f"cargo audit did not return JSON: {detail}") from exc
+
+
+def _registry_packages(lockfile: dict[str, Any]) -> list[dict[str, str]]:
+    packages = lockfile.get("package", [])
+    if not isinstance(packages, list):
+        raise PolicyError("Cargo.lock package entries must be a list")
+    registry_packages = []
+    identities = set()
+    for package in packages:
+        if not isinstance(package, dict):
+            raise PolicyError("Cargo.lock contains a malformed package")
+        name, version, source = (package.get(key) for key in ("name", "version", "source"))
+        if not isinstance(name, str) or not CRATE_NAME.fullmatch(name):
+            raise PolicyError("Cargo.lock contains an invalid package name")
+        if not isinstance(version, str) or not CRATE_VERSION.fullmatch(version):
+            raise PolicyError(f"Cargo.lock contains an invalid version for {name}")
+        if source is not None and not isinstance(source, str):
+            raise PolicyError(f"Cargo.lock contains an invalid source for {name}")
+        identity = (name, version, source)
+        if identity in identities:
+            raise PolicyError(f"Cargo.lock repeats package {name}@{version}")
+        identities.add(identity)
+        if source is None or source.startswith("git+"):
+            # Local and Git dependencies have no registry yanked status.
+            continue
+        if source != CRATES_IO_SOURCE:
+            raise PolicyError(
+                f"complete yanked scan does not support source {source!r} for "
+                f"{name}@{version}; this repository uses only the crates.io registry"
+            )
+        checksum = package.get("checksum")
+        if not isinstance(checksum, str) or not CHECKSUM.fullmatch(checksum):
+            raise PolicyError(f"Cargo.lock lacks a valid checksum for {name}@{version}")
+        registry_packages.append(
+            {"name": name, "version": version, "source": source, "checksum": checksum}
+        )
+    return registry_packages
+
+
+def _fetch_crate_index(name: str) -> list[dict[str, Any]]:
+    lower = name.lower()
+    if len(lower) <= 2:
+        prefix = str(len(lower))
+    elif len(lower) == 3:
+        prefix = f"3/{lower[0]}"
+    else:
+        prefix = f"{lower[:2]}/{lower[2:4]}"
+    url = f"https://index.crates.io/{prefix}/{lower}"
+    request = urllib.request.Request(
+        url, headers={"Accept": "text/plain", "Cache-Control": "no-cache"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=INDEX_TIMEOUT_SECONDS) as response:
+            if response.status != 200 or response.geturl() != url:
+                raise PolicyError(f"unexpected crates.io index response for {name}")
+            data = response.read(MAX_INDEX_BYTES + 1)
+            if len(data) > MAX_INDEX_BYTES:
+                raise PolicyError(f"crates.io index entry exceeds the byte limit for {name}")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and int(content_length) != len(data):
+                raise PolicyError(f"incomplete crates.io index response for {name}")
+        entries = [json.loads(line) for line in data.decode("utf-8").splitlines()]
+    except (OSError, http.client.HTTPException, urllib.error.URLError, ValueError) as exc:
+        raise PolicyError(f"complete yanked scan cannot read index for {name}: {exc}") from exc
+    if not entries or not all(isinstance(entry, dict) for entry in entries):
+        raise PolicyError(f"malformed crates.io index entry for {name}")
+    return entries
+
+
+def scan_yanked_packages(lockfile: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    """Require positive index evidence for EVERY locked registry package version.
+
+    cargo-audit 0.22.1 can return successful JSON without an index and after
+    individual lookup errors. Its warning list is not completeness evidence.
+    Query the published crates.io sparse index independently, without Cargo
+    configuration, local cache or fallback. Any unavailable or missing record
+    is an operational failure, even when all advisories have exceptions.
+    """
+    packages = _registry_packages(lockfile)
+    names = sorted({package["name"] for package in packages})
+    # Fetch each crate once, including crates with multiple locked versions.
+    # Executor.map preserves deterministic processing and propagates failures.
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        indices = dict(zip(names, executor.map(_fetch_crate_index, names)))
+    yanked = []
+    for package in packages:
+        name, version = package["name"], package["version"]
+        matching = [
+            entry
+            for entry in indices[name]
+            if entry.get("name") == name and entry.get("vers") == version
+        ]
+        if len(matching) != 1:
+            raise PolicyError(f"complete yanked scan lacks a unique record for {name}@{version}")
+        entry = matching[0]
+        if entry.get("cksum") != package["checksum"]:
+            raise PolicyError(f"crates.io checksum differs from Cargo.lock for {name}@{version}")
+        if not isinstance(entry.get("yanked"), bool):
+            raise PolicyError(f"complete yanked scan lacks a boolean status for {name}@{version}")
+        if entry["yanked"]:
+            yanked.append({"kind": "yanked", "package": package, "advisory": None})
+    return yanked, len(packages)
+
+
+def merge_yanked_findings(report: dict[str, Any], yanked: list[dict[str, Any]]) -> None:
+    # Validate the original report before adding independently verified rows.
+    findings = collect_findings(report)
+    seen = {_finding_key(finding) for finding in findings if finding["kind"] == "yanked"}
+    for item in yanked:
+        package = item["package"]
+        key = ("yanked", "", package["name"], package["version"], package["source"])
+        if key not in seen:
+            report.setdefault("warnings", {}).setdefault("yanked", []).append(item)
+            seen.add(key)
 
 
 def parse_args() -> argparse.Namespace:
@@ -584,19 +1030,37 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     source_root = args.source_root.resolve()
+    ignored = ignored_candidate_cargo_inputs(source_root)
+    if ignored:
+        print(
+            "cargo runs outside the candidate tree; ignoring candidate cargo and "
+            f"toolchain configuration: {', '.join(ignored)}"
+        )
     try:
-        policy = load_policy(args.policy, args.today)
-        verify_exception_reachability(policy, source_root, args.dependency_tree)
-        if args.audit_json:
-            report = json.loads(args.audit_json.read_text(encoding="utf-8"))
-            audit_status = args.audit_exit_status
-        else:
-            report, audit_status = run_cargo_audit(source_root)
-        reviewed, blocked, stale, informational = evaluate(report, policy)
+        with candidate_snapshot(source_root) as snapshot:
+            policy = load_policy(args.policy, args.today)
+            verify_exception_reachability(policy, snapshot, args.dependency_tree)
+            if args.audit_json:
+                report = json.loads(args.audit_json.read_text(encoding="utf-8"))
+                audit_status = args.audit_exit_status
+            else:
+                report, audit_status = run_cargo_audit(snapshot)
+            audit_findings = collect_findings(report)
+            if audit_status == 1 and not audit_findings:
+                raise PolicyError("cargo audit reported findings this gate could not parse")
+            if audit_status not in (0, 1):
+                raise PolicyError(f"cargo audit failed operationally with exit {audit_status}")
+            yanked, checked_packages = scan_yanked_packages(snapshot.lockfile)
+            merge_yanked_findings(report, yanked)
+            reviewed, blocked, stale, informational = evaluate(report, policy)
     except (OSError, json.JSONDecodeError, PolicyError) as exc:
         print(f"cargo-audit policy error: {exc}", file=sys.stderr)
         return 2
 
+    print(
+        f"yanked scan complete: {checked_packages} crates.io package version(s), "
+        f"{len(yanked)} yanked"
+    )
     for annotation in review_deadline_warnings(policy, args.today):
         print(annotation)
 
@@ -612,17 +1076,6 @@ def main() -> int:
             f"::warning::cargo-audit {finding['kind']} {advisory} affects "
             f"{finding['package']} {finding['version']} (reported, not blocking)"
         )
-
-    parsed_findings = len(reviewed) + len(blocked) + len(informational)
-    if audit_status == 1 and parsed_findings == 0:
-        print(
-            "cargo audit reported findings this gate could not parse",
-            file=sys.stderr,
-        )
-        return 2
-    if audit_status not in (0, 1):
-        print(f"cargo audit failed operationally with exit {audit_status}", file=sys.stderr)
-        return 2
 
     if blocked:
         print("Unreviewed cargo-audit findings:", file=sys.stderr)
