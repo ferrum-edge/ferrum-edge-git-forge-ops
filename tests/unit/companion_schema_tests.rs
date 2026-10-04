@@ -577,7 +577,10 @@ fn alloy_generated_negative_cases(project: &Path, validator: &Path) {
             document["spec"][field] = Value::Null;
         });
         let error = load_resources(&copy.path().join("resources")).unwrap_err();
-        assert!(error.to_string().contains("invalid resource spec"), "{error}");
+        assert!(
+            error.to_string().contains("invalid resource spec"),
+            "{error}"
+        );
     }
 
     let upstream_path = "resources/ferrum/upstreams/orders-api-upstream.yaml";
@@ -601,7 +604,10 @@ fn alloy_generated_negative_cases(project: &Path, validator: &Path) {
         document["spec"]["targets"][0]["host"] = Value::Null;
     });
     let error = load_resources(&copy.path().join("resources")).unwrap_err();
-    assert!(error.to_string().contains("invalid resource spec"), "{error}");
+    assert!(
+        error.to_string().contains("invalid resource spec"),
+        "{error}"
+    );
 
     // Explicit namespace overrides remain supported. Moving only an upstream
     // breaks the same-namespace graph and must fail authoritative validation.
