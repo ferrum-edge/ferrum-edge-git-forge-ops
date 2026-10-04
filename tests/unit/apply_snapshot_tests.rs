@@ -10,7 +10,7 @@
 
 use gitforgeops::apply::{apply_api, ApplyOptions, ApplyResult};
 use gitforgeops::config::env::{EnvConfig, GatewayMode};
-use gitforgeops::config::schema::GatewayConfig;
+use gitforgeops::config::schema::{BackendScheme, GatewayConfig};
 use gitforgeops::diff::resource_diff::state_key;
 use gitforgeops::diff::OwnershipScope;
 use gitforgeops::http_client::{AdminClient, BackupExtras};
@@ -220,6 +220,20 @@ fn document(kind: Kind, id: &str, owner: Option<&str>, version: u16) -> GatewayC
     let mut document = serde_json::Map::new();
     document.insert(kind.section().to_string(), serde_json::json!([row]));
     serde_json::from_value(serde_json::Value::Object(document)).unwrap()
+}
+
+/// Add a typed optional field the desired row omitted.
+fn with_optional_addition(kind: Kind, config: &GatewayConfig) -> GatewayConfig {
+    let mut config = config.clone();
+    match kind {
+        Kind::Proxy => config.proxies[0].dns_override = Some("10.0.0.42".to_string()),
+        Kind::Upstream => {
+            config.upstreams[0].backend_tls_sni = Some("concurrent.example".to_string());
+        }
+        Kind::PluginConfig => config.plugin_configs[0].priority_override = Some(17),
+        Kind::Consumer => config.consumers[0].custom_id = Some("external-id".to_string()),
+    }
+    config
 }
 
 /// One upstream per `(id, version)`, as [`document`] builds it.
@@ -922,6 +936,173 @@ async fn an_ambiguous_create_claims_its_row_only_with_if_match_on_a_matching_rea
 }
 
 #[tokio::test]
+async fn ambiguous_batch_recovery_refuses_optional_fields_added_after_verification() {
+    for (kind, nested) in [
+        (Kind::Proxy, false),
+        (Kind::Upstream, false),
+        (Kind::PluginConfig, false),
+        (Kind::PluginConfig, true),
+    ] {
+        let desired = document(kind, "r1", None, 1);
+        let edited = if nested {
+            let mut edited = desired.clone();
+            edited.plugin_configs[0].config["allow_credentials"] = serde_json::json!(true);
+            edited
+        } else {
+            with_optional_addition(kind, &desired)
+        };
+        let routes = vec![
+            health(),
+            ("POST /batch".into(), 503, "{}".into(), vec![]),
+            backup(&desired),
+            tagged(kind, "r1", &edited, "\"concurrent-tag\""),
+        ];
+
+        let run = apply_exclusive(&desired, GatewayConfig::default(), routes).await;
+
+        let context = format!("{kind:?} nested={nested}");
+        assert_eq!(run.mutations(), ["POST /batch HTTP/1.1"], "{context}");
+        let read = format!("GET {}/r1 ", kind.path());
+        assert!(run.position("GET /backup ") < run.position(&read), "{context}");
+        assert_eq!(run.result.created, 0, "{context}");
+        assert!(run.result.applied_incremental.is_empty(), "{context}");
+        assert_eq!(run.result.errors.len(), 1, "{context}: {:?}", run.result);
+        assert!(
+            run.result.errors[0].contains("did not show the exact row"),
+            "{context}: {:?}",
+            run.result
+        );
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_create_recovery_preserves_the_complete_verified_row() {
+    for kind in ALL_KINDS {
+        for per_resource in [false, true] {
+            let mut desired = document(kind, "r1", None, 1);
+            if matches!(kind, Kind::Consumer) {
+                desired.consumers[0].credentials.insert(
+                    "keyauth".to_string(),
+                    serde_json::json!([{"key": "ambiguous-test-key"}]),
+                );
+            }
+            let mut verified = with_optional_addition(kind, &desired);
+            if matches!(kind, Kind::Proxy) {
+                // This is the gateway's documented default for an omitted
+                // HTTP backend scheme, not a field to erase during recovery.
+                verified.proxies[0].backend_scheme = Some(BackendScheme::Https);
+            }
+            let mut read = row(kind, "r1", &verified);
+            if matches!(kind, Kind::Proxy) {
+                // A legacy stored row may omit the scheme that backup
+                // normalizes. Only this documented default may compare equal.
+                read.as_object_mut().unwrap().remove("backend_scheme");
+            }
+            if matches!(kind, Kind::Consumer) {
+                read["credentials"] = serde_json::json!({"keyauth": [{"key": "***"}]});
+            }
+            let mut routes = vec![
+                health(),
+                backup(&verified),
+                read_route(kind, "r1", read.to_string(), &[("ETag", TAG)]),
+            ];
+            if per_resource {
+                routes.push(("POST /batch".into(), 501, "{}".into(), vec![]));
+                let post = format!("POST {} ", kind.path());
+                routes.push((post, 502, "{}".into(), vec![]));
+            } else {
+                routes.push(("POST /batch".into(), 503, "{}".into(), vec![]));
+            }
+
+            let run = apply_exclusive(&desired, GatewayConfig::default(), routes).await;
+
+            let context = format!("{kind:?} per_resource={per_resource}");
+            assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
+            assert!(run.result.fatal_error.is_none(), "{context}: {:?}", run.result);
+            assert_eq!(run.result.created, 1, "{context}");
+            assert_eq!(run.result.applied_incremental.len(), 1, "{context}");
+            assert_eq!(run.count("POST /batch "), 1, "{context}");
+            let put = format!("PUT {}/r1", kind.path());
+            assert_eq!(run.count(&put), 1, "{context}");
+            let sent = run.request(&put);
+            assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
+            let payload: serde_json::Value =
+                serde_json::from_str(sent.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(payload, row(kind, "r1", &verified), "{context}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_recovery_refuses_a_verification_that_dropped_nested_fields() {
+    let desired = document(Kind::Upstream, "u1", None, 1);
+    let mut incomplete = serde_json::to_value(&desired).unwrap();
+    incomplete["upstreams"][0]["targets"][0]["future_option"] = serde_json::json!(true);
+    for per_resource in [false, true] {
+        // The single-row response has no dropped field, but the verification
+        // backup does. Its typed row cannot be a complete ownership payload.
+        let mut routes = vec![
+            health(),
+            ("GET /backup".into(), 200, incomplete.to_string(), vec![]),
+            tagged(Kind::Upstream, "u1", &desired, TAG),
+        ];
+        if per_resource {
+            routes.push(("POST /batch".into(), 501, "{}".into(), vec![]));
+            routes.push(("POST /upstreams".into(), 502, "{}".into(), vec![]));
+        } else {
+            routes.push(("POST /batch".into(), 503, "{}".into(), vec![]));
+        }
+
+        let run = apply_exclusive(&desired, GatewayConfig::default(), routes).await;
+
+        assert_eq!(run.count("PUT /upstreams/u1"), 0, "per_resource={per_resource}");
+        assert_eq!(run.result.created, 0, "per_resource={per_resource}");
+        assert!(run.result.applied_incremental.is_empty());
+        assert!(!run.result.errors.is_empty() || run.result.fatal_error.is_some());
+    }
+}
+
+#[tokio::test]
+async fn an_added_optional_field_during_batch_recovery_defers_pruning() {
+    // A mixed namespace needs a batch for the new scoped-plugin cycle, then
+    // intends to prune `old`. The proxy is edited after batch verification.
+    let planned = document(Kind::Upstream, "old", None, 1);
+    let desired = scoped_pair(1, true);
+    let edited = with_optional_addition(Kind::Proxy, &desired);
+    let mut verified = desired.clone();
+    verified.upstreams.extend(planned.upstreams.clone());
+    let routes = vec![
+        health(),
+        ("POST /batch".into(), 503, "{}".into(), vec![]),
+        backup(&verified),
+        tagged(Kind::PluginConfig, "pc1", &verified, TAG),
+        tagged(Kind::Proxy, "p1", &edited, "\"concurrent-tag\""),
+        tagged(Kind::Upstream, "old", &planned, TAG),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert_eq!(
+        run.mutations(),
+        ["POST /batch HTTP/1.1", "PUT /plugins/config/pc1 HTTP/1.1"]
+    );
+    assert_eq!(run.count("GET /upstreams/old "), 0);
+    assert_eq!(run.result.deleted, 0);
+    assert_eq!(run.result.deletes_deferred, 1);
+    assert_eq!(run.result.created, 1);
+    assert_eq!(run.result.applied_incremental.len(), 1);
+    assert_eq!(run.result.applied_incremental[0].kind, "PluginConfig");
+    assert!(
+        run.result
+            .errors
+            .iter()
+            .any(|error| error.contains("did not show the exact row")),
+        "{:?}",
+        run.result
+    );
+}
+
+#[tokio::test]
 async fn adoption_claims_a_row_only_with_if_match_on_a_matching_read() {
     // Shared mode: a declared row identical to live and not in the ledger is
     // claimed with an ownership PUT, which must not revert a concurrent edit.
@@ -1221,6 +1402,146 @@ async fn a_412_after_a_retried_put_that_landed_counts_as_applied() {
             assert_eq!(errors.len(), 1, "{context}: {errors:?}");
             assert!(errors[0].contains("412 Precondition Failed"), "{errors:?}");
             assert!(errors[0].contains("itself have committed"), "{errors:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_retried_put_does_not_claim_an_optional_addition_as_its_own_write_or_prune() {
+    for kind in SPEC_KINDS {
+        let mut planned = document(kind, "r1", None, 1);
+        let desired = document(kind, "r1", None, 2);
+        let edited = with_optional_addition(kind, &desired);
+        let old = document(Kind::Upstream, "old", None, 1);
+        planned.upstreams.extend(old.upstreams.clone());
+        let first_read = tagged(kind, "r1", &planned, TAG);
+        let put = format!("PUT {}/r1", kind.path());
+        let routes = vec![
+            health(),
+            (
+                format!("{ONCE}{}", first_read.0),
+                200,
+                first_read.2,
+                first_read.3,
+            ),
+            tagged(kind, "r1", &edited, "\"concurrent-tag\""),
+            (format!("{ONCE}{put}"), 503, "{}".into(), vec![]),
+            (put.clone(), 412, "{}".into(), vec![]),
+            tagged(Kind::Upstream, "old", &old, TAG),
+        ];
+        let (url, requests) = spawn_recording_gateway(routes);
+
+        let result = apply_api(
+            &desired,
+            &client_with_retries(url, 1),
+            &[NS.to_string()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([(NS.to_string(), planned)])),
+            Some(&BTreeMap::from([(NS.to_string(), BackupExtras::default())])),
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        let requests = requests.lock().unwrap().clone();
+        let run = Run { result, requests };
+
+        let context = format!("{kind:?}");
+        assert_eq!(run.count(&put), 2, "{context}");
+        assert_eq!(run.mutations().len(), 2, "{context}");
+        assert!(
+            run.requests
+                .iter()
+                .filter(|request| request.starts_with(&put))
+                .all(|request| request.contains(&format!("if-match: {TAG}\r\n"))),
+            "{context}"
+        );
+        assert_eq!(run.count("GET /upstreams/old "), 0, "{context}");
+        assert_eq!(run.result.updated, 0, "{context}");
+        assert_eq!(run.result.deleted, 0, "{context}");
+        assert_eq!(run.result.deletes_deferred, 1, "{context}");
+        assert!(run.result.applied_incremental.is_empty(), "{context}");
+        assert_eq!(run.result.errors.len(), 1, "{context}: {:?}", run.result);
+        assert!(
+            run.result.errors[0].contains("412 Precondition Failed"),
+            "{context}: {:?}",
+            run.result
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_retried_proxy_put_recovers_only_its_exact_normalized_result() {
+    // The server defaults a missing HTTP backend scheme to https. That known
+    // normalization can prove our write landed; it cannot excuse a concurrent
+    // dns_override addition or invent a default for a stream proxy.
+    for (stream, added, applied) in [
+        (false, false, true),
+        (false, true, false),
+        (true, false, false),
+    ] {
+        let mut planned = document(Kind::Proxy, "p1", None, 1);
+        let mut desired = document(Kind::Proxy, "p1", None, 2);
+        if stream {
+            planned.proxies[0].listen_port = Some(9000);
+            desired.proxies[0].listen_port = Some(9000);
+        }
+        let mut reread = desired.clone();
+        reread.proxies[0].backend_scheme = Some(BackendScheme::Https);
+        if added {
+            reread = with_optional_addition(Kind::Proxy, &reread);
+        }
+        let old = document(Kind::Upstream, "old", None, 1);
+        planned.upstreams.extend(old.upstreams.clone());
+        let first_read = tagged(Kind::Proxy, "p1", &planned, TAG);
+        let routes = vec![
+            health(),
+            (
+                format!("{ONCE}{}", first_read.0),
+                200,
+                first_read.2,
+                first_read.3,
+            ),
+            tagged(Kind::Proxy, "p1", &reread, "\"after\""),
+            (format!("{ONCE}PUT /proxies/p1"), 503, "{}".into(), vec![]),
+            ("PUT /proxies/p1".into(), 412, "{}".into(), vec![]),
+            tagged(Kind::Upstream, "old", &old, "\"old-tag\""),
+        ];
+        let (url, requests) = spawn_recording_gateway(routes);
+
+        let result = apply_api(
+            &desired,
+            &client_with_retries(url, 1),
+            &[NS.to_string()],
+            OwnershipScope::Exclusive,
+            Some(&BTreeMap::from([(NS.to_string(), planned)])),
+            Some(&BTreeMap::from([(NS.to_string(), BackupExtras::default())])),
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        let requests = requests.lock().unwrap().clone();
+        let run = Run { result, requests };
+
+        let context = format!("stream={stream} added={added}");
+        assert_eq!(run.count("PUT /proxies/p1"), 2, "{context}");
+        if applied {
+            assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
+            assert_eq!(run.result.updated, 1, "{context}");
+            assert_eq!(run.result.deleted, 1, "{context}");
+            assert_eq!(run.result.deletes_deferred, 0, "{context}");
+            let sent = run.request("DELETE /upstreams/old");
+            assert!(sent.contains("if-match: \"old-tag\"\r\n"), "{sent}");
+        } else {
+            assert_eq!(run.mutations().len(), 2, "{context}");
+            assert_eq!(run.result.updated, 0, "{context}");
+            assert_eq!(run.result.deleted, 0, "{context}");
+            assert_eq!(run.result.deletes_deferred, 1, "{context}");
+            assert!(run.result.applied_incremental.is_empty(), "{context}");
+            assert!(
+                run.result.errors[0].contains("412 Precondition Failed"),
+                "{context}: {:?}",
+                run.result
+            );
         }
     }
 }

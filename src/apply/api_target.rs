@@ -3024,7 +3024,7 @@ async fn adopt_matching_rows(
             _ => client.get_tagged(kind, id, namespace).await,
         };
         let etag = match read {
-            Ok(Some(tagged)) if resource.tagged_row_is(&tagged.body, true) => tagged.etag,
+            Ok(Some(tagged)) if resource.tagged_row_is(&tagged.body) => tagged.etag,
             Ok(_) => {
                 skip_adoption(result, namespace, &changed);
                 continue;
@@ -3273,15 +3273,17 @@ impl<'a> CreateResource<'a> {
     }
 
     /// After a `412` that followed a retried attempt: does the row now carry
-    /// what this run sent, unowned? Then that earlier attempt committed this
-    /// write, and the `412` only refused its replay. Consumers never qualify:
-    /// their read redacts the credentials that would have to match.
+    /// exactly what this run sent, unowned? A subset match would also accept a
+    /// concurrent writer's added optional field and incorrectly permit later
+    /// writes and pruning. Only known server normalization is ignored.
+    /// Consumers never qualify: their read redacts the credentials that would
+    /// have to match.
     async fn wrote_itself(self, client: &AdminClient, namespace: &str) -> bool {
         if matches!(self, Self::Consumer(_)) {
             return false;
         }
         match client.get_tagged(self.kind(), self.id(), namespace).await {
-            Ok(Some(tagged)) => self.tagged_row_is(&tagged.body, false),
+            Ok(Some(tagged)) => self.tagged_row_is(&tagged.body),
             _ => false,
         }
     }
@@ -3289,11 +3291,10 @@ impl<'a> CreateResource<'a> {
     /// Does a single-resource read show this row, unowned by any API spec and
     /// carrying no nested field the typed mirror drops?
     ///
-    /// `exact` asks for strict equality (adoption); otherwise the read only has
-    /// to carry everything this row declares (create recovery, see
-    /// [`resource_values_match`]). Consumer credentials are left out: the read
-    /// redacts them, so callers prove them from a backup read taken after it.
-    fn tagged_row_is(self, body: &serde_json::Value, exact: bool) -> bool {
+    /// Equality includes every optional field, apart from known server
+    /// normalization. Consumer credentials are left out: the read redacts
+    /// them, so callers prove them from a backup read taken after it.
+    fn tagged_row_is(self, body: &serde_json::Value) -> bool {
         let Ok((live, None)) = observe_body(self.kind(), body) else {
             return false;
         };
@@ -3313,12 +3314,47 @@ impl<'a> CreateResource<'a> {
             Self::Consumer(_) => &["credentials"],
             _ => &[],
         };
-        let desired = without_keys(&desired, ignored);
-        let live = without_keys(&live.value, ignored);
-        if exact {
-            desired == live
-        } else {
-            json_contains(&desired, &live)
+        let desired = recovery_comparison_value(
+            self.kind(),
+            without_keys(&desired, ignored),
+        );
+        let live = recovery_comparison_value(
+            self.kind(),
+            without_keys(&live.value, ignored),
+        );
+        desired == live
+    }
+
+    /// The complete verified row, including gateway-populated optional fields.
+    /// An ownership assertion must preserve these instead of rewriting the
+    /// desired subset. Refuse a verification that dropped nested fields.
+    fn verified_row<'b>(
+        self,
+        live: &LiveIndex<'b>,
+        nested: &[http_client::UnmodeledNestedField],
+    ) -> Option<CreateResource<'b>> {
+        if live.is_spec_owned(self.kind(), self.namespace(), self.id())
+            || nested.iter().any(|field| match field.kind.as_str() {
+                "Proxy" | "Consumer" | "Upstream" | "PluginConfig" => {
+                    field.kind == self.kind()
+                        && field.namespace == self.namespace()
+                        && field.id == self.id()
+                }
+                _ => true,
+            })
+        {
+            return None;
+        }
+        let key = (self.namespace(), self.id());
+        match self {
+            Self::Proxy(_) => live.proxies.get(&key).copied().map(CreateResource::Proxy),
+            Self::Consumer(_) => live.consumers.get(&key).copied().map(CreateResource::Consumer),
+            Self::Upstream(_) => live.upstreams.get(&key).copied().map(CreateResource::Upstream),
+            Self::PluginConfig(_) => live
+                .plugin_configs
+                .get(&key)
+                .copied()
+                .map(CreateResource::PluginConfig),
         }
     }
 
@@ -3465,9 +3501,8 @@ async fn create_with_reconciliation(
             let tagged = client
                 .get_tagged(resource.kind(), resource.id(), namespace)
                 .await;
-            // The row was absent at diff time, so this verification read's
-            // `unmodeled_nested_fields` are not checked: the tagged read refuses
-            // a nested field this client drops before anything is written.
+            // Recovery retains the complete verification row and refuses any
+            // nested fields its typed decode dropped before asserting ownership.
             let snapshot = client
                 .get_backup_snapshot_for_mutation(namespace)
                 .await
@@ -3485,10 +3520,21 @@ async fn create_with_reconciliation(
                     resource.id(),
                 )));
             }
-            match resource.live_match(&LiveIndex::build(&snapshot.config)) {
+            let live = LiveIndex::build(&snapshot.config);
+            let nested = &snapshot.unmodeled_nested_fields;
+            match resource.live_match(&live) {
                 LiveMatch::Exact => {
+                    let verified = resource
+                        .verified_row(&live, nested)
+                        .ok_or_else(|| {
+                            crate::error::Error::AmbiguousMutation(format!(
+                                "{} `{}` in namespace `{namespace}` returned `{original}`; the verification did not retain a complete unowned row, so no ownership assertion was sent",
+                                resource.kind(),
+                                resource.id(),
+                            ))
+                        })?;
                     let etag = match tagged {
-                        Ok(Some(tagged)) if resource.tagged_row_is(&tagged.body, false) => {
+                        Ok(Some(tagged)) if verified.tagged_row_is(&tagged.body) => {
                             tagged.etag
                         }
                         Ok(_) => {
@@ -3506,7 +3552,7 @@ async fn create_with_reconciliation(
                             )));
                         }
                     };
-                    resource
+                    verified
                         .update_if_match(client, namespace, &etag)
                         .await
                         .map_err(|assertion| {
@@ -3603,6 +3649,26 @@ fn comparison_value<T: serde::Serialize>(kind: &str, value: &T) -> Option<serde_
     }
     normalize_associations_for_comparison(kind, &mut value);
     Some(value)
+}
+
+/// Only canonicalize a documented server default for recovery equality.
+/// Typed decoding already fills non-optional defaults; other optional fields
+/// must remain visible, even when the sent row omitted them. HTTP-family
+/// proxies store an omitted backend scheme as `https` (as in assembly), while
+/// stream proxies have no such default. Timestamps and association order were
+/// already handled by `comparison_value`.
+fn recovery_comparison_value(kind: &str, mut value: serde_json::Value) -> serde_json::Value {
+    if kind == "Proxy"
+        && value
+            .get("listen_port")
+            .is_none_or(serde_json::Value::is_null)
+        && value
+            .get("backend_scheme")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        value["backend_scheme"] = serde_json::json!("https");
+    }
+    value
 }
 
 /// `live` carries every key/value in `desired`, recursively.
@@ -3900,8 +3966,8 @@ async fn try_batch_create(
                 let original = e.to_string();
                 // As in `create_with_reconciliation`, consumers are read before
                 // the verification backup (the only read that shows their
-                // credentials), and its `unmodeled_nested_fields` are not
-                // checked: each row's own read refuses one before its PUT.
+                // credentials). Ownership assertions preserve its complete
+                // rows and refuse fields its typed decode dropped.
                 let mut consumer_reads = HashMap::new();
                 for consumer in &chunk.consumers {
                     let id = consumer.id.as_str();
@@ -3940,6 +4006,7 @@ async fn try_batch_create(
                             chunk,
                             client,
                             namespace,
+                            &snapshot,
                             consumer_reads,
                             &mut result,
                         )
@@ -4087,13 +4154,19 @@ fn note_unattempted_chunks(
 /// assertions before it may rewrite it (a plugin PUT touches its proxy's
 /// associations). Exact batch readback already proved every dependency
 /// committed, so a failed plugin ownership assertion does not stop the proxy's.
+/// Compare against, and write, the complete verification row rather than the
+/// desired subset: a field added after verification must refuse the PUT, and
+/// a gateway-populated optional field already verified must survive it.
 async fn assert_batch_ownership(
     batch: &BatchCreate,
     client: &AdminClient,
     namespace: &str,
+    snapshot: &http_client::BackupSnapshot,
     mut consumer_reads: HashMap<&str, crate::error::Result<Option<http_client::TaggedResource>>>,
     result: &mut ApplyResult,
 ) {
+    let live = LiveIndex::build(&snapshot.config);
+    let nested = &snapshot.unmodeled_nested_fields;
     let resources = batch
         .upstreams
         .iter()
@@ -4112,16 +4185,17 @@ async fn assert_batch_ownership(
             CreateResource::Consumer(_) => consumer_reads.remove(id).unwrap_or(Ok(None)),
             _ => client.get_tagged(kind, id, namespace).await,
         };
-        let outcome = match read {
-            Ok(Some(tagged)) if resource.tagged_row_is(&tagged.body, false) => {
-                resource
+        let verified = resource.verified_row(&live, nested);
+        let outcome = match (read, verified) {
+            (Ok(Some(tagged)), Some(verified)) if verified.tagged_row_is(&tagged.body) => {
+                verified
                     .update_if_match(client, namespace, &tagged.etag)
                     .await
             }
-            Ok(_) => Err(crate::error::Error::StalePlan(
+            (Ok(_), _) => Err(crate::error::Error::StalePlan(
                 "not sent: the conditional read before the ownership assertion did not show the exact row the batch created. Re-run diff before retrying".to_string(),
             )),
-            Err(error) => Err(error),
+            (Err(error), _) => Err(error),
         };
         record_create(result, outcome, kind, id, namespace);
         if result.fatal_error.is_some() {
