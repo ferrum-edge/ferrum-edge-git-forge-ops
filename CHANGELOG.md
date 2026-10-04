@@ -7,6 +7,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Credential-complete consumer verification and coherent conditional namespace
+  snapshots for API mutations (#462). Sensitive response parsers validate identities,
+  duplicate records, row-map coverage, strong opaque tokens, source/cache state and
+  count seals without exposing credentials, tokens or response bodies. Doctor uses
+  GET-only capability probes and reports unavailable evidence as unknown.
+- Lifecycle coverage for hidden consumer edits and namespace restore conditions,
+  including ABA, empty replacement and confirmed spec deletion. Qualification on
+  the upcoming immutable Edge release bytes remains required; an older fixture or
+  passing parser tests do not establish first-release acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
   resource trees ([Alloy #27](https://github.com/ferrum-edge/ferrum-alloy/issues/27)).
   The existing required validator-pairing job builds the immutable producer,
@@ -64,6 +73,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Consumer modify/delete, ownership claims, pending-create and ambiguous-create/batch
+  recovery require complete stored evidence. Rotation establishes health, ownership
+  and representability before broker publication, then changes only the authorized
+  credential with the original row `If-Match`; refusal after delivery reports
+  recoverable divergence without recording completion. Basic HMACs remain opaque.
+- Every full replacement uses the original coherent snapshot's namespace `If-Match`,
+  including empty namespaces and confirmed API-spec deletion. The spec-only reread
+  is removed. Proven precommit connectivity retries reuse the identical body and
+  token; stale, unsupported and uncertain outcomes never retag or downgrade.
+- API import uses exact conditional exports and refuses unsupported hidden/custom
+  or legacy credentials before tree or bundle publication. Canonical file imports
+  retain explicit provenance; conditional files require authenticated response
+  headers. Ordinary diff, plan, review and viewer drift reads keep their endpoints.
 - Incremental `apply` needs a gateway that issues strong `ETag` values for
   existing rows and honors conditional writes with `If-Match`. The released
   Ferrum Edge v0.9.6 source contains this capability

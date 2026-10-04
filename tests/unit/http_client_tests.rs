@@ -732,7 +732,11 @@ async fn connection_drop_after_restore_delivery_is_an_ambiguous_mutation() {
         .post_restore(
             &GatewayConfig::default(),
             "team-alpha",
-            &BackupExtras::default(),
+            &super::conditional_fixtures::planned_extras(
+                &GatewayConfig::default(),
+                "team-alpha",
+                BackupExtras::default(),
+            ),
             false,
         )
         .await
@@ -1228,6 +1232,7 @@ fn backup_extras() -> BackupExtras {
         gateway_trust_bundles: Some(serde_json::json!([{ "revision": 7 }])),
         unsupported_sections: Vec::new(),
         unmodeled_nested_fields: Vec::new(),
+        ..BackupExtras::default()
     }
 }
 
@@ -1293,6 +1298,7 @@ fn restore_body_omits_an_authoritative_empty_api_spec_section() {
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
         unmodeled_nested_fields: Vec::new(),
+        ..BackupExtras::default()
     };
     let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
     assert!(body.get("api_specs").is_none());

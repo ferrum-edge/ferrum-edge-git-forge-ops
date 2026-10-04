@@ -30,10 +30,18 @@ pub fn import_from_file(
     // value, then use the same envelope parser as API import so opaque sections
     // are inventoried consistently instead of being discarded by GatewayConfig.
     let value: serde_json::Value =
-        serde_yaml::from_str(&contents).map_err(|source| crate::error::Error::YamlParse {
-            path: file_path.to_path_buf(),
-            source,
+        serde_yaml::from_str(&contents).map_err(|_| {
+            crate::error::Error::Config(
+                "invalid import document; credential-bearing details withheld".to_string(),
+            )
         })?;
+    if value.get("conditional").is_some() {
+        return Err(crate::error::Error::Config(
+            "exact conditional exports require authenticated API import with response headers; \
+             no tree or credential bundle was published"
+                .to_string(),
+        ));
+    }
     let snapshot = BackupSnapshot::from_value(value)?;
     let namespaces = source_namespaces(&snapshot);
     let source = ImportSourceMetadata::from_snapshot("file", namespaces, &snapshot);

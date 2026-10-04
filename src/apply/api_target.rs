@@ -10,6 +10,7 @@ use crate::diff::resource_diff::{
     compare_fields, compute_diff_with_options, normalize_associations_for_comparison, state_key,
     DiffAction, DiffOptions, DiffResult, OwnershipScope, ResourceDiff, SpecOwnedResource,
 };
+use crate::http_client::conditional::ConsumerEvidence;
 use crate::http_client::{
     self, AdminClient, BackupExtras, BatchCreate, ConditionalUpdate, DeleteOutcome,
     BATCH_MAX_BODY_BYTES,
@@ -318,7 +319,7 @@ pub fn incremental_prune_notice(
 /// `Ok`, so the caller can persist state for everything that already landed
 /// before propagating the failure. `into_result()` still turns it into an
 /// `Err`, so the run exits non-zero either way.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PreparedApply<'a> {
     /// One authoritative live view per namespace. Views the caller supplied
     /// are borrowed, not copied: a caller that already holds every
@@ -326,6 +327,7 @@ struct PreparedApply<'a> {
     /// whole live gateway once for the preflight and again for the apply.
     actuals: BTreeMap<String, Cow<'a, GatewayConfig>>,
     full_replaces: BTreeMap<String, PreparedFullReplace>,
+    consumer_evidence: BTreeMap<String, BTreeMap<String, ConsumerEvidence>>,
     /// Namespaces that cannot be reconciled this run, keyed to the reason.
     ///
     /// A repository declaration colliding with an API-spec-owned row is a
@@ -336,16 +338,9 @@ struct PreparedApply<'a> {
     blocked: BTreeMap<String, String>,
 }
 
-#[derive(Debug)]
 struct PreparedFullReplace {
     config: GatewayConfig,
     extras: BackupExtras,
-    /// The live API-spec documents this payload will replay, keyed by spec id,
-    /// as they read at prepare time. Re-checked immediately before `/restore`
-    /// so a spec written in between is not silently rolled back or deleted.
-    /// Empty when the payload carries no `api_specs` section, which is the
-    /// case the gateway's own existing-spec `409` already guards.
-    spec_snapshot: BTreeMap<String, serde_json::Value>,
 }
 
 /// Namespaces an apply will refuse to write, keyed to the refusal it will
@@ -382,6 +377,7 @@ pub async fn preflight_api_apply(
         actual_by_namespace,
         extras_by_namespace,
         options,
+        true,
     )
     .await?;
     preflight_writes(client).await?;
@@ -420,6 +416,39 @@ async fn conditional_write_refusal(
         }
     }
     None
+}
+
+/// Consumer evidence needed before allocation. Nonconsumer work keeps its existing reads.
+pub fn consumer_evidence_targets(
+    desired: &GatewayConfig,
+    actual: &GatewayConfig,
+    namespace: &str,
+    ownership_scope: OwnershipScope<'_>,
+    options: &ApplyOptions,
+) -> crate::error::Result<BTreeSet<String>> {
+    let desired = crate::config::filter_config_by_namespace(desired, namespace);
+    let diff = compute_diff_with_options(
+        &desired,
+        actual,
+        ownership_scope,
+        DiffOptions {
+            prune_spec_owned: options.confirm_api_spec_deletion,
+        },
+    )?;
+    let rewritten = incremental_rewrite_keys(&desired, actual, &diff, ownership_scope, options)?;
+    Ok(actual
+        .consumers
+        .iter()
+        .filter(|row| {
+            rewritten.contains(&state_key(namespace, "Consumer", &row.id))
+                || diff.diffs.iter().any(|diff| {
+                    diff.kind == "Consumer"
+                        && diff.id == row.id
+                        && diff.action == DiffAction::Delete
+                })
+        })
+        .map(|row| row.id.clone())
+        .collect())
 }
 
 /// The first row each unrefused namespace will overwrite, as
@@ -495,6 +524,7 @@ pub async fn apply_blocked_namespaces(
         actual_by_namespace,
         extras_by_namespace,
         options,
+        false,
     )
     .await?;
     Ok(prepared.blocked)
@@ -517,6 +547,7 @@ pub async fn apply_api(
         actual_by_namespace,
         extras_by_namespace,
         options,
+        true,
     )
     .await?;
     block_unresolved_placeholders(desired, namespaces, &mut prepared.blocked);
@@ -640,6 +671,7 @@ async fn apply_prepared(
                     namespace,
                     ownership_scope,
                     actual,
+                    prepared.consumer_evidence.get(namespace),
                     options,
                 )
                 .await
@@ -705,6 +737,7 @@ async fn apply_prepared(
 /// Materialize the complete live view and every full-replace body before a
 /// write is possible. This prevents a deterministic error in a later
 /// namespace from appearing only after an earlier namespace was restored.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_apply<'a>(
     desired: &GatewayConfig,
     client: &AdminClient,
@@ -713,6 +746,7 @@ async fn prepare_apply<'a>(
     actual_by_namespace: Option<&'a BTreeMap<String, GatewayConfig>>,
     extras_by_namespace: Option<&'a BTreeMap<String, BackupExtras>>,
     options: &ApplyOptions,
+    require_evidence: bool,
 ) -> crate::error::Result<PreparedApply<'a>> {
     validate_no_desired_spec_tags(desired)?;
     let mut prepared = PreparedApply::default();
@@ -725,7 +759,25 @@ async fn prepare_apply<'a>(
             && (supplied_actual.is_none() || supplied_extras.is_none());
 
         if needs_paired_snapshot || supplied_actual.is_none() {
-            let snapshot = client.get_backup_snapshot_for_mutation(namespace).await?;
+            let mut snapshot = if require_evidence
+                && matches!(options.strategy, ApplyStrategy::FullReplace)
+            {
+                client.get_conditional_backup(namespace).await?
+            } else {
+                client.get_backup_snapshot_for_mutation(namespace).await?
+            };
+            if require_evidence && matches!(options.strategy, ApplyStrategy::Incremental) {
+                let selected = consumer_evidence_targets(
+                    desired,
+                    &snapshot.config,
+                    namespace,
+                    ownership_scope,
+                    options,
+                )?;
+                client
+                    .capture_consumer_evidence(&mut snapshot, namespace, &selected)
+                    .await?;
+            }
             if snapshot.cached {
                 return Err(crate::error::Error::StaleGatewayView(stale_view_message()));
             }
@@ -741,6 +793,12 @@ async fn prepare_apply<'a>(
                 extras.insert(namespace.clone(), Cow::Borrowed(value));
             }
         }
+    }
+
+    for (namespace, value) in &extras {
+        prepared
+            .consumer_evidence
+            .insert(namespace.clone(), value.consumer_evidence.clone());
     }
 
     // A cached backup deliberately omits API-spec documents and clears
@@ -778,8 +836,14 @@ async fn prepare_apply<'a>(
                 ))
             })?;
             ensure_restore_sections_supported(namespace, live_extras)?;
-            let full_replace =
-                prepare_full_replace(&desired_namespace, actual, live_extras, namespace, options)?;
+            let full_replace = prepare_full_replace(
+                &desired_namespace,
+                actual,
+                live_extras,
+                namespace,
+                options,
+                require_evidence,
+            )?;
             // The restore body re-creates every row it carries, including the
             // live spec-owned rows `preserve_spec_owned_graph` copied in. Those
             // are copied verbatim, `extra` included, so only the repository's
@@ -815,6 +879,30 @@ async fn prepare_apply<'a>(
                 ownership_scope,
                 options,
             )?;
+            let targets = if require_evidence {
+                consumer_evidence_targets(desired, actual, namespace, ownership_scope, options)?
+            } else {
+                BTreeSet::new()
+            };
+            for id in &targets {
+                let evidence = live_extras.consumer_evidence.get(id).ok_or_else(|| {
+                    crate::error::Error::ConditionalWriteUnavailable(
+                        "complete consumer evidence must accompany the original plan before allocation"
+                            .to_string(),
+                    )
+                })?;
+                if let Some(consumer) = desired_namespace
+                    .consumers
+                    .iter()
+                    .find(|row| &row.id == id)
+                {
+                    http_client::conditional::require_preserved_credentials(
+                        &evidence.row,
+                        consumer,
+                        false,
+                    )?;
+                }
+            }
             let top_level = undeclared_live_top_level_fields(&desired_namespace, actual);
             if let Some(block) = unmodeled_field_block(
                 &live_extras.unmodeled_nested_fields,
@@ -1105,27 +1193,43 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
 ///
 /// - **An empty `api_specs` section is not sent.** The gateway answers `409`
 ///   when a payload without the section targets a namespace that holds specs,
-///   which is the only thing that catches a spec created between our backup
-///   and the restore. Sending `items: []` is defined as an intentional wipe
-///   and would silently delete it instead.
+///   retaining the existing authoritative-empty-section semantics. The original
+///   namespace token also fences a concurrent spec creation. Sending `items: []`
+///   is defined as an intentional wipe, so it is omitted.
 /// - **`gateway_trust_bundles` is never sent.** The gateway defines an absent
 ///   section as "leave trust exactly as it is", so omitting it preserves the
 ///   live roots without the lost-update window that replaying a possibly-stale
 ///   snapshot would open.
 ///
-/// Carrying the `api_specs` section *does* open that lost-update window, and
-/// the gateway offers no precondition that would close it. The section is
-/// therefore recorded here and re-verified by
-/// [`ensure_spec_snapshot_is_current`] immediately before the POST, which
-/// narrows the exposure from the whole prepare phase to one round-trip. See
-/// that function for why the window cannot be eliminated outright.
+/// The original namespace token fences the complete replacement at commit.
 fn prepare_full_replace(
     desired: &GatewayConfig,
     actual: &GatewayConfig,
     live_extras: &BackupExtras,
     namespace: &str,
     options: &ApplyOptions,
+    require_evidence: bool,
 ) -> crate::error::Result<PreparedFullReplace> {
+    let conditional = live_extras.conditional.clone();
+    if require_evidence
+        && conditional
+            .as_ref()
+            .is_none_or(|metadata| metadata.namespace != namespace)
+    {
+        return Err(crate::error::Error::ConditionalWriteUnavailable(
+            "full replacement requires the original coherent conditional namespace snapshot"
+                .to_string(),
+        ));
+    }
+    for consumer in &desired.consumers {
+        if let Some(evidence) = live_extras.consumer_evidence.get(&consumer.id) {
+            http_client::conditional::require_preserved_credentials(
+                &evidence.row,
+                consumer,
+                true,
+            )?;
+        }
+    }
     if options.confirm_api_spec_deletion {
         // Deliberate destruction of the spec graph: desired rows only, with
         // `confirm_api_spec_deletion=true` on the query so the gateway's
@@ -1133,12 +1237,10 @@ fn prepare_full_replace(
         // the namespace's roots survive the wipe.
         return Ok(PreparedFullReplace {
             config: desired.clone(),
-            extras: BackupExtras::default(),
-            // Nothing is replayed on this path: the payload carries no
-            // `api_specs` section and the operator has asked for whatever
-            // specs the namespace holds to be deleted, so there is no prior
-            // read whose staleness could matter.
-            spec_snapshot: BTreeMap::new(),
+            extras: BackupExtras {
+                conditional,
+                ..BackupExtras::default()
+            },
         });
     }
 
@@ -1150,9 +1252,9 @@ fn prepare_full_replace(
         config,
         extras: BackupExtras {
             api_specs: live_extras.api_specs.clone(),
+            conditional,
             ..BackupExtras::default()
         },
-        spec_snapshot: api_spec_documents(live_extras, namespace)?,
     })
 }
 
@@ -1163,7 +1265,6 @@ async fn apply_full_replace(
     desired: &GatewayConfig,
     options: &ApplyOptions,
 ) -> crate::error::Result<ApplyResult> {
-    ensure_spec_snapshot_is_current(client, namespace, &prepared.spec_snapshot).await?;
     client
         .post_restore(
             &prepared.config,
@@ -1185,114 +1286,6 @@ async fn apply_full_replace(
         fully_replaced_namespaces: vec![namespace.to_string()],
         ..Default::default()
     })
-}
-
-/// Re-read the namespace's API-spec documents and refuse the restore if any of
-/// them changed since the payload was built.
-///
-/// `POST /restore` with a non-empty `api_specs` section is a wipe-and-reinsert,
-/// not a merge: the gateway deletes every spec in the namespace and re-creates
-/// exactly the items in the payload (ferrum-edge `src/admin/mod.rs`, restore
-/// handler → `db.delete_all_resources` then `batch_insert_api_specs`). So a
-/// spec updated after our `/backup` is rolled back to the snapshot version,
-/// and a spec *created* after it is deleted outright — silently, because
-/// `confirm_api_spec_deletion` is only consulted when the section is absent.
-///
-/// The admin API exposes no precondition a client could attach to close that
-/// window: `/backup` returns no `ETag` or revision, `/restore` accepts no
-/// `If-Match` and answers no `412`, and its payload type does not
-/// `deny_unknown_fields`, so an invented `if_revision` key would be silently
-/// dropped rather than rejected. Detection is therefore client-side, and the
-/// window can only be narrowed, not closed: `/restore` and every `/api-specs`
-/// write take the same namespace config-admission lock, but nothing holds it
-/// across two separate client calls.
-///
-/// Narrowing it is still the difference that matters. Without this, the
-/// payload is built once during `prepare_apply` and can sit unsent through
-/// every *other* namespace's backup read, the `/health` preflight, and each
-/// preceding namespace's restore — minutes, on a multi-namespace environment.
-/// With it, the exposure is one round-trip.
-///
-/// Comparison is by spec id against the whole document each `/backup` returned.
-/// `updated_at` deliberately is *not* the key: restore writes the payload's
-/// timestamps verbatim, so a competing restore can move `updated_at` backwards
-/// and produce an ABA that a timestamp check would miss. Comparing the
-/// documents catches a content change (`content_hash`), a regenerated resource
-/// bundle (`resource_hash`), and an added or removed spec alike.
-async fn ensure_spec_snapshot_is_current(
-    client: &AdminClient,
-    namespace: &str,
-    expected: &BTreeMap<String, serde_json::Value>,
-) -> crate::error::Result<()> {
-    if expected.is_empty() {
-        // No `api_specs` section travels with this payload, so there is
-        // nothing to replay. An absent section makes the gateway count the
-        // namespace's live specs and answer 409 if any appeared, which is a
-        // server-side guard strictly better than anything measured here.
-        return Ok(());
-    }
-
-    let snapshot = client.get_backup_snapshot_for_mutation(namespace).await?;
-    if snapshot.cached {
-        return Err(crate::error::Error::StaleGatewayView(stale_view_message()));
-    }
-    let current = api_spec_documents(&snapshot.extras, namespace)?;
-    if current == *expected {
-        return Ok(());
-    }
-
-    let mut changes = Vec::new();
-    for (id, document) in expected {
-        match current.get(id) {
-            None => changes.push(format!("`{id}` was deleted")),
-            Some(live) if live != document => changes.push(format!("`{id}` was modified")),
-            Some(_) => {}
-        }
-    }
-    for id in current.keys() {
-        if !expected.contains_key(id) {
-            changes.push(format!("`{id}` was created"));
-        }
-    }
-
-    Err(crate::error::Error::ApiSpecsAtRisk(format!(
-        "refusing full_replace for namespace `{namespace}`: its API specs changed while this apply was preparing ({}). \
-         `/restore` replaces the namespace's spec documents with the ones in the payload, so proceeding would roll that change back \
-         or delete a spec created since. Re-run the apply so the payload is built from the current state.",
-        changes.join(", ")
-    )))
-}
-
-/// The live API-spec documents keyed by id, with the same identity rules
-/// [`parse_api_spec_owners`] enforces so a malformed section fails closed in
-/// both places rather than comparing as "unchanged".
-fn api_spec_documents(
-    extras: &BackupExtras,
-    namespace: &str,
-) -> crate::error::Result<BTreeMap<String, serde_json::Value>> {
-    let owners = parse_api_spec_owners(extras, namespace)?;
-    if owners.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let items = extras
-        .api_specs
-        .as_ref()
-        .and_then(|section| section.get("items"))
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            crate::error::Error::Config(
-                "refusing full_replace: backup `api_specs` is not an object with an `items` array; the ownership graph cannot be proven complete"
-                    .to_string(),
-            )
-        })?;
-    let mut documents = BTreeMap::new();
-    for item in items {
-        let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        documents.insert(id.to_string(), item.clone());
-    }
-    Ok(documents)
 }
 
 fn ensure_restore_sections_supported(
@@ -1623,6 +1616,7 @@ async fn apply_incremental(
     namespace: &str,
     ownership_scope: OwnershipScope<'_>,
     actual: &GatewayConfig,
+    consumer_evidence: Option<&BTreeMap<String, ConsumerEvidence>>,
     options: &ApplyOptions,
 ) -> crate::error::Result<ApplyResult> {
     ensure_authoritative_view(client)?;
@@ -1710,6 +1704,7 @@ async fn apply_incremental(
                 index: &index,
                 diffs: &diffs,
                 stale_plan: None,
+                consumer_evidence,
             };
             adopt_matching_rows(
                 &adoption,
@@ -1738,7 +1733,7 @@ async fn apply_incremental(
     // delivery). Every write that overwrites or deletes an existing row is made
     // conditional on a fresh read that still matches the plan; see
     // [`Preconditions`].
-    let mut preconditions = Preconditions::new(client, namespace, actual, &diffs)?;
+    let mut preconditions = Preconditions::new(client, namespace, actual, consumer_evidence)?;
     // The first write refused because its row changed after the plan. The
     // namespace's plan is then known to be stale, so nothing more is sent.
     let mut plan_stale: Option<String> = None;
@@ -2027,6 +2022,7 @@ async fn apply_incremental(
         index: &index,
         diffs: &diffs,
         stale_plan: plan_stale.as_deref(),
+        consumer_evidence,
     };
     adopt_matching_rows(
         &adoption,
@@ -2265,42 +2261,19 @@ const STALE_PLAN_GONE: &str =
 /// refused. A row served from cache, or one without a strong `ETag`, stops the
 /// run: no write to it can be made conditional.
 ///
-/// Consumers always take one more read. Edge redacts consumer credentials on a
-/// single-resource `GET`, although its tag covers them, so the read cannot show
-/// that the credentials still match the plan. Every consumer the namespace
-/// will overwrite is therefore read first, then one `/backup` (which carries
-/// the credentials) is compared with the plan: a change before a consumer's
-/// read shows in the backup, and a change after it fails the `If-Match`.
+/// Consumers compare complete verification with the raw evidence captured before
+/// allocation, including hidden fields and the original row token. Archival
+/// normalization is never substituted for this stored-state precondition.
 struct Preconditions<'a> {
     client: &'a AdminClient,
     namespace: &'a str,
     /// Rows as the plan saw them, keyed by `namespace:Kind:id`.
     planned: HashMap<String, ObservedRow>,
-    /// Every consumer this namespace overwrites, in diff order.
-    consumer_targets: Vec<String>,
-    /// Filled by the first consumer overwrite. `Err` when the backup read
-    /// failed, which refuses every consumer overwrite in the namespace.
-    consumers: Option<Result<HashMap<String, ConsumerPrecondition>, String>>,
+    consumer_evidence: BTreeMap<String, ConsumerEvidence>,
     /// PluginConfigs this run created or updated in the namespace. The gateway
     /// rewrites proxy associations to them itself, so a proxy comparison
     /// leaves those associations, and only those, out.
     written_plugins: BTreeSet<String>,
-}
-
-/// What the consumer reads decided for one consumer.
-enum ConsumerPrecondition {
-    /// Matches the plan; write with `If-Match` on `etag`. `dropped` is the
-    /// first nested field the typed decode dropped, which refuses an update.
-    Ready {
-        etag: String,
-        dropped: Option<String>,
-    },
-    /// No row holds the id.
-    Gone,
-    /// Changed since the plan.
-    Stale(String),
-    /// Could not be read.
-    Failed(String),
 }
 
 impl<'a> Preconditions<'a> {
@@ -2308,19 +2281,13 @@ impl<'a> Preconditions<'a> {
         client: &'a AdminClient,
         namespace: &'a str,
         planned: &GatewayConfig,
-        diffs: &[ResourceDiff],
+        evidence: Option<&BTreeMap<String, ConsumerEvidence>>,
     ) -> crate::error::Result<Self> {
-        let consumer_targets = diffs
-            .iter()
-            .filter(|diff| diff.kind == "Consumer" && diff.action != DiffAction::Add)
-            .map(|diff| diff.id.clone())
-            .collect();
         Ok(Self {
             client,
             namespace,
             planned: observe_rows(planned)?,
-            consumer_targets,
-            consumers: None,
+            consumer_evidence: evidence.cloned().unwrap_or_default(),
             written_plugins: BTreeSet::new(),
         })
     }
@@ -2332,6 +2299,15 @@ impl<'a> Preconditions<'a> {
 
     /// Send the planned update of `resource` conditionally.
     async fn update(&mut self, resource: CreateResource<'_>) -> crate::error::Result<OpOutcome> {
+        if let CreateResource::Consumer(consumer) = resource {
+            if let Some(evidence) = self.consumer_evidence.get(resource.id()) {
+                http_client::conditional::require_preserved_credentials(
+                    &evidence.row,
+                    consumer,
+                    false,
+                )?;
+            }
+        }
         match self.confirm(resource.kind(), resource.id(), true).await? {
             Some(etag) => resource
                 .update_if_match(self.client, self.namespace, &etag)
@@ -2438,110 +2414,20 @@ impl<'a> Preconditions<'a> {
     async fn confirm_consumer(
         &mut self,
         id: &str,
-        update: bool,
+        _update: bool,
     ) -> crate::error::Result<Option<String>> {
-        if self.consumers.is_none() {
-            let reads = self.read_consumers().await?;
-            self.consumers = Some(reads);
-        }
-        let read = match self.consumers.as_mut() {
-            Some(Ok(reads)) => reads.remove(id),
-            Some(Err(error)) => {
-                return Err(crate::error::Error::Config(format!(
-                    "not sent: the backup read that confirms consumer credentials before overwriting them failed ({error}), so the plan cannot be shown to match the gateway. Re-run apply"
-                )));
-            }
-            None => None,
+        let planned = self.consumer_evidence.get(id).ok_or_else(|| {
+            crate::error::Error::ConditionalWriteUnavailable(
+                "complete planned consumer evidence was not captured before allocation".to_string(),
+            )
+        })?;
+        let Some(live) = self.client.get_consumer_verification(id, self.namespace).await? else {
+            return Ok(None);
         };
-        match read {
-            Some(ConsumerPrecondition::Ready { etag, dropped }) => {
-                if update {
-                    refuse_dropped_field(dropped)?;
-                }
-                Ok(Some(etag))
-            }
-            Some(ConsumerPrecondition::Gone) => Ok(None),
-            Some(ConsumerPrecondition::Stale(reason)) => {
-                Err(crate::error::Error::StalePlan(reason))
-            }
-            Some(ConsumerPrecondition::Failed(reason)) => Err(crate::error::Error::Config(reason)),
-            None => Err(crate::error::Error::Config(
-                "not sent: no conditional read was taken for this consumer".to_string(),
-            )),
+        if !planned.same_row(&live) {
+            return Err(stale_plan_changed());
         }
-    }
-
-    /// Read every consumer target, then one `/backup`, and decide each one.
-    ///
-    /// The outer `Err` is run-stopping; the inner one is a failed backup read.
-    async fn read_consumers(
-        &self,
-    ) -> crate::error::Result<Result<HashMap<String, ConsumerPrecondition>, String>> {
-        let mut reads = Vec::with_capacity(self.consumer_targets.len());
-        for id in &self.consumer_targets {
-            let read = match self.client.get_tagged("Consumer", id, self.namespace).await {
-                Ok(read) => Ok(read),
-                Err(error) if is_fatal(&error) => return Err(error),
-                Err(error) => Err(error.to_string()),
-            };
-            reads.push((id, read));
-        }
-        let snapshot = match self
-            .client
-            .get_backup_snapshot_for_mutation(self.namespace)
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) if is_fatal(&error) => return Err(error),
-            Err(error) => return Ok(Err(error.to_string())),
-        };
-        // The client's sticky flag is already set for a cached read; this
-        // turns it into the run-stopping error every other cached view gets.
-        ensure_authoritative_view(self.client)?;
-        let confirmed = observe_rows(&snapshot.config)?;
-        let mut decided = HashMap::with_capacity(reads.len());
-        for (id, read) in reads {
-            let key = state_key(self.namespace, "Consumer", id);
-            let planned = self.planned.get(&key);
-            let verdict = consumer_precondition(planned, confirmed.get(&key), read);
-            decided.insert(id.clone(), verdict);
-        }
-        Ok(Ok(decided))
-    }
-}
-
-/// Decide one consumer from its tagged read and the backup read after it.
-///
-/// Only the backup is compared with the plan: it is in the plan's own form,
-/// carries the credentials the tagged read redacts, and was taken after that
-/// read, so it shows every change the tag does not already fence.
-fn consumer_precondition(
-    planned: Option<&ObservedRow>,
-    confirmed: Option<&ObservedRow>,
-    read: Result<Option<http_client::TaggedResource>, String>,
-) -> ConsumerPrecondition {
-    let tagged = match read {
-        Ok(Some(tagged)) => tagged,
-        Ok(None) if confirmed.is_none() => return ConsumerPrecondition::Gone,
-        Ok(None) => return ConsumerPrecondition::Stale(STALE_PLAN_CHANGED.to_string()),
-        Err(error) => {
-            return ConsumerPrecondition::Failed(format!(
-                "not sent: the conditional read failed ({error}), so the consumer cannot be shown to match the plan. Re-run apply"
-            ));
-        }
-    };
-    let Some(confirmed) = confirmed else {
-        return ConsumerPrecondition::Stale(STALE_PLAN_CHANGED.to_string());
-    };
-    if let Some(reason) = stale_reason(planned, confirmed) {
-        return ConsumerPrecondition::Stale(reason);
-    }
-    match observe_body("Consumer", &tagged.body) {
-        Ok((_, dropped)) => ConsumerPrecondition::Ready {
-            etag: tagged.etag,
-            dropped,
-        },
-        Err(error) => ConsumerPrecondition::Failed(format!("not sent: {error}")),
+        Ok(Some(live.token.as_str().to_string()))
     }
 }
 
@@ -2551,16 +2437,6 @@ struct ObservedRow {
     /// [`comparison_value`]: the row without server timestamps, with
     /// association order normalized.
     value: serde_json::Value,
-}
-
-/// `Some(reason)` when `live` is not the row the plan judged, by owner or by
-/// content apart from server timestamps.
-fn stale_reason(planned: Option<&ObservedRow>, live: &ObservedRow) -> Option<String> {
-    if let Some(reason) = ownership_refusal(planned, live) {
-        return Some(reason);
-    }
-    let unchanged = planned.is_some_and(|planned| planned.value == live.value);
-    (!unchanged).then(|| STALE_PLAN_CHANGED.to_string())
 }
 
 /// `Some(reason)` when `live` gained, lost or changed its `api_spec_id`
@@ -2699,9 +2575,9 @@ fn decode_live_row<T: serde::de::DeserializeOwned>(
             dropped = Some(path.to_string());
         }
     })
-    .map_err(|error| {
+    .map_err(|_| {
         crate::error::Error::HttpClient(format!(
-            "the gateway returned a {kind} this client cannot read: {error}"
+            "the gateway returned a {kind} this client cannot read; details withheld"
         ))
     })?;
     Ok((row, dropped))
@@ -2716,17 +2592,6 @@ fn refuse_dropped_field(dropped: Option<String>) -> crate::error::Result<()> {
         ))),
         None => Ok(()),
     }
-}
-
-/// A comparison value without the given top-level keys.
-fn without_keys(value: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
-    let mut value = value.clone();
-    if let Some(map) = value.as_object_mut() {
-        for key in keys {
-            map.remove(*key);
-        }
-    }
-    value
 }
 
 /// New scoped configs and their new target proxies need a create transaction,
@@ -2863,9 +2728,9 @@ pub fn adoption_summary_line(adopted: usize) -> Option<String> {
 /// [`Preconditions`]). A human edit landing between this run's diff and the
 /// assertion would otherwise be silently reverted. A row that moved is skipped
 /// with a per-resource message and stays unclaimed; the next run sees it as an
-/// ordinary Modify. A freshly re-read authoritative backup also has to show the
-/// row unchanged; it is the only read that shows consumer credentials, so
-/// every consumer candidate is read before it.
+/// ordinary Modify. Consumers use complete verification compared to the original
+/// preallocation evidence; their credentials and row tokens are never inferred from
+/// an archival backup.
 ///
 /// **Exclusive mode** writes nothing. The repo is already authoritative for the
 /// namespace and does not need a claim; the ledger entry is recorded anyway so
@@ -2975,7 +2840,7 @@ async fn adopt_matching_rows(
         return;
     }
 
-    // Consumer reads come before the backup that shows their credentials.
+    // Complete consumer reads are compared with the original preallocation evidence.
     let mut consumer_reads = HashMap::new();
     for resource in &resources {
         if let CreateResource::Consumer(consumer) = resource {
@@ -3017,6 +2882,10 @@ async fn adopt_matching_rows(
             || !resource.safe_to_overwrite(&confirmation)
         {
             skip_adoption(result, namespace, &changed);
+            if kind == "Consumer" {
+                refuse_consumer_claim(result, namespace, id);
+                return;
+            }
             continue;
         }
         let read = match resource {
@@ -3024,9 +2893,25 @@ async fn adopt_matching_rows(
             _ => client.get_tagged(kind, id, namespace).await,
         };
         let etag = match read {
-            Ok(Some(tagged)) if resource.tagged_row_is(&tagged.body) => tagged.etag,
+            Ok(Some(tagged))
+                if resource.tagged_row_is(&tagged.body)
+                    && (kind != "Consumer"
+                        || context
+                            .consumer_evidence
+                            .and_then(|evidence| evidence.get(id))
+                            .is_some_and(|planned| {
+                                planned.row == tagged.body
+                                    && planned.token.as_str() == tagged.etag
+                            })) =>
+            {
+                tagged.etag
+            }
             Ok(_) => {
                 skip_adoption(result, namespace, &changed);
+                if kind == "Consumer" {
+                    refuse_consumer_claim(result, namespace, id);
+                    return;
+                }
                 continue;
             }
             Err(error) if is_fatal(&error) => {
@@ -3042,6 +2927,10 @@ async fn adopt_matching_rows(
             Ok(()) => {}
             Err(crate::error::Error::StalePlan(_)) => {
                 skip_adoption(result, namespace, &changed);
+                if kind == "Consumer" {
+                    refuse_consumer_claim(result, namespace, id);
+                    return;
+                }
                 continue;
             }
             Err(error) if is_fatal(&error) => {
@@ -3071,6 +2960,7 @@ struct AdoptionContext<'a> {
     diffs: &'a [ResourceDiff],
     /// The write whose refusal proved the namespace's plan stale, if any.
     stale_plan: Option<&'a str>,
+    consumer_evidence: Option<&'a BTreeMap<String, ConsumerEvidence>>,
 }
 
 fn adopted_op(resource: CreateResource<'_>) -> AppliedOp {
@@ -3087,6 +2977,18 @@ fn skip_adoption(result: &mut ApplyResult, namespace: &str, message: &str) {
     result
         .adoption_skipped
         .push(format!("[{namespace}] {message}"));
+}
+
+fn refuse_consumer_claim(result: &mut ApplyResult, namespace: &str, id: &str) {
+    fail_adoption(
+        result,
+        namespace,
+        "Consumer",
+        id,
+        &crate::error::Error::StalePlan(
+            "consumer evidence changed; remaining namespace claims withheld".to_string(),
+        ),
+    );
 }
 
 fn fail_adoption(
@@ -3276,8 +3178,8 @@ impl<'a> CreateResource<'a> {
     /// exactly what this run sent, unowned? A subset match would also accept a
     /// concurrent writer's added optional field and incorrectly permit later
     /// writes and pruning. Only known server normalization is ignored.
-    /// Consumers never qualify: their read redacts the credentials that would
-    /// have to match.
+    /// Consumers never qualify: Basic transformations cannot prove a plaintext write's
+    /// outcome, even from complete stored evidence.
     async fn wrote_itself(self, client: &AdminClient, namespace: &str) -> bool {
         if matches!(self, Self::Consumer(_)) {
             return false;
@@ -3292,8 +3194,7 @@ impl<'a> CreateResource<'a> {
     /// carrying no nested field the typed mirror drops?
     ///
     /// Equality includes every optional field, apart from known server
-    /// normalization. Consumer credentials are left out: the read redacts
-    /// them, so callers prove them from a backup read taken after it.
+    /// normalization. Consumer verification includes every stored credential field.
     fn tagged_row_is(self, body: &serde_json::Value) -> bool {
         let Ok((live, None)) = observe_body(self.kind(), body) else {
             return false;
@@ -3310,12 +3211,8 @@ impl<'a> CreateResource<'a> {
         let Some(desired) = desired else {
             return false;
         };
-        let ignored: &[&str] = match self {
-            Self::Consumer(_) => &["credentials"],
-            _ => &[],
-        };
-        let desired = recovery_comparison_value(self.kind(), without_keys(&desired, ignored));
-        let live = recovery_comparison_value(self.kind(), without_keys(&live.value, ignored));
+        let desired = recovery_comparison_value(self.kind(), desired);
+        let live = recovery_comparison_value(self.kind(), live.value);
         desired == live
     }
 
@@ -3338,6 +3235,11 @@ impl<'a> CreateResource<'a> {
             })
         {
             return None;
+        }
+        if matches!(self, Self::Consumer(_)) {
+            let row = live.consumers.get(&(self.namespace(), self.id()))?;
+            let raw = serde_json::to_value(row).ok()?;
+            http_client::conditional::require_publishable_credentials(&raw, false).ok()?;
         }
         let key = (self.namespace(), self.id());
         match self {
@@ -3499,22 +3401,24 @@ async fn create_with_reconciliation(
             let original = error.to_string();
             // The tagged read comes first, so the ownership assertion below is
             // conditional on a row the verification backup then confirms. The
-            // backup is the only read that shows consumer credentials.
+            // complete consumer verification retains credentials without redaction.
             let tagged = client
                 .get_tagged(resource.kind(), resource.id(), namespace)
                 .await;
             // Recovery retains the complete verification row and refuses any
             // nested fields its typed decode dropped before asserting ownership.
-            let snapshot = client
-                .get_backup_snapshot_for_mutation(namespace)
-                .await
-                .map_err(|verification| {
-                    crate::error::Error::AmbiguousMutation(format!(
-                        "{} `{}` in namespace `{namespace}` returned `{original}`, and the authoritative verification read failed: {verification}",
-                        resource.kind(),
-                        resource.id(),
-                    ))
-                })?;
+            let snapshot = if resource.kind() == "Consumer" {
+                client.get_complete_backup(namespace).await
+            } else {
+                client.get_backup_snapshot_for_mutation(namespace).await
+            }
+            .map_err(|verification| {
+                crate::error::Error::AmbiguousMutation(format!(
+                    "{} `{}` in namespace `{namespace}` returned `{original}`, and the authoritative verification read failed: {verification}",
+                    resource.kind(),
+                    resource.id(),
+                ))
+            })?;
             if snapshot.cached {
                 return Err(crate::error::Error::AmbiguousMutation(format!(
                     "{} `{}` in namespace `{namespace}` returned `{original}`, and verification produced only a cached backup with incomplete ownership metadata",
@@ -3536,7 +3440,10 @@ async fn create_with_reconciliation(
                             ))
                         })?;
                     let etag = match tagged {
-                        Ok(Some(tagged)) if verified.tagged_row_is(&tagged.body) => {
+                        Ok(Some(tagged))
+                            if verified.tagged_row_is(&tagged.body)
+                                && complete_consumer_read_matches(resource, &snapshot, &tagged) =>
+                        {
                             tagged.etag
                         }
                         Ok(_) => {
@@ -3967,15 +3874,19 @@ async fn try_batch_create(
             {
                 let original = e.to_string();
                 // As in `create_with_reconciliation`, consumers are read before
-                // the verification backup (the only read that shows their
-                // credentials). Ownership assertions preserve its complete
+                // the coherent verification backup. Ownership assertions preserve complete
                 // rows and refuse fields its typed decode dropped.
                 let mut consumer_reads = HashMap::new();
                 for consumer in &chunk.consumers {
                     let id = consumer.id.as_str();
                     consumer_reads.insert(id, client.get_tagged("Consumer", id, namespace).await);
                 }
-                let snapshot = match client.get_backup_snapshot_for_mutation(namespace).await {
+                let verification = if chunk.consumers.is_empty() {
+                    client.get_backup_snapshot_for_mutation(namespace).await
+                } else {
+                    client.get_complete_backup(namespace).await
+                };
+                let snapshot = match verification {
                     Ok(snapshot) if snapshot.cached => {
                         result.fatal_error = Some(
                             crate::error::Error::AmbiguousMutation(format!(
@@ -4148,6 +4059,22 @@ fn note_unattempted_chunks(
     ));
 }
 
+/// Recovery compares the complete stored row and row token, never a normalized projection.
+fn complete_consumer_read_matches(
+    resource: CreateResource<'_>,
+    snapshot: &http_client::BackupSnapshot,
+    tagged: &http_client::TaggedResource,
+) -> bool {
+    resource.kind() != "Consumer"
+        || snapshot
+            .extras
+            .consumer_evidence
+            .get(resource.id())
+            .is_some_and(|evidence| {
+                evidence.row == tagged.body && evidence.token.as_str() == tagged.etag
+            })
+}
+
 /// Assert ownership of every row an ambiguous batch was proven to have created,
 /// each with a conditional `PUT` on a read that still shows the exact row.
 ///
@@ -4189,7 +4116,10 @@ async fn assert_batch_ownership(
         };
         let verified = resource.verified_row(&live, nested);
         let outcome = match (read, verified) {
-            (Ok(Some(tagged)), Some(verified)) if verified.tagged_row_is(&tagged.body) => {
+            (Ok(Some(tagged)), Some(verified))
+                if verified.tagged_row_is(&tagged.body)
+                    && complete_consumer_read_matches(resource, snapshot, &tagged) =>
+            {
                 verified
                     .update_if_match(client, namespace, &tagged.etag)
                     .await
@@ -4199,8 +4129,9 @@ async fn assert_batch_ownership(
             )),
             (Err(error), _) => Err(error),
         };
+        let stale = matches!(outcome, Err(crate::error::Error::StalePlan(_)));
         record_create(result, outcome, kind, id, namespace);
-        if result.fatal_error.is_some() {
+        if stale || result.fatal_error.is_some() {
             return;
         }
     }
@@ -4459,7 +4390,27 @@ mod prepared_apply_tests {
             .collect();
         let extras = namespaces
             .iter()
-            .map(|ns| (ns.clone(), BackupExtras::default()))
+            .map(|ns| {
+                let body = serde_json::json!({
+                    "version": "1", "ferrum_version": "fixture", "exported_at": "fixture",
+                    "source": "database", "proxies": [], "consumers": [], "upstreams": [],
+                    "plugin_configs": [], "api_specs": {"section_version": "2", "items": []},
+                    "gateway_trust_bundles": [],
+                    "counts": {"proxies": 0, "consumers": 0, "upstreams": 0,
+                        "plugin_configs": 0, "api_specs": 0, "gateway_trust_bundles": 0},
+                    "conditional": {"namespace_etag": "\"original\"", "row_etags": {
+                        "proxies": {}, "consumers": {}, "upstreams": {}, "plugin_configs": {}}}
+                });
+                let snapshot = crate::http_client::conditional::conditional_backup(
+                    &body.to_string(),
+                    ns,
+                    Some("\"original\""),
+                    None,
+                    Some("no-store"),
+                )
+                .unwrap();
+                (ns.clone(), snapshot.extras)
+            })
             .collect();
         let options = ApplyOptions {
             strategy: ApplyStrategy::FullReplace,
@@ -4473,6 +4424,7 @@ mod prepared_apply_tests {
             Some(&actuals),
             Some(&extras),
             &options,
+            true,
         )
         .await
         .unwrap();
@@ -4498,12 +4450,12 @@ mod prepared_apply_tests {
                     })
                     .unwrap();
                 stream.read_exact(&mut vec![0_u8; length]).await.unwrap();
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
-                    )
-                    .await
-                    .unwrap();
+                let body = r#"{"restored":{"proxies":0,"consumers":0,"upstreams":1,"plugin_configs":0,"api_specs":0,"gateway_trust_bundles":0}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
             })
             .await
             .expect("restore fixture did not receive its complete request");
@@ -4547,5 +4499,17 @@ mod prepared_apply_tests {
             state.last_applied_commit.as_deref(),
             Some("previous-complete-commit")
         );
+    }
+}
+
+impl std::fmt::Debug for PreparedApply<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedApply(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for PreparedFullReplace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PreparedFullReplace(<redacted>)")
     }
 }

@@ -129,3 +129,22 @@ Existing template copies get none of these changes automatically; use
 [the downstream update procedure](../docs/template-updates.md) to review and
 adopt the exact released revision. No compatibility layer is promised for
 formats from before the first release.
+
+## Conditional API adoption qualification (#462)
+
+This implementation adopts the immutable Edge owner contract
+`c764084b3b51c3f7ffde268c039688d35e49c553`. It does not publish a new gateway
+pin, checksum/index entry or first-release acceptance claim. Root must bind the
+final canonical release and actual artifact bytes serially, then run hosted
+qualification with complete consumer verification, hidden credential conflicts,
+rotation conflicts before and after broker delivery, and the required
+`conditional-full-replace` lifecycle scenario. The old v0.9.10 fixture cannot
+qualify these endpoints and must not be made green by skipping the new scenario.
+
+Qualification must cover original-token restore, spec-owned graph and verbatim
+documents, trust preservation, ABA, empty namespaces and confirmed spec deletion;
+exact-token/body precommit retry; and no replay after ambiguous commit, audit or
+fence refusal, unsupported topology or `applied:false`. Seal the exact client SHA
+and released server bytes. Source/parser evidence alone is not enforcement.
+Existing eight advisory fixes and #458/#440 provisioning remain required; #266
+retains its external human/App/template/HTTPS acceptance blockers.

@@ -6,6 +6,8 @@ mod assembler_tests;
 mod cli_tests;
 mod companion_schema_tests;
 mod config_export_tests;
+mod conditional_fixtures;
+mod conditional_snapshot_tests;
 mod contracts_tests;
 mod diff_exit_tests;
 mod diff_tests;

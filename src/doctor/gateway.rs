@@ -233,6 +233,12 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
 
     let conditional = conditional_write_check(&client).await;
     checks.push(conditional.for_environment(environment));
+    checks.extend(
+        snapshot_checks(&client, env.namespace_filter.as_deref())
+            .await
+            .into_iter()
+            .map(|check| check.for_environment(environment)),
+    );
     checks
 }
 
@@ -277,5 +283,87 @@ async fn conditional_write_check(client: &AdminClient) -> Check {
             Status::Unknown,
             format!("the entity-tag read did not complete: {error}"),
         ),
+    }
+}
+
+/// GET-only discovery proves response capabilities, never conditional commit enforcement.
+async fn snapshot_checks(client: &AdminClient, namespace: Option<&str>) -> Vec<Check> {
+    const SNAPSHOT: &str = "gateway-conditional-snapshot";
+    const SNAPSHOT_TITLE: &str = "Coherent namespace snapshots";
+    const CONSUMER: &str = "gateway-consumer-verification";
+    const CONSUMER_TITLE: &str = "Complete consumer verification";
+    let namespaces = match namespace {
+        Some(namespace) => Ok(vec![namespace.to_string()]),
+        None => client.list_namespaces().await,
+    };
+    let unknown = |id, title, message: &str| {
+        Check::new(id, title, Scope::Gateway, Status::Unknown, message)
+    };
+    let namespace = namespaces
+        .ok()
+        .and_then(|namespaces| namespaces.into_iter().next());
+    let Some(namespace) = namespace else {
+        return vec![
+            unknown(
+                SNAPSHOT,
+                SNAPSHOT_TITLE,
+                "no namespace is available to probe; support is unknown",
+            ),
+            unknown(
+                CONSUMER,
+                CONSUMER_TITLE,
+                "no consumer is available to probe; support is unknown",
+            ),
+        ];
+    };
+    match client.get_conditional_backup(&namespace).await {
+        Ok(snapshot) => {
+            let mut checks = vec![Check::pass(
+                SNAPSHOT,
+                SNAPSHOT_TITLE,
+                Scope::Gateway,
+                "GET returned a sealed coherent namespace token and complete row maps. \
+                 This read does not prove restore enforces If-Match; qualify the exact \
+                 released build.",
+            )];
+            let check = match snapshot.config.consumers.first() {
+                Some(consumer) => {
+                    match client.get_consumer_verification(&consumer.id, &namespace).await {
+                        Ok(Some(_)) => Check::pass(
+                            CONSUMER,
+                            CONSUMER_TITLE,
+                            Scope::Gateway,
+                            "GET returned complete stored consumer evidence and a strong row \
+                             token; enforcement still needs exact-build qualification",
+                        ),
+                        _ => unknown(
+                            CONSUMER,
+                            CONSUMER_TITLE,
+                            "verification did not return valid authoritative evidence; \
+                             consumer writes will refuse",
+                        ),
+                    }
+                }
+                None => unknown(
+                    CONSUMER,
+                    CONSUMER_TITLE,
+                    "no consumer is available to probe; support is unknown",
+                ),
+            };
+            checks.push(check);
+            checks
+        }
+        Err(_) => vec![
+            unknown(
+                SNAPSHOT,
+                SNAPSHOT_TITLE,
+                "conditional snapshot evidence is unavailable; full replacement will refuse",
+            ),
+            unknown(
+                CONSUMER,
+                CONSUMER_TITLE,
+                "no complete consumer was available to probe; support is unknown",
+            ),
+        ],
     }
 }

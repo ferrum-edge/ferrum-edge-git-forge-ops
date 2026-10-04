@@ -13,6 +13,9 @@ use crate::config_export::ConfigExport;
 use crate::diagnostics::{safe, safe_line};
 use crate::jwt::{self, JwtOptions};
 
+pub mod conditional;
+use conditional::{ConsumerEvidence, ConditionalMetadata};
+
 /// Most namespaces [`AdminClient::issues_entity_tags`] looks in for a row.
 const ENTITY_TAG_PROBE_NAMESPACES: usize = 20;
 
@@ -317,9 +320,22 @@ impl AdminClient {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
+                    if resp.headers().get_all("x-data-source").iter().any(|value| {
+                        value.to_str().is_ok_and(|source| source.eq_ignore_ascii_case("cached"))
+                    }) {
+                        self.saw_cached_backup.store(true, Ordering::Relaxed);
+                    }
                     let location = header_string(&resp, "location");
                     let etag = header_string(&resp, "etag");
+                    let cache_control = header_string(&resp, "cache-control");
                     let retry_after = parse_retry_after(header_string(&resp, "retry-after"));
+                    let evidence_headers_valid = ["etag", "cache-control", "x-data-source"]
+                        .iter()
+                        .all(|name| {
+                            let values = resp.headers().get_all(*name);
+                            values.iter().count() <= 1
+                                && values.iter().all(|value| value.to_str().is_ok())
+                        });
                     let body = resp
                         .text()
                         .await
@@ -332,6 +348,8 @@ impl AdminClient {
                             data_source,
                             location,
                             etag,
+                            cache_control,
+                            evidence_headers_valid,
                             retried: answered_before,
                         });
                     }
@@ -353,6 +371,8 @@ impl AdminClient {
                         data_source,
                         location,
                         etag,
+                        cache_control,
+                        evidence_headers_valid,
                         retried: answered_before,
                     });
                 }
@@ -375,7 +395,9 @@ impl AdminClient {
 
     /// Turn a completed response into `Ok(())` or a typed error.
     fn check(&self, resp: &RawResponse, kind: RequestKind) -> crate::error::Result<()> {
-        if is_success_status(resp.status) {
+        if is_success_status(resp.status)
+            && (kind == RequestKind::Read || ApiErrorBody::parse(&resp.body).applied != Some(false))
+        {
             return Ok(());
         }
         Err(map_api_error_with_redirect_base(
@@ -490,7 +512,10 @@ impl AdminClient {
         }
 
         let mut snapshot = BackupSnapshot::from_scoped_body(&resp.body, namespace)?;
-        snapshot.cached = cached;
+        snapshot.cached = cached || snapshot.source.as_deref() == Some("cached");
+        if snapshot.cached {
+            self.saw_cached_backup.store(true, Ordering::Relaxed);
+        }
         // A live read never fails on the count seal (see `SealStrictness`),
         // but an operator should know the gateway's own inventory disagreed
         // with what it sent — and `import` turns the same notice into a hard
@@ -557,6 +582,121 @@ impl AdminClient {
         Ok(snapshot)
     }
 
+    /// Complete consumer evidence is admin-only, audit-admitted and never cached.
+    pub async fn get_consumer_verification(
+        &self,
+        id: &str,
+        namespace: &str,
+    ) -> crate::error::Result<Option<ConsumerEvidence>> {
+        validate_resource_id_for_path(id)?;
+        let path = format!("/consumers/{id}/verification");
+        let target = self.authorized(&path)?;
+        let resp = self
+            .send_with_retry(RequestKind::Read, || {
+                target
+                    .request(Method::GET)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
+        if !resp.evidence_headers_valid {
+            return Err(conditional::invalid());
+        }
+        if resp.status == 404 {
+            if resp
+                .data_source
+                .as_deref()
+                .is_some_and(|source| source != "database")
+            {
+                return Err(conditional::invalid());
+            }
+            return Ok(None);
+        }
+        if resp.status != 200 {
+            return Err(conditional::invalid());
+        }
+        ConsumerEvidence::from_response(
+            &resp.body,
+            namespace,
+            id,
+            resp.etag.as_deref(),
+            resp.data_source.as_deref(),
+            resp.cache_control.as_deref(),
+        )
+        .map(Some)
+    }
+
+    /// One primary transaction supplies every row and the namespace revision token.
+    pub async fn get_conditional_backup(
+        &self,
+        namespace: &str,
+    ) -> crate::error::Result<BackupSnapshot> {
+        let target = self.authorized("/backup?conditional=true")?;
+        let resp = self
+            .send_with_retry(RequestKind::Read, || {
+                target
+                    .request(Method::GET)
+                    .header("X-Ferrum-Namespace", namespace)
+            })
+            .await?;
+        if resp.status != 200 || !resp.evidence_headers_valid {
+            return Err(conditional::invalid());
+        }
+        conditional::conditional_backup(
+            &resp.body,
+            namespace,
+            resp.etag.as_deref(),
+            resp.data_source.as_deref(),
+            resp.cache_control.as_deref(),
+        )
+        .map_err(|error| {
+            if matches!(error, crate::error::Error::StaleGatewayView(_)) {
+                self.saw_cached_backup.store(true, Ordering::Relaxed);
+            }
+            error
+        })
+    }
+
+    /// Capture only consumers this run might write; other incremental rows need no new route.
+    pub async fn capture_consumer_evidence(
+        &self,
+        snapshot: &mut BackupSnapshot,
+        namespace: &str,
+        ids: &BTreeSet<String>,
+    ) -> crate::error::Result<()> {
+        for id in ids {
+            let evidence = self
+                .get_consumer_verification(id, namespace)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::Error::StalePlan(
+                        "consumer disappeared while planning; re-run apply".to_string(),
+                    )
+                })?;
+            let planned = snapshot
+                .config
+                .consumers
+                .iter()
+                .find(|row| row.id == *id)
+                .ok_or_else(conditional::invalid)?;
+            if !evidence.matches_archival(planned)? {
+                return Err(crate::error::Error::StalePlan(
+                    "consumer changed while capturing complete planned evidence; re-run apply"
+                        .to_string(),
+                ));
+            }
+            snapshot.extras.consumer_evidence.insert(id.clone(), evidence);
+        }
+        Ok(())
+    }
+
+    /// Recovery needs exact credentials; canonical archival exports cannot prove a write.
+    pub async fn get_complete_backup(
+        &self,
+        namespace: &str,
+    ) -> crate::error::Result<BackupSnapshot> {
+        self.get_conditional_backup(namespace).await
+    }
+
     /// Convenience wrapper for callers that only need the four managed
     /// resource kinds. Backup-only sections are dropped; use
     /// [`AdminClient::get_backup_snapshot`] when they matter.
@@ -614,6 +754,13 @@ impl AdminClient {
         extras: &BackupExtras,
         confirm_api_spec_deletion: bool,
     ) -> crate::error::Result<()> {
+        let token = extras
+            .conditional
+            .as_ref()
+            .ok_or_else(conditional::invalid)?;
+        if token.namespace != namespace {
+            return Err(conditional::invalid());
+        }
         let body = build_restore_body(config, extras, confirm_api_spec_deletion)?;
         let path = if confirm_api_spec_deletion {
             "/restore?confirm=true&confirm_api_spec_deletion=true"
@@ -626,6 +773,7 @@ impl AdminClient {
                 target
                     .request(Method::POST)
                     .header("X-Ferrum-Namespace", namespace)
+                    .header("If-Match", token.namespace_token.as_str())
                     .json(&body)
             })
             .await
@@ -640,7 +788,24 @@ impl AdminClient {
                 }
                 other => other,
             })?;
-        self.check_mutation(&resp, RequestKind::Restore).await
+        if resp.status == 412 {
+            return Err(crate::error::Error::StalePlan(
+                "namespace changed after the coherent snapshot; conditional restore refused. \
+                 Re-plan from current state; the prepared body was not replayed"
+                    .to_string(),
+            ));
+        }
+        self.check_mutation(&resp, RequestKind::Restore)
+            .await
+            .map_err(conditional::withhold_error)?;
+        if resp.status != 200 {
+            return Err(crate::error::Error::AmbiguousMutation(
+                "conditional restore returned an unexpected success status; do not replay"
+                    .to_string(),
+            ));
+        }
+        conditional::require_restore_seal(&resp.body, &body)?;
+        Ok(())
     }
 
     /// Create-only bulk import. All-or-nothing in one transaction; it cannot
@@ -662,13 +827,49 @@ impl AdminClient {
                     .header("X-Ferrum-Namespace", namespace)
                     .json(batch)
             })
-            .await?;
+            .await
+            .map_err(|error| {
+                if batch.consumers.is_empty() {
+                    error
+                } else {
+                    conditional::withhold_error(error)
+                }
+            })?;
 
+        if is_success_status(resp.status) {
+            conditional::parse_sensitive(&resp.body).map_err(|_| {
+                crate::error::Error::AmbiguousMutation(
+                    "batch acknowledgement is invalid; reconcile without replaying".to_string(),
+                )
+            })?;
+        }
         if resp.status == 501 {
-            return Ok(None);
+            let refusal = conditional::parse_sensitive(&resp.body)
+                .ok()
+                .and_then(|value| serde_json::from_value::<ApiErrorBody>(value).ok())
+                .ok_or_else(|| {
+                    crate::error::Error::AmbiguousMutation(
+                        "batch rejection is invalid; do not fall back or replay".to_string(),
+                    )
+                })?;
+            if refusal.applied.is_none() && refusal.rollback.is_none() {
+                return Ok(None);
+            }
+            if refusal.applied != Some(false) {
+                return Err(crate::error::Error::AmbiguousMutation(
+                    "batch rejection contradicts a precommit refusal; do not replay".to_string(),
+                ));
+            }
         }
         self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
-            .await?;
+            .await
+            .map_err(|error| {
+                if batch.consumers.is_empty() {
+                    error
+                } else {
+                    conditional::withhold_error(error)
+                }
+            })?;
 
         // Only a complete acknowledgement proves this create transaction landed.
         // Keep the accepted 200 variant, but do not infer success from arbitrary
@@ -758,6 +959,7 @@ impl AdminClient {
             .await?;
         self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
             .await
+            .map_err(conditional::withhold_error)
     }
 
     pub async fn update_consumer(
@@ -898,6 +1100,15 @@ impl AdminClient {
         id: &str,
         namespace: &str,
     ) -> crate::error::Result<Option<TaggedResource>> {
+        if kind == "Consumer" {
+            return Ok(self
+                .get_consumer_verification(id, namespace)
+                .await?
+                .map(|evidence| TaggedResource {
+                    etag: evidence.token.as_str().to_string(),
+                    body: evidence.row,
+                }));
+        }
         let path = resource_path(kind, id)?;
         let target = self.authorized(&path)?;
         let resp = self
@@ -933,8 +1144,11 @@ impl AdminClient {
                  No overwrite was attempted."
             )));
         };
-        let body = serde_json::from_str(&resp.body)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET {path}: {e}")))?;
+        let body = serde_json::from_str(&resp.body).map_err(|_| {
+            crate::error::Error::HttpClient(
+                "invalid resource response; details withheld".to_string(),
+            )
+        })?;
         Ok(Some(TaggedResource { etag, body }))
     }
 
@@ -970,7 +1184,22 @@ impl AdminClient {
                 message: precondition_failed_message("PUT", &path, resp.retried),
             }));
         }
-        self.check_mutation(&resp, RequestKind::Mutation).await?;
+        if kind == "Consumer" && is_success_status(resp.status) {
+            conditional::parse_sensitive(&resp.body).map_err(|_| {
+                crate::error::Error::AmbiguousMutation(
+                    "consumer publication response is invalid; do not replay".to_string(),
+                )
+            })?;
+        }
+        self.check_mutation(&resp, RequestKind::Mutation)
+            .await
+            .map_err(|error| {
+                if kind == "Consumer" {
+                    conditional::withhold_error(error)
+                } else {
+                    error
+                }
+            })?;
         Ok(ConditionalUpdate::Applied)
     }
 
@@ -1015,8 +1244,11 @@ impl AdminClient {
             })
             .await?;
         self.check(&resp, RequestKind::Read)?;
-        let page: Page<serde_json::Value> = serde_json::from_str(&resp.body)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET {path}: {e}")))?;
+        let page: Page<serde_json::Value> = serde_json::from_str(&resp.body).map_err(|_| {
+            crate::error::Error::HttpClient(
+                "invalid resource response; details withheld".to_string(),
+            )
+        })?;
         let id = page.data.first().and_then(|row| row["id"].as_str());
         Ok(id.map(str::to_string))
     }
@@ -1037,7 +1269,15 @@ impl AdminClient {
         if kind == "Proxy" {
             path.push_str("?cleanup_orphaned_upstream=false");
         }
-        self.delete(&path, namespace, Some(etag)).await
+        self.delete(&path, namespace, Some(etag))
+            .await
+            .map_err(|error| {
+                if kind == "Consumer" && !matches!(error, crate::error::Error::StalePlan(_)) {
+                    conditional::withhold_error(error)
+                } else {
+                    error
+                }
+            })
     }
 
     /// Shared DELETE path with 404 tolerance — see [`delete_succeeded`].
@@ -1152,14 +1392,13 @@ fn cleartext_credential_refused() -> crate::error::Error {
 }
 
 /// One resource read for a conditional write.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TaggedResource {
     /// The `ETag` header exactly as received (quoted), sent back verbatim in
     /// `If-Match`.
     pub etag: String,
-    /// The row the tag describes. The admin role reads proxies, upstreams and
-    /// plugin configs in full; consumers come back with their credentials
-    /// redacted, although the tag covers them.
+    /// The complete row the tag describes. Consumers use the dedicated
+    /// verification route; ordinary redacted consumer reads cannot authorize writes.
     pub body: serde_json::Value,
 }
 
@@ -1310,7 +1549,7 @@ pub enum DeleteOutcome {
 
 /// A fully-read response. The body is buffered eagerly so the retry classifier
 /// can inspect it before deciding whether to re-send.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RawResponse {
     status: u16,
     body: String,
@@ -1320,6 +1559,8 @@ struct RawResponse {
     location: Option<String>,
     /// `ETag`, which a single-resource `GET` carries for a conditional write.
     etag: Option<String>,
+    cache_control: Option<String>,
+    evidence_headers_valid: bool,
     /// An earlier attempt got an HTTP response and was retried. A conditional
     /// write answered `412` after that may have been refused because its own
     /// earlier attempt committed.
@@ -1342,7 +1583,7 @@ pub enum RequestKind {
 
 /// The admin API's shared error envelope. Every field is optional — the
 /// gateway populates the subset relevant to the failure.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct ApiErrorBody {
     #[serde(default)]
     pub error: Option<String>,
@@ -1371,7 +1612,10 @@ impl ApiErrorBody {
     /// Parse an error body, degrading to an empty envelope for non-JSON
     /// responses (proxies and load balancers emit HTML).
     pub fn parse(body: &str) -> Self {
-        serde_json::from_str(body).unwrap_or_default()
+        conditional::parse_sensitive(body)
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -1409,10 +1653,16 @@ pub fn classify_retry(status: u16, body: &ApiErrorBody, kind: RequestKind) -> Re
         return RetryDecision::NoRetry;
     }
     if kind == RequestKind::Restore {
-        if status == 500 && rollback_needs_manual_recovery(body.rollback.as_deref()) {
+        if rollback_needs_manual_recovery(body.rollback.as_deref()) {
             return RetryDecision::NoRetry;
         }
-        if status == 503 && body.failure_class.as_deref() == Some("connectivity") {
+        if status == 503
+            && body.failure_class.as_deref() == Some("connectivity")
+            && body.applied.is_none()
+            && body.rollback.is_none()
+            && body.reason.is_none()
+            && body.restore_errors.is_none()
+        {
             return RetryDecision::Retry;
         }
         // A restore is destructive and not generally idempotent. Only the
@@ -1770,10 +2020,12 @@ fn summarize_restore_errors(errors: &Option<Vec<serde_json::Value>>) -> String {
 }
 
 fn header_string(resp: &reqwest::Response, name: &str) -> Option<String> {
-    resp.headers()
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_string())
+    let mut values = resp.headers().get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok().map(str::to_string)
 }
 
 /// `Retry-After` in delta-seconds form, clamped to [`RETRY_AFTER_CAP`]. The
@@ -1875,7 +2127,7 @@ pub fn merge_pages(pages: Vec<Vec<String>>) -> Vec<String> {
 /// Held as opaque JSON for fail-closed inspection. API specs require
 /// concurrency-safe restore handling; trust bundles are never replayed by
 /// GitOps because restore omission preserves their current live value.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct BackupExtras {
     /// `{section_version, items}`. Absent on cached-fallback exports.
     pub api_specs: Option<serde_json::Value>,
@@ -1890,6 +2142,10 @@ pub struct BackupExtras {
     /// every apply path that receives a live view also learns which rows it
     /// cannot rewrite without truncating them.
     pub unmodeled_nested_fields: Vec<UnmodeledNestedField>,
+    /// Original coherent snapshot token. Never refreshed to authorize an old body.
+    pub conditional: Option<ConditionalMetadata>,
+    /// Complete stored rows captured before allocation, separate from comparison views.
+    pub consumer_evidence: std::collections::BTreeMap<String, ConsumerEvidence>,
 }
 
 impl BackupExtras {
@@ -1944,7 +2200,7 @@ pub enum SealStrictness {
 }
 
 /// The full `BackupResponse` envelope.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct BackupSnapshot {
     pub config: GatewayConfig,
     pub extras: BackupExtras,
@@ -2044,8 +2300,9 @@ pub fn describe_unmodeled_nested_fields<'a>(
 impl BackupSnapshot {
     /// Validate wire identities before repository-oriented defaults can invent them.
     pub fn from_scoped_body(body: &str, namespace: &str) -> crate::error::Result<Self> {
-        let value: serde_json::Value = serde_json::from_str(body)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
+        let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+            crate::error::Error::HttpClient("invalid backup response; details withheld".to_string())
+        })?;
         for section in ["proxies", "consumers", "upstreams", "plugin_configs"] {
             if let Some(rows) = value.get(section).and_then(serde_json::Value::as_array) {
                 for row in rows {
@@ -2070,8 +2327,9 @@ impl BackupSnapshot {
     /// future top-level sections are retained by name so full-replace can fail
     /// closed instead of silently deleting data it cannot carry through.
     pub fn from_body(body: &str) -> crate::error::Result<Self> {
-        let value: serde_json::Value = serde_json::from_str(body)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET /backup: {e}")))?;
+        let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+            crate::error::Error::HttpClient("invalid backup response; details withheld".to_string())
+        })?;
         // Live reads are advisory: see [`SealStrictness`]. Callers that turn a
         // backup into permanent repository state re-check
         // `seal_violations` and refuse.
@@ -2164,7 +2422,9 @@ impl BackupSnapshot {
         let config: GatewayConfig = serde_ignored::deserialize(value, |path| {
             ignored.push(ignored_backup_field(&path));
         })
-        .map_err(|e| crate::error::Error::Config(format!("invalid backup payload: {e}")))?;
+        .map_err(|_| {
+            crate::error::Error::Config("invalid backup payload; details withheld".to_string())
+        })?;
         crate::config::validate_unique_live_resource_keys(&config)?;
         let unmodeled_nested_fields: Vec<UnmodeledNestedField> = ignored
             .into_iter()
@@ -3058,4 +3318,34 @@ async fn backoff_sleep(attempt: u32) {
     let cap_ms = (500u64 * (1u64 << exp)).min(8_000);
     let delay_ms = rand::random_range(100..=cap_ms.max(100));
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
+
+impl fmt::Debug for TaggedResource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TaggedResource(<redacted>)")
+    }
+}
+
+impl fmt::Debug for BackupExtras {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BackupExtras(<redacted>)")
+    }
+}
+
+impl fmt::Debug for BackupSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BackupSnapshot(<redacted>)")
+    }
+}
+
+impl fmt::Debug for RawResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RawResponse(<redacted>)")
+    }
+}
+
+impl fmt::Debug for ApiErrorBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ApiErrorBody(<redacted>)")
+    }
 }

@@ -200,6 +200,17 @@ repository. See [GitHub launch controls](github-launch-controls.md).
 
 ## Environment variables
 
+Consumer writes additionally require `GET /consumers/{id}/verification` complete
+stored evidence. Full replacement and API import require coherent
+`GET /backup?conditional=true` snapshots; restore sends the original namespace
+`If-Match`. Missing capabilities refuse their operations. GET-only doctor probes
+report unavailable evidence as unknown and cannot establish write enforcement.
+Exact exports preserve hidden/custom/legacy credentials, while ordinary `/backup`
+canonicalizes some credential entries. Import refuses unsupported exact credentials
+before publishing the resource tree or private bundle; its manifest records the
+credential representation. A conditional export file without authenticated response
+headers is refused. Canonical archival/file imports do not claim exact provenance.
+
 Incremental API overwrites require a strong `ETag` and a gateway that honors
 `If-Match`. The client probes only for the tag and always sends the condition;
 it does not detect a server that returns tags but ignores `If-Match`. The

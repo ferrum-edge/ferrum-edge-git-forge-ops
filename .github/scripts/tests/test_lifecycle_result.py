@@ -321,6 +321,7 @@ class CoverageTests(unittest.TestCase):
                 "reapply-is-a-no-op",
                 "modify-and-delete-in-order",
                 "conditional-overwrite",
+                "conditional-full-replace",
                 "credentials-generate-and-rotate",
                 "partial-failure-recovery",
                 "ledger-publication-failure",

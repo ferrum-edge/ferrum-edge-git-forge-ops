@@ -186,7 +186,7 @@ Refusals stop `apply`, `export --materialize` and `rotate`; `plan` prints a
 `Credential Slot Remaps` section and exits non-zero; the PR comment shows them
 as blocking. Messages name slots, never values. The ledger-backed checks (the
 last two rows) run in `plan`, `review`, `apply` and `export --materialize`;
-`rotate` does not use the ledger.
+`rotate` requires a managed Consumer in shared mode; exclusive scope is checked too.
 
 The revived-slot check exempts `alloc=require`, and exempts a slot recorded by
 a failed apply only when its retry has the same triggering revision
@@ -305,7 +305,8 @@ Run **Actions → GitForgeOps Rotate Credential** (`rotate.yml`) with an
 environment, consumer, credential path and optional namespace (default
 `ferrum`). It generates a new value, writes the environment secret, delivers
 the value age-encrypted to whoever started the workflow, and pushes the updated
-Consumer to the Admin API. It shares the environment's apply concurrency group.
+stored Consumer to the Admin API with its row `If-Match`. It shares the
+environment's apply concurrency group.
 
 The CLI equivalent is
 `gitforgeops rotate --consumer ID --credential PATH [--namespace NS] [--recipient LOGIN]`.
@@ -321,9 +322,22 @@ Rules:
 - Rotation is refused in file mode; use materialization instead.
 - The target must be a placeholder on a declared Consumer in the namespace,
   and its sibling slots must already resolve.
-- Rotation pushes the whole Consumer, so a literal secret anywhere on it
-  refuses the rotation. An `apply` override does not carry over. Broker the
-  literal with `alloc=require`, seed it and apply first.
+- A literal secret anywhere on the declared Consumer refuses rotation. An `apply`
+  override does not carry over. Broker the literal with `alloc=require`, seed it
+  and apply first.
+
+Before any broker write, rotation establishes writable health, repository ownership,
+complete authoritative verification and representability of the stored row. The
+current target must match an available old bundle value when directly comparable;
+Basic's gateway-keyed HMAC remains opaque. Without an old target value, the
+complete stored row establishes the baseline; no plaintext equality is inferred.
+Unsupported legacy or hidden fields that the server would canonicalize away refuse
+before delivery. Publication changes only the authorized
+credential leaf in the complete stored row, preserving unrelated entries and custom
+credentials, and uses the original row token. A conditional refusal after delivery
+is recoverable broker/gateway divergence: completion is not recorded, and a fresh
+apply can reconcile. No unconditional rotation or dedicated credential-deletion
+shortcut is used.
 
 For externally issued secrets (a Consul token, a precomputed password hash),
 mint the replacement at the source, reseed the existing slot keeping every

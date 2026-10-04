@@ -1793,8 +1793,8 @@ fn rotate_checks_target_generation_before_any_network_or_state_publication() {
 }
 
 #[test]
-fn rotate_supported_credentials_in_resolved_namespace_reach_provisioning() {
-    // Positive controls end at the local proxy, before any secret write.
+fn rotate_supported_credentials_reach_gateway_health_before_provisioning() {
+    // Positive controls reach gateway health before any broker request or secret write.
     // An unrelated invalid JWT must not block this Consumer's preflight.
     // The sibling is brokered and seeded.
     for (kind, field) in [
@@ -1805,14 +1805,14 @@ fn rotate_supported_credentials_in_resolved_namespace_reach_provisioning() {
     ] {
         let sibling = format!("platform/app/{kind}/{field}");
         let target = format!("platform/app/{kind}/[1]/{field}");
-        rotate_reaches_provisioning(
+        rotate_reaches_gateway_preflight(
             kind,
             field,
             serde_json::json!({ (sibling.clone()): "seeded-sibling-value" }),
         );
         // Placeholder text in the *target* slot is what rotation replaces, so
         // it must not block the remedy the placeholder-text refusal names.
-        rotate_reaches_provisioning(
+        rotate_reaches_gateway_preflight(
             kind,
             field,
             serde_json::json!({
@@ -1860,18 +1860,19 @@ fn rotate_refuses_a_placeholder_text_sibling_before_provisioning() {
     }
 }
 
-fn rotate_reaches_provisioning(kind: &str, field: &str, slots: serde_json::Value) {
+fn rotate_reaches_gateway_preflight(kind: &str, field: &str, slots: serde_json::Value) {
     let credential = format!("{kind}/[1]/{field}");
     let (repo, output, listener) = run_rotate(kind, field, slots);
     assert!(
         !output.status.success(),
         "the proxy deliberately never responds"
     );
-    assert!(
-        listener.accept().is_ok(),
-        "{credential} must reach provisioning in platform: {}",
-        stderr(&output)
-    );
+    let (mut request, _) = listener.accept().unwrap_or_else(|_| {
+        panic!("{credential} did not reach gateway health: {}", stderr(&output))
+    });
+    let mut bytes = [0; 4096];
+    let count = request.read(&mut bytes).unwrap();
+    assert!(String::from_utf8_lossy(&bytes[..count]).starts_with("GET /health "));
     assert!(!stderr(&output).contains("unresolved placeholder"));
     assert!(!stderr(&output).contains("Security Findings"));
     assert!(!repo.dir.path().join(".state/default.json").exists());
@@ -1904,6 +1905,10 @@ fn run_rotate(
     let repo = Repo::with_files(&[
         ("resources/platform/consumers/app.yaml", &consumer),
         (
+            ".gitforgeops/config.yaml",
+            "version: 1\nenvironments:\n  default:\n    ownership:\n      mode: exclusive\n      namespaces: [platform]\n",
+        ),
+        (
             "resources/platform/consumers/unrelated.yaml",
             "kind: Consumer\nspec:\n  id: unrelated\n  username: unrelated\n  credentials:\n    jwt:\n      - secret: '${gh-env-secret:alloc=generate|len=16}'\n",
         ),
@@ -1923,6 +1928,8 @@ fn run_rotate(
             ("FERRUM_GH_PROVISIONER_TOKEN", "synthetic-token"),
             ("FERRUM_CREDS_JSON", &bundle),
             ("FERRUM_GITHUB_REQUEST_TIMEOUT_SECS", "1"),
+            ("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "1"),
+            ("FERRUM_GATEWAY_MAX_RETRIES", "0"),
             ("HTTPS_PROXY", &endpoint),
             ("HTTP_PROXY", &endpoint),
             ("ALL_PROXY", &endpoint),

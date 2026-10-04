@@ -6,7 +6,7 @@
 //! lands in that window must not be overwritten or deleted from the stale
 //! plan. Each test hands `apply_api` the plan's view and serves the rows the
 //! way a concurrent writer would leave them: on `GET /<kind>/{id}` with an
-//! `ETag`, and on `/backup` where a consumer's credentials need it.
+//! `ETag`; consumers use complete `/consumers/{id}/verification` evidence.
 
 use gitforgeops::apply::{apply_api, ApplyOptions, ApplyResult};
 use gitforgeops::config::env::{EnvConfig, GatewayMode};
@@ -319,7 +319,16 @@ fn read_route(kind: Kind, id: &str, body: String, headers: &[(&str, &str)]) -> R
         .iter()
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect();
-    (format!("GET {}/{id} ", kind.path()), 200, body, headers)
+    let suffix = if matches!(kind, Kind::Consumer) {
+        "/verification"
+    } else {
+        ""
+    };
+    let mut headers: Vec<(String, String)> = headers;
+    if matches!(kind, Kind::Consumer) {
+        headers.push(("Cache-Control".to_string(), "no-store".to_string()));
+    }
+    (format!("GET {}/{id}{suffix} ", kind.path()), 200, body, headers)
 }
 
 /// Serve the row `id` of `config` on `GET /<kind>/{id}` with `etag`, the way
@@ -332,7 +341,12 @@ fn tagged(kind: Kind, id: &str, config: &GatewayConfig, etag: &str) -> Recording
 /// `GET /<kind>/{id}` answering 404.
 fn missing(kind: Kind, id: &str) -> RecordingRoute {
     let body = r#"{"error":"not found"}"#.to_string();
-    (format!("GET {}/{id} ", kind.path()), 404, body, vec![])
+    let suffix = if matches!(kind, Kind::Consumer) {
+        "/verification"
+    } else {
+        ""
+    };
+    (format!("GET {}/{id}{suffix} ", kind.path()), 404, body, vec![])
 }
 
 /// Every route that lets `id`'s row read as `config`: consumers also need the
@@ -397,7 +411,7 @@ async fn apply(
     shared: bool,
     options: ApplyOptions,
 ) -> Run {
-    let (url, requests) = spawn_recording_gateway(routes);
+    let (url, requests) = spawn_recording_gateway(routes.clone());
     let managed: HashSet<String> = options.managed_ledger.iter().cloned().collect();
     let scope = if shared {
         OwnershipScope::Shared {
@@ -406,13 +420,37 @@ async fn apply(
     } else {
         OwnershipScope::Exclusive
     };
+    let mut extras =
+        super::conditional_fixtures::planned_extras(&planned, NS, BackupExtras::default());
+    for evidence in extras.consumer_evidence.values_mut() {
+        let id = evidence.row["id"].as_str().unwrap();
+        let route = format!("GET /consumers/{id}/verification ");
+        let tag = routes
+            .iter()
+            .find(|(needle, _, _, _)| needle.ends_with(&route))
+            .and_then(|(_, _, _, headers)| {
+                headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("etag"))
+            })
+            .map(|(_, tag)| tag.as_str())
+            .filter(|tag| tag.starts_with('"'))
+            .unwrap_or(TAG);
+        *evidence = gitforgeops::http_client::conditional::ConsumerEvidence::from_response(
+            &evidence.row.to_string(),
+            NS,
+            id,
+            Some(tag),
+            None,
+            Some("no-store"),
+        )
+        .unwrap();
+    }
     let result = apply_api(
         desired,
         &client(url),
         &[NS.to_string()],
         scope,
         Some(&BTreeMap::from([(NS.to_string(), planned)])),
-        Some(&BTreeMap::from([(NS.to_string(), BackupExtras::default())])),
+        Some(&BTreeMap::from([(NS.to_string(), extras)])),
         &options,
     )
     .await
@@ -535,14 +573,7 @@ async fn every_overwrite_is_sent_with_the_etag_its_read_returned() {
                 "{context}: {sent}"
             );
             assert_eq!(run.result.applied_incremental.len(), 1, "{context}");
-            if matches!(kind, Kind::Consumer) {
-                // The backup that shows the credentials is read after the
-                // tagged read, so a change between the two cannot hide.
-                let read = run.position("GET /consumers/r1 ");
-                assert!(read < run.position("GET /backup "), "{context}");
-            } else {
-                assert_eq!(run.backup_reads(), 0, "{context}");
-            }
+            assert_eq!(run.backup_reads(), 0, "{context}");
         }
     }
 }
@@ -642,22 +673,19 @@ async fn a_stale_read_withholds_the_rest_of_the_namespace() {
 
 #[tokio::test]
 async fn a_consumer_whose_credentials_changed_after_the_plan_is_not_overwritten() {
-    // The tagged read redacts credentials, so it looks unchanged; only the
-    // backup read after it shows the rotated key.
+    // Complete verification sees the rotated key directly, without an archival backup.
     let planned = keyed_consumer("user-1", "planned-key-value");
     let desired = keyed_consumer("user-2", "planned-key-value");
-    let redacted = keyed_consumer("user-1", "[REDACTED]");
     for (backup_key, refused) in [("rotated-key-value", true), ("planned-key-value", false)] {
         let routes = vec![
             health(),
-            tagged(Kind::Consumer, "c1", &redacted, TAG),
-            backup(&keyed_consumer("user-1", backup_key)),
+            tagged(Kind::Consumer, "c1", &keyed_consumer("user-1", backup_key), TAG),
         ];
 
         let run = apply_exclusive(&desired, planned.clone(), routes).await;
 
-        let read = run.position("GET /consumers/c1 ");
-        assert!(read < run.position("GET /backup "));
+        assert_eq!(run.count("GET /consumers/c1/verification "), 1);
+        assert_eq!(run.backup_reads(), 0);
         if refused {
             assert_refused(&run, CHANGED, "rotated credential");
         } else {
@@ -718,21 +746,16 @@ async fn a_cached_read_stops_the_run_before_any_overwrite() {
     let fatal = run.result.fatal_error.expect("cached view is fatal");
     assert!(fatal.contains("X-Data-Source: cached"), "{fatal}");
 
-    // A consumer's credentials come from /backup, which must not be cached
-    // either.
+    // Credential-complete verification must never accept a cached response.
     let planned = document(Kind::Consumer, "c1", None, 1);
     let desired = document(Kind::Consumer, "c1", None, 2);
-    let cached_backup: RecordingRoute = (
-        "GET /backup".into(),
-        200,
-        serde_json::to_string(&planned).unwrap(),
-        vec![("X-Data-Source".into(), "cached".into())],
+    let cached = read_route(
+        Kind::Consumer,
+        "c1",
+        row(Kind::Consumer, "c1", &planned).to_string(),
+        &[("X-Data-Source", "cached"), ("ETag", TAG)],
     );
-    let routes = vec![
-        health(),
-        tagged(Kind::Consumer, "c1", &planned, TAG),
-        cached_backup,
-    ];
+    let routes = vec![health(), cached];
 
     let run = apply(&desired, planned, routes, false, Default::default()).await;
 
@@ -779,24 +802,18 @@ async fn a_failed_read_refuses_the_overwrite_and_defers_deletes() {
     assert_eq!(run.count("GET /upstreams/u2 "), 0);
     assert_eq!(run.result.deletes_deferred, 1);
 
-    // A consumer whose credential backup cannot be read is refused too.
+    // Audit-admission or verification failure must stop the conditional operation.
     let planned = document(Kind::Consumer, "c1", None, 1);
     let desired = document(Kind::Consumer, "c1", None, 2);
     let failed: RecordingRoute = (
-        "GET /backup".into(),
-        500,
-        r#"{"error":"boom"}"#.into(),
+        "GET /consumers/c1/verification ".into(),
+        503,
+        r#"{"error":"private diagnostic withheld"}"#.into(),
         vec![],
     );
-    let routes = vec![
-        health(),
-        tagged(Kind::Consumer, "c1", &planned, TAG),
-        failed,
-    ];
-
-    let run = apply(&desired, planned, routes, false, Default::default()).await;
-
-    assert_refused(&run, "confirms consumer credentials", "failed backup");
+    let run = apply(&desired, planned, vec![health(), failed], false, Default::default()).await;
+    assert!(run.result.fatal_error.is_some());
+    assert!(run.mutations().is_empty());
 }
 
 #[tokio::test]

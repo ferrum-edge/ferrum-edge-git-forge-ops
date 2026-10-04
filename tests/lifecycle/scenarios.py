@@ -439,12 +439,12 @@ def scenario_conditional_overwrite(harness: Harness) -> str:
         "/proxies/orders-proxy",
         "/upstreams/orders-upstream",
         "/plugins/config/orders-key-auth",
-        "/consumers/orders-client",
+        "/consumers/orders-client/verification",
     ):
         status, etag, _ = _admin_exchange(harness, "GET", path)
         if status != 200 or not etag or not etag.startswith('"'):
             raise ScenarioFailure(
-                f"GET {path} answered {status} with ETag {etag!r}; incremental "
+                f"GET {path} answered {status} without a strong tag; incremental "
                 "apply refuses every overwrite of a row without a strong entity-tag"
             )
 
@@ -464,11 +464,22 @@ def scenario_conditional_overwrite(harness: Harness) -> str:
     if json.loads(body).get("name") != OUT_OF_BAND_PROXY_NAME:
         raise ScenarioFailure("the refused conditional PUT changed the proxy anyway")
 
-    # The client half: apply plans from the edited row and sends conditional
-    # writes that the real gateway accepts, for every kind it overwrites. A
-    # consumer update takes the redacted read plus the /backup that carries
-    # its credentials. Each single-row read must agree with the /backup row
-    # the plan came from, or apply would refuse a row nobody changed.
+    # Hidden-only credential edits must invalidate the matching row tag too.
+    status, consumer_tag, body = _admin_exchange(harness, "GET", "/consumers/orders-client/verification")
+    if status != 200:
+        raise ScenarioFailure("complete consumer verification is unavailable")
+    consumer = json.loads(body)
+    if consumer.get("credentials", {}).get("keyauth", [{}])[0].get("key") != harness_key(harness):
+        raise ScenarioFailure("consumer verification did not return the exact stored key")
+    consumer["credentials"]["custom_fixture"] = [{"opaque": "lifecycle-hidden-field"}]
+    status, _, _ = _admin_exchange(harness, "PUT", "/consumers/orders-client", consumer, if_match=consumer_tag)
+    if status != 200:
+        raise ScenarioFailure("hidden-field setup failed")
+    status, _, _ = _admin_exchange(harness, "PUT", "/consumers/orders-client", consumer, if_match=consumer_tag)
+    if status != 412:
+        raise ScenarioFailure("a hidden-only consumer change did not invalidate the row token")
+
+    # Re-plan and converge through the client, preserving the hidden custom type.
     edit_resource(
         harness,
         "consumers/orders-client.yaml",
@@ -488,14 +499,146 @@ def scenario_conditional_overwrite(harness: Harness) -> str:
         'plugin_name: "key_auth"\n  labels:\n    team: "orders"',
     )
     harness.run("apply", "--auto-approve")
-    harness.run("diff", "--exit-on-drift")
     harness.expect_status("/orders/status/200", 200, {"X-API-Key": harness_key(harness)})
+    status, _, body = _admin_exchange(harness, "GET", "/consumers/orders-client/verification")
+    if status != 200 or json.loads(body)["credentials"].get("custom_fixture") != consumer["credentials"]["custom_fixture"]:
+        raise ScenarioFailure("client update lost the hidden custom credential")
+    # Remove isolated test setup before the following replacement scenario. This
+    # endpoint is deliberately not a conditional deletion shortcut in the client.
+    status, _, _ = _admin_exchange(harness, "DELETE", "/consumers/orders-client/credentials/custom_fixture")
+    if status != 200:
+        raise ScenarioFailure("hidden credential fixture cleanup failed")
+    harness.run("diff", "--exit-on-drift")
     return (
         "the gateway tags every overwritten kind and refuses a superseded If-Match "
         "with 412; apply re-planned over an out-of-band edit and updated a proxy, "
         "an upstream, a plugin config and a consumer through If-Match, converging "
         "with no drift"
     )
+
+
+def scenario_conditional_full_replace(harness: Harness) -> str:
+    ensure_deployed(harness)
+    backend = urllib.parse.urlsplit(harness.upstream_url)
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Conditional lifecycle spec", "version": "1"},
+        "paths": {"/status/200": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {
+            "id": "conditional-spec-proxy", "listen_path": "/conditional-spec",
+            "backend_host": backend.hostname, "backend_port": backend.port,
+            "backend_scheme": "http",
+        },
+        "x-ferrum-upstream": {
+            "id": "conditional-spec-upstream",
+            "targets": [{"host": backend.hostname, "port": backend.port}],
+        },
+        "x-ferrum-plugins": [{
+            "id": "conditional-spec-plugin", "plugin_name": "key_auth", "config": {},
+        }],
+    }
+    status, _, _ = _admin_exchange(harness, "POST", "/api-specs", spec)
+    if status != 201:
+        raise ScenarioFailure("spec-owned graph fixture creation failed")
+    public_key = (ROOT / "tests/lifecycle/conditional-trust-public.pem").read_text(encoding="ascii")
+    trust = {
+        "trust_domain": "conditional.fixture",
+        "bundle": {"local": {
+            "trust_domain": "conditional.fixture",
+            "jwt_authorities": [{"key_id": "conditional-fixture", "public_key_pem": public_key}],
+        }},
+    }
+    status, _, _ = _admin_exchange(harness, "POST", "/gateway-trust-bundles", trust)
+    if status != 201:
+        raise ScenarioFailure("trust-bundle fixture creation failed")
+    status, token, body = _admin_exchange(harness, "GET", "/backup?conditional=true")
+    if status != 200 or not token:
+        raise ScenarioFailure("coherent namespace snapshot is unavailable")
+    snapshot = json.loads(body)
+    metadata = snapshot.get("conditional", {})
+    if metadata.get("namespace_etag") != token or set(metadata.get("row_etags", {})) != {
+        "proxies", "consumers", "upstreams", "plugin_configs"
+    }:
+        raise ScenarioFailure("conditional snapshot metadata is incomplete")
+    restore = {key: snapshot[key] for key in (
+        "version", "proxies", "consumers", "upstreams", "plugin_configs", "api_specs"
+    )}
+    if not snapshot["api_specs"]["items"] or len(snapshot["gateway_trust_bundles"]) != 1:
+        raise ScenarioFailure("the conditional snapshot omitted seeded extra sections")
+    for section in ("proxies", "upstreams", "plugin_configs"):
+        if not any(row.get("api_spec_id") for row in snapshot[section]):
+            raise ScenarioFailure("the conditional snapshot omitted part of the spec graph")
+    # A -> B -> A changes the namespace revision even when row content reverts.
+    status, row_token, proxy_body = _admin_exchange(harness, "GET", "/proxies/orders-proxy")
+    if status != 200:
+        raise ScenarioFailure("proxy setup read failed")
+    original = json.loads(proxy_body)
+    changed = dict(original, name="conditional ABA fixture")
+    status, _, _ = _admin_exchange(harness, "PUT", "/proxies/orders-proxy", changed, if_match=row_token)
+    if status != 200:
+        raise ScenarioFailure("ABA mutation failed")
+    _, current_row_token, _ = _admin_exchange(harness, "GET", "/proxies/orders-proxy")
+    status, _, _ = _admin_exchange(harness, "PUT", "/proxies/orders-proxy", original, if_match=current_row_token)
+    if status != 200:
+        raise ScenarioFailure("ABA reversion failed")
+    for path in ("/restore?confirm=true", "/restore?confirm=true&confirm_api_spec_deletion=true"):
+        status, _, _ = _admin_exchange(harness, "POST", path, restore, if_match=token)
+        if status != 412:
+            raise ScenarioFailure("stale namespace restore, including confirmed deletion, was not refused")
+    status, fresh, _ = _admin_exchange(harness, "GET", "/backup?conditional=true")
+    if status != 200 or fresh == token:
+        raise ScenarioFailure("ABA did not advance the namespace token")
+    empty = {"version": "1", "proxies": [], "consumers": [], "upstreams": [], "plugin_configs": []}
+    status, _, _ = _admin_exchange(
+        harness, "POST", "/restore?confirm=true&confirm_api_spec_deletion=true", empty,
+        if_match=fresh,
+    )
+    if status != 200:
+        raise ScenarioFailure("conditional empty replacement failed")
+    status, empty_token, body = _admin_exchange(harness, "GET", "/backup?conditional=true")
+    if status != 200 or not empty_token:
+        raise ScenarioFailure("empty namespace snapshot is unavailable")
+    emptied = json.loads(body)
+    if any(emptied[section] for section in ("proxies", "consumers", "upstreams", "plugin_configs")):
+        raise ScenarioFailure("confirmed empty replacement left managed rows behind")
+    if emptied["api_specs"]["items"] or emptied["gateway_trust_bundles"] != snapshot["gateway_trust_bundles"]:
+        raise ScenarioFailure("confirmed spec deletion changed trust or left spec documents")
+    status, _, _ = _admin_exchange(harness, "POST", "/restore?confirm=true", restore, if_match=empty_token)
+    if status != 200:
+        raise ScenarioFailure("conditional replacement of an empty namespace failed")
+    # Exercise the actual client full-replacement path against these same server bytes.
+    harness.write(".gitforgeops/config.yaml", f"""
+        version: 1
+        default_environment: acceptance
+        environments:
+          acceptance:
+            apply_strategy: full_replace
+            ownership:
+              mode: exclusive
+              namespaces: [{NAMESPACE}]
+    """)
+    harness.run("apply", "--auto-approve", "--allow-large-prune")
+    harness.run("diff", "--exit-on-drift")
+    status, _, body = _admin_exchange(harness, "GET", "/backup?conditional=true")
+    after_client = json.loads(body)
+    if status != 200 or after_client["api_specs"] != snapshot["api_specs"]:
+        raise ScenarioFailure("client replacement did not preserve verbatim spec documents")
+    if after_client["gateway_trust_bundles"] != snapshot["gateway_trust_bundles"]:
+        raise ScenarioFailure("client replacement rewrote the live trust bundle")
+    harness.run("apply", "--auto-approve", "--allow-large-prune", "--confirm-api-spec-deletion")
+    status, _, body = _admin_exchange(harness, "GET", "/backup?conditional=true")
+    final = json.loads(body)
+    if status != 200 or final["api_specs"]["items"]:
+        raise ScenarioFailure("client confirmed deletion left spec documents")
+    if any(row.get("api_spec_id") for section in ("proxies", "upstreams", "plugin_configs") for row in final[section]):
+        raise ScenarioFailure("client confirmed deletion left spec-owned rows")
+    if final["gateway_trust_bundles"] != snapshot["gateway_trust_bundles"]:
+        raise ScenarioFailure("client confirmed deletion rewrote live trust")
+    status, _, _ = _admin_exchange(harness, "DELETE", f"/gateway-trust-bundles/{NAMESPACE}")
+    if status != 200:
+        raise ScenarioFailure("trust fixture cleanup failed")
+    seed_repository(harness)
+    return "coherent namespace If-Match enforced ABA, empty/spec deletion, spec graph and verbatim documents; trust survived and client converged"
 
 
 def edit_resource(harness: Harness, relative: str, old: str, new: str) -> None:
@@ -657,6 +800,7 @@ SCENARIOS = {
     "reapply-is-a-no-op": scenario_reapply_is_a_no_op,
     "modify-and-delete-in-order": scenario_modify_and_delete_in_order,
     "conditional-overwrite": scenario_conditional_overwrite,
+    "conditional-full-replace": scenario_conditional_full_replace,
     "credentials-generate-and-rotate": scenario_credentials_generate_and_rotate,
     "partial-failure-recovery": scenario_partial_failure_recovery,
     "ledger-publication-failure": scenario_ledger_publication_failure,

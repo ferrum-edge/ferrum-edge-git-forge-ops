@@ -564,6 +564,15 @@ merge changed a deployment input (`Superseded deployment`). Rotation follows
 the same rules. See
 [Ordering between runs](docs/apply.md#ordering-between-runs).
 
+API consumer writes require credential-complete verification, and full replacement
+requires the original coherent conditional namespace snapshot. Rotation checks live
+ownership and field safety before broker publication and uses row `If-Match`.
+GET-only doctor probes report capability availability, while qualification must
+establish enforcement on the exact released gateway bytes. See
+[conditional apply behavior](docs/apply.md#changes-made-during-an-apply). The new
+owner contract still needs the upcoming final release artifact; existing pins are
+not evidence of that qualification.
+
 ### What if apply fails after merge?
 
 Re-run the failed **GitForgeOps Apply** run from the Actions tab. That is safe:

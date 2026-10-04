@@ -17,9 +17,10 @@ revision can be published. The ids are declared once, in
 [`.github/scripts/lifecycle_result.py`](../../.github/scripts/lifecycle_result.py),
 and a test checks that this file lists each of them.
 
-The harness (`run.sh`) runs six scenarios itself: `create-and-route`,
+The harness (`run.sh`) runs seven scenarios itself: `create-and-route`,
 `reapply-is-a-no-op`, `modify-and-delete-in-order`, `conditional-overwrite`,
-`drift-monitoring` and `file-and-mesh-boundary`. The other six always record
+`conditional-full-replace`, `drift-monitoring` and `file-and-mesh-boundary`.
+The other six always record
 `skipped` and are exercised by hand (see below).
 
 | Scenario | Question it answers |
@@ -27,7 +28,8 @@ The harness (`run.sh`) runs six scenarios itself: `create-and-route`,
 | `create-and-route` | Do an upstream, proxy, scoped plugin and consumer actually serve authenticated traffic? |
 | `reapply-is-a-no-op` | Does applying the same desired state again change nothing — no normalization-induced false drift? |
 | `modify-and-delete-in-order` | Do modify and delete succeed in dependency-safe order — including the large-prune guard refusing first, and `--allow-large-prune` carrying it through — and does an unmanaged row survive shared mode? |
-| `conditional-overwrite` | Does the gateway issue a strong `ETag` for every kind incremental apply overwrites and refuse a write carrying a superseded one with `412` — and does an apply over an out-of-band edit re-plan and converge through its `If-Match` writes, consumers (redacted read, credentials from `/backup`) included? |
+| `conditional-overwrite` | Strong row tags and stale writes refuse for every kind, including complete consumer verification and hidden-only credential changes; the client preserves hidden types and converges. |
+| `conditional-full-replace` | The real gateway enforces the coherent namespace token through ABA, empty replacement and confirmed-deletion requests, and the full-replacement client converges. |
 | `credentials-generate-and-rotate` | Does a rotated credential authenticate, does the old one stop, and does no plaintext reach a log, a commit, a comment or an artifact? |
 | `partial-failure-recovery` | Do the recovery safeguards preserve successful work and ownership across an injected partial failure and an ambiguous response? |
 | `ledger-publication-failure` | When state publication is rejected after a gateway mutation and retries are exhausted, does a fresh runner recover ownership by the documented procedure — rather than treating a runner-local ledger as durable? |
@@ -71,8 +73,11 @@ does not establish an earliest or minimum version, or prove that a particular
 released binary contains or enforces the capability. The
 `conditional-overwrite` scenario must pass against the exact released build to
 qualify it, including the CLI's namespace and credential checks. This
-qualification also covers the gateway's backup and consumer representations;
-pending representation fixes are not assumed released.
+qualification also covers the gateway's backup and consumer representations.
+The new consumer-verification and coherent replacement scenarios require the
+upcoming qualified owner build. The existing v0.9.10 pin cannot certify them;
+no scenario is skipped to make that pin pass. Root must finish exact-byte
+qualification after publication.
 
 The Python harness checks its admin and data-plane URLs before use and sends
 credentials only over HTTPS or HTTP to literal loopback IPs (`127.0.0.0/8`,
@@ -235,3 +240,11 @@ behavior that ships uncertified. When adding one:
 
 `test_lifecycle_result.py` checks that all three agree, so a half-added
 scenario fails the build.
+
+The conditional trust fixture is public test material copied verbatim from
+`tests/fixtures/test_rsa_public.pem` at Edge owner
+`c764084b3b51c3f7ffde268c039688d35e49c553`; it contains no private key.
+`conditional-full-replace` seeds a real spec-owned proxy/upstream/plugin graph
+and trust bundle, verifies document and trust preservation, and then exercises
+client-confirmed spec deletion. These checks must run on the upcoming qualified
+release bytes, without skipping old-pin incompatibilities.
