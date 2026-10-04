@@ -3,5 +3,5 @@
 812cfa834d3fa01d7ec5f03743e07d19139fdc5a3cfd837e08fc3eeb27a1a675  crates/ferrum-alloy-edge/src/export.rs
 6ad17e7c846892403802efd3663b27513f0d8023399da056b512a2ab48f3ad3d  crates/ferrum-alloy-edge/src/manifest.rs
 a3789a58669d8aeca63802eb177f7b69d0c3c87ce341a1fa23299ab5d974a52d  crates/ferrum-alloy-cli/src/edge.rs
-6ccdbfac4bb7a9efdf961e69aeaab5a556332c2ba6f29ea9a79ae66cb81bec43  crates/ferrum-alloy-cli/tests/cli.rs
+4f6cc8e3d150716a8f3a520a16521ed42b703c537692a1ec36918ca251e2dbd0  crates/ferrum-alloy-cli/tests/cli.rs
 d62eb5f743459d6dfa5d77f7c0578a09ab7c036ebd358b60ff40b1f2b26e4ad5  Cargo.lock

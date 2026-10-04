@@ -409,7 +409,9 @@ fn alloy_generated_resources_load_assemble_and_validate() {
 
         let resources = load_resources(&project.join("resources")).expect("strict producer load");
         assert_eq!(resources.len(), 3 + upstream_count);
-        assert!(resources.iter().all(|(directory, _)| directory == namespace));
+        assert!(resources
+            .iter()
+            .all(|(directory, _)| directory == namespace));
         let assembled = assemble(resources).expect("assemble actual producer output");
         assert!(assembled.mesh.is_none());
         let gateway = &assembled.gateway;
@@ -493,11 +495,7 @@ fn alloy_generated_resources_load_assemble_and_validate() {
         assert_eq!(report["desired_count"], 3 + upstream_count);
 
         // A typoed parent namespace must refuse the non-empty generated tree.
-        let output = alloy_validate_cli(
-            &project,
-            &validator,
-            Some("missing-alloy-namespace"),
-        );
+        let output = alloy_validate_cli(&project, &validator, Some("missing-alloy-namespace"));
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["success"], false);
@@ -542,7 +540,9 @@ fn alloy_generated_negative_cases(project: &Path, validator: &Path) {
         document["spec"]["targets"][0]["alloy_unknown_field"] = true.into();
     });
     let error = load_resources(&copy.path().join("resources")).unwrap_err();
-    assert!(error.to_string().contains(".spec.targets[0].alloy_unknown_field"));
+    assert!(error
+        .to_string()
+        .contains(".spec.targets[0].alloy_unknown_field"));
 
     // Explicit namespace overrides remain supported. Moving only an upstream
     // breaks the same-namespace graph and must fail authoritative validation.
