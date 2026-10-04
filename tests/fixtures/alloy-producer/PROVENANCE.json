@@ -1,0 +1,12 @@
+{
+  "repository": "ferrum-edge/ferrum-alloy",
+  "commit": "690aed7a9fa8458aeea4ac8416170c8daeb0470b",
+  "issue": "https://github.com/ferrum-edge/ferrum-alloy/issues/27",
+  "command": "ferrum-alloy edge export --manifest INPUT --format gitforgeops --output DIR",
+  "fixture_inputs": [
+    "contracts/fixtures/manifests/orders-api.toml",
+    "contracts/fixtures/manifests/plain-http.toml"
+  ],
+  "checksums": "SHA256SUMS",
+  "output": "Generated only in GitHub-hosted CI; no generated resource snapshot is vendored."
+}
