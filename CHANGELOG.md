@@ -124,6 +124,51 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   loopback clients bypass environment proxies, which could otherwise forward
   credentials to a remote host. `FERRUM_ALLOW_INSECURE_HTTP=true` no longer
   makes a remote cleartext gateway usable (CodeQL alert #298, PR #450).
+- New `supply-chain-policy.yml` reports a `trusted-supply-chain-policy` check
+  whose definition the pull request under review cannot edit. It runs on
+  `pull_request_target`, checks out the pull request's head as data, and runs
+  only the protected branch's checker under `python3 -I` with `--root`, with
+  `contents: read`, no secrets and a 10-minute timeout.
+  `check_supply_chain.py`:
+  - before reading anything, refuses a symlink in the judged tree that is
+    absolute, whose target passes through another symlink or climbs above the
+    tree root (followed component by component), that resolves outside the
+    tree or does not resolve, any special file, and a `--root` that is itself
+    a link;
+  - requires every workflow to be in a small YAML subset, read by a strict
+    stdlib reader before any rule runs. Anchors, aliases, tags, explicit and
+    merge keys, quoted keys, flow mappings, an indented root, tabs, markers,
+    directives and Unicode line breaks are refused. Block scalars and flow
+    sequences are accepted only for listed keys;
+  - pins every non-comment line of the new workflow except the
+    `actions/checkout` commit;
+  - refuses, on the parsed structure, any other job keyed or named
+    `trusted-supply-chain-policy`, a computed job display name, and
+    `checks`/`statuses` write (or `write-all`) in any workflow.
+
+  The bootstrap now writes the new context alongside
+  `security-supply-chain-policy` and binds every required context to the
+  GitHub Actions app (`integration_id` 15368). The settings audit warns until
+  the `main` ruleset requires the new context. It fails when
+  `trusted-supply-chain-policy` or `state-guard-reject-state-edits` is
+  unbound, so it is red after this merges until the operator re-runs the
+  bootstrap, and it warns for the other unbound contexts. The release gate
+  requires a reported result to pass. Add the context to the ruleset after
+  this change merges (`docs/github-launch-controls.md`, "Switching the
+  supply-chain policy check"). The `security-supply-chain-policy` job stays,
+  unchanged, until a later change retires it (GHSA-x5m2-4555-q4cr).
+- Upgrade note for repositories made from this template: every workflow in
+  `.github/workflows/`, including your own, must now fit the YAML subset
+  above, or the supply-chain policy check fails. Common forms to rewrite
+  include `permissions: {}`, bracketed lists other than
+  `branches`/`tags`/`paths`/`types`/`needs`/`workflows` (for example a
+  matrix `environment: [staging, prod]` or `runs-on: [self-hosted, x]`),
+  anchors and aliases, a multi-line plain `if:`, and `|2` block scalars. Use
+  block style instead. The violation names the file and line.
+- A queued rotation whose protected branch moved first prints a
+  rotation-specific notice: the freshness guard's refusal text is written for
+  apply, but no apply reschedules a rotation, so dispatch it again from the
+  current head.
 - Traffic checks can no longer spend arbitrary credentials from the
   environment's bundle (GHSA-8mhw-ghx8-9m63). A `slot:` header in
   `.gitforgeops/smoke.yaml` must name a Consumer credential secret slot

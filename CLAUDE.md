@@ -128,6 +128,20 @@ cargo fmt --all && cargo fmt --all -- --check
 - Unit tests never read the customer-owned `resources/` tree. Shipped-example
   checks use `tests/fixtures/shipped-examples/`.
 - Resource-only PRs skip the Rust steps and run secretless `validate-pr.yml`.
+- `supply-chain-policy.yml` (`pull_request_target`, so its definition comes
+  from the protected branch) reports `trusted-supply-chain-policy`. It checks
+  the PR head out into `candidate/` as data and runs only `python3 -I
+  base/.github/scripts/check_supply_chain.py --root candidate`. The checker
+  first refuses symlinks that leave the judged tree and special files, then
+  requires every workflow to fit a strict YAML subset (no anchors, aliases,
+  tags, explicit or quoted keys, flow mappings; block scalars and flow
+  sequences only for listed keys) parsed by a stdlib reader. On the parsed
+  structure it refuses other jobs keyed or named `trusted-supply-chain-policy`,
+  computed job names and `checks`/`statuses` write. Keep new workflows inside
+  that subset. `security.yml`'s
+  `security-supply-chain-policy` stays required until the ruleset switch and a
+  later retire PR (`docs/github-launch-controls.md`, "Switching the
+  supply-chain policy check").
 - `trusted-pr-review.yml` is a default-branch `workflow_run`. It accepts only
   manifest-verified resource and overlay YAML, copies environment/policy routing
   from the protected branch, and runs a trusted binary with `FERRUM_NAMESPACE`
