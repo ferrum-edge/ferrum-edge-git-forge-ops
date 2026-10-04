@@ -772,6 +772,8 @@ fn cli_review_shows_which_consumer_each_slot_would_spend() {
         "{}",
         shown(&output)
     );
+    let row = "ok, labelled probe Consumer; the operator allowlist is not visible to this run";
+    assert!(stdout.contains(row), "{}", shown(&output));
 }
 
 /// Set only by workflow steps bound to the environment.
@@ -848,9 +850,30 @@ fn cli_review_reports_a_missing_or_malformed_allowlist_for_the_operator() {
         ("FERRUM_CREDS_JSON", bundle.as_str()),
         (ALLOWLIST, "orders-probe"),
     ];
-    for (vars, note) in [
-        (&missing, "is not set for this environment"),
-        (&malformed, "does not parse for this environment"),
+    let malformed_bound = [
+        ("FERRUM_CREDS_JSON", bundle.as_str()),
+        (ALLOWLIST, "orders-probe"),
+        (BOUND, "true"),
+    ];
+    for (vars, note, row) in [
+        (
+            &missing[..],
+            "is not set for this environment",
+            "**refused**, labelled probe Consumer; the operator allowlist is missing \
+             for this environment",
+        ),
+        (
+            &malformed[..],
+            "does not parse for this environment",
+            "**refused**, labelled probe Consumer; the operator allowlist is malformed \
+             for this run",
+        ),
+        (
+            &malformed_bound[..],
+            "does not parse for this environment",
+            "**refused**, labelled probe Consumer; the operator allowlist is malformed \
+             for this run",
+        ),
     ] {
         let repo = probe_repo(PROBE_SLOT, CUSTOMER_CONSUMER);
         for fail_on_blockers in [false, true] {
@@ -871,6 +894,11 @@ fn cli_review_reports_a_missing_or_malformed_allowlist_for_the_operator() {
                 assert!(text.contains("probe-consumer-allowlist"), "{text}");
             }
             assert!(text.contains(note), "{text}");
+            assert!(text.contains(row), "{text}");
+            assert!(
+                !text.contains("the operator allowlist is not visible"),
+                "{text}"
+            );
             assert!(text.contains("repository administrator"), "{text}");
             assert!(!text.contains("invalid-smoke-checks"), "{text}");
             assert!(!text.contains(PR_FIX), "{text}");

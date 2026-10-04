@@ -64,10 +64,15 @@ deletes. The suite uses the approved validator binary as the gateway too, so it
 certifies the build this repository already trusts and adds no second
 artifact to pin.
 
-Ferrum Edge v0.9.9 introduced the `ETag` / `If-Match` capability the
-`conditional-overwrite` scenario requires. That minimum does not certify a
-build's backup and consumer representations: the scenario must pass against
-the exact build, including the CLI's namespace and credential checks.
+The released Ferrum Edge v0.9.6 source contains strong `ETag` and `If-Match`
+handling ([source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
+[PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)). That source
+does not establish an earliest or minimum version, or prove that a particular
+released binary contains or enforces the capability. The
+`conditional-overwrite` scenario must pass against the exact released build to
+qualify it, including the CLI's namespace and credential checks. This
+qualification also covers the gateway's backup and consumer representations;
+pending representation fixes are not assumed released.
 
 The Python harness checks its admin and data-plane URLs before use and sends
 credentials only over HTTPS or HTTP to literal loopback IPs (`127.0.0.0/8`,

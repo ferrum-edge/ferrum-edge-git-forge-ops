@@ -7,7 +7,7 @@ use crate::policy::config::OverrideConfig;
 use crate::policy::github_override::OverrideDecision;
 use crate::policy::PolicyFinding;
 use crate::secrets::{ResolveReport, SlotStatus};
-use crate::verify::{ProbeAllowlistState, SlotBinding};
+use crate::verify::{BindingStatus, ProbeAllowlistState, SlotBinding};
 
 /// GitHub accepts issue comments up to 65,536 characters. Keep a byte-based
 /// safety margin so multi-byte UTF-8 and future envelope changes cannot turn a
@@ -854,7 +854,21 @@ pub fn render_probe_bindings(
             Some(consumer) => probe_identifier(consumer),
             None => "(no Consumer)".to_string(),
         };
-        let verdict = if binding.status.is_refusal() {
+        let allowlist_refused = binding.status == BindingStatus::AllowlistNotVisible
+            && matches!(
+                allowlist,
+                ProbeAllowlistState::Unset | ProbeAllowlistState::Malformed
+            );
+        let description = match (binding.status, allowlist) {
+            (BindingStatus::AllowlistNotVisible, ProbeAllowlistState::Unset) => {
+                "labelled probe Consumer; the operator allowlist is missing for this environment"
+            }
+            (BindingStatus::AllowlistNotVisible, ProbeAllowlistState::Malformed) => {
+                "labelled probe Consumer; the operator allowlist is malformed for this run"
+            }
+            _ => binding.status.describe(),
+        };
+        let verdict = if binding.status.is_refusal() || allowlist_refused {
             "**refused**"
         } else {
             "ok"
@@ -864,7 +878,7 @@ pub fn render_probe_bindings(
             probe_identifier(&binding.check),
             probe_identifier(&binding.header),
             probe_identifier(&binding.slot),
-            binding.status.describe()
+            description
         ));
     }
     let omitted = bindings.len().saturating_sub(MAX_PROBE_BINDING_ITEMS);

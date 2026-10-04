@@ -1315,9 +1315,10 @@ struct OperatorAllowlist {
 /// A workflow step bound to the environment also sets
 /// `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND=true`. There an unset or blank
 /// variable means the operator set no allowlist (`ProbeAllowlistState::Unset`),
-/// which is what `verify` will see. Without the marker the run has no
-/// environment (a pull request's `plan` or `review`), and the allowlist is
-/// only not visible.
+/// which is what `verify` will see. Without the marker an unset or blank
+/// allowlist may be unavailable to the run (a secretless pull request's
+/// `plan` or `review`), so it is only not visible. A malformed value is an
+/// operator error in every run that sends a slot, with or without the marker.
 fn operator_allowlist(env_config: &EnvConfig) -> OperatorAllowlist {
     use gitforgeops::verify::{ProbeAllowlistState, ProbeConsumerAllowlist};
     let parsed = env_config
@@ -1412,9 +1413,10 @@ fn probe_binding_preview(
 /// the gateway, refused here, before anything changes: a slot must be a
 /// brokered secret of a Consumer labelled `gitforgeops/verify-probe: "true"`,
 /// and, when this run can see `FERRUM_VERIFY_PROBE_CONSUMERS`, one the
-/// operator lists there. In a run bound to the environment, an unset or
-/// malformed allowlist is refused first, as `verify` would refuse it. `review`
-/// reports both as blockers.
+/// operator lists there. An unset or blank allowlist in an environment-bound
+/// run, or a malformed allowlist in any run that sends a slot, is refused
+/// first, as `verify` would refuse it. `review` reports both as blockers and
+/// renders the row as missing or malformed rather than merely not visible.
 fn preflight_probe_bindings(
     env_config: &EnvConfig,
     resolved: &ResolvedEnv,

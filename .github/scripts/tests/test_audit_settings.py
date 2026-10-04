@@ -504,7 +504,7 @@ def monitoring_responses():
             "total_count": 2,
             "secrets": [
                 {"name": "FERRUM_GATEWAY_URL"},
-                {"name": "FERRUM_ADMIN_JWT_SECRET"},
+                {"name": "FERRUM_ADMIN_JWT_VIEWER_SECRET"},
             ],
         }
     ]
@@ -576,6 +576,7 @@ class MonitoringEnvironmentTests(unittest.TestCase):
 
     def test_monitoring_may_not_hold_deployment_broker_or_state_secrets(self):
         for secret in (
+            "FERRUM_ADMIN_JWT_SECRET",
             "GITFORGEOPS_STATE_APP_PRIVATE_KEY",
             "FERRUM_GH_PROVISIONER_TOKEN",
             "SETTINGS_AUDIT_TOKEN",
@@ -640,14 +641,16 @@ class MonitoringEnvironmentTests(unittest.TestCase):
             audit.evidence,
         )
 
-    def test_monitoring_on_the_admin_key_alone_is_still_accepted(self):
-        # TRANSITIONAL (#440): the shipped drift-check.yml still binds the
-        # admin key until step 2 moves it to the viewer key.
-        audit = self.run_audit(monitoring_responses())
-        self.assertEqual(audit.violations, [])
-        self.assertEqual(audit.warnings, [])
+    def test_monitoring_requires_the_viewer_key_name(self):
+        for names in ((), ("FERRUM_GATEWAY_URL",), ("FERRUM_ADMIN_JWT_SECRET",)):
+            with self.subTest(names=names):
+                audit = self.run_audit(self._with_monitoring_secrets(*names))
+                self.assertTrue(
+                    any("must hold FERRUM_ADMIN_JWT_VIEWER_SECRET" in item for item in audit.violations),
+                    audit.violations,
+                )
 
-    def test_monitoring_holding_both_keys_is_a_warning_not_a_violation(self):
+    def test_monitoring_holding_both_keys_is_a_violation(self):
         audit = self.run_audit(
             self._with_monitoring_secrets(
                 "FERRUM_GATEWAY_URL",
@@ -655,10 +658,11 @@ class MonitoringEnvironmentTests(unittest.TestCase):
                 "FERRUM_ADMIN_JWT_VIEWER_SECRET",
             )
         )
-        self.assertEqual(audit.violations, [])
-        self.assertEqual(len(audit.warnings), 1, audit.warnings)
-        self.assertIn("'production-monitor' holds both", audit.warnings[0])
-        self.assertIn("remove FERRUM_ADMIN_JWT_SECRET", audit.warnings[0])
+        self.assertTrue(
+            any("must not hold" in item and "FERRUM_ADMIN_JWT_SECRET" in item for item in audit.violations),
+            audit.violations,
+        )
+        self.assertEqual(audit.warnings, [])
 
     def test_monitoring_still_needs_its_branch_policy(self):
         responses = monitoring_responses()

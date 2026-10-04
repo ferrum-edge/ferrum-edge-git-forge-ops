@@ -159,9 +159,9 @@ jobs:
       - name: Check drift
         # `gitforgeops diff --exit-on-drift`: 0 in sync, 2 drift, 1 the check
         # itself failed (unreachable gateway, 401, cached/non-authoritative
-        # backup, bad configuration). The exit code is captured rather than
-        # allowed to fail the step, because the three cases mean three
-        # different things and only one of them is a statement about the
+        # export, unverified secrets, bad configuration). The exit code is
+        # captured rather than allowed to fail the step, because the three
+        # cases mean three different things and only one is a statement about the
         # gateway. `drift_report.py` does that classification; the aggregate
         # job below decides the workflow's status.
         id: check
@@ -170,14 +170,13 @@ jobs:
           FERRUM_ENV: ${{ matrix.scope.environment }}
           FERRUM_GATEWAY_MODE: ${{ steps.deployment-mode.outputs.mode }}
           FERRUM_GATEWAY_URL: ${{ secrets.FERRUM_GATEWAY_URL }}
-          FERRUM_ADMIN_JWT_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_SECRET }}
+          FERRUM_ADMIN_JWT_VIEWER_SECRET: ${{ secrets.FERRUM_ADMIN_JWT_VIEWER_SECRET }}
           # Optional JWT claim settings; see apply-on-merge.yml for why they
           # are bound explicitly and why blank means "unset", not "empty".
-          # `GET /backup` is admin-only today, so a monitoring environment's
-          # token is admin-role and its signing secret is write-equivalent at
-          # the gateway; see docs/github-launch-controls.md §3.1.
+          # The gateway caps this key at viewer. `diff` reads /config/export;
+          # the role claim is fixed, so no admin-role setting is bound here.
+          # Provisioning instructions: docs/reference.md, Scheduled monitoring.
           FERRUM_ADMIN_JWT_ISSUER: ${{ secrets.FERRUM_ADMIN_JWT_ISSUER }}
-          FERRUM_ADMIN_JWT_ROLE: ${{ secrets.FERRUM_ADMIN_JWT_ROLE }}
           FERRUM_ADMIN_JWT_AUDIENCE: ${{ secrets.FERRUM_ADMIN_JWT_AUDIENCE }}
           FERRUM_ADMIN_JWT_TTL_SECS: ${{ secrets.FERRUM_ADMIN_JWT_TTL_SECS }}
           FERRUM_GATEWAY_CA_CERT: ${{ secrets.FERRUM_GATEWAY_CA_CERT }}

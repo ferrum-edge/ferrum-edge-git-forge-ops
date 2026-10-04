@@ -373,7 +373,8 @@ because no human stands in front of it:
 - `audit_settings.py` waives the reviewer rule only for `<env>-monitor` where
   `<env>` is itself a listed environment, and only while it holds none of
   `GITFORGEOPS_STATE_APP_PRIVATE_KEY`, `FERRUM_GH_PROVISIONER_TOKEN`,
-  `SETTINGS_AUDIT_TOKEN` or `FERRUM_CREDS_BUNDLE[_N]`. It checks secret
+  `SETTINGS_AUDIT_TOKEN`, `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_CREDS_BUNDLE[_N]`.
+  It requires the viewer key name `FERRUM_ADMIN_JWT_VIEWER_SECRET`, checks secret
   **names** only and never requests a value.
 - `repo_config.rs` refuses a deployment environment name that ends in the
   reserved suffix.
@@ -385,50 +386,31 @@ The credential bundle is deliberately left out. `diff` excludes unresolved
 broker leaves from the live comparison one leaf at a time, so the rest of the
 document is still compared in full.
 
-**Limitation: the bundled check still holds a write-capable key.**
-`drift-check.yml` runs `diff` against `GET /backup`, which requires the `admin`
-role, with the environment's `FERRUM_ADMIN_JWT_SECRET`. Ferrum Edge signs admin
-tokens with a *symmetric* secret, so that key can mint any role. Leave the
-monitoring environment's `FERRUM_ADMIN_JWT_ROLE` unset (it defaults to `admin`)
-and treat its signing secret as gateway-write-equivalent: fenced to the default
-branch and holding no GitHub-side authority, but not read-limited at the
-gateway. If that trade-off is not acceptable, leave `monitoring.unattended` off
-and read the approval-gated `Not completed` result for what it is.
+**The bundled check uses the viewer key.** `drift-check.yml` reads
+`GET /config/export` with `FERRUM_ADMIN_JWT_VIEWER_SECRET`. Ferrum Edge v0.9.9+
+caps tokens signed with that key at `viewer` whatever they claim. The checker
+requires the exact step-local viewer binding and issuer/audience/TTL settings,
+and rejects the admin key in monitoring. Only this workflow may bind the viewer
+key; `plan`, `review`, `apply` and `rotate` need the admin credential.
 
-Ferrum Edge v0.9.9 closes the gateway side: a token signed with its
-`FERRUM_ADMIN_JWT_VIEWER_SECRET` is authorized as `viewer` whatever it claims,
-and `GET /config/export` serves a fingerprinted snapshot to that role.
-`gitforgeops diff` already reads that way when `FERRUM_ADMIN_JWT_VIEWER_SECRET`
-is set (see
-[Reading with a viewer-capped credential](../README.md#reading-with-a-viewer-capped-credential)).
 Unless the gateway also sets `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, the viewer
-key reads every namespace.
+key reads every namespace. Repository namespace scopes and gateway viewer
+namespace restrictions still apply. The workflow does not pass
+`--accept-unverified-secrets` and does not automatically store fingerprint
+baselines: a comparison with unverified secrets fails instead of certifying
+"in sync". Explicit CLI acceptance retains its documented limits.
 
-**Moving monitoring to the viewer key (#440).** The trusted checker judges
-every PR with the default branch's copy, so the move lands in two PRs:
-
-1. *Policy (done).* `check_supply_chain.py` accepts
-   `FERRUM_ADMIN_JWT_VIEWER_SECRET` as the signing-key binding of
-   `drift-check.yml`, and refuses it in every other workflow or composite
-   action: `plan`, `review` and `apply` read `GET /backup` and cannot use it.
-   A step that binds it must also bind `FERRUM_ADMIN_JWT_ISSUER`, `_AUDIENCE`
-   and `_TTL_SECS` (the role claim is always `viewer`). For now
-   `drift-check.yml` may still bind `FERRUM_ADMIN_JWT_SECRET`; binding both
-   keys is a warning, not a violation. `audit_settings.py` accepts either key
-   in a `<env>-monitor` environment and warns when it holds both. GitHub
-   resolves secret names without regard to case, so the checker matches them
-   case-insensitively and refuses any `secrets.<name>` reference that is not
-   spelled in upper case.
-2. *Workflow (next).* `drift-check.yml` binds the viewer key and drops the
-   admin key, and the checker then makes the admin key in `drift-check.yml` a
-   violation. Before step 2 merges, add `FERRUM_ADMIN_JWT_VIEWER_SECRET` to
-   every environment `drift-check.yml` binds
-   (`matrix.scope.monitoring_environment`): `<env>-monitor` when
-   `monitoring.unattended` is true, otherwise the deployment environment
-   itself. After it merges, remove
-   `FERRUM_ADMIN_JWT_SECRET` from each `<env>-monitor`. Deployment
-   environments keep `FERRUM_ADMIN_JWT_SECRET`, because `apply`, `review` and
-   `rotate` need it.
+**Human deployment step (#440).** Before deploying the viewer-only workflow,
+a repository administrator must provision the gateway's distinct viewer key as
+`FERRUM_ADMIN_JWT_VIEWER_SECRET` in every API environment selected by
+`matrix.scope.monitoring_environment`: `<env>-monitor` when
+`monitoring.unattended` is true, otherwise the deployment environment itself.
+Use GitHub **Settings → Environments → selected environment → Environment
+secrets**. After the workflow switch, remove `FERRUM_ADMIN_JWT_SECRET` from each
+`<env>-monitor`; deployment environments retain it for apply, trusted review and
+rotate. The audit now refuses the admin name in monitoring and requires the
+viewer name. This is a manual secret-entry operation, never a script that reads,
+prints or copies secret values. See [Scheduled monitoring](reference.md#scheduled-monitoring).
 
 ### 3.2 Monitoring outcomes
 
@@ -439,7 +421,7 @@ compared and matched:
 | --- | --- |
 | `In sync` | the gateway was read and matches the repository |
 | `Drift detected` | the gateway was read and differs |
-| `Check failed` | authentication, connectivity, a cached (non-authoritative) backup, or a configuration error — **nothing is known about the gateway** |
+| `Check failed` | authentication, connectivity, a cached (non-authoritative) export, unverified secrets, or a configuration error — **nothing is known about the gateway** |
 | `Skipped (file mode)` | no live Admin API to compare against; a configured absence, not a gap |
 | `Not completed` | the comparison never ran: approval pending, cancelled, or the runner was lost |
 
@@ -553,12 +535,32 @@ The `security-supply-chain-policy` check runs the **protected branch's** copy
 of the checker against the candidate tree, under `python3 -I` so that no module
 in the candidate checkout can load before the trusted policy. A pull request
 therefore cannot weaken the policy by editing the checker: its edits take
-effect only after merge. The cost: a PR that changes the checker *and* the
-workflow shape it governs fails its own policy check once, because the old
-policy judges the new shape. Prefer expand/contract pairs (accept both shapes,
-migrate, then reject the old one). The baseline ruleset has no human bypass,
-so merging past that red required check takes a deliberate admin decision.
-The next run on `main` uses the new policy.
+effect only after merge. The protected base judges each candidate, and a
+checker change takes effect only after it merges. Use a checker-first,
+binding-second sequence: land the checker change under the currently trusted
+policy, then submit the workflow binding change after the new checker is on
+`main`. Prefer expand/contract pairs (accept both shapes, migrate, then reject
+the old one). If the checker-first change cannot pass the trusted check, park
+it until a policy-compatible sequence is available; do not merge past a red
+required check. The next run on `main` uses the new policy.
+
+Guarded `run:` interpolation requires a proven source and is inspected after
+GitHub scalar conversion, before Bash comment removal. The reader preserves
+plain versus quoted YAML provenance: plain `null`, `Null`, `NULL` and `~`
+render empty, while quoted `"null"` remains literal text. Plain booleans render
+lowercase. Numeric interpolation fails closed because GitHub reformats numbers;
+quote a numeric value when its literal spelling is intended. These conversions
+follow the runner's [YAML reader](https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs)
+and [expression string conversion](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/EvaluationResult.cs).
+The shell scan keeps quote and command-substitution context across physical
+lines, so a line starting with `#` inside a multiline quote cannot hide an
+active command. Unsupported shell contexts retain text conservatively. Binding
+checks, output-producer proofs and runtime env-file tracking use the same scan.
+
+Review and merge tighter guard logic into the protected branch first. If the
+workflow binding form must change, do that in a subsequent pull request judged
+by that trusted checker. New checker logic requires fresh exact-head review;
+a green verdict from the previous protected checker does not validate it.
 
 That is not a complete boundary on its own. The check runs under
 `pull_request`, so GitHub executes the pull request's own copy of

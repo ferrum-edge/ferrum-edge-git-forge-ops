@@ -9,18 +9,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Support the per-proxy `allow_path_parameters` option for HTTP-family routes
   and preserve the mesh service opt-in through mesh configuration output.
-- The supply-chain policy accepts `FERRUM_ADMIN_JWT_VIEWER_SECRET` as the
-  signing key of the scheduled drift check (`drift-check.yml`) and refuses it
-  in every other workflow or composite action. A step that binds it must also
-  bind the issuer, audience and TTL settings. During the move,
-  `drift-check.yml` may still bind `FERRUM_ADMIN_JWT_SECRET`, and binding both
-  keys is reported as a warning. The settings audit accepts either key in a
-  `<env>-monitor` environment and warns when it holds both, and `doctor`
-  reports the auditor's warnings as `WARN` findings. Secret names are matched
-  case-insensitively, as GitHub resolves them, and a `secrets.<name>`
-  reference not spelled in upper case is a violation. The next change binds
-  the viewer key in `drift-check.yml` and removes the admin key from
-  monitoring (#440).
+- Scheduled drift monitoring binds only `FERRUM_ADMIN_JWT_VIEWER_SECRET`,
+  with the issuer, audience and TTL settings. The protected policy requires
+  those exact step-local bindings and refuses the admin key in the drift
+  workflow and the viewer key in every other workflow or composite action.
+  The settings audit requires the viewer secret name and forbids the admin
+  secret name in `<env>-monitor`, even when both exist; it never reads secret
+  values. Bootstrap guidance lists the viewer key for each bound API
+  environment (the monitor environment for unattended checks, otherwise the
+  deployment environment), while retaining deployment admin credentials.
+  Operators must provision the distinct gateway viewer key before switching
+  the workflow and remove the admin key from monitor environments. Namespace
+  restrictions and approval gates remain in place. The bundled drift command
+  still fails on unverified secrets and never certifies them as in sync; it
+  adds no fingerprint-baseline storage (#440).
 - `diff` reads Ferrum Edge's `GET /config/export` with a viewer-capped
   credential when `FERRUM_ADMIN_JWT_VIEWER_SECRET` is set, and never uses the
   admin secret on that path; without it, `diff` keeps reading `GET /backup`
@@ -45,8 +47,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `--force-baseline` is passed, and `diff` warns when a baseline path is inside
   a git worktree. A cached export (`X-Data-Source: cached`) never yields an
   in-sync or drift verdict and is never recorded as a baseline. `plan`,
-  `review` and `apply` still read `GET /backup`, and the bundled drift-check
-  workflow does not bind the viewer secret yet (#432).
+  `review` and `apply` still read `GET /backup` (#432).
 - Add exact, code-owned `require_auth_plugin.conditional_auth_exemptions` entries
   for intentionally public proxies. Exempted auth findings stay visible at
   `info`; stale entries are informational, while malformed, wildcard and
@@ -54,16 +55,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- Incremental `apply` needs Ferrum Edge v0.9.9 or later to modify or delete
-  existing rows: every such write is sent with `If-Match`, and an older
-  gateway issues no `ETag`. The apply preflight reads one row the run will
-  overwrite and refuses such a gateway before any credential is allocated or
-  any row written; creates alone still work. `doctor --scope gateway` reports
-  it as `gateway-conditional-writes`. Each modify or delete now costs one
-  extra `GET`. v0.9.9 is the minimum for this capability, not qualification
-  of all backup and consumer representations; the lifecycle suite must pass
-  against the exact gateway build and no pending representation fix is assumed
-  released.
+- Incremental `apply` needs a gateway that issues strong `ETag` values for
+  existing rows and honors conditional writes with `If-Match`. The released
+  Ferrum Edge v0.9.6 source contains this capability
+  ([source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
+  [PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)); this does
+  not establish an earliest or minimum version, or prove that a particular
+  released binary contains or enforces it. Apply's preflight checks only for a
+  strong `ETag` and refuses before credential allocation or writes when none
+  is present; creates alone still work, and `doctor --scope gateway` reports
+  `gateway-conditional-writes`. A server that ignores `If-Match` is not
+  detected. Each modify or delete costs one extra `GET`. This capability does
+  not qualify the gateway's backup or consumer representations: the lifecycle
+  suite must pass against the exact released build, and pending representation
+  fixes are not assumed released.
 - `diff --format json` gains two fields on every path: `live_source`
   (`backup` or `config_export`) and `secret_fingerprints` (`null` on the
   `/backup` path). The cached-read warning now names the source it came from,
@@ -90,6 +95,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the qualified Ferrum Edge version.
 
 ### Security
+
+- Pin the operator-held `FERRUM_VERIFY_PROBE_CONSUMERS` binding in both
+  apply/promote Validate and Verify traffic steps and trusted live review,
+  with `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` in Validate and review.
+  The protected checker reads parsed workflow structure, including decoded
+  YAML scalars, and refuses inherited/dynamic env sources, alternate bindings
+  and shell rebinding. All protected operational workflows refuse whole or
+  indexed GitHub context access, including computed env/path/output references
+  that could inject `BASH_ENV`. In apply, the pinned credential-file hand-off
+  is the only allowed `GITHUB_ENV` access. Validate must execute the pinned command
+  unconditionally and propagate failure before either Apply mode. Changed
+  job dependencies, nonblocking validation, reordered/extra inline mutations,
+  alternate execution defaults and mutation conditions that bypass success
+  are refused. Adversarial fixtures exercise both bypasses with the checker
+  outside the candidate tree, and positive coverage retains the real pinned
+  operations and safe step outputs (#453, #440).
 
 - Release waits up to 900 seconds for pending or missing checks on the exact
   merged PR head, preserving source-bound required checks and lifecycle
@@ -225,10 +246,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (comma-separated `<namespace>/<consumer-id>`) **and** that the environment's
   desired configuration labels `gitforgeops/verify-probe: "true"`. The variable
   is the authorization, because no change to `resources/` or `.gitforgeops/`
-  can change it (the workflow lines binding it are guarded by review of
-  `.github/workflows/`; a trusted-checker pin is a follow-up); the label lives
-  in `resources/` and authorizes nothing alone. With the variable unset or
-  empty, every check that sends a slot is refused; a malformed entry (anything
+  can change it (the protected supply-chain checker pins the workflow
+  bindings, #453); the label lives in `resources/` and authorizes nothing
+  alone. With the variable unset or empty, every check that sends a slot is
+  refused; a malformed entry (anything
   but exactly one `/`) is an error. Anything else exits 1 before the bundle is
   read or any request is sent, and the runner (including `runner::run_check`)
   receives only the authorized values, never the bundle. `validate`, `plan` and

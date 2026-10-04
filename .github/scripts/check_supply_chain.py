@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 from pathlib import Path
@@ -19,6 +20,11 @@ FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+# Closing delimiters inside single-quoted expression literals are data, even
+# in shell comments. GitHub expands expressions before Bash reads the script.
+WORKFLOW_EXPRESSION = re.compile(
+    r"\$\{\{((?:'(?:[^']|'')*'|(?!\}\})[^'])*)\}\}", re.DOTALL
+)
 # GitHub resolves contexts and secret names without regard to case:
 # `${{ secrets.ferrum_admin_jwt_secret }}` and `${{ SECRETS.FERRUM_ADMIN_JWT_SECRET }}`
 # both read FERRUM_ADMIN_JWT_SECRET. Every secret-name match below is therefore
@@ -63,6 +69,8 @@ BUNDLE_SECRET_BINDING = "secrets.FERRUM_CREDS_BUNDLE"
 # nothing else.
 MONITORING_WORKFLOW = "drift-check.yml"
 MONITORING_FORBIDDEN_SECRETS = (
+    # Write-equivalent gateway authority; monitoring uses the viewer key.
+    "FERRUM_ADMIN_JWT_SECRET",
     # Writes GitHub Environment Secrets — the credential broker's authority.
     "FERRUM_GH_PROVISIONER_TOKEN",
     # Mints a Contents: write token for the ownership ledger.
@@ -110,7 +118,6 @@ VIEWER_JWT_SECRET_BINDING = (
 VIEWER_JWT_SECRET_REFERENCE = re.compile(
     r"\bsecrets\.FERRUM_ADMIN_JWT_VIEWER_SECRET\b", re.IGNORECASE
 )
-ADMIN_JWT_SECRET_REFERENCE = re.compile(r"\bsecrets\.FERRUM_ADMIN_JWT_SECRET\b", re.IGNORECASE)
 VIEWER_JWT_WORKFLOW_PATHS = (f".github/workflows/{MONITORING_WORKFLOW}",)
 # The viewer key's tokens carry the configured issuer, audience and TTL; the
 # role claim is always `viewer`, so `FERRUM_ADMIN_JWT_ROLE` does not apply.
@@ -119,14 +126,252 @@ VIEWER_JWT_OPTIONAL_SETTINGS = (
     "FERRUM_ADMIN_JWT_AUDIENCE",
     "FERRUM_ADMIN_JWT_TTL_SECS",
 )
-# TRANSITIONAL (#440, step 1 of 2). The monitoring workflow may bind the viewer
-# key, and may still bind the admin key while the workflow change lands in its
-# own PR (this checker judges every PR from the default branch, so a PR that
-# changed both the rule and the workflow would be judged by the old rule).
-# Binding both is reported as a warning, not a violation. Step 2 binds the
-# viewer key in `drift-check.yml`, drops the admin key from this tuple, and
-# makes "admin secret in drift-check" a violation.
-MONITORING_JWT_SECRET_BINDINGS = (VIEWER_JWT_SECRET_BINDING, ADMIN_JWT_SECRET_BINDING)
+# The protected checker already accepted the viewer binding before the
+# workflow switched (#440). Monitoring must now hold only that signing key.
+MONITORING_JWT_SECRET_BINDINGS = (VIEWER_JWT_SECRET_BINDING,)
+PROBE_CONSUMERS_ENV = "FERRUM_VERIFY_PROBE_CONSUMERS"
+PROBE_BOUND_ENV = "FERRUM_VERIFY_PROBE_CONSUMERS_BOUND"
+PROBE_CONSUMERS_VALUE = "${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}"
+PROBE_RUNTIME_ENVIRONMENTS = {
+    "apply": "${{ matrix.environment }}",
+    "promote": "${{ matrix.scope.environment }}",
+}
+PROBE_WORKFLOW_STEPS = {
+    ".github/workflows/apply-on-merge.yml": (
+        ("apply", "Validate", {
+            "FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["apply"],
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+            PROBE_BOUND_ENV: "true",
+        }),
+        ("apply", "Apply", {"FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["apply"]}),
+        ("apply", "Apply (file mode)", {"FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["apply"]}),
+        ("apply", "Verify traffic", {
+            "FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["apply"],
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+        }),
+        ("promote", "Validate", {
+            "FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["promote"],
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+            PROBE_BOUND_ENV: "true",
+        }),
+        ("promote", "Apply", {"FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["promote"]}),
+        ("promote", "Apply (file mode)", {"FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["promote"]}),
+        ("promote", "Verify traffic", {
+            "FERRUM_ENV": PROBE_RUNTIME_ENVIRONMENTS["promote"],
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+        }),
+    ),
+    ".github/workflows/trusted-pr-review.yml": (
+        ("live-review", "Post trusted live review", {
+            PROBE_CONSUMERS_ENV: PROBE_CONSUMERS_VALUE,
+            PROBE_BOUND_ENV: "true",
+        }),
+    ),
+}
+# These jobs validate inside the same Environment before either publication
+# mode mutates it. Pin the flow as well as the bindings: a skipped/nonblocking
+# Validate or an Apply using always()/failure() loses that ordering guarantee.
+PROBE_APPLY_JOB_GATES = {
+    "apply": (
+        ["list-envs"],
+        "needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''",
+    ),
+    "promote": (
+        ["list-envs", "apply"],
+        "needs.list-envs.outputs.promotions != '[]' && needs.list-envs.outputs.promotions != ''",
+    ),
+}
+PROBE_APPLY_STEP_GATES = {
+    "Apply": "steps.deployment-mode.outputs.mode == 'api'",
+    "Apply (file mode)": "steps.deployment-mode.outputs.mode == 'file'",
+}
+# Verify may read FERRUM_ENV for its notice, but may not override that binding
+# or add CLI environment/namespace selectors. Pin the admitted script while
+# allowing plain shell comments, as for the credential hand-off below.
+PROBE_VERIFY_RUN = (
+    "set -euo pipefail",
+    'if [ -z "$APPLIED_CREDS_FILE" ] || [ ! -s "$APPLIED_CREDS_FILE" ]; then',
+    'echo "::error::The apply step left no finalized credential bundle, '
+    'so traffic cannot be verified against what it deployed."',
+    "exit 1",
+    "fi",
+    "status=0",
+    'FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify || status=$?',
+    'case "$status" in',
+    "0)",
+    'echo "result=passed" >> "$GITHUB_OUTPUT"',
+    ";;",
+    "5)",
+    'echo "result=skipped" >> "$GITHUB_OUTPUT"',
+    'echo "::notice::Traffic verification skipped: .gitforgeops/smoke.yaml declares '
+    'no checks for $FERRUM_ENV. Nothing was verified; this environment authorizes no promotion."',
+    ";;",
+    "*)",
+    'exit "$status"',
+    ";;",
+    "esac",
+)
+# Pin the complete script that writes the one permitted env-file entry, not
+# only its echo: rebinding creds_file to a multiline value would inject more
+# variables through an otherwise unchanged echo. Comments are not script shape.
+CREDENTIAL_HANDOFF_RUN = (
+    "set -euo pipefail",
+    'creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"',
+    'python3 .github/scripts/credential_bundles.py "$creds_file"',
+    'echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"',
+    'applied_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-applied-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"',
+    'rm -f "$applied_file"',
+    'echo "applied_file=$applied_file" >> "$GITHUB_OUTPUT"',
+)
+
+# Exact producer/consumer shapes for the shipped dynamic run interpolations.
+# Never read these shapes from the candidate checkout: it is the data being judged.
+APPLY_ENVIRONMENT_LIST_RUN = (
+    'set -euo pipefail',
+    'if [[ ! -f .gitforgeops/config.yaml ]]; then',
+    'echo "::notice::No .gitforgeops/config.yaml on the protected branch; skipping apply. See docs/github-launch-controls.md to configure deployment environments."',
+    'echo "envs=[]" >> "$GITHUB_OUTPUT"',
+    'echo "promotions=[]" >> "$GITHUB_OUTPUT"',
+    'exit 0',
+    'fi',
+    'scopes=$(gitforgeops envs --format json --include-scopes | jq -c .)',
+    "jq -e '",
+    'type == "array" and',
+    'all(.[];',
+    '(.environment | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))',
+    'and ((.promotion_requires // "x") | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")))',
+    '\' <<< "$scopes" >/dev/null || {',
+    'echo "::error::Every environment must be a single safe path component."',
+    'exit 1',
+    '}',
+    'envs=$(jq -c \'[.[] | select(.promotion_requires == null) | .environment]\' <<< "$scopes")',
+    "promotions=$(jq -c '[.[] | select(.promotion_requires != null)",
+    '| {environment, requires: .promotion_requires}]\' <<< "$scopes")',
+    'echo "envs=$envs" >> "$GITHUB_OUTPUT"',
+    'echo "promotions=$promotions" >> "$GITHUB_OUTPUT"',
+)
+REVIEW_METADATA_RUN = (
+    'set -euo pipefail',
+    '[[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid head SHA" >&2; exit 1; }',
+    'run_path=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" --jq \'.path\')',
+    '[ "$run_path" = "$EXPECTED_WORKFLOW_PATH" ] || {',
+    'echo "Triggering run is \'${run_path}\', not ${EXPECTED_WORKFLOW_PATH}." >&2',
+    'exit 1',
+    '}',
+    'trusted_sha=$(git -C trusted rev-parse HEAD)',
+    'if [ "$EVENT_HEAD_REPO" != "$REPO" ]; then',
+    '{',
+    'echo "head_sha=$EVENT_HEAD_SHA"',
+    'echo "trusted_sha=$trusted_sha"',
+    'echo "privileged=false"',
+    '} >> "$GITHUB_OUTPUT"',
+    'echo "Fork PR: static validation is complete; privileged live review is disabled."',
+    'exit 0',
+    'fi',
+    "matches='[]'",
+    'match_count=0',
+    'for attempt in 1 2 3 4 5; do',
+    'if associated=$(gh api "repos/${REPO}/commits/${EVENT_HEAD_SHA}/pulls?per_page=100" --paginate --slurp); then',
+    'matches=$(jq -c --arg sha "$EVENT_HEAD_SHA" --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" \'',
+    '[.[][]',
+    '| select(.state == "open")',
+    '| select(.head.sha == $sha)',
+    '| select(.head.repo.full_name == $head_repo)',
+    '| select(.base.ref == $base)]',
+    '\' <<< "$associated")',
+    'match_count=$(jq \'length\' <<< "$matches")',
+    '[ "$match_count" -eq 1 ] && break',
+    'fi',
+    'echo "PR association is not yet available and unambiguous; retrying ($attempt/5)." >&2',
+    'if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi',
+    'done',
+    '[ "$match_count" -eq 1 ] || { echo "Expected one open PR for workflow head; found $match_count." >&2; exit 1; }',
+    'event_pr=$(jq -r \'.[0].number\' <<< "$matches")',
+    '[[ "$event_pr" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid resolved PR number" >&2; exit 1; }',
+    'current=$(gh api "repos/${REPO}/pulls/${event_pr}")',
+    'current_sha=$(jq -r \'.head.sha\' <<< "$current")',
+    'current_repo=$(jq -r \'.head.repo.full_name\' <<< "$current")',
+    'current_base=$(jq -r \'.base.ref\' <<< "$current")',
+    'current_base_sha=$(jq -r \'.base.sha\' <<< "$current")',
+    'declared_changed=$(jq -r \'.changed_files\' <<< "$current")',
+    '[ "$current_sha" = "$EVENT_HEAD_SHA" ] || { echo "PR head changed after static validation; wait for the new run." >&2; exit 1; }',
+    '[ "$current_repo" = "$EVENT_HEAD_REPO" ] || { echo "PR source repository changed." >&2; exit 1; }',
+    '[ "$current_base" = "$DEFAULT_BRANCH" ] || { echo "PR no longer targets the protected default branch." >&2; exit 1; }',
+    'pages_file=$(mktemp)',
+    'trap \'rm -f "$pages_file"\' EXIT',
+    'gh api "repos/${REPO}/pulls/${event_pr}/files?per_page=100" \\',
+    '--paginate --slurp > "$pages_file"',
+    '[[ "$declared_changed" =~ ^[0-9]+$ ]] || { echo "Invalid changed-file count" >&2; exit 1; }',
+    'current_after=$(gh api "repos/${REPO}/pulls/${event_pr}")',
+    '[ "$(jq -r \'.head.sha\' <<< "$current_after")" = "$current_sha" ] && \\',
+    '[ "$(jq -r \'.base.sha\' <<< "$current_after")" = "$current_base_sha" ] && \\',
+    '[ "$(jq -r \'.base.ref\' <<< "$current_after")" = "$current_base" ] && \\',
+    '[ "$(jq -r \'.changed_files\' <<< "$current_after")" = "$declared_changed" ] || {',
+    'echo "PR file metadata changed during trusted classification; wait for the new run." >&2',
+    'exit 1',
+    '}',
+    'classification=$(python3 trusted/.github/scripts/changed_files.py \\',
+    '"$pages_file" "$declared_changed" declarative)',
+    '[ "$(jq -r \'.complete\' <<< "$classification")" = true ] || {',
+    'echo "Changed-file pagination was incomplete; trusted review fails closed." >&2',
+    'exit 1',
+    '}',
+    'relevant=$(jq -r \'.matches\' <<< "$classification")',
+    'umask 077',
+    'jq -c \'.matched_paths\' <<< "$classification" > "$RUNNER_TEMP/trusted-changed-paths.json"',
+    'same_repo=false',
+    '[ "$EVENT_HEAD_REPO" = "$REPO" ] && same_repo=true',
+    'privileged=false',
+    '[ "$same_repo" = true ] && [ "$relevant" = true ] && privileged=true',
+    'artifact_name="trusted-pr-input-${RUN_ID}-${RUN_ATTEMPT}"',
+    'binary_artifact_name="trusted-gitforgeops-${RUN_ID}-${RUN_ATTEMPT}"',
+    '{',
+    'echo "pr_number=$event_pr"',
+    'echo "head_sha=$EVENT_HEAD_SHA"',
+    'echo "trusted_sha=$trusted_sha"',
+    'echo "privileged=$privileged"',
+    'echo "artifact_name=$artifact_name"',
+    'echo "binary_artifact_name=$binary_artifact_name"',
+    '} >> "$GITHUB_OUTPUT"',
+)
+APPLY_STATE_COMMIT_RUN = (
+    'set -euo pipefail',
+    'auth=$(printf \'x-access-token:%s\' "$STATE_WRITER_TOKEN" | base64 | tr -d \'\\n\')',
+    'git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $auth"',
+    "trap 'git config --local --unset-all http.https://github.com/.extraheader || true' EXIT",
+    'git config user.name "gitforgeops[bot]"',
+    'git config user.email "gitforgeops[bot]@users.noreply.github.com"',
+    'mkdir -p .state assembled',
+    'for path in \\',
+    '".state/${{ matrix.environment }}.json" \\',
+    '"assembled/${{ matrix.environment }}.yaml" \\',
+    '"assembled/${{ matrix.environment }}-mesh.yaml"; do',
+    '[ -f "$path" ] || continue',
+    'git add "$path"',
+    'done',
+    'if git diff --cached --quiet; then',
+    'echo "No state changes to commit."',
+    'exit 0',
+    'fi',
+    'git commit -m "chore(gitforgeops): state update for ${{ matrix.environment }}"',
+    'for attempt in 1 2 3 4 5; do',
+    'if git push origin "HEAD:$DEFAULT_BRANCH"; then',
+    'echo "Pushed state on attempt $attempt."',
+    'exit 0',
+    'fi',
+    'echo "Push rejected on attempt $attempt; fetching + rebasing..."',
+    'git fetch origin "$DEFAULT_BRANCH"',
+    'git rebase "origin/$DEFAULT_BRANCH" || {',
+    'git rebase --abort',
+    'echo "Rebase failed" >&2',
+    'exit 1',
+    '}',
+    'sleep $((attempt * 2))',
+    'done',
+    'echo "ERROR: failed to push state for ${{ matrix.environment }} after 5 attempts" >&2',
+    'exit 1',
+)
+
 # The revision a recorded credential allocation is bound to, which lets the
 # retry of a failed apply keep the slots it already wrote. It must be the
 # triggering merge: the applied head moves when the failed attempt pushes its
@@ -487,8 +732,8 @@ def admin_jwt_binding_violations(workflow: str, text: str) -> list[str]:
 def admin_api_jwt_bindings(workflow: str) -> tuple[str, ...]:
     """The signing-key bindings that satisfy one admin-API workflow.
 
-    Monitoring may authenticate with the viewer key (or, until step 2 of #440,
-    the admin key); every other admin-API workflow needs the admin key.
+    Monitoring must authenticate with the viewer key; every other admin-API
+    workflow needs the admin key.
     """
     if workflow == MONITORING_WORKFLOW:
         return MONITORING_JWT_SECRET_BINDINGS
@@ -840,25 +1085,6 @@ def monitoring_workflow_violations(text: str) -> list[str]:
             "cannot be reported as in sync"
         )
     return violations
-
-
-def monitoring_jwt_warnings(text: str) -> list[str]:
-    """TRANSITIONAL (#440): binding both gateway keys in monitoring is a warning.
-
-    With the viewer key set, `diff` reads `GET /config/export` with it and never
-    uses the admin key, so a monitoring job holding both carries write-equivalent
-    gateway authority it does not use. Step 2 of #440 binds only the viewer key
-    in `drift-check.yml` and turns any admin-key binding there into a violation.
-    """
-    if VIEWER_JWT_SECRET_REFERENCE.search(text) and ADMIN_JWT_SECRET_REFERENCE.search(text):
-        return [
-            f"{MONITORING_WORKFLOW}: binds both {VIEWER_JWT_SECRET} and "
-            "FERRUM_ADMIN_JWT_SECRET; diff reads with the viewer key whenever it "
-            "is set, so the admin key is unused write-equivalent authority. Drop "
-            "FERRUM_ADMIN_JWT_SECRET: step 2 of #440 makes binding it in "
-            f"{MONITORING_WORKFLOW} a violation"
-        ]
-    return []
 
 
 def trusted_classifier_violations(
@@ -1859,6 +2085,15 @@ def _cut_comment(text: str) -> str:
     return (text if position < 0 else text[:position]).rstrip(" ")
 
 
+class _PlainWorkflowScalar(str):
+    """Keep plain-style provenance while preserving textual shape comparisons.
+
+    GitHub's YAML 1.2 core reader types plain null/boolean/number tokens,
+    whereas quoted and block scalars remain strings. Shell source proofs
+    must account for that conversion instead of trusting the source spelling.
+    """
+
+
 class _WorkflowReader:
     def __init__(self, text: str) -> None:
         forbidden = _FORBIDDEN_WORKFLOW_CHARACTER.search(text)
@@ -2001,7 +2236,7 @@ class _WorkflowReader:
             return value
         value = _cut_comment(text)
         self.check_plain(value)
-        return value
+        return _PlainWorkflowScalar(value)
 
     def check_plain(self, value: str) -> None:
         if (
@@ -2076,6 +2311,7 @@ class _WorkflowReader:
                     if any(mark in value for mark in "[]{}") or " #" in value:
                         self.fail("a flow sequence item must be a plain or quoted scalar")
                     self.check_plain(value)
+                    value = _PlainWorkflowScalar(value)
                     position = end
                 items.append(value)
                 position = self.skip_spaces(text, position)
@@ -2149,6 +2385,1033 @@ def workflow_action_references(document: dict) -> list[str]:
         value if isinstance(value, str) else repr(value)
         for value in _values_for_key(document, "uses")
     ]
+
+
+def _shell_arithmetic_end(script: str, position: int) -> int | None:
+    """End of a balanced, expansion-free arithmetic subset, or no proof.
+
+    Grouping parentheses belong to arithmetic, never to the surrounding
+    command substitution. Quotes, escapes, nested expansions and other
+    unsupported grammar require retaining the rest of the script instead of
+    guessing where arithmetic ends (or whether Bash treats it as arithmetic).
+    """
+    depth = 0
+    cursor = position + 3  # The caller has recognized '$(('.
+    while cursor < len(script):
+        character = script[cursor]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            if depth:
+                depth -= 1
+            elif script.startswith("))", cursor):
+                return cursor + 2
+            else:
+                return None
+        elif not re.fullmatch(r"[A-Za-z0-9_ \t\n+*/%<>=!&|^~-]", character):
+            return None
+        cursor += 1
+    return None
+
+
+def _shell_operation_lines(script: str) -> tuple[str, ...]:
+    """Remove only proven Bash comments, keeping lexical state across lines.
+
+    A physical # line can start inside a quoted word and close it before an
+    active command. Quotes in an actual comment cannot change lexical state.
+    Command substitutions have their own quote context. For unsupported
+    here-documents, backticks, complex parameter expansions and unsupported
+    arithmetic, retain the remaining text conservatively; it cannot satisfy a
+    pinned producer shape by hiding active lines. This is a scan projection,
+    not a Bash interpreter.
+    """
+    frames = [{"quote": "", "depth": 0, "word_start": True}]
+    out: list[str] = []
+    position = 0
+    while position < len(script):
+        frame = frames[-1]
+        quote = frame["quote"]
+        character = script[position]
+        expression = WORKFLOW_EXPRESSION.match(script, position)
+        if expression:
+            # Shape checks inspect the original expressions; rendered scans
+            # inspect the substitutions. Expression-literal quotes are not Bash.
+            out.append(expression.group())
+            frame["word_start"] = False
+            position = expression.end()
+            continue
+        if character == "\\" and quote != "'":
+            following = script[position + 1:position + 2]
+            if quote != '"' or following in ('$', '`', '"', '\\', '\n'):
+                out.append(script[position:position + 2])
+                if following != "\n":
+                    frame["word_start"] = False
+                position += 2
+                continue
+        if quote in ("'", "$'"):
+            if character == "'":
+                frame["quote"] = ""
+        elif character == '"':
+            frame["quote"] = "" if quote else '"'
+            frame["word_start"] = False
+        elif not quote and script.startswith("<<<", position):
+            out.append("<<<")
+            frame["word_start"] = True
+            position += 3
+            continue
+        elif character == "`" or (
+            not quote and script.startswith("<<", position)
+            and not script.startswith("<<<", position)
+        ):
+            out.append(script[position:])
+            break
+        elif script.startswith("${", position):
+            end = script.find("}", position + 2)
+            body = script[position + 2:end] if end >= 0 else ""
+            if end < 0 or any(mark in body for mark in ("'", '"', "`", "\\", "$", "\n")):
+                out.append(script[position:])
+                break
+            out.append(script[position:end + 1])
+            frame["word_start"] = False
+            position = end + 1
+            continue
+        elif script.startswith("$((", position):
+            end = _shell_arithmetic_end(script, position)
+            if end is None:
+                out.append(script[position:])
+                break
+            out.append(script[position:end])
+            frame["word_start"] = False
+            position = end
+            continue
+        elif script.startswith("$(", position):
+            out.append("$(")
+            frame["word_start"] = False
+            frames.append({"quote": "", "depth": 1, "word_start": True})
+            position += 2
+            continue
+        elif not quote:
+            if (
+                frame["depth"] and frame["word_start"]
+                and script.startswith("case", position)
+                and (position + 4 == len(script) or script[position + 4].isspace())
+            ) or (character in "?*+@!" and script[position + 1:position + 2] == "("):
+                # case pattern ')' and extglob tokens need a grammar parser;
+                # do not mistake them for command-substitution boundaries.
+                out.append(script[position:])
+                break
+            if script.startswith("$'", position):
+                out.append("$'")
+                frame["quote"] = "$'"
+                frame["word_start"] = False
+                position += 2
+                continue
+            if character == "'":
+                frame["quote"] = "'"
+                frame["word_start"] = False
+            elif character == "#" and frame["word_start"]:
+                end = script.find("\n", position)
+                end = len(script) if end < 0 else end
+                comment = script[position:end]
+                if "${{" in comment:
+                    out.append(comment)  # GitHub renders before Bash sees comments.
+                position = end
+                continue
+            elif character in " \t\n;|&<>()":
+                if frame["depth"] and character == "(":
+                    frame["depth"] += 1
+                elif frame["depth"] and character == ")":
+                    frame["depth"] -= 1
+                    if not frame["depth"]:
+                        frames.pop()
+                frame["word_start"] = True
+            else:
+                frame["word_start"] = False
+        out.append(character)
+        position += 1
+    lines = [
+        line.lstrip(" \t") if line.rstrip(" \t").endswith("\\") else line.strip(" \t")
+        for line in "".join(out).split("\n")
+    ]
+    # A blank after a continuation terminates it; trailing whitespace after a
+    # backslash means it was never a continuation. Do not change either into
+    # a join when these lines are reused by scans and exact producer proofs.
+    return tuple(
+        line for index, line in enumerate(lines)
+        if line or (index and lines[index - 1].endswith("\\"))
+    )
+
+
+def _literal_env_scope(node: dict):
+    scopes = [value for key, value in node.items() if key.casefold() == "env"]
+    return scopes[0] if len(scopes) == 1 else ({} if not scopes else None)
+
+
+_SHELL_SAFE_LITERAL = re.compile(r"[A-Za-z0-9_./:@%+,= -]*")
+_NAMED_RUN_VALUE = re.compile(
+    r"(?:github|matrix|needs|steps|runner|env|vars|inputs|secrets)"
+    r"(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)+", re.IGNORECASE
+)
+_RUN_RENDER_LIMIT = 128
+
+
+_PLAIN_WORKFLOW_NUMBER = re.compile(
+    r"(?:[-+]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?"
+    r"|0x[0-9a-fA-F]+|0o[0-7]+|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))"
+)
+
+
+def _shell_literal_values(value) -> tuple[str, ...] | None:
+    """GitHub scalar-to-string conversion, refusing unmodeled number spelling.
+
+    Numeric YAML tokens become doubles and are reformatted by GitHub. Do not
+    substitute their source spelling or a guessed numeric witness in a string
+    that could assemble a protected identifier or command. Quote them to use
+    their literal text. Null and booleans have exact documented conversions.
+    """
+    if value is None:
+        return ("",)
+    if isinstance(value, bool):
+        return ("true" if value else "false",)
+    if not isinstance(value, str):
+        return None
+    if isinstance(value, _PlainWorkflowScalar):
+        if value in ("null", "Null", "NULL", "~"):
+            return ("",)
+        if value in ("true", "True", "TRUE", "false", "False", "FALSE"):
+            return (value.casefold(),)
+        if _PLAIN_WORKFLOW_NUMBER.fullmatch(value):
+            return None
+    return (str(value),) if _SHELL_SAFE_LITERAL.fullmatch(value) else None
+
+
+def _shell_scan_text(script: str) -> str:
+    """Join actual continuations; keep every other physical token boundary."""
+    return script.replace("\\\r\n", "").replace("\\\n", "").translate(
+        str.maketrans("", "", "'\"\\")
+    )
+
+
+def _static_env_value(body: str, context: tuple) -> tuple[str, ...] | None:
+    scopes, runtime_names = context[:2]
+    alias = re.fullmatch(r"env\s*\.\s*([A-Za-z_][A-Za-z0-9_-]*)", body, re.IGNORECASE)
+    if not alias:
+        return None
+    name = alias.group(1).casefold()
+    for index in range(len(scopes) - 1, -1, -1):
+        scope = scopes[index]
+        if not isinstance(scope, dict):
+            return None
+        values = [value for key, value in scope.items() if key.casefold() == name]
+        if not values:
+            continue
+        if index < 2 and (runtime_names is None or name in runtime_names):
+            return None
+        return _shell_literal_values(values[0]) if len(values) == 1 else None
+    return None
+
+
+def _named_run_values(body: str, context: tuple) -> tuple[str, ...] | None:
+    if not _NAMED_RUN_VALUE.fullmatch(body):
+        return None
+    name = re.sub(r"\s+", "", body).casefold()
+    if name.startswith("env."):
+        return _static_env_value(body, context)
+    values = context[2] if len(context) > 2 else {}
+    if name in values:
+        return values[name]
+    parts = name.split(".")
+    # GitHub exposes only completed, preceding steps. A not-yet-run or
+    # nonexistent step has no outputs (property dereference renders empty).
+    # A preceding unknown producer is explicitly marked, and fails closed.
+    if len(parts) == 4 and parts[0] == "steps" and parts[2] == "outputs":
+        producer = "steps." + parts[1]
+        if producer not in values or values[producer] == ():
+            return ("",)
+    return None
+
+
+def _render_run_expressions(script: str, context: tuple) -> tuple[tuple[str, ...], list[str]]:
+    """Prove all substitutions before Bash gets to interpret its comments.
+
+    Literal matrices are overapproximated across every axis/include value,
+    so every possible rendered string is scanned, including combinations of
+    different aliases. Unbounded or computed sources never become shell text.
+    """
+    rendered: list[tuple[str, dict[str, str]]] = [("", {})]
+    invalid: list[str] = []
+    offset = 0
+    resolved: dict[str, tuple[str, ...] | None] = {}
+    for match in WORKFLOW_EXPRESSION.finditer(script):
+        body = match.group(1).strip()
+        name = re.sub(r"\s+", "", body).casefold()
+        if name not in resolved:
+            resolved[name] = _named_run_values(body, context)
+        values = resolved[name]
+        repeated = name in rendered[0][1]
+        if values is None or (not repeated and len(rendered) * len(values) > _RUN_RENDER_LIMIT):
+            invalid.append(body)
+            values = (match.group(0),)
+        prefix = script[offset:match.start()]
+        rendered = [
+            (part + prefix + value, {**bindings, name: value})
+            for part, bindings in rendered
+            for value in ((bindings[name],) if repeated else values)
+        ]
+        offset = match.end()
+    return tuple(part + script[offset:] for part, _ in rendered), invalid
+
+
+def _expand_static_run_env(script: str, context: tuple) -> tuple[str, list[str]]:
+    """Single-valued projection used by the static-env proof's callers."""
+    rendered, invalid = _render_run_expressions(script, context)
+    return rendered[0], invalid
+
+
+def _platform_run_values() -> dict[str, tuple[str, ...]]:
+    # Decimal IDs and full hex object IDs cannot supply shell separators or
+    # letters completing any guarded identifier/command. These witnesses are
+    # for those alphabets, not a claimed literal value for the triggering run.
+    # Actor/ref/workflow/event strings, vars, inputs and secrets are unbounded
+    # text; named dot notation alone is no proof of their contents.
+    values = {
+        "github." + name: ("0",)
+        for name in ("run_id", "run_number", "run_attempt", "repository_id", "repository_owner_id")
+    }
+    values["github.sha"] = ("0" * 40,)
+    values["runner.os"] = ("Linux", "Windows", "macOS")
+    values["runner.arch"] = ("X86", "X64", "ARM", "ARM64")
+    values["runner.debug"] = ("", "1")
+    return values
+
+
+def _one_case_value(mapping, name: str):
+    if not isinstance(mapping, dict):
+        return None
+    found = [value for key, value in mapping.items() if key.casefold() == name.casefold()]
+    return found[0] if len(found) == 1 else None
+
+
+def _source_step(job: dict, step_id: str):
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return None
+    found = [
+        step for step in steps
+        if isinstance(step, dict) and isinstance(step.get("id"), str)
+        and step["id"].casefold() == step_id.casefold()
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def _has_run_shape(step, shape: tuple[str, ...], environment: dict) -> bool:
+    return (
+        isinstance(step, dict) and isinstance(step.get("run"), str)
+        and _shell_operation_lines(step["run"]) == shape
+        and _literal_env_scope(step) == environment
+        and not any(key in step for key in ("uses", "shell", "working-directory"))
+    )
+
+
+def _standard_run_defaults(document: dict, job: dict) -> bool:
+    return not any(key.casefold() == "defaults" for node in (document, job) for key in node)
+
+
+def _step_output_values(workflow: str, job_name: str, step: dict, context: tuple) -> dict:
+    """Only complete producer shapes can prove an output's rendered contents."""
+    metadata_env = {
+        "GH_TOKEN": "${{ github.token }}",
+        "REPO": "${{ github.repository }}",
+        "EVENT_HEAD_REPO": "${{ github.event.workflow_run.head_repository.full_name }}",
+        "EVENT_HEAD_SHA": "${{ github.event.workflow_run.head_sha }}",
+        "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+        "RUN_ID": "${{ github.event.workflow_run.id }}",
+        "RUN_ATTEMPT": "${{ github.event.workflow_run.run_attempt }}",
+        "EXPECTED_WORKFLOW_PATH": ".github/workflows/validate-pr.yml",
+    }
+    if (
+        workflow == ".github/workflows/trusted-pr-review.yml" and job_name == "prepare"
+        and step.get("id") == "metadata"
+        and _has_run_shape(step, REVIEW_METADATA_RUN, metadata_env)
+    ):
+        # EVENT_HEAD_SHA has a whole-string hex guard before either output
+        # path. trusted_sha is a git object ID, never PR/event-supplied text.
+        return {"head_sha": ("", "0" * 40), "trusted_sha": ("", "0" * 40)}
+    script = step.get("run")
+    if not isinstance(script, str) or any(
+        key in step for key in ("uses", "shell", "working-directory")
+    ):
+        return {}
+    scripts, invalid = _render_run_expressions(script, context)
+    if invalid:
+        return {}
+    outputs: dict[str, tuple[str, ...]] = {}
+    for rendered in scripts:
+        current: dict[str, str] = {}
+        for line in _shell_operation_lines(rendered):
+            if line == "set -euo pipefail":
+                continue
+            match = re.fullmatch(
+                r'''echo (["'])([A-Za-z_][A-Za-z0-9_-]*)=([A-Za-z0-9_./:@%+,= -]*)\1 >> "\$GITHUB_OUTPUT"''',
+                line,
+            )
+            if not match:
+                return {}
+            current[match.group(2).casefold()] = match.group(3)
+        for name, value in current.items():
+            outputs[name] = tuple(dict.fromkeys((*outputs.get(name, ("",)), value)))
+    return outputs
+
+
+def _matrix_run_values(job: dict, sources: dict) -> dict:
+    """Literal axes/includes and simple aliases to already-proven job sources."""
+    matrix = _one_case_value(_one_case_value(job, "strategy"), "matrix")
+    if not isinstance(matrix, dict):
+        return {}
+    values: dict[str, tuple[str, ...] | None] = {}
+    has_include = False
+
+    def collect(node, path: str) -> dict:
+        if isinstance(node, dict):
+            result = {path: None}  # A composite value is not a simple scalar alias.
+            names = [name.casefold() for name in node]
+            for name, value in node.items():
+                child = path + "." + name.casefold()
+                if names.count(name.casefold()) != 1:
+                    result[child] = None
+                else:
+                    result.update(collect(value, child))
+            return result
+        elif isinstance(node, list):
+            alternatives = [collect(item, path) for item in node]
+            result = {}
+            for name in set().union(*(set(item) for item in alternatives)):
+                choices = [item.get(name, ("",)) for item in alternatives]
+                result[name] = (
+                    None if any(item is None for item in choices) else
+                    tuple(dict.fromkeys(value for item in choices for value in item))
+                )
+            return result or {path: None}
+        else:
+            choices = _shell_literal_values(node)
+            if isinstance(node, str) and (alias := WORKFLOW_EXPRESSION.fullmatch(node.strip())):
+                choices = _named_run_values(alias.group(1).strip(), ((), None, sources))
+            return {path: choices}
+
+    if len({name.casefold() for name in matrix}) != len(matrix):
+        return {}
+    for name, node in matrix.items():
+        if name.casefold() == "exclude":
+            continue  # Exclusion only removes combinations from the proof set.
+        if name.casefold() == "include":
+            if not isinstance(node, list) or not all(isinstance(item, dict) for item in node):
+                return {}  # A computed include can override any axis.
+            has_include = bool(node)
+            for item in node:
+                for path, choices in collect(item, "matrix").items():
+                    previous = values.get(path, ())
+                    values[path] = (
+                        tuple(dict.fromkeys((*previous, *choices)))
+                        if previous is not None and choices is not None else None
+                    )
+        else:
+            for path, choices in collect(node, "matrix." + name.casefold()).items():
+                previous = values.get(path, ())
+                values[path] = (
+                    tuple(dict.fromkeys((*previous, *choices)))
+                    if previous is not None and choices is not None else None
+                )
+    if has_include:
+        # An added include-only combination may omit any other property.
+        values = {
+            name: tuple(dict.fromkeys(("", *choices))) if choices is not None else None
+            for name, choices in values.items()
+        }
+    return values
+
+
+def _credential_handoff_allowed(workflow: str, step: dict, context: tuple) -> bool:
+    scopes, runtime_names = context[:2]
+    drivers = {"runner_temp", "github_run_id", "github_job"}
+    return (
+        workflow == ".github/workflows/apply-on-merge.yml"
+        and step.get("name") == BUNDLE_LOADER_STEP and step.get("id") == "load-bundles"
+        and runtime_names is not None
+        and len(context) > 4 and context[4]
+        and _has_run_shape(step, CREDENTIAL_HANDOFF_RUN, {
+            BUNDLE_SECRET_PREFIX + ("_" + str(index) if index else ""):
+                "${{ secrets." + BUNDLE_SECRET_PREFIX + ("_" + str(index) if index else "") + " }}"
+            for index in range(16)
+        })
+        and all(
+            isinstance(scope, dict) and not drivers.intersection(key.casefold() for key in scope)
+            for scope in scopes
+        )
+    )
+
+
+def _run_env_contexts(workflow: str, document: dict) -> dict[int, tuple]:
+    """Proven sources and workflow < job < step env-file precedence.
+
+    This fences visible workflow declarations, not arbitrary behavior inside
+    invoked programs/actions. A complete, pinned producer is a source proof;
+    a candidate-chosen step ID or dot-property spelling is never one.
+    """
+    contexts: dict[int, tuple] = {}
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return contexts
+    completed: dict[str, dict] = {}
+    visiting: set[str] = set()
+
+    def job_outputs(job_name: str) -> dict:
+        if job_name in completed:
+            return completed[job_name]
+        if job_name in visiting:
+            return {}
+        visiting.add(job_name)
+        job = _one_case_value(jobs, job_name)
+        if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+            visiting.remove(job_name)
+            return {}
+        standard_run = _standard_run_defaults(document, job)
+        sources = _platform_run_values()
+        needs = job.get("needs", [])
+        if isinstance(needs, str):
+            needs = [needs]
+        for dependency in needs if isinstance(needs, list) else []:
+            if not isinstance(dependency, str):
+                continue
+            for name, choices in job_outputs(dependency.casefold()).items():
+                sources[f"needs.{dependency.casefold()}.outputs.{name}"] = choices
+            sources[f"needs.{dependency.casefold()}.result"] = (
+                "success", "failure", "cancelled", "skipped",
+            )
+        sources.update(_matrix_run_values(job, sources))
+        # Environment names are unbounded ASCII components. Admit them only
+        # in the complete shipped consumer, where each interpolation is a
+        # quoted path suffix or message and cannot form a command/channel.
+        # The enumerator's CLI validates every name before emitting its JSON.
+        list_job = _one_case_value(jobs, "list-envs")
+        list_step = _source_step(list_job, "list") if isinstance(list_job, dict) else None
+        matrix = _one_case_value(_one_case_value(job, "strategy"), "matrix")
+        axis = "environment" if job_name == "apply" else "scope"
+        list_output = "envs" if job_name == "apply" else "promotions"
+        pinned_matrix = (
+            workflow == ".github/workflows/apply-on-merge.yml"
+            and job_name in ("apply", "promote")
+            and _has_run_shape(list_step, APPLY_ENVIRONMENT_LIST_RUN, {})
+            and _standard_run_defaults(document, list_job)
+            and _one_case_value(list_job.get("outputs"), list_output)
+                == "${{ steps.list.outputs." + list_output + " }}"
+            and matrix == {axis: "${{ fromJson(needs.list-envs.outputs." + list_output + ") }}"}
+            and "list-envs" in needs
+        )
+        runtime_names: frozenset[str] | None = frozenset()
+        for step in job["steps"]:
+            if not isinstance(step, dict):
+                continue
+            scopes = tuple(_literal_env_scope(node) for node in (document, job, step))
+            step_sources = dict(sources)
+            script = step.get("run")
+            if (
+                pinned_matrix and standard_run and isinstance(script, str)
+                and _has_run_shape(step, tuple(
+                    line.replace("${{ matrix.environment }}", PROBE_RUNTIME_ENVIRONMENTS[job_name])
+                    for line in APPLY_STATE_COMMIT_RUN
+                ), {
+                    "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+                    "STATE_WRITER_TOKEN": "${{ steps.state-writer.outputs.token }}",
+                })
+            ):
+                name = "matrix.environment" if job_name == "apply" else "matrix.scope.environment"
+                step_sources[name] = ("environment",)
+            context = (scopes, runtime_names, step_sources, False, standard_run)
+            context = (*context[:3], _credential_handoff_allowed(workflow, step, context), standard_run)
+            contexts[id(step)] = context
+            step_id = step.get("id")
+            if isinstance(step_id, str):
+                prefix = "steps." + step_id.casefold()
+                sources[prefix] = None  # Unknown producer, including an action.
+                sources[prefix + ".outcome"] = ("success", "failure", "cancelled", "skipped")
+                sources[prefix + ".conclusion"] = sources[prefix + ".outcome"]
+                if standard_run and _source_step(job, step_id) is step:
+                    outputs = _step_output_values(workflow, job_name, step, context)
+                    for name, choices in outputs.items():
+                        sources[prefix + ".outputs." + name] = choices
+            if not isinstance(script, str):
+                continue
+            scripts, invalid = _render_run_expressions(script, context)
+            if invalid:
+                runtime_names = None  # Unknown rendered text could write any inherited binding.
+                continue
+            channel = re.compile(r"\bGITHUB_ENV\b|\bgithub\s*\.\s*env\b", re.IGNORECASE)
+            if not any(
+                channel.search(content) or channel.search(_shell_scan_text(content))
+                for rendered in scripts
+                for content in ("\n".join(_shell_operation_lines(rendered)),)
+            ):
+                continue
+            if context[3]:
+                runtime_names = runtime_names | {"ferrum_creds_json_file"}
+            else:
+                runtime_names = None
+        outputs = {}
+        declared = job.get("outputs")
+        if isinstance(declared, dict):
+            for name, value in declared.items():
+                if _one_case_value(declared, name) != value:
+                    continue
+                alias = WORKFLOW_EXPRESSION.fullmatch(value.strip()) if isinstance(value, str) else None
+                outputs[name.casefold()] = (
+                    _named_run_values(alias.group(1).strip(), ((), None, sources))
+                    if alias else _shell_literal_values(value)
+                )
+        visiting.remove(job_name)
+        completed[job_name] = outputs
+        return outputs
+
+    for job_name in jobs:
+        job_outputs(job_name.casefold())
+    return contexts
+
+
+def github_context_access_violations(workflow: str, document: dict) -> list[str]:
+    """Protected workflows may not compute or alias GitHub file channels."""
+    violations: list[str] = []
+    named_github = re.compile(r"\bgithub\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*", re.IGNORECASE)
+    indexed_github = re.compile(
+        r"\bgithub(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)*\s*\[", re.IGNORECASE
+    )
+    file_context = re.compile(r"\bgithub\s*\.\s*(?:env|path|output)\b", re.IGNORECASE)
+    run_contexts = _run_env_contexts(workflow, document)
+
+    def visit(node, path: str, key: str = "", context: tuple = ((), None)) -> None:
+        if isinstance(node, dict):
+            for child_key, value in node.items():
+                visit(value, f"{path}.{child_key}", child_key, run_contexts.get(id(node), ((), None)))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                visit(value, f"{path}[{index}]", key, context)
+        elif isinstance(node, str):
+            # Inspect the original decoded scalar before removing any shell
+            # comments or joining lines: an expression in a # line can emit a
+            # newline and an active command, including a computed file write.
+            bodies = [match.group(1) for match in WORKFLOW_EXPRESSION.finditer(node)]
+            if "${{" in WORKFLOW_EXPRESSION.sub("", node):
+                violations.append(
+                    f"{workflow}: {path}: unrecognized GitHub expression syntax is forbidden"
+                )
+            if key.casefold() == "run":
+                _, invalid_aliases = _render_run_expressions(node, context)
+                for alias in invalid_aliases:
+                    source = "run env alias" if re.match(r"env\b", alias, re.IGNORECASE) else "run value"
+                    violations.append(
+                        f"{workflow}: {path}: {source} {alias!r} must resolve to a "
+                        "proven shell-safe source before interpolation; "
+                        "computed or unknown shell text is forbidden"
+                    )
+            # `if:` is also an expression without explicit delimiters.
+            if key.casefold() == "if" and not bodies:
+                bodies = [node]
+            for body in bodies:
+                if (
+                    re.search(r"\bgithub\b", named_github.sub("", body), re.IGNORECASE)
+                    or indexed_github.search(body)
+                    or file_context.search(body)
+                ):
+                    violations.append(
+                        f"{workflow}: {path}: computed/indexed, whole or file-channel "
+                        "GitHub context access is forbidden; use named dot properties"
+                    )
+                if key.casefold() == "run" and not _NAMED_RUN_VALUE.fullmatch(body.strip()):
+                    violations.append(
+                        f"{workflow}: {path}: run expressions must use named dot properties; "
+                        "computed shell text is forbidden"
+                    )
+
+    visit(document, "workflow")
+    return violations
+
+
+def guarded_environment_violations(
+    workflow: str, document: dict, required_steps: tuple, protected: tuple[str, ...]
+) -> list[str]:
+    """Require step-local bindings and refuse other sources in the parsed tree.
+
+    A line in a comment, `run:` or `with:` is not an environment binding.
+    Quoted/escaped scalar values are read as GitHub reads them, and dynamic
+    environment maps are refused at every scope. The only permitted env-file
+    reference is the existing credential-file hand-off in apply's bundle
+    loader; no other reference (including an alias for a later write) is safe.
+    GitHub context references must use named dot properties. Indexed or whole
+    context access is unsupported and fails closed, since an expression can
+    compute the env/path/output file name without spelling it in the workflow.
+    This fences workflow bindings, not arbitrary behavior of invoked programs.
+    """
+    context_violations = github_context_access_violations(workflow, document)
+    run_contexts = _run_env_contexts(workflow, document)
+    violations: list[str] = []
+    allowed: dict[int, dict] = {}
+    jobs = document.get("jobs")
+    for job_name, step_name, bindings in required_steps:
+        job = jobs.get(job_name) if isinstance(jobs, dict) else None
+        steps = job.get("steps") if isinstance(job, dict) else None
+        found = (
+            [step for step in steps if isinstance(step, dict) and step.get("name") == step_name]
+            if isinstance(steps, list) else []
+        )
+        label = f"{workflow}: job {job_name!r}, step {step_name!r}"
+        if len(found) != 1:
+            violations.append(f"{label} must exist exactly once with protected env bindings")
+            continue
+        environment = found[0].get("env")
+        if not isinstance(environment, dict):
+            violations.append(f"{label} must have a literal env mapping")
+            continue
+        allowed[id(environment)] = bindings
+        for variable, expected in bindings.items():
+            if environment.get(variable) != expected:
+                violations.append(f"{label} must bind exactly {variable}: {expected}")
+
+    protected_names = {name.casefold() for name in protected}
+    protected_reference = re.compile(
+        r"\b(?:" + "|".join(re.escape(name) for name in protected) + r")\b",
+        re.IGNORECASE,
+    )
+    env_file_reference = re.compile(
+        r"\bGITHUB_(?:ENV|PATH)\b|\bgithub\s*\.\s*(?:env|path|output)\b",
+        re.IGNORECASE,
+    )
+    file_destination = re.compile(r"\bGITHUB_(?:ENV|PATH|OUTPUT)\b", re.IGNORECASE)
+
+    def check_scalar(
+        value: str, key: str, label: str, step_name: str | None, context: tuple = ((), None)
+    ) -> None:
+        # Expand proven literals before removing comments. Keep the original
+        # references too, and judge pinned script shapes against original lines.
+        if key.casefold() == "run":
+            rendered, _ = _render_run_expressions(value, context)
+            lines = list(_shell_operation_lines(value))
+            contents = ("\n".join(lines), *(
+                "\n".join(_shell_operation_lines(script)) for script in rendered
+            ))
+        else:
+            lines = [line.strip() for line in value.splitlines()]
+            contents = ("\n".join(lines),)
+        verify_read_allowed = (
+            workflow == ".github/workflows/apply-on-merge.yml"
+            and step_name == "Verify traffic"
+            and key == "run"
+            and tuple(lines) == PROBE_VERIFY_RUN
+        )
+        protected_contents = (
+            tuple(part.replace("FERRUM_ENV", "") for part in contents)
+            if verify_read_allowed else contents
+        )
+        if any(
+            protected_reference.search(part)
+            or protected_reference.search(_shell_scan_text(part))
+            for part in protected_contents
+        ):
+            violations.append(
+                f"{label}: protected variable references/rebinding outside step env are forbidden"
+            )
+        handoff_allowed = (
+            workflow == ".github/workflows/apply-on-merge.yml"
+            and step_name == BUNDLE_LOADER_STEP
+            and key == "run"
+            and tuple(lines) == CREDENTIAL_HANDOFF_RUN
+            and len(context) > 3 and context[3]
+        )
+        if any(
+            env_file_reference.search(part)
+            or env_file_reference.search(_shell_scan_text(part))
+            for part in contents
+        ) and not handoff_allowed:
+            violations.append(
+                f"{label}: GITHUB_ENV/GITHUB_PATH or GitHub file-context references/writes "
+                "outside the credential hand-off are forbidden"
+            )
+
+    def visit(node, path: str, step_name: str | None = None) -> None:
+        if isinstance(node, list):
+            for index, item in enumerate(node):
+                visit(item, f"{path}[{index}]", step_name)
+            return
+        if isinstance(node, str):
+            check_scalar(node, "", f"{workflow}: {path}", step_name)
+            return
+        if not isinstance(node, dict):
+            return
+        if "run" in node or "uses" in node:
+            step_name = node.get("name")
+        for key, value in node.items():
+            label = f"{workflow}: {path}.{key}"
+            permitted = allowed.get(id(node), {})
+            if key.casefold() in protected_names and key not in permitted:
+                violations.append(
+                    f"{label}: protected variable may only be bound in its required step env"
+                )
+            if key.casefold() == "env" and not isinstance(value, dict):
+                violations.append(f"{label}: dynamic env sources are forbidden")
+            if key.casefold() in ("bash_env", "env") and path.casefold().endswith(".env"):
+                violations.append(f"{label}: shell startup env sources are forbidden")
+            if isinstance(value, str) and key not in permitted:
+                check_scalar(value, key, label, step_name, run_contexts.get(id(node), ((), None)))
+            if file_destination.search(key):
+                violations.append(f"{label}: rebinding a GitHub file destination is forbidden")
+            if isinstance(value, (dict, list)):
+                visit(value, f"{path}.{key}", step_name)
+
+    visit(document, "workflow")
+    return violations + context_violations
+
+
+def _workflow_condition(value) -> str | None:
+    """Compare a pinned expression with optional delimiters and whitespace."""
+    if not isinstance(value, str):
+        return None
+    expression = EXPRESSION.fullmatch(value.strip())
+    body = expression.group(1) if expression else value
+    return re.sub(
+        r"'(?:[^']|'')*'|\s+",
+        lambda match: match.group(0) if match.group(0).startswith("'") else "",
+        body,
+    )
+
+
+def _read_only_gitforgeops_arguments(arguments: list[str]) -> bool:
+    """Classify the subcommand and its flags, never later diagnostic words."""
+    global_flags = {"--no-color", "--allow-empty-namespace", "--allow-credential-slot-remap"}
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token in global_flags or re.fullmatch(r"-v+", token):
+            index += 1
+        elif token == "--env" and index + 1 < len(arguments):
+            index += 2
+        elif token.startswith("--env="):
+            index += 1
+        else:
+            break
+    if index == len(arguments):
+        return True  # No subcommand: Clap prints usage without dispatching a write.
+    command = arguments[index]
+    if command in ("--version", "-V", "--help", "-h"):
+        return index + 1 == len(arguments)
+    formats = {
+        "envs": ("json", "text"), "version": ("json", "text"),
+        "validate": ("text", "json", "github", "github-annotations"),
+        "plan": ("text", "json"), "diff": ("text", "json"),
+        "doctor": ("text", "json"), "verify": ("text", "json"),
+    }
+    if command not in formats:
+        return False
+    flags = {
+        "envs": {"--include-scopes"},
+        "diff": {"--exit-on-drift", "--accept-unverified-secrets"},
+    }.get(command, set())
+    index += 1
+    while index < len(arguments):
+        token = arguments[index]
+        if token in flags or token in global_flags or re.fullmatch(r"-v+", token):
+            index += 1
+            continue
+        name, separator, value = token.partition("=")
+        if not separator:
+            if index + 1 >= len(arguments):
+                return False
+            value = arguments[index + 1]
+        if name == "--format":
+            accepted = value in formats[command]
+        elif name == "--env":
+            accepted = bool(value)
+        elif name == "--fingerprint-baseline" and command == "diff":
+            accepted = bool(value)
+        elif command == "doctor" and name in ("--scope", "--repo", "--state-writer-app-id"):
+            accepted = (
+                value in ("local", "github", "gateway", "all") if name == "--scope" else bool(value)
+            )
+        else:
+            return False
+        if not accepted:
+            return False
+        index += 1 if separator else 2
+    return True
+
+
+def _has_unguarded_gitforgeops_write(script: str) -> bool:
+    active = "\n".join(_shell_operation_lines(script))
+    command = re.compile(r"\bgitforgeops\b[\"']*(?:[ \t]+|(?=\$|`|\\))")
+    for content in (active, _shell_scan_text(active)):
+        for match in command.finditer(content):
+            # Keep shell command boundaries, particularly physical newlines.
+            # Scan every invocation, so a read-only call cannot hide a second
+            # apply/rotate, including inside a command substitution or pipe.
+            tail = re.split(r"[\n;|&<>()]", content[match.end():], maxsplit=1)[0]
+            try:
+                arguments = shlex.split(tail, comments=True)
+            except ValueError:
+                return True  # Unsupported/ambiguous argument spelling.
+            if not _read_only_gitforgeops_arguments(arguments):
+                return True
+    return False
+
+
+def probe_validation_gate_violations(workflow: str, document: dict) -> list[str]:
+    """A successful bound Validate must precede every recognized Apply call."""
+    if workflow != ".github/workflows/apply-on-merge.yml":
+        return []
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return [f"{workflow}: bound Validate/Apply jobs must exist"]
+    allowed_mutations: set[int] = set()
+    for job_name, (expected_needs, condition) in PROBE_APPLY_JOB_GATES.items():
+        job = jobs.get(job_name)
+        label = f"{workflow}: job {job_name!r}"
+        if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
+            violations.append(f"{label}: bound Validate/Apply steps must exist")
+            continue
+        needs = job.get("needs")
+        if isinstance(needs, str):
+            needs = [needs]
+        if (
+            needs != expected_needs
+            or _workflow_condition(job.get("if")) != _workflow_condition(condition)
+        ):
+            violations.append(
+                f"{label}: Validate/Apply job flow must retain its blocking dependencies and gate"
+            )
+        if job.get("continue-on-error", "false") != "false":
+            violations.append(
+                f"{label}: Validate failure must propagate; job continue-on-error is forbidden"
+            )
+        # A default shell can swallow the exit code; a default directory can
+        # validate a different resource tree. Neither is needed by these jobs.
+        if "defaults" in document or "defaults" in job:
+            violations.append(
+                f"{label}: inherited run defaults may not change Validate/Apply execution"
+            )
+        steps = job["steps"]
+        if job.get("environment") != PROBE_RUNTIME_ENVIRONMENTS[job_name]:
+            violations.append(
+                f"{label}: GitHub Environment must match the pinned runtime FERRUM_ENV binding"
+            )
+        verifications = [
+            step for step in steps
+            if isinstance(step, dict) and step.get("name") == "Verify traffic"
+        ]
+        if len(verifications) != 1:
+            violations.append(f"{label}: exactly one Verify traffic must retain its runtime scope")
+        else:
+            verify = verifications[0]
+            script = verify.get("run")
+            if (
+                not isinstance(script, str)
+                or _shell_operation_lines(script) != PROBE_VERIFY_RUN
+                or any(key in verify for key in ("uses", "shell", "working-directory"))
+            ):
+                violations.append(
+                    f"{label}: Verify traffic must retain the pinned command and runtime scope"
+                )
+        validations = [
+            index
+            for index, step in enumerate(steps)
+            if isinstance(step, dict) and step.get("name") == "Validate"
+        ]
+        if len(validations) != 1:
+            violations.append(f"{label}: exactly one blocking Validate must precede Apply")
+            continue
+        validation_index = validations[0]
+        validation = steps[validation_index]
+        if (
+            validation.get("run") != "gitforgeops validate"
+            or any(key in validation for key in ("if", "uses", "shell", "working-directory"))
+            or validation.get("continue-on-error", "false") != "false"
+        ):
+            violations.append(
+                f"{label}: Validate must run gitforgeops validate unconditionally and propagate failure"
+            )
+        for step_name, step_condition in PROBE_APPLY_STEP_GATES.items():
+            mutations = [
+                (index, step)
+                for index, step in enumerate(steps)
+                if isinstance(step, dict) and step.get("name") == step_name
+            ]
+            if len(mutations) != 1:
+                violations.append(f"{label}: {step_name!r} must exist exactly once after Validate")
+                continue
+            index, step = mutations[0]
+            allowed_mutations.add(id(step))
+            if (
+                index <= validation_index
+                or step.get("run") != "gitforgeops apply --auto-approve"
+                or any(key in step for key in ("uses", "shell", "working-directory"))
+                or _workflow_condition(step.get("if")) != _workflow_condition(step_condition)
+            ):
+                violations.append(
+                    f"{label}: {step_name!r} must run after successful Validate with its mode gate"
+                )
+    # Added/renamed inline mutations must not escape the guarded pair. This
+    # does not attempt to judge arbitrary behavior inside invoked programs.
+    run_contexts = _run_env_contexts(workflow, document)
+    for job_name, job in jobs.items():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        for step in steps if isinstance(steps, list) else []:
+            if not isinstance(step, dict) or id(step) in allowed_mutations:
+                continue
+            script = step.get("run")
+            if not isinstance(script, str):
+                continue
+            rendered, invalid = _render_run_expressions(
+                script, run_contexts.get(id(step), ((), None))
+            )
+            if invalid:
+                violations.append(
+                    f"{workflow}: job {job_name!r}: computed or unknown shell text is forbidden"
+                )
+            # Judge rendered scripts: unresolved expressions have already
+            # failed closed, and proven expressions cannot change comments.
+            if any(_has_unguarded_gitforgeops_write(content) for content in rendered):
+                violations.append(
+                    f"{workflow}: job {job_name!r}: mutations may only run in the guarded Apply steps"
+                )
+    return violations
+
+
+def probe_consumer_binding_violations(workflow: str, document: dict) -> list[str]:
+    """The operator-held probe allowlist cannot be replaced by candidate data."""
+    if workflow not in PROBE_WORKFLOW_STEPS:
+        return []
+    protected = (PROBE_CONSUMERS_ENV, PROBE_BOUND_ENV)
+    if workflow == ".github/workflows/apply-on-merge.yml":
+        # These jobs publish the environment's complete scope. An ad-hoc
+        # namespace filter can exempt slots from Validate's authorization.
+        protected += ("FERRUM_ENV", "FERRUM_NAMESPACE")
+    return guarded_environment_violations(
+        workflow,
+        document,
+        PROBE_WORKFLOW_STEPS[workflow],
+        protected,
+    ) + probe_validation_gate_violations(workflow, document)
+
+
+def monitoring_jwt_binding_violations(workflow: str, document: dict) -> list[str]:
+    """Monitoring binds the viewer key and cannot reintroduce the admin key."""
+    if workflow != f".github/workflows/{MONITORING_WORKFLOW}":
+        return []
+    bindings = {VIEWER_JWT_SECRET: "${{ secrets.FERRUM_ADMIN_JWT_VIEWER_SECRET }}"}
+    bindings.update({
+        setting: f"${{{{ secrets.{setting} }}}}" for setting in VIEWER_JWT_OPTIONAL_SETTINGS
+    })
+    return guarded_environment_violations(
+        workflow,
+        document,
+        (("drift", "Check drift", bindings),),
+        (VIEWER_JWT_SECRET, "FERRUM_ADMIN_JWT_SECRET"),
+    )
 
 
 def policy_check_impersonation_violations(workflow: str, document: dict) -> list[str]:
@@ -2518,6 +3781,22 @@ def main(argv: list[str] | None = None) -> int:
             viewer_jwt_scope_violations(workflow.relative_to(root).as_posix(), text)
         )
         if document is not None:
+            # Apply, trusted review and drift call this through their binding
+            # guard. Cover the remaining Environment-bound workflows too.
+            if workflow.name in ("rotate.yml", "materialize-file.yml"):
+                violations.extend(
+                    github_context_access_violations(workflow.relative_to(root).as_posix(), document)
+                )
+            violations.extend(
+                probe_consumer_binding_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
+                monitoring_jwt_binding_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
             violations.extend(
                 policy_check_impersonation_violations(
                     workflow.relative_to(root).as_posix(), document
@@ -2701,7 +3980,6 @@ def main(argv: list[str] | None = None) -> int:
 
     monitoring_text = (workflows / MONITORING_WORKFLOW).read_text(encoding="utf-8")
     violations.extend(monitoring_workflow_violations(monitoring_text))
-    warnings = monitoring_jwt_warnings(monitoring_text)
 
     for state_writer_workflow in ("apply-on-merge.yml", "rotate.yml"):
         violations.extend(
@@ -3045,10 +4323,6 @@ def main(argv: list[str] | None = None) -> int:
         violations.extend(digest_allowlist_violations(allowlist_text))
     approved_digests = allowlisted_validator_digests(allowlist_text)
 
-    # Warnings name a transitional state the policy still accepts. They are
-    # GitHub annotations on stdout, so they never read as a violation line.
-    for warning in warnings:
-        print(f"::warning::{warning}")
     if violations:
         print("Supply-chain policy violations:", file=sys.stderr)
         for violation in violations:
