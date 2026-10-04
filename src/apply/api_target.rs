@@ -400,10 +400,10 @@ const CONDITIONAL_WRITE_PROBES: usize = 3;
 /// Learn, before any write, whether the gateway issues the strong `ETag`
 /// every incremental overwrite needs; `Some(refusal)` when it issues none.
 ///
-/// Every overwrite is conditional (see [`Preconditions`]), and a gateway older
-/// than Ferrum Edge v0.9.9 issues no tag, so without this it would be found
-/// only at the first overwrite, after earlier creates had landed. One read of a
-/// row the run will overwrite settles it. `targets` are `(namespace, kind, id)`;
+/// Every overwrite is conditional (see [`Preconditions`]), and a gateway that
+/// issues no tag would otherwise be found only at the first overwrite, after
+/// earlier creates had landed. One read of a row the run will overwrite settles
+/// it. `targets` are `(namespace, kind, id)`;
 /// a row gone since the plan, or a read that fails, settles nothing, so the
 /// next target is tried, and every write still checks for itself.
 async fn conditional_write_refusal(

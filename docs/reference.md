@@ -200,10 +200,14 @@ repository. See [GitHub launch controls](github-launch-controls.md).
 
 ## Environment variables
 
-Incremental API overwrites require a probed strong `ETag` and honored
-`If-Match`. Released Ferrum Edge v0.9.6 source includes this capability. Apply
-preflight and `doctor --scope gateway` probe it; a version number alone does
-not prove backup or consumer compatibility. See
+Incremental API overwrites require a strong `ETag` and a gateway that honors
+`If-Match`. The client probes only for the tag and always sends the condition;
+it does not detect a server that returns tags but ignores `If-Match`. The
+operator must qualify the exact released gateway build to establish server
+enforcement. Released Ferrum Edge v0.9.6 source includes the capability, with
+no minimum-version claim. Apply preflight and `doctor --scope gateway` check
+for a strong tag; a version number alone does not prove backup or consumer
+compatibility. See
 [Changes made during an apply](apply.md#changes-made-during-an-apply) for the
 remaining checks and exact-build lifecycle qualification.
 

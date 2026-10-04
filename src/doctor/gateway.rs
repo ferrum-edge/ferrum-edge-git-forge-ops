@@ -13,9 +13,9 @@
 //!   accepts the token. It does not prove the role: `/backup` and every write
 //!   need `admin`, which the local `admin-jwt-claims` check enforces.
 //! * `GET /namespaces`, one list page and one single-resource `GET` — does the
-//!   gateway issue the strong `ETag` incremental apply makes every overwrite
-//!   conditional on? Ferrum Edge before v0.9.9 does not, and apply refuses to
-//!   modify or delete there.
+//!   gateway issue the strong `ETag` incremental apply needs to send every
+//!   overwrite conditionally? This checks for the tag only; it does not test
+//!   whether the gateway honors `If-Match`.
 //!
 //! No mutating endpoint is reachable from here: every call is a `GET`.
 //!
@@ -240,7 +240,7 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
 /// made conditional on?
 async fn conditional_write_check(client: &AdminClient) -> Check {
     const ID: &str = "gateway-conditional-writes";
-    const TITLE: &str = "Gateway supports conditional overwrites";
+    const TITLE: &str = "Gateway issues strong entity tags";
     match client.issues_entity_tags().await {
         Ok(Some(true)) => Check::pass(
             ID,
@@ -257,9 +257,10 @@ async fn conditional_write_check(client: &AdminClient) -> Check {
             "a single-resource GET returned no strong ETag",
         )
         .remedy(
-            "Upgrade Ferrum Edge to v0.9.9 or later. Incremental apply sends every \
-             modify and delete with If-Match on the row it validated, and refuses to \
-             overwrite anything on a gateway that issues no entity-tag.",
+            "Use a gateway that issues a strong ETag for single-resource reads. Incremental \
+             apply sends every modify and delete with If-Match on the row it validated. \
+             Qualify the exact released gateway build to confirm it honors If-Match; this \
+             check tests for the tag only.",
         ),
         Ok(None) => Check::new(
             ID,

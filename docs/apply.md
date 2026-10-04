@@ -95,7 +95,8 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
   writes are withheld. See
   [Changes made during an apply](#changes-made-during-an-apply).
 - **`ConditionalWriteUnavailable`.** The gateway returned no strong `ETag` for
-  a row apply must overwrite, or did not honor `If-Match`. It stops the run.
+  a row apply must overwrite. It stops the run. The client probes for the tag
+  only; it does not detect a gateway that returns tags but ignores `If-Match`.
 - **Namespace-scoped backups** must carry an explicit, matching `namespace` on
   every row, and must not contain duplicate `(namespace, id)` rows within a
   kind. Otherwise the snapshot is rejected before diffing: `diff`, `plan` and
@@ -180,15 +181,19 @@ ownership assertion, adoption claim and ambiguous-create ownership assertion it:
 2. compares that row with the row it planned against; and
 3. sends the `PUT` or `DELETE` with `If-Match: <etag>`.
 
-Released Ferrum Edge v0.9.6 source includes this conditional-write capability
+Released Ferrum Edge v0.9.6 source includes this conditional-write capability,
+with no minimum-version claim
 ([release source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
 [Edge PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)). Apply
-requires a probed strong `ETag` and honored `If-Match`. This capability does
-not certify the rest of the gateway's backup or consumer representation for
-this client. Apply still requires explicit matching namespaces, authoritative
-ownership metadata and comparable consumer credentials; the lifecycle suite
-must pass against the exact gateway build. Pending gateway fixes to those
-representations are not implied by the v0.9.6 source.
+probes only for a strong `ETag` and always sends `If-Match`. The operator must
+qualify the exact released gateway build to establish that it honors
+`If-Match`; a server that returns tags but ignores the condition is not
+detected or automatically refused. This capability does not certify the rest
+of the gateway's backup or consumer representation for this client. Apply
+still requires explicit matching namespaces, authoritative ownership metadata
+and comparable consumer credentials; the lifecycle suite must pass against
+the exact gateway build. Pending gateway fixes to those representations are
+not implied by the v0.9.6 source.
 
 Edge compares the tag and commits the write under one namespace admission lease
 that every admin writer (CRUD, `/batch`, `/restore`, `/api-specs`, credential
@@ -229,13 +234,15 @@ Consumers are never counted that way, because their read redacts credentials;
 their refusal says the earlier attempt may have committed, and the re-run
 reconciles it.
 
-A read served from cache (`X-Data-Source: cached`), one without a strong
-`ETag`, or a gateway that does not honor `If-Match` stops the run: no write can
-be made conditional on it. The apply preflight, before any credential is
-allocated or any row written, reads one row the run will overwrite, so such a
-gateway is refused up front rather than after earlier creates landed;
-`doctor --scope gateway` reports it too. A read that fails refuses that write
-like any failed write.
+A read served from cache (`X-Data-Source: cached`) or one without a strong
+`ETag` stops the run: no write can be made conditional on it. The apply
+preflight, before any credential is allocated or any row written, reads one
+row the run will overwrite to check for a strong tag, so a missing tag is
+refused up front rather than after earlier creates landed; `doctor --scope
+gateway` checks for the tag too. Neither check verifies that the server honors
+`If-Match`; operator qualification of the exact released build must establish
+that safety requirement. A read that fails refuses that write like any failed
+write.
 
 **Consumers** take one more read. Edge redacts consumer credentials on a
 single-resource `GET`, although its tag covers them, so that read cannot show

@@ -419,21 +419,27 @@ namespace payload is built before the first mutation.
   re-read shows the desired row unowned (`CreateResource::wrote_itself`;
   never for consumers). A gone row: delete not sent (already gone), update
   refused. A cached single read is `StaleGatewayView`; a missing or weak
-  `ETag`, or a gateway that does not honor `If-Match`, is the run-stopping
-  `ConditionalWriteUnavailable`, which `preflight_api_apply`
-  (before allocation and any write) and `doctor`'s
-  `gateway-conditional-writes` check also probe for. Edge redacts consumer
+  `ETag` is the run-stopping `ConditionalWriteUnavailable`, which
+  `preflight_api_apply` (before allocation and any write) and `doctor`'s
+  `gateway-conditional-writes` check also probe for. The client always sends
+  `If-Match`, but neither check tests whether the gateway honors it. Operator
+  qualification of the exact released gateway build must establish that
+  conditional writes are honored; a server that returns tags but ignores
+  `If-Match` is not detected or automatically refused. Edge redacts consumer
   credentials on `GET /consumers/{id}` while its tag covers them, so a
   namespace's consumer targets are all read first, then one `/backup`
   (credentials) is compared to the plan: a change before a read shows in the
   backup, one after it fails `If-Match`. Only `rotate`'s consumer `PUT` and
   `/restore` stay unconditional. `plan` does not probe: it reads `/backup`
   only.
-  Conditional writes require a probed strong `ETag` and honored `If-Match`.
-  Edge's released v0.9.6 source includes this capability; it does not certify
-  the full backup/consumer wire contract. Exact-build lifecycle qualification
-  and the namespace, ownership and credential checks still apply; pending
-  gateway representation fixes are not assumed released.
+  Conditional writes require a strong `ETag` and a gateway that honors
+  `If-Match`. The client probes only for the strong `ETag` and always sends
+  `If-Match`; operator qualification of the exact released gateway build must
+  establish server enforcement. Edge's released v0.9.6 source includes the
+  capability, with no minimum-version claim; it does not certify the full
+  backup/consumer wire contract. The namespace, ownership and credential
+  checks still apply; pending gateway representation fixes are not assumed
+  released.
 - **Credentials travel only over TLS or loopback.** Every admin request is
   built through `AdminClient::authorize` / `Authorized::request`, the only
   place the bearer token is minted and attached; it refuses a target that is
