@@ -649,11 +649,12 @@ comparison; `drift`/`failed`/`not_completed` block; `skipped` does not. A matrix
 entry with no record becomes `not_completed`. The settings audit also fails when
 the newest successful `drift-check.yml` run is older than
 `--monitoring-max-age-hours` (48), so a `cron:` entry alone proves nothing.
-`drift-check.yml` still binds the admin secret and `diff` then reads `/backup`,
-so the monitoring JWT secret is gateway-write-equivalent. Binding
-`FERRUM_ADMIN_JWT_VIEWER_SECRET` there instead (see
-[Viewer-credential drift reads](#viewer-credential-drift-reads)) is a separate
-supply-chain-policy change.
+`drift-check.yml` binds only `FERRUM_ADMIN_JWT_VIEWER_SECRET` and its
+issuer/audience/TTL settings. The gateway caps that key at `viewer`, and `diff`
+uses it for `GET /config/export`; the protected supply-chain checker pins these
+step-local bindings and refuses the admin key. See
+[Viewer-credential drift reads](#viewer-credential-drift-reads) for the
+comparison limits and behavior.
 
 #### Freshness guard
 
