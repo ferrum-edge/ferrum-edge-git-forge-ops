@@ -1250,7 +1250,8 @@ impl AdminClient {
     }
 
     /// `DELETE` one resource only if its stored row still carries `etag`.
-    /// A 404 is tolerated as for [`AdminClient::delete_proxy`]; a 412 is
+    /// An empty or valid not-found 404 is tolerated as for
+    /// [`AdminClient::delete_proxy`]; a 412 is
     /// [`crate::error::Error::StalePlan`], as for
     /// [`AdminClient::update_if_match`]. A proxy is deleted without the
     /// server-side orphan cleanup, as [`AdminClient::delete_proxy`] explains.
@@ -1305,6 +1306,18 @@ impl AdminClient {
             return Err(crate::error::Error::StalePlan(message));
         }
         if resp.status == 404 {
+            // Empty and valid not-found responses mean the row is already gone.
+            // A nonempty body must not hide an ambiguous or not-live mutation.
+            if !resp.body.is_empty() {
+                let acknowledgement = ApiErrorBody::parse_mutation(&resp.body)?;
+                if acknowledgement.applied == Some(false) {
+                    return Err(conditional::withhold_error(map_api_error(
+                        resp.status,
+                        &resp.body,
+                        RequestKind::Mutation,
+                    )));
+                }
+            }
             return Ok(DeleteOutcome::NotFound);
         }
         self.check_mutation(&resp, RequestKind::Mutation).await?;
@@ -1527,7 +1540,7 @@ fn describe_redirect(base: Option<&str>, location: Option<&str>) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteOutcome {
     Deleted,
-    /// The gateway answered 404 — the resource was already gone.
+    /// The gateway answered an empty or valid not-found 404.
     NotFound,
 }
 
@@ -1838,11 +1851,12 @@ pub fn explain_config_export_refusal(
     ))
 }
 
-/// A DELETE that answers 404 already achieved its goal. The gateway cascades
-/// deletes server-side (proxy delete removes its scoped plugin configs), so a
-/// diff-driven follow-up delete legitimately finds nothing. Treating it as an
-/// error left the state entry in place and wedged every later run on the same
-/// delete.
+/// A DELETE that answers a valid not-found 404 already achieved its goal.
+/// The HTTP path validates nonempty mutation bodies before accepting that
+/// status. The gateway cascades deletes server-side (proxy delete removes its
+/// scoped plugin configs), so a diff-driven follow-up delete legitimately
+/// finds nothing. Treating it as an error left the state entry in place and
+/// wedged every later run on the same delete.
 pub fn delete_succeeded(status: u16) -> bool {
     is_success_status(status) || status == 404
 }

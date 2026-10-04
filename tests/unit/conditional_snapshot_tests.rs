@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use gitforgeops::apply::{apply_api, ApplyOptions};
 use gitforgeops::config::schema::Consumer;
 use gitforgeops::config::{ApplyStrategy, EnvConfig, GatewayConfig};
+use gitforgeops::diff::resource_diff::state_key;
 use gitforgeops::diff::OwnershipScope;
 use gitforgeops::http_client::conditional::{
     conditional_backup, require_preserved_credentials, require_publishable_credentials,
@@ -393,6 +394,108 @@ async fn valid_resource_acknowledgements_and_empty_204_deletes_remain_accepted()
 }
 
 #[tokio::test]
+async fn delete_404_acknowledgements_validate_nonempty_bodies_without_replay() {
+    use gitforgeops::error::Error;
+    use gitforgeops::http_client::DeleteOutcome;
+
+    for kind in ["Proxy", "Consumer", "Upstream", "PluginConfig"] {
+        let owner_message = match kind {
+            "PluginConfig" => "Plugin config not found".to_string(),
+            _ => format!("{kind} not found"),
+        };
+        let cases = [
+            (String::new(), true, false),
+            (json!({"error": "not found"}).to_string(), true, false),
+            (json!({"error": owner_message}).to_string(), true, false),
+            (
+                format!(r#"{{"applied":false,"applied":false,"error":"{SECRET}"}}"#),
+                false,
+                false,
+            ),
+            (
+                format!(r#"{{"applied":false,"applied":true,"error":"{SECRET}"}}"#),
+                false,
+                false,
+            ),
+            (
+                format!(r#"{{"applied":true,"applied":false,"error":"{SECRET}"}}"#),
+                false,
+                false,
+            ),
+            (
+                format!(r#"{{"error":"not found","error":"{SECRET}"}}"#),
+                false,
+                false,
+            ),
+            (
+                json!({"error": "not found", "reason": {"private": SECRET}}).to_string(),
+                false,
+                false,
+            ),
+            (
+                json!({"applied": null, "error": SECRET}).to_string(),
+                false,
+                false,
+            ),
+            (json!({"applied": SECRET}).to_string(), false, false),
+            (
+                json!({"error": {"private": SECRET}}).to_string(),
+                false,
+                false,
+            ),
+            (format!(r#"{{"error":"{SECRET}""#), false, false),
+            (format!("<html>{SECRET}</html>"), false, false),
+            ("[]".to_string(), false, false),
+            (" ".to_string(), false, false),
+            (
+                json!({"applied": false, "reason": SECRET, "error": SECRET}).to_string(),
+                false,
+                true,
+            ),
+        ];
+        for (case, (body, accepted, committed_not_live)) in cases.into_iter().enumerate() {
+            for conditional in [false, true] {
+                let response = body.clone();
+                let (client, requests) = gateway(move |_, _| (404, response.clone(), vec![]));
+                let result = if conditional {
+                    client.delete_if_match(kind, "c1", NS, ROW_TAG).await
+                } else {
+                    match kind {
+                        "Proxy" => client.delete_proxy("c1", NS).await,
+                        "Consumer" => client.delete_consumer("c1", NS).await,
+                        "Upstream" => client.delete_upstream("c1", NS).await,
+                        _ => client.delete_plugin_config("c1", NS).await,
+                    }
+                };
+                let context = format!("{kind} conditional={conditional} case={case}");
+                if accepted {
+                    assert_eq!(result.unwrap(), DeleteOutcome::NotFound, "{context}");
+                } else {
+                    let error = result.unwrap_err();
+                    if committed_not_live {
+                        assert!(matches!(error, Error::CommittedNotLive { .. }), "{context}");
+                    } else {
+                        assert!(matches!(error, Error::AmbiguousMutation(_)), "{context}");
+                    }
+                    let diagnostic = format!("{error:?} {error}");
+                    assert!(!diagnostic.contains(SECRET), "{context}");
+                    assert!(!diagnostic.contains(ROW_TAG), "{context}");
+                }
+                let seen = requests.lock().unwrap();
+                assert_eq!(seen.len(), 1, "{context}");
+                assert!(seen[0].starts_with("DELETE "), "{context}");
+                assert!(seen[0].contains(&format!("x-ferrum-namespace: {NS}\r\n")));
+                assert_eq!(
+                    seen[0].contains(&format!("if-match: {ROW_TAG}\r\n")),
+                    conditional,
+                    "{context}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn malformed_consumer_writes_never_prune_or_update_the_managed_ledger() {
     use gitforgeops::apply::AppliedOp;
     use gitforgeops::diff::resource_diff::{state_key, DiffAction};
@@ -568,7 +671,7 @@ async fn hidden_only_consumer_conflicts_refuse_modify_delete_and_pending_claim()
             _ => {
                 options
                     .pending_create_assertions
-                    .insert(format!("{NS}:Consumer:c1"));
+                    .insert(state_key(NS, "Consumer", "c1"));
             }
         }
         let result = apply_api(
@@ -925,8 +1028,7 @@ async fn malformed_batch_envelopes_never_authorize_success_fallback_or_replay() 
     for status in [201, 503, 501] {
         for body in [
             format!(r#"{{"created":{counts},"applied":false,"applied":false,"error":"{SECRET}"}}"#),
-            json!({"created": counts, "applied": false, "reason": {"private": SECRET}})
-                .to_string(),
+            json!({"created": counts, "applied": false, "reason": {"private": SECRET}}).to_string(),
             json!({"created": counts, "applied": null, "error": SECRET}).to_string(),
         ] {
             let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));
@@ -1042,8 +1144,7 @@ async fn restore_uncertain_admission_fence_and_bad_seal_responses_are_never_repl
         ),
         (
             503,
-            json!({"failure_class": "connectivity", "applied": null, "error": SECRET})
-                .to_string(),
+            json!({"failure_class": "connectivity", "applied": null, "error": SECRET}).to_string(),
         ),
         (
             200,
@@ -1259,7 +1360,7 @@ async fn exact_api_import_records_provenance_and_conditional_file_import_refuses
 fn consumer_target_selection_does_not_add_endpoint_dependencies_to_nonconsumer_work() {
     let actual = config();
     let options = ApplyOptions {
-        managed_ledger: BTreeSet::from([format!("{NS}:Consumer:c1")]),
+        managed_ledger: BTreeSet::from([state_key(NS, "Consumer", "c1")]),
         ..Default::default()
     };
     let targets = gitforgeops::apply::api_target::consumer_evidence_targets(
@@ -1267,7 +1368,7 @@ fn consumer_target_selection_does_not_add_endpoint_dependencies_to_nonconsumer_w
         &actual,
         NS,
         OwnershipScope::Shared {
-            previously_managed: &HashSet::from([format!("{NS}:Consumer:c1")]),
+            previously_managed: &HashSet::from([state_key(NS, "Consumer", "c1")]),
         },
         &options,
     )

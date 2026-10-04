@@ -1042,12 +1042,29 @@ async fn ambiguous_create_recovery_preserves_the_complete_verified_row() {
                 // normalizes. Only this documented default may compare equal.
                 read.as_object_mut().unwrap().remove("backend_scheme");
             }
-            if matches!(kind, Kind::Consumer) {
-                read["credentials"] = serde_json::json!({"keyauth": [{"key": "***"}]});
-            }
+            let verification_backup = if matches!(kind, Kind::Consumer) {
+                let namespace_tag = "\"verification-namespace\"";
+                let mut body = super::conditional_fixtures::envelope(
+                    &verified,
+                    &BackupExtras::default(),
+                    namespace_tag,
+                );
+                body["conditional"]["row_etags"]["consumers"]["r1"] = serde_json::json!(TAG);
+                (
+                    "GET /backup?conditional=true ".into(),
+                    200,
+                    body.to_string(),
+                    vec![
+                        ("ETag".into(), namespace_tag.into()),
+                        ("Cache-Control".into(), "no-store".into()),
+                    ],
+                )
+            } else {
+                backup(&verified)
+            };
             let mut routes = vec![
                 health(),
-                backup(&verified),
+                verification_backup,
                 read_route(kind, "r1", read.to_string(), &[("ETag", TAG)]),
             ];
             if per_resource {
@@ -1070,6 +1087,14 @@ async fn ambiguous_create_recovery_preserves_the_complete_verified_row() {
             assert_eq!(run.result.created, 1, "{context}");
             assert_eq!(run.result.applied_incremental.len(), 1, "{context}");
             assert_eq!(run.count("POST /batch "), 1, "{context}");
+            assert_eq!(
+                run.count(&format!("POST {} ", kind.path())),
+                usize::from(per_resource),
+                "{context}"
+            );
+            if matches!(kind, Kind::Consumer) {
+                assert_eq!(run.count("GET /backup?conditional=true "), 1, "{context}");
+            }
             let put = format!("PUT {}/r1", kind.path());
             assert_eq!(run.count(&put), 1, "{context}");
             let sent = run.request(&put);

@@ -2891,6 +2891,137 @@ async fn failed_proxy_delete_retains_its_plugin_and_ledger() {
 }
 
 #[tokio::test]
+async fn delete_404_acknowledgements_gate_plugin_pruning_ledger_and_completion() {
+    const SECRET: &str = "delete-response-private-fixture";
+
+    let cases = [
+        (String::new(), true),
+        (r#"{"error":"not found"}"#.to_string(), true),
+        (r#"{"error":"Proxy not found"}"#.to_string(), true),
+        (
+            format!(r#"{{"applied":false,"applied":false,"error":"{SECRET}"}}"#),
+            false,
+        ),
+        (
+            format!(r#"{{"applied":false,"applied":true,"error":"{SECRET}"}}"#),
+            false,
+        ),
+        (
+            serde_json::json!({"error": "not found", "reason": {"private": SECRET}}).to_string(),
+            false,
+        ),
+        (
+            serde_json::json!({"applied": null, "error": SECRET}).to_string(),
+            false,
+        ),
+        (format!(r#"{{"error":"{SECRET}""#), false),
+        (
+            serde_json::json!({"applied": false, "reason": SECRET, "error": SECRET}).to_string(),
+            false,
+        ),
+    ];
+    for (case, (body, acknowledged)) in cases.into_iter().enumerate() {
+        for shared in [false, true] {
+            let context = format!("shared={shared} case={case}");
+            let actual = scoped_plugin_desired();
+            let original_ops = [
+                gitforgeops::apply::AppliedOp {
+                    kind: "Proxy".to_string(),
+                    namespace: "team-alpha".to_string(),
+                    id: "p1".to_string(),
+                    action: DiffAction::Add,
+                },
+                gitforgeops::apply::AppliedOp {
+                    kind: "PluginConfig".to_string(),
+                    namespace: "team-alpha".to_string(),
+                    id: "pc1".to_string(),
+                    action: DiffAction::Add,
+                },
+            ];
+            let mut state = ledger_of(&original_ops, &actual);
+            state.last_applied_at = Some("2026-10-03T00:00:00Z".to_string());
+            state.last_applied_commit = Some("prior-complete-commit".to_string());
+            let original_ledger = serde_json::to_value(&state.resources).unwrap();
+            let original_stamp = (
+                state.last_applied_at.clone(),
+                state.last_applied_commit.clone(),
+            );
+            let managed = state.previously_managed_keys();
+            let ownership = if shared {
+                OwnershipScope::Shared {
+                    previously_managed: &managed,
+                }
+            } else {
+                OwnershipScope::Exclusive
+            };
+            let mut routes = vec![
+                ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+                ("DELETE /proxies/p1".into(), 404, body.clone(), vec![]),
+                (
+                    "DELETE /plugins/config/pc1".into(),
+                    204,
+                    String::new(),
+                    vec![],
+                ),
+            ];
+            routes.extend(tagged_rows(&actual));
+            let (url, requests) = spawn_recording_gateway(routes);
+            let actuals = BTreeMap::from([("team-alpha".to_string(), actual)]);
+            let desired = GatewayConfig::default();
+            let result = apply_api(
+                &desired,
+                &stub_client_with_retries(url, 3),
+                &["team-alpha".to_string()],
+                ownership,
+                Some(&actuals),
+                Some(&no_extras(&actuals)),
+                &ApplyOptions::default(),
+            )
+            .await
+            .unwrap();
+            let mut expected = vec!["DELETE /proxies/p1?cleanup_orphaned_upstream=false HTTP/1.1"];
+            if acknowledged {
+                expected.push("DELETE /plugins/config/pc1 HTTP/1.1");
+            }
+            assert_eq!(mutation_lines(&requests), expected, "{context}");
+            assert_eq!(result.deleted, if acknowledged { 2 } else { 0 }, "{context}");
+            assert_eq!(result.deletes_missing, usize::from(acknowledged), "{context}");
+            assert_eq!(result.applied_incremental.len(), result.deleted, "{context}");
+            assert!(result.adopted.is_empty(), "{context}");
+            assert!(!format!("{:?} {:?}", result.errors, result.fatal_error).contains(SECRET));
+            assert_eq!(result.fatal_error.is_none(), acknowledged, "{context}");
+            let seen = requests.lock().unwrap();
+            let deletion = seen
+                .iter()
+                .find(|request| request.starts_with("DELETE /proxies/p1"))
+                .unwrap();
+            assert!(deletion.contains("if-match: \"proxies-p1\"\r\n"));
+            assert!(deletion.contains("x-ferrum-namespace: team-alpha\r\n"));
+            drop(seen);
+            record_prune_result(&mut state, &result, &desired);
+            let succeeded = result.into_result().is_ok();
+            assert_eq!(succeeded, acknowledged, "{context}");
+            state.stamp_last_applied_if_clean(succeeded);
+            if acknowledged {
+                assert!(state.resources.is_empty(), "{context}");
+                assert_ne!(state.last_applied_at, original_stamp.0, "{context}");
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&state.resources).unwrap(),
+                    original_ledger,
+                    "{context}"
+                );
+                assert_eq!(
+                    (state.last_applied_at, state.last_applied_commit),
+                    original_stamp,
+                    "{context}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn post_plugin_confirmation_preserves_ownership_assertions_and_rejects_untrusted_views() {
     for confirmation in [
         "unowned",
@@ -4289,7 +4420,9 @@ async fn supplied_duplicate_live_rows_refuse_both_apply_strategies_before_any_re
                 "team-alpha".to_string(),
                 gitforgeops::http_client::BackupExtras::default(),
             )]);
-            let result = apply_api(
+            // Deliberately invalid raw state must reach the production duplicate
+            // guard before the local wrapper constructs conditional evidence.
+            let result = gitforgeops::apply::apply_api(
                 &GatewayConfig::default(),
                 &client,
                 &["team-alpha".to_string()],
