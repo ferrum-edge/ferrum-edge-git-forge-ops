@@ -3314,14 +3314,8 @@ impl<'a> CreateResource<'a> {
             Self::Consumer(_) => &["credentials"],
             _ => &[],
         };
-        let desired = recovery_comparison_value(
-            self.kind(),
-            without_keys(&desired, ignored),
-        );
-        let live = recovery_comparison_value(
-            self.kind(),
-            without_keys(&live.value, ignored),
-        );
+        let desired = recovery_comparison_value(self.kind(), without_keys(&desired, ignored));
+        let live = recovery_comparison_value(self.kind(), without_keys(&live.value, ignored));
         desired == live
     }
 
@@ -3348,8 +3342,16 @@ impl<'a> CreateResource<'a> {
         let key = (self.namespace(), self.id());
         match self {
             Self::Proxy(_) => live.proxies.get(&key).copied().map(CreateResource::Proxy),
-            Self::Consumer(_) => live.consumers.get(&key).copied().map(CreateResource::Consumer),
-            Self::Upstream(_) => live.upstreams.get(&key).copied().map(CreateResource::Upstream),
+            Self::Consumer(_) => live
+                .consumers
+                .get(&key)
+                .copied()
+                .map(CreateResource::Consumer),
+            Self::Upstream(_) => live
+                .upstreams
+                .get(&key)
+                .copied()
+                .map(CreateResource::Upstream),
             Self::PluginConfig(_) => live
                 .plugin_configs
                 .get(&key)

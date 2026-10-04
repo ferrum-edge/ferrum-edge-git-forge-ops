@@ -963,7 +963,10 @@ async fn ambiguous_batch_recovery_refuses_optional_fields_added_after_verificati
         let context = format!("{kind:?} nested={nested}");
         assert_eq!(run.mutations(), ["POST /batch HTTP/1.1"], "{context}");
         let read = format!("GET {}/r1 ", kind.path());
-        assert!(run.position("GET /backup ") < run.position(&read), "{context}");
+        assert!(
+            run.position("GET /backup ") < run.position(&read),
+            "{context}"
+        );
         assert_eq!(run.result.created, 0, "{context}");
         assert!(run.result.applied_incremental.is_empty(), "{context}");
         assert_eq!(run.result.errors.len(), 1, "{context}: {:?}", run.result);
@@ -1018,7 +1021,11 @@ async fn ambiguous_create_recovery_preserves_the_complete_verified_row() {
 
             let context = format!("{kind:?} per_resource={per_resource}");
             assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
-            assert!(run.result.fatal_error.is_none(), "{context}: {:?}", run.result);
+            assert!(
+                run.result.fatal_error.is_none(),
+                "{context}: {:?}",
+                run.result
+            );
             assert_eq!(run.result.created, 1, "{context}");
             assert_eq!(run.result.applied_incremental.len(), 1, "{context}");
             assert_eq!(run.count("POST /batch "), 1, "{context}");
@@ -1055,7 +1062,11 @@ async fn ambiguous_recovery_refuses_a_verification_that_dropped_nested_fields() 
 
         let run = apply_exclusive(&desired, GatewayConfig::default(), routes).await;
 
-        assert_eq!(run.count("PUT /upstreams/u1"), 0, "per_resource={per_resource}");
+        assert_eq!(
+            run.count("PUT /upstreams/u1"),
+            0,
+            "per_resource={per_resource}"
+        );
         assert_eq!(run.result.created, 0, "per_resource={per_resource}");
         assert!(run.result.applied_incremental.is_empty());
         assert!(!run.result.errors.is_empty() || run.result.fatal_error.is_some());
