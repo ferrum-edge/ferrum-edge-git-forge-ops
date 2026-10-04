@@ -10,17 +10,21 @@ gateway-less CI should still be proving them:
 """
 
 import importlib.util
+import io
 import json
 import os
 import re
 import sys
 import tempfile
 import threading
+import traceback
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from urllib.response import addinfourl
 
 
 ROOT = Path(__file__).parents[3]
@@ -40,6 +44,17 @@ sys.modules[SCENARIO_SPEC.name] = scenarios
 SCENARIO_SPEC.loader.exec_module(scenarios)
 
 SECRET = "an-actual-consumer-key-value-here"
+# Cover the known statuses and any other redirect supported by the interpreter.
+REDIRECT_CODES = tuple(
+    sorted(
+        {301, 302, 303, 307, 308}
+        | {
+            int(name.removeprefix("http_error_"))
+            for name in dir(scenarios.urllib.request.HTTPRedirectHandler)
+            if re.fullmatch(r"http_error_3\d{2}", name)
+        }
+    )
+)
 
 
 def harness(workdir: Path) -> "scenarios.Harness":
@@ -54,7 +69,7 @@ def harness(workdir: Path) -> "scenarios.Harness":
 
 
 @contextmanager
-def loopback_server(status=200, location=None, body=b"{}", etag='"live-row"'):
+def loopback_server(status=200, location=None, body=b"{}", etag='"live-row"', uri=None):
     """Record actual HTTP requests without logging any test credentials."""
     requests = []
 
@@ -70,6 +85,8 @@ def loopback_server(status=200, location=None, body=b"{}", etag='"live-row"'):
             self.send_response(code)
             if location is not None and code != 200:
                 self.send_header("Location", location)
+            if uri is not None and code != 200:
+                self.send_header("URI", uri)
             self.send_header("ETag", etag)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -106,13 +123,29 @@ class TransportTests(unittest.TestCase):
             return scenarios._admin_exchange(instance, "GET", "/probe")[0]
         return instance.request("/probe", {"Authorization": f"Bearer {SECRET}"})
 
+    def assert_failed_capture(self, instance, result_path, implementation, expected_detail):
+        lifecycle_result.save(result_path, lifecycle_result.empty_result())
+        output, errors = io.StringIO(), io.StringIO()
+        with (
+            patch.dict(scenarios.SCENARIOS, {"create-and-route": implementation}),
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            failures = scenarios.run_scenarios(instance, result_path, ["create-and-route"])
+        written = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(failures, 1)
+        self.assertNotIn(SECRET, output.getvalue() + errors.getvalue() + json.dumps(written))
+        entry = written["scenarios"]["create-and-route"]
+        self.assertEqual(entry["status"], lifecycle_result.FAILED)
+        self.assertEqual(entry["detail"], expected_detail)
+
     def assert_redirects_refused(self, same_origin):
         with tempfile.TemporaryDirectory() as directory, loopback_server() as target:
             target_url, target_requests = target
             location = "/redirected" if same_origin else f"{target_url}/redirected"
             instance = harness(Path(directory))
             with patch.dict(os.environ, {"GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN": SECRET}):
-                for code in (301, 302, 303, 307, 308):
+                for code in REDIRECT_CODES:
                     with loopback_server(code, location) as origin:
                         origin_url, origin_requests = origin
                         instance.gateway_url = origin_url
@@ -133,6 +166,118 @@ class TransportTests(unittest.TestCase):
     def test_cross_origin_redirects_never_receive_credentials(self):
         self.assert_redirects_refused(same_origin=False)
 
+    def test_malformed_redirect_headers_never_reach_a_parser_or_leak_into_capture(self):
+        targets = (
+            f"http://[{SECRET}]/",
+            f"https://[{SECRET}]/",
+            f"//[{SECRET}]/",
+            f"file:///{SECRET}",
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN": SECRET}),
+        ):
+            root = Path(directory)
+            instance = harness(root)
+            # Non-redirect 3xx statuses must also bypass redirect processing.
+            for code in (*REDIRECT_CODES, 300, 304, 399):
+                for header in ("location", "uri"):
+                    for target in targets:
+                        with loopback_server(code, **{header: target}) as origin:
+                            origin_url, requests = origin
+                            instance.gateway_url = origin_url
+                            instance.proxy_url = origin_url
+                            for entry_point in self.ENTRY_POINTS:
+                                with self.subTest(
+                                    code=code, header=header, entry_point=entry_point
+                                ):
+                                    requests.clear()
+                                    self.assertEqual(self.call(instance, entry_point), code)
+                                    self.assertEqual(len(requests), 1)
+                                    self.assertEqual(requests[0][1], "/probe")
+
+                                    def refused(current):
+                                        status = self.call(current, entry_point)
+                                        raise scenarios.ScenarioFailure(
+                                            f"redirect refused with status {status}"
+                                        )
+
+                                    requests.clear()
+                                    self.assert_failed_capture(
+                                        instance,
+                                        root / "result.json",
+                                        refused,
+                                        f"redirect refused with status {code}",
+                                    )
+                                    self.assertEqual(len(requests), 1)
+                                    self.assertEqual(requests[0][1], "/probe")
+
+    def test_https_malformed_redirects_never_start_a_second_exchange(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN": SECRET}),
+            patch.object(scenarios.urllib.request, "getproxies", return_value={}),
+        ):
+            instance = harness(Path(directory))
+            instance.gateway_url = instance.proxy_url = "https://gateway.example"
+            for code in REDIRECT_CODES:
+                for header in ("Location", "URI"):
+                    for entry_point in self.ENTRY_POINTS:
+                        with self.subTest(code=code, header=header, entry_point=entry_point):
+                            headers = Message()
+                            headers[header] = f"http://[{SECRET}]/"
+                            response = addinfourl(
+                                io.BytesIO(b"{}"), headers, "https://gateway.example/probe", code
+                            )
+                            response.msg = "redirect"
+                            with patch.object(
+                                scenarios.urllib.request.HTTPSHandler,
+                                "https_open",
+                                return_value=response,
+                            ) as exchange:
+                                self.assertEqual(self.call(instance, entry_point), code)
+                                exchange.assert_called_once()
+
+    def test_transport_and_parser_errors_withhold_backend_controlled_details(self):
+        reflected_url = f"http://[{SECRET}]/backend-controlled"
+        errors = (
+            scenarios.urllib.error.URLError(reflected_url),
+            ValueError(reflected_url),
+            OSError(reflected_url),
+            scenarios.http.client.BadStatusLine(reflected_url),
+        )
+        expected = "lifecycle HTTP exchange failed; target and backend details withheld"
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN": SECRET}),
+        ):
+            root = Path(directory)
+            instance = harness(root)
+            for error in errors:
+                for phase in ("open", "read"):
+                    for entry_point in self.ENTRY_POINTS:
+                        with self.subTest(
+                            error=type(error).__name__, phase=phase, entry_point=entry_point
+                        ):
+                            with patch.object(scenarios.urllib.request, "build_opener") as opener:
+                                if phase == "open":
+                                    opener.return_value.open.side_effect = error
+                                else:
+                                    response = opener.return_value.open.return_value
+                                    response.read.side_effect = error
+                                with self.assertRaises(scenarios.ScenarioFailure) as failure:
+                                    self.call(instance, entry_point)
+                                self.assertEqual(str(failure.exception), expected)
+                                trace = "".join(traceback.format_exception(failure.exception))
+                                self.assertNotIn(SECRET, trace)
+                                self.assertNotIn(reflected_url, trace)
+                                self.assert_failed_capture(
+                                    instance,
+                                    root / "result.json",
+                                    lambda current: self.call(current, entry_point),
+                                    expected,
+                                )
+
     def test_admin_redirects_never_forward_mutation_bodies(self):
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -142,7 +287,7 @@ class TransportTests(unittest.TestCase):
             target_url, target_requests = target
             instance = harness(Path(directory))
             body = {"credentials": {"keyauth": [{"key": SECRET}]}}
-            for code in (301, 302, 303, 307, 308):
+            for code in REDIRECT_CODES:
                 with loopback_server(code, f"{target_url}/redirected") as origin:
                     origin_url, origin_requests = origin
                     instance.gateway_url = origin_url
@@ -307,6 +452,57 @@ class TransportTests(unittest.TestCase):
 
 
 class RedactionTests(unittest.TestCase):
+    def test_the_admin_token_is_remembered_before_any_exchange(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {"GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN": SECRET}),
+        ):
+            instance = harness(Path(directory))
+            self.assertEqual(instance.redact(f"admin token {SECRET}"), "admin token [REDACTED]")
+
+    def test_a_newly_supplied_admin_token_is_redacted_independently_of_transport_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for status in (
+                lifecycle_result.PASSED,
+                lifecycle_result.SKIPPED,
+                lifecycle_result.FAILED,
+            ):
+                with self.subTest(status=status):
+                    with patch.dict(os.environ, {"GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN": ""}):
+                        instance = harness(root)
+                    result_path = root / "result.json"
+                    lifecycle_result.save(result_path, lifecycle_result.empty_result())
+
+                    def reflected(current):
+                        scenarios._admin_exchange(current, "GET", "/probe")
+                        detail = f"gateway reflected admin token {SECRET}"
+                        if status == lifecycle_result.SKIPPED:
+                            raise NotImplementedError(detail)
+                        if status == lifecycle_result.FAILED:
+                            raise RuntimeError(detail)
+                        return detail
+
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        patch.dict(os.environ, {"GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN": SECRET}),
+                        patch.object(scenarios, "_safe_exchange", return_value=(200, None, "{}")),
+                        patch.dict(scenarios.SCENARIOS, {"create-and-route": reflected}),
+                        redirect_stdout(output),
+                        redirect_stderr(errors),
+                    ):
+                        failures = scenarios.run_scenarios(
+                            instance, result_path, ["create-and-route"]
+                        )
+                    written = json.loads(result_path.read_text(encoding="utf-8"))
+                    self.assertEqual(failures, int(status == lifecycle_result.FAILED))
+                    entry = written["scenarios"]["create-and-route"]
+                    self.assertEqual(entry["status"], status)
+                    self.assertIn("[REDACTED]", entry["detail"])
+                    self.assertNotIn(
+                        SECRET, output.getvalue() + errors.getvalue() + json.dumps(written)
+                    )
+
     def test_a_remembered_secret_never_survives_capture(self):
         with tempfile.TemporaryDirectory() as directory:
             instance = harness(Path(directory))

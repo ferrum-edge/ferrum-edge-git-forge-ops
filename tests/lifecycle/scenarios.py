@@ -27,6 +27,7 @@ Run it through `run.sh`, which owns starting the gateway and the test upstream.
 from __future__ import annotations
 
 import argparse
+import http.client
 import ipaddress
 import json
 import os
@@ -56,11 +57,17 @@ class ScenarioFailure(AssertionError):
     """A scenario's assertion did not hold."""
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Returning None makes urllib expose the original 3xx as an HTTPError.
-        # Never spend an admin token or consumer key on a redirected request.
-        return None
+class _NoRedirect(urllib.request.HTTPErrorProcessor):
+    def http_response(self, request, response):
+        # The redirect handler parses Location/URI before redirect_request.
+        # Keep every 3xx out of that handler, including malformed targets that
+        # could reflect credentials in a parser exception. Return the original
+        # status, headers and body without making another request.
+        if 300 <= response.code < 400:
+            return response
+        return super().http_response(request, response)
+
+    https_response = http_response
 
 
 def _credential_target(target: str) -> str:
@@ -106,16 +113,23 @@ def _safe_exchange(
     # A proxy would turn literal-loopback cleartext into a remote credential
     # transmission. Use a fresh opener rather than urlopen's global opener.
     proxies = {} if urllib.parse.urlsplit(target).scheme == "http" else None
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), _NoRedirect())
-    data = json.dumps(body).encode() if body is not None else None
-    request = urllib.request.Request(target, data=data, method=method, headers=headers or {})
     try:
-        response = opener.open(request, timeout=10)
-    except urllib.error.HTTPError as error:
-        response = error
-    with response:
-        text = response.read().decode("utf-8", "replace")
-        return response.code, response.headers.get("ETag"), text
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), _NoRedirect())
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(target, data=data, method=method, headers=headers or {})
+        try:
+            response = opener.open(request, timeout=10)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            text = response.read().decode("utf-8", "replace")
+            return response.code, response.headers.get("ETag"), text
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+        # Transport/parser errors can contain backend-controlled URLs or bytes.
+        # Never expose their text or exception chain to scenario diagnostics.
+        raise ScenarioFailure(
+            "lifecycle HTTP exchange failed; target and backend details withheld"
+        ) from None
 
 
 class Harness:
@@ -146,6 +160,7 @@ class Harness:
         # Every secret this run has seen, for `redact`. Populated as
         # credentials are allocated; never written to disk.
         self._secrets: set[str] = set()
+        self.remember_secret(os.environ.get("GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN", ""))
 
     # -- redaction ---------------------------------------------------------
 
@@ -208,11 +223,8 @@ class Harness:
 
     def request(self, path: str, headers: dict[str, str] | None = None) -> int:
         """A client request through the DATA plane."""
-        try:
-            status, _, _ = _safe_exchange(f"{self.proxy_url}{path}", headers=headers)
-            return status
-        except urllib.error.URLError as error:
-            raise ScenarioFailure(f"{path} was unreachable: {error.reason}") from error
+        status, _, _ = _safe_exchange(f"{self.proxy_url}{path}", headers=headers)
+        return status
 
     def expect_status(self, path: str, status: int, headers=None, attempts: int = 10):
         """Poll until the route answers as expected, or fail with what it said.
@@ -709,6 +721,8 @@ def _admin_exchange(
     findings, so it asserts nothing itself. `if_match` is sent verbatim.
     """
     token = os.environ["GITFORGEOPS_LIFECYCLE_ADMIN_TOKEN"]
+    # Register the token actually supplied, including one changed since init.
+    harness.remember_secret(token)
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -783,12 +797,13 @@ def run_scenarios(harness: Harness, result_path: Path, only: list[str]) -> int:
         except NotImplementedError as reason:
             status, detail = lifecycle_result.SKIPPED, str(reason)
         except ScenarioFailure as error:
-            status, detail = lifecycle_result.FAILED, harness.redact(str(error))
+            status, detail = lifecycle_result.FAILED, str(error)
             failures += 1
         except Exception as error:  # noqa: BLE001 - a crash is a failed scenario
             status = lifecycle_result.FAILED
-            detail = harness.redact(f"{type(error).__name__}: {error}")
+            detail = f"{type(error).__name__}: {error}"
             failures += 1
+        detail = harness.redact(detail)
         print(f"{status:<8} {identifier}: {detail.splitlines()[0] if detail else ''}")
         if status == lifecycle_result.FAILED:
             print(textwrap.indent(detail, "         "))
