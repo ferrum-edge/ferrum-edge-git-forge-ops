@@ -33,6 +33,9 @@ jobs:
     # Naming the repository is the check that actually means upstream.
     if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops' || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
     runs-on: ubuntu-24.04
+    # Fifteen minutes for PR checks, then the existing twenty-minute lifecycle
+    # wait and artifact verification. Individual API calls share the PR budget.
+    timeout-minutes: 45
     permissions:
       contents: read
       checks: read
@@ -42,6 +45,7 @@ jobs:
       actions: read
     steps:
       - name: Verify the published commit passed every required check
+        timeout-minutes: 16
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -52,32 +56,86 @@ jobs:
           pulls_file=$(mktemp)
           checks_file=$(mktemp)
           all_checks_file=$(mktemp)
-          trap 'rm -f "$pulls_file" "$checks_file" "$all_checks_file"' EXIT
+          checks_error_file=$(mktemp)
+          all_checks_error_file=$(mktemp)
+          association_file=$(mktemp)
+          pr_file=$(mktemp)
+          rules_file=$(mktemp)
+          runs_file=$(mktemp)
+          trap 'rm -f "$pulls_file" "$checks_file" "$all_checks_file" "$checks_error_file" "$all_checks_error_file" "$association_file" "$pr_file" "$rules_file" "$runs_file"' EXIT
+
+          deadline=$(( $(date +%s) + 900 ))
+          remaining_budget() {
+            local remaining
+            remaining=$((deadline - $(date +%s)))
+            [ "$remaining" -gt 0 ] || {
+              echo "::error::Timed out waiting for same-head release checks (900 seconds)." >&2
+              return 1
+            }
+            echo "$remaining"
+          }
 
           pr=
           for attempt in 1 2 3 4 5; do
-            if gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls?per_page=100" \
-              --paginate --slurp > "$pulls_file" &&
-              pr=$(jq -er --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" '
-                if type != "array" or any(.[]; type != "array") then
+            timeout --kill-after=5s "$(remaining_budget)s" \
+              gh api "repos/${REPO}/commits/${RELEASE_SHA}/pulls?per_page=100" \
+              --paginate --slurp > "$pulls_file" || {
+              echo "::error::Release merge association could not be read."
+              exit 1
+            }
+            jq -e -s --arg sha "$RELEASE_SHA" --arg branch "$DEFAULT_BRANCH" --arg repo "$REPO" '
+                def positive_integer: type == "number" and . > 0 and . == floor;
+                if length != 1 or (.[0] | type) != "array" or (.[0] | length) == 0 then
                   error("invalid commit-to-PR response")
                 else
-                  ([
+                  .[0]
+                  | if any(.[]; type != "array") or any(.[][]; type != "object") then
+                      error("invalid commit-to-PR pages")
+                    else . end
+                  | if any(.[][];
+                      (.number | positive_integer | not) or (.id | positive_integer | not) or
+                      (.state != "open" and .state != "closed") or
+                      (.base.ref | type) != "string" or (.base.repo.full_name | type) != "string" or
+                      (.head.sha | type) != "string" or
+                      (.merged_at != null and (.merged_at | type) != "string")
+                    ) then error("invalid commit-to-PR record") else . end
+                  | ([.[][]]) as $associated
+                  | if ($associated | group_by(.number) | any(.[]; (unique | length) != 1)) then
+                      error("conflicting commit-to-PR identities") else . end
+                  | ([
                     .[][]
                     | select(
                         .state == "closed" and
                         .base.ref == $branch and
-                        (.merged_at | type) == "string" and
-                        (.number | type) == "number"
+                        (.merged_at | type) == "string"
                       )
                   ] | unique_by(.number)) as $candidates
                   | ([$candidates[] | select(.merge_commit_sha == $sha)]) as $exact
                   | (if ($exact | length) > 0 then $exact else $candidates end)
-                  | if length == 1 then .[0].number
+                  | if length == 0 then
+                      if ($associated | length) == 0 then null
+                      else error("invalid merged default-branch association") end
+                    elif length == 1 then
+                      .[0]
+                      | if (.number | positive_integer) and (.id | positive_integer) and
+                          .base.repo.full_name == $repo and
+                          (.head.sha | type) == "string" and
+                          (.head.sha | test("^[0-9a-f]{40}$")) and
+                          (.merge_commit_sha | type) == "string" and
+                          (.merge_commit_sha | test("^[0-9a-f]{40}$"))
+                        then {number, id, merged_at, merge_commit_sha, head_sha: .head.sha}
+                        else error("invalid merged PR identity") end
                     else error("release commit must map to exactly one merged PR")
                     end
                 end
-              ' "$pulls_file"); then
+              ' "$pulls_file" > "$association_file" || {
+              # jq's false/null result means no association yet. Parse errors,
+              # ambiguous associations and malformed identities never retry.
+              status=$?
+              [ "$status" -eq 1 ] || exit 1
+            }
+            if [ "$(cat "$association_file")" != null ]; then
+              pr=$(jq -er '.number' "$association_file")
               break
             fi
             pr=
@@ -89,62 +147,223 @@ jobs:
             exit 1
           }
 
-          status=0
-          gh pr checks "$pr" --repo "$REPO" --required \
-            --json bucket,name,workflow > "$checks_file" || status=$?
-          [ "$status" -eq 0 ] || {
-            echo "::error::Required checks for merged PR #${pr} are not all passing."
-            cat "$checks_file"
-            exit 1
+          expected_head=$(jq -er '.head_sha' "$association_file")
+          verify_pr_identity() {
+            timeout --kill-after=5s "$(remaining_budget)s" \
+              gh api "repos/${REPO}/pulls/${pr}" > "$pr_file" || return 1
+            jq -e -s --slurpfile association "$association_file" \
+              --arg branch "$DEFAULT_BRANCH" --arg repo "$REPO" '
+              length == 1 and (.[0] | type) == "object" and
+              (.[0] | .id == $association[0].id and
+                .number == $association[0].number and .state == "closed" and .merged == true and
+                .merged_at == $association[0].merged_at and
+                .merge_commit_sha == $association[0].merge_commit_sha and
+                .head.sha == $association[0].head_sha and
+                .base.ref == $branch and .base.repo.full_name == $repo)
+            ' "$pr_file" >/dev/null
           }
 
-          # `accepted` lists checks that are being added to the ruleset: absent
-          # is tolerated while the ruleset does not require them yet, but a
-          # reported one must pass (GHSA-x5m2-4555-q4cr, expand step).
-          # Fetch all checks separately: --required hides transitional results.
-          # JSON mode reports outcomes in buckets, so a failed lookup is fatal
-          # while an unrelated optional failure is left to the jq filter.
-          if ! gh pr checks "$pr" --repo "$REPO" \
-            --json bucket,name,workflow > "$all_checks_file"; then
-            echo "::error::All checks for merged PR #${pr} could not be read."
-            exit 1
-          fi
-
-          jq -e -s --argjson required '[
-            "Rust CI / rust-ci-check",
-            "Security / security-cargo-audit",
-            "Security / security-supply-chain-policy",
-            "GitForgeOps State Guard / state-guard-reject-state-edits",
-            "GitForgeOps PR Static Validation / gitforgeops-required-static-validation"
-          ]' --argjson accepted '[
-            "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy"
-          ]' --slurpfile all_checks "$all_checks_file" '
-            def check_contexts:
-              if type != "array" then error("invalid checks response") else . end
-              | if any(.[]; type != "object") then error("invalid check record") else . end
-              | if any(.[];
-                  (.name | type) != "string" or
-                  (.bucket | type) != "string" or
-                  (.workflow != null and (.workflow | type) != "string")
-                ) then error("invalid check fields") else . end
-              | map({
-                  context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
-                  bucket
-                });
-            if length != 1 or ($all_checks | length) != 1 then
-              error("expected one response per checks lookup")
+          branch_path=$(jq -nr --arg branch "$DEFAULT_BRANCH" '$branch | @uri')
+          classify_check_lookup() {
+            local status=$1 output=$2 errors=$3 mode=$4 head_branch diagnostic
+            [ "$status" -ne 0 ] || return 0
+            # gh errors before exporting JSON for an empty rollup. Accept only
+            # that diagnostic; validate same-head evidence before waiting.
+            head_branch=$(jq -er '.head.ref | select(type == "string" and length > 0)' "$pr_file") || return 1
+            diagnostic=$(cat "$errors")
+            if [ "$status" -eq 1 ] && [ ! -s "$output" ]; then
+              if [ "$diagnostic" = "no checks reported on the '${head_branch}' branch" ]; then
+                echo all
+              elif [ "$mode" = required ] && [ "$diagnostic" = "no required checks reported on the '${head_branch}' branch" ]; then
+                echo required
+              else
+                cat "$errors" >&2
+                return 1
+              fi
+              echo '[]' > "$output"
             else
-              (.[0] | check_contexts) as $checks
-              | ($all_checks[0] | check_contexts) as $reported
-              | all($checks[]; .bucket == "pass")
-              and ($required | all(. as $wanted | any($checks[]; .context == $wanted and .bucket == "pass")))
-              and ($accepted | all(. as $wanted | all($reported[] | select(.context == $wanted); .bucket == "pass")))
-            end
-          ' "$checks_file" >/dev/null || {
-            echo "::error::The merged PR lacks successful launch-required checks or has an unsuccessful transitional check or invalid check response."
-            cat "$checks_file" "$all_checks_file"
-            exit 1
+              cat "$errors" >&2
+              return 1
+            fi
           }
+          while :; do
+            verify_pr_identity || {
+              echo "::error::Merged PR #${pr} changed identity, head or default-branch association."
+              exit 1
+            }
+            # Read the effective rules each time: an accepted context cannot
+            # pass by absence after the ruleset makes it required. Preserve the
+            # ruleset's App binding when checking the immutable head below.
+            timeout --kill-after=5s "$(remaining_budget)s" \
+              gh api "repos/${REPO}/rules/branches/${branch_path}?per_page=100" \
+              --paginate --slurp > "$rules_file" || {
+              echo "::error::Required-check settings could not be read."
+              exit 1
+            }
+            status=0
+            timeout --kill-after=5s "$(remaining_budget)s" \
+              gh pr checks "$pr" --repo "$REPO" --required \
+              --json bucket,name,workflow > "$checks_file" 2> "$checks_error_file" || status=$?
+            required_missing=$(classify_check_lookup "$status" "$checks_file" "$checks_error_file" required) || {
+              echo "::error::Required checks for merged PR #${pr} could not be read."
+              cat "$checks_file"
+              exit 1
+            }
+
+            # --required hides transitional results. Inspect the full rollup
+            # too; every error other than verified absence fails closed.
+            status=0
+            timeout --kill-after=5s "$(remaining_budget)s" \
+              gh pr checks "$pr" --repo "$REPO" \
+              --json bucket,name,workflow > "$all_checks_file" 2> "$all_checks_error_file" || status=$?
+            all_missing=$(classify_check_lookup "$status" "$all_checks_file" "$all_checks_error_file" all) || {
+              echo "::error::All checks for merged PR #${pr} could not be read."
+              exit 1
+            }
+
+            # gh deduplicates by startedAt: a queued retry can disappear behind
+            # an older success. Read every run on the expected head and select
+            # the newest check-run ID per source-bound context instead.
+            timeout --kill-after=5s "$(remaining_budget)s" \
+              gh api "repos/${REPO}/commits/${expected_head}/check-runs?per_page=100&filter=all" \
+              --paginate --slurp > "$runs_file" || {
+              echo "::error::Same-head check-run evidence could not be read."
+              exit 1
+            }
+
+            verdict=$(jq -e -r -s --argjson required '[
+              "Rust CI / rust-ci-check",
+              "Security / security-cargo-audit",
+              "Security / security-supply-chain-policy",
+              "GitForgeOps State Guard / state-guard-reject-state-edits",
+              "GitForgeOps PR Static Validation / gitforgeops-required-static-validation"
+            ]' --argjson accepted '[
+              "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy"
+            ]' --slurpfile all_checks "$all_checks_file" \
+              --slurpfile rules "$rules_file" --slurpfile runs "$runs_file" --arg head "$expected_head" \
+              --arg required_missing "$required_missing" --arg all_missing "$all_missing" '
+              def positive_integer: type == "number" and . > 0 and . == floor;
+              def check_contexts:
+                if type != "array" then error("invalid checks response") else . end
+                | if any(.[]; type != "object") then error("invalid check record") else . end
+                | if any(.[];
+                    (.name | type) != "string" or
+                    .name == "" or
+                    (.bucket | type) != "string" or
+                    (.bucket != "pass" and .bucket != "pending" and .bucket != "fail" and
+                      .bucket != "cancel" and .bucket != "skipping") or
+                    (.workflow != null and (.workflow | type) != "string")
+                  ) then error("invalid check fields") else . end
+                | map({
+                    context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
+                    name, bucket
+                  });
+              if length != 1 or ($all_checks | length) != 1 or
+                  ($rules | length) != 1 or ($rules[0] | type) != "array" or
+                  ($rules[0] | length) == 0 or
+                  ($runs | length) != 1 or ($runs[0] | type) != "array" or ($runs[0] | length) == 0 then
+                error("expected one response per checks lookup")
+              else
+                (.[0] | check_contexts) as $checks
+                | ($all_checks[0] | check_contexts) as $reported
+                | ($rules[0] | map(
+                    if type != "array" then error("invalid rules page") else .[] end
+                    | if type != "object" or (.type | type) != "string" then
+                      error("invalid rule record")
+                    elif .type == "required_status_checks" then
+                      .parameters.required_status_checks
+                      | if type != "array" then error("invalid required-check settings") else . end
+                      | .[]
+                      | if (.context | type) != "string" or .context == "" or
+                          (.integration_id | positive_integer | not) then
+                          error("required checks must be source-bound")
+                        else {name: .context, app: .integration_id} end
+                    else empty end
+                  ) | unique) as $settings
+                | ($required + $accepted | map(split(" / ")[-1])) as $launch_names
+                | if ($required | any(. as $context |
+                    ($settings | map(select(.name == ($context | split(" / ")[-1]) and .app == 15368)) | length) != 1)) or
+                    ($settings | any(. as $setting |
+                      ($launch_names | index($setting.name)) != null and $setting.app != 15368)) then
+                    error("launch-required checks must retain their GitHub Actions source binding")
+                  else . end
+                | ($settings + ($accepted | map({name: split(" / ")[-1], app: 15368})) | unique) as $watched
+                | ($required + ($accepted | map(select(. as $context |
+                    any($settings[]; .name == ($context | split(" / ")[-1])))))) as $required_contexts
+                | if any($checks[]; . as $check | all($settings[]; .name != $check.name)) then
+                    error("required check has no source-bound rule") else . end
+                | ($runs[0] | map(
+                    if type != "object" or (.check_runs | type) != "array" or
+                        (.total_count | type) != "number" or .total_count < 0 or
+                        .total_count != (.total_count | floor) then
+                      error("invalid check-run page")
+                    else .check_runs[] end
+                    | if type != "object" or (.id | positive_integer | not) or
+                        (.name | type) != "string" or .name == "" or .head_sha != $head or
+                        (.app.id | positive_integer | not) or
+                        (.status != "queued" and .status != "in_progress" and .status != "completed" and
+                          .status != "pending" and .status != "waiting" and .status != "requested") or
+                        (if .status == "completed" then
+                          .conclusion as $conclusion
+                          | ["success", "failure", "cancelled", "timed_out", "action_required", "neutral", "skipped", "stale", "startup_failure"]
+                          | index($conclusion) != null
+                          else .conclusion == null end | not)
+                      then error("invalid or wrong-head check run") else . end
+                  )) as $history
+                # Pagination can race a new retry even when both CLI samples
+                # pass. Every page must agree on the total, and distinct IDs
+                # must account for it before selecting any newest result.
+                | ($runs[0] | map(.total_count) | unique) as $counts
+                | ($history | group_by(.id)) as $identities
+                | if ($counts | length) != 1 then
+                    error("inconsistent check-run page counts")
+                  elif ($identities | any(.[]; (unique | length) != 1)) then
+                    error("conflicting check-run identities")
+                  elif ($identities | any(.[]; length != 1)) then
+                    error("duplicate check-run identities")
+                  elif ($identities | length) != $counts[0] then
+                    error("incomplete check-run evidence")
+                  else . end
+                | ($watched | map(. as $setting |
+                    ($history | map(select(.name == $setting.name and .app.id == $setting.app))
+                      | if length == 0 then null else max_by(.id) end) as $latest
+                    | {name, app, latest: $latest}
+                  )) as $latest
+                | ($checks + ($reported | map(select(.context as $context | ($required + $accepted | index($context)) != null)))) as $guarded
+                # Runs may arrive after an empty CLI sample. They still cannot
+                # authorize it: an empty lookup must be sampled again.
+                | if any($guarded[]; .bucket != "pass" and .bucket != "pending") or
+                    any($latest[]; .latest != null and .latest.status == "completed" and .latest.conclusion != "success") then
+                    error("required or transitional check failed, was cancelled or skipped")
+                  elif $required_missing != "" or $all_missing != "" or
+                    any($checks[]; .bucket == "pending") or
+                    ($required_contexts | any(. as $wanted | all($checks[]; .context != $wanted))) or
+                    any($guarded[]; .bucket == "pending") or
+                    any($latest[]; (. as $check | ($settings | any(.name == $check.name and .app == $check.app))) and .latest == null) or
+                    any($latest[]; .latest != null and .latest.status != "completed") then
+                    "wait"
+                  else "pass" end
+              end
+            ' "$checks_file") || {
+              echo "::error::The merged PR lacks successful launch-required checks or has an unsuccessful transitional check or invalid check response."
+              cat "$checks_file" "$all_checks_file"
+              exit 1
+            }
+            # Both gh lookups follow a mutable PR number; bracket them with the
+            # identity from the commit association, including the final pass.
+            verify_pr_identity || {
+              echo "::error::Merged PR #${pr} changed while its checks were sampled."
+              exit 1
+            }
+            remaining=$(remaining_budget) || exit 1
+            if [ "$verdict" = pass ]; then
+              echo "Merged PR #${pr} has successful source-bound checks on ${expected_head}."
+              break
+            fi
+            echo "Required or transitional checks are pending or missing on ${expected_head}; waiting (${remaining}s left)."
+            if [ "$remaining" -gt 15 ]; then remaining=15; fi
+            sleep "$remaining"
+          done
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
