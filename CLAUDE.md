@@ -418,8 +418,11 @@ namespace payload is built before the first mutation.
 - **Credentials travel only over TLS or loopback.** Every admin request is
   built through `AdminClient::authorize` / `Authorized::request`, the only
   place the bearer token is minted and attached; it refuses a target that is
-  not `https://` or `http://` to a loopback host (`credential_transport_allowed`),
-  and client construction refuses such a gateway URL up front.
+  not `https://` or `http://` to a literal loopback IP (`credential_target`),
+  and client construction refuses such a gateway URL up front. Requests retain
+  the parsed URL that passed the check. HTTPS clients also enforce HTTPS in
+  reqwest; plaintext loopback clients bypass environment proxies. Hostnames,
+  including `localhost`, cannot qualify for plaintext.
 - A `GET /health` preflight runs before the first mutation, so a read-only
   plane fails once instead of N times.
 - A sticky `X-Data-Source: cached` on any `/backup` blocks **all** mutations:
@@ -1633,7 +1636,7 @@ credentials. Booleans accept `true|false|1|0`.
 | `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set by environment-bound workflow steps; makes an unset allowlist a refusal instead of "not visible". |
 | `FERRUM_VERIFY_PROBE_CONSUMERS` | unset | Operator allowlist of probe Consumers (`<ns>/<consumer-id>`, comma-separated); a GitHub Environment variable in CI. Unset: `verify` refuses every slot-sending check. See [Traffic verification](#traffic-verification-srcverify). |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Dev only. TLS stays on but any certificate is accepted. |
-| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://` at load; the admin client still sends its token over `http://` only to a loopback host (`AdminClient::authorize`). |
+| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://` at load; the admin client still sends its token over `http://` only to a literal loopback IP (`AdminClient::authorize`). |
 | `FERRUM_GATEWAY_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | unset | Base64-encoded PEM. mTLS needs both cert and key. |
 | `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS handshake cap. |
 | `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | End-to-end cap; raise for large `/backup` or slow `/restore`. |

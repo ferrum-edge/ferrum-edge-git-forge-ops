@@ -48,7 +48,7 @@ const READ_ONLY_MODES: [&str; 4] = ["file", "dp", "mesh", "node_agent"];
 /// share connection pooling, TLS configuration, JWT auth, and retry behavior.
 pub struct AdminClient {
     client: Client,
-    gateway_url: String,
+    gateway_url: url::Url,
     jwt_secret: String,
     jwt_options: JwtOptions,
     max_retries: u32,
@@ -67,19 +67,11 @@ impl AdminClient {
     /// for every namespace. [`AdminClient::new_scoped`] is the only public
     /// door, so a new call site has to say what it is allowed to touch.
     ///
-    /// Transport security is already settled by the time this runs:
-    /// [`crate::config::env::validate_gateway_transport`] has proved
-    /// `env.gateway_url` is `https://` (or a deliberately opted-in local
-    /// `http://`), carries no embedded credentials, and — under
-    /// `GITHUB_ACTIONS` — that no insecure opt-in is aimed at a non-loopback
-    /// host. Every request method below therefore inherits an HTTPS-by-policy
-    /// base URL, which is what makes the admin JWT and the resolved consumer
-    /// credentials in these bodies safe to send.
+    /// Transport construction enforces HTTPS, or plaintext to a literal
+    /// loopback IP without a proxy, even when `env` was constructed directly
+    /// rather than through [`crate::config::env::validate_gateway_transport`].
     fn new(env: &EnvConfig) -> crate::error::Result<Self> {
-        let gateway_url = env
-            .gateway_url
-            .clone()
-            .ok_or(crate::error::Error::NoGatewayUrl)?;
+        let (client, gateway_url) = Self::build_transport(env)?;
         let jwt_secret = env
             .admin_jwt_secret
             .clone()
@@ -91,7 +83,14 @@ impl AdminClient {
                 jwt_secret.len()
             )));
         }
-        Self::with_signing_secret(env, gateway_url, jwt_secret)
+        Ok(Self {
+            client,
+            gateway_url,
+            jwt_secret,
+            jwt_options: JwtOptions::from_env(env),
+            max_retries: env.gateway_max_retries,
+            saw_cached_backup: AtomicBool::new(false),
+        })
     }
 
     /// Build a read-only client whose tokens are signed with
@@ -113,23 +112,30 @@ impl AdminClient {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let gateway_url = env
-            .gateway_url
-            .clone()
-            .ok_or(crate::error::Error::NoGatewayUrl)?;
+        let (transport, gateway_url) = Self::build_transport(env)?;
         let viewer_secret = check_viewer_secret(env)?.to_string();
-        let mut client = Self::with_signing_secret(env, gateway_url, viewer_secret)?;
+        let mut client = Self {
+            client: transport,
+            gateway_url,
+            jwt_secret: viewer_secret,
+            jwt_options: JwtOptions::from_env(env),
+            max_retries: env.gateway_max_retries,
+            saw_cached_backup: AtomicBool::new(false),
+        };
         client.jwt_options.role = crate::config_export::VIEWER_ROLE.to_string();
         client.set_namespace_scope(namespaces);
         Ok(client)
     }
 
-    /// Shared transport construction for both credential tiers.
-    fn with_signing_secret(
-        env: &EnvConfig,
-        gateway_url: String,
-        jwt_secret: String,
-    ) -> crate::error::Result<Self> {
+    /// Build transport independently of the signing key. HTTPS clients also
+    /// reject plaintext at send time; the loopback exception bypasses proxies
+    /// so an environment proxy cannot forward credentials to a remote host.
+    fn build_transport(env: &EnvConfig) -> crate::error::Result<(Client, url::Url)> {
+        let gateway_url = env
+            .gateway_url
+            .as_deref()
+            .ok_or(crate::error::Error::NoGatewayUrl)?;
+        let parsed = credential_target(gateway_url)?;
         // Timeouts prevent CI from hanging indefinitely when the gateway is
         // unreachable or slow. Defaults: connect 10s, total request 60s.
         // `/backup` on large configs or `/restore` on slow commits may need
@@ -141,6 +147,12 @@ impl AdminClient {
             // can rewrite POST to GET, while following a 307/308 can replay a
             // destructive body against a different authority or path.
             .redirect(reqwest::redirect::Policy::none());
+
+        if parsed.scheme() == "https" {
+            builder = builder.https_only(true);
+        } else {
+            builder = builder.no_proxy();
+        }
 
         // Dev-only, and gated well before here: `FERRUM_TLS_NO_VERIFY` warns
         // loudly on every run and is refused under `GITHUB_ACTIONS` for any
@@ -202,21 +214,7 @@ impl AdminClient {
             }
         };
 
-        // Refuse up front what every request would refuse anyway (see
-        // `AdminClient::authorize`), so a command fails once, before any call.
-        let parsed = url::Url::parse(&gateway_url).map_err(|_| unusable_gateway_url())?;
-        if !credential_transport_allowed(&parsed) {
-            return Err(cleartext_credential_refused());
-        }
-
-        Ok(Self {
-            client,
-            gateway_url: gateway_url.trim_end_matches('/').to_string(),
-            jwt_secret,
-            jwt_options: JwtOptions::from_env(env),
-            max_retries: env.gateway_max_retries,
-            saw_cached_backup: AtomicBool::new(false),
-        })
+        Ok((client, parsed))
     }
 
     /// Build a client whose JWTs are scoped to the exact namespaces the
@@ -261,7 +259,9 @@ impl AdminClient {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("{}{}", self.gateway_url, path)
+        let mut target = self.gateway_url.as_str().trim_end_matches('/').to_string();
+        target.push_str(path);
+        target
     }
 
     /// [`AdminClient::authorize`] for a path under the gateway URL.
@@ -272,19 +272,16 @@ impl AdminClient {
     /// The only way to build a request that carries the admin bearer token.
     ///
     /// The token is minted, and attached, only after `url` is shown to be
-    /// `https://`, or cleartext `http://` to a loopback host
-    /// ([`credential_transport_allowed`]). Every admin call builds its request
+    /// `https://`, or cleartext `http://` to a literal loopback IP
+    /// ([`credential_target`]). Every admin call builds its request
     /// through the returned [`Authorized`], so no call can send the token to a
     /// remote host in cleartext, whatever was configured.
     fn authorize(&self, target: String) -> crate::error::Result<Authorized<'_>> {
-        let parsed = url::Url::parse(&target).map_err(|_| unusable_gateway_url())?;
-        if !credential_transport_allowed(&parsed) {
-            return Err(cleartext_credential_refused());
-        }
+        let parsed = credential_target(&target)?;
         let token = self.token()?;
         Ok(Authorized {
             client: &self.client,
-            url: target,
+            url: parsed,
             token,
         })
     }
@@ -1092,35 +1089,45 @@ impl AdminClient {
 /// so every request that carries the token went through that check.
 struct Authorized<'a> {
     client: &'a Client,
-    url: String,
+    url: url::Url,
     token: String,
 }
 
 impl Authorized<'_> {
     fn request(&self, method: Method) -> RequestBuilder {
         self.client
-            .request(method, self.url.as_str())
+            .request(method, self.url.clone())
             .bearer_auth(&self.token)
     }
 }
 
-/// Whether the admin bearer token, and the consumer credentials in request
-/// bodies, may be sent to `url`: over `https://` always, over cleartext
-/// `http://` only to a loopback host (`localhost`, `127.0.0.0/8`, `::1`).
+/// Parse the exact request target before attaching credentials. Retain the
+/// parsed URL through request construction rather than sending the original
+/// string after checking a separate representation. Plaintext requires a
+/// literal loopback IP (`127.0.0.0/8`, `::1`), never a resolver-controlled name.
 ///
 /// `FERRUM_ALLOW_INSECURE_HTTP=true` admits a cleartext gateway URL at
 /// configuration time; it does not extend this to a remote host.
-fn credential_transport_allowed(target: &url::Url) -> bool {
-    match target.scheme() {
+fn credential_target(target: &str) -> crate::error::Result<url::Url> {
+    let parsed = url::Url::parse(target).map_err(|_| unusable_gateway_url())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(crate::error::Error::Config(
+            "FERRUM_GATEWAY_URL must not embed credentials (value withheld)".to_string(),
+        ));
+    }
+    let allowed = match parsed.scheme() {
         "https" => true,
-        "http" => match target.host() {
-            Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        "http" => match parsed.host() {
             Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
             Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            None => false,
+            _ => false,
         },
         _ => false,
+    };
+    if !allowed {
+        return Err(cleartext_credential_refused());
     }
+    Ok(parsed)
 }
 
 fn unusable_gateway_url() -> crate::error::Error {
@@ -1133,9 +1140,9 @@ fn unusable_gateway_url() -> crate::error::Error {
 
 fn cleartext_credential_refused() -> crate::error::Error {
     crate::error::Error::Config(
-        "refusing to send the admin token over cleartext http:// to a gateway host that is not \
-         loopback; the value is an environment secret and is withheld. Use https://, or http:// \
-         only to localhost, 127.0.0.0/8 or [::1]. FERRUM_ALLOW_INSECURE_HTTP=true does not \
+        "refusing to send credentials unless the gateway uses https://, or cleartext http:// \
+         to a literal loopback IP; the value is an environment secret and is withheld. Use \
+         https://, or http:// only to 127.0.0.0/8 or [::1]. FERRUM_ALLOW_INSECURE_HTTP=true does not \
          extend cleartext to a remote host"
             .to_string(),
     )
@@ -1453,9 +1460,8 @@ impl ExportEndpoint {
     /// Accept `https://`, or plain `http://` only to a literal loopback IP
     /// address (`127.0.0.0/8` or `::1`; not a name such as `localhost`, which
     /// a resolver could point elsewhere). Embedded `user:password@` and every
-    /// other scheme are refused. This is stricter than the admin client,
-    /// whose opted-in `http://` may name any host outside GitHub Actions: a
-    /// viewer token is meant for unattended runs, so it gets no such opt-in.
+    /// other scheme are refused. The admin client enforces the same transport
+    /// rule for both credential tiers, independently of insecure opt-ins.
     pub fn from_gateway_url(gateway_url: &str) -> crate::error::Result<Self> {
         let parsed = url::Url::parse(gateway_url).map_err(invalid_gateway_url)?;
         if !parsed.username().is_empty() || parsed.password().is_some() {

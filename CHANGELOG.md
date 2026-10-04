@@ -116,12 +116,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   gateway's tags and `412` and an apply through them for every overwritten
   kind (GHSA-fh5w-5x4f-86gh).
 - The admin client sends its bearer token, and the resolved credentials in
-  request bodies, over cleartext `http://` only to a loopback host
-  (`localhost`, `127.0.0.0/8`, `::1`). Every admin request is built through one
-  guarded path that mints and attaches the token only after checking the
-  target, and the client refuses to build for a remote `http://` gateway.
-  `FERRUM_ALLOW_INSECURE_HTTP=true` no longer makes a remote cleartext gateway
-  usable.
+  request bodies, over cleartext `http://` only to a literal loopback IP
+  (`127.0.0.0/8`, `::1`), never a hostname such as `localhost`. Every admin
+  request retains the parsed, checked target through request construction,
+  and the client refuses to build for a remote `http://` gateway or embedded
+  URL credentials. HTTPS clients also enforce HTTPS at send time. Plaintext
+  loopback clients bypass environment proxies, which could otherwise forward
+  credentials to a remote host. `FERRUM_ALLOW_INSECURE_HTTP=true` no longer
+  makes a remote cleartext gateway usable (CodeQL alert #298, PR #450).
 - Traffic checks can no longer spend arbitrary credentials from the
   environment's bundle (GHSA-8mhw-ghx8-9m63). A `slot:` header in
   `.gitforgeops/smoke.yaml` must name a Consumer credential secret slot
