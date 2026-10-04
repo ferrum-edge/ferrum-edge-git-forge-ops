@@ -51,7 +51,8 @@ jobs:
           set -euo pipefail
           pulls_file=$(mktemp)
           checks_file=$(mktemp)
-          trap 'rm -f "$pulls_file" "$checks_file"' EXIT
+          all_checks_file=$(mktemp)
+          trap 'rm -f "$pulls_file" "$checks_file" "$all_checks_file"' EXIT
 
           pr=
           for attempt in 1 2 3 4 5; do
@@ -100,7 +101,16 @@ jobs:
           # `accepted` lists checks that are being added to the ruleset: absent
           # is tolerated while the ruleset does not require them yet, but a
           # reported one must pass (GHSA-x5m2-4555-q4cr, expand step).
-          jq -e --argjson required '[
+          # Fetch all checks separately: --required hides transitional results.
+          # JSON mode reports outcomes in buckets, so a failed lookup is fatal
+          # while an unrelated optional failure is left to the jq filter.
+          if ! gh pr checks "$pr" --repo "$REPO" \
+            --json bucket,name,workflow > "$all_checks_file"; then
+            echo "::error::All checks for merged PR #${pr} could not be read."
+            exit 1
+          fi
+
+          jq -e -s --argjson required '[
             "Rust CI / rust-ci-check",
             "Security / security-cargo-audit",
             "Security / security-supply-chain-policy",
@@ -108,16 +118,31 @@ jobs:
             "GitForgeOps PR Static Validation / gitforgeops-required-static-validation"
           ]' --argjson accepted '[
             "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy"
-          ]' '
-            map({
-              context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
-              bucket
-            }) as $checks
-            | ($required | all(. as $wanted | any($checks[]; .context == $wanted and .bucket == "pass")))
-            and ($accepted | all(. as $wanted | all($checks[] | select(.context == $wanted); .bucket == "pass")))
+          ]' --slurpfile all_checks "$all_checks_file" '
+            def check_contexts:
+              if type != "array" then error("invalid checks response") else . end
+              | if any(.[]; type != "object") then error("invalid check record") else . end
+              | if any(.[];
+                  (.name | type) != "string" or
+                  (.bucket | type) != "string" or
+                  (.workflow != null and (.workflow | type) != "string")
+                ) then error("invalid check fields") else . end
+              | map({
+                  context: (if (.workflow // "") == "" then .name else .workflow + " / " + .name end),
+                  bucket
+                });
+            if length != 1 or ($all_checks | length) != 1 then
+              error("expected one response per checks lookup")
+            else
+              (.[0] | check_contexts) as $checks
+              | ($all_checks[0] | check_contexts) as $reported
+              | all($checks[]; .bucket == "pass")
+              and ($required | all(. as $wanted | any($checks[]; .context == $wanted and .bucket == "pass")))
+              and ($accepted | all(. as $wanted | all($reported[] | select(.context == $wanted); .bucket == "pass")))
+            end
           ' "$checks_file" >/dev/null || {
-            echo "::error::The merged PR is missing one or more successful launch-required checks."
-            cat "$checks_file"
+            echo "::error::The merged PR lacks successful launch-required checks or has an unsuccessful transitional check or invalid check response."
+            cat "$checks_file" "$all_checks_file"
             exit 1
           }
 
