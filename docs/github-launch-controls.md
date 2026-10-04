@@ -535,12 +535,14 @@ The `security-supply-chain-policy` check runs the **protected branch's** copy
 of the checker against the candidate tree, under `python3 -I` so that no module
 in the candidate checkout can load before the trusted policy. A pull request
 therefore cannot weaken the policy by editing the checker: its edits take
-effect only after merge. The cost: a PR that changes the checker *and* the
-workflow shape it governs fails its own policy check once, because the old
-policy judges the new shape. Prefer expand/contract pairs (accept both shapes,
-migrate, then reject the old one). The baseline ruleset has no human bypass,
-so merging past that red required check takes a deliberate admin decision.
-The next run on `main` uses the new policy.
+effect only after merge. The protected base judges each candidate, and a
+checker change takes effect only after it merges. Use a checker-first,
+binding-second sequence: land the checker change under the currently trusted
+policy, then submit the workflow binding change after the new checker is on
+`main`. Prefer expand/contract pairs (accept both shapes, migrate, then reject
+the old one). If the checker-first change cannot pass the trusted check, park
+it until a policy-compatible sequence is available; do not merge past a red
+required check. The next run on `main` uses the new policy.
 
 Guarded `run:` interpolation requires a proven source and is inspected after
 GitHub scalar conversion, before Bash comment removal. The reader preserves

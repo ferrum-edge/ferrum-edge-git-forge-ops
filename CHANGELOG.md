@@ -55,16 +55,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- Incremental `apply` needs Ferrum Edge v0.9.9 or later to modify or delete
-  existing rows: every such write is sent with `If-Match`, and an older
-  gateway issues no `ETag`. The apply preflight reads one row the run will
-  overwrite and refuses such a gateway before any credential is allocated or
-  any row written; creates alone still work. `doctor --scope gateway` reports
-  it as `gateway-conditional-writes`. Each modify or delete now costs one
-  extra `GET`. v0.9.9 is the minimum for this capability, not qualification
-  of all backup and consumer representations; the lifecycle suite must pass
-  against the exact gateway build and no pending representation fix is assumed
-  released.
+- Incremental `apply` needs a gateway that issues strong `ETag` values for
+  existing rows and honors conditional writes with `If-Match`. The released
+  Ferrum Edge v0.9.6 source contains this capability
+  ([source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
+  [PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)); this does
+  not establish an earliest or minimum version, or prove that a particular
+  released binary contains or enforces it. Apply's preflight checks only for a
+  strong `ETag` and refuses before credential allocation or writes when none
+  is present; creates alone still work, and `doctor --scope gateway` reports
+  `gateway-conditional-writes`. A server that ignores `If-Match` is not
+  detected. Each modify or delete costs one extra `GET`. This capability does
+  not qualify the gateway's backup or consumer representations: the lifecycle
+  suite must pass against the exact released build, and pending representation
+  fixes are not assumed released.
 - `diff --format json` gains two fields on every path: `live_source`
   (`backup` or `config_export`) and `secret_fingerprints` (`null` on the
   `/backup` path). The cached-read warning now names the source it came from,
