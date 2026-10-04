@@ -1,4 +1,4 @@
-"""Exercise release authorization with the workflow shell and filtered gh output."""
+"""Exercise the actual release shell with hosted gh, clock and sleep stubs."""
 
 from __future__ import annotations
 
@@ -59,10 +59,61 @@ TRUSTED_POLICY_CHECK = {
     "required": False,
 }
 
+HEAD_SHA = "b" * 40
+RELEASE_SHA = "a" * 40
+REPO = "acme/template-copy"
+MERGED_PR = {
+    "id": 12345,
+    "number": 452,
+    "state": "closed",
+    "merged": True,
+    "base": {"ref": "main", "repo": {"full_name": REPO}},
+    "head": {"sha": HEAD_SHA, "ref": "feature"},
+    "merged_at": "2026-10-04T00:00:00Z",
+    "merge_commit_sha": RELEASE_SHA,
+}
+
+
+def rules(*contexts: str) -> list[dict]:
+    return [
+        {
+            "type": "required_status_checks",
+            "parameters": {
+                "required_status_checks": [
+                    {"context": context.split(" / ")[-1], "integration_id": 15368}
+                    for context in contexts
+                ]
+            },
+        }
+    ]
+
+
+def passing_runs() -> list[dict]:
+    return [
+        {
+            "id": 100 + index,
+            "name": check["name"],
+            "head_sha": HEAD_SHA,
+            "app": {"id": 15368},
+            "status": "completed",
+            "conclusion": "success",
+        }
+        for index, check in enumerate(PASSING_CHECKS)
+    ]
+
+
+def full_run_page() -> list[dict]:
+    """A full 100-record page with launch checks and older failed retries."""
+    history = passing_runs()
+    return history + [
+        dict(history[2], id=identifier, conclusion="failure")
+        for identifier in range(1, 96)
+    ]
+
+
 GATE = re.compile(
-    r"jq -e -s --argjson required '(?P<required>\[.*?\])' "
-    r"--argjson accepted '(?P<accepted>\[.*?\])' "
-    r"--slurpfile all_checks \"\$all_checks_file\" '(?P<program>.*?)' \"\$checks_file\"",
+    r"--argjson required '(?P<required>\[.*?\])' "
+    r"--argjson accepted '(?P<accepted>\[.*?\])'",
     re.S,
 )
 
@@ -103,33 +154,97 @@ arguments = sys.argv[1:]
 with Path(os.environ["STUB_CALLS"]).open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(arguments) + "\n")
 
+scenario = json.loads(Path(os.environ["STUB_SCENARIO"]).read_text(encoding="utf-8"))
+state_path = Path(os.environ["STUB_STATE"])
+state = json.loads(state_path.read_text(encoding="utf-8"))
+sample = min(state["sample"], len(scenario["checks"]) - 1)
+checks = scenario["checks"][sample]
+reported_checks = checks
+
 if arguments[0] == "api":
-    print(json.dumps([[{
-        "number": 452,
-        "state": "closed",
-        "base": {"ref": os.environ["DEFAULT_BRANCH"]},
-        "merged_at": "2026-10-04T00:00:00Z",
-        "merge_commit_sha": os.environ["RELEASE_SHA"],
-    }]]))
+    endpoint = arguments[1]
+    if endpoint == f"repos/{os.environ['REPO']}/commits/{os.environ['RELEASE_SHA']}/pulls?per_page=100":
+        mode = "PULLS"
+        response = [[scenario["pr"]]]
+    elif endpoint == f"repos/{os.environ['REPO']}/pulls/452":
+        mode = "PR"
+        response = scenario["pr"]
+    elif endpoint == f"repos/{os.environ['REPO']}/rules/branches/main?per_page=100":
+        mode = "RULES"
+        response = scenario.get("rule_pages", [scenario["rules"]])
+    elif endpoint == f"repos/{os.environ['REPO']}/commits/{scenario['pr']['head']['sha']}/check-runs?per_page=100&filter=all":
+        mode = "RUNS"
+        if "runs" in scenario:
+            samples = scenario["runs"]
+            records = samples[min(state["sample"], len(samples) - 1)]
+        else:
+            conclusions = {"pass": "success", "fail": "failure", "cancel": "cancelled", "skipping": "skipped"}
+            records = [{
+                "id": 100 + index,
+                "name": check.get("name", "malformed"),
+                "head_sha": scenario["pr"]["head"]["sha"],
+                "app": {"id": 15368},
+                "status": "queued" if check.get("bucket") == "pending" else "completed",
+                "conclusion": conclusions.get(check.get("bucket")),
+            } for index, check in enumerate(checks)]
+        response = [{"total_count": len(records), "check_runs": records}]
+    else:
+        raise SystemExit(f"unexpected API endpoint: {endpoint}")
 elif arguments[:2] == ["pr", "checks"]:
     required = "--required" in arguments
     mode = "REQUIRED" if required else "ALL"
-    response = os.environ.get(f"STUB_{mode}_RESPONSE")
-    if response is not None:
-        sys.stdout.write(Path(response).read_text(encoding="utf-8"))
-    else:
-        checks = json.loads(Path(os.environ["STUB_CHECKS"]).read_text(encoding="utf-8"))
-        if required:
-            checks = [check for check in checks if check.get("required", False)]
-        print(json.dumps([
-            {key: check[key] for key in ("bucket", "name", "workflow") if key in check}
-            for check in checks
-        ]))
-    # gh's JSON mode exports buckets without an outcome-based exit status.
-    # Lookup/export errors are represented separately, even with JSON stdout.
-    raise SystemExit(int(os.environ[f"STUB_{mode}_STATUS"]))
+    if required:
+        checks = [check for check in checks if check.get("required", False)]
+    response = [
+        {key: check[key] for key in ("bucket", "name", "workflow") if key in check}
+        for check in checks
+    ]
 else:
     raise SystemExit("unexpected gh invocation")
+
+count = state["calls"].get(mode, 0)
+state["calls"][mode] = count + 1
+state["clock"] += scenario.get("api_seconds", 0)
+state_path.write_text(json.dumps(state), encoding="utf-8")
+responses = scenario.get("responses", {}).get(mode)
+status = scenario.get("statuses", {}).get(mode, 0)
+diagnostic = "lookup failed\n" if status else ""
+if responses is not None:
+    sys.stdout.write(responses[min(count, len(responses) - 1)])
+elif mode in ("REQUIRED", "ALL") and not response and status == 0:
+    # Real gh returns an error before JSON export for an empty rollup, or an
+    # empty --required projection. Preserve stdout emptiness and exit code 1.
+    modifier = "required " if required and reported_checks else ""
+    diagnostic = f"no {modifier}checks reported on the '{scenario['pr']['head']['ref']}' branch\n"
+    status = 1
+else:
+    print(json.dumps(response))
+errors = scenario.get("errors", {}).get(mode)
+if errors is not None:
+    diagnostic = errors[min(count, len(errors) - 1)]
+sys.stderr.write(diagnostic)
+# gh JSON mode exports buckets without an outcome-based exit status.
+# Lookup/export errors are separate, even with valid JSON stdout.
+raise SystemExit(status)
+"""
+
+STUB_TIME = r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(os.environ["STUB_STATE"])
+state = json.loads(path.read_text(encoding="utf-8"))
+if Path(sys.argv[0]).name == "date":
+    assert sys.argv[1:] == ["+%s"]
+    print(state["clock"])
+else:
+    with Path(os.environ["STUB_CALLS"]).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(["sleep", *sys.argv[1:]]) + "\n")
+    state["sample"] += 1
+    state["clock"] += int(os.environ.get("STUB_SLEEP_ADVANCE", sys.argv[1]))
+    path.write_text(json.dumps(state), encoding="utf-8")
 """
 
 
@@ -141,10 +256,25 @@ class ReleaseGateListTests(unittest.TestCase):
         self.assertEqual(json.loads(match.group("required")), REQUIRED)
         self.assertEqual(json.loads(match.group("accepted")), ACCEPTED)
 
+    def test_the_wait_budget_fits_inside_step_and_job_timeouts(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        job = workflow.split("  authorize-release:", 1)[1].split("  docker:", 1)[0]
+        step = job.split("name: Verify the published commit passed every required check", 1)[1]
+        job_timeout = int(re.search(r"timeout-minutes: (\d+)", job).group(1)) * 60
+        step_timeout = int(re.search(r"timeout-minutes: (\d+)", step).group(1)) * 60
+        budget = int(re.search(r"deadline=\$\(\( \$\(date \+%s\) \+ (\d+) \)\)", gate_script()).group(1))
+        self.assertEqual(budget, 900)
+        self.assertLessEqual(budget + 5, step_timeout)
+        # Preserve time for the existing forty lifecycle polls, plus evidence
+        # download and verification. No production clock override is added.
+        self.assertLess(step_timeout + 40 * 30, job_timeout)
+        self.assertNotIn("STUB_", gate_script())
+        self.assertIn('gh pr checks "$pr" --repo "$REPO" --required', gate_script())
+
 
 @unittest.skipUnless(
-    shutil.which("jq") and shutil.which("bash"),
-    "jq and bash are required to exercise the release gate",
+    shutil.which("jq") and shutil.which("bash") and shutil.which("timeout"),
+    "jq, bash and timeout are required to exercise the release gate",
 )
 class ReleaseGateTests(unittest.TestCase):
     def run_gate(
@@ -155,6 +285,15 @@ class ReleaseGateTests(unittest.TestCase):
         all_status: int = 0,
         required_response: str | None = None,
         all_response: str | None = None,
+        samples: list[list[dict]] | None = None,
+        run_samples: list[list[dict]] | None = None,
+        settings: list[dict] | None = None,
+        rule_pages: list[list[dict]] | None = None,
+        responses: dict[str, list[str]] | None = None,
+        statuses: dict[str, int] | None = None,
+        errors: dict[str, list[str]] | None = None,
+        sleep_advance: int | None = None,
+        api_seconds: int = 0,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -162,25 +301,50 @@ class ReleaseGateTests(unittest.TestCase):
             bin_dir.mkdir()
             (bin_dir / "gh").write_text(STUB_GH, encoding="utf-8")
             (bin_dir / "gh").chmod(0o755)
-            checks_path = root / "checks.json"
-            checks_path.write_text(json.dumps(checks), encoding="utf-8")
+            for name in ("sleep", "date"):
+                (bin_dir / name).write_text(STUB_TIME, encoding="utf-8")
+                (bin_dir / name).chmod(0o755)
+            default_contexts = REQUIRED + [
+                f"{check.get('workflow', '')} / {check.get('name', '')}"
+                for sample in (samples if samples is not None else [checks])
+                for check in sample
+                if check.get("required", False)
+            ]
+            scenario = {
+                "checks": samples if samples is not None else [checks],
+                "pr": MERGED_PR,
+                "rules": rules(*default_contexts) if settings is None else settings,
+                "responses": dict(responses or {}),
+                "statuses": {"REQUIRED": required_status, "ALL": all_status, **(statuses or {})},
+                "errors": dict(errors or {}),
+                "api_seconds": api_seconds,
+            }
+            if rule_pages is not None:
+                scenario["rule_pages"] = rule_pages
+            if run_samples is not None:
+                scenario["runs"] = run_samples
+            for mode, response in (("REQUIRED", required_response), ("ALL", all_response)):
+                if response is not None:
+                    scenario["responses"][mode] = [response]
+            scenario_path = root / "scenario.json"
+            scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+            state_path = root / "state.json"
+            state_path.write_text(
+                json.dumps({"clock": 0, "sample": 0, "calls": {}}), encoding="utf-8"
+            )
             calls_path = root / "calls.jsonl"
             env = {
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "REPO": "acme/template-copy",
-                "RELEASE_SHA": "a" * 40,
+                "REPO": REPO,
+                "RELEASE_SHA": RELEASE_SHA,
                 "DEFAULT_BRANCH": "main",
                 "GH_TOKEN": "unused",
-                "STUB_CHECKS": str(checks_path),
+                "STUB_SCENARIO": str(scenario_path),
+                "STUB_STATE": str(state_path),
                 "STUB_CALLS": str(calls_path),
-                "STUB_REQUIRED_STATUS": str(required_status),
-                "STUB_ALL_STATUS": str(all_status),
             }
-            for mode, response in (("REQUIRED", required_response), ("ALL", all_response)):
-                if response is not None:
-                    path = root / f"{mode.lower()}-response.json"
-                    path.write_text(response, encoding="utf-8")
-                    env[f"STUB_{mode}_RESPONSE"] = str(path)
+            if sleep_advance is not None:
+                env["STUB_SLEEP_ADVANCE"] = str(sleep_advance)
             result = subprocess.run(
                 ["bash", "--noprofile", "--norc", "-c", gate_script()],
                 cwd=root,
@@ -188,31 +352,39 @@ class ReleaseGateTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=30,
             )
             calls = [
                 json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()
             ]
+            self.calls = calls
+            self.sleeps = [call for call in calls if call[0] == "sleep"]
             required_call = [
                 "pr",
                 "checks",
                 "452",
                 "--repo",
-                "acme/template-copy",
+                REPO,
                 "--required",
                 "--json",
                 "bucket,name,workflow",
             ]
-            self.assertEqual(calls[1], required_call, result.stderr)
-            if required_status == 0:
-                all_call = [argument for argument in required_call if argument != "--required"]
-                self.assertEqual(calls[2:], [all_call], result.stderr)
-            else:
-                self.assertEqual(len(calls), 2, result.stderr)
+            all_call = [argument for argument in required_call if argument != "--required"]
+            for call in calls:
+                if call[:2] == ["pr", "checks"]:
+                    self.assertIn(call, (required_call, all_call), result.stderr)
+                elif call[0] == "api" and "/check-runs?" in call[1]:
+                    self.assertIn(f"/commits/{HEAD_SHA}/", call[1], result.stderr)
+                    self.assertEqual(call[2:], ["--paginate", "--slurp"], result.stderr)
+                elif call[0] == "api" and "/rules/branches/" in call[1]:
+                    self.assertEqual(call[1], f"repos/{REPO}/rules/branches/main?per_page=100")
+                    self.assertEqual(call[2:], ["--paginate", "--slurp"], result.stderr)
             return result
 
     def assert_gate(self, checks, accepted: bool, **options) -> None:
-        result = self.run_gate(checks, **options)
+        # A permanent absence or pending result times out in the hosted stub,
+        # without changing the real workflow's deadline or sleeping in tests.
+        result = self.run_gate(checks, sleep_advance=900, **options)
         self.assertEqual(result.returncode == 0, accepted, result.stdout + result.stderr)
 
     def test_every_required_check_passing_is_accepted(self) -> None:
@@ -307,11 +479,673 @@ class ReleaseGateTests(unittest.TestCase):
             json.dumps([{"bucket": "pass", "workflow": "GitForgeOps Supply-Chain Policy"}]),
             json.dumps([dict(TRUSTED_POLICY_CHECK, bucket=None)]),
             json.dumps([dict(TRUSTED_POLICY_CHECK, workflow=42)]),
+            json.dumps([dict(TRUSTED_POLICY_CHECK, name="")]),
+            json.dumps([dict(TRUSTED_POLICY_CHECK, bucket="unknown")]),
         )
         for mode in ("required", "all"):
             for response in responses:
                 with self.subTest(mode=mode, response=response):
                     self.assert_gate(PASSING_CHECKS, False, **{f"{mode}_response": response})
+                    self.assertEqual(self.sleeps, [])
+
+    def test_pending_required_checks_wait_then_pass_on_the_same_head(self) -> None:
+        pending = [dict(check) for check in PASSING_CHECKS]
+        pending[2]["bucket"] = "pending"
+        result = self.run_gate(PASSING_CHECKS, samples=[pending, PASSING_CHECKS])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        pr_reads = [call for call in self.calls if call == ["api", f"repos/{REPO}/pulls/452"]]
+        self.assertEqual(len(pr_reads), 4)
+
+    def test_missing_required_checks_wait_then_pass(self) -> None:
+        result = self.run_gate(PASSING_CHECKS, samples=[PASSING_CHECKS[1:], PASSING_CHECKS])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_empty_cli_errors_wait_then_pass(self) -> None:
+        result = self.run_gate(PASSING_CHECKS, samples=[[], PASSING_CHECKS])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        self.assertIn("pending or missing", result.stdout)
+        check_calls = [call for call in self.calls if call[:2] == ["pr", "checks"]]
+        self.assertEqual(len(check_calls), 4)
+
+    def test_no_required_cli_error_waits_then_passes(self) -> None:
+        optional = [{"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}]
+        result = self.run_gate(PASSING_CHECKS, samples=[optional, PASSING_CHECKS])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_empty_cli_errors_time_out_instead_of_aborting_the_first_sample(self) -> None:
+        optional = [{"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}]
+        for checks in ([], optional):
+            with self.subTest(checks=checks):
+                result = self.run_gate(checks, sleep_advance=900)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+                self.assertIn("pending or missing", result.stdout)
+                self.assertIn("Timed out", result.stderr)
+
+    def test_an_empty_full_lookup_cannot_authorize_a_passing_required_lookup(self) -> None:
+        result = self.run_gate(
+            PASSING_CHECKS,
+            all_status=1,
+            all_response="",
+            errors={"ALL": ["no checks reported on the 'feature' branch\n"]},
+            sleep_advance=900,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        self.assertIn("Timed out", result.stderr)
+
+    def test_empty_stdout_query_failures_are_not_treated_as_missing_checks(self) -> None:
+        for mode in ("required", "all"):
+            for diagnostic in ("HTTP 502: Bad Gateway\n", "GraphQL: Could not resolve PR\n"):
+                with self.subTest(mode=mode, diagnostic=diagnostic):
+                    result = self.run_gate(
+                        [],
+                        **{f"{mode}_status": 1, f"{mode}_response": ""},
+                        errors={mode.upper(): [diagnostic]},
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.sleeps, [])
+                    self.assertIn(diagnostic.strip(), result.stderr)
+
+    def test_empty_diagnostics_require_empty_stdout_and_exit_code_one(self) -> None:
+        diagnostic = "no checks reported on the 'feature' branch\n"
+        for mode in ("required", "all"):
+            for status, response in ((1, "[]"), (2, ""), (8, ""), (124, "")):
+                with self.subTest(mode=mode, status=status, response=response):
+                    result = self.run_gate(
+                        [],
+                        **{f"{mode}_status": status, f"{mode}_response": response},
+                        errors={mode.upper(): [diagnostic]},
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.sleeps, [])
+
+    def test_empty_diagnostics_must_match_the_verified_head_branch_and_lookup(self) -> None:
+        for mode, diagnostic in (
+            ("required", "no checks reported on the 'other' branch\n"),
+            ("all", "no required checks reported on the 'feature' branch\n"),
+            ("required", "no checks reported on the 'feature' branch\nHTTP 502\n"),
+        ):
+            with self.subTest(mode=mode, diagnostic=diagnostic):
+                result = self.run_gate(
+                    [],
+                    **{f"{mode}_status": 1, f"{mode}_response": ""},
+                    errors={mode.upper(): [diagnostic]},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [])
+
+    def test_empty_cli_errors_require_valid_complete_same_head_evidence(self) -> None:
+        history = [dict(passing_runs()[0], head_sha="c" * 40)]
+        result = self.run_gate([], run_samples=[history])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [])
+        incomplete = json.dumps([{"total_count": 1, "check_runs": []}])
+        result = self.run_gate([], responses={"RUNS": [incomplete]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [])
+
+    def test_runs_arriving_after_an_empty_cli_sample_require_another_poll(self) -> None:
+        optional = [{"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}]
+        for initial in ([], optional):
+            with self.subTest(initial=initial):
+                result = self.run_gate(
+                    PASSING_CHECKS,
+                    samples=[initial, PASSING_CHECKS],
+                    run_samples=[passing_runs()],
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_empty_cli_errors_cannot_hide_a_newer_source_bound_failure(self) -> None:
+        optional = [{"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}]
+        for initial in ([], optional):
+            for conclusion in ("failure", "cancelled"):
+                with self.subTest(initial=initial, conclusion=conclusion):
+                    history = passing_runs()
+                    history.append(dict(history[0], id=900, conclusion=conclusion))
+                    result = self.run_gate(initial, run_samples=[history])
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(self.sleeps, [])
+
+    def test_empty_cli_errors_do_not_hide_evidence_api_failures(self) -> None:
+        for mode in ("RULES", "RUNS"):
+            with self.subTest(mode=mode):
+                result = self.run_gate([], statuses={mode: 1})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [])
+
+    def test_empty_cli_errors_do_not_allow_a_head_change(self) -> None:
+        changed = dict(MERGED_PR, head={"sha": "c" * 40, "ref": "feature"})
+        result = self.run_gate(
+            [], responses={"PR": [json.dumps(MERGED_PR), json.dumps(changed)]}
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("changed", result.stdout)
+
+    def test_pending_required_checks_wait_then_fail_without_retrying_failure(self) -> None:
+        for bucket in ("fail", "cancel", "skipping"):
+            with self.subTest(bucket=bucket):
+                pending = [dict(check) for check in PASSING_CHECKS]
+                pending[2]["bucket"] = "pending"
+                failed = [dict(check) for check in PASSING_CHECKS]
+                failed[2]["bucket"] = bucket
+                result = self.run_gate(PASSING_CHECKS, samples=[pending, failed, PASSING_CHECKS])
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_terminal_failure_takes_precedence_over_other_pending_checks(self) -> None:
+        checks = [dict(check) for check in PASSING_CHECKS]
+        checks[2]["bucket"] = "pending"
+        checks[3]["bucket"] = "fail"
+        self.assert_gate(checks, False)
+        self.assertEqual(self.sleeps, [])
+
+    def test_malformed_response_after_a_pending_sample_fails_without_another_wait(self) -> None:
+        pending = [dict(check) for check in PASSING_CHECKS]
+        pending[2]["bucket"] = "pending"
+        response = json.dumps([
+            {key: check[key] for key in ("bucket", "name", "workflow")}
+            for check in pending
+        ])
+        result = self.run_gate(
+            PASSING_CHECKS, samples=[pending, PASSING_CHECKS],
+            responses={"ALL": [response, "not JSON"]},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_pending_transitional_checks_wait_then_pass(self) -> None:
+        pending = PASSING_CHECKS + [dict(TRUSTED_POLICY_CHECK, bucket="pending")]
+        passing = PASSING_CHECKS + [TRUSTED_POLICY_CHECK]
+        result = self.run_gate(PASSING_CHECKS, samples=[pending, passing])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_pending_transitional_checks_wait_then_fail(self) -> None:
+        pending = PASSING_CHECKS + [dict(TRUSTED_POLICY_CHECK, bucket="pending")]
+        failed = PASSING_CHECKS + [dict(TRUSTED_POLICY_CHECK, bucket="cancel")]
+        result = self.run_gate(PASSING_CHECKS, samples=[pending, failed])
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_pending_and_missing_checks_time_out(self) -> None:
+        pending = [dict(check) for check in PASSING_CHECKS]
+        pending[2]["bucket"] = "pending"
+        for checks in (pending, PASSING_CHECKS[1:]):
+            with self.subTest(checks=checks):
+                result = self.run_gate(checks, sleep_advance=900)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Timed out", result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_total_budget_includes_api_time_and_caps_the_last_sleep(self) -> None:
+        pending = [dict(check) for check in PASSING_CHECKS]
+        pending[2]["bucket"] = "pending"
+        # One association call and six polling calls consume 7 * 128 seconds.
+        result = self.run_gate(pending, api_seconds=128)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "4"]])
+        self.assertIn("Timed out", result.stderr)
+
+    def test_no_pass_after_the_sampling_budget_expires(self) -> None:
+        result = self.run_gate(PASSING_CHECKS, api_seconds=129)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("Timed out", result.stderr)
+
+    def test_an_absent_trusted_policy_check_cannot_pass_once_required(self) -> None:
+        result = self.run_gate(
+            PASSING_CHECKS, settings=rules(*REQUIRED, *ACCEPTED), sleep_advance=900
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        self.assertIn("Timed out", result.stderr)
+
+    def test_a_missing_required_trusted_check_waits_then_passes(self) -> None:
+        trusted = dict(TRUSTED_POLICY_CHECK, required=True)
+        result = self.run_gate(
+            PASSING_CHECKS,
+            settings=rules(*REQUIRED, *ACCEPTED),
+            samples=[PASSING_CHECKS, PASSING_CHECKS + [trusted]],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_missing_required_contexts_on_page_two_cannot_pass_by_absence(self) -> None:
+        first_page = rules(*REQUIRED) + [{"type": "deletion"}] * 99
+        for context in (*ACCEPTED, "Rust CI / coverage"):
+            with self.subTest(context=context):
+                result = self.run_gate(
+                    PASSING_CHECKS,
+                    rule_pages=[first_page, rules(context)],
+                    sleep_advance=900,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+                self.assertIn("Timed out", result.stderr)
+
+    def test_required_contexts_on_page_two_wait_then_pass(self) -> None:
+        first_page = rules(*REQUIRED) + [{"type": "deletion"}] * 99
+        extra = {"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}
+        for check in (TRUSTED_POLICY_CHECK, extra):
+            with self.subTest(check=check):
+                required = dict(check, required=True)
+                context = f"{check['workflow']} / {check['name']}"
+                result = self.run_gate(
+                    PASSING_CHECKS,
+                    rule_pages=[first_page, rules(context)],
+                    samples=[PASSING_CHECKS, PASSING_CHECKS + [required]],
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_malformed_later_rule_pages_fail_immediately(self) -> None:
+        for page in (None, {}, "not an array", [None], [{}], [{"type": 42}]):
+            with self.subTest(page=page):
+                response = json.dumps([rules(*REQUIRED), page])
+                self.assert_gate(PASSING_CHECKS, False, responses={"RULES": [response]})
+                self.assertEqual(self.sleeps, [])
+
+    def test_later_required_settings_are_validated_and_source_bound(self) -> None:
+        for context, app in ((ACCEPTED[0], 42), ("Rust CI / coverage", None)):
+            with self.subTest(context=context, app=app):
+                later = rules(context)
+                later[0]["parameters"]["required_status_checks"][0]["integration_id"] = app
+                self.assert_gate(PASSING_CHECKS, False, rule_pages=[rules(*REQUIRED), later])
+                self.assertEqual(self.sleeps, [])
+        for settings in (None, {}, [None], [{"context": "", "integration_id": 15368}]):
+            with self.subTest(settings=settings):
+                later = rules("Rust CI / coverage")
+                later[0]["parameters"]["required_status_checks"] = settings
+                self.assert_gate(PASSING_CHECKS, False, rule_pages=[rules(*REQUIRED), later])
+                self.assertEqual(self.sleeps, [])
+
+    def test_an_additional_app_binding_on_a_later_page_is_enforced(self) -> None:
+        extra = {"bucket": "pass", "name": "coverage", "workflow": "Rust CI", "required": True}
+        later = rules("Rust CI / coverage")
+        later[0]["parameters"]["required_status_checks"][0]["integration_id"] = 42
+        for app in (15368, 42):
+            with self.subTest(app=app):
+                history = passing_runs() + [
+                    dict(passing_runs()[0], id=900, name="coverage", app={"id": app})
+                ]
+                self.assert_gate(
+                    PASSING_CHECKS + [extra],
+                    app == 42,
+                    rule_pages=[rules(*REQUIRED), later],
+                    run_samples=[history],
+                )
+                self.assertEqual(self.sleeps, [] if app == 42 else [["sleep", "15"]])
+
+    def test_a_required_trusted_check_must_also_appear_in_the_required_lookup(self) -> None:
+        result = self.run_gate(
+            PASSING_CHECKS + [TRUSTED_POLICY_CHECK],
+            settings=rules(*REQUIRED, *ACCEPTED),
+            sleep_advance=900,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        self.assertIn("Timed out", result.stderr)
+
+    def test_the_ruleset_is_rechecked_during_polling(self) -> None:
+        pending = [dict(check) for check in PASSING_CHECKS]
+        pending[2]["bucket"] = "pending"
+        result = self.run_gate(
+            PASSING_CHECKS,
+            samples=[pending, PASSING_CHECKS],
+            responses={"RULES": [
+                json.dumps([rules(*REQUIRED)]), json.dumps([rules(*REQUIRED, *ACCEPTED)])
+            ]},
+            sleep_advance=450,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "15"], ["sleep", "15"]])
+        self.assertIn("Timed out", result.stderr)
+
+    def test_the_associated_head_is_verified_before_sampling_and_before_passing(self) -> None:
+        changed = dict(MERGED_PR, head={"sha": "c" * 40})
+        for responses in ([changed], [MERGED_PR, changed]):
+            with self.subTest(read=len(responses)):
+                result = self.run_gate(
+                    PASSING_CHECKS, responses={"PR": [json.dumps(pr) for pr in responses]}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.sleeps, [])
+                self.assertIn("changed", result.stdout)
+
+    def test_head_change_while_waiting_is_rejected(self) -> None:
+        pending = [dict(check) for check in PASSING_CHECKS]
+        pending[2]["bucket"] = "pending"
+        changed = dict(MERGED_PR, head={"sha": "c" * 40})
+        result = self.run_gate(
+            PASSING_CHECKS,
+            samples=[pending, PASSING_CHECKS],
+            responses={"PR": [json.dumps(MERGED_PR), json.dumps(MERGED_PR), json.dumps(changed)]},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_changed_pr_identity_or_merge_association_is_rejected(self) -> None:
+        changes = (
+            {"id": 54321},
+            {"number": 453},
+            {"merged": False},
+            {"state": "open"},
+            {"merge_commit_sha": "c" * 40},
+            {"merged_at": "2026-10-05T00:00:00Z"},
+            {"base": {"ref": "other", "repo": {"full_name": REPO}}},
+            {"base": {"ref": "main", "repo": {"full_name": "acme/other"}}},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                self.assert_gate(
+                    PASSING_CHECKS, False,
+                    responses={"PR": [json.dumps(dict(MERGED_PR, **change))]},
+                )
+                self.assertEqual(self.sleeps, [])
+
+    def test_malformed_or_api_error_evidence_never_retries(self) -> None:
+        for mode in ("PULLS", "PR", "RULES", "RUNS"):
+            for response in ("", "not JSON", "null", "{}", "[]", "[]\n[]"):
+                with self.subTest(mode=mode, response=response):
+                    self.assert_gate(PASSING_CHECKS, False, responses={mode: [response]})
+                    self.assertEqual(self.sleeps, [])
+            with self.subTest(mode=mode, api_error=True):
+                self.assert_gate(PASSING_CHECKS, False, statuses={mode: 1})
+                self.assertEqual(self.sleeps, [])
+
+    def test_invalid_associations_fail_immediately(self) -> None:
+        associations = (
+            [[dict(MERGED_PR, head={"sha": "invalid"})]],
+            [[dict(MERGED_PR, base={"ref": "other", "repo": {"full_name": REPO}})]],
+            [[dict(MERGED_PR, base={"ref": "main", "repo": {"full_name": "acme/other"}})]],
+            [[dict(MERGED_PR, id=None)]],
+            [[MERGED_PR, dict(MERGED_PR, number=453, id=54321)]],
+            [[MERGED_PR], [dict(MERGED_PR, head={"sha": "c" * 40})]],
+        )
+        for association in associations:
+            with self.subTest(association=association):
+                self.assert_gate(PASSING_CHECKS, False, responses={"PULLS": [json.dumps(association)]})
+                self.assertEqual(self.sleeps, [])
+
+    def test_missing_merge_association_retries_with_a_bound(self) -> None:
+        result = self.run_gate(
+            PASSING_CHECKS, responses={"PULLS": ["[[]]", json.dumps([[MERGED_PR]])]}
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "2"]])
+        result = self.run_gate(PASSING_CHECKS, responses={"PULLS": ["[[]]"]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", str(seconds)] for seconds in (2, 4, 6, 8)])
+
+    def test_exact_merge_match_is_preferred_and_rebase_association_still_works(self) -> None:
+        other = dict(MERGED_PR, id=54321, number=453, merge_commit_sha="c" * 40)
+        result = self.run_gate(
+            PASSING_CHECKS, responses={"PULLS": [json.dumps([[other, MERGED_PR]])]}
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rebased = dict(MERGED_PR, merge_commit_sha="c" * 40)
+        result = self.run_gate(
+            PASSING_CHECKS,
+            responses={"PULLS": [json.dumps([[rebased]])], "PR": [json.dumps(rebased)]},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_an_old_success_cannot_hide_a_newer_queued_retry(self) -> None:
+        history = passing_runs()
+        retry = dict(history[2], id=900, status="queued", conclusion=None)
+        succeeded = dict(retry, status="completed", conclusion="success")
+        result = self.run_gate(PASSING_CHECKS, run_samples=[history + [retry], history + [succeeded]])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_an_old_success_cannot_hide_a_newer_terminal_retry(self) -> None:
+        for conclusion in ("failure", "cancelled", "timed_out", "skipped", "neutral"):
+            for reverse in (False, True):
+                with self.subTest(conclusion=conclusion, reverse=reverse):
+                    history = passing_runs()
+                    history.append(dict(history[2], id=900, conclusion=conclusion))
+                    if reverse:
+                        history.reverse()
+                    self.assert_gate(PASSING_CHECKS, False, run_samples=[history])
+                    self.assertEqual(self.sleeps, [])
+
+    def test_an_older_failure_does_not_hide_a_newer_success(self) -> None:
+        history = passing_runs()
+        history.append(dict(history[2], id=1, conclusion="failure"))
+        self.assert_gate(PASSING_CHECKS, True, run_samples=[history])
+
+    def test_newer_retry_evidence_on_another_page_cannot_be_hidden(self) -> None:
+        history = passing_runs()
+        retry = dict(history[2], id=900, conclusion="cancelled")
+        response = json.dumps([
+            {"total_count": 6, "check_runs": [retry]},
+            {"total_count": 6, "check_runs": history},
+        ])
+        self.assert_gate(PASSING_CHECKS, False, responses={"RUNS": [response]})
+        self.assertEqual(self.sleeps, [])
+
+    def test_passing_cli_cannot_authorize_incomplete_run_history(self) -> None:
+        incomplete = json.dumps([{"total_count": 6, "check_runs": passing_runs()}])
+        complete = json.dumps([{"total_count": 5, "check_runs": passing_runs()}])
+        result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [incomplete, complete]})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("incomplete check-run evidence", result.stderr)
+        self.assertEqual(self.sleeps, [])
+        run_reads = [
+            call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+        ]
+        self.assertEqual(len(run_reads), 1)
+
+    def test_passing_cli_requires_consistent_check_run_page_counts(self) -> None:
+        history = full_run_page()
+        retry = dict(history[2], id=900)
+        for counts in ((100, 101), (101, 100), (101, 102)):
+            with self.subTest(counts=counts):
+                response = json.dumps([
+                    {"total_count": counts[0], "check_runs": history},
+                    {"total_count": counts[1], "check_runs": [retry]},
+                ])
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("inconsistent check-run page counts", result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_passing_cli_cannot_authorize_a_truncated_paginated_history(self) -> None:
+        page = {"total_count": 101, "check_runs": full_run_page()}
+        for pages in ([page], [page, {"total_count": 101, "check_runs": []}]):
+            with self.subTest(pages=len(pages)):
+                result = self.run_gate(
+                    PASSING_CHECKS, responses={"RUNS": [json.dumps(pages)]}
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("incomplete check-run evidence", result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_history_completeness_is_required_again_after_waiting(self) -> None:
+        history = passing_runs()
+        retry = dict(history[2], id=900, status="queued", conclusion=None)
+        pending = json.dumps([{"total_count": 6, "check_runs": history + [retry]}])
+        complete = json.dumps([{
+            "total_count": 6,
+            "check_runs": history + [dict(retry, status="completed", conclusion="success")],
+        }])
+        incomplete = json.dumps([{"total_count": 6, "check_runs": history}])
+        inconsistent = json.dumps([
+            {"total_count": 5, "check_runs": history},
+            {"total_count": 6, "check_runs": []},
+        ])
+        for evidence in (incomplete, inconsistent):
+            with self.subTest(evidence=evidence):
+                result = self.run_gate(
+                    PASSING_CHECKS, responses={"RUNS": [pending, evidence, complete]}
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+                self.assertNotIn("has successful source-bound checks", result.stdout)
+                run_reads = [
+                    call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+                ]
+                self.assertEqual(len(run_reads), 2)
+
+    def test_duplicate_run_ids_cannot_complete_the_advertised_count(self) -> None:
+        history = passing_runs()
+        long_history = full_run_page()
+        pages = (
+            [{"total_count": 6, "check_runs": history + [history[2]]}],
+            [
+                {"total_count": 6, "check_runs": history},
+                {"total_count": 6, "check_runs": [history[2]]},
+            ],
+            [
+                {"total_count": 101, "check_runs": long_history},
+                {"total_count": 101, "check_runs": [long_history[2]]},
+            ],
+            # Even when all five distinct IDs are accounted for, overlapping
+            # pages are inconsistent evidence and must fail closed.
+            [{"total_count": 5, "check_runs": history + [history[2]]}],
+        )
+        for response in pages:
+            with self.subTest(response=response):
+                result = self.run_gate(
+                    PASSING_CHECKS, responses={"RUNS": [json.dumps(response)]}
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("duplicate check-run identities", result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_conflicting_run_identities_across_pages_fail_closed(self) -> None:
+        history = full_run_page()
+        changes = (
+            {"name": "coverage"},
+            {"app": {"id": 42}},
+            {"conclusion": "failure"},
+            {"status": "queued", "conclusion": None},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                response = json.dumps([
+                    {"total_count": 101, "check_runs": history},
+                    {"total_count": 101, "check_runs": [dict(history[2], **change)]},
+                ])
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("conflicting check-run identities", result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_complete_paginated_history_accepts_the_newest_green_retry(self) -> None:
+        history = full_run_page()
+        history[2]["conclusion"] = "failure"
+        history.append(dict(history[2], id=900, conclusion="success"))
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                ordered = sorted(history, key=lambda run: run["id"], reverse=reverse)
+                response = json.dumps([
+                    {"total_count": 101, "check_runs": ordered[:100]},
+                    {"total_count": 101, "check_runs": ordered[100:]},
+                ])
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"has successful source-bound checks on {HEAD_SHA}", result.stdout)
+                self.assertEqual(self.sleeps, [])
+
+    def test_complete_paginated_history_uses_the_newest_pending_or_terminal_retry(self) -> None:
+        history = full_run_page()
+        pending = dict(history[2], id=900, status="queued", conclusion=None)
+        for conclusion in ("success", "failure", "cancelled"):
+            with self.subTest(conclusion=conclusion):
+                responses = [
+                    json.dumps([
+                        {"total_count": 101, "check_runs": history},
+                        {"total_count": 101, "check_runs": [retry]},
+                    ])
+                    for retry in (
+                        pending,
+                        dict(pending, status="completed", conclusion=conclusion),
+                    )
+                ]
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": responses})
+                self.assertEqual(
+                    result.returncode == 0, conclusion == "success", result.stdout + result.stderr
+                )
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+    def test_passing_cli_requires_a_valid_exact_check_run_count(self) -> None:
+        for count in (None, True, "5", -1, 5.5, 0, 4):
+            with self.subTest(count=count):
+                response = json.dumps([{"total_count": count, "check_runs": passing_runs()}])
+                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [])
+
+    def test_required_sources_cannot_be_replaced_by_another_app(self) -> None:
+        settings = rules(*REQUIRED)
+        settings[0]["parameters"]["required_status_checks"][0]["integration_id"] = 42
+        self.assert_gate(PASSING_CHECKS, False, settings=settings)
+        self.assertEqual(self.sleeps, [])
+        history = passing_runs()
+        history[2]["app"] = {"id": 42}
+        self.assert_gate(PASSING_CHECKS, False, run_samples=[history])
+
+    def test_unbound_or_missing_launch_required_settings_fail_immediately(self) -> None:
+        for app in (None, -1, 0, "15368"):
+            with self.subTest(app=app):
+                settings = rules(*REQUIRED)
+                settings[0]["parameters"]["required_status_checks"][0]["integration_id"] = app
+                self.assert_gate(PASSING_CHECKS, False, settings=settings)
+                self.assertEqual(self.sleeps, [])
+        self.assert_gate(PASSING_CHECKS, False, settings=rules(*REQUIRED[1:]))
+        self.assertEqual(self.sleeps, [])
+
+    def test_foreign_app_success_cannot_hide_required_source_failure(self) -> None:
+        history = passing_runs()
+        history[2]["conclusion"] = "failure"
+        history.append(dict(history[2], id=900, app={"id": 42}, conclusion="success"))
+        self.assert_gate(PASSING_CHECKS, False, run_samples=[history])
+        self.assertEqual(self.sleeps, [])
+
+    def test_malformed_or_wrong_head_check_runs_fail_immediately(self) -> None:
+        changes = (
+            {"head_sha": "c" * 40},
+            {"id": None},
+            {"id": 1.5},
+            {"app": {}},
+            {"name": ""},
+            {"status": "unknown"},
+            {"status": "queued", "conclusion": "success"},
+            {"conclusion": None},
+            {"conclusion": "unknown"},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                history = passing_runs()
+                history[2].update(change)
+                self.assert_gate(PASSING_CHECKS, False, run_samples=[history])
+                self.assertEqual(self.sleeps, [])
+
+    def test_conflicting_check_run_identities_fail_immediately(self) -> None:
+        history = passing_runs()
+        history.append(dict(history[2], conclusion="failure"))
+        self.assert_gate(PASSING_CHECKS, False, run_samples=[history])
+        self.assertEqual(self.sleeps, [])
+
+    def test_additional_required_contexts_are_also_source_bound_and_waited_for(self) -> None:
+        extra = {"bucket": "pass", "name": "coverage", "workflow": "Rust CI", "required": True}
+        self.assert_gate(PASSING_CHECKS + [extra], True, settings=rules(*REQUIRED, "Rust CI / coverage"))
+        pending = dict(extra, bucket="pending")
+        result = self.run_gate(
+            PASSING_CHECKS,
+            settings=rules(*REQUIRED, "Rust CI / coverage"),
+            samples=[PASSING_CHECKS + [pending], PASSING_CHECKS + [extra]],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
 
 
 if __name__ == "__main__":
