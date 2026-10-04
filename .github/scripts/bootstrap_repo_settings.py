@@ -134,14 +134,9 @@ MONITORING_ENVIRONMENT_SUFFIX = "-monitor"
 MONITORING_ENVIRONMENT_SECRETS = (
     ("FERRUM_GATEWAY_URL", "required; must be an https:// URL"),
     (
-        "FERRUM_ADMIN_JWT_SECRET",
-        "required; the gateway's signing secret — see the read-only-role caveat "
-        "in docs/github-launch-controls.md",
-    ),
-    (
-        "FERRUM_ADMIN_JWT_ROLE",
-        "optional; leave unset (admin) — GET /backup is admin-only today, so no "
-        "lesser role can run a drift check",
+        "FERRUM_ADMIN_JWT_VIEWER_SECRET",
+        "required; the gateway's distinct viewer-capped signing key, at least 32 "
+        "characters and different from the admin key",
     ),
     (
         "FERRUM_ADMIN_JWT_ISSUER",
@@ -1247,12 +1242,15 @@ def build_plan(api: GitHubApi, args) -> Plan:
                 f"{', '.join(monitoring)}. Each gets a reviewer-free "
                 f"`<env>{MONITORING_ENVIRONMENT_SUFFIX}` environment so the "
                 "nightly check is not parked waiting for approval. Give it "
-                "gateway READ material only — Ferrum Edge signs admin tokens "
-                "with a symmetric secret, so until the gateway offers a "
-                "read-only admin role the signing key you put there is "
-                "write-capable at the gateway. The environment's branch policy "
-                "and the workflow's secret fence are what bound it; see "
-                "docs/github-launch-controls.md."
+                "the gateway's distinct FERRUM_ADMIN_JWT_VIEWER_SECRET; Ferrum "
+                "Edge caps tokens signed with that symmetric key at the viewer "
+                "role, regardless of their role claim. Restrict the viewer key "
+                "to the namespaces this environment needs with "
+                "FERRUM_ADMIN_JWT_VIEWER_NAMESPACES where configured; repository "
+                "namespace filters also limit each comparison. Keep the admin "
+                "key out of monitor environments. The environment's branch "
+                "policy and the workflow's secret fence further bound access; "
+                "see docs/github-launch-controls.md."
             )
         else:
             plan.notes.append("")
@@ -1333,11 +1331,18 @@ def secret_remainder(
             )
     for environment in monitoring:
         monitor = f"{environment}{MONITORING_ENVIRONMENT_SUFFIX}"
-        lines.append(f"  # environment {monitor} (read-only drift monitoring)")
+        lines.append(f"  # environment {monitor} (viewer-only drift monitoring)")
         for name, note in MONITORING_ENVIRONMENT_SECRETS:
             lines.append(
                 f"  gh secret set {name} --repo {repo} --env {monitor}   # {note}"
             )
+        lines.append(
+            f"  # Match FERRUM_ADMIN_JWT_ISSUER, FERRUM_ADMIN_JWT_AUDIENCE and "
+            f"FERRUM_ADMIN_JWT_TTL_SECS to the gateway; the drift workflow binds "
+            f"these optional settings explicitly. Restrict the viewer key to "
+            f"the required namespaces with FERRUM_ADMIN_JWT_VIEWER_NAMESPACES "
+            f"where configured."
+        )
         lines.append(
             f"  # Do NOT set GITFORGEOPS_STATE_APP_PRIVATE_KEY, "
             f"FERRUM_GH_PROVISIONER_TOKEN or FERRUM_CREDS_BUNDLE[_N] on "

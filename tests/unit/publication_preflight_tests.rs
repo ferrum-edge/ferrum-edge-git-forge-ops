@@ -895,7 +895,10 @@ fn cli_review_reports_a_missing_or_malformed_allowlist_for_the_operator() {
             }
             assert!(text.contains(note), "{text}");
             assert!(text.contains(row), "{text}");
-            assert!(!text.contains("the operator allowlist is not visible"), "{text}");
+            assert!(
+                !text.contains("the operator allowlist is not visible"),
+                "{text}"
+            );
             assert!(text.contains("repository administrator"), "{text}");
             assert!(!text.contains("invalid-smoke-checks"), "{text}");
             assert!(!text.contains(PR_FIX), "{text}");
