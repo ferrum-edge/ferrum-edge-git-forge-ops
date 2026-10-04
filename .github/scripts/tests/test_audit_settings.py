@@ -65,7 +65,11 @@ def secure_responses():
                     "parameters": {
                         "strict_required_status_checks_policy": True,
                         "required_status_checks": [
-                            {"context": context} for context in sorted(REQUIRED_CHECKS)
+                            {
+                                "context": context,
+                                "integration_id": audit_settings.GITHUB_ACTIONS_APP_ID,
+                            }
+                            for context in sorted(REQUIRED_CHECKS)
                         ]
                     },
                 },
@@ -934,6 +938,117 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
             ),
             audit.violations,
         )
+
+
+class TrustedPolicyCheckTransitionTests(unittest.TestCase):
+    """GHSA-x5m2-4555-q4cr: the protected-definition policy check is being added.
+
+    `trusted-supply-chain-policy` joins the ruleset in an operator step after
+    its workflow reaches the default branch, so the audit accepts a ruleset
+    without it (with a warning) and still requires the in-tree job's context.
+    """
+
+    TRUSTED = "trusted-supply-chain-policy"
+    RETIRING = "security-supply-chain-policy"
+
+    def audit_ruleset(
+        self, contexts: set[str], unbound: frozenset[str] = frozenset()
+    ) -> "audit_settings.Audit":
+        ruleset = secure_responses()["repos/acme/repo/rulesets/7"]
+        next(
+            rule for rule in ruleset["rules"] if rule["type"] == "required_status_checks"
+        )["parameters"]["required_status_checks"] = [
+            {"context": context}
+            if context in unbound
+            else {"context": context, "integration_id": audit_settings.GITHUB_ACTIONS_APP_ID}
+            for context in sorted(contexts)
+        ]
+        audit = audit_settings.Audit()
+        audit_settings.audit_main_ruleset(
+            audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), 99
+        )
+        return audit
+
+    def test_the_trusted_check_is_part_of_the_launch_baseline(self):
+        self.assertIn(self.TRUSTED, audit_settings.REQUIRED_STATUS_CHECKS)
+        self.assertIn(self.RETIRING, audit_settings.REQUIRED_STATUS_CHECKS)
+        self.assertEqual(audit_settings.TRANSITIONAL_STATUS_CHECKS, (self.TRUSTED,))
+
+    def test_a_ruleset_before_the_switch_passes_with_a_warning(self):
+        audit = self.audit_ruleset(REQUIRED_CHECKS)
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(len(audit.warnings), 1, audit.warnings)
+        self.assertIn(self.TRUSTED, audit.warnings[0])
+
+    def test_a_ruleset_after_the_switch_passes_cleanly(self):
+        audit = self.audit_ruleset(REQUIRED_CHECKS | {self.TRUSTED})
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(audit.warnings, [])
+
+    def test_the_retiring_context_is_still_required(self):
+        # It still runs the workflow-script unit tests until the retire step.
+        audit = self.audit_ruleset((REQUIRED_CHECKS - {self.RETIRING}) | {self.TRUSTED})
+        rendered = "\n".join(audit.violations)
+        self.assertIn("missing required status checks", rendered)
+        self.assertIn(self.RETIRING, rendered)
+
+    def test_the_trusted_check_must_be_bound_to_github_actions(self):
+        # Unbound, a commit status a collaborator posts with their own token
+        # satisfies the rule.
+        for source in (None, 1):
+            with self.subTest(source=source):
+                ruleset = secure_responses()["repos/acme/repo/rulesets/7"]
+                checks = [
+                    {"context": context, "integration_id": audit_settings.GITHUB_ACTIONS_APP_ID}
+                    for context in sorted(REQUIRED_CHECKS)
+                ]
+                checks.append(
+                    {"context": self.TRUSTED}
+                    if source is None
+                    else {"context": self.TRUSTED, "integration_id": source}
+                )
+                next(
+                    rule
+                    for rule in ruleset["rules"]
+                    if rule["type"] == "required_status_checks"
+                )["parameters"]["required_status_checks"] = checks
+                audit = audit_settings.Audit()
+                audit_settings.audit_main_ruleset(
+                    audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), 99
+                )
+                rendered = "\n".join(audit.violations)
+                self.assertIn("GitHub Actions app", rendered)
+                self.assertIn(self.TRUSTED, rendered)
+
+    def test_an_unbound_state_guard_fails_the_audit(self):
+        # Its definition is protected too (pull_request_target), so an
+        # own-token commit status is the only way to forge it.
+        audit = self.audit_ruleset(
+            REQUIRED_CHECKS | {self.TRUSTED},
+            unbound=frozenset({"state-guard-reject-state-edits"}),
+        )
+        rendered = "\n".join(audit.violations)
+        self.assertIn("'state-guard-reject-state-edits' to the GitHub Actions app", rendered)
+        self.assertEqual(
+            audit_settings.SOURCE_BOUND_STATUS_CHECKS,
+            ("trusted-supply-chain-policy", "state-guard-reject-state-edits"),
+        )
+
+    def test_older_unbound_contexts_are_a_warning(self):
+        audit = self.audit_ruleset(
+            REQUIRED_CHECKS | {self.TRUSTED}, unbound=frozenset({"rust-ci-check"})
+        )
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(len(audit.warnings), 1, audit.warnings)
+        self.assertIn("'rust-ci-check' from any source", audit.warnings[0])
+
+    def test_only_the_transitional_context_is_softened(self):
+        for context in sorted(REQUIRED_CHECKS):
+            with self.subTest(context=context):
+                audit = self.audit_ruleset(REQUIRED_CHECKS - {context})
+                rendered = "\n".join(audit.violations)
+                self.assertIn("missing required status checks", rendered)
+                self.assertIn(context, rendered)
 
 
 class SharedConstantTests(unittest.TestCase):

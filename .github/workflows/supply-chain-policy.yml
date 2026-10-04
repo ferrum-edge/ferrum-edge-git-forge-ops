@@ -1,0 +1,71 @@
+name: GitForgeOps Supply-Chain Policy
+
+# The supply-chain verdict must come from a definition the pull request under
+# review cannot edit (GHSA-x5m2-4555-q4cr). `security.yml` runs under
+# `pull_request`, so GitHub executes the pull request's own copy of it.
+# `pull_request_target` always loads THIS file from the protected default
+# branch, so a pull request's edits to it take effect only after merge.
+#
+# That trigger is safe only while the job never executes pull-request bytes:
+#
+# - The candidate is checked out under `candidate/` as data, with no
+#   credentials persisted. Nothing in it runs.
+# - The only program is the protected branch's checker, started from `base/`
+#   under `python3 -I` and pointed at the candidate with `--root`. Isolated
+#   mode puts neither the working directory nor the script directory on the
+#   import path, and ignores every `PYTHON*` variable and the user site
+#   directory. The checker imports only the standard library.
+# - Never `cd candidate`, never add `env:` or `defaults:` (bash reads
+#   `BASH_ENV` before the first command), and never add a step that runs,
+#   sources or installs anything from `candidate/`.
+# - `base/` sits beside `candidate/`, so the checker refuses any symlink in
+#   the candidate that is absolute or leaves it (it would read `base/` here
+#   and the pull request's own files in every other workflow), and any
+#   special file, before it reads anything.
+#
+# The job holds `contents: read`, no secrets and no environment.
+# `check_supply_chain.py` pins every non-comment line of this file, and no
+# other workflow may define a job (or job display name) that reports the same
+# `trusted-supply-chain-policy` check.
+#
+# A new `pull_request_target` workflow does not run on the pull request that
+# adds it: GitHub loads it from the base branch, which does not have it yet.
+# The ruleset switch that makes this the required context is an operator step
+# (docs/github-launch-controls.md, section 2).
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer delivery for the same pull request supersedes an older head's run.
+concurrency:
+  group: trusted-supply-chain-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  trusted-supply-chain-policy:
+    runs-on: ubuntu-24.04
+    # The check reads a few hundred files; a stuck run must not hold a runner.
+    timeout-minutes: 10
+    steps:
+      - name: Check out protected supply-chain policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out candidate as policy data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+
+      # A missing checker is a missing file, and `python3` exits non-zero.
+      - name: Judge candidate with protected supply-chain policy
+        run: python3 -I base/.github/scripts/check_supply_chain.py --root candidate
