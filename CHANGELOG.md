@@ -81,6 +81,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Capture one bounded, regular-file data snapshot for the cargo-audit gate's
+  manifest, source reachability, Cargo graph, audit and independent yanked
+  checks (#454). Original-file replacements can no longer redirect Cargo or
+  split the checks across different lockfiles. Refuse symlinked source
+  directories/files, special files, oversized source trees and local path
+  dependencies. Check RSA reachability with all features and all targets,
+  including optional direct RSA paths; hosted regressions cover a real offline
+  Cargo graph, deterministic replacements and dangerous source inputs.
 - Fail the cargo-audit gate closed when yanked-package verification cannot
   complete (#455). Independently verify every locked crates.io version's
   checksum and explicit yanked status against fresh sparse-index records;
@@ -93,9 +101,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cover unsafe inputs, workspace redirects and incomplete index evidence.
 - The cargo-audit policy gate no longer runs `cargo` from the candidate
   checkout (#448). `cargo tree` and `cargo audit` run from a fresh temporary
-  directory with a fresh `CARGO_HOME`, take the candidate's `Cargo.toml` and
-  `Cargo.lock` through `--manifest-path` and `--file`, and drop inherited
-  `CARGO_*`, `__CARGO_*`, `RUSTUP_TOOLCHAIN`, `RUSTC_BOOTSTRAP` and rustc
+  directory with a fresh `CARGO_HOME`, take captured copies of the candidate's
+  `Cargo.toml` and `Cargo.lock` through `--manifest-path` and `--file`, and drop
+  inherited `CARGO_*`, `__CARGO_*`, `RUSTUP_TOOLCHAIN`, `RUSTC_BOOTSTRAP` and rustc
   wrapper variables. A pull request's
   `.cargo/config[.toml]` aliases or `[env]`, `.cargo/audit.toml` ignore list or
   advisory-database settings, and `rust-toolchain[.toml]` therefore cannot

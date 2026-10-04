@@ -1,7 +1,10 @@
+import contextlib
+import hashlib
 import json
 import importlib.util
 import io
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -120,6 +123,21 @@ def write_reviewed_tree(
         encoding="utf-8",
     )
     return tree_path
+
+
+def verify_candidate_reachability(policy, root, tree):
+    with check_cargo_audit.candidate_snapshot(root) as snapshot:
+        check_cargo_audit.verify_exception_reachability(policy, snapshot, tree)
+
+
+def audit_candidate(root):
+    with check_cargo_audit.candidate_snapshot(root) as snapshot:
+        return check_cargo_audit.run_cargo_audit(snapshot)
+
+
+def read_candidate_tree(root):
+    with check_cargo_audit.candidate_snapshot(root) as snapshot:
+        return check_cargo_audit._read_dependency_tree("rsa", "0.9.10", snapshot, None)
 
 
 HOSTILE_CARGO_CONFIG = (
@@ -404,7 +422,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                         source += f"fn forbidden() {{ let _ = {marker}; }}\n"
                     tree = write_reviewed_tree(root, manifest=manifest, source=source)
                     with self.assertRaises(check_cargo_audit.PolicyError):
-                        check_cargo_audit.verify_exception_reachability(
+                        verify_candidate_reachability(
                             indexed(exception()), root, tree
                         )
 
@@ -416,7 +434,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
             hostile = REVIEWED_SOURCE + "fn forbidden() { let _ = age::Decryptor; }\n"
             tree = write_reviewed_tree(root, source=hostile, rsa_version="0.9.11")
             with self.assertRaises(check_cargo_audit.PolicyError) as raised:
-                check_cargo_audit.verify_exception_reachability(
+                verify_candidate_reachability(
                     indexed(bumped), root, tree
                 )
             self.assertIn("age::Decryptor", str(raised.exception))
@@ -424,7 +442,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tree = write_reviewed_tree(root, rsa_version="0.9.11")
-            check_cargo_audit.verify_exception_reachability(indexed(bumped), root, tree)
+            verify_candidate_reachability(indexed(bumped), root, tree)
 
     def test_rsa_exception_without_a_verifier_is_a_policy_error(self):
         orphan = exception(advisory="RUSTSEC-2099-0009")
@@ -432,7 +450,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
             root = Path(directory)
             tree = write_reviewed_tree(root)
             with self.assertRaises(check_cargo_audit.PolicyError) as raised:
-                check_cargo_audit.verify_exception_reachability(
+                verify_candidate_reachability(
                     indexed(orphan), root, tree
                 )
             self.assertIn("no reachability verifier", str(raised.exception))
@@ -443,7 +461,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
             root = Path(directory)
             tree = write_reviewed_tree(root)
             with self.assertRaises(check_cargo_audit.PolicyError) as raised:
-                check_cargo_audit.verify_exception_reachability(
+                verify_candidate_reachability(
                     indexed(unknown), root, tree
                 )
             self.assertIn("unknown reachability verifier", str(raised.exception))
@@ -457,7 +475,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
             hostile = REVIEWED_SOURCE + "fn forbidden() { let _ = age::Decryptor; }\n"
             tree = write_reviewed_tree(root, source=hostile)
             with self.assertRaises(check_cargo_audit.PolicyError):
-                check_cargo_audit.verify_exception_reachability(
+                verify_candidate_reachability(
                     indexed(declared), root, tree
                 )
 
@@ -472,7 +490,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                     tree = write_reviewed_tree(
                         root, rsa_version=rsa_version, age_version=age_version
                     )
-                    check_cargo_audit.verify_exception_reachability(
+                    verify_candidate_reachability(
                         indexed(exception(version=rsa_version)), root, tree
                     )
 
@@ -491,7 +509,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     tree = write_reviewed_tree(root, manifest=manifest)
-                    check_cargo_audit.verify_exception_reachability(
+                    verify_candidate_reachability(
                         indexed(exception()), root, tree
                     )
 
@@ -506,7 +524,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tree = write_reviewed_tree(root, source=source)
-            check_cargo_audit.verify_exception_reachability(
+            verify_candidate_reachability(
                 indexed(exception()), root, tree
             )
 
@@ -527,7 +545,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             tree = write_reviewed_tree(root, source=source)
-            check_cargo_audit.verify_exception_reachability(
+            verify_candidate_reachability(
                 indexed(exception()), root, tree
             )
 
@@ -541,7 +559,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                     "pub fn mint() {}\n"
                 },
             )
-            check_cargo_audit.verify_exception_reachability(
+            verify_candidate_reachability(
                 indexed(exception()), root, tree
             )
 
@@ -553,7 +571,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                 extra_sources={"src/jwt.rs": "pub fn mint() { let _ = age::Decryptor; }\n"},
             )
             with self.assertRaises(check_cargo_audit.PolicyError) as raised:
-                check_cargo_audit.verify_exception_reachability(
+                verify_candidate_reachability(
                     indexed(exception()), root, tree
                 )
             self.assertIn("src/jwt.rs", str(raised.exception))
@@ -571,7 +589,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                 ),
             )
             with self.assertRaises(check_cargo_audit.PolicyError):
-                check_cargo_audit.verify_exception_reachability(
+                verify_candidate_reachability(
                     indexed(exception()), root, tree
                 )
 
@@ -589,7 +607,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                 check_cargo_audit.subprocess, "run", return_value=completed
             ):
                 with self.assertRaises(check_cargo_audit.PolicyError) as raised:
-                    check_cargo_audit.verify_exception_reachability(
+                    verify_candidate_reachability(
                         indexed(exception()), root, None
                     )
             message = str(raised.exception)
@@ -609,16 +627,19 @@ class CargoAuditPolicyTests(unittest.TestCase):
             with mock.patch.object(
                 check_cargo_audit.subprocess, "run", return_value=completed
             ) as run:
-                check_cargo_audit.verify_exception_reachability(
+                verify_candidate_reachability(
                     indexed(exception()), root, None
                 )
 
             command = run.call_args.args[0]
             self.assertEqual(command[command.index("--color") + 1], "never")
             self.assertEqual(command[command.index("-i") + 1], "rsa@0.9.10")
-            self.assertEqual(
-                command[command.index("--manifest-path") + 1], str(root / "Cargo.toml")
-            )
+            manifest = Path(command[command.index("--manifest-path") + 1])
+            self.assertEqual(manifest.name, "Cargo.toml")
+            self.assertEqual(manifest.parent.name, "snapshot")
+            self.assertNotIn(root.resolve(), manifest.parents)
+            self.assertIn("--all-features", command)
+            self.assertEqual(command[command.index("--target") + 1], "all")
             workdir = Path(run.call_args.kwargs["cwd"]).resolve()
             self.assertNotIn(root.resolve(), (workdir, *workdir.parents))
 
@@ -718,10 +739,10 @@ class CandidateCargoIsolationTests(unittest.TestCase):
                 self.assertIn(name, result.stdout)
             (call,) = self.records(scratch)
             self.assertEqual(call["args"][0], "audit")
-            self.assertEqual(
-                call["args"][call["args"].index("--file") + 1],
-                str(candidate.resolve() / "Cargo.lock"),
-            )
+            lockfile = Path(call["args"][call["args"].index("--file") + 1])
+            self.assertEqual(lockfile.name, "Cargo.lock")
+            self.assertEqual(lockfile.parent.name, "snapshot")
+            self.assertNotIn(candidate.resolve(), lockfile.parents)
             self.assert_outside_candidate(call, candidate)
 
     def test_candidate_configuration_cannot_forge_the_rsa_dependency_path(self):
@@ -739,11 +760,12 @@ class CandidateCargoIsolationTests(unittest.TestCase):
             self.assertIn("dependency path changed", result.stderr)
             (call,) = self.records(scratch)
             self.assertEqual(call["args"][0], "tree")
-            self.assertEqual(
-                call["args"][call["args"].index("--manifest-path") + 1],
-                str(candidate.resolve() / "Cargo.toml"),
-            )
+            manifest = Path(call["args"][call["args"].index("--manifest-path") + 1])
+            self.assertEqual(manifest.name, "Cargo.toml")
+            self.assertEqual(manifest.parent.name, "snapshot")
+            self.assertNotIn(candidate.resolve(), manifest.parents)
             self.assertIn("--locked", call["args"])
+            self.assertIn("--all-features", call["args"])
             self.assert_outside_candidate(call, candidate)
 
     def test_inherited_cargo_selection_variables_are_scrubbed(self):
@@ -785,7 +807,7 @@ class CandidateCargoIsolationTests(unittest.TestCase):
                 with mock.patch.object(
                     check_cargo_audit.subprocess, "run", side_effect=fake_run
                 ):
-                    audit_report, status = check_cargo_audit.run_cargo_audit(root)
+                    audit_report, status = audit_candidate(root)
 
             self.assertEqual((audit_report, status), (report(), 0))
             environment = seen["env"]
@@ -811,22 +833,24 @@ class CandidateCargoIsolationTests(unittest.TestCase):
             self.assertNotIn(root.resolve(), (seen["cwd"], *seen["cwd"].parents))
             self.assertFalse(seen["cwd"].exists(), "the isolated directory is removed")
             command = seen["command"]
-            self.assertEqual(command[command.index("--file") + 1], str(root / "Cargo.lock"))
+            lockfile = Path(command[command.index("--file") + 1])
+            self.assertEqual(lockfile.parent, seen["cwd"].parent / "snapshot")
+            self.assertNotIn(root.resolve(), lockfile.parents)
 
     def test_lockfile_and_manifest_must_be_regular_candidate_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with mock.patch.object(check_cargo_audit.subprocess, "run") as run:
                 with self.assertRaises(check_cargo_audit.PolicyError) as missing:
-                    check_cargo_audit.run_cargo_audit(root)
+                    audit_candidate(root)
                 (root / "elsewhere.lock").write_text("version = 4\n", encoding="utf-8")
                 (root / "Cargo.lock").symlink_to(root / "elsewhere.lock")
                 with self.assertRaises(check_cargo_audit.PolicyError) as linked_lock:
-                    check_cargo_audit.run_cargo_audit(root)
+                    audit_candidate(root)
                 (root / "elsewhere.toml").write_text(REVIEWED_MANIFEST, encoding="utf-8")
                 (root / "Cargo.toml").symlink_to(root / "elsewhere.toml")
                 with self.assertRaises(check_cargo_audit.PolicyError) as linked_manifest:
-                    check_cargo_audit._read_dependency_tree("rsa", "0.9.10", root, None)
+                    read_candidate_tree(root)
             run.assert_not_called()
             for raised in (missing, linked_lock, linked_manifest):
                 self.assertIn("must be a regular file", str(raised.exception))
@@ -906,7 +930,15 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
     """
 
     def run_gate(
-        self, root, entries=None, audit_report=None, audit_stderr="", http=None, audit_status=1
+        self,
+        root,
+        entries=None,
+        audit_report=None,
+        audit_stderr="",
+        http=None,
+        audit_status=1,
+        after_capture=None,
+        cargo_hook=None,
     ):
         policy = root / "policy.json"
         policy.write_text(
@@ -924,9 +956,21 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
         ]
         stdout, stderr = io.StringIO(), io.StringIO()
         calls = []
+        capture = check_cargo_audit.candidate_snapshot
+
+        @contextlib.contextmanager
+        def captured(source_root):
+            with capture(source_root) as snapshot:
+                if after_capture is not None:
+                    after_capture(snapshot)
+                yield snapshot
 
         def cargo(command, **kwargs):
             calls.append((command, kwargs))
+            if cargo_hook is not None:
+                completed = cargo_hook(command, kwargs)
+                if completed is not None:
+                    return completed
             if command[1] == "tree":
                 return subprocess.CompletedProcess(command, 0, REVIEWED_RSA_TREE, "")
             return subprocess.CompletedProcess(
@@ -948,6 +992,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
             mock.patch.object(sys, "argv", argv),
             mock.patch.object(sys, "stdout", stdout),
             mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(check_cargo_audit, "candidate_snapshot", side_effect=captured),
             mock.patch.object(check_cargo_audit.subprocess, "run", side_effect=cargo),
             mock.patch.object(
                 check_cargo_audit.urllib.request, "urlopen", side_effect=http or fetch
@@ -1034,6 +1079,24 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
                         self.assertEqual(calls, [])
                         http.assert_not_called()
 
+    def test_ancestor_workspace_above_the_snapshot_is_refused(self):
+        with (
+            tempfile.TemporaryDirectory() as candidate_directory,
+            tempfile.TemporaryDirectory() as scratch_directory,
+        ):
+            root = Path(candidate_directory)
+            scratch = Path(scratch_directory)
+            write_reviewed_tree(root)
+            (scratch / "Cargo.toml").write_text('[workspace]\nmembers = ["*"]\n')
+            with mock.patch.object(check_cargo_audit.tempfile, "tempdir", str(scratch)):
+                status, stdout, stderr, calls, http = self.run_gate(root)
+            self.assertEqual(status, 2, stderr)
+            self.assertIn("ancestor", stderr)
+            self.assertIn(str(scratch / "Cargo.toml"), stderr)
+            self.assertNotIn("policy passed", stdout)
+            self.assertEqual(calls, [])
+            http.assert_not_called()
+
     def test_replaced_file_and_growth_cannot_turn_validation_into_an_unbounded_read(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1053,6 +1116,383 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
         # Even an unexpected device input is refused before reading bytes.
         with self.assertRaises(check_cargo_audit.PolicyError):
             check_cargo_audit._read_regular_text(Path("/dev/zero"), 32)
+
+    def test_every_check_uses_the_capture_after_original_inputs_are_replaced(self):
+        for kind in ("symlink", "oversized", "changed-valid"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_reviewed_tree(root)
+                rsa, age = locked_package(), locked_package("age", "0.12.1")
+                write_lockfile(root, [rsa, age])
+                manifest_text = (root / "Cargo.toml").read_text(encoding="utf-8")
+                lockfile_text = (root / "Cargo.lock").read_text(encoding="utf-8")
+                snapshots = []
+                source = root / check_cargo_audit.REVIEWED_AGE_MODULE
+
+                def replace_originals(snapshot):
+                    snapshots.append(snapshot)
+                    write_hostile_cargo_inputs(root)
+                    for path, limit in (
+                        (root / "Cargo.toml", check_cargo_audit.MAX_MANIFEST_BYTES),
+                        (root / "Cargo.lock", check_cargo_audit.MAX_LOCKFILE_BYTES),
+                        (source, check_cargo_audit.MAX_SOURCE_BYTES),
+                    ):
+                        path.unlink()
+                        if kind == "symlink":
+                            path.symlink_to("/dev/zero")
+                        elif kind == "oversized":
+                            with path.open("wb") as stream:
+                                stream.truncate(limit + 1)
+                    if kind == "changed-valid":
+                        (root / "Cargo.toml").write_text(
+                            REVIEWED_MANIFEST.replace('"armor"', '"plugin"'), encoding="utf-8"
+                        )
+                        write_lockfile(root, [locked_package("new-yanked", "1.0.0")])
+                        source.write_text("fn danger() { let _ = age::Decryptor; }\n")
+
+                def inspect_cargo(command, kwargs):
+                    snapshot = snapshots[0]
+                    flag = "--manifest-path" if command[1] == "tree" else "--file"
+                    path = Path(command[command.index(flag) + 1])
+                    self.assertEqual(path.parent, snapshot.root)
+                    self.assertNotIn(root, path.parents)
+                    self.assertEqual(kwargs["cwd"], snapshot.workdir)
+                    self.assertEqual(kwargs["env"], snapshot.environment)
+                    self.assertEqual(
+                        (snapshot.root / "Cargo.toml").read_text(encoding="utf-8"), manifest_text
+                    )
+                    self.assertEqual(
+                        (snapshot.root / "Cargo.lock").read_text(encoding="utf-8"), lockfile_text
+                    )
+                    self.assertEqual(
+                        (snapshot.root / check_cargo_audit.REVIEWED_AGE_MODULE).read_text(),
+                        REVIEWED_SOURCE,
+                    )
+                    self.assertEqual(
+                        sorted(path.name for path in snapshot.root.iterdir()),
+                        ["Cargo.lock", "Cargo.toml", "src"],
+                    )
+
+                status, stdout, stderr, calls, http = self.run_gate(
+                    root,
+                    entries={"rsa": [index_entry(rsa)], "age": [index_entry(age)]},
+                    after_capture=replace_originals,
+                    cargo_hook=inspect_cargo,
+                )
+                self.assertEqual(status, 0, stderr)
+                self.assertIn("yanked scan complete: 2", stdout)
+                self.assertEqual([call[0][1] for call in calls], ["tree", "audit"])
+                self.assertEqual(
+                    sorted(call.args[0].full_url for call in http.call_args_list),
+                    ["https://index.crates.io/3/a/age", "https://index.crates.io/3/r/rsa"],
+                )
+                self.assertEqual(len(snapshots), 1)
+                self.assertFalse(snapshots[0].root.exists())
+
+    def test_dangerous_source_inputs_fail_the_complete_gate_before_cargo(self):
+        kinds = (
+            "source-root-link",
+            "nested-directory-link",
+            "file-link",
+            "fifo",
+            "device",
+            "oversized",
+            "invalid-utf8",
+        )
+        for kind in kinds:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_reviewed_tree(root)
+                write_lockfile(root, [locked_package()])
+                source = root / check_cargo_audit.REVIEWED_AGE_MODULE
+                if kind == "source-root-link":
+                    (root / "src").rename(root / "hidden-src")
+                    (root / "src").symlink_to(root / "hidden-src", target_is_directory=True)
+                elif kind == "nested-directory-link":
+                    source.parent.rename(root / "hidden-secrets")
+                    (root / "src" / "secrets").symlink_to(
+                        root / "hidden-secrets", target_is_directory=True
+                    )
+                else:
+                    source.unlink()
+                    if kind == "file-link":
+                        source.symlink_to("/dev/zero")
+                    elif kind == "fifo":
+                        os.mkfifo(source)
+                    elif kind == "oversized":
+                        with source.open("wb") as stream:
+                            stream.truncate(check_cargo_audit.MAX_SOURCE_BYTES + 1)
+                    elif kind == "invalid-utf8":
+                        source.write_bytes(b"\xff")
+                    else:
+                        source.write_text(REVIEWED_SOURCE)
+
+                original_fstat = os.fstat
+
+                def fstat(descriptor):
+                    metadata = original_fstat(descriptor)
+                    if kind == "device" and metadata.st_ino == source.stat().st_ino:
+                        # A hosted runner cannot mknod. Substitute device metadata
+                        # at the actual open descriptor, before any stream read.
+                        values = list(metadata)
+                        values[0] = stat.S_IFCHR | 0o666
+                        return os.stat_result(values)
+                    return metadata
+
+                with mock.patch.object(check_cargo_audit.os, "fstat", side_effect=fstat):
+                    status, stdout, stderr, calls, http = self.run_gate(root)
+                self.assertEqual(status, 2, stderr)
+                self.assertNotIn("policy passed", stdout)
+                self.assertEqual(calls, [])
+                http.assert_not_called()
+
+    def test_replacement_cannot_hide_captured_private_key_apis_or_feature_drift(self):
+        for kind, marker in (
+            ("source", "age::Decryptor"),
+            ("source", "age::ssh::Identity"),
+            ("manifest", "plugin"),
+        ):
+            with self.subTest(kind=kind, marker=marker):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    source = REVIEWED_SOURCE
+                    manifest = REVIEWED_MANIFEST
+                    if kind == "source":
+                        source += f"fn private_key() {{ let _ = {marker}; }}\n"
+                    else:
+                        manifest = manifest.replace('"armor"', '"plugin"')
+                    write_reviewed_tree(root, manifest=manifest, source=source)
+                    write_lockfile(root, [locked_package()])
+
+                    def replace_originals(_snapshot):
+                        write_reviewed_tree(root)
+
+                    status, stdout, stderr, calls, http = self.run_gate(
+                        root, after_capture=replace_originals
+                    )
+                    self.assertEqual(status, 2, stderr)
+                    self.assertIn("RSA exception", stderr)
+                    self.assertNotIn("policy passed", stdout)
+                    self.assertEqual(calls, [])
+                    http.assert_not_called()
+
+    def test_lockfile_replacement_cannot_hide_captured_yanked_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_reviewed_tree(root)
+            rsa = locked_package()
+            write_lockfile(root, [rsa])
+
+            def replace_originals(_snapshot):
+                write_lockfile(root, [locked_package("age", "0.12.1")])
+
+            status, stdout, stderr, calls, http = self.run_gate(
+                root,
+                entries={"rsa": [index_entry(rsa, yanked=True)]},
+                after_capture=replace_originals,
+            )
+            self.assertEqual(status, 1, stderr)
+            self.assertIn("yanked: rsa 0.9.10", stderr)
+            self.assertIn("yanked scan complete: 1", stdout)
+            self.assertEqual([call[0][1] for call in calls], ["tree", "audit"])
+            self.assertEqual(http.call_count, 1)
+            self.assertEqual(http.call_args.args[0].full_url, "https://index.crates.io/3/r/rsa")
+
+    def test_file_replacement_between_metadata_check_and_capture_is_refused(self):
+        for relative in ("Cargo.toml", "Cargo.lock", "src/secrets/delivery.rs"):
+            for kind in ("symlink", "fifo", "oversized"):
+                with self.subTest(path=relative, kind=kind):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        write_reviewed_tree(root)
+                        write_lockfile(root, [locked_package()])
+                        read = check_cargo_audit._read_regular_text
+
+                        def replace_before_open(path, limit, directory_fd=None):
+                            if path.name == Path(relative).name:
+                                original = root / relative
+                                original.unlink()
+                                if kind == "symlink":
+                                    original.symlink_to("/dev/zero")
+                                elif kind == "fifo":
+                                    os.mkfifo(original)
+                                else:
+                                    with original.open("wb") as stream:
+                                        stream.truncate(limit + 1)
+                            return read(path, limit, directory_fd)
+
+                        with mock.patch.object(
+                            check_cargo_audit, "_read_regular_text", side_effect=replace_before_open
+                        ):
+                            status, stdout, stderr, calls, http = self.run_gate(root)
+                        self.assertEqual(status, 2, stderr)
+                        self.assertNotIn("policy passed", stdout)
+                        self.assertEqual(calls, [])
+                        http.assert_not_called()
+
+    def test_path_dependencies_cannot_reopen_original_candidate_manifests(self):
+        sections = (
+            "dependencies",
+            "dev-dependencies",
+            "build-dependencies",
+            "target.'cfg(unix)'.dependencies",
+            "patch.crates-io",
+            "replace",
+        )
+        for section in sections:
+            with self.subTest(section=section), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = REVIEWED_MANIFEST
+                dependency = 'extra = { path = "original-manifest" }\n'
+                if section == "dependencies":
+                    manifest += dependency
+                else:
+                    manifest += f"\n[{section}]\n{dependency}"
+                write_reviewed_tree(root, manifest=manifest)
+                write_lockfile(root, [locked_package()])
+                (root / "original-manifest").mkdir()
+                (root / "original-manifest" / "Cargo.toml").symlink_to("/dev/zero")
+                status, stdout, stderr, calls, http = self.run_gate(root)
+                self.assertEqual(status, 2, stderr)
+                self.assertIn("local path dependencies", stderr)
+                self.assertNotIn("policy passed", stdout)
+                self.assertEqual(calls, [])
+                http.assert_not_called()
+
+    def test_source_directory_replacement_during_capture_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_reviewed_tree(root)
+            write_lockfile(root, [locked_package()])
+            open_directory = check_cargo_audit._directory_descriptor
+
+            @contextlib.contextmanager
+            def replace_directory(path, parent_fd=None):
+                if path == Path("secrets"):
+                    (root / "src" / "secrets").rename(root / "moved-secrets")
+                    (root / "src" / "secrets").symlink_to(
+                        root / "moved-secrets", target_is_directory=True
+                    )
+                with open_directory(path, parent_fd) as descriptor:
+                    yield descriptor
+
+            with mock.patch.object(
+                check_cargo_audit, "_directory_descriptor", side_effect=replace_directory
+            ):
+                status, stdout, stderr, calls, http = self.run_gate(root)
+            self.assertEqual(status, 2, stderr)
+            self.assertIn("real directory", stderr)
+            self.assertNotIn("policy passed", stdout)
+            self.assertEqual(calls, [])
+            http.assert_not_called()
+
+    def test_source_tree_total_size_entry_count_and_depth_are_bounded(self):
+        for constant, value, message in (
+            ("MAX_SOURCE_TOTAL_BYTES", 8, "total byte limit"),
+            ("MAX_SOURCE_ENTRIES", 1, "entry limit"),
+            ("MAX_SOURCE_DEPTH", 0, "directory depth limit"),
+        ):
+            with self.subTest(constant=constant), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_reviewed_tree(root)
+                write_lockfile(root, [locked_package()])
+                with mock.patch.object(check_cargo_audit, constant, value):
+                    status, _stdout, stderr, calls, http = self.run_gate(root)
+                self.assertEqual(status, 2, stderr)
+                self.assertIn(message, stderr)
+                self.assertEqual(calls, [])
+                http.assert_not_called()
+
+    def test_optional_direct_rsa_is_rejected_by_a_real_offline_cargo_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            root, registry = scratch / "candidate", scratch / "registry"
+            root.mkdir()
+            registry.mkdir()
+            manifest = REVIEWED_MANIFEST + 'rsa = { version = "=0.9.10", optional = true }\n'
+            write_reviewed_tree(
+                root,
+                manifest=manifest,
+                extra_sources={
+                    "src/lib.rs": "mod private;\nmod secrets { mod delivery; }\n",
+                    "src/private.rs": '#[cfg(feature = "rsa")]\n'
+                    "fn decrypt(key: rsa::RsaPrivateKey) {\n"
+                    '    let _ = key.decrypt(rsa::Pkcs1v15Encrypt, b"ciphertext");\n'
+                    "}\n",
+                },
+            )
+            rsa = locked_package()
+            age = locked_package("age", "0.12.1", dependencies=["rsa"])
+            write_lockfile(
+                root,
+                [
+                    rsa,
+                    age,
+                    {
+                        "name": "gitforgeops",
+                        "version": "0.1.0",
+                        "dependencies": ["age", "rsa"],
+                    },
+                ],
+            )
+            # Real Cargo resolves a tiny directory registry without network or
+            # compilation. Only registry data is synthetic, never tree output.
+            for package, dependencies in (
+                (rsa, ""),
+                (age, '[dependencies]\nrsa = "=0.9.10"\n'),
+            ):
+                crate = registry / f"{package['name']}-{package['version']}"
+                (crate / "src").mkdir(parents=True)
+                files = {
+                    "Cargo.toml": '[package]\n'
+                    f'name = "{package["name"]}"\nversion = "{package["version"]}"\n'
+                    '[features]\nssh = []\narmor = []\n' + dependencies,
+                    "src/lib.rs": "pub struct RsaPrivateKey;\n",
+                }
+                for relative, text in files.items():
+                    (crate / relative).write_text(text, encoding="utf-8")
+                (crate / ".cargo-checksum.json").write_text(
+                    json.dumps(
+                        {
+                            "package": package["checksum"],
+                            "files": {
+                                relative: hashlib.sha256(text.encode("utf-8")).hexdigest()
+                                for relative, text in files.items()
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            real_run = subprocess.run
+            trees = []
+
+            def real_tree(command, kwargs):
+                self.assertEqual(command[1], "tree")
+                configs = [
+                    "--offline",
+                    "--config",
+                    'source.crates-io.replace-with="fixture"',
+                    "--config",
+                    f"source.fixture.directory={json.dumps(str(registry))}",
+                ]
+                default_command = [arg for arg in command if arg != "--all-features"]
+                default = real_run(default_command + configs, timeout=30, **kwargs)
+                self.assertEqual(default.returncode, 0, default.stderr)
+                self.assertRegex(default.stdout, check_cargo_audit.EXPECTED_RSA_TREE)
+                enabled = real_run(command + configs, timeout=30, **kwargs)
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                self.assertIsNone(check_cargo_audit.EXPECTED_RSA_TREE.fullmatch(enabled.stdout))
+                trees.extend([default.stdout, enabled.stdout])
+                return enabled
+
+            status, stdout, stderr, calls, http = self.run_gate(root, cargo_hook=real_tree)
+            self.assertEqual(status, 2, stderr)
+            self.assertIn("dependency path changed", stderr)
+            self.assertNotIn("policy passed", stdout)
+            self.assertEqual([call[0][1] for call in calls], ["tree"])
+            self.assertEqual(len(trees), 2)
+            http.assert_not_called()
 
     def test_whole_index_failure_is_fatal_with_or_without_upstream_warning(self):
         for upstream_stderr in ("", "warning: couldn't update crates.io index\n"):

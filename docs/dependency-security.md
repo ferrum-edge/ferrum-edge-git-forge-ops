@@ -55,8 +55,8 @@ reports. None of these is looked up next to `--manifest-path` or `--file`.
 
 So `check_cargo_audit.py` never runs cargo from the candidate checkout:
 
-- `cargo tree --manifest-path <candidate>/Cargo.toml` and
-  `cargo audit --file <candidate>/Cargo.lock` run from a fresh temporary
+- `cargo tree --manifest-path <snapshot>/Cargo.toml` and
+  `cargo audit --file <snapshot>/Cargo.lock` run from a fresh temporary
   directory with fresh, empty `HOME` and `CARGO_HOME` directories; `RUSTUP_HOME`
   retains the runner's installed toolchain store outside the candidate tree;
 - inherited `CARGO_*` variables (including `CARGO_ALIAS_<name>`), cargo's
@@ -69,12 +69,27 @@ So `check_cargo_audit.py` never runs cargo from the candidate checkout:
   before any content read, reachability check or Cargo invocation. Reads refuse
   symlinks and special files at open time and are bounded to 1 MiB for the
   manifest and 8 MiB for the lockfile;
+- the gate captures these files once, along with bounded regular Rust files
+  under `src/`, into a private data snapshot outside the checkout. Manifest
+  reachability, the source scan, Cargo's graph, cargo-audit and the independent
+  yanked scan all use that capture. Replacing original files after capture
+  cannot change the evidence or make Cargo reopen a symlink, device or
+  oversized input. Source traversal pins each directory with a descriptor and
+  refuses symlinked directories, symlinked files and special files before
+  interpreting source. Each Rust file is limited to 1 MiB, with a 32 MiB
+  total, 4,096 entries and 32 nested directories for the source tree;
 - this single-package repository must keep `gitforgeops` and its audited
   `Cargo.lock` at the root. `package.workspace`, any `[workspace]` table and an
-  ancestor `Cargo.toml` are refused. Cargo can otherwise select a different
-  workspace's graph and lockfile, leaving the root audit disconnected from the
-  compiled dependencies. Introducing a workspace requires a reviewed change
-  to this policy that establishes and audits the effective workspace graph;
+  ancestor `Cargo.toml` above either the checkout or snapshot are refused.
+  Cargo can otherwise select a different workspace's graph and lockfile,
+  leaving the root audit disconnected from the compiled dependencies.
+  Introducing a workspace requires a reviewed change to this policy that
+  establishes and audits the effective workspace graph;
+- local path dependencies, including target dependencies, patches and
+  replacements, are refused because they would reopen manifests outside the
+  captured package. Cargo receives the captured manifest, lockfile and Rust
+  source layout; candidate configuration, build scripts and other repository
+  files are not copied, and neither Cargo command compiles or executes them;
 - the gate refuses to run when the temporary directory is inside the
   checkout, or when any of those configuration files exists at or above it
   (point `TMPDIR` elsewhere).
@@ -84,7 +99,9 @@ ones present. A local `.cargo/audit.toml` ignore list therefore has no effect on
 the gate; record a reviewed exception in `.github/cargo-audit-policy.json`
 instead. The tests drive the checker with a stand-in `cargo` that answers
 differently whenever it can see candidate configuration, and assert it never
-does.
+does. Complete-gate tests deterministically replace the original files during
+and after capture, exercise dangerous source inputs, and verify that captured
+private-key APIs and yanked evidence cannot be hidden by later replacements.
 
 ### The expand/contract cost
 
@@ -206,13 +223,18 @@ exception. It requires:
 
 - an `age 0.12` requirement in `Cargo.toml` with exactly the `ssh` and `armor`
   features (in any order);
-- a dependency graph containing only `gitforgeops -> age 0.12.x -> rsa 0.9.x`;
+- a dependency graph containing only `gitforgeops -> age 0.12.x -> rsa 0.9.x`,
+  checked with `--all-features --target all` so optional and platform-specific
+  direct RSA paths cannot escape the exception guard;
 - no `age::` references under `src/` outside the reviewed delivery module, and
   only the reviewed `age` APIs inside it.
 
 Adding a decrypt or private-key feature, or a second RSA dependency path,
 therefore fails the required audit check even though the advisory and deadline
-are unchanged.
+are unchanged. A hosted regression runs real Cargo against a tiny offline
+registry fixture: the default-feature graph accepts the age-only path, while
+enabling an optional direct RSA dependency makes the complete gate refuse the
+exception. The fixture requires no network or compilation.
 
 The API scan is syntactic. It strips comments and string literals, then matches
 literal `age::<path>` references in `src/**/*.rs`. It does not resolve
@@ -244,15 +266,15 @@ Then run the same checks locally. None of these change `Cargo.lock`:
 ```bash
 python3 -m unittest discover -s .github/scripts/tests -v
 python3 .github/scripts/check_cargo_audit.py
-cargo tree --locked --target all -i rsa@0.9.10
+cargo tree --locked --all-features --target all -i rsa@0.9.10
 cargo test --test unit_tests
 ```
 
-Run locally, `check_cargo_audit.py` behaves exactly as it does in CI. Each
-`cargo tree` and `cargo audit` call gets fresh, empty `HOME` and `CARGO_HOME`
-directories, so every run downloads the crates.io index, the needed crate
-manifests and the RustSec advisory database again. Your `~/.cargo` cache,
-registry configuration and `~/.cargo/audit.toml` are not used. Each call also
+Run locally, `check_cargo_audit.py` behaves exactly as it does in CI. Each gate
+run shares fresh, empty `HOME` and `CARGO_HOME` directories between its
+`cargo tree` and `cargo audit` calls, so every run downloads the crates.io index,
+the needed crate manifests and the RustSec advisory database again. Your
+`~/.cargo` cache, registry configuration and `~/.cargo/audit.toml` are not used. Each call also
 runs from a temporary directory, so
 the repository's `rust-toolchain.toml` does not apply: cargo comes from your
 rustup default toolchain (or `PATH`), and `RUSTUP_TOOLCHAIN` is ignored. To
@@ -260,7 +282,7 @@ match CI, make the channel pinned in `rust-toolchain.toml` your rustup default.
 The independent yanked scan also fetches fresh sparse-index records and
 requires connectivity to `index.crates.io`.
 
-`cargo audit` reads the committed `Cargo.lock` as-is. Run `cargo update` only
+`cargo audit` reads the captured `Cargo.lock` as-is. Run `cargo update` only
 when you mean to move the lockfile; it is an upgrade, not a check.
 
 Never use `cargo audit --ignore` in CI. Add a narrowly scoped policy entry
