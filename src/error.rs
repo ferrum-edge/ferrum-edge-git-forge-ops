@@ -143,6 +143,19 @@ pub enum Error {
     #[error("{}", safe_block(.0))]
     StaleGatewayView(String),
 
+    /// A row incremental apply planned to overwrite or delete changed after the
+    /// plan: its conditional read disagreed with the plan, it disappeared, or
+    /// the gateway answered `412` to the `If-Match` write. Nothing was written
+    /// to it, and the namespace's remaining writes are withheld.
+    #[error("{}", safe_block(.0))]
+    StalePlan(String),
+
+    /// The gateway issued no strong `ETag` for a row that must be overwritten,
+    /// so no write can be made conditional on the row this run validated.
+    /// Run-stopping: every overwrite on that gateway would be refused alike.
+    #[error("{}", safe_block(.0))]
+    ConditionalWriteUnavailable(String),
+
     /// A brokered credential array shrank while the bundle still stores a
     /// value for an index the array no longer owns. Slot identity is
     /// positional, so the stored value has either been handed to whichever

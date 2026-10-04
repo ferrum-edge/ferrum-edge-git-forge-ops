@@ -1073,7 +1073,7 @@ async fn ambiguous_batch_is_not_replayed_and_is_recovered_from_authoritative_bac
         ..Default::default()
     };
     let backup = serde_json::to_string(&desired).unwrap();
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         (
             "POST /batch".into(),
@@ -1082,7 +1082,9 @@ async fn ambiguous_batch_is_not_replayed_and_is_recovered_from_authoritative_bac
             vec![],
         ),
         ("GET /backup".into(), 200, backup, vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&desired));
+    let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client_with_retries(url, 3);
 
     let result = apply_api(
@@ -1126,6 +1128,11 @@ async fn ambiguous_batch_is_not_replayed_and_is_recovered_from_authoritative_bac
         1,
         "exact readback still needs an idempotent ownership assertion"
     );
+    let put = requests
+        .iter()
+        .find(|r| r.starts_with("PUT /upstreams/u1"))
+        .unwrap();
+    assert!(put.contains("if-match: \"upstreams-u1\"\r\n"), "{put}");
 }
 
 #[tokio::test]
@@ -1135,7 +1142,7 @@ async fn ambiguous_create_is_sent_once_and_recovered_from_authoritative_backup()
         ..Default::default()
     };
     let backup = serde_json::to_string(&desired).unwrap();
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("POST /batch".into(), 501, "{}".into(), vec![]),
         (
@@ -1145,7 +1152,9 @@ async fn ambiguous_create_is_sent_once_and_recovered_from_authoritative_backup()
             vec![],
         ),
         ("GET /backup".into(), 200, backup, vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&desired));
+    let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client_with_retries(url, 3);
 
     let result = apply_api(
@@ -1187,10 +1196,12 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
         upstreams: vec![upstream("u1", "team-alpha")],
         ..Default::default()
     };
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /upstreams/u1".into(), 200, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&desired));
+    let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
 
     let result = apply_api(
@@ -1266,8 +1277,9 @@ async fn pending_assertion_is_not_duplicated_by_an_ordinary_modify() {
         "an assertion without an ordinary diff entry is kept"
     );
 
-    let (url, requests) =
-        spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
+    let mut routes = vec![("GET /health".into(), 200, HEALTHY.into(), vec![])];
+    routes.extend(tagged_rows(&live));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -1309,11 +1321,13 @@ async fn api_write_bodies_omit_timestamps_the_repo_never_declared() {
         ..Default::default()
     };
 
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /proxies/p1".into(), 200, "{}".into(), vec![]),
         ("POST /upstreams".into(), 201, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&live));
+    let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
 
     let result = apply_api(
@@ -2371,6 +2385,36 @@ fn backup_body(config: &GatewayConfig) -> String {
     serde_json::to_string(config).expect("backup body")
 }
 
+/// Serve every row of `config` on `GET /<kind>/{id}` with a strong `ETag`: the
+/// read incremental apply makes before each conditional overwrite.
+fn tagged_rows(config: &GatewayConfig) -> Vec<RecordingRoute> {
+    let document = serde_json::to_value(config).expect("live rows");
+    let mut routes = Vec::new();
+    for (section, path) in [
+        ("proxies", "/proxies"),
+        ("consumers", "/consumers"),
+        ("upstreams", "/upstreams"),
+        ("plugin_configs", "/plugins/config"),
+    ] {
+        for row in document[section].as_array().into_iter().flatten() {
+            let id = row["id"].as_str().expect("row id");
+            let etag = format!("\"{section}-{id}\"");
+            routes.push((
+                format!("GET {path}/{id} "),
+                200,
+                row.to_string(),
+                vec![("ETag".to_string(), etag)],
+            ));
+        }
+    }
+    routes
+}
+
+/// [`tagged_rows`] for every namespace's live view.
+fn tagged_actuals(actuals: &BTreeMap<String, GatewayConfig>) -> Vec<RecordingRoute> {
+    actuals.values().flat_map(tagged_rows).collect()
+}
+
 fn scoped_plugin_desired() -> GatewayConfig {
     let mut desired = GatewayConfig {
         proxies: vec![proxy("p1", "team-alpha", None)],
@@ -2440,15 +2484,10 @@ async fn new_scoped_plugin_precedes_existing_proxy_and_skips_only_a_confirmed_no
         if route_changed {
             desired.proxies[0].backend_port = 9090;
         }
-        let (url, requests) = spawn_recording_gateway(vec![
-            ("GET /health".into(), 200, HEALTHY.into(), vec![]),
-            (
-                "GET /backup".into(),
-                200,
-                backup_body(&after_plugin),
-                vec![],
-            ),
-        ]);
+        // The proxy is read after the plugin write, as the gateway left it.
+        let mut routes = vec![("GET /health".into(), 200, HEALTHY.into(), vec![])];
+        routes.extend(tagged_rows(&after_plugin));
+        let (url, requests) = spawn_recording_gateway(routes);
         let key = state_key("team-alpha", "Proxy", "p1");
         let managed = HashSet::from([key.clone()]);
         let result = apply_api(
@@ -2477,6 +2516,17 @@ async fn new_scoped_plugin_precedes_existing_proxy_and_skips_only_a_confirmed_no
             expected.push("PUT /proxies/p1 HTTP/1.1");
         }
         assert_eq!(mutation_lines(&requests), expected);
+        let requests = requests.lock().unwrap();
+        let plugin_write = requests
+            .iter()
+            .position(|r| r.starts_with("POST /plugins/config"))
+            .unwrap();
+        let proxy_read = requests
+            .iter()
+            .position(|r| r.starts_with("GET /proxies/p1 "))
+            .unwrap();
+        assert!(plugin_write < proxy_read);
+        assert!(requests.iter().all(|r| !r.starts_with("GET /backup")));
         let drift = gitforgeops::diff::compute_diff(&desired, &after_plugin).unwrap();
         assert_eq!(drift.is_empty(), !needs_put);
     }
@@ -2492,7 +2542,7 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
         if delete_proxy {
             detached.proxies.clear();
         }
-        let (url, requests) = spawn_recording_gateway(vec![]);
+        let (url, requests) = spawn_recording_gateway(tagged_rows(&desired));
         let result = apply_api(
             &detached,
             &stub_client(url),
@@ -2521,12 +2571,7 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
     let mut actual = desired.clone();
     actual.plugin_configs[0].enabled = false;
     actual.proxies[0].backend_port = 9090;
-    let (url, requests) = spawn_recording_gateway(vec![(
-        "GET /backup".into(),
-        200,
-        backup_body(&actual),
-        vec![],
-    )]);
+    let (url, requests) = spawn_recording_gateway(tagged_rows(&actual));
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -2626,7 +2671,7 @@ async fn failed_plugin_withholds_only_its_own_cyclic_create_group() {
         upstreams: vec![upstream("stale", "team-alpha")],
         ..Default::default()
     };
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         (
             "POST /batch".into(),
@@ -2640,7 +2685,9 @@ async fn failed_plugin_withholds_only_its_own_cyclic_create_group() {
             r#"{"error":"invalid g1"}"#.into(),
             vec![],
         ),
-    ]);
+    ];
+    routes.extend(tagged_rows(&actual));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -2714,12 +2761,14 @@ async fn failed_plugin_withholds_only_its_own_cyclic_create_group() {
 
 #[tokio::test]
 async fn failed_proxy_delete_retains_its_plugin_and_ledger() {
-    let (url, requests) = spawn_recording_gateway(vec![(
+    let mut routes = vec![(
         "DELETE /proxies/p1".into(),
         409,
         r#"{"error":"cannot delete proxy"}"#.into(),
         vec![],
-    )]);
+    )];
+    routes.extend(tagged_rows(&scoped_plugin_desired()));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &GatewayConfig::default(),
         &stub_client(url),
@@ -2764,17 +2813,19 @@ async fn post_plugin_confirmation_preserves_ownership_assertions_and_rejects_unt
         } else if confirmation == "foreign" {
             live.proxies[0].namespace = "team-b".into();
         }
-        let headers = if confirmation == "cached" {
-            vec![("X-Data-Source".into(), "cached".into())]
-        } else {
-            vec![]
-        };
-        let (url, requests) = spawn_recording_gateway(vec![(
-            "GET /backup".into(),
+        // The proxy is read after the plugin write, as the gateway left it.
+        let mut headers = vec![("ETag".into(), "\"p1-after-plugins\"".into())];
+        if confirmation == "cached" {
+            headers.push(("X-Data-Source".into(), "cached".into()));
+        }
+        let mut routes = vec![(
+            "GET /proxies/p1 ".into(),
             if confirmation == "failed" { 503 } else { 200 },
-            backup_body(&live),
+            serde_json::to_string(&live.proxies[0]).unwrap(),
             headers,
-        )]);
+        )];
+        routes.extend(tagged_rows(&actual));
+        let (url, requests) = spawn_recording_gateway(routes);
         let key = state_key("team-alpha", "Proxy", "p1");
         let old = state_key("team-alpha", "Proxy", "old");
         let managed = HashSet::from([old.clone()]);
@@ -2808,6 +2859,12 @@ async fn post_plugin_confirmation_preserves_ownership_assertions_and_rejects_unt
                 "DELETE /proxies/old?cleanup_orphaned_upstream=false HTTP/1.1",
             ]);
             assert!(result.errors.is_empty());
+            let requests = requests.lock().unwrap();
+            let put = requests
+                .iter()
+                .find(|r| r.starts_with("PUT /proxies/p1"))
+                .unwrap();
+            assert!(put.contains("if-match: \"p1-after-plugins\"\r\n"), "{put}");
         } else {
             assert!(!result.errors.is_empty() || result.fatal_error.is_some());
             assert!(result
@@ -2833,13 +2890,15 @@ async fn new_proxy_and_scoped_plugin_stay_atomic_in_pure_add_and_mixed_namespace
                 },
                 ..Default::default()
             };
-            let (url, requests) = spawn_recording_gateway(vec![(
+            let mut routes = vec![(
                 "POST /batch".into(),
                 batch_status,
                 r#"{"created":{"proxies":1,"plugin_configs":1,"consumers":0,"upstreams":0}}"#
                     .into(),
                 vec![],
-            )]);
+            )];
+            routes.extend(tagged_rows(&actual));
+            let (url, requests) = spawn_recording_gateway(routes);
             let result = apply_api(
                 &desired,
                 &stub_client(url),
@@ -2886,12 +2945,14 @@ async fn opted_in_batch_fallback_publishes_proxy_then_attaches_scoped_plugin() {
                 },
                 ..Default::default()
             };
-            let (url, requests) = spawn_recording_gateway(vec![(
+            let mut routes = vec![(
                 "POST /batch".into(),
                 batch_status,
                 r#"{"error":"batch rejected"}"#.into(),
                 vec![],
-            )]);
+            )];
+            routes.extend(tagged_rows(&actual));
+            let (url, requests) = spawn_recording_gateway(routes);
             let result = apply_api(
                 &desired,
                 &stub_client(url),
@@ -3033,11 +3094,13 @@ async fn opted_in_proxy_create_preserves_external_associations_and_gates_failed_
 #[tokio::test]
 async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure() {
     let desired = scoped_plugin_desired();
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("POST /batch".into(), 503, "{}".into(), vec![]),
         ("GET /backup".into(), 200, backup_body(&desired), vec![]),
         ("PUT /plugins/config/pc1".into(), 500, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&desired));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -3069,7 +3132,7 @@ async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure
 }
 
 #[tokio::test]
-async fn one_post_plugin_snapshot_adopts_all_unchanged_exclusive_proxies() {
+async fn post_plugin_reads_adopt_all_unchanged_exclusive_proxies() {
     let mut desired = scoped_plugin_desired();
     desired.proxies.push(proxy("p2", "team-alpha", None));
     desired
@@ -3081,12 +3144,9 @@ async fn one_post_plugin_snapshot_adopts_all_unchanged_exclusive_proxies() {
     for proxy in &mut actual.proxies {
         proxy.plugins.clear();
     }
-    let (url, requests) = spawn_recording_gateway(vec![(
-        "GET /backup".into(),
-        200,
-        backup_body(&desired),
-        vec![],
-    )]);
+    // Each proxy is read once, after both plugin writes, as the gateway left
+    // it. No namespace backup is needed.
+    let (url, requests) = spawn_recording_gateway(tagged_rows(&desired));
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -3110,14 +3170,16 @@ async fn one_post_plugin_snapshot_adopts_all_unchanged_exclusive_proxies() {
             "POST /plugins/config HTTP/1.1"
         ]
     );
+    let requests = requests.lock().unwrap();
+    let reads = requests
+        .iter()
+        .filter(|request| !request.starts_with("GET /health"))
+        .filter(|request| request.starts_with("GET "))
+        .map(|request| request.lines().next().unwrap())
+        .collect::<Vec<_>>();
     assert_eq!(
-        requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request| request.starts_with("GET /backup"))
-            .count(),
-        1
+        reads,
+        vec!["GET /proxies/p1 HTTP/1.1", "GET /proxies/p2 HTTP/1.1"]
     );
 }
 
@@ -3128,12 +3190,14 @@ async fn existing_plugin_retarget_to_new_proxy_fails_closed_even_with_opt_in() {
     actual.proxies[0].id = "old".into();
     actual.plugin_configs[0].proxy_id = Some("old".into());
     for allow in [false, true] {
-        let (url, requests) = spawn_recording_gateway(vec![(
+        let mut routes = vec![(
             "PUT /plugins/config/pc1".into(),
             400,
             r#"{"error":"target proxy does not exist"}"#.into(),
             vec![],
-        )]);
+        )];
+        routes.extend(tagged_rows(&actual));
+        let (url, requests) = spawn_recording_gateway(routes);
         let result = apply_api(
             &desired,
             &stub_client(url),
@@ -3259,12 +3323,14 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     assert!(
         incremental_plugin_attach_notice(&ApplyStrategy::FullReplace, &diffs, &desired).is_none()
     );
-    let (url, requests) = spawn_recording_gateway(vec![(
+    let mut routes = vec![(
         "POST /batch".into(),
         200,
         r#"{"created":{"proxies":1,"plugin_configs":1,"consumers":0,"upstreams":0}}"#.into(),
         vec![],
-    )]);
+    )];
+    routes.extend(tagged_rows(&actual));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -3340,19 +3406,24 @@ fn spawn_prune_gateway(
                         .find(|(name, _)| name.eq_ignore_ascii_case("x-ferrum-namespace"))
                         .map(|(_, value)| value.trim())
                         .unwrap_or("ferrum");
-                    let (status, response) = {
+                    let if_match = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("if-match"))
+                        .map(|(_, value)| value.trim().to_string());
+                    let (status, response, etag) = {
                         let mut state = shared.lock().unwrap();
                         state
                             .requests
                             .push((method.into(), namespace.into(), path.into()));
                         if method == "GET" && path == "/health" {
-                            (200, HEALTHY.to_string())
+                            (200, HEALTHY.to_string(), None)
                         } else if method == "GET" && path == "/backup" {
                             let config = gitforgeops::config::filter_config_by_namespace(
                                 &state.live,
                                 namespace,
                             );
-                            (200, backup_body(&config))
+                            (200, backup_body(&config), None)
                         } else if path.starts_with("/proxies") {
                             let incoming = if matches!(method, "POST" | "PUT") {
                                 Some(serde_json::from_str::<Proxy>(body).unwrap())
@@ -3365,10 +3436,28 @@ fn spawn_prune_gateway(
                                 .unwrap_or_else(|| {
                                     path.strip_prefix("/proxies/").unwrap().to_string()
                                 });
+                            let stored = state
+                                .live
+                                .proxies
+                                .iter()
+                                .find(|proxy| proxy.namespace == namespace && proxy.id == id)
+                                .cloned();
+                            let current = stored.as_ref().map(prune_etag);
+                            let stale = if_match.is_some() && if_match != current;
                             if let Some((_, _, status)) =
                                 rejection.filter(|(verb, key, _)| *verb == method && *key == id)
                             {
-                                (status, r#"{"error":"injected resource failure"}"#.into())
+                                let body = r#"{"error":"injected resource failure"}"#;
+                                (status, body.into(), None)
+                            } else if stale {
+                                (412, r#"{"error":"precondition failed"}"#.into(), None)
+                            } else if method == "GET" {
+                                match stored {
+                                    Some(proxy) => {
+                                        (200, serde_json::to_string(&proxy).unwrap(), current)
+                                    }
+                                    None => (404, r#"{"error":"not found"}"#.into(), None),
+                                }
                             } else if let Some(incoming) = incoming {
                                 assert_eq!(incoming.namespace, namespace);
                                 let conflict = state.live.proxies.iter().any(|proxy| {
@@ -3378,20 +3467,21 @@ fn spawn_prune_gateway(
                                         && proxy.listen_path == incoming.listen_path
                                 });
                                 if conflict {
-                                    (409, r#"{"error":"proxy route already exists"}"#.into())
+                                    let body = r#"{"error":"proxy route already exists"}"#;
+                                    (409, body.into(), None)
                                 } else {
                                     state.live.proxies.retain(|proxy| {
                                         proxy.namespace != namespace || proxy.id != incoming.id
                                     });
                                     state.live.proxies.push(incoming);
-                                    (200, "{}".into())
+                                    (200, "{}".into(), None)
                                 }
                             } else if method == "DELETE" {
                                 state
                                     .live
                                     .proxies
                                     .retain(|proxy| proxy.namespace != namespace || proxy.id != id);
-                                (204, String::new())
+                                (204, String::new(), None)
                             } else {
                                 panic!("unexpected proxy request: {request}");
                             }
@@ -3399,9 +3489,12 @@ fn spawn_prune_gateway(
                             panic!("unexpected request: {request}");
                         }
                     };
+                    let etag = etag
+                        .map(|etag| format!("etag: {etag}\r\n"))
+                        .unwrap_or_default();
                     if write!(
                         stream,
-                        "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\n{etag}content-length: {}\r\n\r\n{}",
                         response.len(),
                         response
                     )
@@ -3414,6 +3507,15 @@ fn spawn_prune_gateway(
         }
     });
     (format!("http://{addr}"), state)
+}
+
+/// The prune gateway's strong entity-tag for a stored proxy. Any change to the
+/// row changes it, as Ferrum Edge's does.
+fn prune_etag(proxy: &Proxy) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(proxy).unwrap().hash(&mut hasher);
+    format!("\"{:016x}\"", hasher.finish())
 }
 
 fn routed_proxy(id: &str, namespace: &str, route: &str) -> Proxy {
@@ -3827,10 +3929,12 @@ async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
     };
     let desired = live.clone();
 
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("GET /backup".into(), 200, backup_body(&live), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&live));
+    let (url, requests) = spawn_recording_gateway(routes.clone());
     let client = stub_client(url);
     let empty_fence: HashSet<String> = HashSet::new();
 
@@ -3891,10 +3995,7 @@ async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
         consumers: vec![consumer("keep", "team-alpha")],
         ..Default::default()
     };
-    let (url, requests) = spawn_recording_gateway(vec![
-        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
-        ("GET /backup".into(), 200, backup_body(&live), vec![]),
-    ]);
+    let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
 
     let second = apply_api(
@@ -3948,7 +4049,7 @@ async fn a_row_that_changed_between_diff_and_assertion_is_skipped_and_reported()
         ..Default::default()
     };
 
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         (
             "GET /backup".into(),
@@ -3956,7 +4057,10 @@ async fn a_row_that_changed_between_diff_and_assertion_is_skipped_and_reported()
             backup_body(&confirmation),
             vec![],
         ),
-    ]);
+    ];
+    // The consumer read redacts credentials but shows the edited username.
+    routes.extend(tagged_rows(&confirmation));
+    let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
     let empty_fence: HashSet<String> = HashSet::new();
 
@@ -4360,7 +4464,7 @@ async fn a_failed_adoption_put_is_reported_and_not_recorded() {
         consumers: vec![consumer("c1", "team-alpha")],
         ..Default::default()
     };
-    let (url, _requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("GET /backup".into(), 200, backup_body(&desired), vec![]),
         (
@@ -4369,7 +4473,9 @@ async fn a_failed_adoption_put_is_reported_and_not_recorded() {
             r#"{"error":"boom"}"#.into(),
             vec![],
         ),
-    ]);
+    ];
+    routes.extend(tagged_rows(&desired));
+    let (url, _requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
     let empty_fence: HashSet<String> = HashSet::new();
 
@@ -4534,7 +4640,7 @@ async fn ambiguous_batch_acknowledgement_uses_authoritative_readback_and_ownersh
         } else {
             vec![]
         };
-        let (url, requests) = spawn_recording_gateway(vec![
+        let mut routes = vec![
             ("POST /batch".into(), 207, "{}".into(), vec![]),
             (
                 "GET /backup".into(),
@@ -4548,7 +4654,9 @@ async fn ambiguous_batch_acknowledgement_uses_authoritative_readback_and_ownersh
                 "{}".into(),
                 vec![],
             ),
-        ]);
+        ];
+        routes.extend(tagged_rows(&live));
+        let (url, requests) = spawn_recording_gateway(routes);
         let result = apply_api(
             &desired,
             &stub_client_with_retries(url, 3),
@@ -4716,10 +4824,12 @@ async fn incremental_apply_refuses_to_rewrite_a_row_carrying_unmodeled_nested_fi
         row.algorithm = gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
     }
 
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /upstreams/v1".into(), 200, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&beta_live));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -4776,11 +4886,26 @@ async fn incremental_apply_may_delete_an_undeclared_row_carrying_unmodeled_neste
     desired.upstreams[0].algorithm =
         gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
 
-    let (url, requests) = spawn_recording_gateway(vec![
+    // The gateway still reports the nested field the typed mirror drops; a
+    // delete rewrites nothing, so its read does not refuse it.
+    let raw_u1 = live_upstream(
+        "u1",
+        "team-alpha",
+        serde_json::json!({"future_target_option": 7}),
+    );
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /upstreams/u2".into(), 200, "{}".into(), vec![]),
         ("DELETE /upstreams/u1".into(), 204, String::new(), vec![]),
-    ]);
+        (
+            "GET /upstreams/u1 ".into(),
+            200,
+            raw_u1.to_string(),
+            vec![("ETag".into(), "\"u1-with-future-field\"".into())],
+        ),
+    ];
+    routes.extend(tagged_rows(&live));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -4802,6 +4927,15 @@ async fn incremental_apply_may_delete_an_undeclared_row_carrying_unmodeled_neste
             "DELETE /upstreams/u1 HTTP/1.1",
             "PUT /upstreams/u2 HTTP/1.1"
         ]
+    );
+    let requests = requests.lock().unwrap();
+    let delete = requests
+        .iter()
+        .find(|r| r.starts_with("DELETE /upstreams/u1"))
+        .unwrap();
+    assert!(
+        delete.contains("if-match: \"u1-with-future-field\"\r\n"),
+        "{delete}"
     );
 }
 
@@ -5072,10 +5206,12 @@ async fn incremental_apply_refuses_to_modify_a_row_carrying_an_undeclared_top_le
         row.algorithm = gitforgeops::config::schema::LoadBalancerAlgorithm::LeastConnections;
     }
 
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /upstreams/v1".into(), 200, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&beta_live));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -5165,10 +5301,12 @@ async fn a_top_level_field_the_repository_declares_is_written_not_refused() {
         ..Default::default()
     };
 
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /upstreams/u1".into(), 200, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_rows(&live));
+    let (url, requests) = spawn_recording_gateway(routes);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -5464,10 +5602,12 @@ fn two_modified_namespaces() -> (
 #[tokio::test]
 async fn incremental_apply_refuses_a_namespace_the_caller_preflight_refused() {
     let (desired, namespaces, actuals, extras) = two_modified_namespaces();
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /upstreams/".into(), 200, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_actuals(&actuals));
+    let (url, requests) = spawn_recording_gateway(routes);
 
     // Nothing in the inputs themselves blocks `team-alpha`: the verdict comes
     // only from the caller, as it does when `cmd_apply` withheld allocation
@@ -5562,10 +5702,12 @@ fn placeholder_consumer_inputs() -> (
 #[tokio::test]
 async fn apply_refuses_a_namespace_whose_credential_slot_still_holds_its_placeholder() {
     let (desired, namespaces, actuals, extras) = placeholder_consumer_inputs();
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /upstreams/".into(), 200, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_actuals(&actuals));
+    let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
 
     // Before allocation a slot awaiting its value legitimately holds the
@@ -5654,10 +5796,12 @@ async fn a_resolved_credential_is_written_normally() {
         "keyauth".to_string(),
         serde_json::json!({"key": "resolved-value-aaaaaaaaaaaaaaaa"}),
     )]);
-    let (url, requests) = spawn_recording_gateway(vec![
+    let mut routes = vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         ("PUT /upstreams/".into(), 200, "{}".into(), vec![]),
-    ]);
+    ];
+    routes.extend(tagged_actuals(&actuals));
+    let (url, requests) = spawn_recording_gateway(routes);
 
     let result = apply_api(
         &desired,

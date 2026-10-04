@@ -17,16 +17,17 @@ revision can be published. The ids are declared once, in
 [`.github/scripts/lifecycle_result.py`](../../.github/scripts/lifecycle_result.py),
 and a test checks that this file lists each of them.
 
-The harness (`run.sh`) runs five scenarios itself: `create-and-route`,
-`reapply-is-a-no-op`, `modify-and-delete-in-order`, `drift-monitoring` and
-`file-and-mesh-boundary`. The other six always record `skipped` and are
-exercised by hand (see below).
+The harness (`run.sh`) runs six scenarios itself: `create-and-route`,
+`reapply-is-a-no-op`, `modify-and-delete-in-order`, `conditional-overwrite`,
+`drift-monitoring` and `file-and-mesh-boundary`. The other six always record
+`skipped` and are exercised by hand (see below).
 
 | Scenario | Question it answers |
 | --- | --- |
 | `create-and-route` | Do an upstream, proxy, scoped plugin and consumer actually serve authenticated traffic? |
 | `reapply-is-a-no-op` | Does applying the same desired state again change nothing — no normalization-induced false drift? |
 | `modify-and-delete-in-order` | Do modify and delete succeed in dependency-safe order — including the large-prune guard refusing first, and `--allow-large-prune` carrying it through — and does an unmanaged row survive shared mode? |
+| `conditional-overwrite` | Does the gateway issue a strong `ETag` for every kind incremental apply overwrites and refuse a write carrying a superseded one with `412` — and does an apply over an out-of-band edit re-plan and converge through its `If-Match` writes, consumers (redacted read, credentials from `/backup`) included? |
 | `credentials-generate-and-rotate` | Does a rotated credential authenticate, does the old one stop, and does no plaintext reach a log, a commit, a comment or an artifact? |
 | `partial-failure-recovery` | Do the recovery safeguards preserve successful work and ownership across an injected partial failure and an ambiguous response? |
 | `ledger-publication-failure` | When state publication is rejected after a gateway mutation and retries are exhausted, does a fresh runner recover ownership by the documented procedure — rather than treating a runner-local ledger as durable? |
@@ -62,6 +63,19 @@ No database is needed: the config store is a SQLite file the run creates and
 deletes. The suite uses the approved validator binary as the gateway too, so it
 certifies the build this repository already trusts and adds no second
 artifact to pin.
+
+Ferrum Edge v0.9.9 introduced the `ETag` / `If-Match` capability the
+`conditional-overwrite` scenario requires. That minimum does not certify a
+build's backup and consumer representations: the scenario must pass against
+the exact build, including the CLI's namespace and credential checks.
+
+The Python harness checks its admin and data-plane URLs before use and sends
+credentials only over HTTPS or HTTP to literal loopback IPs (`127.0.0.0/8`,
+`::1`). It refuses every redirect and ignores environment proxies for plaintext
+loopback requests. Both out-of-band admin helpers and traffic probes share
+this boundary. HTTP hostnames, including `localhost`, are refused, matching
+the CLI's admin transport policy. The external-gateway mode above still uses
+`127.0.0.1` and disposable credentials.
 
 ### Commands
 

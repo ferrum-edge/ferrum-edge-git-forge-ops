@@ -472,14 +472,20 @@ async fn the_gateway_scope_issues_reads_only() {
     for line in &seen {
         assert!(line.starts_with("GET "), "non-read request: {line}");
     }
-    // And only the two diagnostic endpoints — not /backup, and certainly not
-    // /restore or /batch.
+    // And only the diagnostic endpoints: /health, /cluster, and the
+    // namespace listing the entity-tag probe starts from (this stub lists
+    // none). Not /backup, and certainly not /restore or /batch.
     for line in &seen {
         assert!(
-            line.contains("/health") || line.contains("/cluster"),
+            line.contains("/health") || line.contains("/cluster") || line.contains("/namespaces"),
             "unexpected endpoint: {line}"
         );
     }
+    // With no row to read, entity-tag support is unknown, never a pass.
+    assert_eq!(
+        find(&checks, "gateway-conditional-writes").status,
+        Status::Unknown
+    );
 }
 
 #[tokio::test]
