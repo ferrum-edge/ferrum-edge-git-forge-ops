@@ -14,12 +14,14 @@ checks run again after a policy-only merge. Validator compatibility is checked
 on pull requests and by the canary, not here.
 
 CI installs cargo-audit **0.22.1** with
-`taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172`, using
+`taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0` (v2.87.22), using
 `checksum: true` and `fallback: none`. The action pin fixes the installer code.
-Separately, its [committed cargo-audit manifest](https://github.com/taiki-e/install-action/blob/9983c65e42da123ff25d1f78505eb6de315aa172/manifests/cargo-audit.json)
+The protected policy accepts only this reviewed revision after the workflow
+switch in #465 and retirement of v2.87.20. The byte-identical v2.87.20
+[committed cargo-audit manifest](https://github.com/taiki-e/install-action/blob/9983c65e42da123ff25d1f78505eb6de315aa172/manifests/cargo-audit.json)
 records the 0.22.1 Linux x86-64 archive SHA-256
 `c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab`, and the
-[installer](https://github.com/taiki-e/install-action/blob/9983c65e42da123ff25d1f78505eb6de315aa172/main.sh)
+[installer source](https://github.com/taiki-e/install-action/blob/9983c65e42da123ff25d1f78505eb6de315aa172/main.sh)
 verifies that digest before extracting. (The action SHA alone says nothing
 about the contents of an external release asset.) With fallback disabled, an
 unsupported version or platform fails instead of installing from the registry.
