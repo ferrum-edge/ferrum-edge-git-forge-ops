@@ -369,8 +369,8 @@ key: you decrypt with `age -d -i ~/.ssh/id_ed25519`.
 Install Rust and build this repository with `cargo build`, then run the CLI as
 `./target/debug/gitforgeops` (or install it with `cargo install --path .`).
 `validate` calls a separate Ferrum Edge validator. Use the approved Ferrum Edge
-v0.9.10 binary (SHA-256
-`52745149de09932b54bef79cbe5524e2376cb84d0fa7a4d8436ae0bcd19d6559`), either on
+v0.9.11 binary (SHA-256
+`97cbd7cd277feee8f661e9d2cd97a6383be969fd2fc2b61143601614922f988f`), either on
 `PATH` as `ferrum-edge` or selected with
 `FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge`. The bundled workflows check
 this digest against `.github/ferrum-edge-checksums.txt` before use.

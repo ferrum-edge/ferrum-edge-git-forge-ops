@@ -109,6 +109,14 @@ python3 .github/scripts/lifecycle_result.py record \
    - `git log -p` on the protected branch,
    - every workflow artifact.
 
+5. Use the fault proxy to change a hidden/custom credential before rotation's
+   verification. Confirm unsupported or stale evidence refuses before any broker
+   PUT. Then change the row after encrypted delivery but before its conditional
+   PUT: require refusal, preserve the concurrent row, and leave rotation completion
+   unrecorded. A fresh apply must reconcile the delivered value without deleting
+   unrelated credentials. Exercise Basic HMAC opacity without deriving equality
+   from the admin signing key.
+
 The fourth step is the scenario. The first three only set it up.
 
 ```bash

@@ -150,8 +150,9 @@ pub enum Error {
     #[error("{}", safe_block(.0))]
     StalePlan(String),
 
-    /// The gateway issued no strong `ETag` for a row that must be overwritten,
-    /// so no write can be made conditional on the row this run validated.
+    /// Authoritative consumer evidence or a coherent namespace snapshot is
+    /// unavailable, malformed, cached, unsealed, or lacks a matching strong token.
+    /// No write can be made conditional on the exact state this run validated.
     /// Run-stopping: every overwrite on that gateway would be refused alike.
     #[error("{}", safe_block(.0))]
     ConditionalWriteUnavailable(String),

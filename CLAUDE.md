@@ -377,12 +377,15 @@ namespace payload is built before the first mutation.
   bundles always survive.
 - Refused before mutation: a spec graph that cannot be proven complete, a
   repo/spec ID conflict, cached data, or an unfamiliar top-level backup section.
-- A non-empty `api_specs` section is wipe-and-reinsert, and `/restore` takes no
-  precondition (Edge's `If-Match` covers only single-resource `PUT`/`DELETE` of
-  proxies, upstreams, consumers and plugin configs). So the section is re-read
-  (`GET /backup`) right before the POST, and that namespace's restore is
-  abandoned if any spec document changed. This narrows the lost-update window
-  to one round trip; it cannot close it.
+- The original `GET /backup?conditional=true` supplies every row, four exact
+  row-token maps and a namespace token from one primary transaction. Restore
+  carries that original namespace `If-Match`, including empty namespaces and
+  confirmed spec deletion. The server checks it inside replacement and detects
+  ABA across resources, specs, trust and registry metadata. A `412` abandons the
+  body; never acquire a fresh token to replay it. The spec-only reread is removed.
+- Only proven precommit connectivity retries reuse the identical body and token.
+  Unsupported topology, audit/fence failure, cached or malformed evidence,
+  `applied:false` and uncertain commit refuse rather than downgrade.
 
 #### Mutation safety (both strategies)
 
@@ -425,21 +428,25 @@ namespace payload is built before the first mutation.
   `If-Match`, but neither check tests whether the gateway honors it. Operator
   qualification of the exact released gateway build must establish that
   conditional writes are honored; a server that returns tags but ignores
-  `If-Match` is not detected or automatically refused. Edge redacts consumer
-  credentials on `GET /consumers/{id}` while its tag covers them, so a
-  namespace's consumer targets are all read first, then one `/backup`
-  (credentials) is compared to the plan: a change before a read shows in the
-  backup, one after it fails `If-Match`. Only `rotate`'s consumer `PUT` and
-  `/restore` stay unconditional. `plan` does not probe: it reads `/backup`
-  only.
+  `If-Match` is not detected or automatically refused. Consumers instead use
+  credential-complete `GET /consumers/{id}/verification`: capture planned raw
+  evidence before allocation, confirm its archival comparison projection against
+  the original plan, then compare later complete raw evidence and row tokens.
+  Modify/Delete, shared adoption, pending assertions and ambiguous create/batch
+  reconciliation all use this evidence. Basic gateway-keyed HMACs remain opaque;
+  never infer equality using the admin signing key. Rotation establishes health,
+  ownership and representability before broker publication and changes only the
+  authorized credential with row `If-Match`; post-delivery refusal does not record
+  completion. `plan` retains ordinary `/backup` reads and explains runtime gates.
   Conditional writes require a strong `ETag` and a gateway that honors
   `If-Match`. The client probes only for the strong `ETag` and always sends
   `If-Match`; operator qualification of the exact released gateway build must
   establish server enforcement. Edge's released v0.9.6 source includes the
   capability, with no minimum-version claim; it does not certify the full
   backup/consumer wire contract. The namespace, ownership and credential
-  checks still apply; pending gateway representation fixes are not assumed
-  released.
+  checks still apply. Published Edge v0.9.11 source defines the complete consumer
+  verification and coherent conditional backup/restore contracts; exact-byte
+  hosted qualification is still required, and the first-release record is pending.
 - **Credentials travel only over TLS or loopback.** Every admin request is
   built through `AdminClient::authorize` / `Authorized::request`, the only
   place the bearer token is minted and attached; it refuses a target that is

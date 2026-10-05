@@ -7,6 +7,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Credential-complete consumer verification and coherent conditional namespace
+  snapshots for API mutations (#462). Sensitive response parsers validate identities,
+  duplicate records, row-map coverage, strong opaque tokens, source/cache state and
+  count seals without exposing credentials, tokens or response bodies. Doctor uses
+  GET-only capability probes and reports unavailable evidence as unknown.
+- Lifecycle coverage for hidden consumer edits and namespace restore conditions,
+  including ABA, empty replacement and confirmed spec deletion. Qualification on
+  the published immutable Edge v0.9.11 bytes remains required; an older fixture or
+  passing parser tests do not establish first-release acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
   resource trees ([Alloy #27](https://github.com/ferrum-edge/ferrum-alloy/issues/27)).
   The existing required validator-pairing job builds the immutable producer,
@@ -64,6 +73,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Mutation acknowledgements refuse duplicate keys, malformed field types and
+  ambiguous envelopes without exposing response bytes (#462). Invalid responses
+  cannot authorize retries, pruning, ownership ledger updates or rotation
+  completion. DELETE 404 responses also validate any nonempty acknowledgement
+  and cannot count `applied:false` as deletion; empty 404 and valid not-found
+  responses remain accepted. Ordinary empty 204 acknowledgements remain valid;
+  batch counts and conditional restore count seals still require complete matching
+  evidence.
+- Consumer modify/delete, ownership claims, pending-create and ambiguous-create/batch
+  recovery require complete stored evidence. Rotation establishes health, ownership
+  and representability before broker publication, then changes only the authorized
+  credential with the original row `If-Match`; refusal after delivery reports
+  recoverable divergence without recording completion. Basic HMACs remain opaque.
+- Every full replacement uses the original coherent snapshot's namespace `If-Match`,
+  including empty namespaces and confirmed API-spec deletion. The spec-only reread
+  is removed. Proven precommit connectivity retries reuse the identical body and
+  token; stale, unsupported and uncertain outcomes never retag or downgrade.
+- API import uses exact conditional exports and refuses unsupported hidden/custom
+  or legacy credentials before tree or bundle publication. Canonical file imports
+  retain explicit provenance; conditional files require authenticated response
+  headers. Ordinary diff, plan, review and viewer drift reads keep their endpoints.
 - Incremental `apply` needs a gateway that issues strong `ETag` values for
   existing rows and honors conditional writes with `If-Match`. The released
   Ferrum Edge v0.9.6 source contains this capability
@@ -86,10 +116,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   "requires an authoritative configuration export (GET /config/export)".
 - `EnvConfig`'s `Debug` output redacts the admin and viewer JWT secrets, the
   GitHub tokens, the inline credential bundle and the mTLS client key.
-- Pin the Ferrum Edge validator and bundled gateway to v0.9.10, keeping earlier
-  approved validator digests in the allowlist for in-flight pull requests.
-  The gateway refuses MCP requests with non-UTF-8 charsets and fails closed on
-  uninspectable or over-nested JSON-RPC batches (GHSA-4f9m-cfqg-fhx9,
+- Pin the Ferrum Edge validator and bundled gateway to published v0.9.11, keeping
+  earlier approved validator digests in the allowlist for in-flight pull requests.
+  The release baseline remains pending until exact-byte hosted qualification and
+  external acceptance complete. The gateway retains v0.9.10 MCP charset and
+  uninspectable or over-nested JSON-RPC batch hardening (GHSA-4f9m-cfqg-fhx9,
   GHSA-f2jp-59r9-fp64).
 - Report an authenticator-loss breaking change when an HTTP proxy is changed to
   passthrough, which Ferrum Edge rejects on non-stream proxies.
@@ -99,8 +130,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Include `CHANGELOG.md` and `.env.example` in downstream template updates so adopters receive
   release notes and current environment-variable examples.
 - Pin the plugin catalog, `provisioned-by` vocabulary, GitForgeOps resource-envelope fixtures,
-  and the GitForgeOps-owned resource schema to ferrum-contracts `contracts-edge-0.9.9`; unit tests
-  check vendored hashes, fixture deserialization, schema envelope fields, and compatibility with
+  and the GitForgeOps-owned resource schema to published ferrum-contracts
+  `contracts-edge-0.9.11` at `390edbd5b2485af0988e02f7827fde778d76ae0a`; unit tests check
+  vendored hashes, fixture deserialization, schema envelope fields, and compatibility with
   the qualified Ferrum Edge version.
 
 ### Security

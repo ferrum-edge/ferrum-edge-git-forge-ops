@@ -41,6 +41,8 @@ pub struct ImportSourceMetadata {
     /// Namespaces represented by this source payload, sorted lexically.
     pub namespaces: Vec<String>,
     pub config_version: String,
+    /// Exact authenticated snapshot or canonical archival/file representation.
+    pub credential_representation: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ferrum_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,6 +68,12 @@ impl ImportSourceMetadata {
             source_kind: source_kind.to_string(),
             namespaces,
             config_version: snapshot.config.version.clone(),
+            credential_representation: if snapshot.extras.conditional.is_some() {
+                "exact-stored"
+            } else {
+                "canonical-or-file"
+            }
+            .to_string(),
             ferrum_version: snapshot.ferrum_version.clone(),
             exported_at: snapshot.exported_at.clone(),
             source: snapshot.source.clone(),

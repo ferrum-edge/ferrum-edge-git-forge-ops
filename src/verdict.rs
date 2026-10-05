@@ -28,6 +28,13 @@ use crate::diff::{
 use crate::policy::PolicyFinding;
 use crate::secrets::ResolveReport;
 
+/// Runtime guarantees cannot be inferred from ordinary preview reads.
+pub const CONDITIONAL_APPLY_NOTICE: &str = "API apply requires complete consumer verification \
+    before credential allocation and row If-Match for consumer writes. Full replacement requires \
+    the original coherent namespace snapshot and namespace If-Match, including empty replacement \
+    and confirmed spec deletion. Missing or stale evidence refuses writes; preview reads do not \
+    establish gateway enforcement. Qualify the exact released gateway build.";
+
 /// Process exit code for `diff --exit-on-drift` when the live gateway and the
 /// repository disagree.
 ///

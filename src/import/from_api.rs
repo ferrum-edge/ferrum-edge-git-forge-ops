@@ -39,11 +39,14 @@ pub async fn import_from_api(
     let mut unmodeled_nested_fields = Vec::new();
 
     for namespace in namespaces {
-        let snapshot = client.get_backup_snapshot(&namespace).await?;
+        let snapshot = client.get_conditional_backup(&namespace).await?;
         if snapshot.cached {
             return Err(crate::error::Error::StaleGatewayView(format!(
                 "refusing to import namespace '{namespace}' from X-Data-Source: cached: the snapshot may be stale and omits API-spec ownership metadata; wait for the config database to recover"
             )));
+        }
+        for evidence in snapshot.extras.consumer_evidence.values() {
+            crate::http_client::conditional::require_publishable_credentials(&evidence.row, true)?;
         }
         // Read-only live comparisons treat a mismatched count seal as
         // advisory. Mutation-authorizing reads refuse it, and import also

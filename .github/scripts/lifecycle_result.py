@@ -86,6 +86,12 @@ REQUIRED_SCENARIOS: tuple[tuple[str, str], ...] = (
         "included.",
     ),
     (
+        "conditional-full-replace",
+        "Coherent namespace replacement enforces the original snapshot token, "
+        "including ABA cycles, empty namespaces and confirmed spec deletion; "
+        "the full-replacement client converges through namespace If-Match.",
+    ),
+    (
         "credentials-generate-and-rotate",
         "Generate and rotate a consumer credential; prove the new value "
         "authenticates, the old one does not, and no plaintext reaches logs, "

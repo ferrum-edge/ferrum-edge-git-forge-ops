@@ -732,7 +732,11 @@ async fn connection_drop_after_restore_delivery_is_an_ambiguous_mutation() {
         .post_restore(
             &GatewayConfig::default(),
             "team-alpha",
-            &BackupExtras::default(),
+            &super::conditional_fixtures::planned_extras(
+                &GatewayConfig::default(),
+                "team-alpha",
+                BackupExtras::default(),
+            ),
             false,
         )
         .await
@@ -1103,6 +1107,33 @@ fn applied_false_maps_to_committed_not_live() {
 }
 
 #[test]
+fn malformed_mutation_diagnostics_never_expose_response_or_parser_values() {
+    const PRIVATE: &str = "malformed-response-secret-fixture";
+    for kind in [
+        RequestKind::Mutation,
+        RequestKind::NonIdempotentMutation,
+        RequestKind::Restore,
+    ] {
+        for body in [
+            format!(r#"{{"applied":false,"applied":false,"error":"{PRIVATE}"}}"#),
+            serde_json::json!({"applied": false, "reason": {"private": PRIVATE}}).to_string(),
+            serde_json::json!({"applied": PRIVATE}).to_string(),
+            format!(r#"{{"{PRIVATE}":"unfinished""#),
+            format!("<html>{PRIVATE}</html>"),
+        ] {
+            for status in [200, 503] {
+                let error = map_api_error(status, &body, kind);
+                assert!(matches!(
+                    error,
+                    gitforgeops::error::Error::AmbiguousMutation(_)
+                ));
+                assert!(!format!("{error:?} {error}").contains(PRIVATE));
+            }
+        }
+    }
+}
+
+#[test]
 fn a_redirect_without_a_location_still_explains_itself() {
     let error = map_api_error(301, "", RequestKind::Read);
     let message = error.to_string();
@@ -1228,6 +1259,7 @@ fn backup_extras() -> BackupExtras {
         gateway_trust_bundles: Some(serde_json::json!([{ "revision": 7 }])),
         unsupported_sections: Vec::new(),
         unmodeled_nested_fields: Vec::new(),
+        ..BackupExtras::default()
     }
 }
 
@@ -1293,6 +1325,7 @@ fn restore_body_omits_an_authoritative_empty_api_spec_section() {
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
         unmodeled_nested_fields: Vec::new(),
+        ..BackupExtras::default()
     };
     let body = build_restore_body(&GatewayConfig::default(), &extras, false).unwrap();
     assert!(body.get("api_specs").is_none());

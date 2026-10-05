@@ -401,6 +401,7 @@ fn spec_extras_hashed(specs: &[(&str, &str)]) -> gitforgeops::http_client::Backu
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
         unmodeled_nested_fields: Vec::new(),
+        ..gitforgeops::http_client::BackupExtras::default()
     }
 }
 
@@ -760,7 +761,7 @@ fn a_single_tolerated_404_stays_silent() {
 
 // --- apply_api against a stub gateway ----------------------------------------
 
-use gitforgeops::apply::{all_deletes_missing_warning, apply_api, ApplyOptions};
+use gitforgeops::apply::{all_deletes_missing_warning, ApplyOptions};
 use gitforgeops::config::env::{EnvConfig, GatewayMode};
 use gitforgeops::config::schema::Upstream;
 use gitforgeops::diff::OwnershipScope;
@@ -831,13 +832,35 @@ fn spawn_recording_gateway(routes: Vec<RecordingRoute>) -> (String, Arc<Mutex<Ve
                     .find(|(needle, _, _, _)| request.contains(needle))
                     .map(|(_, status, body, headers)| (*status, body.as_str(), headers.as_slice()))
                     .unwrap_or((200, "{}", &[]));
+                let conditional;
+                let mut extra_headers = String::new();
+                let body = if request.starts_with("GET /backup?conditional=true") && status == 200 {
+                    conditional = super::conditional_fixtures::wire_envelope(
+                        &serde_json::from_str(body).unwrap(),
+                        "\"namespace-original\"",
+                    )
+                    .to_string();
+                    extra_headers =
+                        "ETag: \"namespace-original\"\r\nCache-Control: no-store\r\n".to_string();
+                    conditional.as_str()
+                } else {
+                    body
+                };
+                let sealed;
+                let body = if request.starts_with("POST /restore") && status == 200 && body == "{}"
+                {
+                    sealed = super::conditional_fixtures::restore_seal(&request);
+                    sealed.as_str()
+                } else {
+                    body
+                };
                 let headers = headers
                     .iter()
                     .map(|(name, value)| format!("{name}: {value}\r\n"))
                     .collect::<String>();
                 if write!(
                     stream,
-                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\n{extra_headers}{headers}content-length: {}\r\n\r\n{}",
                     body.len(),
                     body
                 )
@@ -920,12 +943,57 @@ fn empty_actuals(namespaces: &[&str]) -> BTreeMap<String, GatewayConfig> {
         .collect()
 }
 
-/// Backup extras reporting nothing unusual, one per namespace. A supplied live
-/// view must come with its extras, or `apply_api` refuses the namespace.
-fn no_extras(namespaces: &[String]) -> BTreeMap<String, gitforgeops::http_client::BackupExtras> {
-    namespaces
+/// Attach the original contract evidence to explicitly supplied mutation fixtures.
+async fn apply_api(
+    desired: &GatewayConfig,
+    client: &AdminClient,
+    namespaces: &[String],
+    ownership: OwnershipScope<'_>,
+    actuals: Option<&BTreeMap<String, GatewayConfig>>,
+    extras: Option<&BTreeMap<String, gitforgeops::http_client::BackupExtras>>,
+    options: &ApplyOptions,
+) -> gitforgeops::error::Result<ApplyResult> {
+    // Existing mutation regressions supply the original authoritative plan explicitly.
+    // Attach its contract evidence without filling deliberately missing map entries.
+    let extras = extras.map(|extras| {
+        extras
+            .iter()
+            .map(|(namespace, extras)| {
+                let extras = match actuals.and_then(|actuals| actuals.get(namespace)) {
+                    Some(actual) => super::conditional_fixtures::planned_extras(
+                        actual,
+                        namespace,
+                        extras.clone(),
+                    ),
+                    None => extras.clone(),
+                };
+                (namespace.clone(), extras)
+            })
+            .collect()
+    });
+    gitforgeops::apply::apply_api(
+        desired,
+        client,
+        namespaces,
+        ownership,
+        actuals,
+        extras.as_ref(),
+        options,
+    )
+    .await
+}
+
+fn no_extras(
+    actuals: &BTreeMap<String, GatewayConfig>,
+) -> BTreeMap<String, gitforgeops::http_client::BackupExtras> {
+    actuals
         .iter()
-        .map(|ns| (ns.clone(), Default::default()))
+        .map(|(namespace, config)| {
+            (
+                namespace.clone(),
+                super::conditional_fixtures::planned_extras(config, namespace, Default::default()),
+            )
+        })
         .collect()
 }
 
@@ -988,13 +1056,14 @@ async fn a_rejected_batch_chunk_falls_back_to_named_per_resource_creates() {
         ..Default::default()
     };
 
+    let planned_actuals = empty_actuals(&["team-alpha"]);
     let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["team-alpha"])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -1039,13 +1108,14 @@ async fn api_apply_batch_payload_carries_proxy_path_parameter_opt_in() {
         ),
     ]);
 
+    let planned_actuals = empty_actuals(&["team-alpha"]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["team-alpha"])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -1087,13 +1157,14 @@ async fn ambiguous_batch_is_not_replayed_and_is_recovered_from_authoritative_bac
     let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client_with_retries(url, 3);
 
+    let planned_actuals = empty_actuals(&["team-alpha"]);
     let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["team-alpha"])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -1157,13 +1228,14 @@ async fn ambiguous_create_is_sent_once_and_recovered_from_authoritative_backup()
     let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client_with_retries(url, 3);
 
+    let planned_actuals = empty_actuals(&["team-alpha"]);
     let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["team-alpha"])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -1204,16 +1276,14 @@ async fn pending_exact_row_gets_an_idempotent_ownership_assertion() {
     let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
 
+    let planned_actuals = BTreeMap::from([("team-alpha".to_string(), desired.clone())]);
     let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([(
-            "team-alpha".to_string(),
-            desired.clone(),
-        )])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions {
             pending_create_assertions: std::collections::BTreeSet::from([state_key(
                 "team-alpha",
@@ -1280,13 +1350,14 @@ async fn pending_assertion_is_not_duplicated_by_an_ordinary_modify() {
     let mut routes = vec![("GET /health".into(), 200, HEALTHY.into(), vec![])];
     routes.extend(tagged_rows(&live));
     let (url, requests) = spawn_recording_gateway(routes);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), live)]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), live)])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions {
             pending_create_assertions: pending,
             ..Default::default()
@@ -1330,13 +1401,14 @@ async fn api_write_bodies_omit_timestamps_the_repo_never_declared() {
     let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
 
+    let planned_actuals = BTreeMap::from([("ferrum".to_string(), live)]);
     let result = apply_api(
         &desired,
         &client,
         &["ferrum".to_string()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("ferrum".to_string(), live)])),
-        Some(&no_extras(&["ferrum".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -1392,13 +1464,14 @@ async fn a_create_proven_uncommitted_is_an_ordinary_error_and_later_namespaces_s
     ]);
     let client = stub_client(url);
 
+    let planned_actuals = empty_actuals(&["ferrum", "team-b"]);
     let result = apply_api(
         &desired,
         &client,
         &["ferrum".to_string(), "team-b".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["ferrum", "team-b"])),
-        Some(&no_extras(&["ferrum".to_string(), "team-b".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -1477,13 +1550,14 @@ async fn a_create_whose_readback_finds_a_different_row_still_stops_the_run() {
     ]);
     let client = stub_client(url);
 
+    let planned_actuals = empty_actuals(&["ferrum", "team-b"]);
     let result = apply_api(
         &desired,
         &client,
         &["ferrum".to_string(), "team-b".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["ferrum", "team-b"])),
-        Some(&no_extras(&["ferrum".to_string(), "team-b".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -1513,13 +1587,14 @@ async fn committed_but_not_live_create_is_failed_without_reconciliation_success(
     ]);
     let client = stub_client_with_retries(url, 3);
 
+    let planned_actuals = empty_actuals(&["team-alpha"]);
     let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["team-alpha"])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -1631,8 +1706,7 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
             "{}".into(),
             vec![],
         ),
-        // The freshness re-read immediately before the restore. Unchanged,
-        // so the payload is still an accurate description of the namespace.
+        // This route must remain unused: only the original coherent token may authorize restore.
         (
             "GET /backup".into(),
             200,
@@ -1709,21 +1783,12 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
         "an absent trust section preserves the live roots: {restore}"
     );
 
-    // The spec section is only safe to replay because it was re-read directly
-    // before the POST; a payload built minutes earlier is not evidence.
-    let ordered = requests.lock().unwrap().clone();
-    let backup_at = ordered
+    assert!(restore.contains("if-match: \"namespace-original\"\r\n"));
+    assert!(requests
+        .lock()
+        .unwrap()
         .iter()
-        .position(|request| request.contains("GET /backup"))
-        .expect("freshness re-read");
-    let restore_at = ordered
-        .iter()
-        .position(|request| request.contains("POST /restore"))
-        .expect("restore");
-    assert!(
-        backup_at < restore_at,
-        "the spec snapshot must be re-verified before the restore: {ordered:?}"
-    );
+        .all(|request| !request.starts_with("GET /backup")));
 }
 
 /// A spec rewritten between the payload being built and the POST must abort
@@ -1734,13 +1799,12 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
 async fn full_replace_aborts_when_a_spec_changed_since_the_payload_was_built() {
     let (desired, actual) = spec_owned_graph();
     let prepared = spec_extras_hashed(&[("spec-a", "sha-1")]);
-    let live = spec_extras_hashed(&[("spec-a", "sha-2")]);
     let (url, requests) = spawn_recording_gateway(vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         (
-            "GET /backup".into(),
-            200,
-            backup_body_with_extras(&actual, &live),
+            "POST /restore?confirm=true".into(),
+            412,
+            r#"{"error":"namespace changed"}"#.into(),
             vec![],
         ),
     ]);
@@ -1765,16 +1829,23 @@ async fn full_replace_aborts_when_a_spec_changed_since_the_payload_was_built() {
     // `into_result`, without taking every other namespace out of the apply.
     assert!(result.fully_replaced_namespaces.is_empty());
     let rendered = result.errors.join("\n");
-    assert!(rendered.contains("`spec-a` was modified"), "{rendered}");
+    assert!(rendered.contains("namespace changed"), "{rendered}");
     assert!(result.into_result().is_err(), "the run must not exit green");
     assert!(
         requests
             .lock()
             .unwrap()
             .iter()
-            .all(|request| !request.contains("POST /restore")),
+            .filter(|request| request.starts_with("POST /restore"))
+            .count()
+            == 1,
         "a stale spec snapshot must never be replayed"
     );
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| !request.starts_with("GET /backup")));
 }
 
 /// A spec created after the payload was built is the more destructive half of
@@ -1786,13 +1857,12 @@ async fn full_replace_aborts_when_a_spec_changed_since_the_payload_was_built() {
 async fn full_replace_aborts_when_a_spec_was_created_since_the_payload_was_built() {
     let (desired, actual) = spec_owned_graph();
     let prepared = spec_extras(&["spec-a"]);
-    let live = spec_extras(&["spec-a", "spec-b"]);
     let (url, requests) = spawn_recording_gateway(vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
         (
-            "GET /backup".into(),
-            200,
-            backup_body_with_extras(&actual, &live),
+            "POST /restore?confirm=true".into(),
+            412,
+            r#"{"error":"namespace changed"}"#.into(),
             vec![],
         ),
     ]);
@@ -1817,21 +1887,26 @@ async fn full_replace_aborts_when_a_spec_was_created_since_the_payload_was_built
     // `into_result`, without taking every other namespace out of the apply.
     assert!(result.fully_replaced_namespaces.is_empty());
     let rendered = result.errors.join("\n");
-    assert!(rendered.contains("`spec-b` was created"), "{rendered}");
+    assert!(rendered.contains("namespace changed"), "{rendered}");
     assert!(result.into_result().is_err(), "the run must not exit green");
     assert!(
         requests
             .lock()
             .unwrap()
             .iter()
-            .all(|request| !request.contains("POST /restore")),
+            .filter(|request| request.starts_with("POST /restore"))
+            .count()
+            == 1,
         "a snapshot that no longer describes the namespace must not be replayed"
     );
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| !request.starts_with("GET /backup")));
 }
 
-/// A namespace with no API specs sends no `api_specs` section, so there is
-/// nothing to replay and no reason to pay for the extra round-trip. The
-/// gateway's own existing-spec `409` covers a spec created mid-run here.
+/// Even a namespace without specs uses the original namespace token, without a reread.
 #[tokio::test]
 async fn full_replace_without_api_specs_does_not_re_read_the_backup() {
     let desired = GatewayConfig {
@@ -1873,7 +1948,7 @@ async fn full_replace_without_api_specs_does_not_re_read_the_backup() {
             .unwrap()
             .iter()
             .all(|request| !request.contains("GET /backup")),
-        "no spec section travels, so nothing needs re-verifying"
+        "the original namespace token covers all concurrent changes"
     );
 }
 
@@ -1987,6 +2062,7 @@ async fn empty_spec_snapshot_omits_api_specs_and_trust_to_close_lost_update_race
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
         unsupported_sections: Vec::new(),
         unmodeled_nested_fields: Vec::new(),
+        ..gitforgeops::http_client::BackupExtras::default()
     };
     let (url, requests) = spawn_recording_gateway(vec![
         ("GET /health".into(), 200, HEALTHY.into(), vec![]),
@@ -2113,13 +2189,14 @@ async fn a_spec_owned_conflict_blocks_only_the_conflicting_namespace() {
     ]);
     let client = stub_client(url);
 
+    let planned_actuals = actuals.clone();
     let result = apply_api(
         &desired,
         &client,
         &["alpha".to_string(), "beta".to_string()],
         OwnershipScope::Exclusive,
-        Some(&actuals),
-        Some(&no_extras(&["alpha".to_string(), "beta".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2172,13 +2249,14 @@ async fn three_xx_batch_response_never_records_an_applied_operation() {
     ]);
     let client = stub_client(url);
 
+    let planned_actuals = empty_actuals(&["team-alpha"]);
     let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["team-alpha"])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2224,7 +2302,11 @@ async fn bare_restore_403_is_refined_to_a_run_stopping_read_only_error() {
         .post_restore(
             &GatewayConfig::default(),
             "team-a",
-            &Default::default(),
+            &super::conditional_fixtures::planned_extras(
+                &GatewayConfig::default(),
+                "team-a",
+                Default::default(),
+            ),
             false,
         )
         .await
@@ -2270,13 +2352,14 @@ async fn a_read_only_plane_stops_the_run_but_keeps_earlier_namespaces_recorded()
         ..Default::default()
     };
 
+    let planned_actuals = empty_actuals(&["ferrum", "team-b"]);
     let result = apply_api(
         &desired,
         &client,
         &["ferrum".to_string(), "team-b".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["ferrum", "team-b"])),
-        Some(&no_extras(&["ferrum".to_string(), "team-b".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2320,13 +2403,14 @@ async fn a_read_only_plane_at_the_first_namespace_stops_immediately() {
         ..Default::default()
     };
 
+    let planned_actuals = empty_actuals(&["ferrum", "team-b"]);
     let result = apply_api(
         &desired,
         &client,
         &["ferrum".to_string(), "team-b".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["ferrum", "team-b"])),
-        Some(&no_extras(&["ferrum".to_string(), "team-b".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2348,13 +2432,14 @@ async fn a_read_only_preflight_fails_before_any_mutation() {
     )]);
     let client = stub_client(url);
 
+    let planned_actuals = empty_actuals(&["ferrum"]);
     let err = apply_api(
         &GatewayConfig::default(),
         &client,
         &["ferrum".to_string()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["ferrum"])),
-        Some(&no_extras(&["ferrum".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2400,10 +2485,20 @@ fn tagged_rows(config: &GatewayConfig) -> Vec<RecordingRoute> {
             let id = row["id"].as_str().expect("row id");
             let etag = format!("\"{section}-{id}\"");
             routes.push((
-                format!("GET {path}/{id} "),
+                format!(
+                    "GET {path}/{id}{} ",
+                    if section == "consumers" {
+                        "/verification"
+                    } else {
+                        ""
+                    }
+                ),
                 200,
                 row.to_string(),
-                vec![("ETag".to_string(), etag)],
+                vec![
+                    ("ETag".to_string(), etag),
+                    ("Cache-Control".to_string(), "no-store".to_string()),
+                ],
             ));
         }
     }
@@ -2490,6 +2585,7 @@ async fn new_scoped_plugin_precedes_existing_proxy_and_skips_only_a_confirmed_no
         let (url, requests) = spawn_recording_gateway(routes);
         let key = state_key("team-alpha", "Proxy", "p1");
         let managed = HashSet::from([key.clone()]);
+        let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
         let result = apply_api(
             &desired,
             &stub_client(url),
@@ -2497,8 +2593,8 @@ async fn new_scoped_plugin_precedes_existing_proxy_and_skips_only_a_confirmed_no
             OwnershipScope::Shared {
                 previously_managed: &managed,
             },
-            Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-            Some(&no_extras(&["team-alpha".into()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &ApplyOptions {
                 managed_ledger: BTreeSet::from([key]),
                 ..Default::default()
@@ -2543,13 +2639,14 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
             detached.proxies.clear();
         }
         let (url, requests) = spawn_recording_gateway(tagged_rows(&desired));
+        let planned_actuals = BTreeMap::from([("team-alpha".into(), desired.clone())]);
         let result = apply_api(
             &detached,
             &stub_client(url),
             &["team-alpha".into()],
             OwnershipScope::Exclusive,
-            Some(&BTreeMap::from([("team-alpha".into(), desired.clone())])),
-            Some(&no_extras(&["team-alpha".into()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &ApplyOptions::default(),
         )
         .await
@@ -2572,13 +2669,14 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
     actual.plugin_configs[0].enabled = false;
     actual.proxies[0].backend_port = 9090;
     let (url, requests) = spawn_recording_gateway(tagged_rows(&actual));
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2606,13 +2704,14 @@ async fn failed_plugin_write_blocks_its_proxy_and_defers_pruning() {
         r#"{"error":"invalid config"}"#.into(),
         vec![],
     )]);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2688,13 +2787,14 @@ async fn failed_plugin_withholds_only_its_own_cyclic_create_group() {
     ];
     routes.extend(tagged_rows(&actual));
     let (url, requests) = spawn_recording_gateway(routes);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2769,16 +2869,14 @@ async fn failed_proxy_delete_retains_its_plugin_and_ledger() {
     )];
     routes.extend(tagged_rows(&scoped_plugin_desired()));
     let (url, requests) = spawn_recording_gateway(routes);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), scoped_plugin_desired())]);
     let result = apply_api(
         &GatewayConfig::default(),
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([(
-            "team-alpha".into(),
-            scoped_plugin_desired(),
-        )])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -2790,6 +2888,149 @@ async fn failed_proxy_delete_retains_its_plugin_and_ledger() {
     assert_eq!(result.deletes_deferred, 1);
     assert!(result.applied_incremental.is_empty());
     assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn delete_404_acknowledgements_gate_plugin_pruning_ledger_and_completion() {
+    const SECRET: &str = "delete-response-private-fixture";
+
+    let cases = [
+        (String::new(), true),
+        (r#"{"error":"not found"}"#.to_string(), true),
+        (r#"{"error":"Proxy not found"}"#.to_string(), true),
+        (
+            format!(r#"{{"applied":false,"applied":false,"error":"{SECRET}"}}"#),
+            false,
+        ),
+        (
+            format!(r#"{{"applied":false,"applied":true,"error":"{SECRET}"}}"#),
+            false,
+        ),
+        (
+            serde_json::json!({"error": "not found", "reason": {"private": SECRET}}).to_string(),
+            false,
+        ),
+        (
+            serde_json::json!({"applied": null, "error": SECRET}).to_string(),
+            false,
+        ),
+        (format!(r#"{{"error":"{SECRET}""#), false),
+        (
+            serde_json::json!({"applied": false, "reason": SECRET, "error": SECRET}).to_string(),
+            false,
+        ),
+    ];
+    for (case, (body, acknowledged)) in cases.into_iter().enumerate() {
+        for shared in [false, true] {
+            let context = format!("shared={shared} case={case}");
+            let actual = scoped_plugin_desired();
+            let original_ops = [
+                gitforgeops::apply::AppliedOp {
+                    kind: "Proxy".to_string(),
+                    namespace: "team-alpha".to_string(),
+                    id: "p1".to_string(),
+                    action: DiffAction::Add,
+                },
+                gitforgeops::apply::AppliedOp {
+                    kind: "PluginConfig".to_string(),
+                    namespace: "team-alpha".to_string(),
+                    id: "pc1".to_string(),
+                    action: DiffAction::Add,
+                },
+            ];
+            let mut state = ledger_of(&original_ops, &actual);
+            state.last_applied_at = Some("2026-10-03T00:00:00Z".to_string());
+            state.last_applied_commit = Some("prior-complete-commit".to_string());
+            let original_ledger = serde_json::to_value(&state.resources).unwrap();
+            let original_stamp = (
+                state.last_applied_at.clone(),
+                state.last_applied_commit.clone(),
+            );
+            let managed = state.previously_managed_keys();
+            let ownership = if shared {
+                OwnershipScope::Shared {
+                    previously_managed: &managed,
+                }
+            } else {
+                OwnershipScope::Exclusive
+            };
+            let mut routes = vec![
+                ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+                ("DELETE /proxies/p1".into(), 404, body.clone(), vec![]),
+                (
+                    "DELETE /plugins/config/pc1".into(),
+                    204,
+                    String::new(),
+                    vec![],
+                ),
+            ];
+            routes.extend(tagged_rows(&actual));
+            let (url, requests) = spawn_recording_gateway(routes);
+            let actuals = BTreeMap::from([("team-alpha".to_string(), actual)]);
+            let desired = GatewayConfig::default();
+            let result = apply_api(
+                &desired,
+                &stub_client_with_retries(url, 3),
+                &["team-alpha".to_string()],
+                ownership,
+                Some(&actuals),
+                Some(&no_extras(&actuals)),
+                &ApplyOptions::default(),
+            )
+            .await
+            .unwrap();
+            let mut expected = vec!["DELETE /proxies/p1?cleanup_orphaned_upstream=false HTTP/1.1"];
+            if acknowledged {
+                expected.push("DELETE /plugins/config/pc1 HTTP/1.1");
+            }
+            assert_eq!(mutation_lines(&requests), expected, "{context}");
+            assert_eq!(
+                result.deleted,
+                if acknowledged { 2 } else { 0 },
+                "{context}"
+            );
+            assert_eq!(
+                result.deletes_missing,
+                usize::from(acknowledged),
+                "{context}"
+            );
+            assert_eq!(
+                result.applied_incremental.len(),
+                result.deleted,
+                "{context}"
+            );
+            assert!(result.adopted.is_empty(), "{context}");
+            assert!(!format!("{:?} {:?}", result.errors, result.fatal_error).contains(SECRET));
+            assert_eq!(result.fatal_error.is_none(), acknowledged, "{context}");
+            let seen = requests.lock().unwrap();
+            let deletion = seen
+                .iter()
+                .find(|request| request.starts_with("DELETE /proxies/p1"))
+                .unwrap();
+            assert!(deletion.contains("if-match: \"proxies-p1\"\r\n"));
+            assert!(deletion.contains("x-ferrum-namespace: team-alpha\r\n"));
+            drop(seen);
+            record_prune_result(&mut state, &result, &desired);
+            let succeeded = result.into_result().is_ok();
+            assert_eq!(succeeded, acknowledged, "{context}");
+            state.stamp_last_applied_if_clean(succeeded);
+            if acknowledged {
+                assert!(state.resources.is_empty(), "{context}");
+                assert_ne!(state.last_applied_at, original_stamp.0, "{context}");
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&state.resources).unwrap(),
+                    original_ledger,
+                    "{context}"
+                );
+                assert_eq!(
+                    (state.last_applied_at, state.last_applied_commit),
+                    original_stamp,
+                    "{context}"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -2839,6 +3080,7 @@ async fn post_plugin_confirmation_preserves_ownership_assertions_and_rejects_unt
         if confirmation == "pending" {
             options.pending_create_assertions.insert(key);
         }
+        let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
         let result = apply_api(
             &desired,
             &stub_client(url),
@@ -2846,8 +3088,8 @@ async fn post_plugin_confirmation_preserves_ownership_assertions_and_rejects_unt
             OwnershipScope::Shared {
                 previously_managed: &managed,
             },
-            Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-            Some(&no_extras(&["team-alpha".into()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &options,
         )
         .await
@@ -2899,13 +3141,14 @@ async fn new_proxy_and_scoped_plugin_stay_atomic_in_pure_add_and_mixed_namespace
             )];
             routes.extend(tagged_rows(&actual));
             let (url, requests) = spawn_recording_gateway(routes);
+            let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
             let result = apply_api(
                 &desired,
                 &stub_client(url),
                 &["team-alpha".into()],
                 OwnershipScope::Exclusive,
-                Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-                Some(&no_extras(&["team-alpha".into()])),
+                Some(&planned_actuals),
+                Some(&no_extras(&planned_actuals)),
                 &ApplyOptions::default(),
             )
             .await
@@ -2953,13 +3196,14 @@ async fn opted_in_batch_fallback_publishes_proxy_then_attaches_scoped_plugin() {
             )];
             routes.extend(tagged_rows(&actual));
             let (url, requests) = spawn_recording_gateway(routes);
+            let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
             let result = apply_api(
                 &desired,
                 &stub_client(url),
                 &["team-alpha".into()],
                 OwnershipScope::Exclusive,
-                Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-                Some(&no_extras(&["team-alpha".into()])),
+                Some(&planned_actuals),
+                Some(&no_extras(&planned_actuals)),
                 &ApplyOptions {
                     allow_nontransactional_plugin_attach: true,
                     ..Default::default()
@@ -3005,13 +3249,14 @@ async fn failed_opted_in_attachment_preserves_proxy_ownership_and_defers_pruning
         ("POST /batch".into(), 501, "{}".into(), vec![]),
         ("POST /plugins/config".into(), 400, "{}".into(), vec![]),
     ]);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions {
             allow_nontransactional_plugin_attach: true,
             ..Default::default()
@@ -3052,6 +3297,7 @@ async fn opted_in_proxy_create_preserves_external_associations_and_gates_failed_
             ("POST /batch".into(), 501, "{}".into(), vec![]),
             ("POST /proxies".into(), proxy_status, "{}".into(), vec![]),
         ]);
+        let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
         let result = apply_api(
             &desired,
             &stub_client(url),
@@ -3059,8 +3305,8 @@ async fn opted_in_proxy_create_preserves_external_associations_and_gates_failed_
             OwnershipScope::Shared {
                 previously_managed: &HashSet::new(),
             },
-            Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-            Some(&no_extras(&["team-alpha".into()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &ApplyOptions {
                 allow_nontransactional_plugin_attach: true,
                 ..Default::default()
@@ -3101,6 +3347,7 @@ async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure
     ];
     routes.extend(tagged_rows(&desired));
     let (url, requests) = spawn_recording_gateway(routes);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), GatewayConfig::default())]);
     let result = apply_api(
         &desired,
         &stub_client(url),
@@ -3108,11 +3355,8 @@ async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure
         OwnershipScope::Shared {
             previously_managed: &HashSet::new(),
         },
-        Some(&BTreeMap::from([(
-            "team-alpha".into(),
-            GatewayConfig::default(),
-        )])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -3147,13 +3391,14 @@ async fn post_plugin_reads_adopt_all_unchanged_exclusive_proxies() {
     // Each proxy is read once, after both plugin writes, as the gateway left
     // it. No namespace backup is needed.
     let (url, requests) = spawn_recording_gateway(tagged_rows(&desired));
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -3198,13 +3443,14 @@ async fn existing_plugin_retarget_to_new_proxy_fails_closed_even_with_opt_in() {
         )];
         routes.extend(tagged_rows(&actual));
         let (url, requests) = spawn_recording_gateway(routes);
+        let planned_actuals = BTreeMap::from([("team-alpha".into(), actual.clone())]);
         let result = apply_api(
             &desired,
             &stub_client(url),
             &["team-alpha".into()],
             OwnershipScope::Exclusive,
-            Some(&BTreeMap::from([("team-alpha".into(), actual.clone())])),
-            Some(&no_extras(&["team-alpha".into()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &ApplyOptions {
                 allow_nontransactional_plugin_attach: allow,
                 ..Default::default()
@@ -3242,16 +3488,14 @@ async fn non_proxy_scope_with_stray_target_does_not_enter_batch_only_path() {
         // gate. This isolates dependency classification for malformed targets.
         let (url, requests) =
             spawn_recording_gateway(vec![("POST /batch".into(), 501, "{}".into(), vec![])]);
+        let planned_actuals = BTreeMap::from([("team-alpha".into(), GatewayConfig::default())]);
         let result = apply_api(
             &desired,
             &stub_client(url),
             &["team-alpha".into()],
             OwnershipScope::Exclusive,
-            Some(&BTreeMap::from([(
-                "team-alpha".into(),
-                GatewayConfig::default(),
-            )])),
-            Some(&no_extras(&["team-alpha".into()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &ApplyOptions::default(),
         )
         .await
@@ -3331,13 +3575,14 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     )];
     routes.extend(tagged_rows(&actual));
     let (url, requests) = spawn_recording_gateway(routes);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -3938,6 +4183,7 @@ async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
     let client = stub_client(url);
     let empty_fence: HashSet<String> = HashSet::new();
 
+    let planned_actuals = BTreeMap::from([("team-alpha".to_string(), live.clone())]);
     let first = apply_api(
         &desired,
         &client,
@@ -3945,8 +4191,8 @@ async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
         OwnershipScope::Shared {
             previously_managed: &empty_fence,
         },
-        Some(&BTreeMap::from([("team-alpha".to_string(), live.clone())])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -3998,6 +4244,7 @@ async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
     let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
 
+    let planned_actuals = BTreeMap::from([("team-alpha".to_string(), live.clone())]);
     let second = apply_api(
         &desired_without_old,
         &client,
@@ -4005,8 +4252,8 @@ async fn already_matching_rows_are_adopted_and_a_later_removal_is_pruned() {
         OwnershipScope::Shared {
             previously_managed: &managed,
         },
-        Some(&BTreeMap::from([("team-alpha".to_string(), live.clone())])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions {
             managed_ledger: managed.iter().cloned().collect(),
             ..Default::default()
@@ -4058,12 +4305,13 @@ async fn a_row_that_changed_between_diff_and_assertion_is_skipped_and_reported()
             vec![],
         ),
     ];
-    // The consumer read redacts credentials but shows the edited username.
+    // The complete consumer verification shows the edited username.
     routes.extend(tagged_rows(&confirmation));
     let (url, requests) = spawn_recording_gateway(routes);
     let client = stub_client(url);
     let empty_fence: HashSet<String> = HashSet::new();
 
+    let planned_actuals = BTreeMap::from([("team-alpha".to_string(), desired.clone())]);
     let result = apply_api(
         &desired,
         &client,
@@ -4072,18 +4320,16 @@ async fn a_row_that_changed_between_diff_and_assertion_is_skipped_and_reported()
             previously_managed: &empty_fence,
         },
         // The diff ran against a view in which the row still matched.
-        Some(&BTreeMap::from([(
-            "team-alpha".to_string(),
-            desired.clone(),
-        )])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
-    .expect("a skipped adoption is not a failure");
+    .expect("a refused consumer claim retains a namespace-scoped failure");
 
     assert!(result.adopted.is_empty(), "{:?}", result.adopted);
-    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.errors.len(), 1);
+    assert!(result.errors[0].contains("remaining namespace claims withheld"));
     assert_eq!(result.adoption_skipped.len(), 1, "{result:?}");
     let message = &result.adoption_skipped[0];
     assert!(message.contains("Consumer `c1`"), "{message}");
@@ -4145,6 +4391,7 @@ async fn a_spec_owner_added_during_confirmation_prevents_adoption() {
     let client = stub_client(url);
     let empty_fence: HashSet<String> = HashSet::new();
 
+    let planned_actuals = BTreeMap::from([("team-alpha".to_string(), desired.clone())]);
     let result = apply_api(
         &desired,
         &client,
@@ -4152,11 +4399,8 @@ async fn a_spec_owner_added_during_confirmation_prevents_adoption() {
         OwnershipScope::Shared {
             previously_managed: &empty_fence,
         },
-        Some(&BTreeMap::from([(
-            "team-alpha".to_string(),
-            desired.clone(),
-        )])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -4188,7 +4432,9 @@ async fn supplied_duplicate_live_rows_refuse_both_apply_strategies_before_any_re
                 "team-alpha".to_string(),
                 gitforgeops::http_client::BackupExtras::default(),
             )]);
-            let result = apply_api(
+            // Deliberately invalid raw state must reach the production duplicate
+            // guard before the local wrapper constructs conditional evidence.
+            let result = gitforgeops::apply::apply_api(
                 &GatewayConfig::default(),
                 &client,
                 &["team-alpha".to_string()],
@@ -4226,6 +4472,7 @@ async fn duplicate_confirmation_rows_fail_adoption_without_claiming_ownership() 
         ]);
         let client = stub_client(url);
         let fence = HashSet::new();
+        let planned_actuals = BTreeMap::from([("team-alpha".to_string(), desired.clone())]);
         let result = apply_api(
             &desired,
             &client,
@@ -4233,11 +4480,8 @@ async fn duplicate_confirmation_rows_fail_adoption_without_claiming_ownership() 
             OwnershipScope::Shared {
                 previously_managed: &fence,
             },
-            Some(&BTreeMap::from([(
-                "team-alpha".to_string(),
-                desired.clone(),
-            )])),
-            Some(&no_extras(&["team-alpha".to_string()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &ApplyOptions::default(),
         )
         .await
@@ -4387,6 +4631,7 @@ async fn a_cached_backup_blocks_adoption() {
     let client = stub_client(url);
     let empty_fence: HashSet<String> = HashSet::new();
 
+    let planned_actuals = BTreeMap::from([("team-alpha".to_string(), desired.clone())]);
     let result = apply_api(
         &desired,
         &client,
@@ -4394,11 +4639,8 @@ async fn a_cached_backup_blocks_adoption() {
         OwnershipScope::Shared {
             previously_managed: &empty_fence,
         },
-        Some(&BTreeMap::from([(
-            "team-alpha".to_string(),
-            desired.clone(),
-        )])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -4430,16 +4672,14 @@ async fn exclusive_mode_records_adoption_without_a_put() {
         spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
     let client = stub_client(url);
 
+    let planned_actuals = BTreeMap::from([("team-alpha".to_string(), desired.clone())]);
     let result = apply_api(
         &desired,
         &client,
         &["team-alpha".to_string()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([(
-            "team-alpha".to_string(),
-            desired.clone(),
-        )])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -4479,6 +4719,7 @@ async fn a_failed_adoption_put_is_reported_and_not_recorded() {
     let client = stub_client(url);
     let empty_fence: HashSet<String> = HashSet::new();
 
+    let planned_actuals = BTreeMap::from([("team-alpha".to_string(), desired.clone())]);
     let result = apply_api(
         &desired,
         &client,
@@ -4486,11 +4727,8 @@ async fn a_failed_adoption_put_is_reported_and_not_recorded() {
         OwnershipScope::Shared {
             previously_managed: &empty_fence,
         },
-        Some(&BTreeMap::from([(
-            "team-alpha".to_string(),
-            desired.clone(),
-        )])),
-        Some(&no_extras(&["team-alpha".to_string()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -4581,13 +4819,14 @@ async fn batch_acknowledgement_requires_matching_counts_and_a_commit_status() {
                 vec![],
             ),
         ]);
+        let planned_actuals = empty_actuals(&["team-alpha"]);
         let result = apply_api(
             &desired,
             &stub_client_with_retries(url, 3),
             &["team-alpha".into()],
             OwnershipScope::Exclusive,
-            Some(&empty_actuals(&["team-alpha"])),
-            Some(&no_extras(&["team-alpha".into()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &ApplyOptions::default(),
         )
         .await
@@ -4657,6 +4896,7 @@ async fn ambiguous_batch_acknowledgement_uses_authoritative_readback_and_ownersh
         ];
         routes.extend(tagged_rows(&live));
         let (url, requests) = spawn_recording_gateway(routes);
+        let planned_actuals = empty_actuals(&["team-alpha"]);
         let result = apply_api(
             &desired,
             &stub_client_with_retries(url, 3),
@@ -4664,8 +4904,8 @@ async fn ambiguous_batch_acknowledgement_uses_authoritative_readback_and_ownersh
             OwnershipScope::Shared {
                 previously_managed: &HashSet::new(),
             },
-            Some(&empty_actuals(&["team-alpha"])),
-            Some(&no_extras(&["team-alpha".into()])),
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
             &ApplyOptions::default(),
         )
         .await
@@ -4719,13 +4959,14 @@ async fn invalid_batch_acknowledgement_preserves_prior_namespace_operations() {
             vec![("X-Data-Source".into(), "cached".into())],
         ),
     ]);
+    let planned_actuals = empty_actuals(&["alpha", "team-alpha"]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["alpha".into(), "team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&empty_actuals(&["alpha", "team-alpha"])),
-        Some(&no_extras(&["alpha".into(), "team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -4749,13 +4990,14 @@ async fn uncommitted_cycle_batch_defers_deletes_after_invalid_acknowledgement() 
         ("POST /batch".into(), 201, "{}".into(), vec![]),
         ("GET /backup".into(), 200, backup_body(&actual), vec![]),
     ]);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
     let result = apply_api(
         &desired,
         &stub_client(url),
         &["team-alpha".into()],
         OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".into(), actual)])),
-        Some(&no_extras(&["team-alpha".into()])),
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
         &ApplyOptions::default(),
     )
     .await
@@ -4767,6 +5009,58 @@ async fn uncommitted_cycle_batch_defers_deletes_after_invalid_acknowledgement() 
     assert_eq!(result.errors.len(), 1);
     assert_eq!(mutation_lines(&requests), vec!["POST /batch HTTP/1.1"]);
     assert!(result.into_result().is_err());
+}
+
+#[tokio::test]
+async fn malformed_batch_markers_cannot_authorize_pruning_or_ledger_completion() {
+    const PRIVATE: &str = "batch-acknowledgement-secret-fixture";
+    let counts = serde_json::json!({
+        "proxies": 1, "consumers": 0, "plugin_configs": 1, "upstreams": 0
+    });
+    for body in [
+        serde_json::json!({"created": counts, "applied": false, "reason": {"private": PRIVATE}})
+            .to_string(),
+        format!(r#"{{"created":{counts},"applied":false,"applied":false,"error":"{PRIVATE}"}}"#),
+    ] {
+        let desired = scoped_plugin_desired();
+        let actual = GatewayConfig {
+            proxies: vec![proxy("old", "team-alpha", None)],
+            ..Default::default()
+        };
+        let mut state = proxy_ledger(&actual);
+        let original_ledger = state.resources.clone();
+        let managed = state.resources.keys().cloned().collect::<HashSet<_>>();
+        let (url, requests) = spawn_recording_gateway(vec![
+            ("POST /batch".into(), 201, body, vec![]),
+            ("GET /backup".into(), 200, backup_body(&actual), vec![]),
+        ]);
+        let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
+        let result = apply_api(
+            &desired,
+            &stub_client_with_retries(url, 3),
+            &["team-alpha".into()],
+            OwnershipScope::Shared {
+                previously_managed: &managed,
+            },
+            Some(&planned_actuals),
+            Some(&no_extras(&planned_actuals)),
+            &ApplyOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((result.created, result.updated, result.deleted), (0, 0, 0));
+        assert_eq!(result.deletes_deferred, 1);
+        assert!(result.applied_incremental.is_empty());
+        assert!(result.adopted.is_empty());
+        assert!(!result.errors.is_empty());
+        assert!(!format!("{:?} {:?}", result.errors, result.fatal_error).contains(PRIVATE));
+        assert_eq!(mutation_lines(&requests), vec!["POST /batch HTTP/1.1"]);
+        record_prune_result(&mut state, &result, &desired);
+        state.stamp_last_applied_if_clean(result.fatal_error.is_none() && result.errors.is_empty());
+        assert_eq!(state.resources, original_ledger);
+        assert!(state.last_applied_at.is_none());
+        assert!(result.into_result().is_err());
+    }
 }
 
 /// Live view and extras for one namespace, decoded the way `cmd_apply`
@@ -5509,7 +5803,8 @@ async fn preflight_returns_every_namespace_the_apply_will_refuse() {
         ),
         ("team-alpha".to_string(), alpha_live),
     ]);
-    let mut extras = no_extras(&namespaces[..2]);
+    let mut extras = no_extras(&actuals);
+    extras.remove(&namespaces[2]);
     extras.insert("team-alpha".to_string(), alpha_extras);
 
     let (url, requests) =
@@ -5843,7 +6138,7 @@ async fn apply_refuses_an_unresolved_plugin_config_secret_before_any_write() {
     });
     let namespaces = vec!["team-alpha".to_string()];
     let actuals = empty_actuals(&["team-alpha"]);
-    let extras = no_extras(&namespaces);
+    let extras = no_extras(&actuals);
     let (url, requests) =
         spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
 
@@ -5892,7 +6187,7 @@ async fn apply_refuses_an_unresolved_service_discovery_secret_before_any_write()
     };
     let namespaces = vec!["team-alpha".to_string()];
     let actuals = empty_actuals(&["team-alpha"]);
-    let extras = no_extras(&namespaces);
+    let extras = no_extras(&actuals);
     let (url, requests) =
         spawn_recording_gateway(vec![("GET /health".into(), 200, HEALTHY.into(), vec![])]);
 

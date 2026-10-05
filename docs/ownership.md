@@ -88,7 +88,7 @@ spec-owned.
 
 | Mode | What adoption does |
 |---|---|
-| `shared` | Claims the row with an idempotent `PUT`, sent with `If-Match` on a fresh read of the row that must still equal the declaration (and on a freshly re-read backup). A row that changed since the diff, or changes before the `PUT` lands, is skipped and stays unclaimed, so a concurrent edit is never reverted. |
+| `shared` | Claims the row with an idempotent `PUT`, sent with `If-Match` on a fresh read of the row that must still equal the declaration (with complete preallocation evidence for Consumers). A row that changed since the diff, or changes before the `PUT` lands, is skipped and stays unclaimed, so a concurrent edit is never reverted. |
 | `exclusive` | Records the ledger entry without writing. |
 | file mode | Nothing extra; the file write records the whole desired set. |
 | `full_replace` | Not applicable; a restore rebuilds the namespace's ledger entries. |
@@ -178,11 +178,14 @@ whatever the ledger says:
 
 `/restore` validates API-spec ownership as a unit, so the restore body carries
 the repository's rows, the complete live spec-owned graph, and the live
-`api_specs` section. Because a restore deletes and re-creates every spec in the
-namespace, GitForgeOps re-reads `/backup` just before the `POST` and abandons
-that namespace if any spec document changed (the admin API offers no
-precondition header). Other namespaces still apply and the run exits non-zero.
-A namespace whose specs are actively edited should use incremental apply.
+`api_specs` section. All come from the original coherent
+`GET /backup?conditional=true` snapshot. The restore carries its namespace
+`If-Match`, checked inside the server's replacement transaction. A spec document,
+tagged resource, credential, association, trust or namespace metadata change
+invalidates the prepared replacement, including ABA changes. A `412` abandons
+that body without acquiring a fresh token. Other namespaces retain completed
+results and the run exits nonzero. Empty replacement and confirmed spec deletion
+require the same original namespace condition.
 
 Two sections are always left out of the body:
 

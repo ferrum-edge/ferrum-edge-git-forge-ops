@@ -14,15 +14,16 @@ Apply works one namespace at a time (`apply_api` over
 - **`incremental`** (default) reads `/backup` once per namespace, diffs
   locally, and sends one `POST`/`PUT`/`DELETE` per changed resource. Every
   `PUT` or `DELETE` of an existing row is first read with `GET /<kind>/{id}`
-  and sent with `If-Match`, and a namespace that overwrites consumers reads
-  `/backup` once more; see
+  and sent with `If-Match`. Consumer writes instead use credential-complete
+  `GET /consumers/{id}/verification`; see
   [Changes made during an apply](#changes-made-during-an-apply). At about
   100 ms per call, 1,000 creates take about two minutes, and 1,000 modifies or
   deletes about four. A namespace whose diff is only adds uses `POST /batch`
   instead.
 - **`full_replace`** (exclusive mode only) builds and validates every
-  namespace payload first, then calls `POST /restore?confirm=true` once per
-  namespace. Deterministic errors in any namespace mean no restore is sent.
+  namespace payload from `GET /backup?conditional=true` first, then calls
+  `POST /restore?confirm=true` once per namespace with that original snapshot's
+  namespace `If-Match`. Deterministic errors in any namespace mean no restore is sent.
   Each restore is atomic for its namespace, but **not across namespaces**: a
   runtime failure on `beta` after `alpha` succeeded leaves `alpha` replaced.
   Scope `full_replace` to one namespace if you need environment-wide
@@ -42,7 +43,9 @@ Retried:
 
 - connection-establishment errors (no response was received);
 - HTTP 408, 429 and 5xx (except 501) on reads and idempotent `PUT`/`DELETE`;
-- `/restore` 503 with `failure_class: connectivity` (nothing was written).
+- `/restore` 503 with the established precommit `failure_class: connectivity`
+  (nothing was written), using the identical prepared body and namespace token.
+  Contradictory incomplete/unknown rollback or `applied:false` prevents replay.
 
 Never retried:
 
@@ -51,13 +54,24 @@ Never retried:
 - **Any error from a create or batch `POST`.** The write may have committed.
   GitForgeOps re-reads an authoritative backup instead:
   - the exact resource (or complete batch) is live → an idempotent `PUT`
-    records repository ownership, then the create counts;
+    records repository ownership, then the create counts. Consumer recovery uses
+    a coherent conditional backup and a complete tagged verification read; an
+    opaque Basic HMAC cannot prove equality to submitted plaintext;
   - nothing under that id → the create did not commit; it is an ordinary
     failure and the run continues;
   - a different row, or no usable backup → the run stops for reconciliation.
 - **`applied: false`** in the body → `CommittedNotLive` (reason
   `config_rejected`, `reload_timeout` or `sequence_unavailable`). The write is
   stored but not live; check gateway health instead of re-sending.
+- **Malformed mutation envelopes.** Duplicate keys, incorrectly typed fields,
+  null markers and non-object responses cannot establish success or permit a
+  retry. Diagnostics withhold response bytes and parser details. Ordinary writes
+  accept empty HTTP 204 acknowledgements; batch creates still require matching
+  per-kind counts, and conditional restore still requires its complete count seal.
+  An invalid acknowledgement leaves the write's outcome uncertain: no blind
+  replay, pruning or ledger completion is authorized. Create and batch recovery
+  may establish success through authoritative readback and conditional ownership
+  assertions; rotation records completion only after confirmed live publication.
 - **`/restore` failures** other than the connectivity case. A 500 with
   `rollback: incomplete` or `unknown_outcome` is `RestoreNeedsManualRecovery`.
 - **Request timeouts.** The outcome is unknown; the next run re-diffs.
@@ -94,9 +108,11 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
   the `If-Match` write. The row is not written and the namespace's remaining
   writes are withheld. See
   [Changes made during an apply](#changes-made-during-an-apply).
-- **`ConditionalWriteUnavailable`.** The gateway returned no strong `ETag` for
-  a row apply must overwrite. It stops the run. The client probes for the tag
-  only; it does not detect a gateway that returns tags but ignores `If-Match`.
+- **`ConditionalWriteUnavailable`.** A required strong row tag, complete consumer
+  verification or coherent conditional snapshot is unavailable or invalid. The
+  operation refuses before allocation. Cached reads, audit-admission refusal and
+  unsupported transaction topology cannot downgrade to unconditional writes.
+  Capability reads do not establish server enforcement of `If-Match`.
 - **Namespace-scoped backups** must carry an explicit, matching `namespace` on
   every row, and must not contain duplicate `(namespace, id)` rows within a
   kind. Otherwise the snapshot is rejected before diffing: `diff`, `plan` and
@@ -230,8 +246,9 @@ A `412` that answers a retried `PUT` (an earlier attempt reached the gateway,
 got a retryable answer and was sent again) may be refusing a replay of this
 run's own committed write. Apply reads the row once more and counts the write
 as applied when the row now carries what it sent and no API spec owns it.
-Consumers are never counted that way, because their read redacts credentials;
-their refusal says the earlier attempt may have committed, and the re-run
+Consumers are never counted that way: credential transformations, particularly
+opaque Basic HMACs, cannot prove that the earlier plaintext write committed.
+Their refusal says the earlier attempt may have committed, and the re-run
 reconciles it.
 
 A read served from cache (`X-Data-Source: cached`) or one without a strong
@@ -244,13 +261,36 @@ gateway` checks for the tag too. Neither check verifies that the server honors
 that safety requirement. A read that fails refuses that write like any failed
 write.
 
-**Consumers** take one more read. Edge redacts consumer credentials on a
-single-resource `GET`, although its tag covers them, so that read cannot show
-the credentials still match the plan. Before a namespace's first consumer
-overwrite, apply reads every consumer it will overwrite, then one `/backup`,
-which carries the credentials, and compares that backup with the plan. A
-change before a consumer's read shows in the backup; a change after it fails
-the `If-Match`.
+**Consumers** require exact stored evidence. Before allocation, apply captures
+`GET /consumers/{id}/verification` for the consumer targets. Its comparison-only
+canonical projection must still match the original archival backup. The raw row
+and row token stay separate from that projection. Immediately before modify,
+delete, pending assertion or shared ownership claim, complete verification must
+match the planned evidence, including hidden/custom fields and legacy entries;
+the write uses its row `If-Match`. Unknown fields are not discarded to make a
+match. A desired update or replacement that would lose retained credential fields
+refuses. Omitted hidden Basic/custom types survive incremental PUT under the
+server's omission semantics; they cannot be omitted from a replacement that
+keeps that consumer. Basic HMACs use a gateway key and remain opaque; the admin
+signing key is never used to infer plaintext equality.
+
+**Full replacement** captures all four resource arrays and row-token maps,
+verbatim spec documents and the namespace token in one primary transaction.
+The token covers the entire namespace, including trust, ownership and namespace
+metadata, and detects delete/recreate or change/revert cycles. Every prepared
+restore carries that original token, including empty namespaces and confirmed
+spec deletion. `412` abandons the prepared body and requires a new plan; there
+is no fresh-token replay. Trust and authoritative empty spec sections remain
+omitted under the existing server semantics. The former spec-document reread
+is not a concurrency guarantee and is no longer used.
+
+`doctor --scope gateway` probes complete verification and coherent snapshots
+using GET only. No consumer to probe means unknown, never pass. Ordinary diff,
+plan, review and viewer drift reads retain their current endpoints and explain
+these runtime requirements. The immutable Edge owner contract is
+`c764084b3b51c3f7ffde268c039688d35e49c553`; a final released artifact containing
+and enforcing it must be qualified before release acceptance. This change does
+not invent a new release pin or certify an older binary.
 
 **Proxies and their plugins.** Ferrum Edge rewrites a proxy's association list
 itself when a scoped plugin is created, retargeted or removed. A proxy this

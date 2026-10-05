@@ -94,11 +94,11 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.assertTrue(any("Dockerfile gateway base" in issue for issue in issues), issues)
 
         record = self.record()
-        record["validator"]["version"] = "v0.9.9"
+        record["validator"]["version"] = "v0.9.10"
         self.write_record(record)
         issues = check_release_baseline.check(self.root)
         self.assertIn(
-            "the first baseline must name the verified v0.9.10 validator",
+            "the first baseline must name the verified v0.9.11 validator",
             issues,
         )
 

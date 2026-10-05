@@ -23,6 +23,9 @@ environments:
 
   production:
     overlay: production
+    # API full replacement requires a coherent GET /backup?conditional=true
+    # snapshot and the original namespace If-Match on restore. The candidate
+    # pairing is Edge v0.9.11; first-release qualification remains pending.
     apply_strategy: full_replace
     monitoring:
       # Run the nightly drift check in `production-monitor` instead of

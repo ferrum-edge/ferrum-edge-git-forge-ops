@@ -3,12 +3,27 @@
 GitForgeOps pins the shared Ferrum contracts release in
 [`contracts/ferrum-contracts/PIN`](../contracts/ferrum-contracts/PIN). The vendored plugin
 catalog, `provisioned-by` vocabulary, GitForgeOps resource-envelope fixtures, and the
-GitForgeOps-owned resource schema are byte-for-byte copies from `contracts-edge-0.9.9`. The
+GitForgeOps-owned resource schema are byte-for-byte copies from `contracts-edge-0.9.11`. The
 contract test verifies every file's SHA-256, checks that the pinned Edge version maps to the
 contracts tag and appears in the validator checksum allowlist, compares plugin names and
 priorities plus retired and reserved names with the local catalog, checks the assembler's
 `provisioned-by` label, parses valid and invalid resource fixtures with the local `Resource` serde
 type, and checks the schema's top-level envelope against that type.
+
+The published [contracts-edge-0.9.11 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.11)
+resolves to `390edbd5b2485af0988e02f7827fde778d76ae0a`. Its Edge vocabulary provenance
+and plugin OpenAPI integrity pin identify published Edge v0.9.11 at
+`c764084b3b51c3f7ffde268c039688d35e49c553`. The resource schema and fixtures remain
+unchanged. Prepared-publication wording in upstream descriptions and historical
+companion observations are retained byte-for-byte; they are not current release
+status or authority. Attribution still grants no ownership or authorization.
+
+This repository vendors only the resource schema, its fixtures and the two
+vocabularies listed above. The canonical release's shared Alloy v1 status is
+EXISTING/implemented at its qualified owner, whose availability remains unreleased.
+That metadata does not qualify production apply, publish Alloy, or add manifest or
+diagnostic-report consumption here. Exact-byte hosted gateway qualification and
+[first-release acceptance](../release/README.md) remain separate gates.
 
 The plugin catalog also describes config schemas and per-plugin scope constraints. This repository
 does not duplicate those values in its local catalog, so the conformance test compares the catalog

@@ -14,6 +14,7 @@ use gitforgeops::config::{
 use gitforgeops::config_export;
 use gitforgeops::diagnostics::{safe, safe_block, safe_line, safe_path};
 use gitforgeops::diff;
+use gitforgeops::http_client::conditional::PreparedConsumerRotation;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
 use gitforgeops::policy;
@@ -2522,6 +2523,11 @@ async fn cmd_plan(
         reportln!(json_mode);
     }
 
+    reportln!(
+        json_mode,
+        "{}",
+        gitforgeops::verdict::CONDITIONAL_APPLY_NOTICE
+    );
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
         reportln!(json_mode, "{}\n", safe_block(note));
     }
@@ -2724,6 +2730,7 @@ async fn cmd_plan(
             serde_json::json!({
                 "live_filter_warning": live_warning,
                 "plugin_attach_notice": plugin_attach_notice,
+                "conditional_apply_notice": verdict::CONDITIONAL_APPLY_NOTICE,
                 "apply_blocked": offline_summary.is_some()
                     || !conflict_namespaces.is_empty()
                     || desired_finding.as_ref().is_some_and(|finding| finding.is_error()),
@@ -3212,6 +3219,7 @@ async fn cmd_apply(
                     return Ok(());
                 }
                 println!("Will apply {} change(s):", diffs.len());
+                println!("{}", gitforgeops::verdict::CONDITIONAL_APPLY_NOTICE);
                 if let Some(note) = apply::incremental_plugin_attach_notice(
                     &resolved.apply_strategy,
                     &diffs,
@@ -3289,8 +3297,47 @@ async fn cmd_apply(
             // allocation after this gate means a blocked apply leaves GitHub
             // env secrets untouched — otherwise we'd burn a generated value
             // that the gateway never receives.
-            let namespace_pairs =
-                load_namespace_pairs_for(&client, &desired, &namespaces, true).await?;
+            let mut namespace_pairs = Vec::new();
+            let planned_managed = previously_managed(&resolved, &state);
+            let scope = match planned_managed.as_ref() {
+                Some(previously_managed) => diff::OwnershipScope::Shared { previously_managed },
+                None => diff::OwnershipScope::Exclusive,
+            };
+            let evidence_options = apply::ApplyOptions {
+                strategy: resolved.apply_strategy.clone(),
+                pending_create_assertions: state.pending_creates.clone(),
+                managed_ledger: ledger_keys(&state),
+                confirm_api_spec_deletion,
+                allow_nontransactional_plugin_attach,
+                refused_namespaces: apply::BlockedNamespaces::new(),
+            };
+            for namespace in &namespaces {
+                let mut snapshot =
+                    if matches!(resolved.apply_strategy, config::ApplyStrategy::FullReplace) {
+                        client.get_conditional_backup(namespace).await?
+                    } else {
+                        client.get_backup_snapshot_for_mutation(namespace).await?
+                    };
+                if matches!(resolved.apply_strategy, config::ApplyStrategy::Incremental) {
+                    let targets = apply::api_target::consumer_evidence_targets(
+                        &desired,
+                        &snapshot.config,
+                        namespace,
+                        scope,
+                        &evidence_options,
+                    )?;
+                    client
+                        .capture_consumer_evidence(&mut snapshot, namespace, &targets)
+                        .await?;
+                }
+                namespace_pairs.push(NamespaceSnapshot {
+                    namespace: namespace.clone(),
+                    desired: config::filter_config_by_namespace(&desired, namespace),
+                    actual: snapshot.config,
+                    extras: snapshot.extras,
+                    cached: snapshot.cached,
+                });
+            }
             if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                 // This gate intentionally precedes credential allocation. A
                 // cached backup omits API-spec ownership metadata, so no
@@ -4553,9 +4600,9 @@ async fn cmd_rotate(
     let ns = namespace
         .or(resolved.namespace_filter.as_deref())
         .unwrap_or("ferrum");
-    // Rotation publishes the whole desired Consumer row, so the row must pass
-    // the literal-credential gate `apply` runs, on the unresolved document and
-    // before any bundle read, state lock, secret write or gateway call.
+    // Rotation publishes one credential change on the complete stored Consumer.
+    // The declaration must pass the literal-credential gate `apply` runs, on the
+    // unresolved document before any bundle read, state lock, secret write or gateway call.
     refuse_rotation_security_blockers(&desired_for_check, ns, consumer)?;
 
     let repo = env_config
@@ -4649,9 +4696,8 @@ async fn cmd_rotate(
     }
 
     // Preflight 4: no OTHER placeholders on this consumer remain unresolved
-    // against the current bundle. If they did, push_rotated_consumer_to_gateway
-    // would fail (by design) and leave the store/gateway split — mutating
-    // GitHub before running the check just guarantees that split happens.
+    // against the current bundle. Publication would fail and leave the store/gateway
+    // split; mutating GitHub before running the check guarantees that split happens.
     let current_bundle = secrets::merge_bundles(&per_shard);
     let sibling_consumer = desired_for_check
         .consumers
@@ -4682,12 +4728,35 @@ async fn cmd_rotate(
         }
     }
 
+    if matches!(resolved.ownership.mode, OwnershipMode::Shared)
+        && !state
+            .resources
+            .contains_key(&diff::resource_diff::state_key(ns, "Consumer", consumer))
+    {
+        return Err(
+            "rotation requires a repository-owned consumer; apply and claim it first".into(),
+        );
+    }
+
     let mut shard_count = state.credential_shard_count.max(1);
 
     let client = build_github_api_client(&env_config)?;
     // Construct the gateway client before replacing the write-only secret:
     // invalid JWT/TLS configuration is a preflight error too.
     let gateway_client = AdminClient::new_scoped(&env_config, [ns])?;
+
+    let current_consumer = desired_for_check
+        .consumers
+        .iter()
+        .find(|row| row.namespace == ns && row.id == consumer)
+        .ok_or("rotation consumer missing")?;
+    let prepared_rotation = PreparedConsumerRotation::prepare(
+        &gateway_client,
+        current_consumer,
+        credential,
+        current_bundle.get(&slot).map(String::as_str),
+    )
+    .await?;
 
     let outcome = match secrets::rotate_and_deliver(
         &client,
@@ -4739,15 +4808,13 @@ async fn cmd_rotate(
     }
 
     // Now push to the gateway.
-    let push_status = push_rotated_consumer_to_gateway(
-        &gateway_client,
-        &desired_for_check,
-        &per_shard,
-        ns,
-        consumer,
-        resolve_options,
-    )
-    .await;
+    let updated_bundle = secrets::merge_bundles(&per_shard);
+    let rotated_value = updated_bundle
+        .get(&slot)
+        .ok_or("rotated slot missing from committed bundle")?;
+    let push_status = prepared_rotation
+        .publish(&gateway_client, rotated_value)
+        .await;
 
     // Persist rotation state ONLY on full success. Saving before the gateway
     // push check would claim the rotation completed even when the gateway
@@ -4778,10 +4845,10 @@ async fn cmd_rotate(
             // stranded; run apply to close the gap.
             return Err(format!(
                 "Rotated credential stored (GitHub Env Secret) + delivered, but gateway push FAILED: {e}\n\
-                 State NOT persisted (the gateway still has the old value). The new value lives\n\
+                 State NOT persisted; gateway completion was not confirmed. The new value lives\n\
                  in the GitHub Env Secret; run `gitforgeops apply` to push it through and record\n\
                  rotation metadata. If the recipient tries to authenticate with the new value\n\
-                 before apply runs, they will be rejected."
+                 before reconciliation, authentication may fail."
             )
             .into());
         }
@@ -4859,70 +4926,4 @@ fn refuse_rotation_security_blockers(
         blockers.len()
     )
     .into())
-}
-
-/// Push just the rotated consumer to the live gateway so the new credential
-/// is immediately usable. Reuses the preflight's desired snapshot and resolves
-/// only the target Consumer, so unrelated generation failures cannot surface
-/// after the secret has been written.
-///
-/// `desired_snapshot` must be the unresolved document: the row is re-audited
-/// here so no caller can publish a repository-readable credential through
-/// this path.
-async fn push_rotated_consumer_to_gateway(
-    client: &AdminClient,
-    desired_snapshot: &GatewayConfig,
-    per_shard: &BTreeMap<u32, secrets::CredentialBundle>,
-    namespace: &str,
-    consumer_id: &str,
-    resolve_options: secrets::ResolveOptions<'_>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    refuse_rotation_security_blockers(desired_snapshot, namespace, consumer_id)?;
-    let mut desired = GatewayConfig {
-        consumers: desired_snapshot
-            .consumers
-            .iter()
-            .filter(|c| c.namespace == namespace && c.id == consumer_id)
-            .cloned()
-            .collect(),
-        ..Default::default()
-    };
-    let merged = secrets::merge_bundles(per_shard);
-    // `rotate_and_deliver` just wrote the fresh value into the bundle; this
-    // resolve picks it up for the consumer being pushed to the gateway. The
-    // operator's slot-remap policy applies here too, so an acknowledged
-    // shrink does not clear the shim resolve only to fail on the push.
-    let report = secrets::resolve_secrets_with_options(&mut desired, &merged, resolve_options)?;
-
-    let consumer = desired
-        .consumers
-        .iter()
-        .find(|c| c.namespace == namespace && c.id == consumer_id)
-        .ok_or_else(|| {
-            format!(
-                "consumer '{namespace}/{consumer_id}' not present in repo desired state; cannot push rotated credential. Add the consumer to resources/ first, or if it was intentionally removed, rotation has no consumer to update."
-            )
-        })?;
-
-    // Guard: the consumer may carry OTHER credentials besides the one we
-    // just rotated. If any of those other credentials are placeholders
-    // without a bundle value (e.g. alloc=require that was never
-    // pre-populated, or alloc=generate never run through apply), pushing
-    // the consumer now would send a literal `${gh-env-secret:...}` string
-    // to the gateway as a credential value — breaking auth for that
-    // credential. Refuse and tell the operator to run apply first. The
-    // resolution report decides this, not the resolved bytes (#364); a
-    // seeded Consumer secret that is placeholder text is refused by the resolve (#379).
-    let remaining = report.unresolved();
-    if !remaining.is_empty() {
-        return Err(format!(
-            "refusing to push rotated consumer '{namespace}/{consumer_id}': {} unresolved placeholder(s) remain on this consumer:\n  {}\n\
-             Run `gitforgeops apply` to allocate missing slots before rotating (or pre-populate FERRUM_CREDS_JSON).",
-            remaining.len(),
-            remaining.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>().join("\n  ")
-        ).into());
-    }
-
-    client.update_consumer(consumer, namespace).await?;
-    Ok(())
 }

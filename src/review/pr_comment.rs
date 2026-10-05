@@ -1130,6 +1130,11 @@ pub fn build_review_comment_with_preview(
         !adoptions.is_empty(),
     );
 
+    if comparison_error.is_none() {
+        md.push_str(crate::verdict::CONDITIONAL_APPLY_NOTICE);
+        md.push_str("\n\n");
+    }
+
     if comparison_error.is_none() && !adoptions.is_empty() {
         md.push_str("### Ownership Adoption\n\n");
         md.push_str(crate::apply::ADOPTION_PREVIEW_NOTICE);
