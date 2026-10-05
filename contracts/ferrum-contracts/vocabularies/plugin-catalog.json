@@ -2,13 +2,13 @@
   "$schema": "https://github.com/ferrum-edge/ferrum-contracts/schemas/vocabulary-plugin-catalog/v1.schema.json",
   "vocabulary": "plugin-catalog",
   "version": 1,
-  "edge_release": "v0.9.11",
-  "description": "Index of every built-in Ferrum Edge plugin at v0.9.11: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml (canonical contracts tag/publication pending). Build-time custom plugins are not listed.",
+  "edge_release": "v0.9.12",
+  "description": "Index of every built-in Ferrum Edge plugin at v0.9.12: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml (contracts-edge-0.9.11 is published; contracts-edge-0.9.12 publication pending). Build-time custom plugins are not listed.",
   "provenance": [
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.11",
-      "commit": "c764084b3b51c3f7ffde268c039688d35e49c553",
+      "ref": "v0.9.12",
+      "commit": "0d917701b63ef38210c49df830f48cf0457cbc7d",
       "path": "src/plugins/mod.rs",
       "symbols": [
         "BUILTIN_PLUGIN_REGISTRATIONS",
@@ -23,8 +23,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.11",
-      "commit": "c764084b3b51c3f7ffde268c039688d35e49c553",
+      "ref": "v0.9.12",
+      "commit": "0d917701b63ef38210c49df830f48cf0457cbc7d",
       "path": "src/plugins/builtin_parity.rs",
       "symbols": [
         "BUILTIN_PLUGIN_PARITY_META",
@@ -43,8 +43,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.11",
-      "commit": "c764084b3b51c3f7ffde268c039688d35e49c553",
+      "ref": "v0.9.12",
+      "commit": "0d917701b63ef38210c49df830f48cf0457cbc7d",
       "path": "openapi.yaml",
       "symbols": [
         "components.schemas.PluginConfigBase"
@@ -56,10 +56,10 @@
   ],
   "config_schema_document": {
     "repo": "ferrum-edge/ferrum-edge",
-    "ref": "v0.9.11",
-    "commit": "c764084b3b51c3f7ffde268c039688d35e49c553",
+    "ref": "v0.9.12",
+    "commit": "0d917701b63ef38210c49df830f48cf0457cbc7d",
     "path": "openapi.yaml",
-    "sha256": "687db80271512a367814ded6002ecce546eb190a347a57e32eca36af7d665020",
+    "sha256": "f7242228d73d34ad2d7da3c989ec6ba15bb6ae1f2f4c94a8e0a181b000caae77",
     "openapi": "3.1.0",
     "note": "Each config_schema.pointer is a JSON Pointer into this exact file. The schemas are OpenAPI 3.1 (JSON Schema 2020-12 dialect) and may $ref other components in the same document. They apply to `config` only when the plugin config is enabled. They are referenced, not copied, in this release; see docs/adoption.md (follow-ups)."
   },
