@@ -20,8 +20,16 @@ sys.modules[SPEC.name] = check_supply_chain
 SPEC.loader.exec_module(check_supply_chain)
 
 CARGO_AUDIT_ACTION_PINS = (
-    "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",
     "taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0",
+)
+REJECTED_CARGO_AUDIT_ACTION_PINS = (
+    "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",  # retired v2.87.20
+    "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af",
+    "taiki-e/install-action@" + "1" * 40,
+    "taiki-e/install-action@" + "0" * 40,
+    "taiki-e/install-action@v2",
+    "taiki-e/install-action@v2.87.22",
+    "taiki-e/install-action@main",
 )
 
 # The trigger-pinned classifier as each freshness guard of apply-on-merge.yml
@@ -2046,7 +2054,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
             action.write_text("name: sample\n", encoding="utf-8")
             self.assertEqual(check_supply_chain.action_files(root), [action])
 
-    def test_cargo_audit_install_accepts_exactly_two_reviewed_pins(self):
+    def test_cargo_audit_install_accepts_only_the_reviewed_v2_87_22_pin(self):
         self.assertEqual(
             check_supply_chain.CARGO_AUDIT_ACTIONS, frozenset(CARGO_AUDIT_ACTION_PINS)
         )
@@ -2067,23 +2075,16 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 )
                 self.assertEqual(check_supply_chain.cargo_audit_install_violations(workflow), [])
 
-    def test_cargo_audit_install_rejects_unreviewed_pins_and_mutable_tags(self):
+    def test_cargo_audit_install_rejects_retired_unreviewed_pins_and_mutable_tags(self):
         for pin in CARGO_AUDIT_ACTION_PINS:
             workflow = self._cargo_audit_workflow(pin)
-            for replacement in (
-                "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af",
-                "taiki-e/install-action@" + "1" * 40,
-                "taiki-e/install-action@" + "0" * 40,
-                "taiki-e/install-action@v2",
-                "taiki-e/install-action@v2.87.22",
-                "taiki-e/install-action@main",
-            ):
+            for replacement in REJECTED_CARGO_AUDIT_ACTION_PINS:
                 with self.subTest(pin=pin, replacement=replacement):
                     changed = workflow.replace(f"uses: {pin}", f"uses: {replacement}", 1)
                     self.assertNotEqual(changed, workflow)
                     self.assertTrue(check_supply_chain.cargo_audit_install_violations(changed))
 
-    def test_cargo_audit_install_keeps_strict_shape_for_both_reviewed_pins(self):
+    def test_cargo_audit_install_keeps_strict_shape_for_the_reviewed_pin(self):
         mutations = (
             ("tool: cargo-audit@0.22.1", "tool: cargo-audit@latest"),
             ("tool: cargo-audit@0.22.1", "tool: cargo-audit@0.22.2"),
@@ -2109,7 +2110,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     self.assertNotEqual(changed, workflow)
                     self.assertTrue(check_supply_chain.cargo_audit_install_violations(changed))
 
-    def test_cargo_audit_install_rejects_cache_and_registry_fallback_for_both_pins(self):
+    def test_cargo_audit_install_rejects_cache_and_registry_fallback(self):
         extras = (
             "      - uses: actions/cache@" + "a" * 40 + "\n"
             "        with:\n          path: ~/.cargo/bin\n          key: old-auditor\n",
@@ -2130,7 +2131,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     self.assertNotEqual(changed, workflow)
                     self.assertTrue(check_supply_chain.cargo_audit_install_violations(changed))
 
-    def test_cargo_audit_install_must_precede_enforcement_for_both_pins(self):
+    def test_cargo_audit_install_must_precede_enforcement(self):
         for pin in CARGO_AUDIT_ACTION_PINS:
             with self.subTest(pin=pin):
                 workflow = self._cargo_audit_workflow(pin)
@@ -2149,7 +2150,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     check_supply_chain.cargo_audit_install_violations(changed),
                 )
 
-    def test_both_reviewed_cargo_audit_pins_pass_the_trusted_checker(self):
+    def test_reviewed_cargo_audit_pin_passes_the_trusted_checker(self):
         for pin in CARGO_AUDIT_ACTION_PINS:
             with self.subTest(pin=pin), tempfile.TemporaryDirectory() as temporary:
                 root = self._mirror_repo(Path(temporary))
@@ -2181,18 +2182,17 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 )
                 self.assertTrue(any("with checksums" in item for item in self._violations(root)))
 
-    def test_candidate_cannot_authorize_unreviewed_cargo_audit_installer_pins(self):
-        unknown_pin = "taiki-e/install-action@" + "1" * 40
-        for pin in CARGO_AUDIT_ACTION_PINS:
-            with self.subTest(pin=pin), tempfile.TemporaryDirectory() as temporary:
+    def test_candidate_cannot_authorize_rejected_cargo_audit_installer_pins(self):
+        for rejected_pin in REJECTED_CARGO_AUDIT_ACTION_PINS:
+            with self.subTest(pin=rejected_pin), tempfile.TemporaryDirectory() as temporary:
                 root = self._mirror_repo(Path(temporary))
                 (root / ".github/workflows/security.yml").write_text(
-                    self._cargo_audit_workflow(pin).replace(pin, unknown_pin, 1), encoding="utf-8"
+                    self._cargo_audit_workflow(rejected_pin), encoding="utf-8"
                 )
                 # The candidate can declare its own allowlist and return green;
-                # only the checker outside that tree can authorize a rotation.
+                # the checker outside that tree still refuses retired and unreviewed pins.
                 (root / ".github/scripts/check_supply_chain.py").write_text(
-                    f'CARGO_AUDIT_ACTIONS = frozenset({{"{unknown_pin}"}})\n'
+                    f'CARGO_AUDIT_ACTIONS = frozenset({{"{rejected_pin}"}})\n'
                     "raise SystemExit(0)\n",
                     encoding="utf-8",
                 )
@@ -5721,7 +5721,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         for current_pin in CARGO_AUDIT_ACTION_PINS:
             if f"uses: {current_pin}" in workflow:
                 return workflow.replace(f"uses: {current_pin}", f"uses: {pin}", 1)
-        self.fail("security.yml must use one of the two reviewed cargo-audit installer pins")
+        self.fail("security.yml must use the reviewed cargo-audit installer pin")
 
     def _trusted_policy_runner_source(self) -> str:
         """The inline runner `security.yml` feeds the trusted checker."""

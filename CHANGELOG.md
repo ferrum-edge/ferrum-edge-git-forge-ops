@@ -141,6 +141,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Retire the cargo-audit installer v2.87.20 pin after the workflow switch in #465.
+  The protected policy accepts only the reviewed v2.87.22 commit, retaining
+  cargo-audit 0.22.1, checksum verification and `fallback: none`.
 - Preauthorize the reviewed `taiki-e/install-action` v2.87.22 commit
   `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` alongside v2.87.20 in the protected
   cargo-audit installer policy. Action source and the cargo-audit 0.22.1 checksum
