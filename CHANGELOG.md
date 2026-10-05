@@ -14,7 +14,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GET-only capability probes and reports unavailable evidence as unknown.
 - Lifecycle coverage for hidden consumer edits and namespace restore conditions,
   including ABA, empty replacement and confirmed spec deletion. Qualification on
-  the published immutable Edge v0.9.11 bytes remains required; an older fixture or
+  the published immutable Edge v0.9.12 bytes remains required; an older fixture or
   passing parser tests do not establish first-release acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
   resource trees ([Alloy #27](https://github.com/ferrum-edge/ferrum-alloy/issues/27)).
@@ -116,11 +116,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   "requires an authoritative configuration export (GET /config/export)".
 - `EnvConfig`'s `Debug` output redacts the admin and viewer JWT secrets, the
   GitHub tokens, the inline credential bundle and the mTLS client key.
-- Pin the Ferrum Edge validator and bundled gateway to published v0.9.11, keeping
-  earlier approved validator digests in the allowlist for in-flight pull requests.
-  The release baseline remains pending until exact-byte hosted qualification and
-  external acceptance complete. The gateway retains v0.9.10 MCP charset and
-  uninspectable or over-nested JSON-RPC batch hardening (GHSA-4f9m-cfqg-fhx9,
+- Refresh the Ferrum Edge validator and bundled gateway pins to the verified
+  published v0.9.12 binary and multi-platform image, resolving the installer
+  refusal after the new upstream release. Keep every earlier approved validator
+  digest for in-flight pull requests and preserve publisher-checksum verification.
+  Upstream Edge artifact qualification is complete; GitForgeOps hosted validation,
+  exact-revision lifecycle qualification and external acceptance remain required,
+  so the release baseline stays pending. The conditional API implementation and
+  `contracts-edge-0.9.11` pin are unchanged. The gateway retains v0.9.10 MCP charset
+  and uninspectable or over-nested JSON-RPC batch hardening (GHSA-4f9m-cfqg-fhx9,
   GHSA-f2jp-59r9-fp64).
 - Report an authenticator-loss breaking change when an HTTP proxy is changed to
   passthrough, which Ferrum Edge rejects on non-stream proxies.

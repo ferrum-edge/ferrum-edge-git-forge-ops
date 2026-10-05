@@ -570,9 +570,11 @@ ownership and field safety before broker publication and uses row `If-Match`.
 GET-only doctor probes report capability availability, while qualification must
 establish enforcement on the exact released gateway bytes. See
 [conditional apply behavior](docs/apply.md#changes-made-during-an-apply). The new
-owner contract is published in Edge v0.9.11, and the candidate pairing pins its
-verified binary and image bytes. Hosted qualification against those exact bytes
-remains required; the [first-release record](release/README.md) stays pending.
+owner contract was published in Edge v0.9.11. The candidate pairing now pins the
+verified Edge v0.9.12 binary and image bytes; the existing conditional API
+implementation and vendored Contracts pin remain unchanged. Hosted GitForgeOps
+qualification against those exact bytes remains required; the
+[first-release record](release/README.md) stays pending.
 
 ### What if apply fails after merge?
 
