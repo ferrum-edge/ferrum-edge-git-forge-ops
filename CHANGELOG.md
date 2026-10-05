@@ -137,6 +137,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Preauthorize the reviewed `taiki-e/install-action` v2.87.22 commit
+  `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` alongside v2.87.20 in the protected
+  cargo-audit installer policy. Action source and the cargo-audit 0.22.1 checksum
+  manifest are unchanged; workflow rotation in #465 follows after this policy lands.
 - Pin the operator-held `FERRUM_VERIFY_PROBE_CONSUMERS` binding in both
   apply/promote Validate and Verify traffic steps and trusted live review,
   with `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` in Validate and review.

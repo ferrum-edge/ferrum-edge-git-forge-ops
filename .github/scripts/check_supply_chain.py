@@ -385,6 +385,8 @@ STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 CARGO_AUDIT_ACTIONS = frozenset(
     {
         "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",
+        # v2.87.22 retains v2.87.20's action source and cargo-audit manifest.
+        "taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0",
     }
 )
 SECURITY_PUSH_POLICY_PATHS = (
