@@ -26,3 +26,4 @@ c26ba4c059be2d78f4044a3768ebfed5be4e7eb5640620fa93ea9199776b0902  ferrum-edge-li
 e628f60a7d12ad526781cedbd0b15ab3447d99f37222c46a2cda4c3bc3e955c5  ferrum-edge-linux-x86_64  # 2026-10-01T07:09:54Z release v0.9.9
 52745149de09932b54bef79cbe5524e2376cb84d0fa7a4d8436ae0bcd19d6559  ferrum-edge-linux-x86_64  # release v0.9.10
 97cbd7cd277feee8f661e9d2cd97a6383be969fd2fc2b61143601614922f988f  ferrum-edge-linux-x86_64  # 2026-10-04T21:26:11Z release v0.9.11 (verified ferrum-edge-linux-x86_64)
+1453b6ff9ae8bcea983adb7cc120ef2b78c3b292e0adb8e81233222ae4d46ce8  ferrum-edge-linux-x86_64  # 2026-10-05T12:33:02Z release v0.9.12 (verified ferrum-edge-linux-x86_64)

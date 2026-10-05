@@ -287,10 +287,13 @@ is not a concurrency guarantee and is no longer used.
 `doctor --scope gateway` probes complete verification and coherent snapshots
 using GET only. No consumer to probe means unknown, never pass. Ordinary diff,
 plan, review and viewer drift reads retain their current endpoints and explain
-these runtime requirements. The immutable Edge owner contract is
-`c764084b3b51c3f7ffde268c039688d35e49c553`; a final released artifact containing
-and enforcing it must be qualified before release acceptance. This change does
-not invent a new release pin or certify an older binary.
+these runtime requirements. The conditional API owner contract was published at
+Edge `c764084b3b51c3f7ffde268c039688d35e49c553`. The current candidate gateway is
+published v0.9.12 at `0d917701b63ef38210c49df830f48cf0457cbc7d`, with exact binary
+and image pins in the [pending release record](../release/baseline.json).
+GitForgeOps enforcement qualification against those bytes remains required before
+release acceptance. This pin refresh leaves the conditional API implementation
+and vendored Contracts unchanged.
 
 **Proxies and their plugins.** Ferrum Edge rewrites a proxy's association list
 itself when a scoped plugin is created, retargeted or removed. A proxy this
