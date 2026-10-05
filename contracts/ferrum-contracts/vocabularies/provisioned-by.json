@@ -2,13 +2,13 @@
   "$schema": "https://github.com/ferrum-edge/ferrum-contracts/schemas/vocabulary-provisioned-by/v1.schema.json",
   "vocabulary": "provisioned-by",
   "version": 1,
-  "edge_release": "v0.9.11",
+  "edge_release": "v0.9.12",
   "description": "Application attribution for Ferrum Edge configuration resources: the provisioned-by resource label and the X-Ferrum-Provisioned-By admin request header, with the companion products' values. Informational only: not authorization, ownership, audit identity, or a routing selector.",
   "provenance": [
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.11",
-      "commit": "c764084b3b51c3f7ffde268c039688d35e49c553",
+      "ref": "v0.9.12",
+      "commit": "0d917701b63ef38210c49df830f48cf0457cbc7d",
       "path": "docs/admin_api.md",
       "sections": [
         "Resource labels and application attribution"
@@ -16,8 +16,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.11",
-      "commit": "c764084b3b51c3f7ffde268c039688d35e49c553",
+      "ref": "v0.9.12",
+      "commit": "0d917701b63ef38210c49df830f48cf0457cbc7d",
       "path": "src/admin/provisioning.rs",
       "symbols": [
         "PROVISIONED_BY_LABEL",
@@ -28,8 +28,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.11",
-      "commit": "c764084b3b51c3f7ffde268c039688d35e49c553",
+      "ref": "v0.9.12",
+      "commit": "0d917701b63ef38210c49df830f48cf0457cbc7d",
       "path": "openapi.yaml",
       "symbols": [
         "components.parameters.ProvisionedBy"
@@ -37,8 +37,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.11",
-      "commit": "c764084b3b51c3f7ffde268c039688d35e49c553",
+      "ref": "v0.9.12",
+      "commit": "0d917701b63ef38210c49df830f48cf0457cbc7d",
       "path": "docs/hardening.md",
       "note": "Minimum companion versions that inject labels.provisioned-by."
     }

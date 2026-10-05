@@ -73,6 +73,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Refresh the existing 13-file ferrum-contracts adoption to published
+  `contracts-edge-0.9.12` at `31f0a21d707795be293d15837c2f77c3d84219d8`, with an
+  explicit Edge v0.9.12 mapping and updated vocabulary byte hashes. The schema
+  and ten fixtures are unchanged; plugin and attribution values remain unchanged.
+  Preserve upstream preparation wording verbatim and document actual publication
+  separately. This pin update adds no deployment profiles or Alloy manifest/report
+  consumption and does not qualify production apply or first-release acceptance.
 - Mutation acknowledgements refuse duplicate keys, malformed field types and
   ambiguous envelopes without exposing response bytes (#462). Invalid responses
   cannot authorize retries, pruning, ownership ledger updates or rotation
@@ -122,10 +129,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   digest for in-flight pull requests and preserve publisher-checksum verification.
   Upstream Edge artifact qualification is complete; GitForgeOps hosted validation,
   exact-revision lifecycle qualification and external acceptance remain required,
-  so the release baseline stays pending. The conditional API implementation and
-  `contracts-edge-0.9.11` pin are unchanged. The gateway retains v0.9.10 MCP charset
-  and uninspectable or over-nested JSON-RPC batch hardening (GHSA-4f9m-cfqg-fhx9,
-  GHSA-f2jp-59r9-fp64).
+  so the release baseline stays pending. That gateway refresh left the conditional
+  API implementation and then-current `contracts-edge-0.9.11` pin unchanged.
+  The gateway retains v0.9.10 MCP charset and uninspectable or over-nested
+  JSON-RPC batch hardening (GHSA-4f9m-cfqg-fhx9, GHSA-f2jp-59r9-fp64).
 - Report an authenticator-loss breaking change when an HTTP proxy is changed to
   passthrough, which Ferrum Edge rejects on non-stream proxies.
 - Report `mtls_auth` loss when a stream proxy stops terminating TLS and becomes

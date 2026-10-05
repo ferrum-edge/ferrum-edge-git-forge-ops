@@ -327,7 +327,7 @@ fragments are covered in [Writing resources](docs/resources.md).
 [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts) is Ferrum's central store for
 shared vocabularies, JSON schemas and fixtures. GitForgeOps consumes its plugin catalog,
 `provisioned-by` vocabulary and resource fixtures, and publishes its `gitforgeops-resource` schema.
-These files are pinned to `contracts-edge-0.9.11` in
+These files are pinned to `contracts-edge-0.9.12` in
 [`contracts/ferrum-contracts/PIN`](contracts/ferrum-contracts/PIN) and vendored under
 `contracts/ferrum-contracts/`.
 See the [contracts guide](docs/contracts.md) for the pin and conformance checks.
