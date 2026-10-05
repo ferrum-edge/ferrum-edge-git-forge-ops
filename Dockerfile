@@ -1,6 +1,6 @@
 FROM ferrumedge/ferrum-edge:v0.9.11@sha256:2476b502855940e28157858fc24008545cb3baeb3084c9610e1d4505cbe0d36e AS ferrum-edge
 
-FROM rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS builder
+FROM rust:1.99.0-bookworm@sha256:59037199c44290f2befcdd58dcc540164763fc296950255aaefeef096a1866b0 AS builder
 # Override verification needs only Git's built-in local inspection commands.
 # Reuse the reviewed builder's Git and its complete ELF dependency closure,
 # including its loader, so Bookworm libraries never mix with Trixie's libc.
