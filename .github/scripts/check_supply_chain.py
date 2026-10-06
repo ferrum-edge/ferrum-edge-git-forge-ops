@@ -10,6 +10,7 @@ import re
 import shlex
 import stat
 import sys
+import tomllib
 from pathlib import Path
 
 
@@ -19,6 +20,10 @@ USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
 FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
+MIN_RUST_TOOLCHAIN = (1, 98, 0)
+RUST_TOOLCHAIN_CHANNEL = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII
+)
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 # Closing delimiters inside single-quoted expression literals are data, even
 # in shell comments. GitHub expands expressions before Bash reads the script.
@@ -1310,22 +1315,48 @@ def state_guard_override_recheck_violations(text: str) -> list[str]:
     return violations
 
 
-def rust_toolchain_violations(workflow: str, text: str) -> list[str]:
+def rust_toolchain_violations(workflow: str, text: str, channel: str) -> list[str]:
     """Every `dtolnay/rust-toolchain` step must select the exact toolchain.
 
-    Checking that `toolchain: 1.98.0` appears *somewhere* in the file let a
-    second Rust step — or a copied step that lost its `with:` block — install
-    the action's floating default while the first step's pin kept the workflow
-    green. Match per step instead.
+    Checking that the repository's channel appears *somewhere* in the file
+    lets a second Rust step — or a copied step that lost its `with:` block —
+    install the action's floating default while the first step's pin keeps the
+    workflow green. Match every step against the repository pin instead.
     """
     for step in STEP_SPLIT.split(text):
         if "dtolnay/rust-toolchain@" not in step:
             continue
-        if not re.search(r"^\s*toolchain:\s*1\.98\.0\s*$", step, re.MULTILINE):
+        if not re.search(
+            rf"^\s*toolchain:\s*{re.escape(channel)}\s*$", step, re.MULTILINE
+        ):
             return [
-                f"{workflow}: every dtolnay/rust-toolchain step must select exact toolchain 1.98.0"
+                f"{workflow}: every dtolnay/rust-toolchain step must select exact toolchain {channel}"
             ]
     return []
+
+
+def read_rust_toolchain_channel(path: Path) -> str | None:
+    """Read the single pinned channel used by workflows and release provenance."""
+    if path.with_name("rust-toolchain").exists():
+        return None
+    try:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return None
+    if set(document) != {"toolchain"}:
+        return None
+    toolchain = document["toolchain"]
+    if not isinstance(toolchain, dict) or not set(toolchain).issubset(
+        {"channel", "components", "targets", "profile"}
+    ):
+        return None
+    channel = toolchain.get("channel")
+    match = RUST_TOOLCHAIN_CHANNEL.fullmatch(channel) if isinstance(channel, str) else None
+    if match is None:
+        return None
+    if tuple(int(part) for part in match.groups()) < MIN_RUST_TOOLCHAIN:
+        return None
+    return channel
 
 
 def rust_ci_test_scope_violations(text: str) -> list[str]:
@@ -4017,6 +4048,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {violation}", file=sys.stderr)
         return 1
     violations: list[str] = []
+    toolchain_path = root / "rust-toolchain.toml"
+    rust_channel = read_rust_toolchain_channel(toolchain_path)
+    if rust_channel is None:
+        violations.append(
+            "rust-toolchain.toml: expected [toolchain].channel to be a stable "
+            "X.Y.Z channel at or above 1.98.0, with no legacy rust-toolchain file"
+        )
     candidate_checker = root / ".github" / "scripts" / "check_supply_chain.py"
     if candidate_checker.is_symlink() or not candidate_checker.is_file():
         violations.append(
@@ -4044,7 +4082,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"{workflow.relative_to(root)}: runner image must use an explicit Ubuntu release"
             )
         violations.extend(
-            rust_toolchain_violations(str(workflow.relative_to(root)), text)
+            rust_toolchain_violations(
+                str(workflow.relative_to(root)), text, rust_channel or "<invalid>"
+            )
         )
         violations.extend(
             whole_secrets_context_violations(str(workflow.relative_to(root)), text)
@@ -4523,10 +4563,6 @@ def main(argv: list[str] | None = None) -> int:
                     f"{manual_workflow}: missing manual-dispatch guard {required!r}"
                 )
 
-    toolchain = (root / "rust-toolchain.toml").read_text(encoding="utf-8")
-    if 'channel = "1.98.0"' not in toolchain:
-        violations.append("rust-toolchain.toml: channel must be pinned to 1.98.0")
-
     for script_name in ("install-ferrum-edge.sh", "refresh-ferrum-edge-pin.sh"):
         script = root / ".github" / "scripts" / script_name
         if script.is_symlink() or not script.is_file():
@@ -4612,7 +4648,7 @@ def main(argv: list[str] | None = None) -> int:
             "schema_version": 1,
             "source_sha": os.environ.get("GITHUB_SHA", "local"),
             "runner_image": "ubuntu-24.04",
-            "rust_toolchain": "1.98.0",
+            "rust_toolchain": rust_channel,
             "actions": action_pins,
             "docker_bases": FROM.findall(dockerfile),
             "ferrum_edge_binaries": [
