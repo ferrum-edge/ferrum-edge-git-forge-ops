@@ -655,12 +655,29 @@ pub(super) fn parse_sensitive(body: &str) -> Result<Value> {
         .map_err(|_| invalid())
 }
 
+/// Whether a 404 body is Edge's exact `{"error":"Consumer not found"}`
+/// acknowledgement. Any other body, such as a router's generic not-found,
+/// cannot prove that the consumer is gone.
+pub(super) fn is_consumer_not_found(body: &str) -> bool {
+    parse_sensitive(body).ok().is_some_and(|value| {
+        value.as_object().is_some_and(|object| {
+            object.len() == 1
+                && object.get("error").and_then(Value::as_str) == Some("Consumer not found")
+        })
+    })
+}
+
 /// Preserve error categories and no-replay boundaries while withholding sensitive server text.
 pub(super) fn withhold_error(error: Error) -> Error {
     let message = "conditional operation refused or failed; response details withheld. \
                    Inspect current gateway state before retrying"
         .to_string();
     match error {
+        Error::ConditionalWriteUnavailable(_) => Error::ConditionalWriteUnavailable(
+            "conditional operation refused or failed; authoritative conditional evidence \
+             unavailable; response details withheld. Inspect current gateway state before retrying"
+                .to_string(),
+        ),
         Error::ApiError { status, .. } => Error::ApiError { status, message },
         Error::HttpClient(_) => Error::HttpClient(message),
         Error::GatewayReadOnly(_) => Error::GatewayReadOnly(message),

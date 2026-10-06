@@ -193,7 +193,12 @@ async fn admin_client_rejects_unsafe_resource_ids_in_paths() {
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let err = client
-        .delete_proxy("../consumers/victim?confirm=true", "team-alpha")
+        .delete_if_match(
+            "Proxy",
+            "../consumers/victim?confirm=true",
+            "team-alpha",
+            "\"tag\"",
+        )
         .await;
     assert!(err.is_err(), "expected unsafe id to be rejected");
     let msg = err.err().unwrap().to_string();
@@ -227,7 +232,7 @@ async fn admin_client_accepts_safe_resource_id_in_paths() {
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let outcome = client
-        .delete_proxy("proxy-01._~A", "team-alpha")
+        .delete_if_match("Proxy", "proxy-01._~A", "team-alpha", "\"tag\"")
         .await
         .unwrap();
     assert_eq!(outcome, DeleteOutcome::Deleted);
@@ -296,7 +301,9 @@ async fn admin_client_rejects_ids_over_the_length_limit() {
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let too_long = "a".repeat(255);
-    let err = client.delete_proxy(&too_long, "team-alpha").await;
+    let err = client
+        .delete_if_match("Proxy", &too_long, "team-alpha", "\"tag\"")
+        .await;
     assert!(
         err.err().unwrap().to_string().contains("254"),
         "expected the 254-character limit to be named"
@@ -752,21 +759,6 @@ async fn connection_drop_after_restore_delivery_is_an_ambiguous_mutation() {
 // --- Delete tolerance --------------------------------------------------------
 
 #[tokio::test]
-async fn delete_reports_a_404_as_already_gone() {
-    // Individually benign, but the caller counts them: a namespace where every
-    // delete 404s is what a misrouted apply looks like.
-    let url = spawn_stub_gateway(vec![(
-        "DELETE /upstreams/",
-        404,
-        r#"{"error":"not found"}"#,
-    )]);
-    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
-
-    let outcome = client.delete_upstream("u1", "team-alpha").await.unwrap();
-    assert_eq!(outcome, DeleteOutcome::NotFound);
-}
-
-#[tokio::test]
 async fn unclassified_mutation_403_is_upgraded_via_health() {
     // Some deployments answer a bare 403 with no read-only marker in the body.
     // Left as a generic ApiError it repeated once per resource; the health
@@ -781,7 +773,10 @@ async fn unclassified_mutation_403_is_upgraded_via_health() {
     ]);
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
-    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    let err = client
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"")
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
         "expected the 403 to be upgraded, got: {err:?}"
@@ -808,7 +803,10 @@ async fn a_403_on_a_writable_gateway_stays_a_plain_api_error() {
     ]);
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
-    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    let err = client
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"")
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, gitforgeops::error::Error::ApiError { status: 403, .. }),
         "expected the 403 to stand, got: {err:?}"
@@ -825,7 +823,10 @@ async fn the_health_recheck_is_best_effort() {
     ]);
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
-    let err = client.delete_proxy("p1", "team-alpha").await.unwrap_err();
+    let err = client
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"")
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, gitforgeops::error::Error::ApiError { status: 403, .. }),
         "expected the original error, got: {err:?}"

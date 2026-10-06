@@ -36,8 +36,9 @@ builds and generation receive no token binding. No protected checker admission
 or guarded workflow binding is changed by this consumer check.
 
 The original orders manifest references `/etc/ferrum/edge-client.pem`,
-`/etc/ferrum/edge-client.key` and `/etc/ferrum/alloy-ca.pem`. Released Edge
-v0.9.11 reads and validates these files during schema validation. The hosted
+`/etc/ferrum/edge-client.key` and `/etc/ferrum/alloy-ca.pem`. The allowlisted
+validator installed by the pairing job reads and validates these files during
+schema validation. The hosted
 qualification step creates a disposable CA and matching client certificate/key
 with explicit OpenSSL commands at those paths. It refuses an existing
 `/etc/ferrum` directory, gives the runner ownership of the new directory with

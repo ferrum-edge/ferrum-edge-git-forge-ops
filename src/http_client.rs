@@ -623,6 +623,9 @@ impl AdminClient {
             {
                 return Err(conditional::invalid());
             }
+            if !conditional::is_consumer_not_found(&resp.body) {
+                return Err(conditional::invalid());
+            }
             return Ok(None);
         }
         if resp.status != 200 {
@@ -913,39 +916,6 @@ impl AdminClient {
             .await
     }
 
-    pub async fn update_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
-        validate_resource_id_for_path(&proxy.id)?;
-        let path = format!("/proxies/{}", proxy.id);
-        let target = self.authorized(&path)?;
-        let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
-                target
-                    .request(Method::PUT)
-                    .header("X-Ferrum-Namespace", namespace)
-                    .json(proxy)
-            })
-            .await?;
-        self.check_mutation(&resp, RequestKind::Mutation).await
-    }
-
-    /// Delete a proxy without the server-side orphan cleanup.
-    ///
-    /// `cleanup_orphaned_upstream` defaults to `true` server-side: deleting a
-    /// proxy also deletes the last-referenced hand-owned upstream. That
-    /// invisible cascade makes the *next* diff-driven `DELETE /upstreams/{id}`
-    /// answer 404 and wedges the run. gitforgeops owns the upstream lifecycle
-    /// through its own diff, so it opts out and issues the upstream delete
-    /// itself.
-    pub async fn delete_proxy(
-        &self,
-        id: &str,
-        namespace: &str,
-    ) -> crate::error::Result<DeleteOutcome> {
-        validate_resource_id_for_path(id)?;
-        let path = format!("/proxies/{id}?cleanup_orphaned_upstream=false");
-        self.delete(&path, namespace, None).await
-    }
-
     pub async fn create_consumer(
         &self,
         consumer: &Consumer,
@@ -963,35 +933,6 @@ impl AdminClient {
         self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
             .await
             .map_err(conditional::withhold_error)
-    }
-
-    pub async fn update_consumer(
-        &self,
-        consumer: &Consumer,
-        namespace: &str,
-    ) -> crate::error::Result<()> {
-        validate_resource_id_for_path(&consumer.id)?;
-        let path = format!("/consumers/{}", consumer.id);
-        let target = self.authorized(&path)?;
-        let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
-                target
-                    .request(Method::PUT)
-                    .header("X-Ferrum-Namespace", namespace)
-                    .json(consumer)
-            })
-            .await?;
-        self.check_mutation(&resp, RequestKind::Mutation).await
-    }
-
-    pub async fn delete_consumer(
-        &self,
-        id: &str,
-        namespace: &str,
-    ) -> crate::error::Result<DeleteOutcome> {
-        validate_resource_id_for_path(id)?;
-        let path = format!("/consumers/{id}");
-        self.delete(&path, namespace, None).await
     }
 
     pub async fn create_upstream(
@@ -1012,35 +953,6 @@ impl AdminClient {
             .await
     }
 
-    pub async fn update_upstream(
-        &self,
-        upstream: &Upstream,
-        namespace: &str,
-    ) -> crate::error::Result<()> {
-        validate_resource_id_for_path(&upstream.id)?;
-        let path = format!("/upstreams/{}", upstream.id);
-        let target = self.authorized(&path)?;
-        let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
-                target
-                    .request(Method::PUT)
-                    .header("X-Ferrum-Namespace", namespace)
-                    .json(upstream)
-            })
-            .await?;
-        self.check_mutation(&resp, RequestKind::Mutation).await
-    }
-
-    pub async fn delete_upstream(
-        &self,
-        id: &str,
-        namespace: &str,
-    ) -> crate::error::Result<DeleteOutcome> {
-        validate_resource_id_for_path(id)?;
-        let path = format!("/upstreams/{id}");
-        self.delete(&path, namespace, None).await
-    }
-
     pub async fn create_plugin_config(
         &self,
         pc: &PluginConfig,
@@ -1057,35 +969,6 @@ impl AdminClient {
             .await?;
         self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
             .await
-    }
-
-    pub async fn update_plugin_config(
-        &self,
-        pc: &PluginConfig,
-        namespace: &str,
-    ) -> crate::error::Result<()> {
-        validate_resource_id_for_path(&pc.id)?;
-        let path = format!("/plugins/config/{}", pc.id);
-        let target = self.authorized(&path)?;
-        let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
-                target
-                    .request(Method::PUT)
-                    .header("X-Ferrum-Namespace", namespace)
-                    .json(pc)
-            })
-            .await?;
-        self.check_mutation(&resp, RequestKind::Mutation).await
-    }
-
-    pub async fn delete_plugin_config(
-        &self,
-        id: &str,
-        namespace: &str,
-    ) -> crate::error::Result<DeleteOutcome> {
-        validate_resource_id_for_path(id)?;
-        let path = format!("/plugins/config/{id}");
-        self.delete(&path, namespace, None).await
     }
 
     /// Read one proxy, consumer, upstream or plugin config for a conditional
@@ -1250,11 +1133,10 @@ impl AdminClient {
     }
 
     /// `DELETE` one resource only if its stored row still carries `etag`.
-    /// An empty or valid not-found 404 is tolerated as for
-    /// [`AdminClient::delete_proxy`]; a 412 is
+    /// An empty or valid not-found 404 is tolerated; a 412 is
     /// [`crate::error::Error::StalePlan`], as for
-    /// [`AdminClient::update_if_match`]. A proxy is deleted without the
-    /// server-side orphan cleanup, as [`AdminClient::delete_proxy`] explains.
+    /// [`AdminClient::update_if_match`]. Proxy deletion opts out of the
+    /// server-side orphan cleanup.
     pub async fn delete_if_match(
         &self,
         kind: &str,
@@ -1266,7 +1148,7 @@ impl AdminClient {
         if kind == "Proxy" {
             path.push_str("?cleanup_orphaned_upstream=false");
         }
-        self.delete(&path, namespace, Some(etag))
+        self.delete(kind, &path, namespace, Some(etag))
             .await
             .map_err(|error| {
                 if kind == "Consumer" && !matches!(error, crate::error::Error::StalePlan(_)) {
@@ -1285,6 +1167,7 @@ impl AdminClient {
     /// caller can only say that if it can count them.
     async fn delete(
         &self,
+        kind: &str,
         path: &str,
         namespace: &str,
         if_match: Option<&str>,
@@ -1306,8 +1189,14 @@ impl AdminClient {
             return Err(crate::error::Error::StalePlan(message));
         }
         if resp.status == 404 {
-            // Empty and valid not-found responses mean the row is already gone.
-            // A nonempty body must not hide an ambiguous or not-live mutation.
+            // Consumer deletes require Edge's exact not-found acknowledgement;
+            // a router response cannot prove that the consumer is gone.
+            if kind == "Consumer" {
+                if !conditional::is_consumer_not_found(&resp.body) {
+                    return Err(conditional::invalid());
+                }
+                return Ok(DeleteOutcome::NotFound);
+            }
             if !resp.body.is_empty() {
                 let acknowledgement = ApiErrorBody::parse_mutation(&resp.body)?;
                 if acknowledgement.applied == Some(false) {
