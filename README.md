@@ -333,11 +333,12 @@ These files are pinned to `contracts-edge-0.9.12` in
 See the [contracts guide](docs/contracts.md) for the pin and conformance checks.
 Change shared contracts in ferrum-contracts first, then re-vendor them here; never edit shared copies locally.
 
-Alloy's `edge export --format gitforgeops` resource trees are covered by a
-consumer check in the existing hosted validator-pairing job. It generates both
-original manifest fixtures with an immutable producer checkout, loads and
-assembles the output under default strictness, and runs GitForgeOps validation
-with the allowlisted Edge binary. See the [Alloy consumer guide](docs/alloy-consumer.md)
+Alloy's `edge export --format gitforgeops` resource trees are covered by the
+non-required hosted `alloy-consumer.yml` workflow, which runs on consumer-surface
+changes, weekly and on demand. It generates both original manifest fixtures
+with an immutable producer checkout, loads and assembles the output under
+default strictness, and runs GitForgeOps validation with the allowlisted Edge
+binary. See the [Alloy consumer guide](docs/alloy-consumer.md)
 for producer provenance, negative cases and qualification limits.
 
 ## Repo configuration: `.gitforgeops/config.yaml`

@@ -7,6 +7,5 @@
     "contracts/fixtures/manifests/orders-api.toml",
     "contracts/fixtures/manifests/plain-http.toml"
   ],
-  "checksums": "SHA256SUMS",
-  "output": "Generated only in GitHub-hosted CI; no generated resource snapshot is vendored."
+  "output": "Generated only in GitHub-hosted CI; no input manifest or generated resource snapshot is vendored."
 }

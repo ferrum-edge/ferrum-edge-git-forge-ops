@@ -269,6 +269,38 @@ fn loader_rejects_unknown_wrapper_and_resource_fields_with_file_and_path() {
 }
 
 #[test]
+fn loader_rejects_unknown_or_null_kinds_and_null_required_fields() {
+    let proxy = minimal_proxy("");
+    for (body, expected) in [
+        (
+            proxy.replacen("kind: Proxy", "kind: FutureService", 1),
+            "unknown resource kind",
+        ),
+        (
+            proxy.replacen("kind: Proxy", "kind: null", 1),
+            "missing 'kind'",
+        ),
+        (
+            "kind: Proxy\nspec: null\n".to_string(),
+            "invalid resource spec",
+        ),
+        (
+            proxy.replacen("id: api", "id: null", 1),
+            "invalid resource spec",
+        ),
+        (
+            proxy.replacen("backend_port: 80", "backend_port: null", 1),
+            "invalid resource spec",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(tmp.path(), "proxies", "api.yaml", &body);
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains(expected), "expected {expected}: {error}");
+    }
+}
+
+#[test]
 fn loader_rejects_unknown_nested_fields_in_health_checks_and_plugin_associations() {
     let cases = [
         (
