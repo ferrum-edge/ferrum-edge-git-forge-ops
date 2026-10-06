@@ -1,7 +1,7 @@
+name: GitForgeOps PR Static Validation
 # A job that supplies a required check in an `edited`-triggered workflow must
 # not use a job-level `if` that skips edited events; the newest skipped run can
 # fail the release gate.
-name: GitForgeOps PR Static Validation
 
 on:
   pull_request:

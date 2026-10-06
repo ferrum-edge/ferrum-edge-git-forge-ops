@@ -1,7 +1,7 @@
+name: GitForgeOps State Guard
 # A job that supplies a required check in an `edited`-triggered workflow must
 # not use a job-level `if` that skips edited events; the newest skipped run can
 # fail the release gate.
-name: GitForgeOps State Guard
 
 # `.state/<env>.json` is the ownership ledger: in shared mode it is the sole
 # authority for which live gateway resources this repo may delete, and it also
