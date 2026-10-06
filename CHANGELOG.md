@@ -143,12 +143,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   provenance, with exactly one stage named `builder` (#474).
 
 - Refresh the existing 13-file ferrum-contracts adoption to published
-  `contracts-edge-0.9.12` at `31f0a21d707795be293d15837c2f77c3d84219d8`, with an
-  explicit Edge v0.9.12 mapping and updated vocabulary byte hashes. The schema
-  and ten fixtures are unchanged; plugin and attribution values remain unchanged.
-  Preserve upstream preparation wording verbatim and document actual publication
-  separately. This pin update adds no deployment profiles or Alloy manifest/report
-  consumption and does not qualify production apply or first-release acceptance.
+  `contracts-edge-0.9.13` at `9626821eb089c71f5d4d71268c7b8276a8a5ab50`, with an
+  explicit Edge v0.9.13 mapping and updated vocabulary byte hashes. The resource
+  schema and ten fixtures are unchanged; plugin and attribution values remain
+  unchanged. The new `backend-egress-policy` v2 and
+  `admin-deployment-snapshot` v2 schemas are not consumed here. This pin update
+  adds no deployment profiles or Alloy manifest/report consumption and does not
+  qualify production apply or first-release acceptance.
 - Mutation acknowledgements refuse duplicate keys, malformed field types and
   ambiguous envelopes without exposing response bytes (#462). Invalid responses
   cannot authorize retries, pruning, ownership ledger updates or rotation
