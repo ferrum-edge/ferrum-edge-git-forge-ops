@@ -3722,7 +3722,29 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # condition or error tolerance may let it go green without running.
         self.assertNotIn("if", job)
         self.assertNotIn("continue-on-error", job)
-        self.assertIsNone(check_supply_chain.WHOLE_SECRETS.search(workflow))
+        # No secret reaches the job: no expression reads the secrets context,
+        # named or whole, and no key passes secrets on (`secrets: inherit` or
+        # a mapping). The word alone is not exposure: `src/secrets/**` is a
+        # path filter.
+        for expression in check_supply_chain.EXPRESSION.finditer(workflow):
+            self.assertIsNone(
+                check_supply_chain.WHOLE_SECRETS.search(expression.group(1)),
+                expression.group(0),
+            )
+        self.assertEqual(check_supply_chain.whole_secrets_context_violations(workflow_path, workflow), [])
+
+        def secret_keys(node, path=()):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if check_supply_chain.WHOLE_SECRETS.fullmatch(str(key).strip()):
+                        yield path + (key,)
+                    yield from secret_keys(value, path + (key,))
+            elif isinstance(node, list):
+                for index, item in enumerate(node):
+                    yield from secret_keys(item, path + (index,))
+
+        self.assertEqual(list(secret_keys(document)), [])
+        self.assertIsNone(re.search(r"^\s*-?\s*secrets\s*:", workflow, re.MULTILINE | re.IGNORECASE))
         self.assertEqual(check_supply_chain.installer_step_auth_violations(workflow_path, workflow), [])
         self.assertEqual(check_supply_chain.validator_locator_violations([workflow]), [])
         self.assertEqual(check_supply_chain.status_write_permission_violations(workflow_path, document), [])
