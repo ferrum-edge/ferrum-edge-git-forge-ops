@@ -754,9 +754,11 @@ What the export cannot tell you:
   `--force-baseline` is passed. If the drift check rewrites the baseline on
   every run, a change alerts once. Rotating the gateway's
   `FERRUM_ADMIN_JWT_SECRET`, or restarting a gateway that has none, changes
-  every fingerprint; `diff` then reports the baseline as not comparable, which
-  is not authoritative either. The baseline holds keyed fingerprints only; keep
-  it outside the repository (`diff` warns when it is inside a git worktree).
+  every fingerprint; `diff` then reports the baseline as not comparable, and
+  `--exit-on-drift` exits `1` — a supplied baseline that cannot verify secrets
+  is a failed check, unlike the no-baseline `6` warning. The baseline holds
+  keyed fingerprints only; keep it outside the repository (`diff` warns when it
+  is inside a git worktree).
 - **`basicauth` is hidden.** The export omits it (and custom types, and an
   `mtls_auth` type with no identity Edge accepts) and gives each consumer one
   fingerprint over all hidden credentials. Only a baseline can use it, so every

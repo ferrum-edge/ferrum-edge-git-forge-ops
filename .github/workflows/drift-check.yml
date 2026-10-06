@@ -158,10 +158,12 @@ jobs:
       # approval-gated apply and rotate workflows.
       - name: Check drift
         # `gitforgeops diff --exit-on-drift`: 0 in sync, 2 drift, 6 no drift in
-        # any compared field but fingerprinted secrets the viewer credential
-        # cannot compute were not verified, 1 the check itself failed
+        # an alerted category but fingerprinted secrets the viewer credential
+        # cannot compute were not verified (no fingerprint baseline supplied),
+        # 1 the check itself failed
         # (unreachable gateway, 401, cached/non-authoritative export, a whole
-        # value fingerprinted around a secret, bad configuration). The exit
+        # value fingerprinted around a secret, a supplied baseline that cannot
+        # verify secrets, bad configuration). The exit
         # code is captured rather than allowed to fail the step, because the
         # cases mean different things. `drift_report.py` does that
         # classification (6 is a non-blocking warning); the aggregate job

@@ -1720,15 +1720,31 @@ fn masked_ancestor_refusal() -> gitforgeops::error::Error {
     )
 }
 
+/// The refusal `diff --exit-on-drift` returns when `--fingerprint-baseline`
+/// was supplied but the baseline could not verify secrets: the file is
+/// missing, the gateway's fingerprint key changed since it was recorded, or a
+/// namespace it covers is incomplete. The verification control the operator
+/// set up failed, so the run cannot report the in-sync (0) result. Drift found
+/// on the same read is real and keeps the drift exit code.
+fn unverified_secrets_refusal() -> gitforgeops::error::Error {
+    gitforgeops::error::Error::StaleGatewayView(
+        "--exit-on-drift requires every declared secret to be verified before it reports no \
+         drift, but the supplied fingerprint baseline could not verify them (see the notes \
+         above); refusing to return the in-sync (0) result. Record a complete fingerprint \
+         baseline under the gateway's current key, or pass --accept-unverified-secrets"
+            .to_string(),
+    )
+}
+
 /// Ends `diff --exit-on-drift` with [`verdict::SECRETS_UNVERIFIED_EXIT_CODE`]:
-/// a fresh read found no drift in any compared field, but fingerprinted
-/// secrets were not verified, so the run cannot say "in sync". The distinct
-/// code lets scheduled monitoring report it as a warning rather than as a
-/// match (0) or a failed check (1). Drift found on the same read is real and
-/// keeps the drift exit code.
+/// a fresh read found no drift in an alerted category and no fingerprint
+/// baseline was supplied, so fingerprinted secrets were not verified and the
+/// run cannot say "in sync". The distinct code lets scheduled monitoring report
+/// it as a warning rather than as a match (0) or a failed check (1). Drift
+/// found on the same read is real and keeps the drift exit code.
 fn exit_secrets_unverified() -> ! {
     eprintln!(
-        "Note: --exit-on-drift found no drift in the compared fields, but fingerprinted secret fields were not verified (see the notes above), so it does not return the in-sync (0) result; exiting {} (in sync, secrets unverified). Compare against a complete fingerprint baseline under the gateway's current key, or pass --accept-unverified-secrets to exit 0.",
+        "Note: --exit-on-drift found no drift in the alerted categories, but no fingerprint baseline was supplied and fingerprinted secret fields were not verified (see the notes above), so it does not return the in-sync (0) result; exiting {} (in sync, secrets unverified). Compare against a complete fingerprint baseline under the gateway's current key, or pass --accept-unverified-secrets to exit 0.",
         verdict::SECRETS_UNVERIFIED_EXIT_CODE
     );
     process::exit(verdict::SECRETS_UNVERIFIED_EXIT_CODE);
@@ -2108,13 +2124,21 @@ async fn cmd_diff(
     // with unverified secrets (and wins over a refused baseline write, whose
     // warning is already printed). Without drift, unverified secrets make
     // `--exit-on-drift` exit SECRETS_UNVERIFIED_EXIT_CODE rather than 0, unless
-    // a refused baseline write already makes the run fail (1). A cached read
-    // never gets here with `--exit-on-drift`; it was refused above.
-    // Whole values fingerprinted around a secret also hid non-secret
-    // contents; neither a baseline nor --accept-unverified-secrets covers that.
+    // a refused baseline write already makes the run fail (1). A supplied
+    // `--fingerprint-baseline` that could not verify secrets (file missing,
+    // key changed, recorded namespace incomplete) is a failed check too, not
+    // the non-blocking code. A cached read never gets here with
+    // `--exit-on-drift`; it was refused above. Whole values fingerprinted
+    // around a secret also hid non-secret contents; neither a baseline nor
+    // --accept-unverified-secrets covers that.
+    let report_invalidated = fingerprint_report
+        .as_ref()
+        .is_some_and(config_export::SecretFingerprintSummary::baseline_invalidated);
+    let baseline_invalidated = flags.read.is_some() && (baseline.is_none() || report_invalidated);
     let diff_exit = verdict::DiffExit::evaluate(
         &drift,
         fields_authoritative,
+        baseline_invalidated,
         fingerprints_verified,
         flags.accept_unverified_secrets,
     );
@@ -2122,6 +2146,7 @@ async fn cmd_diff(
         _ if !exit_on_drift => baseline_refusal,
         verdict::DiffExit::Drift => None,
         verdict::DiffExit::MaskedSecretAncestors => Some(masked_ancestor_refusal()),
+        verdict::DiffExit::BaselineInvalidated => Some(unverified_secrets_refusal()),
         verdict::DiffExit::InSync | verdict::DiffExit::SecretsUnverified => baseline_refusal,
     };
     let secrets_unverified =

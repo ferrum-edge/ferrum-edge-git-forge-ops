@@ -546,9 +546,18 @@ fn secret_fingerprint_changes_are_managed_modifications() {
 fn unverified_secrets_without_drift_get_their_own_exit_code() {
     let in_sync = DriftVerdict::evaluate(&defaults(), &[], &[], &[]);
 
-    let unverified = DiffExit::evaluate(&in_sync, true, false, false);
+    let unverified = DiffExit::evaluate(&in_sync, true, false, false, false);
     assert_eq!(unverified, DiffExit::SecretsUnverified);
     assert_eq!(unverified.exit_code(), SECRETS_UNVERIFIED_EXIT_CODE);
+
+    // A supplied baseline that could not verify secrets is a failed check, not
+    // the non-blocking unverified code, unless acceptance is explicit.
+    let invalidated = DiffExit::evaluate(&in_sync, true, true, false, false);
+    assert_eq!(invalidated, DiffExit::BaselineInvalidated);
+    assert_eq!(invalidated.exit_code(), 1);
+    let invalidated_accepted = DiffExit::evaluate(&in_sync, true, true, false, true);
+    assert_eq!(invalidated_accepted, DiffExit::InSync);
+    assert_eq!(invalidated_accepted.exit_code(), 0);
 
     // Every documented exit code stays distinct, so a scheduled monitor can
     // tell "in sync, secrets unverified" from a match, drift, a failed check,
@@ -566,10 +575,10 @@ fn unverified_secrets_without_drift_get_their_own_exit_code() {
     assert_eq!(distinct.len(), documented.len(), "{documented:?}");
 
     // Explicit acceptance, or verified secrets, return the in-sync result.
-    let accepted = DiffExit::evaluate(&in_sync, true, false, true);
+    let accepted = DiffExit::evaluate(&in_sync, true, false, false, true);
     assert_eq!(accepted, DiffExit::InSync);
     assert_eq!(accepted.exit_code(), 0);
-    let verified = DiffExit::evaluate(&in_sync, true, true, false);
+    let verified = DiffExit::evaluate(&in_sync, true, false, true, false);
     assert_eq!(verified, DiffExit::InSync);
     assert_eq!(verified.exit_code(), 0);
 }
@@ -584,7 +593,7 @@ fn drift_wins_over_unverified_secrets_and_masked_values() {
         (false, true, true),
         (true, true, false),
     ] {
-        let exit = DiffExit::evaluate(&drift, authoritative, verified, accepted);
+        let exit = DiffExit::evaluate(&drift, authoritative, false, verified, accepted);
         assert_eq!(exit, DiffExit::Drift);
         assert_eq!(exit.exit_code(), DRIFT_EXIT_CODE);
     }
@@ -597,7 +606,7 @@ fn masked_secret_ancestors_are_never_downgraded_to_unverified_secrets() {
     // covers it.
     let in_sync = DriftVerdict::evaluate(&defaults(), &[], &[], &[]);
     for (verified, accepted) in [(false, false), (false, true), (true, false), (true, true)] {
-        let exit = DiffExit::evaluate(&in_sync, false, verified, accepted);
+        let exit = DiffExit::evaluate(&in_sync, false, false, verified, accepted);
         assert_eq!(exit, DiffExit::MaskedSecretAncestors);
         assert_eq!(exit.exit_code(), 1);
     }

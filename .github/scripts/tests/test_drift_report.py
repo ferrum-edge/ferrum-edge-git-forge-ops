@@ -59,8 +59,8 @@ class OutcomeTaxonomyTests(unittest.TestCase):
     def test_diff_exit_codes_map_to_gateway_statements_only(self):
         self.assertEqual(drift_report.outcome_for_exit_code(0), drift_report.IN_SYNC)
         self.assertEqual(drift_report.outcome_for_exit_code(2), drift_report.DRIFT)
-        # Exit 6 (issue #471): a viewer-capped read found no drift in any
-        # compared field, but could not verify fingerprinted secrets.
+        # Exit 6 (issue #471): a viewer-capped read found no drift in an alerted
+        # category, but could not verify fingerprinted secrets.
         self.assertEqual(
             drift_report.outcome_for_exit_code(6),
             drift_report.IN_SYNC_SECRETS_UNVERIFIED,
@@ -241,6 +241,9 @@ class CliTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("In sync, secrets unverified", result.stdout)
+        # The warning is also an annotation, so a green run's checks page shows
+        # it rather than only the job summary.
+        self.assertIn("::warning title=Secrets unverified::", result.stdout)
 
     def test_record_needs_an_outcome_or_an_exit_code(self):
         with tempfile.TemporaryDirectory() as directory:

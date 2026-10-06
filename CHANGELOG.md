@@ -79,15 +79,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `diff --exit-on-drift` exits with the new code `6` ("in sync, secrets
   unverified") instead of `1` when a fresh viewer-credential read found no
-  drift in any compared field and the only gap is fingerprinted secrets the
-  viewer cannot verify (no complete fingerprint baseline, or a changed gateway
-  fingerprint key). `drift_report.py` records it as the non-blocking
-  `in_sync_secrets_unverified` outcome, shown as a warning in the job summary,
-  so scheduled viewer-only monitoring of an in-sync environment that declares
-  secrets no longer fails every run and keeps the settings audit's monitoring
-  evidence current. Drift still exits `2` and fails the workflow; a cached read,
-  a whole value fingerprinted around a secret and a refused baseline write still
-  exit `1`. `--accept-unverified-secrets` still returns `0`; runs without
+  drift in an alerted category and no fingerprint baseline was supplied, so the
+  only gap is fingerprinted secrets the viewer cannot verify. `drift_report.py`
+  records it as the non-blocking `in_sync_secrets_unverified` outcome, shown as
+  a warning in the job summary and as a `::warning::` annotation, so scheduled
+  viewer-only monitoring of an in-sync environment that declares secrets no
+  longer fails every run and keeps the settings audit's monitoring evidence
+  current. Drift still exits `2` and fails the workflow; a cached read, a whole
+  value fingerprinted around a secret, a refused baseline write, and a supplied
+  `--fingerprint-baseline` that cannot verify secrets (missing file, changed
+  gateway fingerprint key, incomplete recorded namespace) still exit `1`.
+  `--accept-unverified-secrets` still returns `0`; runs without
   `--exit-on-drift` and apply-time verification are unchanged (#471).
 - Align `rust-toolchain.toml`, workflow Rust pins, and the Docker builder rule on
   Rust 1.99.0. The trusted supply-chain checker enforces a 1.99.0 minimum,

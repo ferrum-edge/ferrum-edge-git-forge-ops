@@ -101,11 +101,14 @@ pub enum Commands {
         #[arg(long)]
         force_baseline: bool,
         /// With `--exit-on-drift`, return the in-sync result (0) even though
-        /// fingerprinted secrets could not be verified (no complete
-        /// fingerprint baseline, or the gateway's fingerprint key changed).
-        /// Without it, such a run exits 6 (in sync, secrets unverified). Drift
-        /// found on a fresh read exits 2 either way; a cached read always
-        /// exits 1, and so does a whole value fingerprinted around a secret.
+        /// fingerprinted secrets could not be verified. Without it, a run with
+        /// no fingerprint baseline exits 6 (in sync, secrets unverified). A
+        /// supplied baseline that cannot verify secrets (missing file, changed
+        /// gateway fingerprint key, incomplete recorded namespace) exits 1
+        /// instead; the flag turns that to 0 as well. Drift found on a fresh
+        /// read exits 2 either way, a cached read always exits 1, and a whole
+        /// value fingerprinted around a secret always exits 1 — the flag does
+        /// not cover it.
         #[arg(long)]
         accept_unverified_secrets: bool,
     },

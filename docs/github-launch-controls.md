@@ -421,7 +421,7 @@ compared and matched:
 | Outcome | Meaning |
 | --- | --- |
 | `In sync` | the gateway was read and matches the repository |
-| `In sync, secrets unverified` | `diff` exit `6`: every compared field matches, but fingerprinted secrets were not verified because the viewer credential cannot compute their fingerprints; a warning, not a failure |
+| `In sync, secrets unverified` | `diff` exit `6`: no drift in an alerted category, but fingerprinted secrets were not verified because the viewer credential cannot compute their fingerprints; a warning, not a failure |
 | `Drift detected` | the gateway was read and differs |
 | `Check failed` | authentication, connectivity, a cached (non-authoritative) export, a whole value fingerprinted around a secret, or a configuration error — **nothing is known about the gateway** |
 | `Skipped (file mode)` | no live Admin API to compare against; a configured absence, not a gap |
@@ -430,8 +430,9 @@ compared and matched:
 `drift_report.py` classifies each result and writes the table to the job
 summary. `Drift detected`, `Check failed` and `Not completed` fail the
 workflow; `Skipped` and `In sync, secrets unverified` do not. The latter is
-listed as a warning in the summary, so a successful run with it still counts as
-monitoring evidence for the settings audit, while drift in any compared field
+listed as a warning in the summary and emitted as a `::warning::` annotation, so
+a successful run with it still counts as monitoring evidence for the settings
+audit, while drift in an alerted category
 still fails the run. A matrix entry that produced no record is shown as
 `Not completed`, so an environment waiting for approval still appears in the
 table.

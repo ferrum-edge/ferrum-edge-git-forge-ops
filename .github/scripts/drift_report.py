@@ -14,9 +14,9 @@ compared and matched":
 
     in_sync        the gateway was read and matches the repository
     in_sync_secrets_unverified
-                   the gateway was read and every compared field matches,
-                   but fingerprinted secrets the viewer credential cannot
-                   compute were not verified (`diff` exit 6)
+                   the gateway was read and no drift was found in an alerted
+                   category, but fingerprinted secrets the viewer credential
+                   cannot compute were not verified (`diff` exit 6)
     drift          the gateway was read and differs
     failed         the check itself failed (auth, connectivity, stale view,
                    configuration) — nothing is known about the gateway
@@ -28,8 +28,8 @@ compared and matched":
 explicitly *not* `in_sync`. The aggregate exit code fails the workflow for
 `drift`, `failed` and `not_completed`. `skipped` is a deliberate
 configuration, not a gap, and `in_sync_secrets_unverified` is a warning: no
-drift was found in anything the read could compare, and the gap is the
-documented limit of a viewer-capped read, not a failure of the check.
+drift was found in an alerted category, and the gap is the documented limit of
+a viewer-capped read, not a failure of the check.
 
 Usage::
 
@@ -78,7 +78,7 @@ LABELS = {
     IN_SYNC_SECRETS_UNVERIFIED: (
         "⚠️",
         "In sync, secrets unverified",
-        "no drift in any compared field; fingerprinted secrets were not "
+        "no drift in an alerted category; fingerprinted secrets were not "
         "verified because the viewer credential cannot compute their "
         "fingerprints",
     ),
@@ -199,13 +199,17 @@ def summarize(entries: list[dict]) -> tuple[str, int]:
     ]
     if warnings:
         names = ", ".join(f"`{item['environment']}`" for item in warnings)
-        lines.append(
-            f"\nWarning: {names} showed no drift in any compared field, but "
-            "fingerprinted secrets were not verified. The viewer credential "
-            "cannot compute a secret's fingerprint, so only a fingerprint "
-            "baseline can detect a changed secret. This does not fail "
-            "monitoring; drift in any compared field still does."
+        message = (
+            f"{names} showed no drift in an alerted category, but fingerprinted "
+            "secrets were not verified. The viewer credential cannot compute a "
+            "secret's fingerprint, so only a fingerprint baseline can detect a "
+            "changed secret. This does not fail monitoring; drift in an alerted "
+            "category still does."
         )
+        lines.append(f"\nWarning: {message}")
+        # The step summary is not the checks page, so make the warning a visible
+        # annotation on an otherwise green run.
+        print(f"::warning title=Secrets unverified::{message}")
     if skipped:
         names = ", ".join(f"`{item['environment']}`" for item in skipped)
         lines.append(
