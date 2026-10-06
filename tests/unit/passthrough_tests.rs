@@ -162,9 +162,11 @@ fn null_valued_unknown_fields_follow_the_same_policy() {
     assert!(exported.contains("turbo_mode: null"), "{exported}");
 
     // The opt-in covers top-level spec fields only, never the wrapper.
-    let wrapped = proxy
-        .replacen("  turbo_mode: null\n", "", 1)
-        .replacen("spec:", "turbo_wrapper: null\nspec:", 1);
+    let wrapped = proxy.replacen("  turbo_mode: null\n", "", 1).replacen(
+        "spec:",
+        "turbo_wrapper: null\nspec:",
+        1,
+    );
     let tmp = tree(&[("ferrum/proxies/edge.yaml", wrapped.as_str())]);
     let error =
         load_resources_with_options(tmp.path(), LoadOptions::ALLOW_UNKNOWN_FIELDS).unwrap_err();
