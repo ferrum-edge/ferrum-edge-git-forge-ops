@@ -1,16 +1,13 @@
 name: GitForgeOps Base Image Pin Canary
 
-# The runtime stage pins a digest of the Debian base. A temporary
-# `runtime-security-updates` builder stage may install reviewed point-release
-# packages by exact version and SHA-256 when that digest predates the fixes.
-# Five things the canary has to notice: the base catches up (retire the stage),
-# Debian publishes a newer point release (refresh the pins), the archive drops
-# a superseded .deb (the image build fails on a 404), or a later tag reports a
-# fix after the stage has already been retired (reintroduce the pins), or a
-# clean moving tag no longer matches the pinned runtime digest (repin it). A
-# comment cannot notice any of them. The `trivy-image` gate notices a gap, but
-# only by turning every pull request red — which is how the perl-base and
-# libsqlite3 gap was found. This canary checks the moving tag daily and hands
+# The runtime stage pins a digest of the Debian base and may apply reviewed
+# point-release packages by exact version and SHA-256. The canary notices when
+# the base reports an uncovered fix, a pin falls behind, a package leaves the
+# archive, or the clean moving tag no longer matches the pinned digest. A clean
+# Trivy report alone does not prove the base already carries a pinned version;
+# check installed package metadata before dropping that pin. The `trivy-image`
+# gate notices a gap, but only by turning every pull request red — which is
+# how the perl-base and libsqlite3 gap was found. This canary checks the moving tag daily and hands
 # a maintainer the exact next step instead.
 on:
   schedule:
@@ -31,7 +28,7 @@ jobs:
       contents: read
       issues: write
     env:
-      ISSUE_TITLE: Refresh or retire the pinned runtime base image packages
+      ISSUE_TITLE: Refresh or review the pinned runtime base image packages
       ISSUE_MARKER: '<!-- gitforgeops:base-image-pin-canary -->'
     steps:
       - name: Require protected default branch
