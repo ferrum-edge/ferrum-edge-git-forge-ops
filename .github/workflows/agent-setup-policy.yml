@@ -1,4 +1,7 @@
 name: Agent Setup Policy
+# A job that supplies a required check in an `edited`-triggered workflow must
+# not use a job-level `if` that skips edited events; the newest skipped run can
+# fail the release gate.
 
 # pull_request_target keeps this workflow definition on the protected default
 # branch. It never executes candidate code: the candidate is data for the

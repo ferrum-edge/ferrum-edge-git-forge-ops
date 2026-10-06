@@ -208,6 +208,8 @@ state["clock"] += scenario.get("api_seconds", 0)
 state_path.write_text(json.dumps(state), encoding="utf-8")
 responses = scenario.get("responses", {}).get(mode)
 status = scenario.get("statuses", {}).get(mode, 0)
+if isinstance(status, list):
+    status = status[min(count, len(status) - 1)]
 diagnostic = "lookup failed\n" if status else ""
 if responses is not None:
     sys.stdout.write(responses[min(count, len(responses) - 1)])
@@ -525,6 +527,19 @@ class ReleaseGateTests(unittest.TestCase):
                 self.assertEqual(self.sleeps, [["sleep", "15"]])
                 self.assertIn("pending or missing", result.stdout)
                 self.assertIn("Timed out", result.stderr)
+
+    def test_budget_exhaustion_reports_only_the_timeout_not_changed_identity(self) -> None:
+        pending = [dict(check) for check in PASSING_CHECKS]
+        pending[2]["bucket"] = "pending"
+        result = self.run_gate(
+            PASSING_CHECKS, samples=[pending], sleep_advance=900
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        self.assertEqual(
+            result.stderr.count("Timed out waiting for same-head release checks"), 1
+        )
+        self.assertNotIn("changed identity", result.stdout + result.stderr)
 
     def test_an_empty_full_lookup_cannot_authorize_a_passing_required_lookup(self) -> None:
         result = self.run_gate(
@@ -943,19 +958,76 @@ class ReleaseGateTests(unittest.TestCase):
         ]
         self.assertEqual(len(run_reads), 1)
 
-    def test_passing_cli_requires_consistent_check_run_page_counts(self) -> None:
+    def test_inconsistent_check_run_page_counts_wait_then_accept_consistent_sample(self) -> None:
         history = full_run_page()
         retry = dict(history[2], id=900)
+        consistent = json.dumps(
+            [{"total_count": len(passing_runs()), "check_runs": passing_runs()}]
+        )
         for counts in ((100, 101), (101, 100), (101, 102)):
             with self.subTest(counts=counts):
-                response = json.dumps([
+                inconsistent = json.dumps([
                     {"total_count": counts[0], "check_runs": history},
                     {"total_count": counts[1], "check_runs": [retry]},
                 ])
-                result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [response]})
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("inconsistent check-run page counts", result.stderr)
-                self.assertEqual(self.sleeps, [])
+                result = self.run_gate(
+                    PASSING_CHECKS, responses={"RUNS": [inconsistent, consistent]}
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
+                self.assertIn("pending or missing", result.stdout)
+                run_reads = [
+                    call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+                ]
+                self.assertEqual(len(run_reads), 2)
+
+    def test_inconsistent_page_counts_hiding_a_queued_retry_time_out(self) -> None:
+        # Every visible run passed, but the advertised total disagrees across
+        # pages because a queued retry raced pagination. Never judge it.
+        history = passing_runs()
+        inconsistent = json.dumps([
+            {"total_count": 5, "check_runs": history},
+            {"total_count": 6, "check_runs": []},
+        ])
+        result = self.run_gate(
+            PASSING_CHECKS, responses={"RUNS": [inconsistent]}, sleep_advance=900
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        self.assertNotIn("has successful source-bound checks", result.stdout)
+        self.assertIn("Timed out", result.stderr)
+
+    def test_check_run_http_5xx_retries_once_and_then_reads_valid_evidence(self) -> None:
+        result = self.run_gate(
+            PASSING_CHECKS,
+            statuses={"RUNS": [1, 0]},
+            errors={"RUNS": ["gh: HTTP 503: Service Unavailable\n", ""]},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [["sleep", "2"]])
+        run_reads = [
+            call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+        ]
+        self.assertEqual(len(run_reads), 2)
+
+    def test_check_run_http_5xx_retry_is_bounded(self) -> None:
+        result = self.run_gate(
+            PASSING_CHECKS,
+            statuses={"RUNS": [1, 1]},
+            errors={"RUNS": ["gh: HTTP 503: Service Unavailable\n"]},
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        run_reads = [
+            call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+        ]
+        self.assertEqual(len(run_reads), 2)
+
+    def test_malformed_check_run_page_data_remains_fatal(self) -> None:
+        malformed = json.dumps([{"total_count": "5", "check_runs": passing_runs()}])
+        result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [malformed]})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("invalid check-run page", result.stderr)
 
     def test_passing_cli_cannot_authorize_a_truncated_paginated_history(self) -> None:
         page = {"total_count": 101, "check_runs": full_run_page()}
@@ -981,18 +1053,32 @@ class ReleaseGateTests(unittest.TestCase):
             {"total_count": 5, "check_runs": history},
             {"total_count": 6, "check_runs": []},
         ])
-        for evidence in (incomplete, inconsistent):
-            with self.subTest(evidence=evidence):
-                result = self.run_gate(
-                    PASSING_CHECKS, responses={"RUNS": [pending, evidence, complete]}
-                )
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(self.sleeps, [["sleep", "15"]])
-                self.assertNotIn("has successful source-bound checks", result.stdout)
-                run_reads = [
-                    call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
-                ]
-                self.assertEqual(len(run_reads), 2)
+        with self.subTest(evidence="incomplete"):
+            result = self.run_gate(
+                PASSING_CHECKS, responses={"RUNS": [pending, incomplete, complete]}
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.sleeps, [["sleep", "15"]])
+            self.assertNotIn("has successful source-bound checks", result.stdout)
+            run_reads = [
+                call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+            ]
+            self.assertEqual(len(run_reads), 2)
+        # A raced sample hides the queued retry: it waits again and only the
+        # complete sample may pass.
+        with self.subTest(evidence="inconsistent"):
+            result = self.run_gate(
+                PASSING_CHECKS, responses={"RUNS": [pending, inconsistent, complete]}
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(self.sleeps, [["sleep", "15"], ["sleep", "15"]])
+            self.assertEqual(
+                result.stdout.count("has successful source-bound checks"), 1
+            )
+            run_reads = [
+                call for call in self.calls if call[0] == "api" and "/check-runs?" in call[1]
+            ]
+            self.assertEqual(len(run_reads), 3)
 
     def test_duplicate_run_ids_cannot_complete_the_advertised_count(self) -> None:
         history = passing_runs()
