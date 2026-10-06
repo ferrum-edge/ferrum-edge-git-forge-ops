@@ -14,7 +14,8 @@
 //!   the predicates rather than the control flow is what keeps a clean `plan`
 //!   from promising an `apply` that deterministically refuses.
 //! * [`DriftVerdict`] — what makes `diff --exit-on-drift` return
-//!   [`DRIFT_EXIT_CODE`].
+//!   [`DRIFT_EXIT_CODE`], and [`DiffExit`] — how a fresh read ends once
+//!   unverified secrets are folded in ([`SECRETS_UNVERIFIED_EXIT_CODE`]).
 //!
 //! Gates that need a live gateway (large-prune threshold, stale-view block,
 //! per-resource apply failures) are deliberately **not** here: a preview
@@ -42,9 +43,18 @@ pub const CONDITIONAL_APPLY_NOTICE: &str = "API apply requires complete consumer
 /// including an empty-namespace-filter mismatch — see
 /// [`crate::config::EMPTY_NAMESPACE_EXIT_CODE`]) so a scheduled drift monitor
 /// can tell "the gateway drifted" from "the run failed". `drift-check.yml`
-/// treats any non-zero exit as a failed check, so the distinction is for
-/// humans and for anything that inspects `$?`.
+/// classifies each code through `.github/scripts/drift_report.py`.
 pub const DRIFT_EXIT_CODE: i32 = 2;
+
+/// Process exit code for `diff --exit-on-drift` when a fresh read found no
+/// drift in any compared field and the only gap is fingerprinted secrets the
+/// viewer credential could not verify ([`DiffExit::SecretsUnverified`]).
+///
+/// Distinct from `0` (in sync), [`DRIFT_EXIT_CODE`], `1` (the check could not
+/// complete), `doctor`'s `3` and `verify`'s `4`/`5`, so `drift-check.yml` can
+/// report "in sync, secrets unverified" as a non-blocking warning without
+/// calling it either a match or a failed check.
+pub const SECRETS_UNVERIFIED_EXIT_CODE: i32 = 6;
 
 /// One class of fail-closed refusal, decidable without a gateway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -450,5 +460,56 @@ impl DriftVerdict {
             reasons.push("managed secrets changed since the fingerprint baseline");
         }
         reasons
+    }
+}
+
+/// How `diff --exit-on-drift` ends on a fresh (non-cached) read. A cached read
+/// never reaches this: `diff` refuses it before comparing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffExit {
+    /// No drift, every compared field authoritative, and every declared
+    /// secret verified (or `--accept-unverified-secrets` passed): `0`.
+    InSync,
+    /// Drift found: [`DRIFT_EXIT_CODE`]. Real even with unverified secrets.
+    Drift,
+    /// No drift in any compared field, but fingerprinted secrets were not
+    /// verified (no complete fingerprint baseline, or the gateway's
+    /// fingerprint key changed): [`SECRETS_UNVERIFIED_EXIT_CODE`].
+    SecretsUnverified,
+    /// No drift found, but the gateway fingerprinted whole values around a
+    /// secret, hiding their non-secret contents. A refusal (`1`) that neither
+    /// a baseline nor `--accept-unverified-secrets` covers.
+    MaskedSecretAncestors,
+}
+
+impl DiffExit {
+    /// Combine the drift verdict with what the export could not compare.
+    /// `/backup` reads pass `true` for both `fields_authoritative` and
+    /// `secrets_verified`.
+    pub fn evaluate(
+        drift: &DriftVerdict,
+        fields_authoritative: bool,
+        secrets_verified: bool,
+        accept_unverified_secrets: bool,
+    ) -> Self {
+        if drift.has_drift() {
+            Self::Drift
+        } else if !fields_authoritative {
+            Self::MaskedSecretAncestors
+        } else if secrets_verified || accept_unverified_secrets {
+            Self::InSync
+        } else {
+            Self::SecretsUnverified
+        }
+    }
+
+    /// The process exit code for this outcome.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::InSync => 0,
+            Self::Drift => DRIFT_EXIT_CODE,
+            Self::SecretsUnverified => SECRETS_UNVERIFIED_EXIT_CODE,
+            Self::MaskedSecretAncestors => 1,
+        }
     }
 }

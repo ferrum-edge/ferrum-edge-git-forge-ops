@@ -59,10 +59,16 @@ class OutcomeTaxonomyTests(unittest.TestCase):
     def test_diff_exit_codes_map_to_gateway_statements_only(self):
         self.assertEqual(drift_report.outcome_for_exit_code(0), drift_report.IN_SYNC)
         self.assertEqual(drift_report.outcome_for_exit_code(2), drift_report.DRIFT)
+        # Exit 6 (issue #471): a viewer-capped read found no drift in any
+        # compared field, but could not verify fingerprinted secrets.
+        self.assertEqual(
+            drift_report.outcome_for_exit_code(6),
+            drift_report.IN_SYNC_SECRETS_UNVERIFIED,
+        )
         # Exit 1 covers authentication, connectivity, a cached
-        # (non-authoritative) backup and configuration errors. None of them is
+        # (non-authoritative) read and configuration errors. None of them is
         # a statement about the gateway.
-        for unknown in (1, 3, 101, 137):
+        for unknown in (1, 3, 4, 5, 101, 137):
             with self.subTest(exit_code=unknown):
                 self.assertEqual(
                     drift_report.outcome_for_exit_code(unknown), drift_report.FAILED
@@ -79,6 +85,14 @@ class OutcomeTaxonomyTests(unittest.TestCase):
         # not a gap in coverage.
         self.assertNotIn(drift_report.SKIPPED, drift_report.BLOCKING)
 
+    def test_unverified_secrets_warn_without_blocking_or_claiming_a_match(self):
+        unverified = drift_report.IN_SYNC_SECRETS_UNVERIFIED
+        self.assertIn(unverified, drift_report.OUTCOMES)
+        self.assertIn(unverified, drift_report.WARNING)
+        self.assertNotIn(unverified, drift_report.BLOCKING)
+        self.assertNotIn(unverified, drift_report.SUCCESSFUL_COMPARISON)
+        self.assertTrue(drift_report.WARNING.isdisjoint(drift_report.BLOCKING))
+
     def test_unknown_outcome_is_refused(self):
         with self.assertRaises(ValueError):
             drift_report.record("prod", "prod-monitor", "probably_fine", False)
@@ -92,12 +106,47 @@ class SummaryTests(unittest.TestCase):
             entry("c", drift_report.FAILED),
             entry("d", drift_report.SKIPPED),
             entry("e", drift_report.NOT_COMPLETED),
+            entry("f", drift_report.IN_SYNC_SECRETS_UNVERIFIED),
         ]
         text, status = drift_report.summarize(entries)
         for outcome in drift_report.OUTCOMES:
             self.assertIn(drift_report.LABELS[outcome][1], text)
-        self.assertIn("1 of 5 environments were compared and matched", text)
+        labels = [drift_report.LABELS[outcome][1] for outcome in drift_report.OUTCOMES]
+        self.assertEqual(len(set(labels)), len(labels))
+        self.assertIn("1 of 6 environments were compared and matched", text)
         self.assertEqual(status, 1)
+
+    def test_unverified_secrets_alone_pass_with_a_warning(self):
+        # Scheduled viewer-only monitoring of an in-sync environment that
+        # declares secrets must not fail every run (#471): the settings audit
+        # reads the workflow's last successful run as monitoring evidence.
+        text, status = drift_report.summarize(
+            [
+                entry("production", drift_report.IN_SYNC_SECRETS_UNVERIFIED),
+                entry("staging"),
+            ]
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("In sync, secrets unverified", text)
+        self.assertIn("Warning: `production`", text)
+        self.assertIn("1 of 2 environments were compared and matched", text)
+        self.assertNotIn("Needs attention", text)
+
+    def test_unverified_secrets_never_mask_real_drift_or_failure(self):
+        for blocking in (
+            drift_report.DRIFT,
+            drift_report.FAILED,
+            drift_report.NOT_COMPLETED,
+        ):
+            with self.subTest(outcome=blocking):
+                text, status = drift_report.summarize(
+                    [
+                        entry("production", drift_report.IN_SYNC_SECRETS_UNVERIFIED),
+                        entry("staging", blocking),
+                    ]
+                )
+                self.assertEqual(status, 1)
+                self.assertIn(f"`staging` ({blocking})", text)
 
     def test_a_clean_run_reports_every_environment_compared(self):
         text, status = drift_report.summarize(
@@ -170,6 +219,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("Drift detected", result.stdout)
         self.assertIn("Skipped (file mode)", result.stdout)
+
+    def test_secrets_unverified_exit_code_records_a_non_blocking_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._record(
+                root / "production.json",
+                "--environment", "production",
+                "--check-environment", "production-monitor",
+                "--unattended",
+                "--exit-code", "6",
+            )
+            written = json.loads((root / "production.json").read_text())
+            self.assertEqual(
+                written["outcome"], drift_report.IN_SYNC_SECRETS_UNVERIFIED
+            )
+            self.assertEqual(written["exit_code"], 6)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "summarize", "--input", str(root)],
+                check=False, text=True, capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("In sync, secrets unverified", result.stdout)
 
     def test_record_needs_an_outcome_or_an_exit_code(self):
         with tempfile.TemporaryDirectory() as directory:

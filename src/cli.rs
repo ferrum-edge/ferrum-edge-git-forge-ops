@@ -103,9 +103,9 @@ pub enum Commands {
         /// With `--exit-on-drift`, return the in-sync result (0) even though
         /// fingerprinted secrets could not be verified (no complete
         /// fingerprint baseline, or the gateway's fingerprint key changed).
-        /// Without it, such a run exits 1 as non-authoritative. Drift found
-        /// on a fresh read exits 2 either way; a cached read always exits 1,
-        /// and so does a whole value fingerprinted around a secret.
+        /// Without it, such a run exits 6 (in sync, secrets unverified). Drift
+        /// found on a fresh read exits 2 either way; a cached read always
+        /// exits 1, and so does a whole value fingerprinted around a secret.
         #[arg(long)]
         accept_unverified_secrets: bool,
     },

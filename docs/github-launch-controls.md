@@ -397,8 +397,9 @@ Unless the gateway also sets `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, the viewer
 key reads every namespace. Repository namespace scopes and gateway viewer
 namespace restrictions still apply. The workflow does not pass
 `--accept-unverified-secrets` and does not automatically store fingerprint
-baselines: a comparison with unverified secrets fails instead of certifying
-"in sync". Explicit CLI acceptance retains its documented limits.
+baselines. A comparison with no drift but unverified secrets exits `6` and is
+reported as `In sync, secrets unverified`: a warning, never "in sync", and not
+a failure. Explicit CLI acceptance retains its documented limits.
 
 **Human deployment step (#440).** Before deploying the viewer-only workflow,
 a repository administrator must provision the gateway's distinct viewer key as
@@ -414,21 +415,25 @@ prints or copies secret values. See [Scheduled monitoring](reference.md#schedule
 
 ### 3.2 Monitoring outcomes
 
-The scheduled check reports five outcomes. Only `In sync` says a gateway was
+The scheduled check reports six outcomes. Only `In sync` says a gateway was
 compared and matched:
 
 | Outcome | Meaning |
 | --- | --- |
 | `In sync` | the gateway was read and matches the repository |
+| `In sync, secrets unverified` | `diff` exit `6`: every compared field matches, but fingerprinted secrets were not verified because the viewer credential cannot compute their fingerprints; a warning, not a failure |
 | `Drift detected` | the gateway was read and differs |
-| `Check failed` | authentication, connectivity, a cached (non-authoritative) export, unverified secrets, or a configuration error — **nothing is known about the gateway** |
+| `Check failed` | authentication, connectivity, a cached (non-authoritative) export, a whole value fingerprinted around a secret, or a configuration error — **nothing is known about the gateway** |
 | `Skipped (file mode)` | no live Admin API to compare against; a configured absence, not a gap |
 | `Not completed` | the comparison never ran: approval pending, cancelled, or the runner was lost |
 
 `drift_report.py` classifies each result and writes the table to the job
 summary. `Drift detected`, `Check failed` and `Not completed` fail the
-workflow; `Skipped` does not. A matrix entry that produced no record is shown
-as `Not completed`, so an environment waiting for approval still appears in the
+workflow; `Skipped` and `In sync, secrets unverified` do not. The latter is
+listed as a warning in the summary, so a successful run with it still counts as
+monitoring evidence for the settings audit, while drift in any compared field
+still fails the run. A matrix entry that produced no record is shown as
+`Not completed`, so an environment waiting for approval still appears in the
 table.
 
 ### The gateway URL must be `https://`

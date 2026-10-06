@@ -1720,17 +1720,18 @@ fn masked_ancestor_refusal() -> gitforgeops::error::Error {
     )
 }
 
-/// The refusal `diff --exit-on-drift` returns when it found no drift but
-/// fingerprinted secrets were not verified: the run cannot say "in sync".
-/// Drift found on the same read is real and keeps the drift exit code.
-fn unverified_secrets_refusal() -> gitforgeops::error::Error {
-    gitforgeops::error::Error::StaleGatewayView(
-        "--exit-on-drift requires every declared secret to be verified before it reports no \
-         drift, but fingerprinted secret fields were not (see the notes above); refusing to \
-         return the in-sync (0) result. Compare against a complete fingerprint baseline under \
-         the gateway's current key, or pass --accept-unverified-secrets"
-            .to_string(),
-    )
+/// Ends `diff --exit-on-drift` with [`verdict::SECRETS_UNVERIFIED_EXIT_CODE`]:
+/// a fresh read found no drift in any compared field, but fingerprinted
+/// secrets were not verified, so the run cannot say "in sync". The distinct
+/// code lets scheduled monitoring report it as a warning rather than as a
+/// match (0) or a failed check (1). Drift found on the same read is real and
+/// keeps the drift exit code.
+fn exit_secrets_unverified() -> ! {
+    eprintln!(
+        "Note: --exit-on-drift found no drift in the compared fields, but fingerprinted secret fields were not verified (see the notes above), so it does not return the in-sync (0) result; exiting {} (in sync, secrets unverified). Compare against a complete fingerprint baseline under the gateway's current key, or pass --accept-unverified-secrets to exit 0.",
+        verdict::SECRETS_UNVERIFIED_EXIT_CODE
+    );
+    process::exit(verdict::SECRETS_UNVERIFIED_EXIT_CODE);
 }
 
 /// The exports a viewer-credential `diff` read, and the fingerprinted fields
@@ -2106,20 +2107,25 @@ async fn cmd_diff(
     // Drift found on a fresh read is real: it keeps the drift exit code even
     // with unverified secrets (and wins over a refused baseline write, whose
     // warning is already printed). Without drift, unverified secrets make
-    // `--exit-on-drift` non-authoritative. A cached read never gets here
-    // with `--exit-on-drift`; it was refused above.
+    // `--exit-on-drift` exit SECRETS_UNVERIFIED_EXIT_CODE rather than 0, unless
+    // a refused baseline write already makes the run fail (1). A cached read
+    // never gets here with `--exit-on-drift`; it was refused above.
     // Whole values fingerprinted around a secret also hid non-secret
     // contents; neither a baseline nor --accept-unverified-secrets covers that.
-    let drift_exit = exit_on_drift && drift.has_drift();
-    let refusal = if drift_exit {
-        None
-    } else if exit_on_drift && !fields_authoritative {
-        Some(masked_ancestor_refusal())
-    } else if exit_on_drift && !fingerprints_verified && !flags.accept_unverified_secrets {
-        Some(unverified_secrets_refusal())
-    } else {
-        baseline_refusal
+    let diff_exit = verdict::DiffExit::evaluate(
+        &drift,
+        fields_authoritative,
+        fingerprints_verified,
+        flags.accept_unverified_secrets,
+    );
+    let refusal = match diff_exit {
+        _ if !exit_on_drift => baseline_refusal,
+        verdict::DiffExit::Drift => None,
+        verdict::DiffExit::MaskedSecretAncestors => Some(masked_ancestor_refusal()),
+        verdict::DiffExit::InSync | verdict::DiffExit::SecretsUnverified => baseline_refusal,
     };
+    let secrets_unverified =
+        exit_on_drift && refusal.is_none() && diff_exit == verdict::DiffExit::SecretsUnverified;
 
     if json_mode {
         if let Some(error) = refusal {
@@ -2127,6 +2133,9 @@ async fn cmd_diff(
         }
         if exit_on_drift && cached_namespaces.is_empty() && drift.has_drift() {
             process::exit(drift.exit_code());
+        }
+        if secrets_unverified {
+            exit_secrets_unverified();
         }
         return Ok(());
     }
@@ -2149,6 +2158,9 @@ async fn cmd_diff(
         }
         if let Some(error) = refusal {
             return Err(error.into());
+        }
+        if secrets_unverified {
+            exit_secrets_unverified();
         }
         return Ok(());
     }
@@ -2241,6 +2253,9 @@ async fn cmd_diff(
             verdict::DRIFT_EXIT_CODE
         );
         process::exit(drift.exit_code());
+    }
+    if secrets_unverified {
+        exit_secrets_unverified();
     }
 
     Ok(())

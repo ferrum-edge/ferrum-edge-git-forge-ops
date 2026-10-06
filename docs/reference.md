@@ -58,7 +58,7 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 | Command | Codes |
 |---|---|
 | all | `0` success, `1` error or blocking finding |
-| `diff --exit-on-drift` | `0` in sync, `2` drift, `1` the check could not complete |
+| `diff --exit-on-drift` | `0` in sync, `2` drift, `6` no drift but fingerprinted secrets unverified (viewer credential), `1` the check could not complete |
 | `verify` | `0` all checks passed, `4` a check failed, `5` no checks declared (skipped), `1` could not run |
 | `doctor` | `0` nothing blocking, `3` something blocking, `1` the diagnosis itself failed |
 
@@ -79,8 +79,12 @@ changed since the baseline counts as a managed modification.
   fingerprint can only be checked against a baseline.
   - Drift found: `2`, as usual. The drift is real; unverified secrets only
     undermine a "no drift" claim.
-  - No drift found: `1`, because "in sync" cannot be claimed.
-    `--accept-unverified-secrets` returns `0` instead.
+  - No drift found: `6` ("in sync, secrets unverified"), because "in sync"
+    cannot be claimed, yet every field the read could compare matched. It is
+    distinct from `0`, `2` and `1` so scheduled monitoring can report it as a
+    warning rather than a failed check. `--accept-unverified-secrets` returns
+    `0` instead. A refused `--write-fingerprint-baseline` in the same run
+    still exits `1`.
 - **Whole values fingerprinted around a secret** (viewer-credential path):
   Edge fingerprinted a value that only *contains* a secret (for example a
   plugin `headers` map holding an API key), and its non-secret contents were
@@ -466,12 +470,16 @@ value through the protected secret-entry UI.
 
 The workflow keeps `diff --exit-on-drift` without
 `--accept-unverified-secrets` or automatic fingerprint-baseline storage. A fresh
-viewer export with no drift but unverified secrets exits `1` and reports a failed
-comparison; it never certifies "in sync". The CLI's explicit acceptance flag
-still permits exit `0` for unverified secret leaves, while JSON remains
-`in_sync: false`; it cannot accept a cached read or masked ancestors. The
-settings-audit environment and secretless template mode are unchanged. File-mode
-drift jobs still skip before receiving gateway credentials.
+viewer export with no drift but unverified secrets exits `6`, which
+`drift_report.py` records as `In sync, secrets unverified`: a warning in the job
+summary, never "in sync", and not a failure, so the workflow stays green and the
+settings audit's last-successful-run evidence keeps advancing. Drift in any
+compared field still exits `2` and fails the workflow; a cached read or a whole
+value fingerprinted around a secret still exits `1` and fails it. The CLI's
+explicit acceptance flag still permits exit `0` for unverified secret leaves,
+while JSON remains `in_sync: false`; it cannot accept a cached read or masked
+ancestors. The settings-audit environment and secretless template mode are
+unchanged. File-mode drift jobs still skip before receiving gateway credentials.
 
 **Breaking changes** (also in `plan`):
 
