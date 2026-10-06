@@ -244,6 +244,15 @@ CREDENTIAL_HANDOFF_SHAPES = {
     ".github/workflows/materialize-file.yml": CREDENTIAL_HANDOFF_RUN,
     ".github/workflows/rotate.yml": CREDENTIAL_HANDOFF_RUN,
 }
+# Apply writes its finalized bundle, and Verify traffic trusts it, only at the
+# path the apply hand-off cleared first. GitHub refuses a duplicate step id, so
+# pinning the hand-off's id and both readers ties the path to that hand-off.
+APPLY_CREDENTIAL_HANDOFF_ID = "load-bundles"
+APPLIED_BUNDLE_VALUE = "${{ steps.load-bundles.outputs.applied_file }}"
+APPLIED_BUNDLE_BINDINGS = {
+    "Apply": "FERRUM_CREDS_JSON_OUTPUT_FILE",
+    "Verify traffic": "APPLIED_CREDS_FILE",
+}
 # The runner values the hand-off's file name is built from. A workflow or job
 # env that rebinds one (to a multiline value, say) changes what the pinned echo
 # writes, so neither scope may name them.
@@ -265,6 +274,70 @@ RUN_EXPRESSIONS = {
     ".github/workflows/drift-check.yml": {},
     ".github/workflows/materialize-file.yml": {},
     ".github/workflows/rotate.yml": {},
+}
+# A pinned run value is only as safe as its producer, so the wiring is pinned
+# too: each job output a later job interpolates, each matrix, and the lines of
+# the step that writes the value. Rewiring one to event data (a branch name, a
+# title, an API field) fails here instead of reaching `run:` unseen.
+RUN_EXPRESSION_JOB_OUTPUTS = {
+    ".github/workflows/apply-on-merge.yml": {
+        "list-envs": {
+            "envs": "${{ steps.list.outputs.envs }}",
+            "promotions": "${{ steps.list.outputs.promotions }}",
+        },
+    },
+    ".github/workflows/trusted-pr-review.yml": {
+        "prepare": {
+            "head_sha": "${{ steps.metadata.outputs.head_sha }}",
+            "trusted_sha": "${{ steps.metadata.outputs.trusted_sha }}",
+        },
+    },
+}
+RUN_EXPRESSION_MATRICES = {
+    "apply": {"environment": "${{ fromJson(needs.list-envs.outputs.envs) }}"},
+    "promote": {"scope": "${{ fromJson(needs.list-envs.outputs.promotions) }}"},
+}
+# The enumerator step, whole. An entry holding a newline is one command over
+# several lines (a quoted jq program): its lines match consecutively, with no
+# comment lines dropped inside it.
+APPLY_ENVIRONMENT_LIST_RUN = (
+    "set -euo pipefail",
+    "if [[ ! -f .gitforgeops/config.yaml ]]; then",
+    'echo "::notice::No .gitforgeops/config.yaml on the protected branch; skipping apply. '
+    'See docs/github-launch-controls.md to configure deployment environments."',
+    'echo "envs=[]" >> "$GITHUB_OUTPUT"',
+    'echo "promotions=[]" >> "$GITHUB_OUTPUT"',
+    "exit 0",
+    "fi",
+    "scopes=$(gitforgeops envs --format json --include-scopes | jq -c .)",
+    "jq -e '\n"
+    'type == "array" and\n'
+    "all(.[];\n"
+    '(.environment | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))\n'
+    'and ((.promotion_requires // "x") | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")))\n'
+    "' <<< \"$scopes\" >/dev/null || {",
+    'echo "::error::Every environment must be a single safe path component."',
+    "exit 1",
+    "}",
+    "envs=$(jq -c '[.[] | select(.promotion_requires == null) | .environment]' <<< \"$scopes\")",
+    "promotions=$(jq -c '[.[] | select(.promotion_requires != null)\n"
+    "| {environment, requires: .promotion_requires}]' <<< \"$scopes\")",
+    'echo "envs=$envs" >> "$GITHUB_OUTPUT"',
+    'echo "promotions=$promotions" >> "$GITHUB_OUTPUT"',
+)
+# Trusted review's metadata step does much more, so only the lines that
+# produce the two SHAs are pinned: the event SHA is bound from the event,
+# checked as 40 hex digits first, and never reassigned; the trusted SHA comes
+# from `git rev-parse`; and each output is written by its one echo.
+REVIEW_EVENT_HEAD_SHA = "${{ github.event.workflow_run.head_sha }}"
+REVIEW_METADATA_PREAMBLE = (
+    "set -euo pipefail",
+    '[[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid head SHA" >&2; exit 1; }',
+)
+REVIEW_TRUSTED_SHA_ASSIGNMENT = "trusted_sha=$(git -C trusted rev-parse HEAD)"
+REVIEW_METADATA_LINES = {
+    "head_sha": ('echo "head_sha=$EVENT_HEAD_SHA"',),
+    "trusted_sha": ('echo "trusted_sha=$trusted_sha"', REVIEW_TRUSTED_SHA_ASSIGNMENT),
 }
 # Outside its two guarded Apply steps, apply-on-merge.yml may invoke the binary
 # only on these lines: the enumerator, Validate and Verify traffic.
@@ -2591,16 +2664,20 @@ def workflow_action_references(document: dict) -> list[str]:
 # exactly and ban the env-file channels everywhere else. They do not interpret
 # what a command computes. A program a step invokes (the binary, a helper
 # script, or Bash itself evaluating computed text such as `base64 -d | bash` or
-# `${!name}`) can still write $GITHUB_ENV or rebind a variable, and no text
+# `eval "$text"`) can still write $GITHUB_ENV or rebind a variable, and no text
 # rule can prove otherwise. Review of every workflow change, which the
 # protected-definition check makes unavoidable, is the control for that.
-# Within that scope the rules are exact: no shell lexer, expression renderer or
-# source proofs (#476).
+# Within that scope the rules are exact pins and bans, with no shell lexer or
+# expression renderer (#476).
 
 # Env-file channels and shell startup files, in any scalar or key. Each binds a
-# variable that a later step inherits without naming it there.
+# variable that a later step inherits without naming it there. The runner
+# keeps every file-command file of a step in `_runner_file_commands`, named by
+# command prefix plus one shared suffix, so `set_env_` and `add_path_` (and
+# `save_state_`) spell GITHUB_ENV and GITHUB_PATH by another name.
 _FILE_CHANNEL = re.compile(
     r"github_env|github_path|bash_env"
+    r"|_runner_file_commands|set_env_|add_path_|save_state_"
     r"|\bgithub\s*(?:\.\s*(?:env|path|output)\b|\[\s*(?:env|path|output)\s*\])"
 )
 # A redirect or `tee` into any other GitHub file channel. Steps may write only
@@ -2608,6 +2685,19 @@ _FILE_CHANNEL = re.compile(
 _GITHUB_FILE_WRITE = re.compile(
     r"(?:>>?|>\||\btee\b[^\n;&|]*)\s*\$\{?github_(?!output\b|step_summary\b)[a-z0-9_]+"
 )
+# The output and summary files may be named only as a whole, unmodified
+# expansion: an append (`>>`) or `tee -a` target, or the summary as a
+# `--summary` argument. Any other use, such as `${GITHUB_OUTPUT/set_output_/x}`,
+# `${GITHUB_OUTPUT%/*}` or `$(dirname "$GITHUB_OUTPUT")`, can derive the path of
+# another file-command file from it.
+_OUTPUT_FILE = re.compile(r"github_output|github_step_summary")
+_PLAIN_OUTPUT_TARGET = re.compile(
+    r"(?:>>[ \t]*|\btee[ \t]+-a[ \t]+)\$(?:\{(?:github_output|github_step_summary)\}"
+    r"|(?:github_output|github_step_summary)\b)(?=[\s;&|)]|\Z)"
+    r"|--summary[ \t]+\$(?:\{github_step_summary\}|github_step_summary\b)(?=[\s;&|)]|\Z)"
+)
+# Indirect expansion computes the name it reads; no text rule sees that name.
+_INDIRECT_EXPANSION = re.compile(r"\$\{!")
 # Keys of an `env:` mapping that name a startup file (`sh` reads ENV) or a file
 # destination GitHub would otherwise supply.
 _ENV_DESTINATION_KEYS = frozenset({"env", "github_output", "github_step_summary", "github_state"})
@@ -2615,8 +2705,12 @@ _NAMED_GITHUB = re.compile(r"\bgithub\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*", re.IGNORE
 _INDEXED_GITHUB = re.compile(
     r"\bgithub(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)*\s*\[", re.IGNORECASE
 )
+# Stands in for a `run:` interpolation when judging what it adjoins.
+_RUN_SENTINEL = "\ue000"
 _BUNDLE_SHARD_NAME = re.compile(BUNDLE_SECRET_PREFIX + r"(?:_[1-9][0-9]*)?")
-_GITFORGEOPS_WORD = re.compile(r"(?<![\w.-])gitforgeops(?![\w/\[)-])")
+# `gitforgeops):` is the commit subject `chore(gitforgeops):`; any other `)`
+# after the name, as in `$(command -v gitforgeops) apply`, still counts.
+_GITFORGEOPS_WORD = re.compile(r"(?<![\w.-])gitforgeops(?![\w/\[-])(?!\):)")
 
 
 def _scan_text(text: str) -> str:
@@ -2633,23 +2727,40 @@ def _scan_text(text: str) -> str:
 def pinned_run_matches(script: str, shape: tuple[str, ...]) -> bool:
     """Whether a `run:` script is exactly a pinned shape, apart from comment lines.
 
-    Lines are compared without surrounding spaces and tabs; blank lines and
-    lines starting with `#` are dropped. That is sound only because every
-    pinned shape consists of complete lines: no pinned line opens a quote,
-    here-document or continuation that a later line closes, so an inserted
-    line always starts where Bash reads a new command, and a `#` line there is
-    a comment. A comment holding an expression is refused: GitHub renders it
-    before Bash sees the `#`.
+    Lines are compared without surrounding spaces and tabs. Between entries,
+    blank lines and lines starting with `#` are dropped. That is sound only
+    because every entry is a complete command: no entry opens a quote,
+    here-document or continuation that a later entry closes, so a dropped line
+    always sits where Bash reads a new command, and a `#` line there is a
+    comment. An entry spanning several lines (one holding a newline) matches
+    its lines consecutively, with nothing dropped inside it. A comment holding
+    an expression is refused: GitHub renders it before Bash sees the `#`.
     """
-    lines = []
-    for line in script.split("\n"):
-        line = line.strip(" \t")
-        if line.startswith("#"):
-            if "${{" in line:
+    lines = [line.strip(" \t") for line in script.split("\n")]
+    index = 0
+
+    def skip_comments() -> bool:
+        nonlocal index
+        while index < len(lines) and (not lines[index] or lines[index].startswith("#")):
+            if "${{" in lines[index]:
                 return False
-        elif line:
-            lines.append(line)
-    return tuple(lines) == shape
+            index += 1
+        return True
+
+    for entry in shape:
+        expected = entry.split("\n")
+        if not skip_comments() or lines[index:index + len(expected)] != expected:
+            return False
+        index += len(expected)
+    return skip_comments() and index == len(lines)
+
+
+def _script_lines(script: str) -> list[str]:
+    """A script's lines without surrounding spaces and tabs, blank and `#` lines dropped."""
+    return [
+        line for line in (line.strip(" \t") for line in script.split("\n"))
+        if line and not line.startswith("#")
+    ]
 
 
 def _env_scopes(node: dict) -> list:
@@ -2663,6 +2774,11 @@ def _credential_handoff_refusal(workflow: str, document: dict, job: dict, step: 
         return "this workflow has no credential hand-off"
     if any(key in step for key in ("uses", "shell", "working-directory")):
         return "the hand-off runs the default shell in the workspace"
+    if shape is APPLY_CREDENTIAL_HANDOFF_RUN and step.get("id") != APPLY_CREDENTIAL_HANDOFF_ID:
+        return (
+            f"the apply hand-off keeps id {APPLY_CREDENTIAL_HANDOFF_ID}, "
+            "which Apply and Verify traffic read"
+        )
     if any(key.casefold() == "defaults" for node in (document, job) for key in node):
         return "inherited run defaults may not change the hand-off's shell"
     environment = step.get("env")
@@ -2685,15 +2801,19 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
     """No workflow may write or rebind an env-file channel, except the pinned hand-off.
 
     Every key and scalar of every workflow is judged in `_scan_text` form, and
-    shell comments count: GITHUB_ENV, GITHUB_PATH and BASH_ENV in any spelling,
-    the `github.env`/`github.path` contexts, and a redirect or `tee` into any
-    `$GITHUB_*` file other than GITHUB_OUTPUT and GITHUB_STEP_SUMMARY. An `env:`
+    shell comments count: GITHUB_ENV, GITHUB_PATH and BASH_ENV however quoted
+    or escaped, the runner's file-command file names, the
+    `github.env`/`github.path` contexts, a redirect or `tee` into any
+    `$GITHUB_*` file other than GITHUB_OUTPUT and GITHUB_STEP_SUMMARY, any use
+    of those two other than as a plain append or `tee -a` target (or the
+    summary as a `--summary` argument), and indirect expansion. An `env:`
     mapping may not be computed, nor bind ENV or a GitHub file destination.
     Expressions may reach the `github` context only through named dot
     properties, since an index or a whole-context conversion can compute a
-    channel name, and a `run:` interpolation may not adjoin a name character,
-    where its rendered value would complete a name no rule saw spelled. The one
-    exception is the `run:` of a credential hand-off that matches its pin.
+    channel name, and a `run:` interpolation may not adjoin a name character
+    once quotes are removed, where its rendered value would complete a name no
+    rule saw spelled. The one exception is the `run:` of a credential hand-off
+    that matches its pin.
     """
     violations: list[str] = []
     handoffs: dict[int, str | None] = {}
@@ -2706,11 +2826,22 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
 
     def check(value: str, key: str, label: str, handoff: str | None) -> None:
         scan = _scan_text(value)
-        if _FILE_CHANNEL.search(scan) or _GITHUB_FILE_WRITE.search(scan):
+        if (
+            _FILE_CHANNEL.search(scan)
+            or _GITHUB_FILE_WRITE.search(scan)
+            or _OUTPUT_FILE.search(_PLAIN_OUTPUT_TARGET.sub("", scan))
+        ):
             violations.append(
-                f"{label}: GITHUB_ENV, GITHUB_PATH, BASH_ENV and writes to GitHub file "
-                "channels other than GITHUB_OUTPUT and GITHUB_STEP_SUMMARY are forbidden "
-                "outside the pinned credential hand-off" + (f" ({handoff})" if handoff else "")
+                f"{label}: GITHUB_ENV, GITHUB_PATH, BASH_ENV, runner file-command names, "
+                "writes to other GitHub file channels, and GITHUB_OUTPUT or "
+                "GITHUB_STEP_SUMMARY other than as a plain `>>` or `tee -a` target are "
+                "forbidden outside the pinned credential hand-off"
+                + (f" ({handoff})" if handoff else "")
+            )
+        if _INDIRECT_EXPANSION.search(scan):
+            violations.append(
+                f"{label}: indirect expansion (`${{!name}}`) is forbidden; it reads a "
+                "name no rule saw spelled"
             )
         if "${{" in WORKFLOW_EXPRESSION.sub("", value):
             violations.append(f"{label}: unrecognized GitHub expression syntax is forbidden")
@@ -2727,10 +2858,13 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
                 f"{label}: computed/indexed or whole GitHub context access is forbidden; "
                 "use named dot properties"
             )
-        if key.casefold() == "run" and any(
-            re.search(r"[A-Za-z0-9_${}]\Z", value[:match.start()])
-            or re.match(r"[A-Za-z0-9_{}]", value[match.end():])
-            for match in expressions
+        # Judge neighbours with quotes and escapes removed, as Bash joins
+        # `"${{ a }}""${{ b }}"` into one word; each interpolation is a
+        # sentinel, which also counts as a name character beside another.
+        spliced = _scan_text(WORKFLOW_EXPRESSION.sub(_RUN_SENTINEL, value))
+        if key.casefold() == "run" and re.search(
+            f"[a-z0-9_${{}}{_RUN_SENTINEL}]{_RUN_SENTINEL}|{_RUN_SENTINEL}[a-z0-9_{{}}]",
+            spliced,
         ):
             violations.append(
                 f"{label}: a run interpolation may not adjoin a name character; "
@@ -2770,7 +2904,10 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
 
 
 def run_expression_violations(workflow: str, document: dict) -> list[str]:
-    """Environment-bound jobs interpolate into `run:` only the pinned values."""
+    """Environment-bound jobs interpolate into `run:` only the pinned values.
+
+    `run_expression_source_violations` pins where those values come from.
+    """
     if workflow not in RUN_EXPRESSIONS:
         return []
     violations: list[str] = []
@@ -2789,6 +2926,93 @@ def run_expression_violations(workflow: str, document: dict) -> list[str]:
                         f"{match.group(1).strip()!r} is not pinned for this job; pass the "
                         "value through step env instead"
                     )
+    return violations
+
+
+def _producer_step(job: dict, step_id: str):
+    """The one step of `job` with id `step_id`, or None."""
+    steps = job.get("steps")
+    found = [
+        step for step in (steps if isinstance(steps, list) else [])
+        if isinstance(step, dict) and step.get("id") == step_id
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def _metadata_line_violations(label: str, script: str) -> list[str]:
+    """The metadata step writes the SHAs only through its pinned lines."""
+    violations: list[str] = []
+    if tuple(_script_lines(script)[:len(REVIEW_METADATA_PREAMBLE)]) != REVIEW_METADATA_PREAMBLE:
+        violations.append(f"{label}: the event head SHA must be checked as 40 hex digits first")
+    lines = [line.strip(" \t") for line in _scan_text(script).split("\n")]
+    if re.search(r"event_head_sha", re.sub(
+        r"\$(?:event_head_sha\b|\{event_head_sha\})", "", "\n".join(lines)
+    )):
+        violations.append(f"{label}: EVENT_HEAD_SHA may only be read, never reassigned")
+    for name, allowed in REVIEW_METADATA_LINES.items():
+        permitted = {_scan_text(line) for line in allowed}
+        reads = re.compile(r"\$(?:" + name + r"\b|\{" + name + r"\})")
+        named = [
+            line for line in lines
+            if re.search(r"\b" + name + r"\b", reads.sub("", line))
+        ]
+        if any(line not in permitted for line in named):
+            violations.append(f"{label}: {name} may only be produced by its pinned lines")
+    if lines.count(_scan_text(REVIEW_TRUSTED_SHA_ASSIGNMENT)) != 1:
+        violations.append(f"{label}: trusted_sha must be assigned once, from git rev-parse")
+    return violations
+
+
+def run_expression_source_violations(workflow: str, document: dict) -> list[str]:
+    """Each pinned run value keeps its pinned producer."""
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    jobs = jobs if isinstance(jobs, dict) else {}
+    for job_name, outputs in RUN_EXPRESSION_JOB_OUTPUTS.get(workflow, {}).items():
+        job = jobs.get(job_name)
+        declared = job.get("outputs") if isinstance(job, dict) else None
+        declared = declared if isinstance(declared, dict) else {}
+        for name, expected in outputs.items():
+            spellings = [key for key in declared if key.casefold() == name]
+            if spellings != [name] or declared[name] != expected:
+                violations.append(
+                    f"{workflow}: jobs.{job_name}.outputs.{name} must be exactly {expected}"
+                )
+    if workflow == ".github/workflows/apply-on-merge.yml":
+        for job_name, matrix in RUN_EXPRESSION_MATRICES.items():
+            job = jobs.get(job_name)
+            strategy = job.get("strategy") if isinstance(job, dict) else None
+            if not isinstance(strategy, dict) or strategy.get("matrix") != matrix:
+                violations.append(
+                    f"{workflow}: jobs.{job_name}.strategy.matrix must be exactly {matrix}"
+                )
+        producers = (("list-envs", "list", APPLY_ENVIRONMENT_LIST_RUN),)
+    elif workflow == ".github/workflows/trusted-pr-review.yml":
+        producers = (("prepare", "metadata", None),)
+    else:
+        producers = ()
+    for job_name, step_id, shape in producers:
+        job = jobs.get(job_name)
+        step = _producer_step(job, step_id) if isinstance(job, dict) else None
+        label = f"{workflow}: job {job_name!r}, step {step_id!r}"
+        if step is None or not isinstance(step.get("run"), str):
+            violations.append(f"{label} must exist exactly once and produce the pinned values")
+            continue
+        if (
+            any(key in step for key in ("uses", "shell", "working-directory"))
+            or any(key.casefold() == "defaults" for node in (document, job) for key in node)
+        ):
+            violations.append(f"{label} runs the default shell in the workspace")
+        if shape is not None:
+            if not pinned_run_matches(step["run"], shape):
+                violations.append(f"{label} must match its pinned script")
+            continue
+        environment = step.get("env")
+        if not isinstance(environment, dict) or (
+            environment.get("EVENT_HEAD_SHA") != REVIEW_EVENT_HEAD_SHA
+        ):
+            violations.append(f"{label} must bind EVENT_HEAD_SHA: {REVIEW_EVENT_HEAD_SHA}")
+        violations.extend(_metadata_line_violations(label, step["run"]))
     return violations
 
 
@@ -2941,6 +3165,17 @@ def probe_validation_gate_violations(workflow: str, document: dict) -> list[str]
             ):
                 violations.append(
                     f"{label}: Verify traffic must retain the pinned command and runtime scope"
+                )
+        for step_name, variable in APPLIED_BUNDLE_BINDINGS.items():
+            bound = [
+                step for step in steps
+                if isinstance(step, dict) and step.get("name") == step_name
+            ]
+            environment = bound[0].get("env") if len(bound) == 1 else None
+            value = environment.get(variable) if isinstance(environment, dict) else None
+            if value != APPLIED_BUNDLE_VALUE:
+                violations.append(
+                    f"{label}: {step_name!r} must bind exactly {variable}: {APPLIED_BUNDLE_VALUE}"
                 )
         validations = [
             index
@@ -3602,6 +3837,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 run_expression_violations(workflow.relative_to(root).as_posix(), document)
+            )
+            violations.extend(
+                run_expression_source_violations(workflow.relative_to(root).as_posix(), document)
             )
             violations.extend(
                 probe_consumer_binding_violations(

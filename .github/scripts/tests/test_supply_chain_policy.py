@@ -82,6 +82,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
     def _guarded_bindings(self, workflow, document):
         violations = check_supply_chain.workflow_channel_violations(workflow, document)
         violations += check_supply_chain.run_expression_violations(workflow, document)
+        violations += check_supply_chain.run_expression_source_violations(workflow, document)
         if workflow == ".github/workflows/drift-check.yml":
             return violations + check_supply_chain.monitoring_jwt_binding_violations(
                 workflow, document
@@ -128,6 +129,24 @@ class SupplyChainPolicyTests(unittest.TestCase):
             'echo x >> "$GITHUB_STATE"',
             "echo x > ${GITHUB_STATE}",
             "echo x >| $GITHUB_STATE",
+            # The runner's file-command files share one directory and suffix,
+            # so the output and summary paths derive the env and path files.
+            'echo "X=1" >> "${GITHUB_OUTPUT/set_output_/set_env_}"',
+            'echo "$PWD/bin" >> "${GITHUB_STEP_SUMMARY/step_summary_/add_path_}"',
+            'echo "X=1" >> ${GITHUB_OUTPUT%/*}/set_env_*',
+            'echo "X=1" >> "$(dirname "$GITHUB_OUTPUT")"/set_env_*',
+            'echo "X=1" >> "$RUNNER_TEMP/_runner_file_commands/set_env_$suffix"',
+            'echo "X=1" >> "$RUNNER_TEMP"/_RUNNER_FILE_COMMANDS/"$name"',
+            'name=save_state_x; echo x >> "$name"',
+            'echo x >> "${GITHUB_OUTPUT#*/}"',
+            'echo x >> "${GITHUB_OUTPUT:-/dev/null}"',
+            'echo x >> "${!GITHUB_OUTPUT}"',
+            'directory=$(dirname "$GITHUB_STEP_SUMMARY")',
+            'destination="$GITHUB_OUTPUT"\necho x >> "$destination"',
+            'cp payload "$GITHUB_OUTPUT"',
+            'echo x > "$GITHUB_OUTPUT"',
+            'echo x | tee "$GITHUB_OUTPUT"',
+            'report --summary "$GITHUB_OUTPUT"',
         )
         for workflow in self._shipped_workflows():
             for script in scripts:
@@ -145,6 +164,10 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "{\n  echo a=1\n  echo b=2\n} >>\"$GITHUB_OUTPUT\"",
             'echo "## Report" >> "$GITHUB_STEP_SUMMARY"',
             'tee -a "$GITHUB_STEP_SUMMARY" <<< "done"',
+            'echo x | tee -a "$GITHUB_OUTPUT"',
+            "echo x >> ${GITHUB_OUTPUT}",
+            "cat >> \"$GITHUB_STEP_SUMMARY\" <<'MSG'\ndone\nMSG",
+            'python3 report.py --summary "$GITHUB_STEP_SUMMARY" || true',
             'cd "$GITHUB_WORKSPACE" && echo "$GITHUB_RUN_ID" > /dev/null',
         ):
             with self.subTest(allowed=script):
@@ -209,10 +232,19 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 'echo x >> "${{ matrix.prefix }}${{ matrix.suffix }}"',
                 "export FERRUM_${{ matrix.suffix }}=other",
                 'echo x >> "${${{ matrix.name }}}"',
+                # Bash joins adjacent quoted words, so quotes do not separate.
+                'export "${{ env.A }}""${{ env.B }}"=x',
+                'export FERRUM_"${{ matrix.suffix }}"=other',
+                "echo x >> \"$GITHUB_\"'${{ matrix.suffix }}'",
+                'echo x >> "$GITHUB_"\\\n"${{ matrix.suffix }}"',
+                "echo x >> $GITHUB_\\${{ matrix.suffix }}",
             ):
                 with self.subTest(workflow=workflow, script=script):
                     document = self._probe_document(workflow)
-                    self._first_steps(document).insert(0, {"name": "Splice", "run": script})
+                    self._first_steps(document).insert(0, {
+                        "name": "Splice", "env": {"A": "FERRUM_", "B": "NAMESPACE"},
+                        "run": script,
+                    })
                     violations = check_supply_chain.workflow_channel_violations(
                         workflow, document
                     )
@@ -304,7 +336,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # program behavior, left to review of every workflow change (#476).
         workflow = ".github/workflows/rust-ci.yml"
         for script in (
-            "name=GITHUB_E; name=${name}NV; echo x >> \"${!name}\"",
+            'name=GITHUB_E; eval "echo x >> \\$${name}NV"',
             "echo ZWNobyB4ID4+ICRHSVRIVUJfRU5WCg== | base64 -d | bash",
             "python3 -c 'import os; open(os.environ[\"GITHUB_\" + \"E\" + \"NV\"], \"a\")'",
         ):
@@ -314,6 +346,22 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 self.assertEqual(
                     check_supply_chain.workflow_channel_violations(workflow, document), []
                 )
+
+    def test_indirect_expansion_is_refused_in_every_workflow(self):
+        for workflow in self._shipped_workflows():
+            for script in (
+                'name=GITHUB_E; name=${name}NV; echo x >> "${!name}"',
+                'echo "${!prefix@}"',
+            ):
+                with self.subTest(workflow=workflow, script=script):
+                    document = self._probe_document(workflow)
+                    self._first_steps(document).insert(0, {"name": "Indirect", "run": script})
+                    violations = check_supply_chain.workflow_channel_violations(
+                        workflow, document
+                    )
+                    self.assertTrue(
+                        any("indirect expansion" in item for item in violations), violations
+                    )
 
     def _closes_its_quotes(self, line):
         quote, escaped = "", False
@@ -330,20 +378,23 @@ class SupplyChainPolicyTests(unittest.TestCase):
         return not quote and not escaped
 
     def test_pinned_shapes_are_complete_lines(self):
-        # `pinned_run_matches` may drop `#` lines only because no pinned line
-        # leaves a quote, here-document or continuation open.
+        # `pinned_run_matches` may drop `#` lines between entries only because
+        # no entry leaves a quote, here-document or continuation open.
         shapes = (
             check_supply_chain.PROBE_VERIFY_RUN,
+            check_supply_chain.APPLY_ENVIRONMENT_LIST_RUN,
             *check_supply_chain.CREDENTIAL_HANDOFF_SHAPES.values(),
         )
         for shape in shapes:
-            for line in shape:
-                with self.subTest(line=line):
-                    self.assertTrue(self._closes_its_quotes(line))
-                    self.assertFalse(line.endswith("\\"))
-                    self.assertIsNone(re.search(r"<<(?!<)", line))
-                    self.assertEqual(line, line.strip(" \t"))
-                    self.assertFalse(line.startswith("#"))
+            for entry in shape:
+                with self.subTest(entry=entry):
+                    self.assertTrue(self._closes_its_quotes(entry))
+                    self.assertFalse(entry.endswith("\\"))
+                    self.assertIsNone(re.search(r"(?<!<)<<(?!<)", entry))
+                    for line in entry.split("\n"):
+                        self.assertEqual(line, line.strip(" \t"))
+                        self.assertNotEqual(line, "")
+                        self.assertFalse(line.startswith("#"))
 
     def test_pinned_run_matches_ignores_only_comment_lines(self):
         shape = check_supply_chain.CREDENTIAL_HANDOFF_RUN
@@ -365,6 +416,26 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "\n".join(check_supply_chain.APPLY_CREDENTIAL_HANDOFF_RUN),
         ):
             with self.subTest(changed=changed):
+                self.assertFalse(check_supply_chain.pinned_run_matches(changed, shape))
+        # A multi-line entry matches its lines consecutively: a `#` line inside
+        # a quoted jq program is jq text, and jq continues a comment ending in
+        # a backslash onto the next line.
+        shape = check_supply_chain.APPLY_ENVIRONMENT_LIST_RUN
+        script = "\n".join(shape)
+        guard = next(entry for entry in shape if entry.startswith("jq -e '\n"))
+        lines = guard.split("\n")
+        self.assertTrue(check_supply_chain.pinned_run_matches(script, shape))
+        self.assertTrue(check_supply_chain.pinned_run_matches(
+            script.replace(guard, "# The guard.\n\n" + guard), shape
+        ))
+        for changed in (
+            script.replace(guard, "\n".join([lines[0], "# skip \\", *lines[1:]])),
+            script.replace(guard, "\n".join([*lines[:2], "", *lines[2:]])),
+            script.replace(guard, "\n".join([lines[0], *lines[2:]])),
+            script.replace(guard + "\n", ""),
+        ):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(changed, script)
                 self.assertFalse(check_supply_chain.pinned_run_matches(changed, shape))
 
     def test_credential_handoff_is_the_only_env_file_write(self):
@@ -478,6 +549,180 @@ class SupplyChainPolicyTests(unittest.TestCase):
         })
         self.assertEqual(check_supply_chain.run_expression_violations(workflow, document), [])
 
+    def test_run_values_keep_their_pinned_producers(self):
+        for workflow in self._shipped_workflows():
+            with self.subTest(workflow=workflow):
+                self.assertEqual(
+                    check_supply_chain.run_expression_source_violations(
+                        workflow, self._probe_document(workflow)
+                    ),
+                    [],
+                )
+
+        def assign(*path, value):
+            def mutate(document):
+                node = document
+                for key in path[:-1]:
+                    node = node[key]
+                node[path[-1]] = value
+            return mutate
+
+        def producer(document, job, step_id):
+            return next(
+                step for step in document["jobs"][job]["steps"] if step.get("id") == step_id
+            )
+
+        def edit_run(job, step_id, old, new):
+            def mutate(document):
+                step = producer(document, job, step_id)
+                self.assertIn(old, step["run"])
+                step["run"] = step["run"].replace(old, new)
+            return mutate
+
+        def edit_step(job, step_id, key, value):
+            def mutate(document):
+                step = producer(document, job, step_id)
+                if isinstance(step.get(key), dict):
+                    step[key].update(value)
+                else:
+                    step[key] = value
+            return mutate
+
+        guard = check_supply_chain.REVIEW_METADATA_PREAMBLE[1]
+        assignment = check_supply_chain.REVIEW_TRUSTED_SHA_ASSIGNMENT
+        branch = "${{ github.event.workflow_run.head_branch }}"
+        message = "${{ github.event.head_commit.message }}"
+        cases = {
+            ".github/workflows/trusted-pr-review.yml": (
+                # The pushed branch name, spliced into live review's run.
+                assign("jobs", "prepare", "outputs", "head_sha", value=branch),
+                assign("jobs", "prepare", "outputs", "trusted_sha",
+                       value="${{ github.event.workflow_run.display_title }}"),
+                assign("jobs", "prepare", "outputs", "HEAD_SHA", value=branch),
+                # The hex check removed, or a SHA output taken from API data.
+                edit_run("prepare", "metadata", guard + "\n", ""),
+                edit_run("prepare", "metadata", guard, "true\n" + guard),
+                edit_run(
+                    "prepare", "metadata", 'echo "head_sha=$EVENT_HEAD_SHA"',
+                    'echo "head_sha=$(jq -r .head.ref <<< "$current")"',
+                ),
+                edit_run(
+                    "prepare", "metadata", guard,
+                    guard + '\nEVENT_HEAD_SHA=$(gh api "repos/${REPO}/pulls/1" --jq .head.ref)',
+                ),
+                edit_run(
+                    "prepare", "metadata", assignment,
+                    'trusted_sha=$(gh api "repos/${REPO}" --jq .description)',
+                ),
+                edit_run(
+                    "prepare", "metadata", assignment,
+                    assignment + '\nread -r trusted_sha <<< "$TITLE"',
+                ),
+                edit_run("prepare", "metadata", assignment, assignment + "\n" + assignment),
+                edit_step("prepare", "metadata", "env", {"EVENT_HEAD_SHA": branch}),
+                edit_step("prepare", "metadata", "id", "workflow-run"),
+                edit_step("prepare", "metadata", "shell", "sh {0}"),
+            ),
+            ".github/workflows/apply-on-merge.yml": (
+                # A matrix, job output or enumerator rewired to other data.
+                assign("jobs", "apply", "strategy", "matrix",
+                       value={"environment": "${{ fromJson(vars.ENVIRONMENTS) }}"}),
+                assign("jobs", "apply", "strategy", "matrix", "include",
+                       value=[{"environment": message}]),
+                assign("jobs", "promote", "strategy", "matrix",
+                       value={"scope": "${{ fromJson(github.event.head_commit.message) }}"}),
+                assign("jobs", "list-envs", "outputs", "envs", value=message),
+                assign("jobs", "list-envs", "outputs", "promotions",
+                       value="${{ steps.other.outputs.promotions }}"),
+                edit_run(
+                    "list-envs", "list", 'test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")', "true"
+                ),
+                edit_run(
+                    "list-envs", "list",
+                    "envs=$(jq -c '[.[] | select(.promotion_requires == null) | .environment]'",
+                    "envs=$(git log -1 --format=%s | jq -R -c '[.]'",
+                ),
+                edit_run("list-envs", "list", "jq -e '\n", "jq -e '\n# skip \\\n"),
+                edit_step("list-envs", "list", "id", "enumerate"),
+                edit_step("list-envs", "list", "working-directory", "candidate"),
+            ),
+        }
+        for workflow, mutations in cases.items():
+            for index, mutate in enumerate(mutations):
+                with self.subTest(workflow=workflow, mutation=index):
+                    document = self._probe_document(workflow)
+                    mutate(document)
+                    self.assertTrue(
+                        check_supply_chain.run_expression_source_violations(workflow, document)
+                    )
+
+    def test_trusted_checker_refuses_rewired_run_values(self):
+        for workflow, old, new, expected in (
+            (
+                ".github/workflows/trusted-pr-review.yml",
+                "head_sha: ${{ steps.metadata.outputs.head_sha }}",
+                "head_sha: ${{ github.event.workflow_run.head_branch }}",
+                "jobs.prepare.outputs.head_sha must be exactly",
+            ),
+            (
+                ".github/workflows/apply-on-merge.yml",
+                "environment: ${{ fromJson(needs.list-envs.outputs.envs) }}",
+                "environment: ${{ fromJson(vars.ENVIRONMENTS) }}",
+                "jobs.apply.strategy.matrix must be exactly",
+            ),
+        ):
+            with self.subTest(workflow=workflow), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                (root / ".github/scripts/check_supply_chain.py").write_text(
+                    "raise SystemExit(0)\n", encoding="utf-8"
+                )
+                path = root / workflow
+                original = path.read_text(encoding="utf-8")
+                changed = original.replace(old, new, 1)
+                self.assertNotEqual(changed, original)
+                path.write_text(changed, encoding="utf-8")
+                violations = self._violations(root)
+                self.assertTrue(any(expected in item for item in violations), violations)
+
+    def test_applied_bundle_path_comes_only_from_the_apply_hand_off(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for job in ("apply", "promote"):
+            for identifier in (None, "bundles"):
+                with self.subTest(job=job, identifier=identifier):
+                    document = self._probe_document(workflow)
+                    loader = self._step(document, job, check_supply_chain.BUNDLE_LOADER_STEP)
+                    if identifier is None:
+                        loader.pop("id")
+                    else:
+                        loader["id"] = identifier
+                    violations = check_supply_chain.workflow_channel_violations(
+                        workflow, document
+                    )
+                    self.assertTrue(
+                        any("keeps id load-bundles" in item for item in violations), violations
+                    )
+            for step_name, variable in check_supply_chain.APPLIED_BUNDLE_BINDINGS.items():
+                for replacement in (
+                    None, "${{ steps.stale.outputs.applied_file }}", "/tmp/ready.json",
+                ):
+                    with self.subTest(job=job, step=step_name, replacement=replacement):
+                        document = self._probe_document(workflow)
+                        environment = self._step(document, job, step_name)["env"]
+                        self.assertEqual(
+                            environment[variable], check_supply_chain.APPLIED_BUNDLE_VALUE
+                        )
+                        if replacement is None:
+                            environment.pop(variable)
+                        else:
+                            environment[variable] = replacement
+                        violations = check_supply_chain.probe_validation_gate_violations(
+                            workflow, document
+                        )
+                        self.assertTrue(
+                            any(f"must bind exactly {variable}" in item for item in violations),
+                            violations,
+                        )
+
     def test_trusted_checker_refuses_env_file_bypasses_in_candidate_workflows(self):
         for workflow, script in (
             (".github/workflows/rust-ci.yml", 'echo "BASH_ENV=x" >> "${GITHUB_ENV}"'),
@@ -575,6 +820,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "gitforgeops<input apply --auto-approve",
             "~/.cargo/bin/gitforgeops apply --auto-approve",
             "gitforgeops \\\napply --auto-approve",
+            "$(command -v gitforgeops) apply --auto-approve",
+            '"$(which gitforgeops)" apply --auto-approve',
             "gitforgeops rotate --consumer x --credential jwt.secret",
             "gitforgeops export --materialize",
             "gitforgeops version",
