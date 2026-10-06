@@ -43,15 +43,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Operators must provision the distinct gateway viewer key before switching
   the workflow and remove the admin key from monitor environments. Namespace
   restrictions and approval gates remain in place. The bundled drift command
-  still fails on unverified secrets and never certifies them as in sync; it
-  adds no fingerprint-baseline storage (#440).
+  never certifies unverified secrets as in sync; it adds no
+  fingerprint-baseline storage (#440).
 - `diff` reads Ferrum Edge's `GET /config/export` with a viewer-capped
   credential when `FERRUM_ADMIN_JWT_VIEWER_SECRET` is set, and never uses the
   admin secret on that path; without it, `diff` keeps reading `GET /backup`
   with the admin credential. Secrets arrive as gateway-keyed fingerprints a
   viewer cannot reproduce. Declared secret-bearing fields (and every declared
   consumer's hidden-credentials fingerprint) are reported as unverified, never
-  as in sync: JSON `in_sync` is `false`, and `--exit-on-drift` exits 1 instead
+  as in sync: JSON `in_sync` is `false`, and `--exit-on-drift` exits 6 instead
   of 0 unless `--accept-unverified-secrets` is passed (drift found on a fresh
   read still exits 2; a cached read always exits 1). Fingerprinted credentials the
   repository does not declare, and fingerprint-shaped values in non-secret
@@ -77,6 +77,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `diff --exit-on-drift` exits with the new code `6` ("in sync, secrets
+  unverified") instead of `1` when a fresh viewer-credential read found no
+  drift in an alerted category and no fingerprint baseline was supplied, so the
+  only gap is fingerprinted secrets the viewer cannot verify. `drift_report.py`
+  records it as the non-blocking `in_sync_secrets_unverified` outcome, shown as
+  a warning in the job summary and as a `::warning::` annotation, so scheduled
+  viewer-only monitoring of an in-sync environment that declares secrets no
+  longer fails every run and keeps the settings audit's monitoring evidence
+  current. Drift still exits `2` and fails the workflow; a cached read, a whole
+  value fingerprinted around a secret, a refused baseline write, and a supplied
+  `--fingerprint-baseline` that cannot verify secrets (missing file, changed
+  gateway fingerprint key, incomplete recorded namespace) still exit `1`.
+  `--accept-unverified-secrets` still returns `0`; runs without
+  `--exit-on-drift` and apply-time verification are unchanged (#471).
 - Align `rust-toolchain.toml`, workflow Rust pins, and the Docker builder rule on
   Rust 1.99.0. The trusted supply-chain checker enforces a 1.99.0 minimum,
   rejects legacy `rust-toolchain` files and unsupported toolchain keys, and

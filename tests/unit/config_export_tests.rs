@@ -302,11 +302,14 @@ fn every_declared_consumer_leaves_its_hidden_credentials_uncompared() {
     let exports = [export];
     let unverified = SecretFingerprintSummary::evaluate(&exports, 1, None, &desired);
     assert!(!unverified.verified());
+    // No baseline was supplied, so nothing the operator set up was invalidated.
+    assert!(!unverified.baseline_invalidated());
 
     let mut baseline = FingerprintBaseline::default();
     baseline.record(&exports[0]);
     let proven = SecretFingerprintSummary::evaluate(&exports, 1, Some(&baseline), &desired);
     assert!(proven.verified());
+    assert!(!proven.baseline_invalidated());
 }
 
 #[test]
@@ -333,6 +336,10 @@ fn a_consumer_exported_without_its_hidden_fingerprint_is_never_verified() {
     let summary =
         SecretFingerprintSummary::evaluate(&exports, uncompared, Some(&baseline), &desired);
     assert!(!summary.verified());
+    // The namespace is recorded in the baseline but came back incomplete, so
+    // the operator's verification control failed rather than merely missing an
+    // incremental entry.
+    assert!(summary.baseline_invalidated());
     assert!(summary.notes[0].contains("hidden_credentials_fingerprint"));
 }
 
@@ -557,12 +564,14 @@ fn the_summary_is_unverified_without_a_complete_baseline() {
     let none = SecretFingerprintSummary::evaluate(&exports, uncompared, None, &desired);
     assert!(!none.verified());
     assert!(none.changes.is_empty());
+    assert!(!none.baseline_invalidated());
 
     let mut baseline = FingerprintBaseline::default();
     baseline.record(&exports[0]);
     let complete =
         SecretFingerprintSummary::evaluate(&exports, uncompared, Some(&baseline), &desired);
     assert!(complete.verified());
+    assert!(!complete.baseline_invalidated());
     assert!(complete.notes.is_empty());
 
     let rotated = [export_with('a', 'b', ROTATED_KEY_ID)];
@@ -570,6 +579,7 @@ fn the_summary_is_unverified_without_a_complete_baseline() {
         SecretFingerprintSummary::evaluate(&rotated, uncompared, Some(&baseline), &desired);
     assert!(!key_changed.verified());
     assert!(key_changed.key_changed);
+    assert!(key_changed.baseline_invalidated());
     assert!(key_changed.notes[0].contains("fingerprint key changed"));
 
     // A key change is never verified, even with nothing to compare.

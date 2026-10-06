@@ -105,6 +105,7 @@ Exit codes:
 | 3 | `doctor` found a blocker (`DOCTOR_FAILED_EXIT_CODE`). |
 | 4 | `verify` check failed (`VERIFY_FAILED_EXIT_CODE`). |
 | 5 | `verify` had no declared check for the environment (`VERIFY_SKIPPED_EXIT_CODE`). Skipped is never a pass. |
+| 6 | `diff --exit-on-drift` found no drift in an alerted category with no fingerprint baseline supplied, but fingerprinted secrets were unverified (`SECRETS_UNVERIFIED_EXIT_CODE`). Never in sync; monitoring warns, does not fail. A supplied baseline that cannot verify secrets exits 1 instead. |
 
 ## Build / Test / Lint
 
@@ -623,11 +624,18 @@ which the export lacks.
   count as managed modifications (`DriftVerdict::with_secret_changes`).
   Recording refuses a run with diffs or secret changes unless
   `--force-baseline`; a baseline path inside a git worktree is warned about.
-- Unverified secrets (or a key change) are non-authoritative: no "in sync"
+- Unverified secrets are non-authoritative: no "in sync"
   text, JSON `in_sync: false`; `--exit-on-drift` exits 2 when drift was
-  found, otherwise 1 unless `--accept-unverified-secrets` (which does not
-  cover masked ancestors). A cached read exits 1 either way. The four
-  export-only flags are refused on the `/backup` path.
+  found, otherwise 6 (`verdict::DiffExit::SecretsUnverified`) when no
+  `--fingerprint-baseline` was supplied, unless `--accept-unverified-secrets`
+  (0). A supplied baseline that cannot verify secrets — the file is missing, the
+  key changed, or a recorded namespace is incomplete — is
+  `DiffExit::BaselineInvalidated` (exit 1; `--accept-unverified-secrets` still
+  maps to 0); a namespace absent from the baseline or a resource not yet
+  recorded stays 6. Masked ancestors exit 1 with or without
+  the flag; a refused baseline write wins over 6 (exit 1). A cached read
+  exits 1 either way. The four export-only flags are refused on the
+  `/backup` path.
 - Cached export (`X-Data-Source: cached` or `source: cached`): same as a cached
   `/backup` — warning, no authoritative verdict, `--exit-on-drift` exits 1, and
   no baseline is written.
@@ -678,10 +686,13 @@ Fences on the reviewer-free environment:
   `<env>-monitor` (see `docs/reference.md`, Scheduled monitoring). That is why
   `CREDENTIAL_BUNDLE_WORKFLOWS` is a subset of `PRIVILEGED_WORKFLOWS`.
 
-Outcomes come from `.github/scripts/drift_report.py`: `in_sync`, `drift`,
-`failed`, `skipped` (file mode), `not_completed`. Only `in_sync` is a successful
-comparison; `drift`/`failed`/`not_completed` block; `skipped` does not. A matrix
-entry with no record becomes `not_completed`. The settings audit also fails when
+Outcomes come from `.github/scripts/drift_report.py`: `in_sync`,
+`in_sync_secrets_unverified` (`diff` exit 6), `drift`, `failed`, `skipped`
+(file mode), `not_completed`. Only `in_sync` is a successful comparison;
+`drift`/`failed`/`not_completed` block; `skipped` and
+`in_sync_secrets_unverified` (a summary warning and `::warning::` annotation) do
+not. A matrix entry with no record becomes `not_completed`. The settings audit
+also fails when
 the newest successful `drift-check.yml` run is older than
 `--monitoring-max-age-hours` (48), so a `cron:` entry alone proves nothing.
 `drift-check.yml` binds only `FERRUM_ADMIN_JWT_VIEWER_SECRET` and its

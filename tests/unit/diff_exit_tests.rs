@@ -15,6 +15,7 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
+use gitforgeops::verdict::SECRETS_UNVERIFIED_EXIT_CODE;
 use tempfile::TempDir;
 
 /// JWT signing secret. The stub ignores the token, but `AdminClient` refuses
@@ -778,6 +779,18 @@ fn assert_drift_exit(output: &Output) {
     );
 }
 
+/// The documented "in sync, secrets unverified" exit code (#471).
+fn assert_secrets_unverified_exit(output: &Output) {
+    assert_eq!(
+        output.status.code(),
+        Some(SECRETS_UNVERIFIED_EXIT_CODE),
+        "expected the secrets-unverified exit code; stdout={} stderr={}",
+        stdout(output),
+        stderr(output)
+    );
+    assert!(stderr(output).contains("(in sync, secrets unverified)"));
+}
+
 #[test]
 fn a_spec_ownership_conflict_with_identical_fields_exits_with_the_drift_code() {
     // The issue-131 reproduction: the repo declares Proxy `app`, the live row
@@ -1348,31 +1361,35 @@ const VIEWER_ONLY: [(&str, &str); 2] = [
 fn a_viewer_diff_reads_the_export_and_does_not_call_unverified_secrets_in_sync() {
     let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
 
-    // Unverified secrets make --exit-on-drift non-authoritative, like a cache.
+    // Unverified secrets keep --exit-on-drift from returning 0, but with no
+    // drift in an alerted category the run is neither drift (2) nor a failed
+    // check (1): it exits with the dedicated secrets-unverified code (#471).
     let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
 
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "stdout={} stderr={}",
-        stdout(&output),
-        stderr(&output)
-    );
+    assert_secrets_unverified_exit(&output);
     assert!(stdout(&output).contains("Fingerprinted secret fields were not verified"));
     assert!(stderr(&output).contains("cannot compute the fingerprint"));
-    assert!(stderr(&output).contains("requires every declared secret to be verified"));
     assert!(!stdout(&output).contains("Configuration is in sync."));
 
     let accepted = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
     let output = repo.run_with_env(&accepted, &VIEWER_ONLY);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("secrets unverified"));
 
+    // Without --exit-on-drift the exit code is unchanged.
     let output = repo.run_with_env(&["diff", "--format", "json"], &VIEWER_ONLY);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert_eq!(report["in_sync"], false);
     assert_eq!(report["live_source"], "config_export");
     assert_eq!(report["secret_fingerprints"]["verified"], false);
+
+    let json = ["diff", "--exit-on-drift", "--format", "json"];
+    let output = repo.run_with_env(&json, &VIEWER_ONLY);
+    assert_secrets_unverified_exit(&output);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["in_sync"], false);
+    assert_eq!(report["diff_count"], 0);
 
     let requests = repo.requests.lock().unwrap();
     assert!(!requests.is_empty());
@@ -1394,7 +1411,7 @@ fn a_viewer_diff_still_reports_a_credential_the_repository_does_not_declare() {
     assert!(out.contains("MODIFY Consumer app (ferrum)"), "{out}");
     assert!(out.contains("credentials: [REDACTED] -> [REDACTED]"));
     assert!(!out.contains("hmac-sha256:"), "{out}");
-    assert!(!stderr(&output).contains("requires every declared secret"));
+    assert!(!stderr(&output).contains("secrets unverified"));
 
     let accepted = ["diff", "--exit-on-drift", "--accept-unverified-secrets"];
     assert_drift_exit(&repo.run_with_env(&accepted, &VIEWER_ONLY));
@@ -1440,10 +1457,101 @@ fn a_fingerprint_baseline_detects_a_secret_changed_between_exports() {
 
     let rekeyed = export_repo(config_export("fedcba9876543210", &['c']), false);
     let not_comparable = rekeyed.run_with_env(&compare, &VIEWER_ONLY);
-    assert_eq!(not_comparable.status.code(), Some(1));
+    // A key change invalidates the baseline the operator supplied, so this is a
+    // failed check (1), not the non-blocking secrets-unverified code (6).
+    assert_eq!(
+        not_comparable.status.code(),
+        Some(1),
+        "{}",
+        stderr(&not_comparable)
+    );
     assert!(stderr(&not_comparable).contains("fingerprint key changed"));
-    assert!(stderr(&not_comparable).contains("requires every declared secret to be verified"));
+    assert!(stderr(&not_comparable).contains("could not verify them"));
     assert!(stdout(&not_comparable).contains("were not verified"));
+
+    // Explicit acceptance still maps the invalidated baseline to 0.
+    let accepted = [
+        "diff",
+        "--exit-on-drift",
+        "--fingerprint-baseline",
+        path,
+        "--accept-unverified-secrets",
+    ];
+    assert_eq!(
+        rekeyed.run_with_env(&accepted, &VIEWER_ONLY).status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_missing_fingerprint_baseline_file_is_a_failed_check_not_unverified_secrets() {
+    // Passing --fingerprint-baseline names the verification control the
+    // operator wants. When the file it names does not exist, that control did
+    // not run, so the run fails (1) rather than reporting the no-baseline
+    // warning code (6).
+    let baseline_dir = TempDir::new().unwrap();
+    let baseline = baseline_dir.path().join("missing.json");
+    let path = baseline.to_str().unwrap();
+    assert!(!baseline.exists());
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+
+    let args = ["diff", "--exit-on-drift", "--fingerprint-baseline", path];
+    let output = repo.run_with_env(&args, &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("does not exist yet"));
+    assert!(stderr(&output).contains("could not verify them"));
+
+    // Explicit acceptance still maps it to 0.
+    let accepted = [
+        "diff",
+        "--exit-on-drift",
+        "--fingerprint-baseline",
+        path,
+        "--accept-unverified-secrets",
+    ];
+    assert_eq!(
+        repo.run_with_env(&accepted, &VIEWER_ONLY).status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn a_refused_baseline_write_with_unverified_secrets_is_a_failed_check() {
+    // A run that would otherwise be only "secrets unverified" (6) must still
+    // fail (1) when its --write-fingerprint-baseline is refused. Exercises the
+    // SecretsUnverified branch specifically: the live extra credential is muted
+    // by drift_alert_on, so has_drift() is false, but the refused write is a
+    // real failure. The declared keyauth key stays unverified because no
+    // --fingerprint-baseline was read.
+    let baseline_dir = TempDir::new().unwrap();
+    let next = baseline_dir.path().join("next.json");
+    let next_path = next.to_str().unwrap();
+    let repo = Repo::new(
+        &[
+            ("resources/ferrum/consumers/app.yaml", KEYAUTH_CONSUMER),
+            (".gitforgeops/config.yaml", MUTED_DRIFT_CONFIG),
+        ],
+        vec![(
+            "ferrum".to_string(),
+            config_export(EXPORT_KEY_ID, &['a', 'b']),
+        )],
+    );
+
+    let write = [
+        "diff",
+        "--exit-on-drift",
+        "--write-fingerprint-baseline",
+        next_path,
+    ];
+    let output = repo.run_with_env(&write, &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("refusing to write a fingerprint baseline"));
+    assert!(!next.exists());
+
+    // Without the refused write, the same unverified read exits 6. This proves
+    // the refusal, not ordinary drift, is what fails the run.
+    let unverified = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+    assert_secrets_unverified_exit(&unverified);
 }
 
 #[test]
@@ -1538,7 +1646,7 @@ fn a_credential_less_consumer_is_not_in_sync_without_a_baseline() {
     let text = repo.run_with_env(&["diff"], &VIEWER_ONLY);
     assert!(!stdout(&text).contains("Configuration is in sync."));
     let strict = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
-    assert_eq!(strict.status.code(), Some(1));
+    assert_secrets_unverified_exit(&strict);
 }
 
 #[test]
@@ -1676,6 +1784,12 @@ fn a_whole_value_fingerprinted_around_a_secret_is_never_accepted() {
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(stderr(&output).contains("--accept-unverified-secrets does not cover this"));
     assert!(stderr(&output).contains("fingerprinted 1 whole value(s)"));
+
+    // Hidden non-secret contents are not "only secrets unverified": the
+    // dedicated non-blocking code never covers them.
+    let output = repo.run_with_env(&["diff", "--exit-on-drift"], &VIEWER_ONLY);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("secrets unverified"));
 
     let json = repo.run_with_env(&["diff", "--format", "json"], &VIEWER_ONLY);
     let report: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
