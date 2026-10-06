@@ -4917,22 +4917,111 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
-    def test_docker_parser_ignores_decoy_from_in_continued_run_and_heredoc(self):
+    def test_docker_physical_from_scan_rejects_decoy_with_wrong_channel(self):
         digest = "a" * 64
         dockerfile = (
             f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
             "RUN echo first \\\n"
             f"    FROM rust:1.98.0-bookworm@sha256:{digest} AS decoy\n"
-            "RUN <<'SCRIPT'\n"
-            f"FROM rust:1.98.0-bookworm@sha256:{digest} AS heredoc-decoy\n"
-            "SCRIPT\n"
             "FROM debian:stable-slim@sha256:"
             + digest
             + "\n"
         )
-        self.assertEqual(
-            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0"),
-            [],
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            dockerfile, "1.99.0"
+        )
+        self.assertTrue(
+            any("every Rust base image" in item for item in violations), violations
+        )
+
+    def test_docker_b1_double_backslash_does_not_hide_physical_from(self):
+        digest = "a" * 64
+        dockerfile = (
+            f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+            "RUN echo foo\\\\\n"
+            f"FROM rust:1.98.0-bookworm@sha256:{digest} AS compile\n"
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            dockerfile, "1.99.0"
+        )
+        self.assertTrue(violations, violations)
+
+    def test_docker_b2_rejects_unicode_whitespace_after_escape(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "RUN echo hi \\" + "\u00a0\n"
+            "FROM rust:1.98.0-bookworm AS compile\n"
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
+        )
+
+    def test_docker_b3_rejects_heredoc_marker_in_quoted_label(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            'LABEL note="a <<END b"\n'
+            "FROM rust:1.98.0-bookworm AS compile\n"
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
+        )
+
+    def test_docker_b4_rejects_quoted_heredoc_delimiter(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "RUN <<E\"O\"F\n"
+            "body\n"
+            "EOF\n"
+            "FROM rust:1.98.0-bookworm AS compile\n"
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
+        )
+
+    def test_docker_b5_rejects_heredoc_marker_in_continuation_comment(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "RUN echo first \\\n"
+            "  # <<END\n"
+            f"FROM rust:1.98.0-bookworm@sha256:{'a' * 64} AS compile\n"
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
+        )
+
+    def test_docker_b6_rejects_escape_parser_directive_outside_allowed_position(self):
+        dockerfiles = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            " # escape=`\n"
+            "RUN echo x #\\\n"
+            "FROM rust:1.98.0-bookworm AS compile\n",
+            "# syntax=docker/dockerfile:1\n"
+            "# escape=`\n"
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "RUN echo x #\\\n"
+            "FROM rust:1.98.0-bookworm AS compile\n",
+        )
+        for dockerfile in dockerfiles:
+            with self.subTest(dockerfile=dockerfile):
+                self.assertTrue(
+                    check_supply_chain.docker_builder_toolchain_violations(
+                        dockerfile, "1.99.0"
+                    )
+                )
+
+    def test_docker_b7_rejects_variable_in_from_image(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "ARG BASE=rust:1.98.0-bookworm\n"
+            "FROM ${BASE}@sha256:"
+            + "a" * 64
+            + " AS compile\n"
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            dockerfile, "1.99.0"
+        )
+        self.assertTrue(
+            any("could not parse FROM" in item for item in violations), violations
         )
 
     def test_docker_toolchain_check_fails_closed_on_unparseable_input(self):

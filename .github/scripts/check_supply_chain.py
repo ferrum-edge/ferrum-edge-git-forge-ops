@@ -1371,18 +1371,36 @@ def read_rust_toolchain_channel(path: Path) -> str | None:
 
 
 def dockerfile_instructions(text: str) -> list[str] | None:
-    """Return Dockerfile logical instructions, excluding heredoc bodies.
+    """Return Dockerfile logical instructions, refusing ambiguous syntax.
 
-    Docker parses continuations before instructions and consumes heredoc bodies
-    as data. The policy must do the same so shell text cannot impersonate FROM.
-    A malformed continuation, escape directive, instruction, or heredoc refuses.
+    Docker parses continuations before instructions. Ambiguous heredoc and
+    parser-directive syntax is refused rather than interpreted approximately.
     """
-    lines = text.splitlines()
-    escape = "\\"
-    if lines and re.fullmatch(r"#\s*escape\s*=\s*(`|\\)\s*", lines[0], re.IGNORECASE):
-        escape = lines[0].rsplit("=", 1)[1].strip()
-    elif lines and re.match(r"#\s*escape\s*=", lines[0], re.IGNORECASE):
+    # Docker's parser splits only at LF and trims only a CR immediately before
+    # it. Other Unicode and control whitespace can change where its parser sees
+    # continuations, so reject those bytes instead of guessing.
+    forbidden_whitespace = (
+        "\u00a0\u1680"
+        + "".join(chr(codepoint) for codepoint in range(0x2000, 0x2010))
+        + "\u2028\u2029\u202f\u205f\u3000\ufeff\x0b\x0c\x1c\x1d\x1e\x1f\x85"
+    )
+    if any(character in text for character in forbidden_whitespace):
         return None
+
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    if "<<" in text:
+        # Heredoc recognition is shell-lexer-sensitive. Dockerfiles in this
+        # repository do not need heredocs, so refuse ambiguous inputs.
+        return None
+    if any(line.endswith("\\\\") for line in lines):
+        return None
+
+    for line_number, line in enumerate(lines):
+        directive = re.match(r"^[ \t]*#[ \t]*(syntax|escape|check)[ \t]*=", line, re.I)
+        if directive is None:
+            continue
+        if line_number != 0 or not re.match(r"^#[ \t]*syntax[ \t]*=\S", line, re.I):
+            return None
 
     instructions: list[str] = []
     supported_instructions = {
@@ -1409,44 +1427,29 @@ def dockerfile_instructions(text: str) -> list[str] | None:
     while index < len(lines):
         line = lines[index]
         index += 1
-        stripped = line.lstrip()
+        stripped = line.lstrip(" \t")
         if not stripped or stripped.startswith("#"):
             continue
 
-        logical = stripped.rstrip()
+        logical = stripped.rstrip(" \t")
         while True:
-            if not logical.endswith(escape):
+            if not re.search(r"(?<!\\)\\[ \t]*$|^\\[ \t]*$", logical):
                 break
-            logical = logical[:-1]
+            logical = re.sub(r"\\[ \t]*$", "", logical)
             if index >= len(lines):
                 return None
             continuation = lines[index]
             index += 1
-            if not continuation.strip():
+            continuation = continuation.lstrip(" \t")
+            if not continuation or continuation.startswith("#"):
                 continue
-            logical += " " + continuation.strip()
+            logical += " " + continuation.rstrip(" \t")
 
         instruction = re.match(r"^([A-Za-z]+)(?:\s+(.*))?$", logical)
         if instruction is None or instruction.group(1).upper() not in supported_instructions:
             return None
         instructions.append(logical)
 
-        arguments = instruction.group(2) or ""
-        heredocs: list[tuple[str, bool]] = []
-        for match in re.finditer(r"<<(-?)(?:'([^']+)'|\"([^\"]+)\"|([^\s;|&]+))", arguments):
-            delimiter = next(group for group in match.groups()[1:] if group is not None)
-            heredocs.append((delimiter, bool(match.group(1))))
-        if "<<" in arguments and not heredocs:
-            return None
-        for delimiter, strip_tabs in heredocs:
-            while index < len(lines):
-                body_line = lines[index]
-                index += 1
-                candidate = body_line.lstrip("\t") if strip_tabs else body_line
-                if candidate == delimiter:
-                    break
-            else:
-                return None
     return instructions
 
 
@@ -1457,6 +1460,36 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
         return ["Dockerfile: could not parse Dockerfile instructions"]
 
     violations: list[str] = []
+    # Independently inspect every physical FROM-looking line. This superset
+    # scan ensures a parser discrepancy cannot hide a real Docker stage.
+    physical_froms = []
+    for physical_line in text.split("\n"):
+        if physical_line.endswith("\r"):
+            physical_line = physical_line[:-1]
+        candidate = physical_line.lstrip(" \t")
+        if re.match(r"^FROM(?:[ \t]+|$)", candidate, re.IGNORECASE):
+            physical_froms.append(candidate)
+
+    def check_from(arguments: str) -> tuple[str, str | None] | None:
+        if arguments.endswith("\\"):
+            return None
+        match = re.fullmatch(
+            r"(?:--platform=\S+[ \t]+)?(\S+)(?:[ \t]+AS[ \t]+([A-Za-z0-9_.-]+))?",
+            arguments,
+            re.IGNORECASE,
+        )
+        if match is None or "$" in match.group(1):
+            return None
+        return match.group(1), match.group(2)
+
+    checked_physical_froms: list[tuple[str, str | None]] = []
+    for line in physical_froms:
+        parsed = re.match(r"^FROM[ \t]+(.*)$", line, re.IGNORECASE)
+        checked = check_from(parsed.group(1)) if parsed else None
+        if checked is None:
+            return ["Dockerfile: could not parse FROM instruction"]
+        checked_physical_froms.append(checked)
+
     builder_count = 0
     builder_uses_rust = False
     rust_image_found = False
@@ -1467,19 +1500,17 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
         if parsed_instruction.group(1).upper() != "FROM":
             continue
         arguments = parsed_instruction.group(2) or ""
-        match = re.fullmatch(
-            r"(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+([A-Za-z0-9_.-]+))?",
-            arguments,
-            re.IGNORECASE,
-        )
+        match = check_from(arguments)
         if match is None:
             return ["Dockerfile: could not parse FROM instruction"]
 
-        image = match.group(1)
-        stage_name = match.group(2)
+        image, stage_name = match
         if stage_name and stage_name.lower() == "builder":
             builder_count += 1
 
+    # Physical lines can be shell text or heredoc data. They still must not
+    # contain a Rust image on a different channel.
+    for image, stage_name in checked_physical_froms:
         image_name = image.rsplit("/", 1)[-1]
         if not (image_name.startswith("rust:") or image_name.startswith("rust@")):
             continue
