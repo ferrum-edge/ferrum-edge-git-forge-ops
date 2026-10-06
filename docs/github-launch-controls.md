@@ -572,14 +572,37 @@ step is pinned whole (including its safe-name `jq` guard), and trusted review's
 metadata step must check the event head SHA as 40 hex digits first, never
 reassign it, take the trusted SHA from `git rev-parse`, and write each SHA
 output only through its pinned `echo`. Apply's hand-off keeps
-`id: load-bundles`, and Apply and Verify traffic read the finalized bundle path
-only from that step's output.
+`id: load-bundles`, only the `Load credential bundles` step in each job may
+carry that id (compared without regard to case, like every producer id), and
+Apply and Verify traffic read the finalized bundle path only from that step's
+output. An `env:` mapping at any level may not bind, in any case, `ENV`,
+`BASH_ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `LD_PRELOAD` or
+`LD_LIBRARY_PATH`, each of which changes what a later step's shell or loader
+runs before its script. In `apply-on-merge.yml`, every scalar outside the
+guarded Apply steps is read for the binary, not only `run:`: a step's or a
+default's `shell:` and an action input count, a `run:` line may name it only as
+a pinned `envs`, `validate` or `verify` line, and any other scalar only as a
+pinned display name (`name:`).
+
+A local action (`uses: ./...`) carries no commit pin, so the checker reads what
+it runs. Every local reference must name, by a plain path, a composite action
+under `.github/actions/` with exactly one `action.yml` or `action.yaml`, reached
+through no symbolic link and written in the same YAML subset as workflows.
+Anything else is refused: another action type, a path into another checkout, a
+missing or unparsable file, and a local reusable workflow
+(`jobs.<id>.uses: ./...`), which would carry none of its caller's pins. Each
+local action a workflow reaches, directly or through another local action, is
+judged by that workflow's fences: the env-file channel and startup-key bans,
+its protected names, no `run:` interpolation when the workflow is
+Environment-bound, and in `apply-on-merge.yml` the binary pin above.
 
 Program-level writes are out of scope. A program a step invokes (the binary, a
 helper script, or Bash evaluating computed text such as `base64 -d | bash` or
 `eval "$text"`) can still write `$GITHUB_ENV` or rebind a variable, and no text
-rule can prove otherwise. Review of every workflow change is the control for
-that.
+rule can prove otherwise. That includes a file-command path the step discovers
+rather than derives from a spelled name: a glob over the runner's temp directory
+(`"$RUNNER_TEMP"/*/set_e*`), `/proc/$$/fd`, or the environment read back through
+`env | sed`. Review of every workflow change is the control for that.
 
 These text rules can refuse legitimate workflow text: a redirect or `tee` into
 `$GITHUB_WORKSPACE/...`, any name containing `GITHUB_ENV`, `GITHUB_PATH` or a
