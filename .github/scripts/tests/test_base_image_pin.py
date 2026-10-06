@@ -187,7 +187,7 @@ class RealDockerfileTests(unittest.TestCase):
         )
         self.assertIn("dpkg --purge", instructions)
 
-    def test_the_live_dockerfile_pins_the_current_libpcre2_security_update(self):
+    def test_the_live_dockerfile_keeps_the_libpcre2_fix_until_base_metadata_is_verified(self):
         self.assertEqual(
             self.pin.versions_by_name(),
             {"libpcre2-8-0": {"amd64": "10.46-1~deb13u3", "arm64": "10.46-1~deb13u3"}},
@@ -213,7 +213,11 @@ class RealDockerfileTests(unittest.TestCase):
         self.assertIn("dpkg --install", instructions)
         self.assertEqual(
             self.pin.digest,
-            "sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a",
+            "sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f",
+        )
+        self.assertIn(
+            "installed\n# package metadata confirms it already carries the fix",
+            (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8"),
         )
 
     def test_every_pinned_package_carries_both_architectures_and_a_pool(self):
@@ -268,9 +272,9 @@ class ClassificationTests(unittest.TestCase):
         findings, _ = check_base_image_pin.parse_trivy_report(report_document(vulnerabilities))
         return check_base_image_pin.classify(findings, self.pin)
 
-    def test_a_clean_base_means_the_stage_can_be_retired(self):
+    def test_a_clean_scan_does_not_prove_the_pinned_version_is_in_the_base(self):
         report = self.classify([])
-        self.assertEqual(report.state, "retire")
+        self.assertEqual(report.state, "ok")
         self.assertEqual(sorted(report.redundant_pins), ["gzip", "perl-base"])
 
     def test_a_pin_at_the_fixed_version_covers_the_finding(self):
@@ -382,25 +386,25 @@ class PoolAvailabilityTests(unittest.TestCase):
         self.assertEqual(self.report.state, "ok")
         self.assertEqual(len(self.report.unverified_pool), 4)
 
-    def test_a_retirable_state_survives_a_healthy_pool_check(self):
-        report = check_base_image_pin.Report(state="retire")
+    def test_a_clean_scan_remains_ok_after_a_healthy_pool_check(self):
+        report = check_base_image_pin.Report(state="ok")
         check_base_image_pin.check_pool(self.pin, report, fetch=lambda url: 200)
-        self.assertEqual(report.state, "retire")
+        self.assertEqual(report.state, "ok")
 
 
 class RenderTests(unittest.TestCase):
-    def test_the_retirement_report_names_the_digest_to_move_to(self):
+    def test_a_clean_report_keeps_redundant_pins_until_base_metadata_is_verified(self):
         report = check_base_image_pin.Report(
-            state="retire",
+            state="ok",
             image="debian:trixie-slim",
             pinned_digest="sha256:cccc",
             current_digest="sha256:dddd",
+            has_pins=True,
         )
+        report.redundant_pins = ["libpcre2-8-0"]
         text = check_base_image_pin.render(report)
-        self.assertIn("can be retired", text)
-        self.assertIn("debian:trixie-slim@sha256:dddd", text)
-        self.assertIn("Keep the `dpkg --purge` step", text)
-        self.assertIn("The tag has been rebuilt since the pin.", text)
+        self.assertIn("does not confirm the installed package version", text)
+        self.assertIn("metadata before dropping a pin", text)
 
     def test_the_stale_report_explains_how_to_refresh_a_pin(self):
         report = check_base_image_pin.Report(
@@ -465,12 +469,12 @@ class MainTests(unittest.TestCase):
     def test_a_covered_base_exits_zero(self):
         code, body = self.run_main([vulnerability("perl-base", "5.40.1-6+deb13u1")])
         self.assertEqual(code, 0)
-        self.assertIn("still required and still sufficient", body)
+        self.assertIn("No uncovered fixed CRITICAL/HIGH", body)
 
-    def test_a_retirable_base_exits_zero_because_nothing_is_broken(self):
+    def test_a_clean_scan_exits_zero_and_retains_unverified_package_pins(self):
         code, body = self.run_main([])
         self.assertEqual(code, 0)
-        self.assertIn("can be retired", body)
+        self.assertIn("does not confirm the installed package version", body)
 
     def test_a_stale_pin_exits_non_zero(self):
         code, body = self.run_main([vulnerability("perl-base", "5.40.1-6+deb13u2")])
