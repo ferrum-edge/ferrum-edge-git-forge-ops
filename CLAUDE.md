@@ -420,14 +420,27 @@ namespace payload is built before the first mutation.
      (`Preconditions::written_plugins`, `without_written_associations`) and
      with every other association, so a concurrently attached plugin is not
      detached and a scoped plugin can move off a proxy deleted in the same
-     run. When the read's content differs, one `/backup` taken after the read
+     run. When the read's content differs, a `/backup` taken after the read
      decides: `/backup` is normalized on load and the read is the stored row,
      so representation-only differences (legacy un-normalized rows) must not
-     refuse forever;
+     refuse forever. The namespace's latest backup
+     (`Preconditions::confirmation`) is reused while it shows the row with
+     the read's server `updated_at`; otherwise a fresh one is taken after
+     the read;
   3. `PUT`/`DELETE` with `If-Match: <etag>` (`update_if_match` /
      `delete_if_match`). Edge compares and commits under the namespace
      admission lease every admin writer takes, so a `412` proves the row
      changed after the read and nothing was written.
+
+  A PluginConfig `ETag` does not cover proxy associations, which Edge removes
+  on a plugin delete and on a `proxy`/`global` update (all but the target). So
+  before a plugin delete, and before an update changing the planned
+  `scope`/`proxy_id` to `proxy`/`global` (`Preconditions::retargets`),
+  `refuse_unplanned_references` re-reads `/backup` and refuses with
+  `Error::UnplannedPluginReference` (withholds like `StalePlan`) when a
+  referencing proxy is not in the plan's live view, not declared, and not the
+  kept target. The read-to-write window stays open: Edge has no association
+  precondition; only an Edge-side referenced-plugin guard closes it.
 
   A mismatch or `412` is `Error::StalePlan`: a per-resource error that also
   withholds **every later write in the namespace** (creates and updates

@@ -237,6 +237,10 @@ fn untrusted_error_variants_cannot_emit_a_workflow_command() {
     check("StaleGatewayView", Error::StaleGatewayView(bad.clone()));
     check("StalePlan", Error::StalePlan(bad.clone()));
     check(
+        "UnplannedPluginReference",
+        Error::UnplannedPluginReference(bad.clone()),
+    );
+    check(
         "ConditionalWriteUnavailable",
         Error::ConditionalWriteUnavailable(bad.clone()),
     );

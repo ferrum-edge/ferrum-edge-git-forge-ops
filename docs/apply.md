@@ -108,6 +108,11 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
   the `If-Match` write. The row is not written and the namespace's remaining
   writes are withheld. See
   [Changes made during an apply](#changes-made-during-an-apply).
+- **`UnplannedPluginReference`.** A PluginConfig delete, or an update that
+  moves its scope or target, would make the gateway detach the plugin from a
+  proxy that neither the plan nor the repository showed referencing it. The
+  plugin is not written and the namespace's remaining writes are withheld, as
+  for `StalePlan`. See [Plugin associations](#plugin-associations).
 - **`ConditionalWriteUnavailable`.** A required strong row tag, complete consumer
   verification or coherent conditional snapshot is unavailable or invalid. The
   operation refuses before allocation. Cached reads, audit-admission refusal and
@@ -235,6 +240,14 @@ read, and goes ahead only if that backup still shows the planned row: a change
 made before the read shows there in the plan's own form, and a change made
 after it fails the `If-Match`. Such a row is never refused forever.
 
+One such backup serves the whole namespace. A later read that also disagrees
+with the plan reuses the namespace's latest backup when the backup shows that
+row with the same server `updated_at` as the read. Ferrum Edge advances
+`updated_at` on every write to a row, including the association changes a
+plugin write makes to a proxy, so both then show the same stored version. Any
+other read, such as one of a row this run or another writer changed since that
+backup, takes a fresh backup after the read, as above.
+
 A refused write (by the read or by a `412`) is a per-resource error naming the
 row, and it proves the namespace's plan stale: **nothing more is sent to that
 namespace** in this run. Its remaining creates and updates are reported as
@@ -310,6 +323,33 @@ Creates need no precondition, because `POST` and `POST /batch` are create-only.
 After an ambiguous create, the row is read before the verification backup, and
 a row that carries an `api_spec_id` is never claimed, even when its content
 matches.
+
+### Plugin associations
+
+Deleting a plugin config makes Ferrum Edge remove every proxy association to
+it, and updating a plugin config to `scope: proxy` or `scope: global` removes
+every association except the `proxy` target. Association rows are not part of
+the plugin config's `ETag`, so `If-Match` on the plugin cannot see a proxy
+that attached the plugin after the plan, and the write would silently detach
+it.
+
+Immediately before a plugin config delete, and before an update that changes
+the plan's `scope` or `proxy_id` to `proxy` or `global`, apply therefore reads
+the namespace's `/backup` again and lists the proxies that reference the
+plugin now. The write is refused as `UnplannedPluginReference` when any of
+them is neither a proxy the plan's live view showed referencing the plugin, a
+proxy the repository declares referencing it, nor the target the update keeps.
+As with `StalePlan`, the namespace's remaining writes are withheld. Re-run
+apply to plan against the current gateway. A `proxy_group` update leaves
+associations alone, and an update that keeps its scope and target detaches
+nothing another proxy could validly have attached, so neither takes this read.
+
+This check narrows the race; it does not close it. A proxy that attaches the
+plugin between that read and the write is still detached, because the gateway
+offers no precondition on associations. The full fix is a Ferrum Edge guard
+that refuses to delete or retarget a plugin config while a proxy outside the
+caller's expectation references it, checked inside the same write
+transaction.
 
 ## Ordering between runs
 
