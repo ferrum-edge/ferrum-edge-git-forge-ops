@@ -563,8 +563,12 @@ redirect or `tee` into any GitHub file channel other than `GITHUB_OUTPUT` and
 target (and the summary as a `--summary` argument), never inside a parameter
 expansion or `dirname` that could derive another file-command path. Quotes,
 backslashes and line continuations are removed before matching, and shell
-comments count. A `run:` interpolation may not adjoin a name character, with
-quotes removed. The Environment-bound workflows may interpolate into `run:`
+comments count. In a scalar that uses Bash ANSI-C quoting (`$'...'`), every
+`\xHH`, `\NNN`, `\uHHHH`, `\UHHHHHHHH` and `\cX` escape is decoded first, so
+`$'GITHUB_\x45NV'` reads as `GITHUB_ENV` and `$'\x67'itforgeops` as the
+binary; a decoded control character ends a name. A name Bash computes by
+expansion is still program behavior (below). A `run:` interpolation may not
+adjoin a name character, with quotes removed. The Environment-bound workflows may interpolate into `run:`
 only a per-job allowlist; pass any other value through step `env:`. Each
 allowlisted value is pinned to its producer: the job outputs and matrices that
 carry it must be exactly the reviewed expressions, the environment enumerator
@@ -576,13 +580,18 @@ output only through its pinned `echo`. Apply's hand-off keeps
 carry that id (compared without regard to case, like every producer id), and
 Apply and Verify traffic read the finalized bundle path only from that step's
 output. An `env:` mapping at any level may not bind, in any case, `ENV`,
-`BASH_ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `LD_PRELOAD` or
-`LD_LIBRARY_PATH`, each of which changes what a later step's shell or loader
-runs before its script. In `apply-on-merge.yml`, every scalar outside the
-guarded Apply steps is read for the binary, not only `run:`: a step's or a
-default's `shell:` and an action input count, a `run:` line may name it only as
-a pinned `envs`, `validate` or `verify` line, and any other scalar only as a
-pinned display name (`name:`).
+`BASH_ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4` or any `LD_*` loader
+variable (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, ...), each of which
+changes what a later step's shell or loader runs before its script. A job
+container or service container may not set `options:`, a `docker create`
+command line whose `-e`, `--env` or `--env-file` would bind the same variables
+for every step of the job, and may not be computed. In `apply-on-merge.yml`,
+every scalar outside the guarded Apply steps is read for the binary, not only
+`run:`: a step's or a default's `shell:` and an action input count, a `run:`
+line may name it only as a pinned `envs`, `validate` or `verify` line, and any
+other scalar only as a pinned display name. A display name is the `name:` of
+the workflow (or local action), a job or a step; an action input or env value
+called `name` is not one.
 
 A local action (`uses: ./...`) carries no commit pin, so the checker reads what
 it runs. Every local reference must name, by a plain path, a composite action
@@ -594,7 +603,25 @@ missing or unparsable file, and a local reusable workflow
 local action a workflow reaches, directly or through another local action, is
 judged by that workflow's fences: the env-file channel and startup-key bans,
 its protected names, no `run:` interpolation when the workflow is
-Environment-bound, and in `apply-on-merge.yml` the binary pin above.
+Environment-bound, and in `apply-on-merge.yml` the binary pin above. Every
+action file under `.github/actions/`, reached or not, must be in that subset,
+and its remote `uses:` are pinned to 40-hex commits from the parsed file, in
+any key case.
+
+A local action is judged as the tree carries it, but the runner reads it from
+the workspace when its step runs. So no job may run a local action after an
+`actions/checkout` step that checks another revision out over the workspace
+root: a `ref` other than `${{ github.event.repository.default_branch }}`
+(judged when it merged) or a `repository` other than `${{ github.repository }}`,
+with no `path` or one that is not a plain subdirectory (`.`, `.github`, `..`,
+an absolute or computed path). A local action may not make such a checkout at
+all, since a later local action would run from it. Check another revision out
+into a subdirectory instead. A `git checkout` in a `run:` script is program
+behavior, outside these rules.
+
+`.github/actions/**` is a deployment input (it schedules and supersedes
+`apply-on-merge.yml` like `.github/scripts/**`), a `security.yml` push path and
+code-owned in `CODEOWNERS`; the checker requires all three.
 
 Program-level writes are out of scope. A program a step invokes (the binary, a
 helper script, or Bash evaluating computed text such as `base64 -d | bash` or

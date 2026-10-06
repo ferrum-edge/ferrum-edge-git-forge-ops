@@ -61,6 +61,8 @@ from pathlib import Path
 #                                         `rust-toolchain` file when both
 #                                         exist; `.cargo/config.toml` can set
 #                                         rustflags, env and source replacement)
+#   .github/actions/                      local composite actions a step runs
+#                                         from the checkout
 #   .github/scripts/                      helper programs the job executes
 #                                         (credential loading, installer,
 #                                         merge attribution, this file)
@@ -71,6 +73,7 @@ from pathlib import Path
 # the two can be compared literally.
 DEPLOYMENT_INPUT_PATHS: tuple[str, ...] = (
     ".cargo/**",
+    ".github/actions/**",
     ".github/ferrum-edge-checksums.txt",
     ".github/scripts/**",
     ".github/workflows/apply-on-merge.yml",

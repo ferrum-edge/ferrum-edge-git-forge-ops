@@ -346,8 +346,8 @@ READ_ONLY_GITFORGEOPS_LINES = (
     "gitforgeops validate",
     'FERRUM_CREDS_JSON_FILE="$APPLIED_CREDS_FILE" gitforgeops verify || status=$?',
 )
-# The only other apply-on-merge.yml scalars that may spell the binary: `name:`
-# values (workflow and steps), which GitHub displays and never runs.
+# The only other apply-on-merge.yml scalars that may spell the binary: the
+# `name:` of the workflow, a job or a step, which GitHub displays and never runs.
 GITFORGEOPS_DISPLAY_NAMES = ("GitForgeOps Apply", "Build gitforgeops", "Install gitforgeops")
 
 # The revision a recorded credential allocation is bound to, which lets the
@@ -367,6 +367,7 @@ CARGO_AUDIT_ACTIONS = frozenset(
     }
 )
 SECURITY_PUSH_POLICY_PATHS = (
+    ".github/actions/**",
     ".github/cargo-audit-policy.json",
     ".github/ferrum-edge-checksums.txt",
     ".github/CODEOWNERS",
@@ -2706,13 +2707,14 @@ _INDIRECT_EXPANSION = re.compile(r"\$\{!")
 # runs before a step's own script, or name a file destination GitHub would
 # otherwise supply. `sh` reads ENV and Bash BASH_ENV; Bash imports a
 # `BASH_FUNC_<name>%%` value as a function that shadows the command, and runs
-# PS4 under SHELLOPTS/BASHOPTS xtrace; LD_PRELOAD and LD_LIBRARY_PATH load
-# other code into every dynamically linked program.
+# PS4 under SHELLOPTS/BASHOPTS xtrace; the dynamic loader's `LD_*` variables
+# (LD_PRELOAD, LD_LIBRARY_PATH, LD_AUDIT, ...) load other code into every
+# dynamically linked program, so the whole prefix is refused.
 _ENV_DESTINATION_KEYS = frozenset({
-    "env", "bash_env", "shellopts", "bashopts", "ps4", "ld_preload", "ld_library_path",
+    "env", "bash_env", "shellopts", "bashopts", "ps4",
     "github_output", "github_step_summary", "github_state",
 })
-_ENV_DESTINATION_PREFIXES = ("bash_func_",)
+_ENV_DESTINATION_PREFIXES = ("bash_func_", "ld_")
 _NAMED_GITHUB = re.compile(r"\bgithub\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*", re.IGNORECASE)
 _INDEXED_GITHUB = re.compile(
     r"\bgithub(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_-]*)*\s*\[", re.IGNORECASE
@@ -2725,14 +2727,42 @@ _BUNDLE_SHARD_NAME = re.compile(BUNDLE_SECRET_PREFIX + r"(?:_[1-9][0-9]*)?")
 _GITFORGEOPS_WORD = re.compile(r"(?<![\w.-])gitforgeops(?![\w/\[-])(?!\):)")
 
 
+# Bash ANSI-C quoting spells a character by its code: `$'\x67'itforgeops` is
+# `gitforgeops` and `$'GITHUB_\x45NV'` is `GITHUB_ENV`. In a scalar that uses
+# `$'` at all, every numeric or control escape is decoded wherever it sits.
+# Decoding one that Bash reads literally can only find more names, and a
+# decoded control character becomes U+FFFD, which ends a name and splits no line.
+_ANSI_C_ESCAPE = re.compile(
+    r"\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3})|c(.))",
+    re.DOTALL,
+)
+
+
+def _decode_ansi_c_escape(match: re.Match[str]) -> str:
+    hexadecimal = match.group(1) or match.group(2) or match.group(3)
+    if hexadecimal is not None:
+        code = int(hexadecimal, 16)
+    elif match.group(4) is not None:
+        code = int(match.group(4), 8) & 0xFF
+    else:
+        code = ord(match.group(5)) & 0x1F
+    if code < 0x20 or code == 0x7F or code > 0x10FFFF:
+        return "\ufffd"
+    return chr(code)
+
+
 def _scan_text(text: str) -> str:
     """Casefolded text with quotes, escapes and line continuations removed.
 
-    Bash reads `GITHUB_""ENV`, `GITHUB_E\\NV`, `$'GITHUB_ENV'` and a name split
-    by a backslash-newline as the same word, so every text rule judges this
-    form. A name computed by expansion (`GITHUB_E${x}NV`) is program behavior.
+    Bash reads `GITHUB_""ENV`, `GITHUB_E\\NV`, `$'GITHUB_ENV'`,
+    `$'GITHUB_\\x45NV'` and a name split by a backslash-newline as the same
+    word, so every text rule judges this form. A name computed by expansion
+    (`GITHUB_E${x}NV`) is program behavior.
     """
-    text = text.replace("\\\n", "").replace("$'", "'").replace('$"', '"')
+    text = text.replace("\\\n", "")
+    if "$'" in text:
+        text = _ANSI_C_ESCAPE.sub(_decode_ansi_c_escape, text)
+    text = text.replace("$'", "'").replace('$"', '"')
     return text.translate(str.maketrans("", "", "'\"\\")).casefold()
 
 
@@ -2813,14 +2843,16 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
     """No workflow may write or rebind an env-file channel, except the pinned hand-off.
 
     Every key and scalar of every workflow is judged in `_scan_text` form, and
-    shell comments count: GITHUB_ENV, GITHUB_PATH and BASH_ENV however quoted
-    or escaped, the runner's file-command file names, the
+    shell comments count: GITHUB_ENV, GITHUB_PATH and BASH_ENV through quotes,
+    backslashes, line continuations and ANSI-C escapes (a name computed by
+    expansion is program behavior), the runner's file-command file names, the
     `github.env`/`github.path` contexts, a redirect or `tee` into any
     `$GITHUB_*` file other than GITHUB_OUTPUT and GITHUB_STEP_SUMMARY, any use
     of those two other than as a plain append or `tee -a` target (or the
     summary as a `--summary` argument), and indirect expansion. An `env:`
     mapping may not be computed, nor bind a shell startup or loader variable
-    (`_ENV_DESTINATION_KEYS`, `BASH_FUNC_*`) or a GitHub file destination.
+    (`_ENV_DESTINATION_KEYS`, `BASH_FUNC_*`, `LD_*`) or a GitHub file
+    destination.
     Expressions may reach the `github` context only through named dot
     properties, since an index or a whole-context conversion can compute a
     channel name, and a `run:` interpolation may not adjoin a name character
@@ -2905,7 +2937,7 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
             ):
                 violations.append(
                     f"{label}: binding a shell startup or loader variable (ENV, BASH_ENV, "
-                    "BASH_FUNC_*, SHELLOPTS, BASHOPTS, PS4, LD_PRELOAD, LD_LIBRARY_PATH) "
+                    "BASH_FUNC_*, SHELLOPTS, BASHOPTS, PS4, LD_*) "
                     "or a GitHub file destination is forbidden"
                 )
             if key.casefold() == "env" and not isinstance(value, dict):
@@ -2918,6 +2950,48 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
                 visit(value, f"{path}.{key}", key)
 
     visit(document, "workflow")
+    return violations
+
+
+def container_options_violations(workflow: str, document: dict) -> list[str]:
+    """Job and service containers take no `options:` and are not computed.
+
+    `options` is a `docker create` command line: `-e`, `--env` and
+    `--env-file` bind the startup and loader variables an `env:` mapping may
+    not (`LD_PRELOAD`, `SHELLOPTS`, `PS4`, ...) for every step of a container
+    job, and no other option is needed by any workflow here. A computed
+    container or service mapping could carry the same options unseen.
+    """
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
+        if not isinstance(job, dict):
+            continue
+        containers: list[tuple[str, object]] = []
+        for key, value in job.items():
+            path = f"jobs.{job_name}.{key}"
+            if key.casefold() == "container":
+                containers.append((path, value))
+            elif key.casefold() == "services":
+                if isinstance(value, dict):
+                    containers.extend(
+                        (f"{path}.{name}", service) for name, service in value.items()
+                    )
+                else:
+                    containers.append((path, value))
+        for path, container in containers:
+            if isinstance(container, dict):
+                if any(key.casefold() == "options" for key in container):
+                    violations.append(
+                        f"{workflow}: {path}.options: container options are forbidden; "
+                        "`-e`/`--env`/`--env-file` bind startup and loader variables "
+                        "for every step"
+                    )
+            elif not isinstance(container, str) or "${{" in container:
+                violations.append(
+                    f"{workflow}: {path}: a container or service must be a literal "
+                    "image or mapping, never computed"
+                )
     return violations
 
 
@@ -3260,32 +3334,42 @@ def gitforgeops_scalar_violations(label: str, document, guarded: set[int]) -> li
     runs the script through its command, and an action input can be executed
     by the action. A `run:` line naming the binary must be one of the pinned
     read-only lines; any other scalar may name it only as a pinned display
-    name, which runs nothing.
+    name, which runs nothing. Only the `name:` of the workflow (or local
+    action), a job or a step is a display name; an action input or env value
+    called `name` is not.
     """
     violations: list[str] = []
     read_only = {_scan_text(line) for line in READ_ONLY_GITFORGEOPS_LINES}
     display_names = {_scan_text(name) for name in GITFORGEOPS_DISPLAY_NAMES}
+    titled = [document]
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    titled.extend(jobs.values() if isinstance(jobs, dict) else ())
+    runs = document.get("runs") if isinstance(document, dict) else None
+    for parent in [*titled[1:], runs]:
+        steps = parent.get("steps") if isinstance(parent, dict) else None
+        titled.extend(steps if isinstance(steps, list) else ())
+    titled_ids = {id(node) for node in titled if isinstance(node, dict)}
 
-    def permitted(key: str, scan: str) -> bool:
-        if key == "name" and scan.strip(" \t") in display_names:
+    def permitted(key: str, scan: str, owner: int | None) -> bool:
+        if key == "name" and owner in titled_ids and scan.strip(" \t") in display_names:
             return True
         return key == "run" and all(
             not _GITFORGEOPS_WORD.search(line) or line.strip(" \t") in read_only
             for line in scan.split("\n")
         )
 
-    def visit(node, path: str, key: str = "") -> None:
+    def visit(node, path: str, key: str = "", owner: int | None = None) -> None:
         if isinstance(node, dict):
             if id(node) in guarded:
                 return
             for child, value in node.items():
-                visit(value, f"{path}.{child}", child)
+                visit(value, f"{path}.{child}", child, id(node))
         elif isinstance(node, list):
             for index, item in enumerate(node):
                 visit(item, f"{path}[{index}]", key)
         elif isinstance(node, str):
             scan = _scan_text(node)
-            if _GITFORGEOPS_WORD.search(scan) and not permitted(key, scan):
+            if _GITFORGEOPS_WORD.search(scan) and not permitted(key, scan, owner):
                 violations.append(
                     f"{label}: {path}: mutations may only run in the guarded Apply steps; "
                     "elsewhere gitforgeops may appear only on the pinned envs, validate "
@@ -3392,9 +3476,90 @@ def resolve_local_action(root: Path, reference: str) -> tuple[str, dict | None, 
     return relative, document, None
 
 
+# A local action is judged as the tree carries it, and the runner reads it from
+# the workspace when the step runs. A checkout of another revision over the
+# workspace root before that step would run an action no rule judged. The
+# protected default branch was judged when it merged, so that ref is allowed;
+# any other ref or repository, or a path that may be the root, is not.
+# A `git checkout` in a `run:` script is program behavior, outside these rules.
+JUDGED_CHECKOUT_REFS = ("${{ github.event.repository.default_branch }}",)
+JUDGED_CHECKOUT_REPOSITORIES = ("${{ github.repository }}",)
+# A plain relative path whose components do not start with `.`: never the root,
+# `..`, or a dot directory such as `.github`.
+_CHECKOUT_SUBDIRECTORY = re.compile(
+    r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*/?"
+)
+
+
+def _replaces_workspace(step) -> bool:
+    """Whether a step checks an unjudged revision out over the workspace root."""
+    if not isinstance(step, dict):
+        return False
+    uses = [value for key, value in step.items() if key.casefold() == "uses"]
+    if not any(
+        isinstance(value, str) and value.casefold().startswith("actions/checkout@")
+        for value in uses
+    ):
+        return False
+    inputs = [value for key, value in step.items() if key.casefold() == "with"]
+    if not inputs:
+        return False
+    if len(inputs) != 1 or not isinstance(inputs[0], dict):
+        return True
+
+    def given(name: str) -> list:
+        return [value for key, value in inputs[0].items() if key.casefold() == name]
+
+    paths, refs, repositories = given("path"), given("ref"), given("repository")
+    subdirectory = (
+        len(paths) == 1
+        and isinstance(paths[0], str)
+        and _CHECKOUT_SUBDIRECTORY.fullmatch(paths[0]) is not None
+    )
+    if subdirectory:
+        return False  # The workspace's own actions are untouched.
+    return (
+        len(refs) > 1
+        or len(repositories) > 1
+        or any(ref not in JUDGED_CHECKOUT_REFS for ref in refs)
+        or any(name not in JUDGED_CHECKOUT_REPOSITORIES for name in repositories)
+    )
+
+
+def workspace_checkout_violations(workflow: str, document: dict) -> list[str]:
+    """No job runs a local action after checking out an unjudged revision at the root."""
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        replaced: str | None = None
+        for index, step in enumerate(steps if isinstance(steps, list) else ()):
+            local = isinstance(step, dict) and any(
+                key.casefold() == "uses" and isinstance(value, str) and value.startswith("./")
+                for key, value in step.items()
+            )
+            if local and replaced is not None:
+                violations.append(
+                    f"{workflow}: jobs.{job_name}.steps[{index}]: a local action may not run "
+                    f"after {replaced} checks another revision out over the workspace root; "
+                    "check it out into a subdirectory instead"
+                )
+            if replaced is None and _replaces_workspace(step):
+                replaced = f"jobs.{job_name}.steps[{index}]"
+    return violations
+
+
 def local_action_fence_violations(workflow: str, label: str, action: dict) -> list[str]:
     """The text fences of `workflow`, applied to a local action it runs."""
     violations = workflow_channel_violations(label, action)
+    runs = action.get("runs")
+    steps = runs.get("steps") if isinstance(runs, dict) else None
+    for index, step in enumerate(steps if isinstance(steps, list) else ()):
+        if _replaces_workspace(step):
+            violations.append(
+                f"{label}: runs.steps[{index}]: a local action may not check another "
+                "revision out over the workspace root, where later local actions are read"
+            )
     protected = protected_environment_names(workflow)
     if protected:
         violations.extend(guarded_environment_violations(label, action, (), protected))
@@ -3964,11 +4129,19 @@ def main(argv: list[str] | None = None) -> int:
     for workflow in checked_action_files:
         text = workflow.read_text(encoding="utf-8")
         document = workflow_documents.get(workflow.relative_to(root).as_posix())
-        references = (
-            [reference.strip("'\"") for reference in USES.findall(text)]
-            if document is None
-            else workflow_action_references(document)
-        )
+        if document is not None:
+            references = workflow_action_references(document)
+        else:
+            # A local action: its `uses:` are read from the parsed file, as the
+            # runner reads them, never from a text scan a spelling can evade.
+            try:
+                references = workflow_action_references(parse_workflow(text))
+            except WorkflowSyntaxError as error:
+                references = []
+                violations.append(
+                    f"{workflow.relative_to(root)}: action is outside the YAML subset "
+                    f"the policy reads, so its action pins cannot be read: {error}"
+                )
         action_pins[str(workflow.relative_to(root))] = references
         for reference in references:
             if reference.startswith("./"):
@@ -4037,6 +4210,12 @@ def main(argv: list[str] | None = None) -> int:
                 local_action_violations(
                     root, workflow.relative_to(root).as_posix(), document, local_actions
                 )
+            )
+            violations.extend(
+                workspace_checkout_violations(workflow.relative_to(root).as_posix(), document)
+            )
+            violations.extend(
+                container_options_violations(workflow.relative_to(root).as_posix(), document)
             )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(
@@ -4449,6 +4628,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     for required_pattern in (
         "/.github/workflows/",
+        "/.github/actions/",
         "/.github/scripts/",
         "/.github/ferrum-edge-checksums.txt",
         "/.gitforgeops/",

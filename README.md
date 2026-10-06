@@ -611,6 +611,7 @@ lives in [`.github/scripts/deployment_scope.py`](.github/scripts/deployment_scop
 | `resources/**`, `overlays/**` | the desired gateway configuration |
 | `.gitforgeops/**` | environments, ownership and policy |
 | `src/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain`, `rust-toolchain.toml`, `.cargo/**` | the `gitforgeops` binary the job builds |
+| `.github/actions/**` | local composite actions a step runs |
 | `.github/scripts/**` | helper programs the job runs |
 | `.github/ferrum-edge-checksums.txt` | which validator build is trusted |
 | `.github/workflows/apply-on-merge.yml` | the deployment procedure itself |

@@ -225,6 +225,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Close the remaining supply-chain checker residuals (#493). `env:` mappings may
+  no longer bind any `LD_*` loader variable (`LD_AUDIT` included), and job and
+  service containers may no longer set `options:` (whose `-e`/`--env`/
+  `--env-file` would bind them for every step) or be computed. In a scalar that
+  uses Bash ANSI-C quoting (`$'...'`), numeric and control escapes are decoded
+  before the channel and binary rules read it, so `$'\x67'itforgeops` and
+  `$'GITHUB_\x45NV'` no longer pass. The `apply-on-merge.yml` display-name
+  exemption now covers only the `name:` of the workflow, a job or a step, not an
+  action input or env value called `name`. Every action file under
+  `.github/actions/` must be in the strict YAML subset, and its remote `uses:`
+  are pinned from the parsed file in any key case. No job may run a local action
+  after an `actions/checkout` of another ref or repository over the workspace
+  root, and a local action may not make such a checkout. `.github/actions/**` is
+  now a deployment input, a `security.yml` push path and code-owned, each
+  required by the checker.
 - Close supply-chain checker residuals (#487). A local action (`uses: ./...`)
   is no longer exempt and unread: every local reference must name, by a plain
   path, a composite action under `.github/actions/` with exactly one
