@@ -25,10 +25,10 @@ COPY src/ src/
 COPY .github/scripts/audit_settings.py .github/scripts/audit_settings.py
 RUN cargo build --release --locked
 
-# Debian point-release security update for CVE-2026-103111 (HIGH): the pinned
-# runtime base still carries libpcre2-8-0 10.46-1~deb13u2, while 10.46-1~deb13u3
-# fixes the out-of-bounds write. Pin the .deb by version and SHA-256 from its
-# content-immutable security pool path; never consult a mutable package index
+# Debian point-release security update for CVE-2026-103111 (HIGH): the Trixie
+# package index still lists libpcre2-8-0 10.46-1~deb13u2, while
+# 10.46-1~deb13u3 fixes the out-of-bounds write. Pin the .deb by version and
+# SHA-256 from its content-immutable security pool path; never consult a mutable package index
 # here. The security pool drops a version once a newer update supersedes it;
 # the build then fails closed (404) and the base-image pin canary reports it.
 ARG TARGETARCH
@@ -62,13 +62,11 @@ RUN set -eu; \
 # usable /bin/sh, and several of its code paths shell out — `validate` execs
 # `ferrum-edge`, overrides inspect Git, delivery execs `age`. Trixie matches
 # the glibc of the upstream ferrum-edge image so the copied binary links cleanly.
-# Issue #431: the `debian:trixie-slim` digest still carries
-# libpcre2-8-0 10.46-1~deb13u2, which has CVE-2026-103111. Reintroduce the
-# `runtime-security-updates` stage for this fixed HIGH until a rebuilt
-# `trixie-slim` digest carries libpcre2-8-0 >= 10.46-1~deb13u3; then drop this
-# stage. The .deb is pinned by version and SHA-256 from its immutable pool path.
-# Install it before the purge below. Never `apt-get`.
-FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+# The current Debian Trixie package index still lists libpcre2-8-0
+# 10.46-1~deb13u2 on amd64 and arm64; the reviewed security fix is u3. Keep the
+# exact-version, SHA-256-verified package update until the base's installed
+# package metadata confirms it already carries the fix. Never `apt-get`.
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 # Install only bytes the builder already verified against the reviewed digests.
 COPY --from=builder /opt/runtime-security-updates /tmp/runtime-security-updates
 RUN dpkg --install /tmp/runtime-security-updates/*.deb \

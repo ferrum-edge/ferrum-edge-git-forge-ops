@@ -2,29 +2,24 @@
 """Decide whether the Dockerfile's pinned runtime security packages are still
 needed, still sufficient, and still fetchable.
 
-The runtime stage pins a digest of the Debian base. A temporary
-`runtime-security-updates` builder stage may then install a reviewed set of
-point-release packages by exact version and SHA-256 when that digest predates
-the fixes. The stage is gone once a rebuilt base carries those versions, and it
-has to come back if a later tag reports a fix the digest-pinned base does not
-yet carry. Left to a comment, either change is noticed when a pull request
-turns red, which is how the perl-base and libsqlite3 gap was found.
+The runtime stage pins a digest of the Debian base. It may install reviewed
+point-release packages by exact version and SHA-256 when the digest predates
+the fixes. Trivy findings show when a pin is insufficient, but a clean report
+does not prove the base already carries a pinned package version. Keep such
+pins until the installed package metadata is confirmed. The canary also notices
+when the moving tag reports a fix the digest-pinned base does not carry, or
+when the digest should be refreshed.
 
 This checker reads the Dockerfile as the single source of truth and compares it
 with a Trivy report for the *moving* base tag. Three outcomes:
 
-  retire  the Dockerfile still pins packages, and the current base tag reports
-          no fixed CRITICAL/HIGH vulnerability, so the package stage is
-          redundant and the digest can be bumped to the moving tag
   stale   the base reports a fix this repository does not cover — a newer point
           release than the pinned version, a package that is neither pinned
-          nor purged from the runtime image (including when the stage has
-          already been retired), or a pinned .deb has left the Debian pool,
-          which fails the image build on a 404 that reads like nothing to do
-          with this stage
+          nor purged from the runtime image, or a pinned .deb has left the
+          Debian pool, which fails the image build on a 404
   ok      every reported fix is covered by a pinned package or by one the
-          runtime purges, every pinned .deb is still in the pool, and a
-          retired stage stays retired while the base remains clean
+          runtime purges, every pinned .deb is still in the pool, and no
+          uncovered fixed CRITICAL/HIGH finding remains
 
 Nothing here needs Docker: it consumes a Trivy JSON report produced by the
 canary workflow, so the canary and the `trivy-image` gate judge the same data.
@@ -369,8 +364,6 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
 
     if report.uncovered or report.stale_pins:
         report.state = "stale"
-    elif pin.packages and not findings:
-        report.state = "retire"
     elif not pin.packages and not findings and report.digest_moved:
         report.state = "repin"
     return report
@@ -424,10 +417,9 @@ def check_pool(pin: BasePin, report: Report, *, fetch=head_status) -> None:
 
 
 HEADLINE = {
-    "ok": "The pinned runtime security packages are still required and still sufficient.",
+    "ok": "No uncovered fixed CRITICAL/HIGH base-image findings were reported.",
     "ok-retired": "The digest-pinned runtime base needs no point-release package stage.",
     "repin": "The moving runtime base is clean, but the Dockerfile pins an older digest.",
-    "retire": "The base image has caught up: the pinned package stage can be retired.",
     "stale": "The pinned runtime security packages no longer cover the base image.",
 }
 
@@ -449,21 +441,6 @@ def render(report: Report) -> str:
         else "- The tag still resolves to the pinned digest."
     )
     lines.append("")
-
-    if report.state == "retire":
-        lines += [
-            "The current base tag reports no fixed CRITICAL or HIGH vulnerability, so",
-            "the reviewed point-release packages add nothing the base does not already",
-            "carry. To retire the stage:",
-            "",
-            f"1. Repin the runtime `FROM` to `{report.image}@{report.current_digest}`.",
-            "2. Delete the `runtime-security-updates` builder stage, the `COPY` that",
-            "   carries it into the runtime, and the `dpkg --install` that consumes it.",
-            "3. Keep the `dpkg --purge` step: it removes packages from the base rather",
-            "   than adding any, and the runtime smoke test asserts they stay gone.",
-            "4. Let the `trivy-image` gate confirm the rebuilt image before merging.",
-            "",
-        ]
 
     if report.state == "repin":
         lines += [
@@ -521,10 +498,10 @@ def render(report: Report) -> str:
 
     if report.redundant_pins:
         lines += [
-            "Pinned, but the base reports no fixed CRITICAL or HIGH finding for them.",
-            "That can mean the base already carries the pinned version, or that the",
-            "advisory no longer meets the gate. Confirm against the image before",
-            "dropping a pin; carrying a redundant one is harmless:",
+            "Pinned, but Trivy reports no fixed CRITICAL or HIGH finding for them.",
+            "A clean report does not confirm the installed package version. Check the",
+            "base image's installed package metadata before dropping a pin; carrying",
+            "a redundant one is harmless:",
             "",
         ]
         lines += [f"- {name}" for name in report.redundant_pins] + [""]

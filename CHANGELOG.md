@@ -491,8 +491,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that, until the required check moves to a workflow whose definition comes
   from the protected branch, a green result also depends on reviewing workflow
   changes (GHSA-x5m2-4555-q4cr).
-- Pin libpcre2-8-0 10.46-1~deb13u3 into the runtime image to fix the HIGH
-  CVE-2026-103111 finding while the pinned Debian base remains behind.
+- Repin the Debian Trixie runtime image to the current multi-architecture index.
+  Keep the reviewed libpcre2-8-0 10.46-1~deb13u3 update because the published
+  Trixie package index still lists the pre-fix u2 version; remove it after the
+  base's installed package metadata confirms the fix is already present.
 - Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on
   non-stream proxies and rejects it with `frontend_tls: true`, so GitForgeOps
   does not count their HTTP authenticators. Set `passthrough: false` and
