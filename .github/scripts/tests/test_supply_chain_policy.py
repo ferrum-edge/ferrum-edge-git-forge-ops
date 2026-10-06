@@ -2139,9 +2139,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
             encoding="utf-8"
         )
         job = check_supply_chain.workflow_job(workflow, "security-cargo-audit")
-        self.assertIn("toolchain: 1.98.0", job)
+        self.assertIn("toolchain: 1.99.0", job)
         bumped_job = re.sub(r"@[0-9a-f]{40}", "@" + "a" * 40, job).replace(
-            "toolchain: 1.98.0", "toolchain: 1.99.0"
+            "toolchain: 1.99.0", "toolchain: 1.100.0"
         )
         self.assertNotEqual(bumped_job, job)
         bumped = workflow.replace(job, bumped_job, 1)
@@ -2149,7 +2149,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # Each free part still answers to its own rule.
         self.assertTrue(check_supply_chain.cargo_audit_install_violations(bumped))
         self.assertTrue(
-            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.98.0")
+            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.99.0")
         )
 
     def test_cargo_audit_comment_bypass_is_refused_by_the_trusted_checker(self):
@@ -4851,6 +4851,19 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
         )
 
+    def test_explicit_cargo_toolchains_follow_the_pinned_channel(self):
+        self.assertEqual(
+            check_supply_chain.cargo_toolchain_violations(
+                "alloy-consumer.yml", "cargo +1.99.0 build --locked", "1.99.0"
+            ),
+            [],
+        )
+        self.assertTrue(
+            check_supply_chain.cargo_toolchain_violations(
+                "alloy-consumer.yml", "cargo +1.98.0 build --locked", "1.99.0"
+            )
+        )
+
     def test_rust_toolchain_channel_requires_one_stable_pin(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "rust-toolchain.toml"
@@ -4863,26 +4876,248 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
             self.assertIsNone(check_supply_chain.read_rust_toolchain_channel(path))
 
+    def test_docker_builder_toolchain_must_match_the_channel(self):
+        digest = "a" * 64
+        matching = f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+        mismatched = f"FROM rust:1.98.0-bookworm@sha256:{digest} AS builder\n"
+        self.assertEqual(
+            check_supply_chain.docker_builder_toolchain_violations(matching, "1.99.0"),
+            [],
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            mismatched, "1.99.0"
+        )
+        self.assertTrue(
+            any("must match rust-toolchain.toml channel" in item for item in violations),
+            violations,
+        )
+
+    def test_every_rust_from_stage_must_match_and_builder_must_be_unique(self):
+        digest = "a" * 64
+        dockerfile = (
+            f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+            f"FROM rust:1.98.0-bookworm@sha256:{digest} AS compile\n"
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            dockerfile, "1.99.0"
+        )
+        self.assertTrue(
+            any("every Rust base image" in item for item in violations), violations
+        )
+
+        duplicate_builder = (
+            f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+            f"FROM rust:1.99.0-bookworm@sha256:{digest} AS BUILDER\n"
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            duplicate_builder, "1.99.0"
+        )
+        self.assertTrue(
+            any("exactly one stage named builder" in item for item in violations),
+            violations,
+        )
+
+    def test_docker_physical_from_scan_rejects_decoy_with_wrong_channel(self):
+        digest = "a" * 64
+        dockerfile = (
+            f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+            "RUN echo first \\\n"
+            f"    FROM rust:1.98.0-bookworm@sha256:{digest} AS decoy\n"
+            "FROM debian:stable-slim@sha256:"
+            + digest
+            + "\n"
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            dockerfile, "1.99.0"
+        )
+        self.assertTrue(
+            any("every Rust base image" in item for item in violations), violations
+        )
+
+    def test_docker_b1_double_backslash_does_not_hide_physical_from(self):
+        digest = "a" * 64
+        dockerfile = (
+            f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+            "RUN echo foo\\\\\n"
+            f"FROM rust:1.98.0-bookworm@sha256:{digest} AS compile\n"
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            dockerfile, "1.99.0"
+        )
+        self.assertTrue(violations, violations)
+
+    def test_docker_from_continuations_cannot_hide_rust_channel(self):
+        digest = "a" * 64
+        continued_froms = (
+            "FROM\\\n"
+            f" rust:1.98.0-bookworm@sha256:{digest} AS compile\n",
+            "from\\\n"
+            f" rust:1.98.0-bookworm@sha256:{digest} AS compile\n",
+            "FROM\\ \t\n"
+            f"\trust:1.98.0-bookworm@sha256:{digest} AS compile\n",
+            "FROM\\\n"
+            "  # continued FROM comment\n"
+            f" rust:1.98.0-bookworm@sha256:{digest} AS compile\n",
+        )
+        for continued_from in continued_froms:
+            with self.subTest(continued_from=continued_from):
+                dockerfile = (
+                    f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+                    + continued_from
+                )
+                violations = check_supply_chain.docker_builder_toolchain_violations(
+                    dockerfile, "1.99.0"
+                )
+                self.assertTrue(violations, violations)
+
+    def test_docker_from_backslash_fails_closed_when_physical_match_cannot_parse(self):
+        hidden_unpinned_stage = "FROM\\\n rust:1.98.0-bookworm AS compile\n"
+        self.assertEqual(check_supply_chain.FROM.findall(hidden_unpinned_stage), ["\\"])
+
+        lines = (
+            "FROM\\\n rust:1.99.0-bookworm AS builder\n",
+            "from\\\n rust:1.99.0-bookworm AS builder\n",
+        )
+        for line in lines:
+            with self.subTest(line=line):
+                violations = check_supply_chain.docker_builder_toolchain_violations(
+                    line, "1.99.0"
+                )
+                self.assertTrue(
+                    any("could not parse FROM" in item for item in violations),
+                    violations,
+                )
+
+    def test_docker_b2_rejects_unicode_whitespace_after_escape(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "RUN echo hi \\" + "\u00a0\n"
+            "FROM rust:1.98.0-bookworm AS compile\n"
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
+        )
+
+    def test_docker_b3_rejects_heredoc_marker_in_quoted_label(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            'LABEL note="a <<END b"\n'
+            "FROM rust:1.98.0-bookworm AS compile\n"
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
+        )
+
+    def test_docker_b4_rejects_quoted_heredoc_delimiter(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "RUN <<E\"O\"F\n"
+            "body\n"
+            "EOF\n"
+            "FROM rust:1.98.0-bookworm AS compile\n"
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
+        )
+
+    def test_docker_b5_rejects_heredoc_marker_in_continuation_comment(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "RUN echo first \\\n"
+            "  # <<END\n"
+            f"FROM rust:1.98.0-bookworm@sha256:{'a' * 64} AS compile\n"
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
+        )
+
+    def test_docker_b6_rejects_all_parser_directives(self):
+        dockerfiles = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            " # escape=`\n"
+            "RUN echo x #\\\n"
+            "FROM rust:1.98.0-bookworm AS compile\n",
+            "# syntax=docker/dockerfile:1\n"
+            "FROM rust:1.99.0-bookworm AS builder\n",
+            "# syntax=docker/dockerfile:1\n"
+            "# escape=`\n"
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "RUN echo x #\\\n"
+            "FROM rust:1.98.0-bookworm AS compile\n",
+        )
+        for dockerfile in dockerfiles:
+            with self.subTest(dockerfile=dockerfile):
+                self.assertTrue(
+                    check_supply_chain.docker_builder_toolchain_violations(
+                        dockerfile, "1.99.0"
+                    )
+                )
+
+    def test_docker_b7_rejects_variable_in_from_image(self):
+        dockerfile = (
+            "FROM rust:1.99.0-bookworm AS builder\n"
+            "ARG BASE=rust:1.98.0-bookworm\n"
+            "FROM ${BASE}@sha256:"
+            + "a" * 64
+            + " AS compile\n"
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            dockerfile, "1.99.0"
+        )
+        self.assertTrue(
+            any("could not parse FROM" in item for item in violations), violations
+        )
+
+    def test_docker_toolchain_check_fails_closed_on_unparseable_input(self):
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(
+                "FROM rust:1.99.0-bookworm AS builder \\", "1.99.0"
+            )
+        )
+        self.assertTrue(
+            check_supply_chain.docker_builder_toolchain_violations(
+                "FROM rust:1.99.0-bookworm AS builder extra\n", "1.99.0"
+            )
+        )
+
+    def test_main_rejects_dockerfile_rust_channel_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._mirror_repo(Path(temporary))
+            dockerfile = root / "Dockerfile"
+            text = dockerfile.read_text(encoding="utf-8")
+            changed = text.replace("rust:1.99.0-bookworm", "rust:1.98.0-bookworm", 1)
+            self.assertNotEqual(text, changed)
+            dockerfile.write_text(changed, encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("every Rust base image" in item for item in violations), violations
+        )
+
     def test_main_rejects_invalid_rust_toolchain_files(self):
         invalid_files = {
             "nightly": ('[toolchain]\nchannel = "nightly"\n', None),
-            "missing patch": ('[toolchain]\nchannel = "1.98"\n', None),
+            "missing patch": ('[toolchain]\nchannel = "1.99"\n', None),
             "non-string channel": ('[toolchain]\nchannel = 198\n', None),
-            "leading zero": ('[toolchain]\nchannel = "01.98.0"\n', None),
-            "unicode digits": ('[toolchain]\nchannel = "١.98.0"\n', None),
+            "leading zero": ('[toolchain]\nchannel = "01.99.0"\n', None),
+            "unicode digits": ('[toolchain]\nchannel = "١.99.0"\n', None),
             "duplicate table": (
-                '[toolchain]\nchannel = "1.98.0"\n'
+                '[toolchain]\nchannel = "1.99.0"\n'
                 '[toolchain]\nchannel = "1.99.0"\n',
                 None,
             ),
             "decoy table": (
-                '[toolchain]\nchannel = "nightly"\n'
+                '[toolchain]\nchannel = "1.99.0"\n'
                 '[decoy]\nchannel = "1.98.0"\n',
                 None,
             ),
-            "path key": ('[toolchain]\npath = "../rust"\n', None),
+            "path key": (
+                '[toolchain]\nchannel = "1.99.0"\npath = "../rust"\n', None
+            ),
+            "unknown key": (
+                '[toolchain]\nchannel = "1.99.0"\ncustom = "value"\n', None
+            ),
             "below floor": ('[toolchain]\nchannel = "1.97.9"\n', None),
-            "legacy file": ('[toolchain]\nchannel = "1.98.0"\n', "legacy"),
+            "legacy file": ('[toolchain]\nchannel = "1.99.0"\n', "legacy"),
             "missing file": (None, None),
         }
         for label, (contents, legacy) in invalid_files.items():
@@ -4894,7 +5129,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 else:
                     toolchain.write_text(contents, encoding="utf-8")
                 if legacy is not None:
-                    (root / "rust-toolchain").write_text("1.98.0\n", encoding="utf-8")
+                    (root / "rust-toolchain").write_text("1.99.0\n", encoding="utf-8")
                 violations = self._violations(root)
                 self.assertTrue(
                     any(
@@ -4903,6 +5138,18 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     ),
                     violations,
                 )
+
+    def test_rust_toolchain_floor_violation_names_the_configured_minimum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._mirror_repo(Path(temporary))
+            (root / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "1.98.0"\n', encoding="utf-8"
+            )
+            violations = self._violations(root)
+            self.assertTrue(
+                any("channel at or above 1.99.0" in item for item in violations),
+                violations,
+            )
 
     def test_main_manifest_records_the_parsed_rust_toolchain_channel(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4925,9 +5172,14 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 manifest["rust_toolchain"],
-                check_supply_chain.read_rust_toolchain_channel(
-                    root / "rust-toolchain.toml"
+                "1.99.0",
+            )
+            self.assertTrue(
+                any(
+                    image.startswith(f"rust:{manifest['rust_toolchain']}-")
+                    for image in manifest["docker_bases"]
                 ),
+                manifest["docker_bases"],
             )
 
     def test_rust_ci_runs_the_library_target_unfiltered(self):

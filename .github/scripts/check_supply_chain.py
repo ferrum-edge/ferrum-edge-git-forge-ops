@@ -17,10 +17,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ACTION_SHA = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?@[0-9a-f]{40}$")
 USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
-FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
+FROM = re.compile(r"^FROM\b[ \t]*([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
-MIN_RUST_TOOLCHAIN = (1, 98, 0)
+MIN_RUST_TOOLCHAIN = (1, 99, 0)
 RUST_TOOLCHAIN_CHANNEL = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII
 )
@@ -1335,6 +1335,17 @@ def rust_toolchain_violations(workflow: str, text: str, channel: str) -> list[st
     return []
 
 
+def cargo_toolchain_violations(workflow: str, text: str, channel: str) -> list[str]:
+    """Keep explicit cargo toolchain overrides aligned with the repo channel."""
+    for match in re.finditer(r"\bcargo\s+\+(\d+\.\d+\.\d+)(?=\s|$)", text):
+        if match.group(1) != channel:
+            return [
+                f"{workflow}: explicit cargo toolchain overrides must match "
+                f"rust-toolchain.toml channel {channel}"
+            ]
+    return []
+
+
 def read_rust_toolchain_channel(path: Path) -> str | None:
     """Read the single pinned channel used by workflows and release provenance."""
     if path.with_name("rust-toolchain").exists():
@@ -1357,6 +1368,174 @@ def read_rust_toolchain_channel(path: Path) -> str | None:
     if tuple(int(part) for part in match.groups()) < MIN_RUST_TOOLCHAIN:
         return None
     return channel
+
+
+def dockerfile_instructions(text: str) -> list[str] | None:
+    """Return Dockerfile logical instructions, refusing ambiguous syntax.
+
+    Docker parses continuations before instructions. Ambiguous heredoc and
+    parser-directive syntax is refused rather than interpreted approximately.
+    """
+    # Docker's parser splits only at LF and trims only a CR immediately before
+    # it. Other Unicode and control whitespace can change where its parser sees
+    # continuations, so reject those bytes instead of guessing.
+    forbidden_whitespace = (
+        "\u00a0\u1680"
+        + "".join(chr(codepoint) for codepoint in range(0x2000, 0x2010))
+        + "\u2028\u2029\u202f\u205f\u3000\ufeff\x0b\x0c\x1c\x1d\x1e\x1f\x85"
+    )
+    if any(character in text for character in forbidden_whitespace):
+        return None
+
+    lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+    if "<<" in text:
+        # Heredoc recognition is shell-lexer-sensitive. Dockerfiles in this
+        # repository do not need heredocs, so refuse ambiguous inputs.
+        return None
+    if any(line.endswith("\\\\") for line in lines):
+        return None
+
+    for line in lines:
+        directive = re.match(r"^[ \t]*#[ \t]*(syntax|escape|check)[ \t]*=", line, re.I)
+        if directive is None:
+            continue
+        return None
+
+    instructions: list[str] = []
+    supported_instructions = {
+        "ADD",
+        "ARG",
+        "CMD",
+        "COPY",
+        "ENTRYPOINT",
+        "ENV",
+        "EXPOSE",
+        "FROM",
+        "HEALTHCHECK",
+        "LABEL",
+        "MAINTAINER",
+        "ONBUILD",
+        "RUN",
+        "SHELL",
+        "STOPSIGNAL",
+        "USER",
+        "VOLUME",
+        "WORKDIR",
+    }
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        logical = stripped.rstrip(" \t")
+        while True:
+            if not re.search(r"(?<!\\)\\[ \t]*$|^\\[ \t]*$", logical):
+                break
+            logical = re.sub(r"\\[ \t]*$", "", logical)
+            if index >= len(lines):
+                return None
+            continuation = lines[index]
+            index += 1
+            continuation = continuation.lstrip(" \t")
+            if not continuation or continuation.startswith("#"):
+                continue
+            logical += " " + continuation.rstrip(" \t")
+
+        instruction = re.match(r"^([A-Za-z]+)(?:\s+(.*))?$", logical)
+        if instruction is None or instruction.group(1).upper() not in supported_instructions:
+            return None
+        instructions.append(logical)
+
+    return instructions
+
+
+def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
+    """Require every Rust FROM image and the sole builder stage to use channel."""
+    instructions = dockerfile_instructions(text)
+    if instructions is None:
+        return ["Dockerfile: could not parse Dockerfile instructions"]
+
+    violations: list[str] = []
+    # Independently inspect every physical FROM-looking line. This superset
+    # scan ensures a parser discrepancy cannot hide a real Docker stage.
+    physical_froms = []
+    for physical_line in text.split("\n"):
+        if physical_line.endswith("\r"):
+            physical_line = physical_line[:-1]
+        candidate = physical_line.lstrip(" \t")
+        if re.match(r"^FROM\b", candidate, re.IGNORECASE):
+            physical_froms.append(candidate)
+
+    def check_from(arguments: str) -> tuple[str, str | None] | None:
+        if arguments.endswith("\\"):
+            return None
+        match = re.fullmatch(
+            r"(?:--platform=\S+[ \t]+)?(\S+)(?:[ \t]+AS[ \t]+([A-Za-z0-9_.-]+))?",
+            arguments,
+            re.IGNORECASE,
+        )
+        if match is None or "$" in match.group(1):
+            return None
+        return match.group(1), match.group(2)
+
+    checked_physical_froms: list[tuple[str, str | None]] = []
+    for line in physical_froms:
+        parsed = re.match(r"^FROM[ \t]+(.*)$", line, re.IGNORECASE)
+        checked = check_from(parsed.group(1)) if parsed else None
+        if checked is None:
+            return ["Dockerfile: could not parse FROM instruction"]
+        checked_physical_froms.append(checked)
+
+    checked_logical_froms: list[tuple[str, str | None]] = []
+    builder_count = 0
+    for instruction in instructions:
+        parsed_instruction = re.match(r"^([A-Za-z]+)(?:\s+(.*))?$", instruction)
+        if parsed_instruction is None:
+            return ["Dockerfile: could not parse Dockerfile instructions"]
+        if parsed_instruction.group(1).upper() != "FROM":
+            continue
+        arguments = parsed_instruction.group(2) or ""
+        match = check_from(arguments)
+        if match is None:
+            return ["Dockerfile: could not parse FROM instruction"]
+
+        image, stage_name = match
+        checked_logical_froms.append(match)
+        if stage_name and stage_name.lower() == "builder":
+            builder_count += 1
+
+    builder_uses_rust = False
+    rust_image_found = False
+    # Physical lines can be shell text or heredoc data. They still must not
+    # contain a Rust image on a different channel. Logical instructions are
+    # also checked because a continued FROM can hide its image from the
+    # physical-line scan.
+    for image, stage_name in checked_logical_froms + checked_physical_froms:
+        image_name = image.rsplit("/", 1)[-1]
+        if not (image_name.startswith("rust:") or image_name.startswith("rust@")):
+            continue
+        rust_image_found = True
+        if stage_name and stage_name.lower() == "builder":
+            builder_uses_rust = True
+        tagged = image_name.startswith("rust:")
+        tag_and_digest = image_name[len("rust:") :] if tagged else ""
+        tag = tag_and_digest.split("@", 1)[0]
+        if not tagged or not re.fullmatch(
+            rf"{re.escape(channel)}(?:-[A-Za-z0-9_.-]+)?", tag
+        ):
+            violations.append(
+                "Dockerfile: every Rust base image version must match "
+                f"rust-toolchain.toml channel {channel}"
+            )
+
+    if builder_count != 1:
+        violations.append("Dockerfile: expected exactly one stage named builder")
+    if not rust_image_found or not builder_uses_rust:
+        violations.append("Dockerfile: builder stage must use a Rust base image")
+    return violations
 
 
 def rust_ci_test_scope_violations(text: str) -> list[str]:
@@ -4051,9 +4230,11 @@ def main(argv: list[str] | None = None) -> int:
     toolchain_path = root / "rust-toolchain.toml"
     rust_channel = read_rust_toolchain_channel(toolchain_path)
     if rust_channel is None:
+        minimum_rust_toolchain = ".".join(str(part) for part in MIN_RUST_TOOLCHAIN)
         violations.append(
             "rust-toolchain.toml: expected [toolchain].channel to be a stable "
-            "X.Y.Z channel at or above 1.98.0, with no legacy rust-toolchain file"
+            f"X.Y.Z channel at or above {minimum_rust_toolchain}, "
+            "with no legacy rust-toolchain file"
         )
     candidate_checker = root / ".github" / "scripts" / "check_supply_chain.py"
     if candidate_checker.is_symlink() or not candidate_checker.is_file():
@@ -4083,6 +4264,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         violations.extend(
             rust_toolchain_violations(
+                str(workflow.relative_to(root)), text, rust_channel or "<invalid>"
+            )
+        )
+        violations.extend(
+            cargo_toolchain_violations(
                 str(workflow.relative_to(root)), text, rust_channel or "<invalid>"
             )
         )
@@ -4131,6 +4317,8 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    if rust_channel is not None:
+        violations.extend(docker_builder_toolchain_violations(dockerfile, rust_channel))
     for image in FROM.findall(dockerfile):
         if "@sha256:" not in image:
             violations.append(f"Dockerfile: base image is not digest-pinned: {image}")

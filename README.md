@@ -11,7 +11,7 @@
   <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/security.yml"><img src="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/security.yml/badge.svg?branch=main" alt="Security" /></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/release.yml"><img src="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/release.yml/badge.svg?branch=main" alt="Release" /></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License" /></a>
-  <img src="https://img.shields.io/badge/rust-1.98.0-orange?logo=rust" alt="Rust 1.98.0" />
+  <img src="https://img.shields.io/badge/rust-1.99.0-orange?logo=rust" alt="Rust 1.99.0" />
   <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge-git-forge-ops"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge-git-forge-ops" alt="Docker Pulls" /></a>
 </p>
 
