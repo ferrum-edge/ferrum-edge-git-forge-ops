@@ -11,15 +11,32 @@ name: GitForgeOps Alloy Consumer Qualification
 # validator installer's read-only token is scoped to its own step.
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
     branches: [main]
+    # Everything the consumer test exercises: the CLI load boundary, the
+    # loader and validator hand-off, the checks the load boundary calls, and
+    # the dependency and toolchain inputs that decide how trees are parsed.
     paths:
       - '.github/workflows/alloy-consumer.yml'
       - '.github/ferrum-edge-checksums.txt'
       - 'tests/fixtures/alloy-producer/**'
       - 'tests/unit/companion_schema_tests.rs'
+      - 'tests/unit/mod.rs'
+      - 'tests/unit_tests.rs'
+      - 'src/main.rs'
+      - 'src/cli.rs'
+      - 'src/lib.rs'
+      - 'src/error.rs'
+      - 'src/diagnostics.rs'
       - 'src/config/**'
       - 'src/validate/**'
+      - 'src/apply/**'
+      - 'src/secrets/**'
+      - 'build.rs'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
   schedule:
     - cron: '41 6 * * 1'
   workflow_dispatch:

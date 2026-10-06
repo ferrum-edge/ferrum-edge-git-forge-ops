@@ -22,10 +22,14 @@ The qualification runs in its own workflow,
 required check**: it builds an external repository with crates.io
 dependencies, so the required `validator-pairing` job and
 `gitforgeops-required-static-validation` status stay fast and independent of
-Alloy. It runs on pull requests that change the consumer surface
-(`src/config/**`, `src/validate/**`, the consumer test, the Alloy provenance,
-the validator allowlist or the workflow itself), weekly, and on manual
-dispatch. A red run should block merging a change to that surface by review,
+Alloy. It runs on pull requests that change the consumer surface, weekly, and
+on manual dispatch. The surface is everything the test exercises: the CLI load
+boundary (`src/main.rs`, `src/cli.rs`, `src/lib.rs`, `src/error.rs`,
+`src/diagnostics.rs`), `src/config/**`, `src/validate/**`, the load-boundary
+checks in `src/apply/**` and `src/secrets/**`, the build and dependency inputs
+(`build.rs`, `.cargo/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`),
+the test and its registration, the Alloy provenance, the validator allowlist
+and the workflow itself. A red run should block merging a change to that surface by review,
 not by branch protection.
 
 The workflow installs the validator with the protected default-branch installer
@@ -71,9 +75,26 @@ CLI. It prints SHA-256 hashes of the generated files and verifies validation
 does not rewrite them. Mutated copies cover only refusals that depend on the
 generated shape: an unsupported `h2c` transport and an upstream moved outside
 its proxy's namespace, which Edge rejects as a broken cross-namespace graph.
-Generic loader refusals (unknown kinds and fields, null required values,
-symlinks, forged `api_spec_id` ownership, typoed namespace filters) are covered
-by the ordinary offline unit suite on every Rust change.
+Generic refusals and controls run in the ordinary offline unit suite on every
+Rust change instead:
+
+- `loader_tests.rs`: unknown and null kinds; unknown wrapper, top-level and
+  nested fields, including null-valued unknown keys; null required wrapper and
+  spec fields (proxy `id` and `backend_port`, plugin `plugin_name` and `scope`,
+  upstream target `host`); nullable optional proxy and upstream fields; and
+  symlinks escaping the resource tree.
+- `passthrough_tests.rs`: null-valued nested unknowns stay fatal under both
+  strictness modes, and the unknown-field opt-in keeps a top-level null
+  verbatim through export while refusing a null unknown wrapper.
+- `validator_namespace_tests.rs`: `gitforgeops validate`, `plan`, `export` and
+  file-mode `apply` refuse a repository-authored `api_spec_id` with
+  "admin-generated" before any validator pass or publication. A
+  path-traversing id such as `../escaped` reaches the validator verbatim and
+  its refusal fails validation and blocks publication; GitForgeOps never uses a
+  desired id as a path outside `import`, which refuses such ids itself
+  (`import_tests.rs`).
+- `namespace_filter_guard_tests.rs`: a typoed namespace filter refuses a
+  non-empty tree.
 
 This check qualifies resource consumption only. Alloy's pinned exporter emits
 no Consumers, mesh fragments or credential slots. It does not qualify gateway

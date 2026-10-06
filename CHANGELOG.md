@@ -24,7 +24,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   both original manifest fixtures, and tests strict loading, assembly and real
   Edge validation through the shared runner and CLI. The producer is pinned by
   full commit SHA; mutated generated files cover transport and cross-namespace
-  graph refusals. The required validator-pairing job stays a fast install and
+  graph refusals, while generic loader refusals, nullable controls and the
+  CLI's `api_spec_id` refusal run in the offline unit suite. The required validator-pairing job stays a fast install and
   probe with a 10-minute limit. Validator pins, protected install/probe
   bindings, credential protections and release qualification gates are
   unchanged.

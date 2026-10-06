@@ -115,6 +115,7 @@ keep its schema in one initial baseline; see the
 | `validator-pin-canary.yml` | daily, manual | Reports a stale validator digest pin. |
 | `base-image-pin-canary.yml` | daily, manual | Watches the Docker base image for fixes. |
 | `rust-ci.yml`, `security.yml` | pull request, push | Build, test, lint, dependency audit. |
+| `alloy-consumer.yml` | consumer-surface pull requests, weekly, manual | Non-required Alloy consumer qualification. |
 | `lifecycle.yml` | push, daily, manual | End-to-end acceptance against a real gateway. |
 | `release.yml` | push to `main`, `v*` tag | Publish the container image. |
 | `agent-setup-ci.yml`, `agent-setup-policy.yml` | pull request | Contributor tooling checks. |

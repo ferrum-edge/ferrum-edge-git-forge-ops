@@ -3676,14 +3676,37 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # Runs when the consumer surface changes, weekly and on demand.
         triggers = document["on"]
         self.assertEqual(set(triggers), {"pull_request", "schedule", "workflow_dispatch"})
+        self.assertEqual(
+            check_supply_chain.pull_request_trigger_violations(workflow_path, workflow), []
+        )
         self.assertEqual(triggers["pull_request"]["branches"], ["main"])
-        for path in (
-            workflow_path,
-            "tests/fixtures/alloy-producer/**",
-            "src/config/**",
-            "src/validate/**",
-        ):
-            self.assertIn(path, triggers["pull_request"]["paths"])
+        # Everything the consumer test exercises, compared exactly so a path
+        # cannot be dropped silently.
+        self.assertEqual(
+            triggers["pull_request"]["paths"],
+            [
+                workflow_path,
+                ".github/ferrum-edge-checksums.txt",
+                "tests/fixtures/alloy-producer/**",
+                "tests/unit/companion_schema_tests.rs",
+                "tests/unit/mod.rs",
+                "tests/unit_tests.rs",
+                "src/main.rs",
+                "src/cli.rs",
+                "src/lib.rs",
+                "src/error.rs",
+                "src/diagnostics.rs",
+                "src/config/**",
+                "src/validate/**",
+                "src/apply/**",
+                "src/secrets/**",
+                "build.rs",
+                ".cargo/**",
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+            ],
+        )
         self.assertEqual(len(triggers["schedule"]), 1)
         self.assertIn("cron", triggers["schedule"][0])
 
@@ -3695,6 +3718,10 @@ class SupplyChainPolicyTests(unittest.TestCase):
         for scope in (document, job):
             self.assertNotIn("environment", scope)
             self.assertNotIn("env", scope)
+        # The check is not required, so reviewers rely on its color: no
+        # condition or error tolerance may let it go green without running.
+        self.assertNotIn("if", job)
+        self.assertNotIn("continue-on-error", job)
         self.assertIsNone(check_supply_chain.WHOLE_SECRETS.search(workflow))
         self.assertEqual(check_supply_chain.installer_step_auth_violations(workflow_path, workflow), [])
         self.assertEqual(check_supply_chain.validator_locator_violations([workflow]), [])
@@ -3703,6 +3730,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         steps = {step.get("name"): step for step in job["steps"]}
         installer = "Download verified ferrum-edge validator"
         for step in job["steps"]:
+            self.assertNotIn("if", step)
             self.assertNotIn("continue-on-error", step)
             self.assertNotEqual(step.get("uses", "").split("@", 1)[0], "actions/cache")
             if step.get("uses", "").startswith("actions/checkout@"):
@@ -3770,7 +3798,11 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 ),
             },
         )
-        lines = [line.strip() for line in qualify["run"].splitlines()]
+        # Logical shell lines: continuations joined, whitespace collapsed.
+        lines = [
+            " ".join(line.split())
+            for line in qualify["run"].replace("\\\n", " ").splitlines()
+        ]
         test_name = next(line for line in lines if line.startswith("test_name="))
         self.assertTrue(
             test_name.endswith("::alloy_generated_resources_load_assemble_and_validate")
@@ -3788,14 +3820,52 @@ class SupplyChainPolicyTests(unittest.TestCase):
         self.assertIn("--list", cargo_tests[0])
         self.assertNotIn("--list", cargo_tests[1])
 
-        # Disposable TLS material: claim a fresh directory, clean up on exit,
-        # and only then write keys.
+        # Disposable TLS material: private umask, claim a fresh directory,
+        # clean up every file on exit, and only then write keys.
+        tls_files = [
+            f"/etc/ferrum/{name}"
+            for name in (
+                "edge-client.pem",
+                "edge-client.key",
+                "alloy-ca.pem",
+                "alloy-ca.key",
+                "edge-client.csr",
+            )
+        ]
+        umask = lines.index("umask 077")
+        cleanup = lines.index("cleanup_tls() {")
+        self.assertEqual(
+            lines[cleanup : cleanup + 4],
+            [
+                "cleanup_tls() {",
+                "sudo rm -f -- " + " ".join(tls_files),
+                "sudo rmdir -- /etc/ferrum",
+                "}",
+            ],
+        )
         mkdir = lines.index("sudo mkdir --mode=0700 /etc/ferrum")
         trap = lines.index("trap cleanup_tls EXIT")
-        first_openssl = next(i for i, line in enumerate(lines) if line.startswith("openssl"))
+        chown = lines.index('sudo chown "$(id -u):$(id -g)" /etc/ferrum')
+        openssl = [i for i, line in enumerate(lines) if line.startswith("openssl ")]
+        self.assertEqual(len(openssl), 4)
+        self.assertTrue(all(lines[i].endswith(">/dev/null 2>&1") for i in openssl))
+        self.assertEqual(qualify["run"].count(">/dev/null 2>&1"), 4)
+        chmods = [i for i, line in enumerate(lines) if line.startswith("chmod")]
+        self.assertEqual(len(chmods), 1)
+        chmod = lines[chmods[0]].split()
+        self.assertEqual(chmod[:2], ["chmod", "0600"])
+        self.assertEqual(sorted(chmod[2:]), sorted(tls_files))
+        verify = next(i for i in openssl if lines[i].startswith("openssl verify "))
+        self.assertEqual(verify, openssl[-1])
+        self.assertLess(umask, cleanup)
+        self.assertLess(cleanup, mkdir)
         self.assertLess(mkdir, trap)
-        self.assertLess(trap, first_openssl)
-        self.assertFalse(any(line.startswith("mkdir -p /etc/ferrum") for line in lines))
+        self.assertLess(trap, chown)
+        self.assertLess(chown, openssl[0])
+        self.assertLess(openssl[-2], chmods[0])
+        self.assertLess(chmods[0], verify)
+        self.assertLess(verify, lines.index(test_name))
+        self.assertFalse(any("mkdir -p" in line for line in lines))
 
         order = [step.get("name") for step in job["steps"]]
         self.assertLess(order.index(trusted["name"]), order.index(installer))

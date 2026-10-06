@@ -8,6 +8,7 @@ use gitforgeops::config::{
     apply_overlay, apply_overlay_with_options, assemble, load_resources,
     load_resources_with_options, LoadOptions,
 };
+use gitforgeops::error::Error;
 
 const PROXY_WITH_UNKNOWN_TOP_LEVEL: &str = r#"
 kind: Proxy
@@ -122,6 +123,54 @@ spec:
             error.contains(".spec.circuit_breaker.turbo_trip"),
             "nested unknown must be rejected with its full path under {options:?}; got: {error}"
         );
+    }
+}
+
+#[test]
+fn null_valued_unknown_fields_follow_the_same_policy() {
+    // A null value must neither hide an unknown key nor be dropped from an
+    // opted-in pass-through field.
+    let tmp = tree(&[(
+        "ferrum/upstreams/pool.yaml",
+        "kind: Upstream\nspec:\n  id: pool\n  targets:\n    - host: h\n      port: 80\n      turbo_target: null\n",
+    )]);
+    for options in [LoadOptions::STRICT, LoadOptions::ALLOW_UNKNOWN_FIELDS] {
+        match load_resources_with_options(tmp.path(), options).unwrap_err() {
+            Error::UnknownFields { fields, .. } => {
+                assert_eq!(fields, ".spec.targets[0].turbo_target", "{options:?}");
+            }
+            other => panic!("expected a nested refusal under {options:?}: {other}"),
+        }
+    }
+
+    let proxy = "kind: Proxy\nspec:\n  id: edge\n  listen_path: /edge\n  backend_host: example.test\n  backend_port: 443\n  turbo_mode: null\n";
+    let tmp = tree(&[("ferrum/proxies/edge.yaml", proxy)]);
+    match load_resources(tmp.path()).unwrap_err() {
+        Error::UnknownFields { fields, .. } => assert_eq!(fields, ".spec.turbo_mode"),
+        other => panic!("expected a top-level refusal: {other}"),
+    }
+    let resources =
+        load_resources_with_options(tmp.path(), LoadOptions::ALLOW_UNKNOWN_FIELDS).unwrap();
+    assert_eq!(
+        only_proxy(&resources).passthrough().get("turbo_mode"),
+        Some(&serde_json::Value::Null)
+    );
+    let assembled = assemble(resources).unwrap();
+    let exported = serde_json::to_value(&assembled.gateway.proxies[0]).unwrap();
+    assert_eq!(exported.get("turbo_mode"), Some(&serde_json::Value::Null));
+    let exported = gitforgeops::apply::render_file_yaml(&assembled.gateway).unwrap();
+    assert!(exported.contains("turbo_mode: null"), "{exported}");
+
+    // The opt-in covers top-level spec fields only, never the wrapper.
+    let wrapped = proxy
+        .replacen("  turbo_mode: null\n", "", 1)
+        .replacen("spec:", "turbo_wrapper: null\nspec:", 1);
+    let tmp = tree(&[("ferrum/proxies/edge.yaml", wrapped.as_str())]);
+    let error =
+        load_resources_with_options(tmp.path(), LoadOptions::ALLOW_UNKNOWN_FIELDS).unwrap_err();
+    match error {
+        Error::UnknownFields { fields, .. } => assert_eq!(fields, ".turbo_wrapper"),
+        other => panic!("expected a wrapper refusal: {other}"),
     }
 }
 
