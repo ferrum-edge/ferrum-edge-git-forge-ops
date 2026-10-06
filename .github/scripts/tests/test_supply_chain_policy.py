@@ -2139,9 +2139,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
             encoding="utf-8"
         )
         job = check_supply_chain.workflow_job(workflow, "security-cargo-audit")
-        self.assertIn("toolchain: 1.98.0", job)
+        self.assertIn("toolchain: 1.99.0", job)
         bumped_job = re.sub(r"@[0-9a-f]{40}", "@" + "a" * 40, job).replace(
-            "toolchain: 1.98.0", "toolchain: 1.99.0"
+            "toolchain: 1.99.0", "toolchain: 1.100.0"
         )
         self.assertNotEqual(bumped_job, job)
         bumped = workflow.replace(job, bumped_job, 1)
@@ -2149,7 +2149,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # Each free part still answers to its own rule.
         self.assertTrue(check_supply_chain.cargo_audit_install_violations(bumped))
         self.assertTrue(
-            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.98.0")
+            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.99.0")
         )
 
     def test_cargo_audit_comment_bypass_is_refused_by_the_trusted_checker(self):
@@ -4863,6 +4863,22 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
             self.assertIsNone(check_supply_chain.read_rust_toolchain_channel(path))
 
+    def test_docker_builder_toolchain_must_match_the_channel(self):
+        digest = "a" * 64
+        matching = f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+        mismatched = f"FROM rust:1.98.0-bookworm@sha256:{digest} AS builder\n"
+        self.assertEqual(
+            check_supply_chain.docker_builder_toolchain_violations(matching, "1.99.0"),
+            [],
+        )
+        violations = check_supply_chain.docker_builder_toolchain_violations(
+            mismatched, "1.99.0"
+        )
+        self.assertTrue(
+            any("must match rust-toolchain.toml channel" in item for item in violations),
+            violations,
+        )
+
     def test_main_rejects_invalid_rust_toolchain_files(self):
         invalid_files = {
             "nightly": ('[toolchain]\nchannel = "nightly"\n', None),
@@ -4876,11 +4892,16 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 None,
             ),
             "decoy table": (
-                '[toolchain]\nchannel = "nightly"\n'
+                '[toolchain]\nchannel = "1.99.0"\n'
                 '[decoy]\nchannel = "1.98.0"\n',
                 None,
             ),
-            "path key": ('[toolchain]\npath = "../rust"\n', None),
+            "path key": (
+                '[toolchain]\nchannel = "1.99.0"\npath = "../rust"\n', None
+            ),
+            "unknown key": (
+                '[toolchain]\nchannel = "1.99.0"\ncustom = "value"\n', None
+            ),
             "below floor": ('[toolchain]\nchannel = "1.97.9"\n', None),
             "legacy file": ('[toolchain]\nchannel = "1.98.0"\n', "legacy"),
             "missing file": (None, None),
@@ -4904,6 +4925,18 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     violations,
                 )
 
+    def test_rust_toolchain_floor_violation_names_the_configured_minimum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._mirror_repo(Path(temporary))
+            (root / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "1.98.0"\n', encoding="utf-8"
+            )
+            violations = self._violations(root)
+            self.assertTrue(
+                any("channel at or above 1.99.0" in item for item in violations),
+                violations,
+            )
+
     def test_main_manifest_records_the_parsed_rust_toolchain_channel(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self._mirror_repo(Path(temporary) / "candidate")
@@ -4925,9 +4958,14 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 manifest["rust_toolchain"],
-                check_supply_chain.read_rust_toolchain_channel(
-                    root / "rust-toolchain.toml"
+                "1.99.0",
+            )
+            self.assertTrue(
+                any(
+                    image.startswith(f"rust:{manifest['rust_toolchain']}-")
+                    for image in manifest["docker_bases"]
                 ),
+                manifest["docker_bases"],
             )
 
     def test_rust_ci_runs_the_library_target_unfiltered(self):

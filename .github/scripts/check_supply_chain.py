@@ -20,7 +20,7 @@ USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
 FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
-MIN_RUST_TOOLCHAIN = (1, 98, 0)
+MIN_RUST_TOOLCHAIN = (1, 99, 0)
 RUST_TOOLCHAIN_CHANNEL = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII
 )
@@ -1357,6 +1357,29 @@ def read_rust_toolchain_channel(path: Path) -> str | None:
     if tuple(int(part) for part in match.groups()) < MIN_RUST_TOOLCHAIN:
         return None
     return channel
+
+
+def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
+    """Require the Rust builder image version to match the repository channel."""
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        match = re.match(
+            r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if match is None or (match.group(2) or "").lower() != "builder":
+            continue
+        image = match.group(1)
+        rust_version = re.match(r"^rust:(\d+\.\d+\.\d+)(?:-|@)", image)
+        if rust_version is None or rust_version.group(1) != channel:
+            return [
+                "Dockerfile: builder Rust image version must match "
+                f"rust-toolchain.toml channel {channel}"
+            ]
+        return []
+    return ["Dockerfile: expected a Rust builder stage named builder"]
 
 
 def rust_ci_test_scope_violations(text: str) -> list[str]:
@@ -4051,9 +4074,11 @@ def main(argv: list[str] | None = None) -> int:
     toolchain_path = root / "rust-toolchain.toml"
     rust_channel = read_rust_toolchain_channel(toolchain_path)
     if rust_channel is None:
+        minimum_rust_toolchain = ".".join(str(part) for part in MIN_RUST_TOOLCHAIN)
         violations.append(
             "rust-toolchain.toml: expected [toolchain].channel to be a stable "
-            "X.Y.Z channel at or above 1.98.0, with no legacy rust-toolchain file"
+            f"X.Y.Z channel at or above {minimum_rust_toolchain}, "
+            "with no legacy rust-toolchain file"
         )
     candidate_checker = root / ".github" / "scripts" / "check_supply_chain.py"
     if candidate_checker.is_symlink() or not candidate_checker.is_file():
@@ -4131,6 +4156,8 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    if rust_channel is not None:
+        violations.extend(docker_builder_toolchain_violations(dockerfile, rust_channel))
     for image in FROM.findall(dockerfile):
         if "@sha256:" not in image:
             violations.append(f"Dockerfile: base image is not digest-pinned: {image}")

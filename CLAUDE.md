@@ -166,7 +166,7 @@ cargo fmt --all && cargo fmt --all -- --check
 - Environments with `live_review: false` are removed before the
   Environment-bound matrix; file mode requires it. Fork PRs and new or remapped
   namespaces never enter the privileged live-read boundary.
-- Rust is pinned to 1.98.0 in `rust-toolchain.toml`. External Actions use full
+- Rust is pinned to 1.99.0 in `rust-toolchain.toml`. External Actions use full
   commit SHAs.
 
 ## Architecture
