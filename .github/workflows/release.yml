@@ -65,7 +65,8 @@ jobs:
           pr_file=$(mktemp)
           rules_file=$(mktemp)
           runs_file=$(mktemp)
-          trap 'rm -f "$pulls_file" "$checks_file" "$all_checks_file" "$checks_error_file" "$all_checks_error_file" "$association_file" "$pr_file" "$rules_file" "$runs_file"' EXIT
+          runs_error_file=$(mktemp)
+          trap 'rm -f "$pulls_file" "$checks_file" "$all_checks_file" "$checks_error_file" "$all_checks_error_file" "$association_file" "$pr_file" "$rules_file" "$runs_file" "$runs_error_file"' EXIT
 
           deadline=$(( $(date +%s) + 900 ))
           remaining_budget() {
@@ -231,21 +232,25 @@ jobs:
             run_read=0
             for run_attempt in 1 2; do
               : > "$runs_file"
-              : > "$checks_error_file"
+              : > "$runs_error_file"
               status=0
               timeout --kill-after=5s "$(remaining_budget)s" \
                 gh api "repos/${REPO}/commits/${expected_head}/check-runs?per_page=100&filter=all" \
-                --paginate --slurp > "$runs_file" 2> "$checks_error_file" || status=$?
+                --paginate --slurp > "$runs_file" 2> "$runs_error_file" || status=$?
               if [ "$status" -eq 0 ]; then
                 run_read=1
                 break
               fi
               if [ "$run_attempt" -eq 1 ] &&
-                  grep -Eq 'HTTP 5[0-9][0-9]' "$checks_error_file"; then
+                  grep -Eq 'HTTP 5[0-9][0-9]' "$runs_error_file"; then
                 echo "Same-head check-run API returned a transient HTTP 5xx; retrying once." >&2
+                # Back off briefly, never past the shared sampling budget.
+                retry_delay=$(remaining_budget) || exit 1
+                if [ "$retry_delay" -gt 2 ]; then retry_delay=2; fi
+                sleep "$retry_delay"
                 continue
               fi
-              cat "$checks_error_file" >&2
+              cat "$runs_error_file" >&2
               break
             done
             [ "$run_read" -eq 1 ] || {
@@ -337,34 +342,38 @@ jobs:
                 # must account for it before selecting any newest result.
                 | ($runs[0] | map(.total_count) | unique) as $counts
                 | ($history | group_by(.id)) as $identities
+                # A race repeats or drops records across pages: wait for a
+                # consistent sample before judging any record in this one.
                 | if ($counts | length) != 1 then
                     "wait"
-                  elif ($identities | any(.[]; (unique | length) != 1)) then
-                    error("conflicting check-run identities")
-                  elif ($identities | any(.[]; length != 1)) then
-                    error("duplicate check-run identities")
-                  elif ($identities | length) != $counts[0] then
-                    error("incomplete check-run evidence")
-                  else . end
-                | ($watched | map(. as $setting |
-                    ($history | map(select(.name == $setting.name and .app.id == $setting.app))
-                      | if length == 0 then null else max_by(.id) end) as $latest
-                    | {name, app, latest: $latest}
-                  )) as $latest
-                | ($checks + ($reported | map(select(.context as $context | ($required + $accepted | index($context)) != null)))) as $guarded
-                # Runs may arrive after an empty CLI sample. They still cannot
-                # authorize it: an empty lookup must be sampled again.
-                | if any($guarded[]; .bucket != "pass" and .bucket != "pending") or
-                    any($latest[]; .latest != null and .latest.status == "completed" and .latest.conclusion != "success") then
-                    error("required or transitional check failed, was cancelled or skipped")
-                  elif $required_missing != "" or $all_missing != "" or
-                    any($checks[]; .bucket == "pending") or
-                    ($required_contexts | any(. as $wanted | all($checks[]; .context != $wanted))) or
-                    any($guarded[]; .bucket == "pending") or
-                    any($latest[]; (. as $check | ($settings | any(.name == $check.name and .app == $check.app))) and .latest == null) or
-                    any($latest[]; .latest != null and .latest.status != "completed") then
-                    "wait"
-                  else "pass" end
+                  else
+                    if ($identities | any(.[]; (unique | length) != 1)) then
+                      error("conflicting check-run identities")
+                    elif ($identities | any(.[]; length != 1)) then
+                      error("duplicate check-run identities")
+                    elif ($identities | length) != $counts[0] then
+                      error("incomplete check-run evidence")
+                    else . end
+                  | ($watched | map(. as $setting |
+                      ($history | map(select(.name == $setting.name and .app.id == $setting.app))
+                        | if length == 0 then null else max_by(.id) end) as $latest
+                      | {name, app, latest: $latest}
+                    )) as $latest
+                  | ($checks + ($reported | map(select(.context as $context | ($required + $accepted | index($context)) != null)))) as $guarded
+                  # Runs may arrive after an empty CLI sample. They still cannot
+                  # authorize it: an empty lookup must be sampled again.
+                  | if any($guarded[]; .bucket != "pass" and .bucket != "pending") or
+                      any($latest[]; .latest != null and .latest.status == "completed" and .latest.conclusion != "success") then
+                      error("required or transitional check failed, was cancelled or skipped")
+                    elif $required_missing != "" or $all_missing != "" or
+                      any($checks[]; .bucket == "pending") or
+                      ($required_contexts | any(. as $wanted | all($checks[]; .context != $wanted))) or
+                      any($guarded[]; .bucket == "pending") or
+                      any($latest[]; (. as $check | ($settings | any(.name == $check.name and .app == $check.app))) and .latest == null) or
+                      any($latest[]; .latest != null and .latest.status != "completed") then
+                      "wait"
+                    else "pass" end
+                  end
               end
             ' "$checks_file") || {
               echo "::error::The merged PR lacks successful launch-required checks or has an unsuccessful transitional check or invalid check response."
@@ -378,6 +387,8 @@ jobs:
               echo "::error::Merged PR #${pr} changed while its checks were sampled."
               exit 1
             }
+            # The identity read spends budget too: no pass after the deadline.
+            remaining=$(remaining_budget) || exit 1
             if [ "$verdict" = pass ]; then
               echo "Merged PR #${pr} has successful source-bound checks on ${expected_head}."
               break
