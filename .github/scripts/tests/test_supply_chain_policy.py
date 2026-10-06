@@ -4946,6 +4946,48 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
         self.assertTrue(violations, violations)
 
+    def test_docker_from_continuations_cannot_hide_rust_channel(self):
+        digest = "a" * 64
+        continued_froms = (
+            "FROM\\\n"
+            f" rust:1.98.0-bookworm@sha256:{digest} AS compile\n",
+            "from\\\n"
+            f" rust:1.98.0-bookworm@sha256:{digest} AS compile\n",
+            "FROM\\ \t\n"
+            f"\trust:1.98.0-bookworm@sha256:{digest} AS compile\n",
+            "FROM\\\n"
+            "  # continued FROM comment\n"
+            f" rust:1.98.0-bookworm@sha256:{digest} AS compile\n",
+        )
+        for continued_from in continued_froms:
+            with self.subTest(continued_from=continued_from):
+                dockerfile = (
+                    f"FROM rust:1.99.0-bookworm@sha256:{digest} AS builder\n"
+                    + continued_from
+                )
+                violations = check_supply_chain.docker_builder_toolchain_violations(
+                    dockerfile, "1.99.0"
+                )
+                self.assertTrue(violations, violations)
+
+    def test_docker_from_backslash_fails_closed_when_physical_match_cannot_parse(self):
+        hidden_unpinned_stage = "FROM\\\n rust:1.98.0-bookworm AS compile\n"
+        self.assertEqual(check_supply_chain.FROM.findall(hidden_unpinned_stage), ["\\"])
+
+        lines = (
+            "FROM\\\n rust:1.99.0-bookworm AS builder\n",
+            "from\\\n rust:1.99.0-bookworm AS builder\n",
+        )
+        for line in lines:
+            with self.subTest(line=line):
+                violations = check_supply_chain.docker_builder_toolchain_violations(
+                    line, "1.99.0"
+                )
+                self.assertTrue(
+                    any("could not parse FROM" in item for item in violations),
+                    violations,
+                )
+
     def test_docker_b2_rejects_unicode_whitespace_after_escape(self):
         dockerfile = (
             "FROM rust:1.99.0-bookworm AS builder\n"
@@ -4989,12 +5031,14 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             check_supply_chain.docker_builder_toolchain_violations(dockerfile, "1.99.0")
         )
 
-    def test_docker_b6_rejects_escape_parser_directive_outside_allowed_position(self):
+    def test_docker_b6_rejects_all_parser_directives(self):
         dockerfiles = (
             "FROM rust:1.99.0-bookworm AS builder\n"
             " # escape=`\n"
             "RUN echo x #\\\n"
             "FROM rust:1.98.0-bookworm AS compile\n",
+            "# syntax=docker/dockerfile:1\n"
+            "FROM rust:1.99.0-bookworm AS builder\n",
             "# syntax=docker/dockerfile:1\n"
             "# escape=`\n"
             "FROM rust:1.99.0-bookworm AS builder\n"

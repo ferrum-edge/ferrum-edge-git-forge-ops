@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ACTION_SHA = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?@[0-9a-f]{40}$")
 USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
-FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
+FROM = re.compile(r"^FROM\b[ \t]*([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
 MIN_RUST_TOOLCHAIN = (1, 99, 0)
@@ -1395,12 +1395,11 @@ def dockerfile_instructions(text: str) -> list[str] | None:
     if any(line.endswith("\\\\") for line in lines):
         return None
 
-    for line_number, line in enumerate(lines):
+    for line in lines:
         directive = re.match(r"^[ \t]*#[ \t]*(syntax|escape|check)[ \t]*=", line, re.I)
         if directive is None:
             continue
-        if line_number != 0 or not re.match(r"^#[ \t]*syntax[ \t]*=\S", line, re.I):
-            return None
+        return None
 
     instructions: list[str] = []
     supported_instructions = {
@@ -1467,7 +1466,7 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
         if physical_line.endswith("\r"):
             physical_line = physical_line[:-1]
         candidate = physical_line.lstrip(" \t")
-        if re.match(r"^FROM(?:[ \t]+|$)", candidate, re.IGNORECASE):
+        if re.match(r"^FROM\b", candidate, re.IGNORECASE):
             physical_froms.append(candidate)
 
     def check_from(arguments: str) -> tuple[str, str | None] | None:
@@ -1490,9 +1489,8 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
             return ["Dockerfile: could not parse FROM instruction"]
         checked_physical_froms.append(checked)
 
+    checked_logical_froms: list[tuple[str, str | None]] = []
     builder_count = 0
-    builder_uses_rust = False
-    rust_image_found = False
     for instruction in instructions:
         parsed_instruction = re.match(r"^([A-Za-z]+)(?:\s+(.*))?$", instruction)
         if parsed_instruction is None:
@@ -1505,12 +1503,17 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
             return ["Dockerfile: could not parse FROM instruction"]
 
         image, stage_name = match
+        checked_logical_froms.append(match)
         if stage_name and stage_name.lower() == "builder":
             builder_count += 1
 
+    builder_uses_rust = False
+    rust_image_found = False
     # Physical lines can be shell text or heredoc data. They still must not
-    # contain a Rust image on a different channel.
-    for image, stage_name in checked_physical_froms:
+    # contain a Rust image on a different channel. Logical instructions are
+    # also checked because a continued FROM can hide its image from the
+    # physical-line scan.
+    for image, stage_name in checked_logical_froms + checked_physical_froms:
         image_name = image.rsplit("/", 1)[-1]
         if not (image_name.startswith("rust:") or image_name.startswith("rust@")):
             continue
