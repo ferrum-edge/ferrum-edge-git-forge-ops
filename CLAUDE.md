@@ -136,6 +136,10 @@ cargo fmt --all && cargo fmt --all -- --check
 - Unit tests never read the customer-owned `resources/` tree. Shipped-example
   checks use `tests/fixtures/shipped-examples/`.
 - Resource-only PRs skip the Rust steps and run secretless `validate-pr.yml`.
+- `alloy-consumer.yml` is **not** required: it builds the pinned external Alloy
+  producer and runs the ignored consumer test on PRs touching the consumer
+  surface, weekly and on dispatch. Keep it out of `validator-pairing`, which
+  stays a 10-minute install-and-probe job.
 - `supply-chain-policy.yml` (`pull_request_target`, so its definition comes
   from the protected branch) reports `trusted-supply-chain-policy`. It checks
   the PR head out into `candidate/` as data and runs only `python3 -I

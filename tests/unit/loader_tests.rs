@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use gitforgeops::config::{load_resources, schema::Resource};
+use gitforgeops::config::schema::{BackendScheme, Resource};
+use gitforgeops::config::{assemble, load_resources};
+use gitforgeops::error::Error;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/simple-config")
@@ -266,6 +268,112 @@ fn loader_rejects_unknown_wrapper_and_resource_fields_with_file_and_path() {
         assert!(error.contains(&path.display().to_string()), "{error}");
         assert!(error.contains(expected), "expected {expected}: {error}");
     }
+}
+
+#[test]
+fn loader_rejects_unknown_or_null_kinds_and_null_required_fields() {
+    let proxy = minimal_proxy("");
+    for (body, expected) in [
+        (
+            proxy.replacen("kind: Proxy", "kind: FutureService", 1),
+            "unknown resource kind",
+        ),
+        (
+            proxy.replacen("kind: Proxy", "kind: null", 1),
+            "missing 'kind'",
+        ),
+        (
+            "kind: Proxy\nspec: null\n".to_string(),
+            "invalid resource spec",
+        ),
+        (
+            proxy.replacen("id: api", "id: null", 1),
+            "invalid resource spec",
+        ),
+        (
+            proxy.replacen("backend_port: 80", "backend_port: null", 1),
+            "invalid resource spec",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(tmp.path(), "proxies", "api.yaml", &body);
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains(expected), "expected {expected}: {error}");
+    }
+}
+
+#[test]
+fn loader_rejects_unknown_keys_even_when_their_value_is_null() {
+    // A null value must not make an unknown key look absent.
+    for (body, expected) in [
+        (
+            format!("{}future_wrapper: null\n", minimal_proxy("")),
+            ".future_wrapper",
+        ),
+        (
+            minimal_proxy("  future_spec_field: null\n"),
+            ".spec.future_spec_field",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(tmp.path(), "proxies", "api.yaml", &body);
+        match load_resources(tmp.path()).unwrap_err() {
+            Error::UnknownFields { fields, .. } => assert_eq!(fields, expected),
+            other => panic!("expected an unknown-field refusal for {expected}: {other}"),
+        }
+    }
+}
+
+#[test]
+fn loader_rejects_null_required_plugin_and_upstream_target_fields() {
+    let plugin = "kind: PluginConfig\nspec:\n  id: cid\n  plugin_name: cid\n  scope: global\n";
+    let upstream = "kind: Upstream\nspec:\n  id: up\n  targets:\n    - host: h\n      port: 80\n";
+    for (subdir, body) in [("plugins", plugin), ("upstreams", upstream)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(tmp.path(), subdir, "resource.yaml", body);
+        load_resources(tmp.path()).expect("the unmodified control loads");
+    }
+    for (subdir, control, from, to) in [
+        ("plugins", plugin, "plugin_name: cid", "plugin_name: null"),
+        ("plugins", plugin, "scope: global", "scope: null"),
+        ("upstreams", upstream, "host: h", "host: null"),
+    ] {
+        let body = control.replacen(from, to, 1);
+        assert_ne!(body, control);
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(tmp.path(), subdir, "resource.yaml", &body);
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("invalid resource spec"), "{body}: {error}");
+    }
+}
+
+#[test]
+fn loader_treats_null_optional_fields_as_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_resource(
+        tmp.path(),
+        "proxies",
+        "api.yaml",
+        "kind: Proxy\nspec:\n  id: api\n  name: null\n  listen_path: /api\n  backend_scheme: null\n  backend_host: h\n  backend_port: 80\n  backend_path: null\n  circuit_breaker: null\n",
+    );
+    write_resource(
+        tmp.path(),
+        "upstreams",
+        "pool.yaml",
+        "kind: Upstream\nspec:\n  id: pool\n  targets:\n    - host: h\n      port: 80\n      path: null\n  health_checks:\n    passive: null\n",
+    );
+    let assembled = assemble(load_resources(tmp.path()).unwrap()).unwrap();
+    let proxy = &assembled.gateway.proxies[0];
+    assert!(proxy.name.is_none());
+    // An omitted scheme assembles to https on a non-stream proxy, as Edge
+    // stores it.
+    assert_eq!(proxy.backend_scheme, Some(BackendScheme::Https));
+    assert!(proxy.backend_path.is_none());
+    assert!(proxy.circuit_breaker.is_none());
+    let upstream = &assembled.gateway.upstreams[0];
+    assert!(upstream.targets[0].path.is_none());
+    let health_checks = upstream.health_checks.as_ref().unwrap();
+    assert!(health_checks.passive.is_none());
 }
 
 #[test]

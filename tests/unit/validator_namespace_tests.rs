@@ -535,6 +535,70 @@ fn namespace_labels_do_not_change_annotation_severity() {
     );
 }
 
+/// `api_spec_id` is admin-generated. The shared load boundary refuses a
+/// repository-authored tag before any validator pass or publication.
+#[test]
+fn repository_authored_spec_ownership_is_refused_at_the_shared_load_boundary() {
+    let repo = Repo::new(&["alpha"], None, None);
+    repo.write(
+        "resources/alpha/proxies/app.yaml",
+        "kind: Proxy\nspec:\n  id: app\n  listen_path: /contract\n  backend_scheme: http\n  backend_host: 127.0.0.1\n  backend_port: 9101\n  api_spec_id: forged-spec-owner\n",
+    );
+    for args in [
+        &["validate", "--format", "json"][..],
+        &["plan", "--format", "json"],
+        &["export"],
+        &["apply", "--auto-approve"],
+    ] {
+        let output = repo.run(args, &[]);
+        let text = output_text(&output);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {text}");
+        assert!(text.contains("admin-generated"), "{args:?}: {text}");
+        assert_eq!(
+            std::fs::read_to_string(repo.dir.path().join("calls")).unwrap(),
+            "",
+            "{args:?}: {text}"
+        );
+        assert!(!repo.published().exists(), "{args:?}: {text}");
+    }
+}
+
+/// Outside import, GitForgeOps never turns a desired id into a filesystem
+/// path; whether an id is acceptable is Edge's decision. A path-traversing id
+/// therefore reaches the validator verbatim, and its refusal fails validation
+/// and blocks file publication.
+#[test]
+fn path_traversing_ids_reach_the_validator_verbatim_and_block_publication() {
+    let repo = Repo::new(&[], None, None);
+    repo.write(
+        "validator",
+        "#!/bin/sh\nset -eu\n[ \"$3\" = file ] || exit 0\ncp \"$7\" \"$(dirname \"$0\")/validated.yaml\"\necho 'error: invalid proxy id' >&2\nexit 1\n",
+    );
+    repo.write(
+        "resources/alpha/proxies/escaped.yaml",
+        "kind: Proxy\nspec:\n  id: ../escaped\n  listen_path: /escaped\n  backend_scheme: http\n  backend_host: 127.0.0.1\n  backend_port: 9101\n",
+    );
+    let validated = repo.dir.path().join("validated.yaml");
+    for args in [
+        &["validate", "--format", "json"][..],
+        &["apply", "--auto-approve"],
+    ] {
+        let output = repo.run(args, &[]);
+        let text = output_text(&output);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {text}");
+        assert!(text.contains("invalid proxy id"), "{args:?}: {text}");
+        assert!(!repo.published().exists(), "{args:?}: {text}");
+        let document = std::fs::read_to_string(&validated).unwrap();
+        let document: serde_yaml::Value = serde_yaml::from_str(&document).unwrap();
+        assert_eq!(
+            document["proxies"][0]["id"],
+            serde_yaml::Value::from("../escaped"),
+            "{args:?}"
+        );
+        std::fs::remove_file(&validated).unwrap();
+    }
+}
+
 fn real_validator() -> Option<PathBuf> {
     let Some(binary) = std::env::var_os("GITFORGEOPS_TEST_EDGE_BINARY") else {
         eprintln!("skipping real Edge contract: GITFORGEOPS_TEST_EDGE_BINARY is unset");

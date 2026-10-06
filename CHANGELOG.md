@@ -19,13 +19,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
   resource trees ([Alloy #27](https://github.com/ferrum-edge/ferrum-alloy/issues/27)).
-  The existing required validator-pairing job builds the immutable producer,
-  generates both original manifest fixtures, and tests strict loading,
-  assembly and real Edge validation through the shared runner and CLI.
-  Provenance and input/source hashes are recorded; mutated generated files
-  cover strictness, namespace, transport, path and ownership refusals.
-  Validator pins, protected install/probe bindings, credential protections
-  and release qualification gates are unchanged.
+  The non-required `alloy-consumer.yml` workflow (consumer-surface pull
+  requests, weekly and on demand) builds the immutable producer, generates
+  both original manifest fixtures, and tests strict loading, assembly and real
+  Edge validation through the shared runner and CLI. The producer is pinned by
+  full commit SHA; mutated generated files cover transport and cross-namespace
+  graph refusals, while generic loader refusals, nullable controls and the
+  CLI's `api_spec_id` refusal run in the offline unit suite. The required validator-pairing job stays a fast install and
+  probe with a 10-minute limit. Validator pins, protected install/probe
+  bindings, credential protections and release qualification gates are
+  unchanged.
 - Support the per-proxy `allow_path_parameters` option for HTTP-family routes
   and preserve the mesh service opt-in through mesh configuration output.
 - Scheduled drift monitoring binds only `FERRUM_ADMIN_JWT_VIEWER_SECRET`,

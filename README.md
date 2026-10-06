@@ -115,6 +115,7 @@ keep its schema in one initial baseline; see the
 | `validator-pin-canary.yml` | daily, manual | Reports a stale validator digest pin. |
 | `base-image-pin-canary.yml` | daily, manual | Watches the Docker base image for fixes. |
 | `rust-ci.yml`, `security.yml` | pull request, push | Build, test, lint, dependency audit. |
+| `alloy-consumer.yml` | consumer-surface pull requests, weekly, manual | Non-required Alloy consumer qualification. |
 | `lifecycle.yml` | push, daily, manual | End-to-end acceptance against a real gateway. |
 | `release.yml` | push to `main`, `v*` tag | Publish the container image. |
 | `agent-setup-ci.yml`, `agent-setup-policy.yml` | pull request | Contributor tooling checks. |
@@ -333,11 +334,12 @@ These files are pinned to `contracts-edge-0.9.12` in
 See the [contracts guide](docs/contracts.md) for the pin and conformance checks.
 Change shared contracts in ferrum-contracts first, then re-vendor them here; never edit shared copies locally.
 
-Alloy's `edge export --format gitforgeops` resource trees are covered by a
-consumer check in the existing hosted validator-pairing job. It generates both
-original manifest fixtures with an immutable producer checkout, loads and
-assembles the output under default strictness, and runs GitForgeOps validation
-with the allowlisted Edge binary. See the [Alloy consumer guide](docs/alloy-consumer.md)
+Alloy's `edge export --format gitforgeops` resource trees are covered by the
+non-required hosted `alloy-consumer.yml` workflow, which runs on consumer-surface
+changes, weekly and on demand. It generates both original manifest fixtures
+with an immutable producer checkout, loads and assembles the output under
+default strictness, and runs GitForgeOps validation with the allowlisted Edge
+binary. See the [Alloy consumer guide](docs/alloy-consumer.md)
 for producer provenance, negative cases and qualification limits.
 
 ## Repo configuration: `.gitforgeops/config.yaml`
