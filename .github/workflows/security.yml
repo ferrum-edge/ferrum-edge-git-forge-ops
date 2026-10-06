@@ -24,6 +24,7 @@ on:
       - 'rust-toolchain'
       - 'Dockerfile'
       - '.github/workflows/**'
+      - '.github/actions/**'
       - '.github/scripts/**'
       - '.github/dependabot.yml'
       - '.github/cargo-audit-policy.json'

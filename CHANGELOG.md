@@ -225,6 +225,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Close the remaining supply-chain checker residuals (#493). `env:` mappings may
+  no longer bind any `LD_*` loader variable (`LD_AUDIT` included), and job and
+  service containers may no longer set `options:` (whose `-e`/`--env`/
+  `--env-file` would bind them for every step) or be computed, and their images
+  must be pinned by `@sha256:` digest. Bash ANSI-C quoting (`$'...'`) is refused
+  in every workflow scalar and reached local action, because it spells names by
+  character code (`$'\x67'itforgeops`, `$'GITHUB_\x45NV'`) that no text rule
+  decodes; escapes elsewhere are still stripped, so `GITH\UB_ENV` reads as
+  `GITHUB_ENV`. `GITHUB_STATE` is refused anywhere, like `GITHUB_ENV`. The
+  `apply-on-merge.yml` display-name exemption now covers only the `name:` of the
+  workflow, a job or a step, not an action input or env value called `name`.
+  Every action file under `.github/actions/` must be in the strict YAML subset,
+  and its remote `uses:` are pinned from the parsed file in any key case. No job
+  may run a local action after an `actions/checkout` of another ref or
+  repository over the workspace root, and a local action may not make such a
+  checkout. `.github/actions/**` is now a deployment input, a `security.yml`
+  push path and code-owned, each required by the checker.
 - Close supply-chain checker residuals (#487). A local action (`uses: ./...`)
   is no longer exempt and unread: every local reference must name, by a plain
   path, a composite action under `.github/actions/` with exactly one

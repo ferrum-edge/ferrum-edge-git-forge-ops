@@ -855,11 +855,13 @@ Consumer plus every labelled Consumer, names only
   plus `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` in Validate and live review.
   A protected name anywhere else (workflow/job env, other steps, `with:`, any
   script or comment) is refused. `workflow_channel_violations` bans
-  `GITHUB_ENV`, `GITHUB_PATH`, `BASH_ENV`, the runner's file-command file
-  names (`set_env_`, `add_path_`, `save_state_`, `_runner_file_commands`),
-  indirect expansion, computed env maps, shell startup and loader env keys
-  (`ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `LD_PRELOAD`,
-  `LD_LIBRARY_PATH`) and writes to other GitHub file channels in every
+  `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STATE`, `BASH_ENV`, the runner's
+  file-command file names (`set_env_`, `add_path_`, `save_state_`,
+  `_runner_file_commands`), indirect expansion, ANSI-C quoting (any `$'`; no
+  rule decodes escapes, they are only stripped), computed env maps, shell
+  startup and loader env keys (`ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`,
+  `PS4`, `LD_*`), container and service `options:`, container images not
+  pinned by `@sha256:` digest, and writes to other GitHub file channels in every
   workflow, and allows `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY`
   only as a plain `>>` or `tee -a` target (or the summary as `--summary`); the
   bundle loader's credential-file hand-off, pinned line for line, is the only
@@ -868,9 +870,10 @@ Consumer plus every labelled Consumer, names only
   producing step's lines). `local_action_violations` refuses any `uses: ./`
   reference that is not a parseable composite action under `.github/actions/`
   (local reusable workflows included) and judges each one a workflow reaches
-  by that workflow's fences. These are text rules (#476): a program a step
-  runs can still write `$GITHUB_ENV`, and review of every workflow change
-  covers that.
+  by that workflow's fences; `workspace_checkout_violations` refuses a local
+  action after a root checkout of another revision. These are text rules
+  (#476): a program a step runs can still write `$GITHUB_ENV`, and review of
+  every workflow change covers that.
 - Only an ad-hoc `FERRUM_NAMESPACE` (not `namespace_filter_is_environment_scope`)
   makes an out-of-scope slot `OutsideNamespaceScope`, which does not refuse.
   Under the environment's own scope it is `NotAConsumerSecret`, as at verify.

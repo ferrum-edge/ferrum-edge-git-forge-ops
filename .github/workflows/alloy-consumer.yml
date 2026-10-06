@@ -144,6 +144,6 @@ jobs:
           # `cargo test` builds the gitforgeops binary the test invokes.
           test_name=unit::companion_schema_tests::alloy_generated_resources_load_assemble_and_validate
           listed=$(cargo test --locked --test unit_tests "$test_name" -- --ignored --exact --list --format terse)
-          [ "$(grep -c ': test$' <<< "$listed")" -eq 1 ]
+          [ "$(grep -cx '.*: test' <<< "$listed")" -eq 1 ]
           grep -Fxq "$test_name: test" <<< "$listed"
           cargo test --locked --test unit_tests "$test_name" -- --ignored --exact --nocapture
