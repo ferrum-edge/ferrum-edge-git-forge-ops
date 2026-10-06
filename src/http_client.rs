@@ -623,17 +623,7 @@ impl AdminClient {
             {
                 return Err(conditional::invalid());
             }
-            let is_consumer_not_found =
-                conditional::parse_sensitive(&resp.body)
-                    .ok()
-                    .is_some_and(|value| {
-                        value.as_object().is_some_and(|object| {
-                            object.len() == 1
-                                && object.get("error").and_then(serde_json::Value::as_str)
-                                    == Some("Consumer not found")
-                        })
-                    });
-            if !is_consumer_not_found {
+            if !conditional::is_consumer_not_found(&resp.body) {
                 return Err(conditional::invalid());
             }
             return Ok(None);
@@ -1158,7 +1148,7 @@ impl AdminClient {
         if kind == "Proxy" {
             path.push_str("?cleanup_orphaned_upstream=false");
         }
-        self.delete(&path, namespace, Some(etag))
+        self.delete(kind, &path, namespace, Some(etag))
             .await
             .map_err(|error| {
                 if kind == "Consumer" && !matches!(error, crate::error::Error::StalePlan(_)) {
@@ -1177,6 +1167,7 @@ impl AdminClient {
     /// caller can only say that if it can count them.
     async fn delete(
         &self,
+        kind: &str,
         path: &str,
         namespace: &str,
         if_match: Option<&str>,
@@ -1201,16 +1192,7 @@ impl AdminClient {
             // Consumer deletes require Edge's exact not-found acknowledgement;
             // a router response cannot prove that the consumer is gone.
             if kind == "Consumer" {
-                let is_consumer_not_found = conditional::parse_sensitive(&resp.body)
-                    .ok()
-                    .is_some_and(|value| {
-                        value.as_object().is_some_and(|object| {
-                            object.len() == 1
-                                && object.get("error").and_then(serde_json::Value::as_str)
-                                    == Some("Consumer not found")
-                        })
-                    });
-                if !is_consumer_not_found {
+                if !conditional::is_consumer_not_found(&resp.body) {
                     return Err(conditional::invalid());
                 }
                 return Ok(DeleteOutcome::NotFound);

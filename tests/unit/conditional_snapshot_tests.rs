@@ -454,9 +454,8 @@ async fn delete_404_acknowledgements_are_kind_specific_and_never_replayed() {
             ),
         ];
         for (case, (body, accepted, committed_not_live)) in cases.into_iter().enumerate() {
-            let accepted = accepted
-                && (kind != "Consumer"
-                    || body == r#"{"error":"Consumer not found"}"#);
+            let accepted =
+                accepted && (kind != "Consumer" || body == r#"{"error":"Consumer not found"}"#);
             let response = body.clone();
             let (client, requests) = gateway(move |_, _| (404, response.clone(), vec![]));
             let result = client.delete_if_match(kind, "c1", NS, ROW_TAG).await;
