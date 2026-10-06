@@ -139,8 +139,9 @@ formats from before the first release.
 
 ## Conditional API adoption qualification (#462)
 
-The candidate pairing pins published Edge v0.9.12 at immutable owner
-`0d917701b63ef38210c49df830f48cf0457cbc7d`, with the verified x86_64 asset and
+The candidate pairing pins published Edge v0.9.12 to owner commit
+`0d917701b63ef38210c49df830f48cf0457cbc7d`, with content-pinned (SHA-256)
+release artifacts, the verified x86_64 asset and
 default multi-platform image index listed above. The existing conditional API
 implementation is unchanged. Vendored Contracts remain at published
 `contracts-edge-0.9.11`, commit `390edbd5b2485af0988e02f7827fde778d76ae0a`;

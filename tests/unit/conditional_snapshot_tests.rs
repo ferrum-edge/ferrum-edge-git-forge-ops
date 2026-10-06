@@ -454,43 +454,28 @@ async fn delete_404_acknowledgements_validate_nonempty_bodies_without_replay() {
             ),
         ];
         for (case, (body, accepted, committed_not_live)) in cases.into_iter().enumerate() {
-            for conditional in [false, true] {
-                let response = body.clone();
-                let (client, requests) = gateway(move |_, _| (404, response.clone(), vec![]));
-                let result = if conditional {
-                    client.delete_if_match(kind, "c1", NS, ROW_TAG).await
+            let response = body.clone();
+            let (client, requests) = gateway(move |_, _| (404, response.clone(), vec![]));
+            let result = client.delete_if_match(kind, "c1", NS, ROW_TAG).await;
+            let context = format!("{kind} case={case}");
+            if accepted {
+                assert_eq!(result.unwrap(), DeleteOutcome::NotFound, "{context}");
+            } else {
+                let error = result.unwrap_err();
+                if committed_not_live {
+                    assert!(matches!(error, Error::CommittedNotLive { .. }), "{context}");
                 } else {
-                    match kind {
-                        "Proxy" => client.delete_proxy("c1", NS).await,
-                        "Consumer" => client.delete_consumer("c1", NS).await,
-                        "Upstream" => client.delete_upstream("c1", NS).await,
-                        _ => client.delete_plugin_config("c1", NS).await,
-                    }
-                };
-                let context = format!("{kind} conditional={conditional} case={case}");
-                if accepted {
-                    assert_eq!(result.unwrap(), DeleteOutcome::NotFound, "{context}");
-                } else {
-                    let error = result.unwrap_err();
-                    if committed_not_live {
-                        assert!(matches!(error, Error::CommittedNotLive { .. }), "{context}");
-                    } else {
-                        assert!(matches!(error, Error::AmbiguousMutation(_)), "{context}");
-                    }
-                    let diagnostic = format!("{error:?} {error}");
-                    assert!(!diagnostic.contains(SECRET), "{context}");
-                    assert!(!diagnostic.contains(ROW_TAG), "{context}");
+                    assert!(matches!(error, Error::AmbiguousMutation(_)), "{context}");
                 }
-                let seen = requests.lock().unwrap();
-                assert_eq!(seen.len(), 1, "{context}");
-                assert!(seen[0].starts_with("DELETE "), "{context}");
-                assert!(seen[0].contains(&format!("x-ferrum-namespace: {NS}\r\n")));
-                assert_eq!(
-                    seen[0].contains(&format!("if-match: {ROW_TAG}\r\n")),
-                    conditional,
-                    "{context}"
-                );
+                let diagnostic = format!("{error:?} {error}");
+                assert!(!diagnostic.contains(SECRET), "{context}");
+                assert!(!diagnostic.contains(ROW_TAG), "{context}");
             }
+            let seen = requests.lock().unwrap();
+            assert_eq!(seen.len(), 1, "{context}");
+            assert!(seen[0].starts_with("DELETE "), "{context}");
+            assert!(seen[0].contains(&format!("x-ferrum-namespace: {NS}\r\n")));
+            assert!(seen[0].contains(&format!("if-match: {ROW_TAG}\r\n")));
         }
     }
 }
@@ -594,6 +579,71 @@ async fn malformed_consumer_writes_never_prune_or_update_the_managed_ledger() {
 }
 
 #[tokio::test]
+async fn router_404_during_consumer_delete_preserves_the_managed_ledger() {
+    use gitforgeops::apply::AppliedOp;
+    use gitforgeops::diff::resource_diff::{state_key, DiffAction};
+    use gitforgeops::state::{ResourceKeys, StateFile};
+
+    let actual = config();
+    let extras = planned_extras(&actual, NS, BackupExtras::default());
+    let key = state_key(NS, "Consumer", "c1");
+    let mut state = StateFile::default();
+    state
+        .record_op(
+            &AppliedOp {
+                kind: "Consumer".to_string(),
+                namespace: NS.to_string(),
+                id: "c1".to_string(),
+                action: DiffAction::Add,
+            },
+            &ResourceKeys::from_config(&actual),
+        )
+        .unwrap();
+    let original_ledger = serde_json::to_value(&state.resources).unwrap();
+    let managed = HashSet::from([key.clone()]);
+    let (client, requests) = gateway(|request, _| {
+        if request.starts_with("GET /health") {
+            healthy()
+        } else if request.starts_with("GET /consumers/c1/verification ") {
+            (404, r#"{"error":"Not Found"}"#.to_string(), vec![])
+        } else {
+            panic!("an unknown verification route must not authorize deletion")
+        }
+    });
+    let result = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &[NS.to_string()],
+        OwnershipScope::Shared {
+            previously_managed: &managed,
+        },
+        Some(&BTreeMap::from([(NS.to_string(), actual)])),
+        Some(&BTreeMap::from([(NS.to_string(), extras)])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.deleted, 0);
+    assert_eq!(result.deletes_missing, 0);
+    assert!(result.applied_incremental.is_empty());
+    assert!(!result.errors.is_empty());
+    assert!(result
+        .errors
+        .join(" ")
+        .contains("authoritative conditional evidence unavailable"));
+    let desired_keys = ResourceKeys::from_config(&GatewayConfig::default());
+    for op in result.applied_incremental.iter().chain(&result.adopted) {
+        state.record_op(op, &desired_keys).unwrap();
+    }
+    assert_eq!(serde_json::to_value(&state.resources).unwrap(), original_ledger);
+    assert!(state.resources.contains_key(&key));
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().all(|request| request.starts_with("GET ")));
+}
+
+#[tokio::test]
 async fn preallocation_capture_checks_archival_projection_but_retains_exact_hidden_fields() {
     let mut archival = config();
     archival.consumers[0]
@@ -643,6 +693,30 @@ async fn sensitive_http_reads_refuse_duplicate_headers_and_cached_evidence_stays
     let (client, _) = gateway(move |_, _| verified(&raw, NS_TAG));
     assert!(client.get_conditional_backup(NS).await.is_err());
     assert!(client.served_from_cache());
+}
+
+#[tokio::test]
+async fn verification_404_requires_the_exact_consumer_not_found_body() {
+    for (body, is_gone) in [
+        (r#"{"error":"Consumer not found"}"#, true),
+        (r#"{"error":"Not Found"}"#, false),
+        (r#"{"error":"Consumer not found","detail":"route missing"}"#, false),
+        (r#"{"error":"Consumer not found","error":"Not Found"}"#, false),
+        ("not json", false),
+    ] {
+        let response = body.to_string();
+        let (client, requests) = gateway(move |_, _| (404, response.clone(), vec![]));
+        let result = client.get_consumer_verification("c1", NS).await;
+        if is_gone {
+            assert!(result.unwrap().is_none());
+        } else {
+            assert!(matches!(
+                result.unwrap_err(),
+                gitforgeops::error::Error::ConditionalWriteUnavailable(_)
+            ));
+        }
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]
