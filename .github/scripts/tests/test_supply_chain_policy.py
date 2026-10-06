@@ -2148,7 +2148,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
         self.assertEqual(check_supply_chain.cargo_audit_job_shape_violations(bumped), [])
         # Each free part still answers to its own rule.
         self.assertTrue(check_supply_chain.cargo_audit_install_violations(bumped))
-        self.assertTrue(check_supply_chain.rust_toolchain_violations("security.yml", bumped))
+        self.assertTrue(
+            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.98.0")
+        )
 
     def test_cargo_audit_comment_bypass_is_refused_by_the_trusted_checker(self):
         trusted = (
@@ -4806,7 +4808,10 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
           toolchain: 1.98.0
 """
         self.assertEqual(
-            check_supply_chain.rust_toolchain_violations("rust-ci.yml", secure), []
+            check_supply_chain.rust_toolchain_violations(
+                "rust-ci.yml", secure, "1.98.0"
+            ),
+            [],
         )
 
         # One pinned step used to satisfy the whole file.
@@ -4821,12 +4826,42 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
 """,
         )
         violations = check_supply_chain.rust_toolchain_violations(
-            "rust-ci.yml", insecure
+            "rust-ci.yml", insecure, "1.98.0"
         )
         self.assertTrue(
             any("every dtolnay/rust-toolchain step" in item for item in violations),
             violations,
         )
+
+    def test_rust_toolchain_workflows_follow_the_pinned_channel(self):
+        workflow = """      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000
+        with:
+          toolchain: 1.99.0
+"""
+        self.assertEqual(
+            check_supply_chain.rust_toolchain_violations(
+                "rust-ci.yml", workflow, "1.99.0"
+            ),
+            [],
+        )
+        self.assertTrue(
+            check_supply_chain.rust_toolchain_violations(
+                "rust-ci.yml", workflow, "1.98.0"
+            )
+        )
+
+    def test_rust_toolchain_channel_requires_one_stable_pin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "rust-toolchain.toml"
+            path.write_text('[toolchain]\nchannel = "1.99.0"\n', encoding="utf-8")
+            self.assertEqual(
+                check_supply_chain.read_rust_toolchain_channel(path), "1.99.0"
+            )
+            path.write_text(
+                '[toolchain]\nchannel = "stable"\n', encoding="utf-8"
+            )
+            self.assertIsNone(check_supply_chain.read_rust_toolchain_channel(path))
 
     def test_rust_ci_runs_the_library_target_unfiltered(self):
         text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")

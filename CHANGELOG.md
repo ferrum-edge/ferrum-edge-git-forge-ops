@@ -5,6 +5,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Make supply-chain workflow toolchain checks and release provenance follow
+  `rust-toolchain.toml`, so the compiler pin can be updated coherently with the
+  Docker builder (#474).
+
 ### Added
 
 - Credential-complete consumer verification and coherent conditional namespace
