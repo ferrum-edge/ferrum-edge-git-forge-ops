@@ -5,12 +5,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Changed
-
-- Make supply-chain workflow toolchain checks and release provenance follow
-  `rust-toolchain.toml`, so the compiler pin can be updated coherently with the
-  Docker builder (#474).
-
 ### Added
 
 - Credential-complete consumer verification and coherent conditional namespace
@@ -82,6 +76,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   duplicate entries are rejected.
 
 ### Changed
+
+- Make supply-chain workflow toolchain checks and release provenance follow
+  `rust-toolchain.toml`, so the compiler pin can be updated coherently with the
+  Docker builder (#474).
 
 - Refresh the existing 13-file ferrum-contracts adoption to published
   `contracts-edge-0.9.12` at `31f0a21d707795be293d15837c2f77c3d84219d8`, with an

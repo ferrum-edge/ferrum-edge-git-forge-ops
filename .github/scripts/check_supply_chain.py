@@ -10,6 +10,7 @@ import re
 import shlex
 import stat
 import sys
+import tomllib
 from pathlib import Path
 
 
@@ -19,6 +20,10 @@ USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
 FROM = re.compile(r"^FROM\s+([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
+MIN_RUST_TOOLCHAIN = (1, 98, 0)
+RUST_TOOLCHAIN_CHANNEL = re.compile(
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII
+)
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 # Closing delimiters inside single-quoted expression literals are data, even
 # in shell comments. GitHub expands expressions before Bash reads the script.
@@ -1332,14 +1337,26 @@ def rust_toolchain_violations(workflow: str, text: str, channel: str) -> list[st
 
 def read_rust_toolchain_channel(path: Path) -> str | None:
     """Read the single pinned channel used by workflows and release provenance."""
+    if path.with_name("rust-toolchain").exists():
+        return None
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
         return None
-    channels = re.findall(r'^channel\s*=\s*"([^"]+)"\s*$', text, re.MULTILINE)
-    if len(channels) != 1 or not re.fullmatch(r"\d+\.\d+\.\d+", channels[0]):
+    if set(document) != {"toolchain"}:
         return None
-    return channels[0]
+    toolchain = document["toolchain"]
+    if not isinstance(toolchain, dict) or not set(toolchain).issubset(
+        {"channel", "components", "targets", "profile"}
+    ):
+        return None
+    channel = toolchain.get("channel")
+    match = RUST_TOOLCHAIN_CHANNEL.fullmatch(channel) if isinstance(channel, str) else None
+    if match is None:
+        return None
+    if tuple(int(part) for part in match.groups()) < MIN_RUST_TOOLCHAIN:
+        return None
+    return channel
 
 
 def rust_ci_test_scope_violations(text: str) -> list[str]:
@@ -4035,7 +4052,8 @@ def main(argv: list[str] | None = None) -> int:
     rust_channel = read_rust_toolchain_channel(toolchain_path)
     if rust_channel is None:
         violations.append(
-            "rust-toolchain.toml: expected exactly one pinned stable channel"
+            "rust-toolchain.toml: expected [toolchain].channel to be a stable "
+            "X.Y.Z channel at or above 1.98.0, with no legacy rust-toolchain file"
         )
     candidate_checker = root / ".github" / "scripts" / "check_supply_chain.py"
     if candidate_checker.is_symlink() or not candidate_checker.is_file():

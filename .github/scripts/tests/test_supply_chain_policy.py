@@ -4863,6 +4863,73 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
             self.assertIsNone(check_supply_chain.read_rust_toolchain_channel(path))
 
+    def test_main_rejects_invalid_rust_toolchain_files(self):
+        invalid_files = {
+            "nightly": ('[toolchain]\nchannel = "nightly"\n', None),
+            "missing patch": ('[toolchain]\nchannel = "1.98"\n', None),
+            "non-string channel": ('[toolchain]\nchannel = 198\n', None),
+            "leading zero": ('[toolchain]\nchannel = "01.98.0"\n', None),
+            "unicode digits": ('[toolchain]\nchannel = "١.98.0"\n', None),
+            "duplicate table": (
+                '[toolchain]\nchannel = "1.98.0"\n'
+                '[toolchain]\nchannel = "1.99.0"\n',
+                None,
+            ),
+            "decoy table": (
+                '[toolchain]\nchannel = "nightly"\n'
+                '[decoy]\nchannel = "1.98.0"\n',
+                None,
+            ),
+            "path key": ('[toolchain]\npath = "../rust"\n', None),
+            "below floor": ('[toolchain]\nchannel = "1.97.9"\n', None),
+            "legacy file": ('[toolchain]\nchannel = "1.98.0"\n', "legacy"),
+            "missing file": (None, None),
+        }
+        for label, (contents, legacy) in invalid_files.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = self._mirror_repo(Path(temporary))
+                toolchain = root / "rust-toolchain.toml"
+                if contents is None:
+                    toolchain.unlink()
+                else:
+                    toolchain.write_text(contents, encoding="utf-8")
+                if legacy is not None:
+                    (root / "rust-toolchain").write_text("1.98.0\n", encoding="utf-8")
+                violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        "rust-toolchain.toml: expected [toolchain].channel" in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_main_manifest_records_the_parsed_rust_toolchain_channel(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._mirror_repo(Path(temporary) / "candidate")
+            manifest_path = Path(temporary) / "manifest.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--root",
+                    str(root),
+                    "--write-manifest",
+                    str(manifest_path),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["rust_toolchain"],
+                check_supply_chain.read_rust_toolchain_channel(
+                    root / "rust-toolchain.toml"
+                ),
+            )
+
     def test_rust_ci_runs_the_library_target_unfiltered(self):
         text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
         self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(text), [])
