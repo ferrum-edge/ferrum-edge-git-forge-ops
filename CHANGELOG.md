@@ -13,9 +13,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   count seals without exposing credentials, tokens or response bodies. Doctor uses
   GET-only capability probes and reports unavailable evidence as unknown.
 - Lifecycle coverage for hidden consumer edits and namespace restore conditions,
-  including ABA, empty replacement and confirmed spec deletion. Qualification on
-  the published immutable Edge v0.9.12 bytes remains required; an older fixture or
-  passing parser tests do not establish first-release acceptance.
+  including ABA, empty replacement and confirmed spec deletion. Qualification
+  on the published Edge v0.9.12 release, content-pinned (SHA-256), remains
+  required; an older fixture or passing parser tests do not establish first-release
+  acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
   resource trees ([Alloy #27](https://github.com/ferrum-edge/ferrum-alloy/issues/27)).
   The existing required validator-pairing job builds the immutable producer,
@@ -165,13 +166,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a copy with a customized `security-cargo-audit` job, a workflow-level `env:`
   or `defaults:` in `security.yml`, or an extra `security.yml` trigger (such as
   `workflow_dispatch`) now fails the checker too.
-- Retire the cargo-audit installer v2.87.20 pin after the workflow switch in #465.
-  The protected policy accepts only the reviewed v2.87.22 commit, retaining
-  cargo-audit 0.22.1, checksum verification and `fallback: none`.
-- Preauthorize the reviewed `taiki-e/install-action` v2.87.22 commit
-  `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` alongside v2.87.20 in the protected
-  cargo-audit installer policy. Action source and the cargo-audit 0.22.1 checksum
-  manifest are unchanged; workflow rotation in #465 follows after this policy lands.
+- Fail closed on ambiguous consumer verification 404s and remove unconditional update/delete methods.
+- Complete the cargo-audit installer rotation to reviewed v2.87.22 commit
+  `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` after #465, retiring v2.87.20 while
+  retaining cargo-audit 0.22.1, checksum verification and `fallback: none`.
 - Pin the operator-held `FERRUM_VERIFY_PROBE_CONSUMERS` binding in both
   apply/promote Validate and Verify traffic steps and trusted live review,
   with `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` in Validate and review.
@@ -205,15 +203,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   proxy update after scoped-plugin writes) is now conditional: apply reads the
   row with `GET /<kind>/{id}`, refuses it when it gained, lost or changed its
   `api_spec_id` or changed content since the plan, and sends the write with
-  `If-Match` on the strong `ETag` Ferrum Edge v0.9.9+ returned. Edge refuses a
+  `If-Match` on the strong `ETag` Ferrum Edge v0.9.6+ returned. Edge refuses a
   row changed after that read with `412`, atomically with the write. A refusal
   is a per-resource error and withholds every later write in that namespace
   (its deletes are deferred and adoption is skipped); the run exits non-zero.
   A delete whose row is already gone is not sent. When the read differs from
   the plan only because `/backup` normalizes rows the read returns as stored,
   a `/backup` taken after the read settles it, so such a row is not refused
-  forever. Consumers are always checked against that later `/backup`, since
-  Edge redacts their credentials on a single-row read. A proxy read after
+  forever. Consumers use `GET /consumers/{id}/verification` to compare complete
+  credential evidence and row tags against the original plan, including hidden
+  credential changes that `/backup` cannot show. A proxy read after
   this run's plugin writes ignores only the associations to plugin configs
   this run wrote, so a plugin someone else attached is never detached, and a
   scoped plugin can move off a proxy deleted in the same apply. A `412` that

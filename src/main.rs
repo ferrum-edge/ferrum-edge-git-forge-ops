@@ -897,16 +897,11 @@ async fn load_namespace_pairs_for(
     client: &AdminClient,
     desired: &GatewayConfig,
     namespaces: &[String],
-    mutation_safe: bool,
 ) -> gitforgeops::error::Result<Vec<NamespaceSnapshot>> {
     let mut pairs = Vec::new();
     for namespace in namespaces {
         let desired_namespace = config::filter_config_by_namespace(desired, namespace);
-        let snapshot = if mutation_safe {
-            client.get_backup_snapshot_for_mutation(namespace).await?
-        } else {
-            client.get_backup_snapshot(namespace).await?
-        };
+        let snapshot = client.get_backup_snapshot(namespace).await?;
         pairs.push(NamespaceSnapshot {
             namespace: namespace.clone(),
             desired: desired_namespace,
@@ -1919,7 +1914,7 @@ async fn cmd_diff(
         .await
         .map(|(pairs, comparison)| (pairs, Some(comparison)))
     } else {
-        load_namespace_pairs_for(&client, &desired, &namespaces, false)
+        load_namespace_pairs_for(&client, &desired, &namespaces)
             .await
             .map(|pairs| (pairs, None))
     };
@@ -2400,7 +2395,7 @@ async fn cmd_plan(
     let client = AdminClient::new_scoped(&env_config, &namespaces);
     let (diffs, breaking, unmanaged, spec_owned, actual_available, provenance_note) = match &client
     {
-        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces, false).await {
+        Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
             Ok(mut namespace_pairs) => {
                 let live_count: usize = namespace_pairs
                     .iter()
@@ -3133,7 +3128,7 @@ async fn cmd_apply(
             if !auto_approve {
                 let managed = previously_managed(&resolved, &state);
                 let namespace_pairs =
-                    load_namespace_pairs_for(&client, &desired, &namespaces, false).await?;
+                    load_namespace_pairs_for(&client, &desired, &namespaces).await?;
                 if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                     return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
                 }
@@ -4037,7 +4032,7 @@ async fn cmd_review(
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(error))
     } else {
         match &client {
-            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces, false).await {
+            Ok(c) => match load_namespace_pairs_for(c, &desired, &namespaces).await {
                 // A `/backup` served from the gateway's in-memory snapshot
                 // is not the live view this review claims to publish, so
                 // the computed diff is dropped rather than presented as a
