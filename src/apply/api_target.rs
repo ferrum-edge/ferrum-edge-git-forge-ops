@@ -2443,7 +2443,7 @@ impl<'a> Preconditions<'a> {
             "proxies"
         };
         Err(crate::error::Error::UnplannedPluginReference(format!(
-            "not sent: the gateway would detach PluginConfig `{id}` from {noun} {}, which this run's plan and the repository do not show referencing it (most likely attached after the plan). Re-run apply to plan against the current gateway",
+            "not sent: the gateway would detach PluginConfig `{id}` from {noun} {}, which this run's plan and the repository do not show referencing it (most likely attached after the plan). Declare the reference in the repository to keep it, or re-run apply to accept detaching it",
             unplanned.join(", ")
         )))
     }

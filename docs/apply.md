@@ -339,10 +339,17 @@ the namespace's `/backup` again and lists the proxies that reference the
 plugin now. The write is refused as `UnplannedPluginReference` when any of
 them is neither a proxy the plan's live view showed referencing the plugin, a
 proxy the repository declares referencing it, nor the target the update keeps.
-As with `StalePlan`, the namespace's remaining writes are withheld. Re-run
-apply to plan against the current gateway. A `proxy_group` update leaves
-associations alone, and an update that keeps its scope and target detaches
-nothing another proxy could validly have attached, so neither takes this read.
+As with `StalePlan`, the namespace's remaining writes are withheld. Declare the
+reference in the repository to keep it, or re-run apply to accept detaching it:
+the next plan's live view then shows the late proxy, so the write proceeds and
+detaches it. A `proxy_group` update leaves associations alone, and an update
+that keeps its scope and target detaches nothing another proxy could validly
+have attached, so neither takes this read.
+
+That narrowed update guard relies on Ferrum Edge rejecting a proxy write that
+references a `global` config or a `proxy` config aimed at another proxy, so only
+the target the update keeps can be validly attached; revisit it if Edge relaxes
+that association validation (for example, by allowing `global` references).
 
 This check narrows the race; it does not close it. A proxy that attaches the
 plugin between that read and the write is still detached, because the gateway

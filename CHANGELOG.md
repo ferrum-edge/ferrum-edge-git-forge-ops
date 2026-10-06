@@ -119,6 +119,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   not qualify the gateway's backup or consumer representations: the lifecycle
   suite must pass against the exact released build, and pending representation
   fixes are not assumed released.
+- Incremental `apply` takes one confirmation `/backup` per namespace instead of
+  one per row whose single-row read differs from the plan (#475). A later
+  mismatching read reuses the most recent backup only while that backup shows
+  the row at the read's server `updated_at`; a row the gateway has rewritten
+  since, including a proxy whose association this run's own plugin write
+  changed, takes a fresh backup after the read. The plugin-reference guard adds
+  a `/backup` read of its own before a plugin delete or retarget.
 - `diff --format json` gains two fields on every path: `live_source`
   (`backup` or `config_export`) and `secret_fingerprints` (`null` on the
   `/backup` path). The cached-read warning now names the source it came from,
@@ -165,11 +172,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is still detached: the gateway offers no association precondition, and only
   an Edge-side referenced-plugin guard inside the write transaction closes
   that window.
-- Take one confirmation `/backup` per namespace per apply instead of one per
-  row whose single-row read differs from the plan (#475). A later mismatching
-  read reuses the latest backup only when that backup shows the row with the
-  same server `updated_at`; otherwise it takes a fresh backup after the read,
-  as before.
 - Harden the trusted supply-chain checker. The strict workflow reader refuses
   folded block scalars (`>`, `>-`, `>+`) for every key except `if`: it joined
   folded lines with spaces where YAML keeps line breaks, so a folded `run:`
