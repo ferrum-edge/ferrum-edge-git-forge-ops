@@ -1669,6 +1669,69 @@ def security_push_trigger_violations(text: str) -> list[str]:
     return violations
 
 
+# The exact triggers `security.yml` may carry. `security-cargo-audit` and
+# `security-supply-chain-policy` are required contexts defined by the pull
+# request's own copy of this workflow, and every pinned job switches on
+# `github.event_name`. An added trigger — `workflow_dispatch:` above all —
+# would run that candidate copy outside `pull_request`, take the `else` branch
+# and post a second result under a required check name from a run no rule
+# reviewed. So the trigger list is part of the pinned shape.
+SECURITY_TRIGGERS = ("pull_request", "push", "schedule")
+SECURITY_PULL_REQUEST_SHAPE = {
+    "types": ["opened", "synchronize", "reopened", "edited"],
+    "branches": ["main"],
+}
+SECURITY_PUSH_BRANCHES = ["main"]
+
+
+def security_trigger_violations(text: str) -> list[str]:
+    """`security.yml` may run on exactly the reviewed triggers.
+
+    Read from the strict workflow reader, so the checked list is the one the
+    runner acts on. The required `security-cargo-audit` and
+    `security-supply-chain-policy` jobs switch on `github.event_name`, so an
+    extra trigger would run the candidate's own copy of the workflow on an
+    event this policy never reviewed and post another check run under the
+    required name. Pin the key set, the pull request types and branch, and the
+    push branch.
+    """
+    try:
+        document = parse_workflow(text)
+    except WorkflowSyntaxError as error:
+        return [
+            "security.yml: the trigger list must be in the YAML subset the "
+            f"policy reads: {error}"
+        ]
+    candidates = [value for key, value in document.items() if key.casefold() == "on"]
+    if len(candidates) != 1 or not isinstance(candidates[0], dict):
+        return ["security.yml: the workflow must declare exactly one `on:` mapping"]
+    triggers = candidates[0]
+    violations: list[str] = []
+    for found in triggers:
+        if found.casefold() not in {name.casefold() for name in SECURITY_TRIGGERS}:
+            violations.append(
+                f"security.yml: the trigger {found!r} is not reviewed; the only "
+                f"reviewed triggers are {', '.join(SECURITY_TRIGGERS)}"
+            )
+    spelled = {found.casefold(): found for found in triggers}
+    for name in SECURITY_TRIGGERS:
+        if name.casefold() not in spelled:
+            violations.append(f"security.yml: the reviewed trigger {name!r} is missing")
+    pull_request = triggers.get(spelled.get("pull_request", ""))
+    if pull_request is not None and pull_request != SECURITY_PULL_REQUEST_SHAPE:
+        violations.append(
+            "security.yml: pull_request must keep its reviewed types and branch; "
+            f"expected {SECURITY_PULL_REQUEST_SHAPE!r}, found {pull_request!r}"
+        )
+    push = triggers.get(spelled.get("push", ""))
+    if isinstance(push, dict) and push.get("branches") != SECURITY_PUSH_BRANCHES:
+        violations.append(
+            "security.yml: push must keep its reviewed branch; "
+            f"expected {SECURITY_PUSH_BRANCHES!r}, found {push.get('branches')!r}"
+        )
+    return violations
+
+
 def allowlisted_validator_digests(text: str) -> list[str]:
     """Return every approved validator digest, in file order."""
     digests: list[str] = []
@@ -4323,6 +4386,7 @@ def main(argv: list[str] | None = None) -> int:
     violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
     violations.extend(cargo_audit_install_violations(security_workflow))
     violations.extend(security_push_trigger_violations(security_workflow))
+    violations.extend(security_trigger_violations(security_workflow))
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     if 'result=$(python3 "$helper"' not in state_guard:
         violations.append(

@@ -651,7 +651,14 @@ What the checker enforces for this check:
   branch's cargo-audit checker, its tests and its exception list. Only the
   action commits and the Rust toolchain (pinned by their own rules) are free.
   A workflow-level `env:` or `defaults:` in `security.yml` is refused, since
-  either reaches the job's shell without appearing in it.
+  either reaches the job's shell without appearing in it. The pinned shape
+  also fixes `runs-on: ubuntu-24.04`, and `security.yml`'s `on:` triggers are
+  pinned to the reviewed events (the `pull_request` types and branch, the
+  `push` branch and the `schedule`): a runner-image bump or an added trigger
+  such as `workflow_dispatch` — which could post a second
+  `security-cargo-audit` result from a candidate copy run outside
+  `pull_request` — needs a checker PR first, the same two-PR pattern as the
+  action pins.
 - **Status forgery.** At every `permissions:` in every workflow, `checks` and
   `statuses` may only be `read` or `none`, and a string grant must be
   `read-all` (`write-all` grants both). With write access, a job could post

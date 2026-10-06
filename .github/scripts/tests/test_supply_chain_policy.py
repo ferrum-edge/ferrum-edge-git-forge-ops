@@ -2371,6 +2371,53 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     )
                 )
 
+    def test_security_trigger_list_is_pinned_to_the_reviewed_events(self):
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(check_supply_chain.security_trigger_violations(workflow), [])
+
+        # A `workflow_dispatch:` runs the candidate's own copy of this workflow
+        # outside `pull_request`, where the pinned jobs take the `else` branch
+        # and post a second `security-cargo-audit` result under the required
+        # name from a run no rule reviewed.
+        dispatched = workflow.replace("on:\n", "on:\n  workflow_dispatch:\n", 1)
+        self.assertNotEqual(dispatched, workflow)
+        violations = check_supply_chain.security_trigger_violations(dispatched)
+        self.assertTrue(
+            any("workflow_dispatch" in item for item in violations), violations
+        )
+
+        for label, old, new in (
+            (
+                "pull_request_types",
+                "    types: [opened, synchronize, reopened, edited]\n",
+                "    types: [opened]\n",
+            ),
+            ("pull_request_branch", "    branches: [main]\n", "    branches: [develop]\n"),
+            ("push_branch", "  push:\n    branches: [main]\n", "  push:\n    branches: [develop]\n"),
+            ("dropped_schedule", "  schedule:\n    - cron: '17 9 * * 1'\n", ""),
+        ):
+            with self.subTest(label=label):
+                changed = workflow.replace(old, new, 1)
+                self.assertNotEqual(changed, workflow)
+                self.assertTrue(check_supply_chain.security_trigger_violations(changed))
+
+        # The rule is wired into the aggregate run, not only callable.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._mirror_repo(Path(temporary))
+            (root / ".github/workflows/security.yml").write_text(
+                dispatched, encoding="utf-8"
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith("security.yml: the trigger 'workflow_dispatch' is not reviewed")
+                for item in violations
+            ),
+            violations,
+        )
+
     def test_security_policy_must_execute_the_default_branch_checker(self):
         secure = "\n".join(
             [
@@ -3351,7 +3398,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
             any(
                 item.startswith(
                     ".github/workflows/impostor.yml: job 'trusted-supply-chain-policy': "
-                    "only supply-chain-policy.yml"
+                    "only job 'trusted-supply-chain-policy' of supply-chain-policy.yml"
                 )
                 for item in violations
             ),

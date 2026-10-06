@@ -147,7 +147,8 @@ cargo fmt --all && cargo fmt --all -- --check
   scalars only for `if`) parsed by a stdlib reader. On the parsed structure it
   refuses a job keyed or named like a required context outside that context's
   own job (`REQUIRED_CHECK_WORKFLOWS`), computed job names and
-  `checks`/`statuses` write, and pins the parsed `security-cargo-audit` job.
+  `checks`/`statuses` write, and pins the parsed `security-cargo-audit` job
+  and `security.yml`'s reviewed `on:` triggers.
   Keep new workflows inside that subset. `security.yml`'s
   `security-supply-chain-policy` stays required until the ruleset switch and a
   later retire PR (`docs/github-launch-controls.md`, "Switching the

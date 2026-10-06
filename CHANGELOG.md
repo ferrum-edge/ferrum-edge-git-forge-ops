@@ -161,7 +161,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   any required context (`state-guard-reject-state-edits` included) except that
   context's own job. Shipped workflows that folded a `run:` or `description:`
   now spell the same value on one line. Template repositories must rewrite
-  their own folded scalars outside `if:` as literal (`|`) or one-line scalars.
+  their own folded scalars outside `if:` as literal (`|`) or one-line scalars;
+  a copy with a customized `security-cargo-audit` job, a workflow-level `env:`
+  or `defaults:` in `security.yml`, or an extra `security.yml` trigger (such as
+  `workflow_dispatch`) now fails the checker too.
 - Retire the cargo-audit installer v2.87.20 pin after the workflow switch in #465.
   The protected policy accepts only the reviewed v2.87.22 commit, retaining
   cargo-audit 0.22.1, checksum verification and `fallback: none`.
