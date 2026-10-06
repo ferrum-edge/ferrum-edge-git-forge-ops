@@ -88,6 +88,40 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GitForgeOps hosted validation and exact-revision lifecycle acceptance remain
   required, the release baseline stays pending, and the conditional API
   implementation and `contracts-edge-0.9.11` pin are unchanged.
+- Simplify the trusted checker's probe-binding rules (#476). The hand-written
+  Bash lexer, expression renderer and rendered matrix/step-output source
+  proofs are gone. In their place: the Verify traffic script and the credential-file
+  hand-off in each `Load credential bundles` step are pinned line for line
+  (comment lines are ignored unless they hold an expression), and every
+  workflow is banned from spelling `GITHUB_ENV`, `GITHUB_PATH` or `BASH_ENV`,
+  the runner's file-command file names (`set_env_`, `add_path_`,
+  `save_state_`, `_runner_file_commands`), indirect expansion, the
+  `github.env`/`github.path` contexts, or a redirect or `tee` into any GitHub
+  file channel other than `GITHUB_OUTPUT` and `GITHUB_STEP_SUMMARY`, outside
+  that hand-off; those two may appear only as a plain `>>` or `tee -a` target
+  (and the summary as `--summary`). Quotes, backslashes and line continuations
+  are removed before matching, shell comments count, a `run:` interpolation
+  may not adjoin a name character (with quotes removed), and an `env:` mapping
+  may not be computed or bind `ENV` or a GitHub file destination. The
+  Environment-bound workflows may interpolate into `run:` only a per-job
+  allowlist, and each allowlisted value is pinned to its producer by exact
+  job-output, matrix and producer-step pins (the enumerator step whole; the
+  metadata step's hex-checked event SHA and its two SHA writes). Apply's
+  hand-off keeps `id: load-bundles`, and Apply and Verify traffic must read the
+  finalized bundle path from it. Outside the guarded Apply steps
+  `apply-on-merge.yml` may invoke the binary only on the pinned `envs`,
+  `validate` and `verify` lines; `$(command -v gitforgeops) apply` counts as an
+  invocation. Protected bindings and the Validate/Apply/Verify flow pins are
+  unchanged; the GitHub context-access rules now cover every workflow. The
+  rules read workflow text only: a program a step runs (the binary, a helper,
+  or Bash evaluating computed text) can still write `$GITHUB_ENV`, which is
+  left to review of every workflow change. Some legitimate text now fails the check and must be reworded: a
+  shell comment that names an env-file channel or a protected variable
+  outside its pinned step, a redirect or `tee` into `$GITHUB_WORKSPACE/...`,
+  any name containing `GITHUB_ENV`, `GITHUB_PATH` or a file-command prefix
+  (such as `GITHUB_ENVIRONMENT`), an interpolation glued to a name
+  (`v${{ matrix.version }}`), and indexed or whole `github` context access
+  (`toJSON(github)`, `github.event.commits[0]`) in any workflow.
 - `diff --exit-on-drift` exits with the new code `6` ("in sync, secrets
   unverified") instead of `1` when a fresh viewer-credential read found no
   drift in an alerted category and no fingerprint baseline was supplied, so the
