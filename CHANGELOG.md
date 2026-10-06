@@ -77,6 +77,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Simplify the trusted checker's probe-binding rules (#476). The hand-written
+  Bash lexer, expression renderer and matrix/step-output source proofs are
+  gone. In their place: the Verify traffic script and the credential-file
+  hand-off in each `Load credential bundles` step are pinned line for line
+  (comment lines are ignored unless they hold an expression), and every
+  workflow is banned from spelling `GITHUB_ENV`, `GITHUB_PATH` or `BASH_ENV`,
+  the `github.env`/`github.path` contexts, or a redirect or `tee` into any
+  GitHub file channel other than `GITHUB_OUTPUT` and `GITHUB_STEP_SUMMARY`,
+  outside that hand-off. Quotes, backslashes and line continuations are
+  removed before matching, shell comments count, a `run:` interpolation may
+  not adjoin a name character, and an `env:` mapping may not be computed or
+  bind `ENV` or a GitHub file destination. The Environment-bound workflows may
+  interpolate into `run:` only a per-job allowlist (environment names and
+  commit SHAs), and outside the guarded Apply steps `apply-on-merge.yml` may
+  invoke the binary only on the pinned `envs`, `validate` and `verify` lines.
+  Protected bindings and the Validate/Apply/Verify flow pins are unchanged;
+  the GitHub context-access rules now cover every workflow. The rules read
+  workflow text only: a
+  program a step runs (the binary, a helper, or Bash evaluating computed text)
+  can still write `$GITHUB_ENV`, which is left to review of every workflow
+  change. A shell comment that names an env-file channel or a protected
+  variable outside its pinned step now fails the check; reword it.
 - `diff --exit-on-drift` exits with the new code `6` ("in sync, secrets
   unverified") instead of `1` when a fresh viewer-credential read found no
   drift in an alerted category and no fingerprint baseline was supplied, so the
