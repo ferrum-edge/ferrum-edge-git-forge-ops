@@ -550,18 +550,44 @@ the old one). If the checker-first change cannot pass the trusted check, park
 it until a policy-compatible sequence is available; do not merge past a red
 required check. The next run on `main` uses the new policy.
 
-Guarded `run:` interpolation requires a proven source and is inspected after
-GitHub scalar conversion, before Bash comment removal. The reader preserves
-plain versus quoted YAML provenance: plain `null`, `Null`, `NULL` and `~`
-render empty, while quoted `"null"` remains literal text. Plain booleans render
-lowercase. Numeric interpolation fails closed because GitHub reformats numbers;
-quote a numeric value when its literal spelling is intended. These conversions
-follow the runner's [YAML reader](https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs)
-and [expression string conversion](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/EvaluationResult.cs).
-The shell scan keeps quote and command-substitution context across physical
-lines, so a line starting with `#` inside a multiline quote cannot hide an
-active command. Unsupported shell contexts retain text conservatively. Binding
-checks, output-producer proofs and runtime env-file tracking use the same scan.
+The workflow binding rules read workflow text, never what a command
+computes. They pin the guarded steps exactly: the Verify traffic script and the
+credential-file hand-off in each `Load credential bundles` step must match
+their pinned lines (comment lines are ignored unless they hold an expression).
+Outside that hand-off, every workflow is banned from spelling `GITHUB_ENV`,
+`GITHUB_PATH` or `BASH_ENV`, the runner's file-command file names (`set_env_`,
+`add_path_`, `save_state_`, `_runner_file_commands`), the
+`github.env`/`github.path` contexts, indirect expansion (`${!name}`), or a
+redirect or `tee` into any GitHub file channel other than `GITHUB_OUTPUT` and
+`GITHUB_STEP_SUMMARY`. Those two may appear only as a plain `>>` or `tee -a`
+target (and the summary as a `--summary` argument), never inside a parameter
+expansion or `dirname` that could derive another file-command path. Quotes,
+backslashes and line continuations are removed before matching, and shell
+comments count. A `run:` interpolation may not adjoin a name character, with
+quotes removed. The Environment-bound workflows may interpolate into `run:`
+only a per-job allowlist; pass any other value through step `env:`. Each
+allowlisted value is pinned to its producer: the job outputs and matrices that
+carry it must be exactly the reviewed expressions, the environment enumerator
+step is pinned whole (including its safe-name `jq` guard), and trusted review's
+metadata step must check the event head SHA as 40 hex digits first, never
+reassign it, take the trusted SHA from `git rev-parse`, and write each SHA
+output only through its pinned `echo`. Apply's hand-off keeps
+`id: load-bundles`, and Apply and Verify traffic read the finalized bundle path
+only from that step's output.
+
+Program-level writes are out of scope. A program a step invokes (the binary, a
+helper script, or Bash evaluating computed text such as `base64 -d | bash` or
+`eval "$text"`) can still write `$GITHUB_ENV` or rebind a variable, and no text
+rule can prove otherwise. Review of every workflow change is the control for
+that.
+
+These text rules can refuse legitimate workflow text: a redirect or `tee` into
+`$GITHUB_WORKSPACE/...`, any name containing `GITHUB_ENV`, `GITHUB_PATH` or a
+file-command prefix (`GITHUB_ENVIRONMENT`, say), an interpolation glued to a
+name (`v${{ matrix.version }}`), indexed or whole `github` context access
+(`toJSON(github)`, `github.event.commits[0]`), and a shell comment naming a
+protected variable or channel. Rephrase such text, or pass the value through
+step `env:`.
 
 Review and merge tighter guard logic into the protected branch first. If the
 workflow binding form must change, do that in a subsequent pull request judged

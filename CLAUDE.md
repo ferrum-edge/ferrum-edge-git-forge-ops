@@ -852,9 +852,19 @@ Consumer plus every labelled Consumer, names only
   workflow tree and pins `${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}` in both
   apply and promote Validate/Verify traffic steps and trusted live review,
   plus `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` in Validate and live review.
-  Workflow/job env, dynamic maps, other step bindings, shell rebinding and
-  alternate `GITHUB_ENV` writes are refused. The bundle loader's credential-file
-  hand-off remains the only permitted env-file reference.
+  A protected name anywhere else (workflow/job env, other steps, `with:`, any
+  script or comment) is refused. `workflow_channel_violations` bans
+  `GITHUB_ENV`, `GITHUB_PATH`, `BASH_ENV`, the runner's file-command file
+  names (`set_env_`, `add_path_`, `save_state_`, `_runner_file_commands`),
+  indirect expansion, computed env maps and writes to other GitHub file
+  channels in every workflow, and allows `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY`
+  only as a plain `>>` or `tee -a` target (or the summary as `--summary`); the
+  bundle loader's credential-file hand-off, pinned line for line, is the only
+  permitted env-file write. `run_expression_source_violations` pins where each
+  allowlisted `run:` interpolation comes from (job outputs, matrices and the
+  producing step's lines). These are text rules (#476): a program a step runs
+  can still write `$GITHUB_ENV`, and review of every workflow change covers
+  that.
 - Only an ad-hoc `FERRUM_NAMESPACE` (not `namespace_filter_is_environment_scope`)
   makes an out-of-scope slot `OutsideNamespaceScope`, which does not refuse.
   Under the environment's own scope it is `NotAConsumerSecret`, as at verify.
