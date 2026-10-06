@@ -1725,7 +1725,8 @@ async fn apply_incremental(
     // delivery). Every write that overwrites or deletes an existing row is made
     // conditional on a fresh read that still matches the plan; see
     // [`Preconditions`].
-    let mut preconditions = Preconditions::new(client, namespace, actual, consumer_evidence)?;
+    let mut preconditions =
+        Preconditions::new(client, namespace, actual, desired, consumer_evidence)?;
     // The first write refused because its row changed after the plan. The
     // namespace's plan is then known to be stale, so nothing more is sent.
     let mut plan_stale: Option<String> = None;
@@ -1858,7 +1859,8 @@ async fn apply_incremental(
                     Err(failed_plugin_dependency(p, &failed_plugins))
                 }
                 Some(p) if changed_proxy_associations.contains(&diff.id) => {
-                    update_proxy_after_plugins(p, &preconditions, ownership_scope, options).await
+                    update_proxy_after_plugins(p, &mut preconditions, ownership_scope, options)
+                        .await
                 }
                 Some(p) => preconditions.update(CreateResource::Proxy(p)).await,
                 None => continue,
@@ -1977,7 +1979,11 @@ async fn apply_incremental(
                 return Ok(result);
             }
             Err(e) => {
-                if matches!(e, crate::error::Error::StalePlan(_)) {
+                if matches!(
+                    e,
+                    crate::error::Error::StalePlan(_)
+                        | crate::error::Error::UnplannedPluginReference(_)
+                ) {
                     plan_stale = Some(format!("{} `{}`", diff.kind, diff.id));
                 }
                 if matches!(diff.action, DiffAction::Add | DiffAction::Modify) {
@@ -2174,7 +2180,7 @@ fn partition_cyclic_creates(
 /// revert. The update is sent with `If-Match` on that read.
 async fn update_proxy_after_plugins(
     proxy: &Proxy,
-    preconditions: &Preconditions<'_>,
+    preconditions: &mut Preconditions<'_>,
     ownership_scope: OwnershipScope<'_>,
     options: &ApplyOptions,
 ) -> crate::error::Result<OpOutcome> {
@@ -2253,6 +2259,11 @@ const STALE_PLAN_GONE: &str =
 /// refused. A row served from cache, or one without a strong `ETag`, stops the
 /// run: no write to it can be made conditional.
 ///
+/// A PluginConfig's `ETag` does not cover the proxy associations to it, which
+/// the gateway removes when it deletes or retargets the plugin. Those writes
+/// are also refused when a proxy outside the plan references the plugin (see
+/// [`Preconditions::refuse_unplanned_references`]).
+///
 /// Consumers compare complete verification with the raw evidence captured before
 /// allocation, including hidden fields and the original row token. Archival
 /// normalization is never substituted for this stored-state precondition.
@@ -2266,6 +2277,16 @@ struct Preconditions<'a> {
     /// rewrites proxy associations to them itself, so a proxy comparison
     /// leaves those associations, and only those, out.
     written_plugins: BTreeSet<String>,
+    /// For each PluginConfig id, the proxies the plan accounts for referencing
+    /// it: those the plan's live view showed referencing it and those the
+    /// repository declares referencing it.
+    planned_references: BTreeMap<String, BTreeSet<String>>,
+    /// Each PluginConfig's `(scope, proxy_id)` in the plan's live view.
+    planned_targets: HashMap<String, (PluginScope, Option<String>)>,
+    /// The rows of the latest `/backup` this namespace's writes read, keyed
+    /// like `planned`. One backup confirms every later single-row read of the
+    /// same stored version (see [`Preconditions::confirm_content`]).
+    confirmation: Option<HashMap<String, ObservedRow>>,
 }
 
 impl<'a> Preconditions<'a> {
@@ -2273,14 +2294,39 @@ impl<'a> Preconditions<'a> {
         client: &'a AdminClient,
         namespace: &'a str,
         planned: &GatewayConfig,
+        desired: &GatewayConfig,
         evidence: Option<&BTreeMap<String, ConsumerEvidence>>,
     ) -> crate::error::Result<Self> {
+        let declared = desired
+            .proxies
+            .iter()
+            .filter(|proxy| proxy.namespace == namespace);
+        let mut planned_references: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for proxy in planned.proxies.iter().chain(declared) {
+            for association in &proxy.plugins {
+                planned_references
+                    .entry(association.plugin_config_id.clone())
+                    .or_default()
+                    .insert(proxy.id.clone());
+            }
+        }
+        let planned_targets = planned
+            .plugin_configs
+            .iter()
+            .map(|plugin| {
+                let target = (plugin.scope.clone(), plugin.proxy_id.clone());
+                (plugin.id.clone(), target)
+            })
+            .collect();
         Ok(Self {
             client,
             namespace,
             planned: observe_rows(planned)?,
             consumer_evidence: evidence.cloned().unwrap_or_default(),
             written_plugins: BTreeSet::new(),
+            planned_references,
+            planned_targets,
+            confirmation: None,
         })
     }
 
@@ -2300,25 +2346,118 @@ impl<'a> Preconditions<'a> {
                 )?;
             }
         }
-        match self.confirm(resource.kind(), resource.id(), true).await? {
-            Some(etag) => resource
-                .update_if_match(self.client, self.namespace, &etag)
-                .await
-                .map(applied),
-            None => Err(crate::error::Error::StalePlan(STALE_PLAN_GONE.to_string())),
+        let Some(etag) = self.confirm(resource.kind(), resource.id(), true).await? else {
+            return Err(crate::error::Error::StalePlan(STALE_PLAN_GONE.to_string()));
+        };
+        if let CreateResource::PluginConfig(plugin) = resource {
+            if self.retargets(plugin) {
+                let kept = match plugin.scope {
+                    PluginScope::Proxy => plugin.proxy_id.as_deref(),
+                    _ => None,
+                };
+                self.refuse_unplanned_references(&plugin.id, kept).await?;
+            }
         }
+        resource
+            .update_if_match(self.client, self.namespace, &etag)
+            .await
+            .map(applied)
     }
 
     /// Send the planned delete of `kind`/`id` conditionally.
     async fn delete(&mut self, kind: &str, id: &str) -> crate::error::Result<OpOutcome> {
-        match self.confirm(kind, id, false).await? {
-            Some(etag) => self
-                .client
-                .delete_if_match(kind, id, self.namespace, &etag)
-                .await
-                .map(OpOutcome::from),
-            None => Ok(OpOutcome::AlreadyGone),
+        let Some(etag) = self.confirm(kind, id, false).await? else {
+            return Ok(OpOutcome::AlreadyGone);
+        };
+        if kind == "PluginConfig" {
+            self.refuse_unplanned_references(id, None).await?;
         }
+        self.client
+            .delete_if_match(kind, id, self.namespace, &etag)
+            .await
+            .map(OpOutcome::from)
+    }
+
+    /// Whether the planned update of `plugin` lets the gateway detach it from
+    /// proxies: Ferrum Edge keeps a `proxy` config associated only with its
+    /// target and a `global` config with none, and this update changes the
+    /// scope or target the plan saw. A `proxy_group` config keeps its
+    /// associations, and an unchanged scope and target detach nothing the
+    /// gateway would have let another proxy attach.
+    fn retargets(&self, plugin: &PluginConfig) -> bool {
+        plugin.scope != PluginScope::ProxyGroup
+            && self
+                .planned_targets
+                .get(&plugin.id)
+                .is_none_or(|(scope, proxy_id)| {
+                    *scope != plugin.scope || *proxy_id != plugin.proxy_id
+                })
+    }
+
+    /// Refuse a write that makes the gateway detach PluginConfig `id` from a
+    /// proxy the plan does not account for, other than `kept`, the target the
+    /// write keeps.
+    ///
+    /// Ferrum Edge's plugin-config `DELETE` removes every proxy association to
+    /// the plugin, and a `proxy` or `global` update removes every association
+    /// but its target. Those association rows are not covered by the plugin's
+    /// `ETag`, so `If-Match` cannot see a proxy that attached the plugin after
+    /// the plan, and the write would silently undo that attachment. So a
+    /// fresh `/backup`, read immediately before the write, lists the proxies
+    /// that reference the plugin now; any one neither the plan's live view nor
+    /// the repository showed referencing it refuses the write as
+    /// [`crate::error::Error::UnplannedPluginReference`].
+    ///
+    /// This narrows the race to the time between that read and the write; it
+    /// does not close it. A proxy that attaches the plugin in between is still
+    /// detached, because Edge offers no precondition on associations. Only a
+    /// gateway-side guard that refuses to delete or retarget a referenced
+    /// plugin config closes it.
+    async fn refuse_unplanned_references(
+        &mut self,
+        id: &str,
+        kept: Option<&str>,
+    ) -> crate::error::Result<()> {
+        let live = self.read_backup().await?;
+        let expected = self.planned_references.get(id);
+        let unplanned: Vec<String> = live
+            .proxies
+            .iter()
+            .filter(|proxy| {
+                proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == id)
+            })
+            .map(|proxy| proxy.id.as_str())
+            .filter(|proxy| Some(*proxy) != kept)
+            .filter(|proxy| !expected.is_some_and(|expected| expected.contains(*proxy)))
+            .map(|proxy| format!("`{proxy}`"))
+            .collect();
+        if unplanned.is_empty() {
+            return Ok(());
+        }
+        let noun = if unplanned.len() == 1 {
+            "proxy"
+        } else {
+            "proxies"
+        };
+        Err(crate::error::Error::UnplannedPluginReference(format!(
+            "not sent: the gateway would detach PluginConfig `{id}` from {noun} {}, which this run's plan and the repository do not show referencing it (most likely attached after the plan). Declare the reference in the repository to keep it, or re-run apply to accept detaching it",
+            unplanned.join(", ")
+        )))
+    }
+
+    /// Read the namespace's `/backup` and keep its rows as the confirmation
+    /// later single-row reads may reuse.
+    async fn read_backup(&mut self) -> crate::error::Result<GatewayConfig> {
+        let snapshot = self
+            .client
+            .get_backup_snapshot_for_mutation(self.namespace)
+            .await?;
+        ensure_authoritative_view(self.client)?;
+        self.confirmation = Some(observe_rows(&snapshot.config)?);
+        Ok(snapshot.config)
     }
 
     /// The tag to write `kind`/`id` with, or `None` when no row holds it.
@@ -2350,14 +2489,22 @@ impl<'a> Preconditions<'a> {
     /// plan judged; otherwise [`crate::error::Error::StalePlan`].
     ///
     /// The owner must match. The content is compared with the read first and,
-    /// only when that differs, with one `/backup` taken after the read. The
-    /// plan came from `/backup`, which Ferrum Edge normalizes on load, while
-    /// the read returns the row as stored, so a row stored before a
-    /// normalization rule existed reads differently without having changed.
-    /// The later backup shows any change made before it in the plan's own
-    /// form, and the `If-Match` write refuses any change made after the read.
+    /// only when that differs, with a `/backup` showing the stored version the
+    /// read returned. The plan came from `/backup`, which Ferrum Edge
+    /// normalizes on load, while the read returns the row as stored, so a row
+    /// stored before a normalization rule existed reads differently without
+    /// having changed. The backup shows the row in the plan's own form, and
+    /// the `If-Match` write refuses any change made after the read.
+    ///
+    /// The namespace's latest backup is reused while it shows the row with
+    /// the read's server `updated_at`, which Ferrum Edge advances on every
+    /// write to the row, including the association changes a plugin write
+    /// makes to a proxy: both then show the same stored version, so a
+    /// namespace with many such rows takes one backup, not one per row. Any
+    /// other read, such as one of a row written since that backup, takes a
+    /// fresh backup after the read.
     async fn confirm_content(
-        &self,
+        &mut self,
         kind: &str,
         id: &str,
         live: &ObservedRow,
@@ -2370,13 +2517,11 @@ impl<'a> Preconditions<'a> {
         if self.content_matches(kind, planned, live) {
             return Ok(());
         }
-        let snapshot = self
-            .client
-            .get_backup_snapshot_for_mutation(self.namespace)
-            .await?;
-        ensure_authoritative_view(self.client)?;
-        let confirmed = observe_rows(&snapshot.config)?;
-        let Some(row) = confirmed.get(&key) else {
+        if !self.confirmation_shows(&key, live) {
+            self.read_backup().await?;
+        }
+        let planned = self.planned.get(&key);
+        let Some(row) = self.confirmation.as_ref().and_then(|rows| rows.get(&key)) else {
             return Err(stale_plan_changed());
         };
         if let Some(reason) = ownership_refusal(planned, row) {
@@ -2386,6 +2531,17 @@ impl<'a> Preconditions<'a> {
             return Ok(());
         }
         Err(stale_plan_changed())
+    }
+
+    /// Whether the latest backup shows `key` at the stored version `live` was
+    /// read from: the same server `updated_at`.
+    fn confirmation_shows(&self, key: &str, live: &ObservedRow) -> bool {
+        live.updated_at.is_some()
+            && self
+                .confirmation
+                .as_ref()
+                .and_then(|rows| rows.get(key))
+                .is_some_and(|row| row.updated_at == live.updated_at)
     }
 
     /// Content equality apart from server timestamps and, for a proxy, the
@@ -2427,12 +2583,14 @@ impl<'a> Preconditions<'a> {
     }
 }
 
-/// One row's ownership tag and comparable content.
+/// One row's ownership tag, comparable content and stored version.
 struct ObservedRow {
     api_spec_id: Option<String>,
     /// [`comparison_value`]: the row without server timestamps, with
     /// association order normalized.
     value: serde_json::Value,
+    /// The row's server `updated_at`, which identifies its stored version.
+    updated_at: Option<serde_json::Value>,
 }
 
 /// `Some(reason)` when `live` gained, lost or changed its `api_spec_id`
@@ -2481,14 +2639,21 @@ fn observed_row<T: serde::Serialize>(
     api_spec_id: Option<&str>,
     row: &T,
 ) -> crate::error::Result<ObservedRow> {
-    let value = comparison_value(kind, row).ok_or_else(|| {
+    let unserializable = || {
         crate::error::Error::Config(format!(
             "a {kind} row could not be serialized for comparison"
         ))
-    })?;
+    };
+    let raw = serde_json::to_value(row).map_err(|_| unserializable())?;
+    let updated_at = raw
+        .get("updated_at")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let value = comparison_value(kind, &raw).ok_or_else(unserializable)?;
     Ok(ObservedRow {
         api_spec_id: api_spec_id.map(str::to_string),
         value,
+        updated_at,
     })
 }
 

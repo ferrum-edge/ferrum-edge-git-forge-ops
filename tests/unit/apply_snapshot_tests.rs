@@ -301,6 +301,12 @@ fn backup(config: &GatewayConfig) -> RecordingRoute {
     ("GET /backup".into(), 200, body, vec![])
 }
 
+/// Serve `config` as one `GET /backup`, so a later route answers the rest.
+fn once_backup(config: &GatewayConfig) -> RecordingRoute {
+    let body = serde_json::to_string(config).unwrap();
+    (format!("{ONCE}GET /backup"), 200, body, vec![])
+}
+
 /// The row `id` of `config` as JSON.
 fn row(kind: Kind, id: &str, config: &GatewayConfig) -> serde_json::Value {
     let document = serde_json::to_value(config).unwrap();
@@ -585,7 +591,9 @@ async fn every_overwrite_is_sent_with_the_etag_its_read_returned() {
                 "{context}: {sent}"
             );
             assert_eq!(run.result.applied_incremental.len(), 1, "{context}");
-            assert_eq!(run.backup_reads(), 0, "{context}");
+            // A plugin delete also reads which proxies reference it now.
+            let plugin_delete = matches!(kind, Kind::PluginConfig) && action == "delete";
+            assert_eq!(run.backup_reads(), usize::from(plugin_delete), "{context}");
         }
     }
 }
@@ -1377,6 +1385,7 @@ async fn moving_a_scoped_plugin_off_a_proxy_and_deleting_that_proxy_is_one_apply
         tagged(Kind::PluginConfig, "move", &planned, "\"move-tag\""),
         tagged(Kind::Proxy, "new", &after, "\"new-tag\""),
         tagged(Kind::Proxy, "old", &after, "\"old-tag\""),
+        backup(&planned),
     ];
 
     let run = apply_exclusive(&desired, planned, routes).await;
@@ -1391,7 +1400,11 @@ async fn moving_a_scoped_plugin_off_a_proxy_and_deleting_that_proxy_is_one_apply
     );
     let sent = run.request("DELETE /proxies/old");
     assert!(sent.contains("if-match: \"old-tag\"\r\n"), "{sent}");
-    assert_eq!(run.backup_reads(), 0);
+    // Retargeting reads which proxies reference `move` before the PUT: only
+    // `old`, which the plan saw, so the gateway may detach it.
+    assert_eq!(run.backup_reads(), 1);
+    let references = run.position("GET /backup ");
+    assert!(references < run.position("PUT /plugins/config/move"));
 }
 
 #[tokio::test]
@@ -1425,6 +1438,310 @@ async fn a_row_stored_unnormalized_is_written_once_a_backup_confirms_the_plan() 
             }
         }
     }
+}
+
+/// [`graph`]'s proxies plus PluginConfig `shared` with `scope` and, when
+/// set, `proxy_id`.
+fn with_shared_plugin(
+    proxies: &[(&str, &[&str])],
+    scope: &str,
+    target: Option<&str>,
+) -> GatewayConfig {
+    let mut config = graph(proxies, &[]);
+    let plugin = serde_json::json!({
+        "id": "shared",
+        "namespace": NS,
+        "plugin_name": "cors",
+        "config": {},
+        "scope": scope,
+        "proxy_id": target,
+    });
+    config
+        .plugin_configs
+        .push(serde_json::from_value(plugin).unwrap());
+    config
+}
+
+#[tokio::test]
+async fn a_plugin_delete_never_detaches_a_proxy_outside_the_plan() {
+    // Ferrum Edge removes every association to a deleted plugin config, and
+    // the plugin's ETag does not cover them: `q` attaching `shared` after the
+    // plan changes nothing the plugin's own read can see. `p1` is unmanaged
+    // and referenced `shared` in the plan, so detaching it is planned.
+    let planned = with_shared_plugin(&[("p1", &["shared"]), ("q", &[])], "proxy_group", None);
+    let desired = graph(&[("q", &[])], &[]);
+    for refused in [false, true] {
+        let context = format!("refused={refused}");
+        let q_attached: &[&str] = if refused { &["shared"] } else { &[] };
+        let live = with_shared_plugin(
+            &[("p1", &["shared"]), ("q", q_attached)],
+            "proxy_group",
+            None,
+        );
+        let routes = vec![
+            health(),
+            tagged(Kind::PluginConfig, "shared", &planned, TAG),
+            backup(&live),
+        ];
+        let mut options = ApplyOptions::default();
+        for (kind, id) in [("PluginConfig", "shared"), ("Proxy", "q")] {
+            options.managed_ledger.insert(state_key(NS, kind, id));
+        }
+
+        let run = apply(&desired, planned.clone(), routes, true, options).await;
+
+        // The references are read after the plugin's own conditional read.
+        let read = run.position("GET /plugins/config/shared ");
+        assert!(read < run.position("GET /backup "), "{context}");
+        assert_eq!(run.backup_reads(), 1, "{context}");
+        if refused {
+            assert_refused(&run, "from proxy `q`,", &context);
+            assert_starts(&run.result.errors, 0, "PluginConfig shared delete");
+            assert!(!run.result.errors[0].contains("`p1`"), "{context}");
+            assert_eq!(run.result.deleted, 0, "{context}");
+        } else {
+            assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
+            assert_eq!(run.mutations(), ["DELETE /plugins/config/shared HTTP/1.1"]);
+            let sent = run.request("DELETE /plugins/config/shared");
+            assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
+            assert_eq!(run.result.deleted, 1, "{context}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn retargeting_a_plugin_never_detaches_a_proxy_outside_the_plan() {
+    // A `proxy` update keeps only its target, so moving `shared` from
+    // `proxy_group` onto `p1` detaches every other proxy. `p1` is planned and
+    // kept; `q` attached it after the plan.
+    let planned = with_shared_plugin(&[("p1", &["shared"]), ("q", &[])], "proxy_group", None);
+    let desired = with_shared_plugin(&[("p1", &["shared"]), ("q", &[])], "proxy", Some("p1"));
+    for refused in [false, true] {
+        let context = format!("refused={refused}");
+        let q_attached: &[&str] = if refused { &["shared"] } else { &[] };
+        let live = with_shared_plugin(
+            &[("p1", &["shared"]), ("q", q_attached)],
+            "proxy_group",
+            None,
+        );
+        let routes = vec![
+            health(),
+            tagged(Kind::PluginConfig, "shared", &planned, TAG),
+            backup(&live),
+        ];
+
+        let run = apply_exclusive(&desired, planned.clone(), routes).await;
+
+        assert_eq!(run.backup_reads(), 1, "{context}");
+        if refused {
+            assert_refused(&run, "from proxy `q`,", &context);
+            assert_starts(&run.result.errors, 0, "PluginConfig shared update");
+        } else {
+            assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
+            assert_eq!(run.mutations(), ["PUT /plugins/config/shared HTTP/1.1"]);
+            let sent = run.request("PUT /plugins/config/shared");
+            assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
+            let references = run.position("GET /backup ");
+            assert!(references < run.position("PUT /plugins/config/shared"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_plugin_delete_spares_a_proxy_the_repository_declares_referencing_it() {
+    // The plan's live view never showed `q`, but the repository declares it
+    // referencing `shared`, so the delete must not refuse.
+    let planned = with_shared_plugin(&[], "proxy_group", None);
+    let desired = graph(&[("q", &["shared"])], &[]);
+    let live = with_shared_plugin(&[("q", &["shared"])], "proxy_group", None);
+    let routes = vec![
+        health(),
+        tagged(Kind::PluginConfig, "shared", &planned, TAG),
+        backup(&live),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert!(run.result.errors.is_empty(), "{:?}", run.result);
+    assert_eq!(
+        run.mutations(),
+        [
+            "POST /proxies HTTP/1.1",
+            "DELETE /plugins/config/shared HTTP/1.1",
+        ]
+    );
+    assert_eq!(run.backup_reads(), 1);
+}
+
+#[tokio::test]
+async fn retargeting_a_plugin_spares_the_kept_target_absent_from_the_plan() {
+    // `shared` moves onto `new`, which the plan's live view never showed. The
+    // fresh backup lists `new` referencing `shared`, but the update keeps `new`
+    // as its target, so it must not refuse.
+    let planned = with_shared_plugin(&[], "proxy_group", None);
+    let desired = with_shared_plugin(&[], "proxy", Some("new"));
+    let live = with_shared_plugin(&[("new", &["shared"])], "proxy_group", None);
+    let routes = vec![
+        health(),
+        tagged(Kind::PluginConfig, "shared", &planned, TAG),
+        backup(&live),
+    ];
+
+    let run = apply(&desired, planned, routes, true, Default::default()).await;
+
+    assert_eq!(run.mutations(), ["PUT /plugins/config/shared HTTP/1.1"]);
+    assert!(run.result.errors.is_empty(), "{:?}", run.result);
+    assert_eq!(run.backup_reads(), 1);
+}
+
+#[tokio::test]
+async fn an_update_that_keeps_a_plugins_scope_and_target_takes_no_reference_read() {
+    // Changing only an ordinary field leaves the `proxy` scope and target
+    // alone, so another proxy cannot have validly attached it and the guard
+    // read is unnecessary.
+    let planned = with_shared_plugin(&[("p1", &["shared"])], "proxy", Some("p1"));
+    let desired = with_optional_addition(Kind::PluginConfig, &planned);
+    let routes = vec![
+        health(),
+        tagged(Kind::PluginConfig, "shared", &planned, TAG),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert!(run.result.errors.is_empty(), "{:?}", run.result);
+    assert_eq!(run.mutations(), ["PUT /plugins/config/shared HTTP/1.1"]);
+    assert_eq!(run.backup_reads(), 0);
+}
+
+/// [`upstreams`], each row stored at server `updated_at` `stamp`.
+fn stamped_upstreams(rows: &[(&str, u16)], stamp: &str) -> GatewayConfig {
+    let mut config = serde_json::to_value(upstreams(rows)).unwrap();
+    for row in config["upstreams"].as_array_mut().unwrap() {
+        row["updated_at"] = serde_json::json!(stamp);
+    }
+    serde_json::from_value(config).unwrap()
+}
+
+#[tokio::test]
+async fn one_backup_confirms_every_unnormalized_row_it_shows_at_the_read_version() {
+    // Three rows read differently from the plan only because they are stored
+    // unnormalized. The first takes a backup, read after its single-row read;
+    // the others reuse it, because it shows each at the `updated_at` its read
+    // returned. A later read at another version (a row rewritten since the
+    // backup) takes its own fresh backup, which shows every row at that
+    // version: no served backup is older than the read it answers.
+    const PLANNED_AT: &str = "2026-10-06T00:00:00Z";
+    let ids = [("u1", 1), ("u2", 1), ("u3", 1)];
+    let planned = stamped_upstreams(&ids, PLANNED_AT);
+    let desired = upstreams(&[("u1", 2), ("u2", 2), ("u3", 2)]);
+    let versions = [
+        [PLANNED_AT, PLANNED_AT, PLANNED_AT],
+        [
+            "2026-10-06T00:00:01Z",
+            "2026-10-06T00:00:02Z",
+            "2026-10-06T00:00:03Z",
+        ],
+    ];
+    for (versions, backups) in versions.iter().zip([1, 3]) {
+        let mut routes = vec![health()];
+        for (index, &(id, _)) in ids.iter().enumerate() {
+            let stamp = versions[index];
+            routes.push(tagged(
+                Kind::Upstream,
+                id,
+                &stamped_upstreams(&[(id, 9)], stamp),
+                TAG,
+            ));
+            let snapshot = stamped_upstreams(&ids, stamp);
+            // All but the last are answered once, so the next read can take a
+            // fresh backup at its own version.
+            routes.push(if index + 1 == ids.len() {
+                backup(&snapshot)
+            } else {
+                once_backup(&snapshot)
+            });
+        }
+
+        let run = apply_exclusive(&desired, planned.clone(), routes).await;
+
+        assert!(
+            run.result.errors.is_empty(),
+            "{versions:?}: {:?}",
+            run.result
+        );
+        assert_eq!(
+            run.mutations(),
+            [
+                "PUT /upstreams/u1 HTTP/1.1",
+                "PUT /upstreams/u2 HTTP/1.1",
+                "PUT /upstreams/u3 HTTP/1.1",
+            ],
+            "{versions:?}"
+        );
+        assert_eq!(run.backup_reads(), backups, "{versions:?}");
+        let first_read = run.position("GET /upstreams/u1 ");
+        assert!(first_read < run.position("GET /backup "), "{versions:?}");
+    }
+}
+
+/// `config` with every proxy row stamped at server `updated_at` `stamp`.
+fn stamped_proxies(config: &GatewayConfig, stamp: &str) -> GatewayConfig {
+    let mut value = serde_json::to_value(config).unwrap();
+    for row in value["proxies"].as_array_mut().unwrap() {
+        row["updated_at"] = serde_json::json!(stamp);
+    }
+    serde_json::from_value(value).unwrap()
+}
+
+#[tokio::test]
+async fn a_proxy_read_after_this_runs_plugin_write_takes_a_fresh_backup() {
+    // `shared` moves from `p1` onto `p2`, which makes the gateway bump both
+    // proxies' `updated_at`. A concurrent edit to `p1` forces its proxy read
+    // down the confirmation path, and the guard's pre-write backup no longer
+    // matches the read, so the cache is not reused: a fresh backup is taken and
+    // the stale plan is refused instead of overwriting the concurrent edit.
+    const PLANNED_AT: &str = "2026-10-06T00:00:00Z";
+    const AFTER_AT: &str = "2026-10-06T00:00:01Z";
+    let planned = stamped_proxies(
+        &with_shared_plugin(&[("p1", &["shared"]), ("p2", &[])], "proxy", Some("p1")),
+        PLANNED_AT,
+    );
+    let desired = with_shared_plugin(&[("p1", &[]), ("p2", &["shared"])], "proxy", Some("p2"));
+    let mut after = with_shared_plugin(&[("p1", &[]), ("p2", &["shared"])], "proxy", Some("p2"));
+    for proxy in &mut after.proxies {
+        if proxy.id == "p1" {
+            proxy.backend_port = 2;
+        }
+    }
+    let after = stamped_proxies(&after, AFTER_AT);
+    let routes = vec![
+        health(),
+        tagged(Kind::PluginConfig, "shared", &planned, TAG),
+        once_backup(&planned),
+        tagged(Kind::Proxy, "p1", &after, TAG),
+        backup(&after),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert_eq!(run.backup_reads(), 2);
+    let plugin_put = run.position("PUT /plugins/config/shared");
+    let backups_after = run
+        .requests
+        .iter()
+        .skip(plugin_put + 1)
+        .filter(|request| request.starts_with("GET /backup "))
+        .count();
+    assert_eq!(backups_after, 1);
+    assert_eq!(run.count("PUT /proxies/p1"), 0);
+    assert!(
+        run.result
+            .errors
+            .iter()
+            .any(|error| error.contains(CHANGED)),
+        "{:?}",
+        run.result.errors
+    );
 }
 
 #[tokio::test]

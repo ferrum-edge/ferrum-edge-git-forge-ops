@@ -150,6 +150,16 @@ pub enum Error {
     #[error("{}", safe_block(.0))]
     StalePlan(String),
 
+    /// A PluginConfig delete, or an update that moves its scope or target,
+    /// would make the gateway detach the plugin from a proxy that neither the
+    /// plan's live view nor the repository showed referencing it: most likely
+    /// one that attached it after the plan. Association rows are outside the
+    /// plugin's `ETag`, so `If-Match` cannot refuse this. Nothing was written,
+    /// and the namespace's remaining writes are withheld, as for
+    /// [`Error::StalePlan`].
+    #[error("{}", safe_block(.0))]
+    UnplannedPluginReference(String),
+
     /// Authoritative consumer evidence or a coherent namespace snapshot is
     /// unavailable, malformed, cached, unsealed, or lacks a matching strong token.
     /// No write can be made conditional on the exact state this run validated.
