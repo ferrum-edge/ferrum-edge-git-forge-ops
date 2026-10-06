@@ -112,10 +112,18 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "echo x >> \"$GITHUB_E\\NV\"",
             'echo x >> "$GITHUB_E\\\nNV"',
             "echo x >> $'GITHUB_ENV'",
-            "echo x >> $'GITHUB_\\x45NV'",
-            "echo x >> $'GITHUB_\\105NV'",
-            "echo x >> $'GITHUB_\\u0045NV'",
-            "echo x >> \"$RUNNER_TEMP\"/$'_runner_file_\\x63ommands'/x",
+            # Outside quotes Bash reads `\\U` as `U`; plain stripping does too,
+            # with or without a `$'` elsewhere in the scalar.
+            'echo x >> "$(printenv GITH\\UB_ENV)"',
+            "# $'\necho X >> \"$(printenv GITH\\UB_ENV)\"",
+            'echo x >> "$(printenv GITH\\UB_ENV)"; : $\'x\'',
+            'echo "$PWD/bin" >> "$(printenv GITH\\UB_PATH)"',
+            "# $'\necho X >> \"$(printenv GITH\\UB_PATH)\"",
+            'p=$(printenv GITH\\UB_OUTPUT); echo X=1 >> "${p/output/env}"',
+            "# $'\np=$(printenv GITH\\UB_OUTPUT); echo X=1 >> \"${p/output/env}\"",
+            'echo x >> "$(printenv GITH\\UB_STATE)"',
+            "# $'\necho x >> \"$GITH\\UB_STATE\"",
+            'echo x >> "$RUNNER_TEMP"/_runner_file_\\commands/x',
             "echo x | tee -a $GITHUB_ENV",
             'echo x | tee -a "$GITHUB_PATH"',
             "printf '%s\\n' \"$PWD/bin\" > \"$GITHUB_PATH\"",
@@ -371,29 +379,56 @@ class SupplyChainPolicyTests(unittest.TestCase):
         for text in (
             "GITHUB_ENV", 'GITHUB_""ENV', "GITHUB_''ENV", "GITHUB_E\\NV", "GITHUB_E\\\nNV",
             "$'GITHUB_ENV'", 'GITHUB_E$""NV', "github_env", "Github_Env",
-            "$'GITHUB_\\x45NV'", "$'GITHUB_\\x45'NV", "$'GITHUB_\\105NV'",
-            "$'GITHUB_\\u0045NV'", "$'GITHUB_\\U00000045NV'", "$'\\x47\\x49'THUB_ENV",
+            "GITH\\UB_ENV", "# $'\nGITH\\UB_ENV", "$'' GITH\\UB_ENV",
         ):
             with self.subTest(text=text):
                 self.assertIn("github_env", check_supply_chain._scan_text(text))
 
-    def test_scan_text_decodes_ansi_c_escapes(self):
+    def test_scan_text_strips_escapes_without_decoding(self):
         scan = check_supply_chain._scan_text
-        for text in (
-            "$'\\x67'itforgeops", "$'\\147'itforgeops", "$'\\u0067'itforgeops",
-            "$'\\U00000067'itforgeops", "$'\\x47itForgeOps'",
-            # Any `$'` in a scalar decodes every numeric escape in it.
-            "$'' \\x67itforgeops",
-        ):
-            with self.subTest(text=text):
-                self.assertTrue(check_supply_chain._GITFORGEOPS_WORD.search(scan(text)))
-        # A decoded control character ends a name and splits no line.
-        for escape in ("\\012", "\\x0a", "\\u000A", "\\cJ", "\\0", "\\x7f"):
-            with self.subTest(escape=escape):
-                self.assertEqual(scan(f"$'{escape}'"), "\ufffd")
-        self.assertEqual(scan("$'\\U00110000'"), "\ufffd")
-        # Without `$'`, Bash reads an escaped `x` as a literal.
-        self.assertEqual(scan("\\x67itforgeops"), "x67itforgeops")
+        # Escapes are stripped, never decoded, whether or not `$'` appears.
+        self.assertEqual(scan("$'\\x67'itforgeops"), "x67itforgeops")
+        self.assertEqual(scan("# $'\nprintenv GITH\\UB_ENV"), "# \nprintenv github_env")
+        self.assertEqual(scan("_runner_file_\\commands"), "_runner_file_commands")
+
+    def test_ansi_c_quoting_is_refused_in_every_workflow(self):
+        refused = "ANSI-C quoting (`$'...'`) is not supported"
+        scripts = (
+            "echo x >> $'GITHUB_\\x45NV'",
+            "echo x >> $'GITHUB_\\105NV'",
+            "echo x >> $'GITHUB_\\u0045NV'",
+            "echo x >> $'GIT\\x48'\\UB_ENV",
+            "echo x >> \"$RUNNER_TEMP\"/$'_runner_file_\\x63ommands'/x",
+            "$'\\x67'itforgeops apply --auto-approve",
+            "# $'\necho X >> \"$(printenv GITH\\UB_ENV)\"",
+            # Fail closed without a lexer: a plain quoted `$` before a quote
+            # and a `$` continued onto a quote are refused too.
+            "echo '$''x'",
+            "echo $\\\n'x'",
+        )
+        for workflow in self._shipped_workflows():
+            for script in scripts:
+                with self.subTest(workflow=workflow, script=script):
+                    document = self._probe_document(workflow)
+                    self._first_steps(document).insert(0, {"name": "Quoted", "run": script})
+                    violations = check_supply_chain.workflow_channel_violations(
+                        workflow, document
+                    )
+                    self.assertTrue(any(refused in item for item in violations), violations)
+            with self.subTest(workflow=workflow, key="env"):
+                document = self._probe_document(workflow)
+                self._first_steps(document).insert(
+                    0, {"name": "Quoted", "env": {"VALUE": "$'\\x41'"}, "run": "true"}
+                )
+                violations = check_supply_chain.workflow_channel_violations(workflow, document)
+                self.assertTrue(any(refused in item for item in violations), violations)
+        for script in ('echo "$x"', "echo '$x'", 'echo $"x"', "echo \"it's $HOME\""):
+            with self.subTest(allowed=script):
+                workflow = ".github/workflows/rust-ci.yml"
+                document = self._probe_document(workflow)
+                self._first_steps(document).insert(0, {"name": "Quoted", "run": script})
+                violations = check_supply_chain.workflow_channel_violations(workflow, document)
+                self.assertFalse(any(refused in item for item in violations), violations)
 
     def test_program_level_writes_are_out_of_scope(self):
         # The fence reads workflow text. A command that computes the channel
@@ -844,6 +879,19 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     any("protected variable references/rebinding" in item for item in violations),
                     violations,
                 )
+        # A name spelled by character code is refused by the protected-name
+        # fence itself, not decoded.
+        document = self._probe_document(workflow)
+        document["jobs"]["list-envs"]["steps"].insert(
+            0, {"run": "export $'FERRUM_NAMESP\\x41CE'=other"}
+        )
+        violations = check_supply_chain.guarded_environment_violations(
+            workflow, document, (), check_supply_chain.protected_environment_names(workflow)
+        )
+        self.assertTrue(
+            any("ANSI-C quoting (`$'...'`) is not supported" in item for item in violations),
+            violations,
+        )
         workflow = ".github/workflows/trusted-pr-review.yml"
         document = self._probe_document(workflow)
         review = self._step(document, "live-review", "Post trusted live review")
@@ -896,18 +944,30 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "gitforgeops export --materialize",
             "gitforgeops version",
             "# gitforgeops apply --auto-approve\ntrue",
-            # Bash ANSI-C quoting spells the name by character code.
-            "$'\\x67'itforgeops apply --auto-approve",
-            "$'\\147'itforgeops apply --auto-approve",
-            "$'\\u0067itforgeops' apply --auto-approve",
-            "gitforgeops validate$'\\012'apply --auto-approve",
-            "gitforgeops validate$'\\n'apply --auto-approve",
         ):
             with self.subTest(write=script):
                 document = self._probe_document(workflow)
                 document["jobs"]["list-envs"]["steps"].insert(0, {"run": script})
                 self.assertTrue(any(
                     "mutations may only run" in item
+                    for item in check_supply_chain.probe_validation_gate_violations(
+                        workflow, document
+                    )
+                ))
+        # Bash ANSI-C quoting spells the name by character code. No rule
+        # decodes it, so any `$'` is refused.
+        for script in (
+            "$'\\x67'itforgeops apply --auto-approve",
+            "$'\\147'itforgeops apply --auto-approve",
+            "$'\\u0067itforgeops' apply --auto-approve",
+            "gitforgeops validate$'\\012'apply --auto-approve",
+            "gitforgeops validate$'\\n'apply --auto-approve",
+        ):
+            with self.subTest(ansi_c=script):
+                document = self._probe_document(workflow)
+                document["jobs"]["list-envs"]["steps"].insert(0, {"run": script})
+                self.assertTrue(any(
+                    "ANSI-C quoting (`$'...'`) is not supported" in item
                     for item in check_supply_chain.probe_validation_gate_violations(
                         workflow, document
                     )
@@ -1103,6 +1163,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
         for workflow, steps, expected in (
             (rust, '    - shell: bash\n      run: |\n        echo X=1 >> "$GITHUB_ENV"\n',
              self.HANDOFF_FENCE),
+            (rust, "    - shell: bash\n      run: |\n        echo x >> $'GITHUB_\\x45NV'\n",
+             "ANSI-C quoting"),
             (rust, "    - shell: bash\n      env:\n        SHELLOPTS: xtrace\n"
                    "      run: echo hello\n", "shell startup or loader variable"),
             (rust, "    - shell: bash\n      env:\n        BASH_FUNC_x: '() { true; }'\n"
@@ -1208,6 +1270,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
     def test_container_and_service_options_are_refused(self):
         refused = "container options are forbidden"
         computed = "never computed"
+        unpinned = "must be pinned by digest"
+        digest = "@sha256:" + "0" * 64
         for workflow in self._shipped_workflows():
             with self.subTest(workflow=workflow):
                 self.assertEqual(
@@ -1226,6 +1290,15 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 ("services", "${{ fromJSON(vars.SERVICES) }}", computed),
                 ("services", {"db": "${{ fromJSON(vars.DB) }}"}, computed),
                 ("container", ["alpine"], computed),
+                ("container", "alpine", unpinned),
+                ("container", "alpine:3.20", unpinned),
+                ("container", {"image": "alpine", "env": {"A": "b"}}, unpinned),
+                ("container", {"env": {"A": "b"}}, unpinned),
+                ("container", {"image": "alpine" + digest, "Image": "alpine"}, unpinned),
+                ("container", {"image": "alpine@sha256:" + "A" * 64}, unpinned),
+                ("container", {"image": "${{ vars.IMAGE }}" + digest}, unpinned),
+                ("services", {"cache": "redis"}, unpinned),
+                ("services", {"db": {"image": "postgres:16", "ports": ["5432:5432"]}}, unpinned),
             ):
                 with self.subTest(workflow=workflow, key=key, value=value):
                     document = self._probe_document(workflow)
@@ -1240,10 +1313,11 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     self.assertTrue(any(expected in item for item in violations), violations)
         workflow = ".github/workflows/rust-ci.yml"
         for key, value in (
-            ("container", "alpine"),
-            ("container", {"image": "alpine", "env": {"A": "b"}}),
-            ("services", {"db": {"image": "postgres", "ports": ["5432:5432"]}}),
-            ("services", {"cache": "redis"}),
+            ("container", "alpine" + digest),
+            ("container", {"image": "alpine:3.20" + digest, "env": {"A": "b"}}),
+            ("Container", {"Image": "ghcr.io/acme/tool" + digest}),
+            ("services", {"db": {"image": "postgres" + digest, "ports": ["5432:5432"]}}),
+            ("services", {"cache": "redis" + digest}),
         ):
             with self.subTest(allowed=value):
                 document = self._probe_document(workflow)

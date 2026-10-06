@@ -2679,9 +2679,10 @@ def workflow_action_references(document: dict) -> list[str]:
 # variable that a later step inherits without naming it there. The runner
 # keeps every file-command file of a step in `_runner_file_commands`, named by
 # command prefix plus one shared suffix, so `set_env_` and `add_path_` (and
-# `save_state_`) spell GITHUB_ENV and GITHUB_PATH by another name.
+# `save_state_`) spell GITHUB_ENV and GITHUB_PATH by another name. GITHUB_STATE
+# names the `save_state_` file, and no step here needs it.
 _FILE_CHANNEL = re.compile(
-    r"github_env|github_path|bash_env"
+    r"github_env|github_path|github_state|bash_env"
     r"|_runner_file_commands|set_env_|add_path_|save_state_"
     r"|\bgithub\s*(?:\.\s*(?:env|path|output)\b|\[\s*(?:env|path|output)\s*\])"
 )
@@ -2728,41 +2729,33 @@ _GITFORGEOPS_WORD = re.compile(r"(?<![\w.-])gitforgeops(?![\w/\[-])(?!\):)")
 
 
 # Bash ANSI-C quoting spells a character by its code: `$'\x67'itforgeops` is
-# `gitforgeops` and `$'GITHUB_\x45NV'` is `GITHUB_ENV`. In a scalar that uses
-# `$'` at all, every numeric or control escape is decoded wherever it sits.
-# Decoding one that Bash reads literally can only find more names, and a
-# decoded control character becomes U+FFFD, which ends a name and splits no line.
-_ANSI_C_ESCAPE = re.compile(
-    r"\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3})|c(.))",
-    re.DOTALL,
+# `gitforgeops` and `$'GITHUB_\x45NV'` is `GITHUB_ENV`. Reading that needs a
+# quote-state lexer, which #476 removed: outside quotes Bash reads
+# `GITH\UB_ENV` as `GITHUB_ENV`, so decoding escapes outside a real `$'...'`
+# span hides names that plain stripping finds. ANSI-C quoting is therefore not
+# supported in workflows or the local actions they run: a scalar holding `$'`
+# is refused, and `_scan_text` only strips quotes and backslashes.
+_ANSI_C_QUOTING_REFUSAL = (
+    "ANSI-C quoting (`$'...'`) is not supported in workflows or the local actions "
+    "they run; it spells names by character code that no text rule decodes"
 )
 
 
-def _decode_ansi_c_escape(match: re.Match[str]) -> str:
-    hexadecimal = match.group(1) or match.group(2) or match.group(3)
-    if hexadecimal is not None:
-        code = int(hexadecimal, 16)
-    elif match.group(4) is not None:
-        code = int(match.group(4), 8) & 0xFF
-    else:
-        code = ord(match.group(5)) & 0x1F
-    if code < 0x20 or code == 0x7F or code > 0x10FFFF:
-        return "\ufffd"
-    return chr(code)
+def _uses_ansi_c_quoting(text: str) -> bool:
+    """Whether Bash can read `$'` in `text` once line continuations are joined."""
+    return "$'" in text.replace("\\\n", "")
 
 
 def _scan_text(text: str) -> str:
     """Casefolded text with quotes, escapes and line continuations removed.
 
-    Bash reads `GITHUB_""ENV`, `GITHUB_E\\NV`, `$'GITHUB_ENV'`,
-    `$'GITHUB_\\x45NV'` and a name split by a backslash-newline as the same
-    word, so every text rule judges this form. A name computed by expansion
-    (`GITHUB_E${x}NV`) is program behavior.
+    Bash reads `GITHUB_""ENV`, `GITHUB_E\\NV`, `$'GITHUB_ENV'` and a name split
+    by a backslash-newline as the same word, so every text rule judges this
+    form. Escapes are stripped, never decoded; a scalar that uses ANSI-C
+    quoting is refused instead (`_uses_ansi_c_quoting`). A name computed by
+    expansion (`GITHUB_E${x}NV`) is program behavior.
     """
-    text = text.replace("\\\n", "")
-    if "$'" in text:
-        text = _ANSI_C_ESCAPE.sub(_decode_ansi_c_escape, text)
-    text = text.replace("$'", "'").replace('$"', '"')
+    text = text.replace("\\\n", "").replace("$'", "'").replace('$"', '"')
     return text.translate(str.maketrans("", "", "'\"\\")).casefold()
 
 
@@ -2843,13 +2836,14 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
     """No workflow may write or rebind an env-file channel, except the pinned hand-off.
 
     Every key and scalar of every workflow is judged in `_scan_text` form, and
-    shell comments count: GITHUB_ENV, GITHUB_PATH and BASH_ENV through quotes,
-    backslashes, line continuations and ANSI-C escapes (a name computed by
+    shell comments count: GITHUB_ENV, GITHUB_PATH, GITHUB_STATE and BASH_ENV
+    through quotes, backslashes and line continuations (a name computed by
     expansion is program behavior), the runner's file-command file names, the
     `github.env`/`github.path` contexts, a redirect or `tee` into any
     `$GITHUB_*` file other than GITHUB_OUTPUT and GITHUB_STEP_SUMMARY, any use
     of those two other than as a plain append or `tee -a` target (or the
-    summary as a `--summary` argument), and indirect expansion. An `env:`
+    summary as a `--summary` argument), indirect expansion, and ANSI-C
+    quoting (`$'`), which spells a name by character code. An `env:`
     mapping may not be computed, nor bind a shell startup or loader variable
     (`_ENV_DESTINATION_KEYS`, `BASH_FUNC_*`, `LD_*`) or a GitHub file
     destination.
@@ -2877,10 +2871,10 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
             or _OUTPUT_FILE.search(_PLAIN_OUTPUT_TARGET.sub("", scan))
         ):
             violations.append(
-                f"{label}: GITHUB_ENV, GITHUB_PATH, BASH_ENV, runner file-command names, "
-                "writes to other GitHub file channels, and GITHUB_OUTPUT or "
-                "GITHUB_STEP_SUMMARY other than as a plain `>>` or `tee -a` target are "
-                "forbidden outside the pinned credential hand-off"
+                f"{label}: GITHUB_ENV, GITHUB_PATH, GITHUB_STATE, BASH_ENV, runner "
+                "file-command names, writes to other GitHub file channels, and "
+                "GITHUB_OUTPUT or GITHUB_STEP_SUMMARY other than as a plain `>>` or "
+                "`tee -a` target are forbidden outside the pinned credential hand-off"
                 + (f" ({handoff})" if handoff else "")
             )
         if _INDIRECT_EXPANSION.search(scan):
@@ -2888,6 +2882,8 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
                 f"{label}: indirect expansion (`${{!name}}`) is forbidden; it reads a "
                 "name no rule saw spelled"
             )
+        if _uses_ansi_c_quoting(value):
+            violations.append(f"{label}: {_ANSI_C_QUOTING_REFUSAL}")
         if "${{" in WORKFLOW_EXPRESSION.sub("", value):
             violations.append(f"{label}: unrecognized GitHub expression syntax is forbidden")
         expressions = list(WORKFLOW_EXPRESSION.finditer(value))
@@ -2953,14 +2949,20 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
     return violations
 
 
+# A container image's own `ENV` (LD_PRELOAD, BASH_ENV, ...) applies to every
+# step of its job, as `options:` would, so the image is pinned like an action.
+_DIGEST_PINNED_IMAGE = re.compile(r"[^\s@${}]+@sha256:[0-9a-f]{64}")
+
+
 def container_options_violations(workflow: str, document: dict) -> list[str]:
-    """Job and service containers take no `options:` and are not computed.
+    """Job and service containers are digest-pinned, take no `options:` and are not computed.
 
     `options` is a `docker create` command line: `-e`, `--env` and
     `--env-file` bind the startup and loader variables an `env:` mapping may
     not (`LD_PRELOAD`, `SHELLOPTS`, `PS4`, ...) for every step of a container
-    job, and no other option is needed by any workflow here. A computed
-    container or service mapping could carry the same options unseen.
+    job, and no other option is needed by any workflow here. An image's own
+    `ENV` has the same reach, so the image is pinned by `@sha256:` digest. A
+    computed container or service mapping could carry either unseen.
     """
     violations: list[str] = []
     jobs = document.get("jobs")
@@ -2987,10 +2989,20 @@ def container_options_violations(workflow: str, document: dict) -> list[str]:
                         "`-e`/`--env`/`--env-file` bind startup and loader variables "
                         "for every step"
                     )
-            elif not isinstance(container, str) or "${{" in container:
+                images = [value for key, value in container.items() if key.casefold() == "image"]
+                image = images[0] if len(images) == 1 else None
+            elif isinstance(container, str) and "${{" not in container:
+                image = container
+            else:
                 violations.append(
                     f"{workflow}: {path}: a container or service must be a literal "
                     "image or mapping, never computed"
+                )
+                continue
+            if not isinstance(image, str) or _DIGEST_PINNED_IMAGE.fullmatch(image) is None:
+                violations.append(
+                    f"{workflow}: {path}: a container or service image must be pinned by "
+                    "digest (`@sha256:<64 hex>`); its own ENV applies to every step"
                 )
     return violations
 
@@ -3122,9 +3134,10 @@ def guarded_environment_violations(
     its exact bindings. A protected name may appear nowhere else: not as a key
     in any other mapping (workflow or job env, another step, `with:`), and not
     in any scalar, in `_scan_text` form, including run scripts and their
-    comments. Verify traffic may read FERRUM_ENV only through its pinned
-    script. Dynamic env maps and env-file writes, the other ways to bind a
-    name without spelling it, are `workflow_channel_violations`.
+    comments, and no scalar may use ANSI-C quoting. Verify traffic may read
+    FERRUM_ENV only through its pinned script. Dynamic env maps and env-file
+    writes, the other ways to bind a name without spelling it, are
+    `workflow_channel_violations`.
     """
     violations: list[str] = []
     allowed: dict[int, dict] = {}
@@ -3155,6 +3168,8 @@ def guarded_environment_violations(
     )
 
     def check(value: str, label: str, verify_run: bool = False) -> None:
+        if _uses_ansi_c_quoting(value):
+            violations.append(f"{label}: {_ANSI_C_QUOTING_REFUSAL}")
         scan = _scan_text(value)
         if verify_run:
             scan = re.sub(r"\bferrum_env\b", "", scan)
@@ -3336,7 +3351,8 @@ def gitforgeops_scalar_violations(label: str, document, guarded: set[int]) -> li
     read-only lines; any other scalar may name it only as a pinned display
     name, which runs nothing. Only the `name:` of the workflow (or local
     action), a job or a step is a display name; an action input or env value
-    called `name` is not.
+    called `name` is not. No scalar may use ANSI-C quoting, which spells the
+    name by character code.
     """
     violations: list[str] = []
     read_only = {_scan_text(line) for line in READ_ONLY_GITFORGEOPS_LINES}
@@ -3368,6 +3384,8 @@ def gitforgeops_scalar_violations(label: str, document, guarded: set[int]) -> li
             for index, item in enumerate(node):
                 visit(item, f"{path}[{index}]", key)
         elif isinstance(node, str):
+            if _uses_ansi_c_quoting(node):
+                violations.append(f"{label}: {path}: {_ANSI_C_QUOTING_REFUSAL}")
             scan = _scan_text(node)
             if _GITFORGEOPS_WORD.search(scan) and not permitted(key, scan, owner):
                 violations.append(
