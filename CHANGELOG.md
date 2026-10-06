@@ -149,6 +149,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Harden the trusted supply-chain checker. The strict workflow reader refuses
+  folded block scalars (`>`, `>-`, `>+`) for every key except `if`: it joined
+  folded lines with spaces where YAML keeps line breaks, so a folded `run:`
+  could hide an env-file write behind a `#`. Every file in
+  `.github/workflows/` must end in exactly `.yml` or `.yaml`. The required
+  `security-cargo-audit` job is pinned by its parsed shape (job keys, every
+  step, the exact trusted `run:` scripts; action commits and the Rust
+  toolchain stay with their own rules), and `security.yml` may not set a
+  workflow-level `env:` or `defaults:`, so a commented-out, skipped or
+  swallowed audit command no longer passes. No job may be keyed or named like
+  any required context (`state-guard-reject-state-edits` included) except that
+  context's own job. Shipped workflows that folded a `run:` or `description:`
+  now spell the same value on one line. Template repositories must rewrite
+  their own folded scalars outside `if:` as literal (`|`) or one-line scalars;
+  a copy with a customized `security-cargo-audit` job, a workflow-level `env:`
+  or `defaults:` in `security.yml`, or an extra `security.yml` trigger (such as
+  `workflow_dispatch`) now fails the checker too.
 - Fail closed on ambiguous consumer verification 404s and remove unconditional update/delete methods.
 - Complete the cargo-audit installer rotation to reviewed v2.87.22 commit
   `83ac0ad63c0167e6f06796fab0fce28db1bf3db0` after #465, retiring v2.87.20 while

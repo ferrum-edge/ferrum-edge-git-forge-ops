@@ -27,9 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       github_acceptance:
-        description: >-
-          Sealed lifecycle-result.json from the GitHub acceptance path, as JSON.
-          Fills only this run's skipped scenarios, attributed to you.
+        description: Sealed lifecycle-result.json from the GitHub acceptance path, as JSON. Fills only this run's skipped scenarios, attributed to you.
         required: false
         default: ''
 

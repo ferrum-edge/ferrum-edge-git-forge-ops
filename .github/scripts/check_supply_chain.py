@@ -525,6 +525,30 @@ def action_files(root: Path) -> list[Path]:
     )
 
 
+WORKFLOW_SUFFIXES = (".yml", ".yaml")
+
+
+def workflow_extension_violations(root: Path) -> list[str]:
+    """Every file in `.github/workflows/` must end in exactly `.yml` or `.yaml`.
+
+    The rules judge what `action_files` globs, and the glob is case-sensitive
+    on the Linux runner, so a workflow spelled `x.YML` or `x.Yaml` would skip
+    every rule here. Any other name in that directory is refused as well
+    rather than guessed at: nothing but reviewed workflows belongs there.
+    Subdirectories are not workflows and are left alone.
+    """
+    workflows = root / ".github" / "workflows"
+    if workflows.is_symlink() or not workflows.is_dir():
+        return []
+    return [
+        f"{path.relative_to(root).as_posix()}: a workflow file must end in exactly "
+        "`.yml` or `.yaml`; any other spelling would skip every supply-chain rule"
+        for path in sorted(workflows.iterdir())
+        if (path.is_symlink() or not path.is_dir())
+        and not path.name.endswith(WORKFLOW_SUFFIXES)
+    ]
+
+
 def mentions_secret(text: str, reference: str) -> bool:
     """Case-insensitive substring test for a `secrets.<NAME>` reference.
 
@@ -1645,6 +1669,69 @@ def security_push_trigger_violations(text: str) -> list[str]:
     return violations
 
 
+# The exact triggers `security.yml` may carry. `security-cargo-audit` and
+# `security-supply-chain-policy` are required contexts defined by the pull
+# request's own copy of this workflow, and every pinned job switches on
+# `github.event_name`. An added trigger — `workflow_dispatch:` above all —
+# would run that candidate copy outside `pull_request`, take the `else` branch
+# and post a second result under a required check name from a run no rule
+# reviewed. So the trigger list is part of the pinned shape.
+SECURITY_TRIGGERS = ("pull_request", "push", "schedule")
+SECURITY_PULL_REQUEST_SHAPE = {
+    "types": ["opened", "synchronize", "reopened", "edited"],
+    "branches": ["main"],
+}
+SECURITY_PUSH_BRANCHES = ["main"]
+
+
+def security_trigger_violations(text: str) -> list[str]:
+    """`security.yml` may run on exactly the reviewed triggers.
+
+    Read from the strict workflow reader, so the checked list is the one the
+    runner acts on. The required `security-cargo-audit` and
+    `security-supply-chain-policy` jobs switch on `github.event_name`, so an
+    extra trigger would run the candidate's own copy of the workflow on an
+    event this policy never reviewed and post another check run under the
+    required name. Pin the key set, the pull request types and branch, and the
+    push branch.
+    """
+    try:
+        document = parse_workflow(text)
+    except WorkflowSyntaxError as error:
+        return [
+            "security.yml: the trigger list must be in the YAML subset the "
+            f"policy reads: {error}"
+        ]
+    candidates = [value for key, value in document.items() if key.casefold() == "on"]
+    if len(candidates) != 1 or not isinstance(candidates[0], dict):
+        return ["security.yml: the workflow must declare exactly one `on:` mapping"]
+    triggers = candidates[0]
+    violations: list[str] = []
+    for found in triggers:
+        if found.casefold() not in {name.casefold() for name in SECURITY_TRIGGERS}:
+            violations.append(
+                f"security.yml: the trigger {found!r} is not reviewed; the only "
+                f"reviewed triggers are {', '.join(SECURITY_TRIGGERS)}"
+            )
+    spelled = {found.casefold(): found for found in triggers}
+    for name in SECURITY_TRIGGERS:
+        if name.casefold() not in spelled:
+            violations.append(f"security.yml: the reviewed trigger {name!r} is missing")
+    pull_request = triggers.get(spelled.get("pull_request", ""))
+    if pull_request is not None and pull_request != SECURITY_PULL_REQUEST_SHAPE:
+        violations.append(
+            "security.yml: pull_request must keep its reviewed types and branch; "
+            f"expected {SECURITY_PULL_REQUEST_SHAPE!r}, found {pull_request!r}"
+        )
+    push = triggers.get(spelled.get("push", ""))
+    if isinstance(push, dict) and push.get("branches") != SECURITY_PUSH_BRANCHES:
+        violations.append(
+            "security.yml: push must keep its reviewed branch; "
+            f"expected {SECURITY_PUSH_BRANCHES!r}, found {push.get('branches')!r}"
+        )
+    return violations
+
+
 def allowlisted_validator_digests(text: str) -> list[str]:
     """Return every approved validator digest, in file order."""
     digests: list[str] = []
@@ -2022,7 +2109,7 @@ def _link_traversal(root: Path, path: Path, target: str) -> str | None:
 # - keys are plain `[A-Za-z0-9_-]+` and unique within their mapping;
 # - scalars are plain, single-quoted or double-quoted, each on one line;
 # - a block scalar (`|` or `>`, optional `-`/`+`) only as the value of a key in
-#   `BLOCK_SCALAR_KEYS`;
+#   `BLOCK_SCALAR_KEYS`, and a folded one (`>`) only under `FOLDED_SCALAR_KEYS`;
 # - a one-line flow sequence of scalars only as the value of a key in
 #   `FLOW_SEQUENCE_KEYS` (`branches: [main]`); never a flow mapping;
 # - nowhere: anchors, aliases, tags, explicit keys, merge keys, directives,
@@ -2037,6 +2124,13 @@ class WorkflowSyntaxError(ValueError):
 BLOCK_SCALAR_KEYS = frozenset(
     {"run", "script", "body", "description", "if", "path", "restore-keys", "images", "tags"}
 )
+# A folded scalar (`>`, `>-`, `>+`) only as the value of these keys. YAML keeps
+# a line break around a blank or more-indented line of a folded scalar, and
+# this reader joins every line with one space, so for `run:` the policy would
+# read one shell line where bash runs several: `echo ok #`, a blank line, then
+# an env-file write is a comment here and a command on the runner. An `if:`
+# expression reads the same either way and runs no shell.
+FOLDED_SCALAR_KEYS = frozenset({"if"})
 FLOW_SEQUENCE_KEYS = frozenset(
     {
         "branches",
@@ -2176,6 +2270,11 @@ class _WorkflowReader:
                 self.fail(f"a block scalar is not accepted as the value of {key!r}")
             if _cut_comment(rest) not in _BLOCK_SCALAR_HEADERS:
                 self.fail("a block scalar header must be one of | |- |+ > >- >+")
+            if rest[0] == ">" and key not in FOLDED_SCALAR_KEYS:
+                self.fail(
+                    f"a folded block scalar (`>`) is not accepted as the value of {key!r}; "
+                    "use a literal block scalar (`|`)"
+                )
             self.index += 1
             return self.block_scalar(indent, folded=rest[0] == ">")
         if rest[0] == "[":
@@ -3415,22 +3514,50 @@ def monitoring_jwt_binding_violations(workflow: str, document: dict) -> list[str
     )
 
 
+# Every launch-required status check context, with the one workflow whose job
+# of the same key reports it. These are `audit_settings.REQUIRED_STATUS_CHECKS`,
+# which `bootstrap_repo_settings.py` writes into the `main` ruleset; a test keeps
+# the two in step, because this checker imports nothing from the tree it judges.
+REQUIRED_CHECK_WORKFLOWS = {
+    "rust-ci-check": ".github/workflows/rust-ci.yml",
+    "security-cargo-audit": ".github/workflows/security.yml",
+    "security-supply-chain-policy": ".github/workflows/security.yml",
+    SUPPLY_CHAIN_POLICY_JOB: SUPPLY_CHAIN_POLICY_PATH,
+    "state-guard-reject-state-edits": ".github/workflows/state-guard.yml",
+    "gitforgeops-required-static-validation": ".github/workflows/validate-pr.yml",
+}
+
+
+def _impersonated_check(workflow: str, job_id: str, spelled: str) -> str | None:
+    """The required context `spelled` names, unless this is that context's own job."""
+    context = spelled.strip().casefold()
+    home = REQUIRED_CHECK_WORKFLOWS.get(context)
+    if home is None or (workflow == home and job_id == context):
+        return None
+    return context
+
+
 def policy_check_impersonation_violations(workflow: str, document: dict) -> list[str]:
-    """Only the protected policy workflow may report `trusted-supply-chain-policy`.
+    """Only a required check's own job may report its context.
 
     A ruleset requires a check by name, and a check run is named by its job's
     key or its `name:`. A candidate's `pull_request` workflows run its own
-    definitions, so a job keyed or named like the trusted one would put a
-    second, candidate-defined result under the required name. Read from the
-    parsed workflow: no job key and no job `name:` may equal the context (in
-    any case, ignoring surrounding whitespace), and no job `name:` may be
-    computed with `${{ }}`. A matrix suffix or a reusable workflow's
-    `caller / callee` form can never equal it.
+    definitions, so a job keyed or named like a required one would put a
+    second, candidate-defined result under the required name. For
+    `trusted-supply-chain-policy` and `state-guard-reject-state-edits`, which
+    come from `pull_request_target` workflows the pull request cannot edit,
+    that second result would come from code no protected definition reviewed.
+    Read from the parsed workflow: no job key and no job `name:` may equal a
+    context in `REQUIRED_CHECK_WORKFLOWS` (in any case, ignoring surrounding
+    whitespace) except the job keyed by that context in its own workflow, and
+    no job `name:` may be computed with `${{ }}`. A matrix suffix or a reusable
+    workflow's `caller / callee` form can never equal a context.
+
+    This is defense in depth. How branch protection resolves two check runs
+    with one name is not established (docs/github-launch-controls.md).
 
     `workflow` is the path relative to the repository root.
     """
-    if workflow == SUPPLY_CHAIN_POLICY_PATH:
-        return []
     violations: list[str] = []
     for jobs in (value for key, value in document.items() if key.casefold() == "jobs"):
         if jobs is None:
@@ -3440,14 +3567,10 @@ def policy_check_impersonation_violations(workflow: str, document: dict) -> list
             continue
         for job_id, job in jobs.items():
             label = f"{workflow}: job {job_id!r}"
-            if job_id.casefold() == SUPPLY_CHAIN_POLICY_JOB:
-                violations.append(
-                    f"{label}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may define the "
-                    f"{SUPPLY_CHAIN_POLICY_JOB!r} check"
-                )
+            claimed = [_impersonated_check(workflow, job_id, job_id)]
             if not isinstance(job, dict):
                 violations.append(f"{label}: a job must be a mapping")
-                continue
+                job = {}
             for key, name in job.items():
                 if key.casefold() != "name" or name is None:
                     continue
@@ -3456,14 +3579,17 @@ def policy_check_impersonation_violations(workflow: str, document: dict) -> list
                 elif "${{" in name:
                     violations.append(
                         f"{label}: a job display name must be a literal, so no "
-                        f"workflow can compute the {SUPPLY_CHAIN_POLICY_JOB!r} "
-                        f"check name; found {name!r}"
+                        "workflow can compute a required check name; "
+                        f"found {name!r}"
                     )
-                elif name.strip().casefold() == SUPPLY_CHAIN_POLICY_JOB:
-                    violations.append(
-                        f"{label}: only {SUPPLY_CHAIN_POLICY_WORKFLOW} may define the "
-                        f"{SUPPLY_CHAIN_POLICY_JOB!r} check"
-                    )
+                else:
+                    claimed.append(_impersonated_check(workflow, job_id, name))
+            for context in dict.fromkeys(item for item in claimed if item is not None):
+                home = REQUIRED_CHECK_WORKFLOWS[context].rsplit("/", 1)[-1]
+                violations.append(
+                    f"{label}: only job {context!r} of {home} may define the "
+                    f"{context!r} check"
+                )
     return violations
 
 
@@ -3509,6 +3635,154 @@ def status_write_permission_violations(workflow: str, document: dict) -> list[st
     return violations
 
 
+CARGO_AUDIT_JOB = "security-cargo-audit"
+# Stands in for the toolchain, which `rust_toolchain_violations` pins per step.
+PINNED_RUST_TOOLCHAIN = "<rust toolchain>"
+# The parsed `security-cargo-audit` job. It is a required check defined by the
+# pull request itself, so substrings anywhere in the file prove nothing: `true`
+# with the trusted command commented out below it, an `exit 0` or `|| true`
+# around it, a skipped or failure-tolerant step, an added step or a job-level
+# `env:`/`defaults:` (`BASH_ENV`, another shell) all keep every substring and
+# report success. Exact rather than substring, like
+# `SUPPLY_CHAIN_POLICY_SHAPE`: only action commits (the repository-wide rule
+# and `CARGO_AUDIT_ACTIONS` judge them) and the toolchain are free.
+CARGO_AUDIT_JOB_SHAPE = {
+    "runs-on": "ubuntu-24.04",
+    "permissions": {"contents": "read"},
+    "steps": [
+        {
+            "uses": f"actions/checkout@{PINNED_ACTION_COMMIT}",
+            "with": {"persist-credentials": "false"},
+        },
+        {
+            "name": "Check out trusted cargo-audit policy",
+            "if": "github.event_name == 'pull_request'",
+            "uses": f"actions/checkout@{PINNED_ACTION_COMMIT}",
+            "with": {
+                "ref": "${{ github.event.repository.default_branch }}",
+                "path": "trusted-cargo-audit",
+                "persist-credentials": "false",
+            },
+        },
+        {
+            "name": "Install Rust toolchain",
+            "uses": f"dtolnay/rust-toolchain@{PINNED_ACTION_COMMIT}",
+            "with": {"toolchain": PINNED_RUST_TOOLCHAIN},
+        },
+        {
+            "name": "Install cargo-audit",
+            "uses": f"taiki-e/install-action@{PINNED_ACTION_COMMIT}",
+            "with": {"tool": "cargo-audit@0.22.1", "checksum": "true", "fallback": "none"},
+        },
+        {
+            "name": "Test audit policy gate",
+            "env": {"EVENT_NAME": "${{ github.event_name }}"},
+            "run": "\n".join(
+                (
+                    'if [ "$EVENT_NAME" = pull_request ]; then',
+                    "  python3 trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
+                    "else",
+                    "  python3 .github/scripts/tests/test_check_cargo_audit.py",
+                    "fi",
+                )
+            ),
+        },
+        {
+            "name": "Enforce cargo audit policy",
+            "env": {"EVENT_NAME": "${{ github.event_name }}"},
+            "run": "\n".join(
+                (
+                    'if [ "$EVENT_NAME" = pull_request ]; then',
+                    "  python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\",
+                    "    --policy trusted-cargo-audit/.github/cargo-audit-policy.json \\",
+                    '    --source-root "$GITHUB_WORKSPACE"',
+                    "else",
+                    "  python3 .github/scripts/check_cargo_audit.py",
+                    "fi",
+                )
+            ),
+        },
+    ],
+}
+_PINNED_USES_VALUE = re.compile(r"([^@\s]+)@[0-9a-f]{40}")
+# Workflow-level keys that reach every job's shell.
+_SHELL_REACHING_WORKFLOW_KEYS = ("env", "defaults")
+
+
+def _normalized_cargo_audit_step(step):
+    """A parsed step with its action commit and toolchain made placeholders."""
+    if not isinstance(step, dict):
+        return step
+    uses = step.get("uses")
+    match = _PINNED_USES_VALUE.fullmatch(uses) if isinstance(uses, str) else None
+    if match is None:
+        return step
+    step = {**step, "uses": f"{match.group(1)}@{PINNED_ACTION_COMMIT}"}
+    with_inputs = step.get("with")
+    if (
+        match.group(1) == "dtolnay/rust-toolchain"
+        and isinstance(with_inputs, dict)
+        and "toolchain" in with_inputs
+    ):
+        step["with"] = {**with_inputs, "toolchain": PINNED_RUST_TOOLCHAIN}
+    return step
+
+
+def cargo_audit_job_shape_violations(text: str) -> list[str]:
+    """The required `security-cargo-audit` job must keep its reviewed, parsed shape.
+
+    Read from the strict workflow reader, so a comment is never a command and
+    a command is never hidden in a comment. Workflow-level `env:` and
+    `defaults:` are refused too: they reach this job's shell without appearing
+    in it.
+    """
+    try:
+        document = parse_workflow(text)
+    except WorkflowSyntaxError as error:
+        return [
+            "security.yml: the cargo-audit gate must be in the YAML subset the "
+            f"policy reads: {error}"
+        ]
+    violations = [
+        f"security.yml: workflow-level {key!r} reaches the required {CARGO_AUDIT_JOB!r} "
+        "job's shell (a startup file, another shell or working directory); the "
+        "workflow must not set it"
+        for key in document
+        if key.casefold() in _SHELL_REACHING_WORKFLOW_KEYS
+    ]
+    jobs = document.get("jobs")
+    job = jobs.get(CARGO_AUDIT_JOB) if isinstance(jobs, dict) else None
+    if not isinstance(job, dict):
+        violations.append(f"security.yml: the required {CARGO_AUDIT_JOB!r} job is missing")
+        return violations
+    for key in sorted(set(job) | set(CARGO_AUDIT_JOB_SHAPE)):
+        if key != "steps" and job.get(key) != CARGO_AUDIT_JOB_SHAPE.get(key):
+            violations.append(
+                f"security.yml: {CARGO_AUDIT_JOB} must keep its reviewed job keys; "
+                f"{key!r} should be {CARGO_AUDIT_JOB_SHAPE.get(key)!r}, "
+                f"found {job.get(key)!r}"
+            )
+    steps = job.get("steps")
+    found_steps = (
+        [_normalized_cargo_audit_step(step) for step in steps]
+        if isinstance(steps, list)
+        else []
+    )
+    expected_steps = CARGO_AUDIT_JOB_SHAPE["steps"]
+    for index in range(max(len(found_steps), len(expected_steps))):
+        found = found_steps[index] if index < len(found_steps) else "<end of steps>"
+        wanted = expected_steps[index] if index < len(expected_steps) else "<end of steps>"
+        if found != wanted:
+            violations.append(
+                f"security.yml: {CARGO_AUDIT_JOB} must keep its reviewed steps (the "
+                "trusted checker, its tests and exception policy on pull requests; "
+                "no commented-out, skipped, swallowed or added command); step "
+                f"{index + 1} should be {wanted!r}, found {found!r}"
+            )
+            break
+    return violations
+
+
 def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
     """The dependency gate must run `main`'s checker against `main`'s exceptions.
 
@@ -3517,13 +3791,15 @@ def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
     cargo-audit exception *and* delete the trusted checkout that stops the
     exception from counting — and the gate would report success. The trusted
     supply-chain runner reads the candidate's copy of `security.yml`, which is
-    the only place an assertion about it can be enforced.
+    the only place an assertion about it can be enforced. The parsed job is
+    pinned by `cargo_audit_job_shape_violations`; the substring checks below
+    keep their specific messages.
 
     Push and schedule runs keep executing the tree's own checker: there is no
     untrusted author there, and pinning them to the default branch would stop
     a merged policy change from ever taking effect.
     """
-    violations: list[str] = []
+    violations = cargo_audit_job_shape_violations(text)
 
     checkout = named_step(text, "Check out trusted cargo-audit policy")
     if checkout is None:
@@ -3717,10 +3993,11 @@ def main(argv: list[str] | None = None) -> int:
     root = args.root.resolve()
     workflows = root / ".github" / "workflows"
     checked_action_files = action_files(root)
-    # Every workflow must be in the YAML subset the structural rules read,
-    # before any rule runs (GHSA-x5m2-4555-q4cr).
+    # Every workflow must be spelled so the rules find it, and be in the YAML
+    # subset the structural rules read, before any rule runs
+    # (GHSA-x5m2-4555-q4cr).
     workflow_documents: dict[str, dict] = {}
-    syntax_violations: list[str] = []
+    syntax_violations = workflow_extension_violations(root)
     for workflow in checked_action_files:
         if workflow.parent != workflows:
             continue
@@ -4109,6 +4386,7 @@ def main(argv: list[str] | None = None) -> int:
     violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
     violations.extend(cargo_audit_install_violations(security_workflow))
     violations.extend(security_push_trigger_violations(security_workflow))
+    violations.extend(security_trigger_violations(security_workflow))
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     if 'result=$(python3 "$helper"' not in state_guard:
         violations.append(

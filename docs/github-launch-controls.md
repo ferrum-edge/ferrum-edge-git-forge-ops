@@ -599,14 +599,22 @@ What the checker enforces for this check:
   runs the tree at the workspace root, executes the pull request's own copy.
   Links that stay inside the tree are allowed. A `--root` that is itself a
   link is refused.
-- **Workflow syntax.** Every file in `.github/workflows/` must be written in
-  a small YAML subset, read by a strict standard-library reader before any
-  rule runs. A file outside it fails the check on its own. The subset:
+- **Workflow syntax.** Every file in `.github/workflows/` must end in exactly
+  `.yml` or `.yaml`; the rules find workflows by a case-sensitive glob, so a
+  `.YML` or `.Yaml` file would skip all of them. Every workflow must be
+  written in a small YAML subset, read by a strict standard-library reader
+  before any rule runs. A file outside it fails the check on its own. The
+  subset:
   - top-level keys at column 0, space indentation only, block mappings and
     block sequences, and plain `[A-Za-z0-9_-]+` keys, unique per mapping;
   - plain, single-quoted or double-quoted scalars on one line;
-  - block scalars (`|`, `>`) only for `run`, `script`, `body`, `description`,
-    `if`, `path`, `restore-keys`, `images` and `tags`;
+  - literal block scalars (`|`) only for `run`, `script`, `body`,
+    `description`, `if`, `path`, `restore-keys`, `images` and `tags`, and
+    folded ones (`>`, `>-`, `>+`) only for `if`. YAML keeps line breaks
+    around blank and more-indented lines of a folded scalar, and the reader
+    joins its lines with spaces, so a folded `run:` would show the rules one
+    shell line where Bash runs several: a trailing `#` would hide the next
+    command from the policy;
   - one-line flow sequences of scalars only for `branches`, `tags`, `paths`
     (and their `-ignore` forms), `types`, `needs` and `workflows`.
 
@@ -616,11 +624,41 @@ What the checker enforces for this check:
   breaks are all refused. YAML spells one key many ways. The rules below read
   the parsed structure, so a spelling the reader does not accept cannot carry
   a meaning past it.
-- **The check name.** No other workflow may define a job whose key or
-  `name:` equals `trusted-supply-chain-policy` (in any case, ignoring
-  surrounding whitespace), and no job's `name:` may be computed with
-  `${{ }}`. Mentioning the context in a script, a step title or an action
-  input is fine, since none of those names a check run.
+- **The check name.** No job may have a key or `name:` equal to a required
+  context (in any case, ignoring surrounding whitespace) except the job keyed
+  by that context in its own workflow: `trusted-supply-chain-policy` in
+  `supply-chain-policy.yml`, `state-guard-reject-state-edits` in
+  `state-guard.yml`, and likewise `rust-ci-check`, `security-cargo-audit`,
+  `security-supply-chain-policy` and `gitforgeops-required-static-validation`
+  (`REQUIRED_CHECK_WORKFLOWS`, kept equal to the bootstrap's
+  `REQUIRED_STATUS_CHECKS` by a test). No job's `name:` may be computed with
+  `${{ }}`. Mentioning a context in a script, a step title or an action input
+  is fine, since none of those names a check run.
+
+  This rule is defense in depth, not the boundary. How branch protection
+  resolves two check runs with the same name from the same app (the newest
+  wins, any failure blocks, or every run must pass) has not been verified. A
+  follow-up issue will run that experiment in a sandbox repository and, if a
+  duplicate can satisfy the rule, enforce the context by workflow path as
+  well. The GitHub Actions app binding does not help here, since a
+  candidate's own `pull_request` job also reports through that app; until
+  then exact-head review of every workflow change carries the guarantee.
+- **The cargo-audit gate.** `security-cargo-audit` is required but defined by
+  the pull request's own `security.yml`, so substrings anywhere in that file
+  prove nothing: the trusted command can sit in a comment under a `true`, or
+  behind `exit 0` or `|| true`. The parsed job is pinned instead: its keys,
+  every step in order, and the exact `run:` scripts that run the protected
+  branch's cargo-audit checker, its tests and its exception list. Only the
+  action commits and the Rust toolchain (pinned by their own rules) are free.
+  A workflow-level `env:` or `defaults:` in `security.yml` is refused, since
+  either reaches the job's shell without appearing in it. The pinned shape
+  also fixes `runs-on: ubuntu-24.04`, and `security.yml`'s `on:` triggers are
+  pinned to the reviewed events (the `pull_request` types and branch, the
+  `push` branch and the `schedule`): a runner-image bump or an added trigger
+  such as `workflow_dispatch` — which could post a second
+  `security-cargo-audit` result from a candidate copy run outside
+  `pull_request` — needs a checker PR first, the same two-PR pattern as the
+  action pins.
 - **Status forgery.** At every `permissions:` in every workflow, `checks` and
   `statuses` may only be `read` or `none`, and a string grant must be
   `read-all` (`write-all` grants both). With write access, a job could post
