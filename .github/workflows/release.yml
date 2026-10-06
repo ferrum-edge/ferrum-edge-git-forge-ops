@@ -517,9 +517,7 @@ jobs:
           fi
 
       - name: Verify and record immutable build inputs
-        run: >-
-          python3 .github/scripts/check_supply_chain.py
-          --write-manifest supply-chain-inputs.json
+        run: python3 .github/scripts/check_supply_chain.py --write-manifest supply-chain-inputs.json
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4

@@ -2044,6 +2044,140 @@ class SupplyChainPolicyTests(unittest.TestCase):
             any("--source-root" in item for item in violations), violations
         )
 
+    def test_cargo_audit_gate_pins_its_parsed_job_shape(self):
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(check_supply_chain.cargo_audit_job_shape_violations(workflow), [])
+        enforce = (
+            "      - name: Enforce cargo audit policy\n"
+            "        env:\n"
+            "          EVENT_NAME: ${{ github.event_name }}\n"
+            "        run: |\n"
+        )
+        trusted_enforce = (
+            "            python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\\n"
+            "              --policy trusted-cargo-audit/.github/cargo-audit-policy.json \\\n"
+            '              --source-root "$GITHUB_WORKSPACE"\n'
+        )
+        trusted_tests = (
+            "            python3 trusted-cargo-audit/.github/scripts/tests/"
+            "test_check_cargo_audit.py\n"
+        )
+        job = "  security-cargo-audit:\n    runs-on: ubuntu-24.04\n"
+        for anchor in (enforce, trusted_enforce, trusted_tests, job, "\njobs:\n"):
+            self.assertEqual(workflow.count(anchor), 1, anchor)
+        commented = "".join(
+            "            # " + line.lstrip(" ") + "\n"
+            for line in trusted_enforce.splitlines()
+        )
+        refused = {
+            # Every required substring survives in a comment under `true`.
+            "commented_enforcement": (trusted_enforce, "            true\n" + commented),
+            "commented_tests": (
+                trusted_tests, "            true # " + trusted_tests.lstrip(" ")
+            ),
+            "early_exit": (enforce, enforce + "          exit 0\n"),
+            "swallowed_failure": (
+                '--source-root "$GITHUB_WORKSPACE"\n',
+                '--source-root "$GITHUB_WORKSPACE" || true\n',
+            ),
+            "skipped_step": (
+                enforce, enforce.replace("        env:\n", "        if: false\n        env:\n", 1)
+            ),
+            "tolerated_step": (
+                enforce,
+                enforce.replace("        env:\n", "        continue-on-error: true\n        env:\n", 1),
+            ),
+            "alternate_shell": (
+                enforce, enforce.replace("        env:\n", "        shell: 'true {0}'\n        env:\n", 1)
+            ),
+            "step_startup_file": (
+                enforce,
+                enforce.replace(
+                    "          EVENT_NAME:", "          BASH_ENV: ./startup.sh\n          EVENT_NAME:", 1
+                ),
+            ),
+            "added_step": (
+                enforce,
+                "      - name: Replace trusted checker\n"
+                "        run: cp /dev/null trusted-cargo-audit/.github/scripts/check_cargo_audit.py\n"
+                "\n" + enforce,
+            ),
+            "skipped_job": (job, job + "    if: false\n"),
+            "tolerated_job": (job, job + "    continue-on-error: true\n"),
+            "renamed_job": (job, job + "    name: cargo-audit\n"),
+            "job_startup_file": (job, job + "    env:\n      BASH_ENV: ./startup.sh\n"),
+            "job_shell": (job, job + "    defaults:\n      run:\n        shell: 'true {0}'\n"),
+            "workflow_startup_file": (
+                "\njobs:\n", "\nenv:\n  BASH_ENV: ./startup.sh\n\njobs:\n"
+            ),
+            "workflow_shell": (
+                "\njobs:\n", "\ndefaults:\n  run:\n    shell: 'true {0}'\n\njobs:\n"
+            ),
+        }
+        required = (
+            "python3 trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
+            "python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py",
+            "--policy trusted-cargo-audit/.github/cargo-audit-policy.json",
+            '--source-root "$GITHUB_WORKSPACE"',
+        )
+        for label, (old, new) in refused.items():
+            with self.subTest(label=label):
+                changed = workflow.replace(old, new, 1)
+                self.assertNotEqual(changed, workflow)
+                # The substring contract alone accepts each of these.
+                for item in required:
+                    self.assertIn(item, changed)
+                self.assertTrue(check_supply_chain.cargo_audit_job_shape_violations(changed))
+                self.assertTrue(
+                    check_supply_chain.trusted_cargo_audit_policy_violations(changed)
+                )
+
+    def test_cargo_audit_job_shape_leaves_commits_and_toolchain_to_their_own_rules(self):
+        workflow = (ROOT / ".github/workflows/security.yml").read_text(
+            encoding="utf-8"
+        )
+        job = check_supply_chain.workflow_job(workflow, "security-cargo-audit")
+        self.assertIn("toolchain: 1.98.0", job)
+        bumped_job = re.sub(r"@[0-9a-f]{40}", "@" + "a" * 40, job).replace(
+            "toolchain: 1.98.0", "toolchain: 1.99.0"
+        )
+        self.assertNotEqual(bumped_job, job)
+        bumped = workflow.replace(job, bumped_job, 1)
+        self.assertEqual(check_supply_chain.cargo_audit_job_shape_violations(bumped), [])
+        # Each free part still answers to its own rule.
+        self.assertTrue(check_supply_chain.cargo_audit_install_violations(bumped))
+        self.assertTrue(check_supply_chain.rust_toolchain_violations("security.yml", bumped))
+
+    def test_cargo_audit_comment_bypass_is_refused_by_the_trusted_checker(self):
+        trusted = (
+            "            python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self._mirror_repo(Path(temporary))
+            path = root / ".github/workflows/security.yml"
+            workflow = path.read_text(encoding="utf-8")
+            self.assertEqual(workflow.count(trusted), 1)
+            path.write_text(
+                workflow.replace(trusted, "            true\n            # " + trusted.lstrip(" "), 1),
+                encoding="utf-8",
+            )
+            # The candidate's own checker cannot approve the bypass.
+            (root / ".github/scripts/check_supply_chain.py").write_text(
+                "raise SystemExit(0)\n", encoding="utf-8"
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith(
+                    "security.yml: security-cargo-audit must keep its reviewed steps"
+                )
+                for item in violations
+            ),
+            violations,
+        )
+
     def test_root_override_checks_the_selected_repository(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2726,6 +2860,104 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 self._syntax_error(text)
         self.assertIsInstance(check_supply_chain.parse_workflow(base), dict)
 
+    # `echo ok #`, a blank line, then an env-file write. YAML folding keeps the
+    # line break around the blank line, so bash runs the write; a reader that
+    # joins folded lines with spaces would show the policy one commented line.
+    HIDDEN_ENV_WRITE = (
+        "      - run: {}\n"
+        "          echo ok #\n"
+        "\n"
+        '          echo "BASH_ENV=/tmp/x" >> "$GITHUB_ENV"\n'
+    )
+
+    def test_the_reader_refuses_folded_scalars_except_for_if(self):
+        base = self.SUBSET_WORKFLOW
+        for header in (">", ">-", ">+", "> # comment"):
+            with self.subTest(header=header):
+                text = base.replace("      - run: true\n", self.HIDDEN_ENV_WRITE.format(header))
+                self.assertNotEqual(text, base)
+                self.assertIn("folded block scalar", self._syntax_error(text))
+        for key in ("description", "script", "body", "path", "restore-keys", "images", "tags"):
+            with self.subTest(key=key):
+                text = base.replace(
+                    "      - run: true\n",
+                    "      - uses: actions/checkout@" + "0" * 40 + "\n"
+                    "        with:\n"
+                    f"          {key}: >-\n"
+                    "            x\n",
+                )
+                self.assertIn("folded block scalar", self._syntax_error(text))
+
+        # A literal block scalar keeps every line, so the rules read what bash runs.
+        literal = base.replace("      - run: true\n", self.HIDDEN_ENV_WRITE.format("|"))
+        self.assertEqual(
+            check_supply_chain.parse_workflow(literal)["jobs"]["build"]["steps"],
+            [{"run": 'echo ok #\n\necho "BASH_ENV=/tmp/x" >> "$GITHUB_ENV"'}],
+        )
+        # An `if:` expression may still fold: it runs no shell.
+        conditional = base.replace(
+            "    runs-on: ubuntu-24.04\n",
+            "    if: >-\n      always() &&\n      success()\n    runs-on: ubuntu-24.04\n",
+        )
+        self.assertEqual(
+            check_supply_chain.parse_workflow(conditional)["jobs"]["build"]["if"],
+            "always() && success()",
+        )
+
+    def test_a_folded_run_hiding_an_env_file_write_stops_the_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            (root / ".github/workflows/impostor.yml").write_text(
+                self.SUBSET_WORKFLOW.replace(
+                    "      - run: true\n", self.HIDDEN_ENV_WRITE.format(">")
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertEqual(len(violations), 1, violations)
+        self.assertTrue(
+            violations[0].startswith(
+                ".github/workflows/impostor.yml: workflow is outside the YAML subset"
+            ),
+            violations,
+        )
+        self.assertIn("folded block scalar", violations[0])
+
+    def test_workflow_files_must_use_an_exact_yml_or_yaml_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflows = root / ".github/workflows"
+            # A subdirectory holds no workflow GitHub loads.
+            (workflows / "nested.YML").mkdir(parents=True)
+            for name in ("a.yml", "b.yaml", "c.YML", "d.Yaml", "e.yml.disabled", "README.md"):
+                (workflows / name).write_text(self.SUBSET_WORKFLOW, encoding="utf-8")
+            self.assertEqual(
+                check_supply_chain.workflow_extension_violations(root),
+                [
+                    f".github/workflows/{name}: a workflow file must end in exactly "
+                    "`.yml` or `.yaml`; any other spelling would skip every supply-chain rule"
+                    for name in ("README.md", "c.YML", "d.Yaml", "e.yml.disabled")
+                ],
+            )
+
+    def test_a_case_variant_workflow_extension_stops_the_check(self):
+        # The impostor would report the trusted check; under a case-variant
+        # extension the case-sensitive glob never hands it to that rule.
+        impostor = self.SUBSET_WORKFLOW.replace("  build:\n", "  trusted-supply-chain-policy:\n")
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            for name in ("impostor.YML", "impostor2.Yaml"):
+                (root / ".github/workflows" / name).write_text(impostor, encoding="utf-8")
+            violations = self._violations(root)
+        self.assertEqual(
+            violations,
+            [
+                f".github/workflows/{name}: a workflow file must end in exactly "
+                "`.yml` or `.yaml`; any other spelling would skip every supply-chain rule"
+                for name in ("impostor.YML", "impostor2.Yaml")
+            ],
+        )
+
     def test_a_workflow_outside_the_subset_stops_the_check(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
@@ -2823,6 +3055,96 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # The protected workflow itself is the one place the job is defined.
         self.assertEqual(
             rule(cases["job_key"][0], check_supply_chain.SUPPLY_CHAIN_POLICY_PATH), []
+        )
+
+    def test_only_a_required_checks_own_job_may_define_it(self):
+        base = self.SUBSET_WORKFLOW
+        job = "  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n"
+        named = "  build:\n    name: {}\n    runs-on: ubuntu-24.04\n"
+        impostor = ".github/workflows/impostor.yml"
+
+        def rule(text: str, path: str) -> list[str]:
+            return check_supply_chain.policy_check_impersonation_violations(
+                path, check_supply_chain.parse_workflow(text)
+            )
+
+        self.assertEqual(
+            check_supply_chain.REQUIRED_CHECK_WORKFLOWS["state-guard-reject-state-edits"],
+            ".github/workflows/state-guard.yml",
+        )
+        for context, home in check_supply_chain.REQUIRED_CHECK_WORKFLOWS.items():
+            defines = f"may define the {context!r} check"
+            keyed = base.replace("  build:\n", f"  {context}:\n")
+            refused = {
+                "key_elsewhere": (keyed, impostor),
+                "upper_case_key_elsewhere": (
+                    base.replace("  build:\n", f"  {context.upper()}:\n"), impostor
+                ),
+                "upper_case_key_at_home": (
+                    base.replace("  build:\n", f"  {context.upper()}:\n"), home
+                ),
+                "name_elsewhere": (base.replace(job, named.format(context)), impostor),
+                # Another job of the home workflow named like the context.
+                "name_at_home": (base.replace(job, named.format(context)), home),
+                "padded_name_at_home": (
+                    base.replace(job, named.format(f"'  {context.upper()} '")), home
+                ),
+            }
+            for label, (text, path) in refused.items():
+                with self.subTest(context=context, label=label):
+                    self.assertNotEqual(text, base)
+                    violations = rule(text, path)
+                    self.assertTrue(any(defines in item for item in violations), violations)
+            with self.subTest(context=context, label="own_job"):
+                self.assertEqual(rule(keyed, home), [])
+                self.assertEqual(
+                    rule(
+                        keyed.replace(
+                            f"  {context}:\n", f"  {context}:\n    name: {context}\n", 1
+                        ),
+                        home,
+                    ),
+                    [],
+                )
+
+    def test_required_check_homes_match_the_ruleset_and_the_shipped_jobs(self):
+        # The ruleset contexts the bootstrap writes; the checker cannot import
+        # them from the tree it judges, so this keeps the copies equal.
+        path = ROOT / ".github/scripts/audit_settings.py"
+        spec = importlib.util.spec_from_file_location("audit_settings_required_checks", path)
+        audit_settings = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = audit_settings
+        spec.loader.exec_module(audit_settings)
+        self.assertEqual(
+            set(check_supply_chain.REQUIRED_CHECK_WORKFLOWS),
+            set(audit_settings.REQUIRED_STATUS_CHECKS),
+        )
+        for context, home in check_supply_chain.REQUIRED_CHECK_WORKFLOWS.items():
+            with self.subTest(context=context):
+                document = check_supply_chain.parse_workflow(
+                    (ROOT / home).read_text(encoding="utf-8")
+                )
+                self.assertIn(context, document["jobs"])
+                self.assertEqual(
+                    check_supply_chain.policy_check_impersonation_violations(home, document),
+                    [],
+                )
+
+    def test_a_state_guard_impostor_is_refused_by_the_trusted_checker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            (root / ".github/workflows/impostor.yml").write_text(
+                self.SUBSET_WORKFLOW.replace(
+                    "  build:\n", "  state-guard-reject-state-edits:\n"
+                ),
+                encoding="utf-8",
+            )
+            violations = self._violations(root)
+        self.assertIn(
+            ".github/workflows/impostor.yml: job 'state-guard-reject-state-edits': only job "
+            "'state-guard-reject-state-edits' of state-guard.yml may define the "
+            "'state-guard-reject-state-edits' check",
+            violations,
         )
 
     def test_no_workflow_may_write_check_runs_or_commit_statuses(self):

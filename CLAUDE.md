@@ -141,12 +141,14 @@ cargo fmt --all && cargo fmt --all -- --check
   the PR head out into `candidate/` as data and runs only `python3 -I
   base/.github/scripts/check_supply_chain.py --root candidate`. The checker
   first refuses symlinks that leave the judged tree and special files, then
-  requires every workflow to fit a strict YAML subset (no anchors, aliases,
-  tags, explicit or quoted keys, flow mappings; block scalars and flow
-  sequences only for listed keys) parsed by a stdlib reader. On the parsed
-  structure it refuses other jobs keyed or named `trusted-supply-chain-policy`,
-  computed job names and `checks`/`statuses` write. Keep new workflows inside
-  that subset. `security.yml`'s
+  requires every workflow to end in exactly `.yml`/`.yaml` and fit a strict
+  YAML subset (no anchors, aliases, tags, explicit or quoted keys, flow
+  mappings; block scalars and flow sequences only for listed keys, folded `>`
+  scalars only for `if`) parsed by a stdlib reader. On the parsed structure it
+  refuses a job keyed or named like a required context outside that context's
+  own job (`REQUIRED_CHECK_WORKFLOWS`), computed job names and
+  `checks`/`statuses` write, and pins the parsed `security-cargo-audit` job.
+  Keep new workflows inside that subset. `security.yml`'s
   `security-supply-chain-policy` stays required until the ruleset switch and a
   later retire PR (`docs/github-launch-controls.md`, "Switching the
   supply-chain policy check").
