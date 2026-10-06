@@ -77,11 +77,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- Align `rust-toolchain.toml`, workflow Rust pins, and the Docker builder on
+- Align `rust-toolchain.toml`, workflow Rust pins, and the Docker builder rule on
   Rust 1.99.0. The trusted supply-chain checker enforces a 1.99.0 minimum,
   rejects legacy `rust-toolchain` files and unsupported toolchain keys, and
-  requires the builder image version to equal the parsed channel used in release
-  provenance (#474).
+  requires every Rust `FROM` stage to match the parsed channel used in release
+  provenance, with exactly one stage named `builder` (#474).
 
 - Refresh the existing 13-file ferrum-contracts adoption to published
   `contracts-edge-0.9.12` at `31f0a21d707795be293d15837c2f77c3d84219d8`, with an

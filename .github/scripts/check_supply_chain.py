@@ -1335,6 +1335,17 @@ def rust_toolchain_violations(workflow: str, text: str, channel: str) -> list[st
     return []
 
 
+def cargo_toolchain_violations(workflow: str, text: str, channel: str) -> list[str]:
+    """Keep explicit cargo toolchain overrides aligned with the repo channel."""
+    for match in re.finditer(r"\bcargo\s+\+(\d+\.\d+\.\d+)(?=\s|$)", text):
+        if match.group(1) != channel:
+            return [
+                f"{workflow}: explicit cargo toolchain overrides must match "
+                f"rust-toolchain.toml channel {channel}"
+            ]
+    return []
+
+
 def read_rust_toolchain_channel(path: Path) -> str | None:
     """Read the single pinned channel used by workflows and release provenance."""
     if path.with_name("rust-toolchain").exists():
@@ -1359,27 +1370,138 @@ def read_rust_toolchain_channel(path: Path) -> str | None:
     return channel
 
 
-def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
-    """Require the Rust builder image version to match the repository channel."""
-    for line in text.splitlines():
-        if line.lstrip().startswith("#"):
+def dockerfile_instructions(text: str) -> list[str] | None:
+    """Return Dockerfile logical instructions, excluding heredoc bodies.
+
+    Docker parses continuations before instructions and consumes heredoc bodies
+    as data. The policy must do the same so shell text cannot impersonate FROM.
+    A malformed continuation, escape directive, instruction, or heredoc refuses.
+    """
+    lines = text.splitlines()
+    escape = "\\"
+    if lines and re.fullmatch(r"#\s*escape\s*=\s*(`|\\)\s*", lines[0], re.IGNORECASE):
+        escape = lines[0].rsplit("=", 1)[1].strip()
+    elif lines and re.match(r"#\s*escape\s*=", lines[0], re.IGNORECASE):
+        return None
+
+    instructions: list[str] = []
+    supported_instructions = {
+        "ADD",
+        "ARG",
+        "CMD",
+        "COPY",
+        "ENTRYPOINT",
+        "ENV",
+        "EXPOSE",
+        "FROM",
+        "HEALTHCHECK",
+        "LABEL",
+        "MAINTAINER",
+        "ONBUILD",
+        "RUN",
+        "SHELL",
+        "STOPSIGNAL",
+        "USER",
+        "VOLUME",
+        "WORKDIR",
+    }
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
             continue
-        match = re.match(
-            r"^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?\s*$",
-            line,
+
+        logical = stripped.rstrip()
+        while True:
+            if not logical.endswith(escape):
+                break
+            logical = logical[:-1]
+            if index >= len(lines):
+                return None
+            continuation = lines[index]
+            index += 1
+            if not continuation.strip():
+                continue
+            logical += " " + continuation.strip()
+
+        instruction = re.match(r"^([A-Za-z]+)(?:\s+(.*))?$", logical)
+        if instruction is None or instruction.group(1).upper() not in supported_instructions:
+            return None
+        instructions.append(logical)
+
+        arguments = instruction.group(2) or ""
+        heredocs: list[tuple[str, bool]] = []
+        for match in re.finditer(r"<<(-?)(?:'([^']+)'|\"([^\"]+)\"|([^\s;|&]+))", arguments):
+            delimiter = next(group for group in match.groups()[1:] if group is not None)
+            heredocs.append((delimiter, bool(match.group(1))))
+        if "<<" in arguments and not heredocs:
+            return None
+        for delimiter, strip_tabs in heredocs:
+            while index < len(lines):
+                body_line = lines[index]
+                index += 1
+                candidate = body_line.lstrip("\t") if strip_tabs else body_line
+                if candidate == delimiter:
+                    break
+            else:
+                return None
+    return instructions
+
+
+def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
+    """Require every Rust FROM image and the sole builder stage to use channel."""
+    instructions = dockerfile_instructions(text)
+    if instructions is None:
+        return ["Dockerfile: could not parse Dockerfile instructions"]
+
+    violations: list[str] = []
+    builder_count = 0
+    builder_uses_rust = False
+    rust_image_found = False
+    for instruction in instructions:
+        parsed_instruction = re.match(r"^([A-Za-z]+)(?:\s+(.*))?$", instruction)
+        if parsed_instruction is None:
+            return ["Dockerfile: could not parse Dockerfile instructions"]
+        if parsed_instruction.group(1).upper() != "FROM":
+            continue
+        arguments = parsed_instruction.group(2) or ""
+        match = re.fullmatch(
+            r"(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+([A-Za-z0-9_.-]+))?",
+            arguments,
             re.IGNORECASE,
         )
-        if match is None or (match.group(2) or "").lower() != "builder":
-            continue
+        if match is None:
+            return ["Dockerfile: could not parse FROM instruction"]
+
         image = match.group(1)
-        rust_version = re.match(r"^rust:(\d+\.\d+\.\d+)(?:-|@)", image)
-        if rust_version is None or rust_version.group(1) != channel:
-            return [
-                "Dockerfile: builder Rust image version must match "
+        stage_name = match.group(2)
+        if stage_name and stage_name.lower() == "builder":
+            builder_count += 1
+
+        image_name = image.rsplit("/", 1)[-1]
+        if not (image_name.startswith("rust:") or image_name.startswith("rust@")):
+            continue
+        rust_image_found = True
+        if stage_name and stage_name.lower() == "builder":
+            builder_uses_rust = True
+        tagged = image_name.startswith("rust:")
+        tag_and_digest = image_name[len("rust:") :] if tagged else ""
+        tag = tag_and_digest.split("@", 1)[0]
+        if not tagged or not re.fullmatch(
+            rf"{re.escape(channel)}(?:-[A-Za-z0-9_.-]+)?", tag
+        ):
+            violations.append(
+                "Dockerfile: every Rust base image version must match "
                 f"rust-toolchain.toml channel {channel}"
-            ]
-        return []
-    return ["Dockerfile: expected a Rust builder stage named builder"]
+            )
+
+    if builder_count != 1:
+        violations.append("Dockerfile: expected exactly one stage named builder")
+    if not rust_image_found or not builder_uses_rust:
+        violations.append("Dockerfile: builder stage must use a Rust base image")
+    return violations
 
 
 def rust_ci_test_scope_violations(text: str) -> list[str]:
@@ -4108,6 +4230,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         violations.extend(
             rust_toolchain_violations(
+                str(workflow.relative_to(root)), text, rust_channel or "<invalid>"
+            )
+        )
+        violations.extend(
+            cargo_toolchain_violations(
                 str(workflow.relative_to(root)), text, rust_channel or "<invalid>"
             )
         )
