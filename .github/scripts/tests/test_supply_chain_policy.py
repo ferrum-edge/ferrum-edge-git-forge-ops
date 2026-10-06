@@ -82,6 +82,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
     def _guarded_bindings(self, workflow, document):
         violations = check_supply_chain.workflow_channel_violations(workflow, document)
         violations += check_supply_chain.run_expression_violations(workflow, document)
+        violations += check_supply_chain.run_script_expression_violations(workflow, document)
         violations += check_supply_chain.run_expression_source_violations(workflow, document)
         if workflow == ".github/workflows/drift-check.yml":
             return violations + check_supply_chain.monitoring_jwt_binding_violations(
@@ -653,6 +654,53 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "run": 'echo ".state/${{ matrix.scope.environment }}.json"',
         })
         self.assertEqual(check_supply_chain.run_expression_violations(workflow, document), [])
+
+    def test_required_and_privileged_run_expressions_cannot_render_shell_source(self):
+        workflow = ".github/workflows/rust-ci.yml"
+        guarded_scripts = (
+            ("${{ fromJSON(vars.SCRIPT) }}", "computed fromJSON() expression"),
+            ("${{ format('{0}', vars.SCRIPT) }}", "computed format() expression"),
+            ("${{ join(matrix.parts, '') }}", "computed join() expression"),
+            ("${{ toJSON(github.event) }}", "computed toJSON() expression"),
+            ("${{ 'echo injected' }}", "string-literal expression"),
+            ("${{ github.event.comment.body }}", "standalone interpolation"),
+        )
+        for expression, expected in guarded_scripts:
+            with self.subTest(expression=expression):
+                document = {
+                    "jobs": {
+                        "job": {"steps": [{"run": "echo safe\n" + expression}]}
+                    }
+                }
+                violations = check_supply_chain.run_script_expression_violations(
+                    workflow, document
+                )
+                self.assertTrue(any(expected in item for item in violations), violations)
+
+        for workflow in (
+            ".github/workflows/rust-ci.yml",
+            ".github/workflows/apply-on-merge.yml",
+        ):
+            with self.subTest(workflow=workflow, case="inline value"):
+                document = {
+                    "jobs": {
+                        "job": {
+                            "steps": [{"run": 'echo "${{ github.sha }}"'}]
+                        }
+                    }
+                }
+                self.assertEqual(
+                    check_supply_chain.run_script_expression_violations(workflow, document),
+                    [],
+                )
+
+        self.assertEqual(
+            check_supply_chain.run_script_expression_violations(
+                ".github/workflows/lifecycle.yml",
+                {"jobs": {"job": {"steps": [{"run": "${{ fromJSON(vars.SCRIPT) }}"}]}}},
+            ),
+            [],
+        )
 
     def test_run_values_keep_their_pinned_producers(self):
         for workflow in self._shipped_workflows():

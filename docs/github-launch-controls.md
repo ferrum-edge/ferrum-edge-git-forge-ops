@@ -597,6 +597,17 @@ display name. A display name is the `name:` of
 the workflow (or local action), a job or a step; an action input or env value
 called `name` is not one.
 
+In every workflow that reports a launch-required check, and every
+Environment-bound privileged workflow, a `run:` interpolation is refused if
+it calls `fromJSON()`, `format()`, `join()` or `toJSON()`, contains a
+single-quoted expression literal, or is the only non-whitespace text on its
+script line. GitHub renders expressions before the shell parses the script, so
+computed strings, literals and standalone values can introduce shell source
+that the text rules cannot inspect. Pass dynamic data through step `env:` and
+quote the environment variable in the script. Ordinary inline values such as
+`${{ github.sha }}` remain available where the other run-expression rules
+allow them.
+
 A local action (`uses: ./...`) carries no commit pin, so the checker reads what
 it runs. Every local reference must name, by a plain path, a composite action
 under `.github/actions/` with exactly one `action.yml` or `action.yaml`, reached
@@ -607,7 +618,8 @@ missing or unparsable file, and a local reusable workflow
 local action a workflow reaches, directly or through another local action, is
 judged by that workflow's fences: the env-file channel and startup-key bans,
 its protected names, no `run:` interpolation when the workflow is
-Environment-bound, and in `apply-on-merge.yml` the binary pin above. Every
+Environment-bound, the shell-source expression refusal above, and in
+`apply-on-merge.yml` the binary pin above. Every
 action file under `.github/actions/`, reached or not, must be in that subset,
 and its remote `uses:` are pinned to 40-hex commits from the parsed file, in
 any key case.
@@ -639,9 +651,10 @@ These text rules can refuse legitimate workflow text: a redirect or `tee` into
 `$GITHUB_WORKSPACE/...`, any name containing `GITHUB_ENV`, `GITHUB_PATH` or a
 file-command prefix (`GITHUB_ENVIRONMENT`, say), an interpolation glued to a
 name (`v${{ matrix.version }}`), indexed or whole `github` context access
-(`toJSON(github)`, `github.event.commits[0]`), and a shell comment naming a
-protected variable or channel. Rephrase such text, or pass the value through
-step `env:`.
+(`toJSON(github)`, `github.event.commits[0]`), a shell comment naming a
+protected variable or channel, and Bash ANSI-C quoting (`$'`). For example,
+`grep -cx $'.*: test$'` is refused; write it as `grep -cx '.*: test'` instead.
+Rephrase such text, or pass the value through step `env:`.
 
 Review and merge tighter guard logic into the protected branch first. If the
 workflow binding form must change, do that in a subsequent pull request judged

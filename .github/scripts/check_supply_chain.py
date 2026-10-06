@@ -3033,6 +3033,63 @@ def run_expression_violations(workflow: str, document: dict) -> list[str]:
     return violations
 
 
+RUN_SCRIPT_RENDERING_FUNCTION = re.compile(
+    r"\b(fromjson|format|join|tojson)\s*\(", re.IGNORECASE
+)
+RUN_SCRIPT_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+
+
+def run_script_expression_violations(workflow: str, document: dict) -> list[str]:
+    """Refuse expressions that can supply shell source in required or privileged workflows.
+
+    GitHub expands expressions before the runner shell parses a `run:` script. In
+    particular, computed strings and a standalone interpolation can introduce
+    shell syntax that the text rules never see. Simple inline values remain
+    available, with step `env:` preferred for untrusted data.
+    """
+    guarded_workflows = (
+        set(REQUIRED_CHECK_WORKFLOWS.values())
+        | {f".github/workflows/{name}" for name in PRIVILEGED_WORKFLOWS}
+        | set(RUN_EXPRESSIONS)
+    )
+    if workflow not in guarded_workflows:
+        return []
+
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
+        steps = job.get("steps") if isinstance(job, dict) else None
+        for index, step in enumerate(steps if isinstance(steps, list) else ()):
+            script = step.get("run") if isinstance(step, dict) else None
+            if not isinstance(script, str):
+                continue
+            for match in WORKFLOW_EXPRESSION.finditer(script):
+                expression = match.group(1).strip()
+                start_of_line = script.rfind("\n", 0, match.start()) + 1
+                end_of_line = script.find("\n", match.end())
+                if end_of_line < 0:
+                    end_of_line = len(script)
+                standalone = (
+                    not script[start_of_line:match.start()].strip(" \t")
+                    and not script[match.end():end_of_line].strip(" \t")
+                )
+                reasons = []
+                function = RUN_SCRIPT_RENDERING_FUNCTION.search(expression)
+                if function is not None:
+                    reasons.append(f"computed {function.group(1)}() expression")
+                if RUN_SCRIPT_STRING_LITERAL.search(expression) is not None:
+                    reasons.append("string-literal expression")
+                if standalone:
+                    reasons.append("standalone interpolation")
+                if reasons:
+                    violations.append(
+                        f"{workflow}: jobs.{job_name}.steps[{index}].run: "
+                        f"{' and '.join(reasons)} can render arbitrary shell text; "
+                        "pass values through step env instead"
+                    )
+    return violations
+
+
 def _producer_step(job: dict, step_id: str):
     """The one step of `job` with id `step_id` in any case, or None.
 
@@ -3570,6 +3627,7 @@ def workspace_checkout_violations(workflow: str, document: dict) -> list[str]:
 def local_action_fence_violations(workflow: str, label: str, action: dict) -> list[str]:
     """The text fences of `workflow`, applied to a local action it runs."""
     violations = workflow_channel_violations(label, action)
+    violations.extend(run_script_expression_violations(workflow, action))
     runs = action.get("runs")
     steps = runs.get("steps") if isinstance(runs, dict) else None
     for index, step in enumerate(steps if isinstance(steps, list) else ()):
@@ -4200,6 +4258,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 run_expression_violations(workflow.relative_to(root).as_posix(), document)
+            )
+            violations.extend(
+                run_script_expression_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
             )
             violations.extend(
                 run_expression_source_violations(workflow.relative_to(root).as_posix(), document)
