@@ -225,6 +225,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Close supply-chain checker residuals (#487). A local action (`uses: ./...`)
+  is no longer exempt and unread: every local reference must name, by a plain
+  path, a composite action under `.github/actions/` with exactly one
+  `action.yml` or `action.yaml`, reached through no symbolic link and inside the
+  strict YAML subset, and each one a workflow reaches (also through another
+  local action) is judged by that workflow's channel bans, protected names,
+  `run:` interpolation rule and, in `apply-on-merge.yml`, binary pin. Any other
+  local reference, including a local reusable workflow, fails closed. `env:`
+  mappings at every level may no longer bind `BASH_FUNC_*`, `SHELLOPTS`,
+  `BASHOPTS`, `PS4`, `LD_PRELOAD` or `LD_LIBRARY_PATH` (in any case), beside
+  `ENV` and `BASH_ENV`. `apply-on-merge.yml` now reads every scalar outside the
+  guarded Apply steps for the binary, including step and default `shell:`
+  values and action inputs; only the pinned read-only `run:` lines and pinned
+  display names may name it. The step with `id: load-bundles` in each apply job
+  must be the one named `Load credential bundles`, and producer step ids compare
+  without regard to case. The docs now name file-command paths discovered from
+  the filesystem (`"$RUNNER_TEMP"/*/…`, `/proc/$$/fd`) as program-level, out of
+  scope for text rules.
 - Refuse a plugin config delete, or an update that moves its scope or target,
   when a proxy outside the plan references the plugin (#475). Ferrum Edge
   removes every association to a deleted plugin config, and every association

@@ -857,15 +857,20 @@ Consumer plus every labelled Consumer, names only
   script or comment) is refused. `workflow_channel_violations` bans
   `GITHUB_ENV`, `GITHUB_PATH`, `BASH_ENV`, the runner's file-command file
   names (`set_env_`, `add_path_`, `save_state_`, `_runner_file_commands`),
-  indirect expansion, computed env maps and writes to other GitHub file
-  channels in every workflow, and allows `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY`
+  indirect expansion, computed env maps, shell startup and loader env keys
+  (`ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4`, `LD_PRELOAD`,
+  `LD_LIBRARY_PATH`) and writes to other GitHub file channels in every
+  workflow, and allows `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY`
   only as a plain `>>` or `tee -a` target (or the summary as `--summary`); the
   bundle loader's credential-file hand-off, pinned line for line, is the only
   permitted env-file write. `run_expression_source_violations` pins where each
   allowlisted `run:` interpolation comes from (job outputs, matrices and the
-  producing step's lines). These are text rules (#476): a program a step runs
-  can still write `$GITHUB_ENV`, and review of every workflow change covers
-  that.
+  producing step's lines). `local_action_violations` refuses any `uses: ./`
+  reference that is not a parseable composite action under `.github/actions/`
+  (local reusable workflows included) and judges each one a workflow reaches
+  by that workflow's fences. These are text rules (#476): a program a step
+  runs can still write `$GITHUB_ENV`, and review of every workflow change
+  covers that.
 - Only an ad-hoc `FERRUM_NAMESPACE` (not `namespace_filter_is_environment_scope`)
   makes an out-of-scope slot `OutsideNamespaceScope`, which does not refuse.
   Under the environment's own scope it is `NotAConsumerSecret`, as at verify.

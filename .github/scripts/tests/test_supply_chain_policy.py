@@ -223,6 +223,43 @@ class SupplyChainPolicyTests(unittest.TestCase):
                         violations,
                     )
 
+    def test_shell_startup_and_loader_env_keys_are_refused(self):
+        refused = "shell startup or loader variable"
+        keys = (
+            "ENV", "env", "BASH_ENV", "BASH_FUNC_gitforgeops", "bash_func_x", "SHELLOPTS",
+            "shellopts", "BASHOPTS", "BashOpts", "PS4", "ps4", "LD_PRELOAD", "ld_preload",
+            "LD_LIBRARY_PATH", "Ld_Library_Path",
+        )
+        for workflow in self._shipped_workflows():
+            for scope in ("workflow", "job", "step"):
+                for key in keys:
+                    with self.subTest(workflow=workflow, scope=scope, key=key):
+                        document = self._probe_document(workflow)
+                        steps = self._first_steps(document)
+                        if scope == "workflow":
+                            document["env"] = {key: "x"}
+                        elif scope == "job":
+                            next(
+                                job for job in document["jobs"].values()
+                                if isinstance(job, dict) and job.get("steps") is steps
+                            )["env"] = {key: "x"}
+                        else:
+                            steps.insert(0, {"name": "Startup", "run": "true", "env": {key: "x"}})
+                        violations = check_supply_chain.workflow_channel_violations(
+                            workflow, document
+                        )
+                        self.assertTrue(any(refused in item for item in violations), violations)
+        workflow = ".github/workflows/rust-ci.yml"
+        for key in ("PS3", "FERRUM_PS4", "LD_PRELOADED", "BASH_FUNCTIONS", "SHELL_OPTIONS"):
+            with self.subTest(allowed=key):
+                document = self._probe_document(workflow)
+                self._first_steps(document).insert(
+                    0, {"name": "Near miss", "run": "true", "env": {key: "x"}}
+                )
+                self.assertEqual(
+                    check_supply_chain.workflow_channel_violations(workflow, document), []
+                )
+
     def test_run_interpolations_may_not_splice_a_name(self):
         for workflow in self._shipped_workflows():
             for script in (
@@ -339,6 +376,11 @@ class SupplyChainPolicyTests(unittest.TestCase):
             'name=GITHUB_E; eval "echo x >> \\$${name}NV"',
             "echo ZWNobyB4ID4+ICRHSVRIVUJfRU5WCg== | base64 -d | bash",
             "python3 -c 'import os; open(os.environ[\"GITHUB_\" + \"E\" + \"NV\"], \"a\")'",
+            # A sibling file-command path found on the filesystem, not
+            # derived from a spelled name.
+            'for f in "$RUNNER_TEMP"/*/set_e*; do echo X=1 >> "$f"; done',
+            '{ p=$(readlink /proc/$$/fd/1); echo X=1 >> "${p/output/env}"; } >> "$GITHUB_OUTPUT"',
+            "p=$(env | sed -n 's/^GITHUB_OUT[P]UT=//p'); echo X=1 >> \"${p/output/env}\"",
         ):
             with self.subTest(script=script):
                 document = self._probe_document(workflow)
@@ -836,6 +878,284 @@ class SupplyChainPolicyTests(unittest.TestCase):
                         workflow, document
                     )
                 ))
+
+    def test_every_apply_scalar_outside_the_guarded_steps_names_the_binary_only_as_pinned(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        pinned_action = "acme/run@" + "a" * 40
+        command = "gitforgeops apply --auto-approve"
+
+        def insert_step(step):
+            return lambda document: document["jobs"]["list-envs"]["steps"].insert(0, step)
+
+        def set_defaults(document):
+            document["jobs"]["list-envs"]["defaults"] = {"run": {"shell": command + " {0}"}}
+
+        for index, mutate in enumerate((
+            insert_step({"name": "Shell", "shell": command + " {0}", "run": "true"}),
+            insert_step({"name": "Shell", "shell": "gitforgeops validate", "run": "true"}),
+            insert_step({"name": "Shell", "shell": "GitForge\"\"Ops apply {0}", "run": "true"}),
+            insert_step({"name": "Input", "uses": pinned_action, "with": {"args": command}}),
+            insert_step({"name": "Inputs", "uses": pinned_action, "with": {"args": [command]}}),
+            insert_step({"name": "Env", "env": {"COMMAND": command}, "run": "true"}),
+            insert_step({"name": "Run gitforgeops apply", "run": "true"}),
+            insert_step({"working-directory": "Build gitforgeops", "run": "true"}),
+            insert_step({"if": "contains('gitforgeops apply', 'x')", "run": "true"}),
+            set_defaults,
+        )):
+            with self.subTest(mutation=index):
+                document = self._probe_document(workflow)
+                mutate(document)
+                violations = check_supply_chain.probe_validation_gate_violations(
+                    workflow, document
+                )
+                self.assertTrue(
+                    any("mutations may only run" in item for item in violations), violations
+                )
+        for step in (
+            {"name": "Install gitforgeops", "run": "true"},
+            {"name": "Build gitforgeops", "run": "gitforgeops validate", "shell": "bash"},
+            {"if": "hashFiles('.gitforgeops/smoke.yaml') != ''", "run": "true"},
+            {"name": "Actor", "env": {"GITFORGEOPS_ACTOR": "x"}, "run": "true"},
+            {"name": "Bot", "run": 'git config user.name "gitforgeops[bot]"'},
+        ):
+            with self.subTest(allowed=step):
+                document = self._probe_document(workflow)
+                document["jobs"]["list-envs"]["steps"].insert(0, step)
+                self.assertEqual(
+                    check_supply_chain.probe_validation_gate_violations(workflow, document), []
+                )
+
+    def test_producer_step_ids_compare_case_insensitively(self):
+        producer = check_supply_chain._producer_step
+        loader = {"id": "Load-Bundles", "name": check_supply_chain.BUNDLE_LOADER_STEP}
+        self.assertIs(producer({"steps": [loader]}, "load-bundles"), loader)
+        self.assertIsNone(producer({"steps": [{"id": "metadata"}, {"id": "Metadata"}]}, "metadata"))
+        self.assertIsNone(producer({"steps": [{"id": "metadata-2"}, {"id": 1}]}, "metadata"))
+        workflow = ".github/workflows/trusted-pr-review.yml"
+        for shadow in ("metadata", "Metadata", "METADATA"):
+            with self.subTest(shadow=shadow):
+                document = self._probe_document(workflow)
+                document["jobs"]["prepare"]["steps"].insert(0, {"id": shadow, "run": "true"})
+                violations = check_supply_chain.run_expression_source_violations(
+                    workflow, document
+                )
+                self.assertTrue(
+                    any("must exist exactly once" in item for item in violations), violations
+                )
+
+    def test_load_bundles_id_belongs_to_the_named_loader(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        expected = f"must be named {check_supply_chain.BUNDLE_LOADER_STEP!r}"
+        self.assertEqual(
+            check_supply_chain.probe_validation_gate_violations(
+                workflow, self._probe_document(workflow)
+            ),
+            [],
+        )
+        for job in ("apply", "promote"):
+            for mutation in ("renamed", "shadow", "shadow-case", "missing"):
+                with self.subTest(job=job, mutation=mutation):
+                    document = self._probe_document(workflow)
+                    loader = self._step(document, job, check_supply_chain.BUNDLE_LOADER_STEP)
+                    if mutation == "renamed":
+                        loader["name"] = "Load bundles"
+                    elif mutation == "missing":
+                        loader.pop("id")
+                    else:
+                        document["jobs"][job]["steps"].insert(0, {
+                            "name": "Shadow",
+                            "id": "load-bundles" if mutation == "shadow" else "LOAD-BUNDLES",
+                            "run": "true",
+                        })
+                    violations = check_supply_chain.probe_validation_gate_violations(
+                        workflow, document
+                    )
+                    self.assertTrue(any(expected in item for item in violations), violations)
+
+    def _local_action(self, root: Path, name: str, steps: str) -> str:
+        """Write a composite action with `steps` (YAML, indented four spaces)."""
+        directory = root / ".github" / "actions" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "action.yml").write_text(
+            "name: Local\ndescription: Test action\nruns:\n  using: composite\n  steps:\n"
+            + steps,
+            encoding="utf-8",
+        )
+        return f"./.github/actions/{name}"
+
+    def test_local_actions_must_resolve_to_readable_composite_actions(self):
+        clean = "    - shell: bash\n      run: echo hello\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            actions = root / ".github" / "actions"
+            self._local_action(root, "clean", clean)
+            self._local_action(root, "both", clean)
+            (actions / "both" / "action.yaml").write_text("name: Both\n", encoding="utf-8")
+            (actions / "node").mkdir()
+            (actions / "node" / "action.yml").write_text(
+                "name: Node\nruns:\n  using: node20\n  main: index.js\n", encoding="utf-8"
+            )
+            (actions / "anchored").mkdir()
+            (actions / "anchored" / "action.yml").write_text(
+                "name: Anchored\nruns: &shared\n  using: composite\n", encoding="utf-8"
+            )
+            (actions / "docker").mkdir()
+            (actions / "docker" / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+            (actions / "linked").mkdir()
+            (actions / "linked" / "action.yml").symlink_to(actions / "clean" / "action.yml")
+            (actions / "alias").symlink_to(actions / "clean", target_is_directory=True)
+            (root / "tools" / "act").mkdir(parents=True)
+            (root / "tools" / "act" / "action.yml").write_text(
+                (actions / "clean" / "action.yml").read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            below = "below ./.github/actions/"
+            for reference, expected in (
+                ("./", below),
+                ("./tools/act", below),
+                ("./.github/workflows/rust-ci.yml", below),
+                ("./trusted/.github/actions/clean", below),
+                ("./.github/actions", below),
+                ("./.github/actions/../actions/clean", below),
+                ("./.github/actions/./clean", below),
+                ("./.github/actions//clean", below),
+                ("./.github/actions/clean@v1", below),
+                ("./.github/actions/missing", "exactly one action.yml or action.yaml"),
+                ("./.github/actions/docker", "exactly one action.yml or action.yaml"),
+                ("./.github/actions/both", "exactly one action.yml or action.yaml"),
+                ("./.github/actions/linked", "no symbolic link"),
+                ("./.github/actions/alias", "no symbolic link"),
+                ("./.github/actions/node", "must be a composite action"),
+                ("./.github/actions/anchored", "outside the YAML subset"),
+            ):
+                with self.subTest(reference=reference):
+                    _, action, refusal = check_supply_chain.resolve_local_action(root, reference)
+                    self.assertIsNone(action)
+                    self.assertIn(expected, refusal)
+            for reference in ("./.github/actions/clean", "./.github/actions/clean/"):
+                with self.subTest(allowed=reference):
+                    relative, action, refusal = check_supply_chain.resolve_local_action(
+                        root, reference
+                    )
+                    self.assertIsNone(refusal)
+                    self.assertEqual(relative, ".github/actions/clean/action.yml")
+                    self.assertEqual(
+                        action["runs"]["steps"], [{"shell": "bash", "run": "echo hello"}]
+                    )
+            # A job-level local reusable workflow carries none of its caller's pins.
+            workflow = ".github/workflows/rust-ci.yml"
+            document = self._probe_document(workflow)
+            document["jobs"]["reuse"] = {"uses": "./.github/workflows/rust-ci.yml"}
+            violations = check_supply_chain.local_action_violations(root, workflow, document)
+            self.assertTrue(any(below in item for item in violations), violations)
+
+    def test_local_actions_carry_their_callers_text_fences(self):
+        apply = ".github/workflows/apply-on-merge.yml"
+        review = ".github/workflows/trusted-pr-review.yml"
+        rust = ".github/workflows/rust-ci.yml"
+        for workflow, steps, expected in (
+            (rust, '    - shell: bash\n      run: |\n        echo X=1 >> "$GITHUB_ENV"\n',
+             self.HANDOFF_FENCE),
+            (rust, "    - shell: bash\n      env:\n        SHELLOPTS: xtrace\n"
+                   "      run: echo hello\n", "shell startup or loader variable"),
+            (rust, "    - shell: bash\n      env:\n        BASH_FUNC_x: '() { true; }'\n"
+                   "      run: echo hello\n", "shell startup or loader variable"),
+            (apply, "    - shell: bash\n      run: gitforgeops apply --auto-approve\n",
+             "mutations may only run"),
+            (apply, "    - shell: gitforgeops apply --auto-approve {0}\n      run: echo hello\n",
+             "mutations may only run"),
+            (apply, "    - shell: bash\n      env:\n        FERRUM_NAMESPACE: other\n"
+                    "      run: echo hello\n", "protected variable"),
+            (review, '    - shell: bash\n      run: |\n        echo "${{ inputs.title }}"\n',
+             "may not interpolate into run:"),
+            (review, "    - shell: bash\n      run: echo $FERRUM_VERIFY_PROBE_CONSUMERS\n",
+             "protected variable"),
+            (".github/workflows/drift-check.yml",
+             "    - shell: bash\n      run: echo $FERRUM_ADMIN_JWT_SECRET\n", "protected variable"),
+        ):
+            with self.subTest(workflow=workflow, steps=steps), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                document = self._probe_document(workflow)
+                self._first_steps(document).insert(
+                    0, {"name": "Local", "uses": self._local_action(root, "local", steps)}
+                )
+                violations = check_supply_chain.local_action_violations(root, workflow, document)
+                self.assertTrue(
+                    any(
+                        f".github/actions/local/action.yml (run by {workflow})" in item
+                        and expected in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clean = self._local_action(root, "clean", "    - shell: bash\n      run: echo hello\n")
+            for workflow in self._shipped_workflows():
+                with self.subTest(allowed=workflow):
+                    document = self._probe_document(workflow)
+                    self.assertEqual(
+                        check_supply_chain.local_action_violations(root, workflow, document), []
+                    )
+                    self._first_steps(document).insert(0, {"name": "Local", "uses": clean})
+                    self.assertEqual(
+                        check_supply_chain.local_action_violations(root, workflow, document), []
+                    )
+            # Nested local actions are judged as their caller's, and a cycle ends.
+            outer = self._local_action(
+                root, "outer",
+                "    - uses: ./.github/actions/inner\n    - uses: ./.github/actions/outer\n"
+                "    - uses: ./.github/actions/missing\n",
+            )
+            self._local_action(
+                root, "inner", "    - shell: bash\n      run: gitforgeops apply --auto-approve\n"
+            )
+            document = self._probe_document(apply)
+            self._first_steps(document).insert(0, {"name": "Local", "uses": outer})
+            violations = check_supply_chain.local_action_violations(root, apply, document)
+            self.assertTrue(any(
+                f".github/actions/inner/action.yml (run by {apply})" in item
+                and "mutations may only run" in item
+                for item in violations
+            ), violations)
+            self.assertTrue(any(
+                item.startswith(
+                    ".github/actions/outer/action.yml: local action './.github/actions/missing'"
+                )
+                for item in violations
+            ), violations)
+
+    def test_trusted_checker_judges_local_actions_a_workflow_runs(self):
+        workflow = ".github/workflows/apply-on-merge.yml"
+        for steps, reference, expected in (
+            ("    - shell: bash\n      run: echo hello\n", "./.github/actions/deploy", None),
+            ("    - shell: bash\n      run: gitforgeops apply --auto-approve\n",
+             "./.github/actions/deploy", "mutations may only run"),
+            ("    - shell: bash\n      run: echo hello\n", "./.github/actions/missing",
+             "must resolve to exactly one action.yml or action.yaml"),
+        ):
+            with self.subTest(reference=reference, expected=expected), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                self._local_action(root, "deploy", steps)
+                path = root / workflow
+                original = path.read_text(encoding="utf-8")
+                changed = original.replace(
+                    "    steps:\n",
+                    f"    steps:\n      - name: Local\n        uses: {reference}\n",
+                    1,
+                )
+                self.assertNotEqual(changed, original)
+                path.write_text(changed, encoding="utf-8")
+                if expected is None:
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPT), "--root", str(root)],
+                        check=False, text=True, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    continue
+                violations = self._violations(root)
+                self.assertTrue(any(expected in item for item in violations), violations)
 
     def test_bound_validate_cannot_be_skipped_or_lose_its_exit_status(self):
         workflow = ".github/workflows/apply-on-merge.yml"
