@@ -1,4 +1,7 @@
 name: GitForgeOps Supply-Chain Policy
+# A job that supplies a required check in an `edited`-triggered workflow must
+# not use a job-level `if` that skips edited events; the newest skipped run can
+# fail the release gate.
 
 # The supply-chain verdict must come from a definition the pull request under
 # review cannot edit (GHSA-x5m2-4555-q4cr). `security.yml` runs under
