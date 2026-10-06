@@ -1664,7 +1664,11 @@ async fn one_backup_confirms_every_unnormalized_row_it_shows_at_the_read_version
 
         let run = apply_exclusive(&desired, planned.clone(), routes).await;
 
-        assert!(run.result.errors.is_empty(), "{versions:?}: {:?}", run.result);
+        assert!(
+            run.result.errors.is_empty(),
+            "{versions:?}: {:?}",
+            run.result
+        );
         assert_eq!(
             run.mutations(),
             [
@@ -1731,7 +1735,10 @@ async fn a_proxy_read_after_this_runs_plugin_write_takes_a_fresh_backup() {
     assert_eq!(backups_after, 1);
     assert_eq!(run.count("PUT /proxies/p1"), 0);
     assert!(
-        run.result.errors.iter().any(|error| error.contains(CHANGED)),
+        run.result
+            .errors
+            .iter()
+            .any(|error| error.contains(CHANGED)),
         "{:?}",
         run.result.errors
     );
