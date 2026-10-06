@@ -394,7 +394,7 @@ async fn valid_resource_acknowledgements_and_empty_204_deletes_remain_accepted()
 }
 
 #[tokio::test]
-async fn delete_404_acknowledgements_validate_nonempty_bodies_without_replay() {
+async fn delete_404_acknowledgements_are_kind_specific_and_never_replayed() {
     use gitforgeops::error::Error;
     use gitforgeops::http_client::DeleteOutcome;
 
@@ -454,6 +454,9 @@ async fn delete_404_acknowledgements_validate_nonempty_bodies_without_replay() {
             ),
         ];
         for (case, (body, accepted, committed_not_live)) in cases.into_iter().enumerate() {
+            let accepted = accepted
+                && (kind != "Consumer"
+                    || body == r#"{"error":"Consumer not found"}"#);
             let response = body.clone();
             let (client, requests) = gateway(move |_, _| (404, response.clone(), vec![]));
             let result = client.delete_if_match(kind, "c1", NS, ROW_TAG).await;
@@ -462,7 +465,12 @@ async fn delete_404_acknowledgements_validate_nonempty_bodies_without_replay() {
                 assert_eq!(result.unwrap(), DeleteOutcome::NotFound, "{context}");
             } else {
                 let error = result.unwrap_err();
-                if committed_not_live {
+                if kind == "Consumer" {
+                    assert!(
+                        matches!(error, Error::ConditionalWriteUnavailable(_)),
+                        "{context}"
+                    );
+                } else if committed_not_live {
                     assert!(matches!(error, Error::CommittedNotLive { .. }), "{context}");
                 } else {
                     assert!(matches!(error, Error::AmbiguousMutation(_)), "{context}");
@@ -601,13 +609,16 @@ async fn router_404_during_consumer_delete_preserves_the_managed_ledger() {
         .unwrap();
     let original_ledger = serde_json::to_value(&state.resources).unwrap();
     let managed = HashSet::from([key.clone()]);
-    let (client, requests) = gateway(|request, _| {
+    let raw = serde_json::to_value(consumer()).unwrap();
+    let (client, requests) = gateway(move |request, _| {
         if request.starts_with("GET /health") {
             healthy()
         } else if request.starts_with("GET /consumers/c1/verification ") {
+            verified(&raw, ROW_TAG)
+        } else if request.starts_with("DELETE /consumers/c1 ") {
             (404, r#"{"error":"Not Found"}"#.to_string(), vec![])
         } else {
-            panic!("an unknown verification route must not authorize deletion")
+            panic!("an unexpected request must not authorize deletion")
         }
     });
     let result = apply_api(
@@ -627,20 +638,26 @@ async fn router_404_during_consumer_delete_preserves_the_managed_ledger() {
     assert_eq!(result.deleted, 0);
     assert_eq!(result.deletes_missing, 0);
     assert!(result.applied_incremental.is_empty());
-    assert!(!result.errors.is_empty());
+    assert!(result.errors.is_empty());
     assert!(result
-        .errors
-        .join(" ")
+        .fatal_error
+        .as_deref()
+        .unwrap_or_default()
         .contains("authoritative conditional evidence unavailable"));
     let desired_keys = ResourceKeys::from_config(&GatewayConfig::default());
     for op in result.applied_incremental.iter().chain(&result.adopted) {
         state.record_op(op, &desired_keys).unwrap();
     }
-    assert_eq!(serde_json::to_value(&state.resources).unwrap(), original_ledger);
+    assert_eq!(
+        serde_json::to_value(&state.resources).unwrap(),
+        original_ledger
+    );
     assert!(state.resources.contains_key(&key));
     let seen = requests.lock().unwrap();
-    assert_eq!(seen.len(), 2);
-    assert!(seen.iter().all(|request| request.starts_with("GET ")));
+    assert_eq!(seen.len(), 3);
+    assert!(seen[0].starts_with("GET /health "));
+    assert!(seen[1].starts_with("GET /consumers/c1/verification "));
+    assert!(seen[2].starts_with("DELETE /consumers/c1 "));
 }
 
 #[tokio::test]
@@ -700,8 +717,14 @@ async fn verification_404_requires_the_exact_consumer_not_found_body() {
     for (body, is_gone) in [
         (r#"{"error":"Consumer not found"}"#, true),
         (r#"{"error":"Not Found"}"#, false),
-        (r#"{"error":"Consumer not found","detail":"route missing"}"#, false),
-        (r#"{"error":"Consumer not found","error":"Not Found"}"#, false),
+        (
+            r#"{"error":"Consumer not found","detail":"route missing"}"#,
+            false,
+        ),
+        (
+            r#"{"error":"Consumer not found","error":"Not Found"}"#,
+            false,
+        ),
         ("not json", false),
     ] {
         let response = body.to_string();

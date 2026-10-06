@@ -623,15 +623,16 @@ impl AdminClient {
             {
                 return Err(conditional::invalid());
             }
-            let is_consumer_not_found = conditional::parse_sensitive(&resp.body)
-                .ok()
-                .is_some_and(|value| {
-                    value.as_object().is_some_and(|object| {
-                        object.len() == 1
-                            && object.get("error").and_then(serde_json::Value::as_str)
-                                == Some("Consumer not found")
-                    })
-                });
+            let is_consumer_not_found =
+                conditional::parse_sensitive(&resp.body)
+                    .ok()
+                    .is_some_and(|value| {
+                        value.as_object().is_some_and(|object| {
+                            object.len() == 1
+                                && object.get("error").and_then(serde_json::Value::as_str)
+                                    == Some("Consumer not found")
+                        })
+                    });
             if !is_consumer_not_found {
                 return Err(conditional::invalid());
             }
@@ -1197,8 +1198,23 @@ impl AdminClient {
             return Err(crate::error::Error::StalePlan(message));
         }
         if resp.status == 404 {
-            // Empty and valid not-found responses mean the row is already gone.
-            // A nonempty body must not hide an ambiguous or not-live mutation.
+            // Consumer deletes require Edge's exact not-found acknowledgement;
+            // a router response cannot prove that the consumer is gone.
+            if kind == "Consumer" {
+                let is_consumer_not_found = conditional::parse_sensitive(&resp.body)
+                    .ok()
+                    .is_some_and(|value| {
+                        value.as_object().is_some_and(|object| {
+                            object.len() == 1
+                                && object.get("error").and_then(serde_json::Value::as_str)
+                                    == Some("Consumer not found")
+                        })
+                    });
+                if !is_consumer_not_found {
+                    return Err(conditional::invalid());
+                }
+                return Ok(DeleteOutcome::NotFound);
+            }
             if !resp.body.is_empty() {
                 let acknowledgement = ApiErrorBody::parse_mutation(&resp.body)?;
                 if acknowledgement.applied == Some(false) {

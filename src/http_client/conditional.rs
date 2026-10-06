@@ -661,6 +661,11 @@ pub(super) fn withhold_error(error: Error) -> Error {
                    Inspect current gateway state before retrying"
         .to_string();
     match error {
+        Error::ConditionalWriteUnavailable(_) => Error::ConditionalWriteUnavailable(
+            "conditional operation refused or failed; authoritative evidence unavailable; \
+             response details withheld. Inspect current gateway state before retrying"
+                .to_string(),
+        ),
         Error::ApiError { status, .. } => Error::ApiError { status, message },
         Error::HttpClient(_) => Error::HttpClient(message),
         Error::GatewayReadOnly(_) => Error::GatewayReadOnly(message),
