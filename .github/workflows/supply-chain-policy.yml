@@ -1,3 +1,6 @@
+# A job that supplies a required check in an `edited`-triggered workflow must
+# not use a job-level `if` that skips edited events; the newest skipped run can
+# fail the release gate.
 name: GitForgeOps Supply-Chain Policy
 
 # The supply-chain verdict must come from a definition the pull request under

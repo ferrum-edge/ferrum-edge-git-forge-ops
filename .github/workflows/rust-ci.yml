@@ -1,3 +1,6 @@
+# A job that supplies a required check in an `edited`-triggered workflow must
+# not use a job-level `if` that skips edited events; the newest skipped run can
+# fail the release gate.
 name: Rust CI
 
 # The workflow reports its `check` status on every PR so it is safe to require

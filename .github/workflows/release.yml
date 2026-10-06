@@ -25,6 +25,9 @@ concurrency:
 jobs:
   authorize-release:
     name: Require a checked, merged pull request
+    # Required jobs in workflows triggered by `edited` must not use a
+    # job-level `if` that skips the check on edited events. A newest skipped
+    # run can fail the release gate even when the PR's code is unchanged.
     # Publishing runs on the upstream repository, or wherever an owner has
     # explicitly opted in. A `fork == false` test used to stand in for
     # "upstream": it is also true of every copy made through "Use this
@@ -187,6 +190,7 @@ jobs:
             fi
           }
           while :; do
+            remaining=$(remaining_budget) || exit 1
             verify_pr_identity || {
               echo "::error::Merged PR #${pr} changed identity, head or default-branch association."
               exit 1
@@ -224,9 +228,27 @@ jobs:
             # gh deduplicates by startedAt: a queued retry can disappear behind
             # an older success. Read every run on the expected head and select
             # the newest check-run ID per source-bound context instead.
-            timeout --kill-after=5s "$(remaining_budget)s" \
-              gh api "repos/${REPO}/commits/${expected_head}/check-runs?per_page=100&filter=all" \
-              --paginate --slurp > "$runs_file" || {
+            run_read=0
+            for run_attempt in 1 2; do
+              : > "$runs_file"
+              : > "$checks_error_file"
+              status=0
+              timeout --kill-after=5s "$(remaining_budget)s" \
+                gh api "repos/${REPO}/commits/${expected_head}/check-runs?per_page=100&filter=all" \
+                --paginate --slurp > "$runs_file" 2> "$checks_error_file" || status=$?
+              if [ "$status" -eq 0 ]; then
+                run_read=1
+                break
+              fi
+              if [ "$run_attempt" -eq 1 ] &&
+                  grep -Eq 'HTTP 5[0-9][0-9]' "$checks_error_file"; then
+                echo "Same-head check-run API returned a transient HTTP 5xx; retrying once." >&2
+                continue
+              fi
+              cat "$checks_error_file" >&2
+              break
+            done
+            [ "$run_read" -eq 1 ] || {
               echo "::error::Same-head check-run evidence could not be read."
               exit 1
             }
@@ -316,7 +338,7 @@ jobs:
                 | ($runs[0] | map(.total_count) | unique) as $counts
                 | ($history | group_by(.id)) as $identities
                 | if ($counts | length) != 1 then
-                    error("inconsistent check-run page counts")
+                    "wait"
                   elif ($identities | any(.[]; (unique | length) != 1)) then
                     error("conflicting check-run identities")
                   elif ($identities | any(.[]; length != 1)) then
@@ -351,11 +373,11 @@ jobs:
             }
             # Both gh lookups follow a mutable PR number; bracket them with the
             # identity from the commit association, including the final pass.
+            remaining=$(remaining_budget) || exit 1
             verify_pr_identity || {
               echo "::error::Merged PR #${pr} changed while its checks were sampled."
               exit 1
             }
-            remaining=$(remaining_budget) || exit 1
             if [ "$verdict" = pass ]; then
               echo "Merged PR #${pr} has successful source-bound checks on ${expected_head}."
               break
