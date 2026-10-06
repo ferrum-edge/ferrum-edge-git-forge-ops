@@ -14,7 +14,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GET-only capability probes and reports unavailable evidence as unknown.
 - Lifecycle coverage for hidden consumer edits and namespace restore conditions,
   including ABA, empty replacement and confirmed spec deletion. Qualification
-  on the published Edge v0.9.12 release, content-pinned (SHA-256), remains
+  on the published Edge v0.9.13 release, content-pinned (SHA-256), remains
   required; an older fixture or passing parser tests do not establish first-release
   acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
@@ -77,6 +77,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Refresh the Ferrum Edge validator and bundled gateway pins to published
+  v0.9.13: validator SHA-256
+  `bdb8756c30bd2c04c3483ebff26bf0163ebeb0d5dfdc887897a7eb473305ed6c` and
+  Docker Hub multi-platform index
+  `sha256:6caa0987adb4c0a3a368fcd800bb0459cff3d3e219522e2e9c56280205862e50`.
+  Retain all earlier approved validator digests for in-flight pull requests and
+  preserve publisher-checksum verification. Edge release 404961860 was published
+  at `9b83115de7ec23ab51ec4feae6bed65e596db425`; upstream release jobs passed.
+  GitForgeOps hosted validation and exact-revision lifecycle acceptance remain
+  required, the release baseline stays pending, and the conditional API
+  implementation and `contracts-edge-0.9.11` pin are unchanged.
 - Simplify the trusted checker's probe-binding rules (#476). The hand-written
   Bash lexer, expression renderer and rendered matrix/step-output source
   proofs are gone. In their place: the Verify traffic script and the credential-file
