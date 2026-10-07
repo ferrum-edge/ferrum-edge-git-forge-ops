@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Require the published commit's merged pull request to have passed its checks.
 
-A port of the inline bash and jq gate in `release.yml`'s `authorize-release`
-job (#473), with the same semantics:
+`release.yml`'s `authorize-release` job runs this from the release commit's
+own checkout (#473). It replaced an inline bash and jq gate and keeps that
+gate's verdicts, except where noted below:
 
 * The release commit maps to exactly one merged default-branch pull request
   (an exact merge-commit match wins over a rebase association). A missing
@@ -24,11 +25,28 @@ job (#473), with the same semantics:
 * The same-head check-run read retries once, after a bounded backoff, when its
   error names an HTTP 5xx status. Malformed data never retries.
 
+It differs from the inline gate only in these cases, each stricter or more robust:
+
+* A head or merge commit SHA with a trailing newline is refused. jq's
+  `test("^...$")` accepted one.
+* A completed check run whose `conclusion` is not a string is refused. jq's
+  `index` would have matched an array conclusion as a subarray.
+* `NaN` and `Infinity` in any response are refused; jq parsed them.
+* When the budget runs out during a call, only the timeout is reported. The
+  inline gate also printed the interrupted call's own failure, such as a
+  changed identity. Both exit 1.
+* A timed-out `gh` is killed at once rather than after a five-second TERM
+  grace period.
+* The pull request number is always rendered as an integer, in API paths and
+  messages. jq 1.7 could render an integral float as `5.0`.
+
 Run it from a checkout with `python3 -I .github/scripts/release_gate.py`.
 `gh` reads `GH_TOKEN`; the gate reads `REPO`, `RELEASE_SHA` and
 `DEFAULT_BRANCH`. The supply-chain checker pins the launch check lists, the
-GitHub Actions App binding and the budget below, and limits what this file
-may import and call.
+GitHub Actions App binding and the budget below, and the small import,
+reference and call surface this file uses: only `gh api` and `gh pr checks`,
+and the environment only as a copy. Those pins catch drift, not a deliberate
+rewrite; review of every change to this file is the control for that.
 """
 
 from __future__ import annotations
@@ -483,16 +501,31 @@ class Gate:
         return left
 
     def gh(self, arguments: list[str]) -> Result:
-        """Run `gh` within the remaining budget; a timeout is exit status 124."""
+        """Run `gh api` or `gh pr checks` within the remaining budget.
+
+        A timeout is exit status 124. Each subcommand is a literal at its call,
+        which is how the supply-chain checker pins the commands gh may run.
+        """
         budget = self.remaining()
         try:
-            completed = subprocess.run(
-                ["gh", *arguments],
-                capture_output=True,
-                timeout=budget,
-                env=self.subprocess_env,
-                check=False,
-            )
+            if arguments[:1] == ["api"]:
+                completed = subprocess.run(
+                    ["gh", "api", *arguments[1:]],
+                    capture_output=True,
+                    timeout=budget,
+                    env=self.subprocess_env,
+                    check=False,
+                )
+            elif arguments[:2] == ["pr", "checks"]:
+                completed = subprocess.run(
+                    ["gh", "pr", "checks", *arguments[2:]],
+                    capture_output=True,
+                    timeout=budget,
+                    env=self.subprocess_env,
+                    check=False,
+                )
+            else:
+                raise ValueError(f"unsupported gh command {arguments[:2]!r}")
         except subprocess.TimeoutExpired as expired:
             return Result(124, _decode(expired.stdout), _decode(expired.stderr))
         except OSError as error:
@@ -686,8 +719,12 @@ def main(
     clock: Callable[[], int] | None = None,
     sleep: Callable[[int], None] | None = None,
 ) -> int:
-    """Run the gate. Tests inject the environment, clock and sleep."""
-    source = os.environ if environ is None else environ
+    """Run the gate. Tests inject the environment, clock and sleep.
+
+    The gate reads a copy of the process environment; gh inherits the
+    original, which nothing here changes.
+    """
+    source = dict(os.environ) if environ is None else environ
     for name in ("REPO", "RELEASE_SHA", "DEFAULT_BRANCH"):
         if not source.get(name):
             print(f"::error::{name} is required.")

@@ -7,17 +7,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- `.github/scripts/release_gate.py`, a Python port of the release gate that
-  `release.yml`'s `authorize-release` job runs as inline bash and jq (#473). It
-  keeps the same semantics: one shared 900-second sampling budget checked
-  before every call and again after the final identity read, a bounded retry of
-  a missing merge association, identity reads bracketing each sample,
-  inconsistent check-run page totals treated as a pagination race that polls
-  again, one bounded retry of a check-run read that fails with HTTP 5xx, and
-  malformed evidence refused without waiting. Every existing release-gate
-  scenario now runs against both the inline gate and the helper. `release.yml`
-  still runs the inline gate; a follow-up pull request switches it to the
-  helper once the protected checker below is on `main`.
+- `.github/scripts/release_gate.py`, the release gate as a Python helper
+  (#473). `release.yml`'s `authorize-release` job now checks out the release
+  commit first and runs `python3 -I .github/scripts/release_gate.py` in place
+  of about 340 lines of inline bash and jq. It keeps the inline gate's
+  verdicts: one shared 900-second sampling budget checked before every call
+  and again after the final identity read, a bounded retry of a missing merge
+  association, identity reads bracketing each sample, inconsistent check-run
+  page totals treated as a pagination race that polls again, one bounded retry
+  of a check-run read that fails with HTTP 5xx, and malformed evidence refused
+  without waiting. It is stricter in a few edge cases its docstring lists: a
+  SHA with a trailing newline, a non-string check-run conclusion, and `NaN` or
+  `Infinity` in a response are refused, and a budget that runs out during a
+  call reports only the timeout. Every release-gate scenario runs against the
+  helper with a stub `gh`.
 - Credential-complete consumer verification and coherent conditional namespace
   snapshots for API mutations (#462). Sensitive response parsers validate identities,
   duplicate records, row-map coverage, strong opaque tokens, source/cache state and
@@ -236,21 +239,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
-- Pin the release gate in the supply-chain checker, ahead of moving it into a
-  helper (#473). The inline gate must pass exactly the launch-required and
-  accepted check lists to jq and keep its 900-second budget and GitHub Actions
-  app binding. A `release.yml` that runs `.github/scripts/release_gate.py`
-  must do so as exactly `python3 -I .github/scripts/release_gate.py`, with only
-  `GH_TOKEN`, `REPO`, `RELEASE_SHA` and `DEFAULT_BRANCH` bound, a 16-minute step
-  timeout, no shell, working-directory, condition or tolerated failure, no
+- Pin the release gate in the supply-chain checker (#473). `release.yml` must
+  run the gate as exactly `python3 -I .github/scripts/release_gate.py`, with
+  only `GH_TOKEN`, `REPO`, `RELEASE_SHA` and `DEFAULT_BRANCH` bound, a 16-minute
+  step timeout, no shell, working-directory, condition or tolerated failure, no
   workflow or job env or run defaults, and directly after a plain
-  `actions/checkout` of the release commit. Whenever the helper exists, its
-  launch lists, app id and budget must be the pinned values, bound once and
-  read; it may import only a small standard-library set, unaliased, name `os`,
-  `sys` and `subprocess` only through allowed attributes, run only a literal
-  `gh` argument list, and use no dynamic builtins, dunder attributes or
-  env-file channel names. These pins bound the helper's reach, not its control
-  flow, which stays under exact-head review.
+  `actions/checkout` of the release commit; any other gate step, including the
+  former inline script, is refused. The helper's launch lists, app id and
+  budget must be the pinned values, bound once and read. It may import only a
+  small standard-library set, unaliased, and use each imported name only as
+  one listed reference, with nothing after it, so it cannot walk from an
+  allowed module to another (`re.enum.sys`, `json.codecs`). It reads the
+  environment only as `dict(os.environ)`, runs only literal `gh api` and
+  `gh pr checks` argument lists (never `gh alias` or `gh extension`), and uses
+  no dynamic builtins, `help`, dunder attributes or class patterns. No string
+  literal may name a `GITHUB_*` runner variable or env-file channel, even
+  split across `+`, an f-string or `"".join`. These pins catch drift and
+  accidental reach; they are not a sandbox and do not prove control flow.
+  Exact-head review of every helper change is the control against a deliberate
+  rewrite.
 - Refuse computed shells. No `shell:` value may hold a GitHub expression, in
   any workflow or the local actions it runs, and a workflow's or job's
   `defaults:` and its `run:` must be mappings rather than computed values: the

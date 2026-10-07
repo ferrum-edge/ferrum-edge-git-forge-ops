@@ -1,8 +1,8 @@
-"""Exercise the release gate with hosted gh, clock and sleep stubs.
+"""Exercise the release gate with a hosted gh stub and an injected clock and sleep.
 
-Every scenario runs twice: against the inline shell `release.yml` runs today,
-and against `release_gate.py`, the helper it will run instead (#473). Both must
-reach the same verdict through the same gh calls and waits.
+`release.yml`'s `authorize-release` job runs `release_gate.py` from the release
+commit's checkout (#473). Every scenario runs the helper against the same stub
+`gh` and checks its verdict, its gh calls and its waits.
 """
 
 from __future__ import annotations
@@ -12,8 +12,6 @@ import importlib.util
 import io
 import json
 import os
-import re
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -25,6 +23,10 @@ HELPER = ROOT / ".github" / "scripts" / "release_gate.py"
 SPEC = importlib.util.spec_from_file_location("release_gate", HELPER)
 release_gate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release_gate)
+CHECKER = ROOT / ".github" / "scripts" / "check_supply_chain.py"
+CHECKER_SPEC = importlib.util.spec_from_file_location("check_supply_chain", CHECKER)
+check_supply_chain = importlib.util.module_from_spec(CHECKER_SPEC)
+CHECKER_SPEC.loader.exec_module(check_supply_chain)
 
 REQUIRED = [
     "Rust CI / rust-ci-check",
@@ -123,39 +125,6 @@ def full_run_page() -> list[dict]:
     ]
 
 
-GATE = re.compile(
-    r"--argjson required '(?P<required>\[.*?\])' "
-    r"--argjson accepted '(?P<accepted>\[.*?\])'",
-    re.S,
-)
-
-
-def gate() -> re.Match[str]:
-    """Locate the jq gate the release job runs over `gh pr checks` output."""
-    match = GATE.search(WORKFLOW.read_text(encoding="utf-8"))
-    if match is None:
-        raise AssertionError("release.yml no longer contains the required-check jq gate")
-    return match
-
-
-def gate_script() -> str:
-    """Extract the actual commit-to-PR and check authorization shell step."""
-    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
-    start = next(
-        index
-        for index, line in enumerate(lines)
-        if "name: Verify the published commit passed every required check" in line
-    )
-    run = next(index for index in range(start, len(lines)) if lines[index].strip() == "run: |")
-    indent = len(lines[run + 1]) - len(lines[run + 1].lstrip())
-    body = []
-    for line in lines[run + 1 :]:
-        if line.strip() and len(line) - len(line.lstrip()) < indent:
-            break
-        body.append(line[indent:])
-    return "\n".join(body) + "\n"
-
-
 STUB_GH = r"""#!/usr/bin/env python3
 import json
 import os
@@ -242,54 +211,40 @@ sys.stderr.write(diagnostic)
 raise SystemExit(status)
 """
 
-STUB_TIME = r"""#!/usr/bin/env python3
-import json
-import os
-import sys
-from pathlib import Path
 
-path = Path(os.environ["STUB_STATE"])
-state = json.loads(path.read_text(encoding="utf-8"))
-if Path(sys.argv[0]).name == "date":
-    assert sys.argv[1:] == ["+%s"]
-    print(state["clock"])
-else:
-    with Path(os.environ["STUB_CALLS"]).open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(["sleep", *sys.argv[1:]]) + "\n")
-    state["sample"] += 1
-    state["clock"] += int(os.environ.get("STUB_SLEEP_ADVANCE", sys.argv[1]))
-    path.write_text(json.dumps(state), encoding="utf-8")
-"""
+class ReleaseGateWiringTests(unittest.TestCase):
+    def setUp(self) -> None:
+        document = check_supply_chain.parse_workflow(WORKFLOW.read_text(encoding="utf-8"))
+        self.job = document["jobs"]["authorize-release"]
+        self.steps = self.job["steps"]
 
-
-class ReleaseGateListTests(unittest.TestCase):
-    def test_the_workflow_lists_exactly_the_launch_checks(self) -> None:
-        # Behavior tests run the workflow itself; pin the launch lists as well
-        # so accidentally removing a mandatory check cannot make them pass.
-        match = gate()
-        self.assertEqual(json.loads(match.group("required")), REQUIRED)
-        self.assertEqual(json.loads(match.group("accepted")), ACCEPTED)
+    def test_the_release_job_runs_the_pinned_helper_after_its_checkout(self) -> None:
+        checkout, step = self.steps[0], self.steps[1]
+        self.assertEqual(checkout["uses"].split("@", 1)[0], "actions/checkout")
+        self.assertEqual(checkout["with"], {"persist-credentials": "false"})
+        self.assertEqual(step["name"], "Verify the published commit passed every required check")
+        self.assertEqual(step["run"], "python3 -I .github/scripts/release_gate.py")
+        self.assertEqual(
+            step["env"],
+            {
+                "GH_TOKEN": "${{ github.token }}",
+                "REPO": "${{ github.repository }}",
+                "RELEASE_SHA": "${{ github.sha }}",
+                "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+            },
+        )
 
     def test_the_wait_budget_fits_inside_step_and_job_timeouts(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        job = workflow.split("  authorize-release:", 1)[1].split("  docker:", 1)[0]
-        step = job.split("name: Verify the published commit passed every required check", 1)[1]
-        job_timeout = int(re.search(r"timeout-minutes: (\d+)", job).group(1)) * 60
-        step_timeout = int(re.search(r"timeout-minutes: (\d+)", step).group(1)) * 60
-        budget = int(re.search(r"deadline=\$\(\( \$\(date \+%s\) \+ (\d+) \)\)", gate_script()).group(1))
+        job_timeout = int(self.job["timeout-minutes"]) * 60
+        step_timeout = int(self.steps[1]["timeout-minutes"]) * 60
+        budget = release_gate.BUDGET_SECONDS
         self.assertEqual(budget, 900)
         self.assertLessEqual(budget + 5, step_timeout)
         # Preserve time for the existing forty lifecycle polls, plus evidence
         # download and verification. No production clock override is added.
         self.assertLess(step_timeout + 40 * 30, job_timeout)
-        self.assertNotIn("STUB_", gate_script())
-        self.assertIn('gh pr checks "$pr" --repo "$REPO" --required', gate_script())
 
-    def test_the_helper_pins_the_same_lists_and_budget(self) -> None:
-        # Until release.yml runs the helper, both copies must agree.
-        match = gate()
-        self.assertEqual(list(release_gate.REQUIRED_CHECKS), json.loads(match.group("required")))
-        self.assertEqual(list(release_gate.ACCEPTED_CHECKS), json.loads(match.group("accepted")))
+    def test_the_helper_pins_the_launch_lists_and_budget(self) -> None:
         self.assertEqual(list(release_gate.REQUIRED_CHECKS), REQUIRED)
         self.assertEqual(list(release_gate.ACCEPTED_CHECKS), ACCEPTED)
         self.assertEqual(release_gate.ACTIONS_APP_ID, 15368)
@@ -395,11 +350,22 @@ class ReleaseGateHelperUnitTests(unittest.TestCase):
         self.assertIn("Release merge association could not be read", stdout.getvalue())
         self.assertIn("gh could not be run", stderr.getvalue())
 
+    def test_only_gh_api_and_gh_pr_checks_can_run(self) -> None:
+        with tempfile.TemporaryDirectory() as empty:
+            environ = {"PATH": empty}
+            gate = release_gate.Gate(environ, lambda: 0, self.fail, environ)
+            for arguments in (["alias", "set", "x", "y"], ["extension", "install", "x"], ["pr"]):
+                with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                    gate.gh(arguments)
+            # The two supported commands still reach the (missing) executable.
+            self.assertEqual(gate.gh(["api", "user"]).status, 127)
+            self.assertEqual(gate.gh(["pr", "checks", "1"]).status, 127)
+
 
 class ReleaseGateBehavior:
-    """Scenarios shared by the inline gate and the helper.
+    """Release gate scenarios against the stub `gh`.
 
-    Subclasses provide `execute(root, bin_dir, env)`, which runs one gate with
+    Subclasses provide `execute(root, bin_dir, env)`, which runs the gate with
     the stub `gh` first on `PATH` and returns its exit status and streams.
     """
 
@@ -1345,31 +1311,6 @@ class ReleaseGateBehavior:
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
-
-
-
-@unittest.skipUnless(
-    shutil.which("jq") and shutil.which("bash") and shutil.which("timeout"),
-    "jq, bash and timeout are required to exercise the release gate",
-)
-class WorkflowReleaseGateTests(ReleaseGateBehavior, unittest.TestCase):
-    """The inline shell `release.yml` runs today."""
-
-    def execute(
-        self, root: Path, bin_dir: Path, env: dict[str, str]
-    ) -> subprocess.CompletedProcess[str]:
-        for name in ("sleep", "date"):
-            (bin_dir / name).write_text(STUB_TIME, encoding="utf-8")
-            (bin_dir / name).chmod(0o755)
-        return subprocess.run(
-            ["bash", "--noprofile", "--norc", "-c", gate_script()],
-            cwd=root,
-            env=env,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
 
 
 class HelperReleaseGateTests(ReleaseGateBehavior, unittest.TestCase):
