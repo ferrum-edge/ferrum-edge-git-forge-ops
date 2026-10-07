@@ -240,6 +240,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Tighten the protected release-gate helper pins to reject direct frame,
+  code, generator and traceback attributes, dunder names outside the
+  required main guard, and any `subprocess.run` environment other than
+  `self.subprocess_env`. Clarify that the AST checks detect drift and selected
+  accidental reach; they are not a sandbox. (#500)
 - Pin the release gate in the supply-chain checker (#473). `release.yml` must
   run the gate as exactly `python3 -I .github/scripts/release_gate.py`, with
   only `GH_TOKEN`, `REPO`, `RELEASE_SHA` and `DEFAULT_BRANCH` bound, a 16-minute

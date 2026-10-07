@@ -721,8 +721,8 @@ def main(
 ) -> int:
     """Run the gate. Tests inject the environment, clock and sleep.
 
-    The gate reads a copy of the process environment; gh inherits the
-    original, which nothing here changes.
+    In production, gh receives env=None and inherits the process environment
+    unchanged. Tests that inject an environment pass a copy to gh.
     """
     source = dict(os.environ) if environ is None else environ
     for name in ("REPO", "RELEASE_SHA", "DEFAULT_BRANCH"):

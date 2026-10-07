@@ -835,21 +835,25 @@ weaken:
   and bare `Callable`. Nothing may follow a reference, so the helper cannot
   walk from an allowed module to another one, such as `re.enum.sys`.
 - **Environment and commands.** `os.environ` is read only as
-  `dict(os.environ)`, so the helper never changes the environment `gh`
-  inherits. `subprocess.run` is always called, with a literal `gh api` or
-  `gh pr checks` argument list and only `capture_output`, `check`, `env` and
-  `timeout`. Any other `gh` subcommand, such as `alias` or `extension`, is
-  refused.
+  `dict(os.environ)`. Each `subprocess.run` call passes exactly
+  `env=self.subprocess_env`. The pin covers only that expression: today the
+  helper sets it to `None` in production, so `gh` inherits the process
+  environment unchanged, and tests that inject an environment pass its copy,
+  but exact-head review, not the checker, keeps that value. Calls use a literal `gh api` or `gh pr checks`
+  argument list and only `capture_output`, `check`, `env` and `timeout`. Any
+  other `gh` subcommand, such as `alias` or `extension`, is refused.
 - **Builtins and names.** No `eval`, `exec`, `open`, `getattr`, `help` or
-  similar dynamic builtin, no dunder attribute, and no class pattern. No
-  string literal names a `GITHUB_*` runner variable or env-file channel, even
-  when built from several literals with `+`, an f-string or `"".join`. The
-  file ends with the standard `main()` guard.
+  similar dynamic builtin, dunder name other than the exact `__name__` in the
+  required main guard, dunder attribute, frame/generator/traceback attribute,
+  or class pattern. No string literal names a `GITHUB_*` runner variable or
+  env-file channel, even when built from several literals with `+`, an f-string
+  or `"".join`. The file ends with the standard `main()` guard.
 
-These pins catch drift in the lists, app id and budget, and accidental reach.
-They are not a sandbox. A name built through a variable, or a value passed
-through one, is invisible to them, and they do not prove the helper's control
-flow: a rewritten helper could simply report success. Exact-head review of
+These pins catch drift in the lists, app id and budget, and selected forms of
+accidental reach, including direct frame-related attribute access and dunder
+names. They are drift detection, not a sandbox: names or values computed
+indirectly may be invisible to them, and they do not prove the helper's control
+flow. A rewritten helper could simply report success. Exact-head review of
 every change to the helper is the control against a deliberate rewrite.
 `.github/scripts/tests/test_release_gate.py` runs every release-gate scenario
 against the helper with a stub `gh`.
