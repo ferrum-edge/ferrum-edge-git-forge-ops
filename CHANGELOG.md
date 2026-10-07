@@ -14,7 +14,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GET-only capability probes and reports unavailable evidence as unknown.
 - Lifecycle coverage for hidden consumer edits and namespace restore conditions,
   including ABA, empty replacement and confirmed spec deletion. Qualification
-  on the published Edge v0.9.12 release, content-pinned (SHA-256), remains
+  on the published Edge v0.9.13 release, content-pinned (SHA-256), remains
   required; an older fixture or passing parser tests do not establish first-release
   acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
@@ -43,15 +43,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Operators must provision the distinct gateway viewer key before switching
   the workflow and remove the admin key from monitor environments. Namespace
   restrictions and approval gates remain in place. The bundled drift command
-  still fails on unverified secrets and never certifies them as in sync; it
-  adds no fingerprint-baseline storage (#440).
+  never certifies unverified secrets as in sync; it adds no
+  fingerprint-baseline storage (#440).
 - `diff` reads Ferrum Edge's `GET /config/export` with a viewer-capped
   credential when `FERRUM_ADMIN_JWT_VIEWER_SECRET` is set, and never uses the
   admin secret on that path; without it, `diff` keeps reading `GET /backup`
   with the admin credential. Secrets arrive as gateway-keyed fingerprints a
   viewer cannot reproduce. Declared secret-bearing fields (and every declared
   consumer's hidden-credentials fingerprint) are reported as unverified, never
-  as in sync: JSON `in_sync` is `false`, and `--exit-on-drift` exits 1 instead
+  as in sync: JSON `in_sync` is `false`, and `--exit-on-drift` exits 6 instead
   of 0 unless `--accept-unverified-secrets` is passed (drift found on a fresh
   read still exits 2; a cached read always exits 1). Fingerprinted credentials the
   repository does not declare, and fingerprint-shaped values in non-secret
@@ -77,6 +77,65 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Refresh the Ferrum Edge validator and bundled gateway pins to published
+  v0.9.13: validator SHA-256
+  `bdb8756c30bd2c04c3483ebff26bf0163ebeb0d5dfdc887897a7eb473305ed6c` and
+  Docker Hub multi-platform index
+  `sha256:6caa0987adb4c0a3a368fcd800bb0459cff3d3e219522e2e9c56280205862e50`.
+  Retain all earlier approved validator digests for in-flight pull requests and
+  preserve publisher-checksum verification. Edge release 404961860 was published
+  at `9b83115de7ec23ab51ec4feae6bed65e596db425`; upstream release jobs passed.
+  GitForgeOps hosted validation and exact-revision lifecycle acceptance remain
+  required, the release baseline stays pending, and the conditional API
+  implementation and `contracts-edge-0.9.11` pin are unchanged.
+- Simplify the trusted checker's probe-binding rules (#476). The hand-written
+  Bash lexer, expression renderer and rendered matrix/step-output source
+  proofs are gone. In their place: the Verify traffic script and the credential-file
+  hand-off in each `Load credential bundles` step are pinned line for line
+  (comment lines are ignored unless they hold an expression), and every
+  workflow is banned from spelling `GITHUB_ENV`, `GITHUB_PATH` or `BASH_ENV`,
+  the runner's file-command file names (`set_env_`, `add_path_`,
+  `save_state_`, `_runner_file_commands`), indirect expansion, the
+  `github.env`/`github.path` contexts, or a redirect or `tee` into any GitHub
+  file channel other than `GITHUB_OUTPUT` and `GITHUB_STEP_SUMMARY`, outside
+  that hand-off; those two may appear only as a plain `>>` or `tee -a` target
+  (and the summary as `--summary`). Quotes, backslashes and line continuations
+  are removed before matching, shell comments count, a `run:` interpolation
+  may not adjoin a name character (with quotes removed), and an `env:` mapping
+  may not be computed or bind `ENV` or a GitHub file destination. The
+  Environment-bound workflows may interpolate into `run:` only a per-job
+  allowlist, and each allowlisted value is pinned to its producer by exact
+  job-output, matrix and producer-step pins (the enumerator step whole; the
+  metadata step's hex-checked event SHA and its two SHA writes). Apply's
+  hand-off keeps `id: load-bundles`, and Apply and Verify traffic must read the
+  finalized bundle path from it. Outside the guarded Apply steps
+  `apply-on-merge.yml` may invoke the binary only on the pinned `envs`,
+  `validate` and `verify` lines; `$(command -v gitforgeops) apply` counts as an
+  invocation. Protected bindings and the Validate/Apply/Verify flow pins are
+  unchanged; the GitHub context-access rules now cover every workflow. The
+  rules read workflow text only: a program a step runs (the binary, a helper,
+  or Bash evaluating computed text) can still write `$GITHUB_ENV`, which is
+  left to review of every workflow change. Some legitimate text now fails the check and must be reworded: a
+  shell comment that names an env-file channel or a protected variable
+  outside its pinned step, a redirect or `tee` into `$GITHUB_WORKSPACE/...`,
+  any name containing `GITHUB_ENV`, `GITHUB_PATH` or a file-command prefix
+  (such as `GITHUB_ENVIRONMENT`), an interpolation glued to a name
+  (`v${{ matrix.version }}`), and indexed or whole `github` context access
+  (`toJSON(github)`, `github.event.commits[0]`) in any workflow.
+- `diff --exit-on-drift` exits with the new code `6` ("in sync, secrets
+  unverified") instead of `1` when a fresh viewer-credential read found no
+  drift in an alerted category and no fingerprint baseline was supplied, so the
+  only gap is fingerprinted secrets the viewer cannot verify. `drift_report.py`
+  records it as the non-blocking `in_sync_secrets_unverified` outcome, shown as
+  a warning in the job summary and as a `::warning::` annotation, so scheduled
+  viewer-only monitoring of an in-sync environment that declares secrets no
+  longer fails every run and keeps the settings audit's monitoring evidence
+  current. Drift still exits `2` and fails the workflow; a cached read, a whole
+  value fingerprinted around a secret, a refused baseline write, and a supplied
+  `--fingerprint-baseline` that cannot verify secrets (missing file, changed
+  gateway fingerprint key, incomplete recorded namespace) still exit `1`.
+  `--accept-unverified-secrets` still returns `0`; runs without
+  `--exit-on-drift` and apply-time verification are unchanged (#471).
 - Align `rust-toolchain.toml`, workflow Rust pins, and the Docker builder rule on
   Rust 1.99.0. The trusted supply-chain checker enforces a 1.99.0 minimum,
   rejects legacy `rust-toolchain` files and unsupported toolchain keys, and
@@ -84,12 +143,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   provenance, with exactly one stage named `builder` (#474).
 
 - Refresh the existing 13-file ferrum-contracts adoption to published
-  `contracts-edge-0.9.12` at `31f0a21d707795be293d15837c2f77c3d84219d8`, with an
-  explicit Edge v0.9.12 mapping and updated vocabulary byte hashes. The schema
-  and ten fixtures are unchanged; plugin and attribution values remain unchanged.
-  Preserve upstream preparation wording verbatim and document actual publication
-  separately. This pin update adds no deployment profiles or Alloy manifest/report
-  consumption and does not qualify production apply or first-release acceptance.
+  `contracts-edge-0.9.13` at `9626821eb089c71f5d4d71268c7b8276a8a5ab50`, with an
+  explicit Edge v0.9.13 mapping and updated vocabulary byte hashes. The resource
+  schema and ten fixtures are unchanged; plugin and attribution values remain
+  unchanged. The new `backend-egress-policy` v2 and
+  `admin-deployment-snapshot` v2 schemas are not consumed here. This pin update
+  adds no deployment profiles or Alloy manifest/report consumption and does not
+  qualify production apply or first-release acceptance.
 - Mutation acknowledgements refuse duplicate keys, malformed field types and
   ambiguous envelopes without exposing response bytes (#462). Invalid responses
   cannot authorize retries, pruning, ownership ledger updates or rotation
@@ -165,6 +225,55 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Allowlist `run:` interpolations in every workflow (#495). GitHub renders a
+  `run:` interpolation into the script before the shell parses it, and an env,
+  matrix, input, job- or step-output or event value can carry text computed or
+  chosen elsewhere (`env.A` set by `fromJSON(...)`, a pull request title), so
+  refusing only computed expressions inside `run:` would be bypassed by
+  indirection. A `run:` interpolation is now accepted only when it
+  is exactly `github.event_name`, `github.sha`, `github.run_id`,
+  `github.run_attempt`, `runner.os` or `runner.arch`, or in an
+  Environment-bound job one of its existing per-job pins. Every key named `run`
+  is read, so composite actions' `runs.steps` count, and each local action a
+  workflow reaches is judged by the same allowlist (Environment-bound
+  workflows' local actions still interpolate nothing). Pass any other value
+  through step `env:` and read it as `"$NAME"`. The shipped workflows already
+  comply.
+- Close the remaining supply-chain checker residuals (#493). `env:` mappings may
+  no longer bind any `LD_*` loader variable (`LD_AUDIT` included), and job and
+  service containers may no longer set `options:` (whose `-e`/`--env`/
+  `--env-file` would bind them for every step) or be computed, and their images
+  must be pinned by `@sha256:` digest. Bash ANSI-C quoting (`$'...'`) is refused
+  in every workflow scalar and reached local action, because it spells names by
+  character code (`$'\x67'itforgeops`, `$'GITHUB_\x45NV'`) that no text rule
+  decodes; escapes elsewhere are still stripped, so `GITH\UB_ENV` reads as
+  `GITHUB_ENV`. `GITHUB_STATE` is refused anywhere, like `GITHUB_ENV`. The
+  `apply-on-merge.yml` display-name exemption now covers only the `name:` of the
+  workflow, a job or a step, not an action input or env value called `name`.
+  Every action file under `.github/actions/` must be in the strict YAML subset,
+  and its remote `uses:` are pinned from the parsed file in any key case. No job
+  may run a local action after an `actions/checkout` of another ref or
+  repository over the workspace root, and a local action may not make such a
+  checkout. `.github/actions/**` is now a deployment input, a `security.yml`
+  push path and code-owned, each required by the checker.
+- Close supply-chain checker residuals (#487). A local action (`uses: ./...`)
+  is no longer exempt and unread: every local reference must name, by a plain
+  path, a composite action under `.github/actions/` with exactly one
+  `action.yml` or `action.yaml`, reached through no symbolic link and inside the
+  strict YAML subset, and each one a workflow reaches (also through another
+  local action) is judged by that workflow's channel bans, protected names,
+  `run:` interpolation rule and, in `apply-on-merge.yml`, binary pin. Any other
+  local reference, including a local reusable workflow, fails closed. `env:`
+  mappings at every level may no longer bind `BASH_FUNC_*`, `SHELLOPTS`,
+  `BASHOPTS`, `PS4`, `LD_PRELOAD` or `LD_LIBRARY_PATH` (in any case), beside
+  `ENV` and `BASH_ENV`. `apply-on-merge.yml` now reads every scalar outside the
+  guarded Apply steps for the binary, including step and default `shell:`
+  values and action inputs; only the pinned read-only `run:` lines and pinned
+  display names may name it. The step with `id: load-bundles` in each apply job
+  must be the one named `Load credential bundles`, and producer step ids compare
+  without regard to case. The docs now name file-command paths discovered from
+  the filesystem (`"$RUNNER_TEMP"/*/…`, `/proc/$$/fd`) as program-level, out of
+  scope for text rules.
 - Refuse a plugin config delete, or an update that moves its scope or target,
   when a proxy outside the plan references the plugin (#475). Ferrum Edge
   removes every association to a deleted plugin config, and every association
@@ -432,8 +541,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   that, until the required check moves to a workflow whose definition comes
   from the protected branch, a green result also depends on reviewing workflow
   changes (GHSA-x5m2-4555-q4cr).
-- Pin libpcre2-8-0 10.46-1~deb13u3 into the runtime image to fix the HIGH
-  CVE-2026-103111 finding while the pinned Debian base remains behind.
+- Repin the Debian Trixie runtime image to the current multi-architecture index.
+  Keep the reviewed libpcre2-8-0 10.46-1~deb13u3 update because the published
+  Trixie package index still lists the pre-fix u2 version; remove it after the
+  base's installed package metadata confirms the fix is already present.
 - Fail closed on HTTP passthrough proxies: Ferrum Edge rejects passthrough on
   non-stream proxies and rejects it with `frontend_tls: true`, so GitForgeOps
   does not count their HTTP authenticators. Set `passthrough: false` and

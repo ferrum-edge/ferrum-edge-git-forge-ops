@@ -17,13 +17,14 @@ live operations.
 Shared contracts live in [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts); see
 [README.md's Contracts section](README.md#contracts) for the vendored pin and update rule.
 
-The 13 adopted files are pinned to published `contracts-edge-0.9.12` at
-`31f0a21d707795be293d15837c2f77c3d84219d8`, with Edge v0.9.12 provenance at
-`0d917701b63ef38210c49df830f48cf0457cbc7d`. Adoption covers only the GitForgeOps
+The 13 adopted files are pinned to published `contracts-edge-0.9.13` at
+`9626821eb089c71f5d4d71268c7b8276a8a5ab50`, with Edge v0.9.13 provenance at
+`9b83115de7ec23ab51ec4feae6bed65e596db425`. Adoption covers only the GitForgeOps
 resource-envelope schema, its ten fixtures, and the plugin-catalog and
 `provisioned-by` vocabularies. Retain upstream preparation prose verbatim; the
 [contracts guide](docs/contracts.md) distinguishes actual publication from metadata
-and the separate hosted qualification and first-release acceptance gates.
+and the separate hosted qualification and first-release acceptance gates. The
+`backend-egress-policy` v2 and `admin-deployment-snapshot` v2 schemas are not consumed here.
 
 GitForgeOps is in pre-launch buildout with no users. Breaking changes are
 acceptable. Update implementation, examples, fixtures, tests and docs together;
@@ -105,6 +106,7 @@ Exit codes:
 | 3 | `doctor` found a blocker (`DOCTOR_FAILED_EXIT_CODE`). |
 | 4 | `verify` check failed (`VERIFY_FAILED_EXIT_CODE`). |
 | 5 | `verify` had no declared check for the environment (`VERIFY_SKIPPED_EXIT_CODE`). Skipped is never a pass. |
+| 6 | `diff --exit-on-drift` found no drift in an alerted category with no fingerprint baseline supplied, but fingerprinted secrets were unverified (`SECRETS_UNVERIFIED_EXIT_CODE`). Never in sync; monitoring warns, does not fail. A supplied baseline that cannot verify secrets exits 1 instead. |
 
 ## Build / Test / Lint
 
@@ -623,11 +625,18 @@ which the export lacks.
   count as managed modifications (`DriftVerdict::with_secret_changes`).
   Recording refuses a run with diffs or secret changes unless
   `--force-baseline`; a baseline path inside a git worktree is warned about.
-- Unverified secrets (or a key change) are non-authoritative: no "in sync"
+- Unverified secrets are non-authoritative: no "in sync"
   text, JSON `in_sync: false`; `--exit-on-drift` exits 2 when drift was
-  found, otherwise 1 unless `--accept-unverified-secrets` (which does not
-  cover masked ancestors). A cached read exits 1 either way. The four
-  export-only flags are refused on the `/backup` path.
+  found, otherwise 6 (`verdict::DiffExit::SecretsUnverified`) when no
+  `--fingerprint-baseline` was supplied, unless `--accept-unverified-secrets`
+  (0). A supplied baseline that cannot verify secrets — the file is missing, the
+  key changed, or a recorded namespace is incomplete — is
+  `DiffExit::BaselineInvalidated` (exit 1; `--accept-unverified-secrets` still
+  maps to 0); a namespace absent from the baseline or a resource not yet
+  recorded stays 6. Masked ancestors exit 1 with or without
+  the flag; a refused baseline write wins over 6 (exit 1). A cached read
+  exits 1 either way. The four export-only flags are refused on the
+  `/backup` path.
 - Cached export (`X-Data-Source: cached` or `source: cached`): same as a cached
   `/backup` — warning, no authoritative verdict, `--exit-on-drift` exits 1, and
   no baseline is written.
@@ -678,10 +687,13 @@ Fences on the reviewer-free environment:
   `<env>-monitor` (see `docs/reference.md`, Scheduled monitoring). That is why
   `CREDENTIAL_BUNDLE_WORKFLOWS` is a subset of `PRIVILEGED_WORKFLOWS`.
 
-Outcomes come from `.github/scripts/drift_report.py`: `in_sync`, `drift`,
-`failed`, `skipped` (file mode), `not_completed`. Only `in_sync` is a successful
-comparison; `drift`/`failed`/`not_completed` block; `skipped` does not. A matrix
-entry with no record becomes `not_completed`. The settings audit also fails when
+Outcomes come from `.github/scripts/drift_report.py`: `in_sync`,
+`in_sync_secrets_unverified` (`diff` exit 6), `drift`, `failed`, `skipped`
+(file mode), `not_completed`. Only `in_sync` is a successful comparison;
+`drift`/`failed`/`not_completed` block; `skipped` and
+`in_sync_secrets_unverified` (a summary warning and `::warning::` annotation) do
+not. A matrix entry with no record becomes `not_completed`. The settings audit
+also fails when
 the newest successful `drift-check.yml` run is older than
 `--monitoring-max-age-hours` (48), so a `cron:` entry alone proves nothing.
 `drift-check.yml` binds only `FERRUM_ADMIN_JWT_VIEWER_SECRET` and its
@@ -841,9 +853,35 @@ Consumer plus every labelled Consumer, names only
   workflow tree and pins `${{ vars.FERRUM_VERIFY_PROBE_CONSUMERS }}` in both
   apply and promote Validate/Verify traffic steps and trusted live review,
   plus `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` in Validate and live review.
-  Workflow/job env, dynamic maps, other step bindings, shell rebinding and
-  alternate `GITHUB_ENV` writes are refused. The bundle loader's credential-file
-  hand-off remains the only permitted env-file reference.
+  A protected name anywhere else (workflow/job env, other steps, `with:`, any
+  script or comment) is refused. `workflow_channel_violations` bans
+  `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STATE`, `BASH_ENV`, the runner's
+  file-command file names (`set_env_`, `add_path_`, `save_state_`,
+  `_runner_file_commands`), indirect expansion, ANSI-C quoting (any `$'`; no
+  rule decodes escapes, they are only stripped), computed env maps, shell
+  startup and loader env keys (`ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`,
+  `PS4`, `LD_*`), container and service `options:`, container images not
+  pinned by `@sha256:` digest, and writes to other GitHub file channels in every
+  workflow, and allows `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY`
+  only as a plain `>>` or `tee -a` target (or the summary as `--summary`); the
+  bundle loader's credential-file hand-off, pinned line for line, is the only
+  permitted env-file write. `run_expression_violations` allows a `run:`
+  interpolation, in every workflow and every local action it reaches, only
+  when it is exactly one of `RUN_TRUSTED_EXPRESSIONS` (`github.event_name`,
+  `github.sha`, `github.run_id`, `github.run_attempt`, `runner.os`,
+  `runner.arch`), or in an Environment-bound job one of its `RUN_EXPRESSIONS`
+  pins (their local actions interpolate nothing). Env, matrix, input, output,
+  `vars`/`secrets` and event values, functions and literals reach a script
+  only through step `env:`, read as `"$NAME"`.
+  `run_expression_source_violations` pins where each Environment-bound `run:`
+  interpolation comes from (job outputs, matrices and the producing step's
+  lines). `local_action_violations` refuses any `uses: ./` reference that is
+  not a parseable composite action under `.github/actions/` (local reusable
+  workflows included) and judges each one a workflow reaches by that
+  workflow's fences; `workspace_checkout_violations` refuses a local
+  action after a root checkout of another revision. These are text rules
+  (#476): a program a step runs can still write `$GITHUB_ENV`, and review of
+  every workflow change covers that.
 - Only an ad-hoc `FERRUM_NAMESPACE` (not `namespace_filter_is_environment_scope`)
   makes an out-of-scope slot `OutsideNamespaceScope`, which does not refuse.
   Under the environment's own scope it is `NotAConsumerSecret`, as at verify.

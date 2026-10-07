@@ -987,6 +987,12 @@ pub struct SecretFingerprintSummary {
     /// A namespace's baseline was recorded under a different gateway key, so
     /// none of its fingerprints could be compared.
     pub key_changed: bool,
+    /// A namespace recorded in the baseline could not be compared completely: a
+    /// declared Consumer came without `hidden_credentials_fingerprint`. Unlike
+    /// a namespace absent from the baseline or a resource not yet recorded —
+    /// incremental gaps — this is a failure of the verification control an
+    /// operator set up with `--fingerprint-baseline`.
+    pub recorded_namespace_incomplete: bool,
     /// Whole values Edge fingerprinted around a secret (see
     /// [`ExportLiveView::masked_ancestors`]). Never authoritative: neither a
     /// baseline nor `--accept-unverified-secrets` covers their non-secret
@@ -1013,6 +1019,7 @@ impl SecretFingerprintSummary {
             changes: Vec::new(),
             baseline_complete: baseline.is_some(),
             key_changed: false,
+            recorded_namespace_incomplete: false,
             masked_ancestors: 0,
             notes: Vec::new(),
         };
@@ -1033,6 +1040,9 @@ impl SecretFingerprintSummary {
                 .count();
             if missing > 0 {
                 summary.baseline_complete = false;
+                if baseline.namespaces.contains_key(namespace) {
+                    summary.recorded_namespace_incomplete = true;
+                }
                 summary.notes.push(format!(
                     "namespace '{namespace}': {missing} declared consumer(s) came without \
                      {HIDDEN_CREDENTIALS_FIELD}, so their hidden credentials cannot be verified"
@@ -1079,6 +1089,15 @@ impl SecretFingerprintSummary {
     /// verified: the baseline it invalidated proves nothing.
     pub fn verified(&self) -> bool {
         !self.key_changed && (self.uncompared == 0 || self.baseline_complete)
+    }
+
+    /// True when a supplied baseline could not verify secrets for a namespace
+    /// it covers, rather than merely lacking an incremental entry (a namespace
+    /// or resource not yet recorded). `diff --exit-on-drift` treats this as a
+    /// failed check (`1`), not the non-blocking unverified code (`6`): the
+    /// verification control the operator set up was invalidated.
+    pub fn baseline_invalidated(&self) -> bool {
+        self.key_changed || self.recorded_namespace_incomplete
     }
 
     /// Record how many whole values were fingerprinted around a secret.

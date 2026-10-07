@@ -157,13 +157,17 @@ jobs:
       # comparison", so the bundle stays where allocation needs it: the
       # approval-gated apply and rotate workflows.
       - name: Check drift
-        # `gitforgeops diff --exit-on-drift`: 0 in sync, 2 drift, 1 the check
-        # itself failed (unreachable gateway, 401, cached/non-authoritative
-        # export, unverified secrets, bad configuration). The exit code is
-        # captured rather than allowed to fail the step, because the three
-        # cases mean three different things and only one is a statement about the
-        # gateway. `drift_report.py` does that classification; the aggregate
-        # job below decides the workflow's status.
+        # `gitforgeops diff --exit-on-drift`: 0 in sync, 2 drift, 6 no drift in
+        # an alerted category but fingerprinted secrets the viewer credential
+        # cannot compute were not verified (no fingerprint baseline supplied),
+        # 1 the check itself failed
+        # (unreachable gateway, 401, cached/non-authoritative export, a whole
+        # value fingerprinted around a secret, a supplied baseline that cannot
+        # verify secrets, bad configuration). The exit
+        # code is captured rather than allowed to fail the step, because the
+        # cases mean different things. `drift_report.py` does that
+        # classification (6 is a non-blocking warning); the aggregate job
+        # below decides the workflow's status.
         id: check
         if: steps.deployment-mode.outputs.mode == 'api'
         env:

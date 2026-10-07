@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turn one drift check's raw result into an unambiguous monitoring outcome.
 
-`gitforgeops diff --exit-on-drift` answers with three exit codes, and the
+`gitforgeops diff --exit-on-drift` answers with four exit codes, and the
 scheduled workflow can end in states the binary never reports at all — the job
 was never released by an environment approval, the runner was cancelled, file
 mode has no live surface to compare. Collapsing all of that into "the job is
@@ -13,6 +13,10 @@ So every outcome is named, and only ONE of them means "this gateway was
 compared and matched":
 
     in_sync        the gateway was read and matches the repository
+    in_sync_secrets_unverified
+                   the gateway was read and no drift was found in an alerted
+                   category, but fingerprinted secrets the viewer credential
+                   cannot compute were not verified (`diff` exit 6)
     drift          the gateway was read and differs
     failed         the check itself failed (auth, connectivity, stale view,
                    configuration) — nothing is known about the gateway
@@ -20,9 +24,12 @@ compared and matched":
     not_completed  the job never ran the comparison (approval pending,
                    cancelled, runner lost)
 
-`failed`, `skipped` and `not_completed` are explicitly *not* `in_sync`. The
-aggregate exit code fails the workflow for `drift`, `failed` and
-`not_completed`; `skipped` is a deliberate configuration, not a gap.
+`in_sync_secrets_unverified`, `failed`, `skipped` and `not_completed` are
+explicitly *not* `in_sync`. The aggregate exit code fails the workflow for
+`drift`, `failed` and `not_completed`. `skipped` is a deliberate
+configuration, not a gap, and `in_sync_secrets_unverified` is a warning: no
+drift was found in an alerted category, and the gap is the documented limit of
+a viewer-capped read, not a failure of the check.
 
 Usage::
 
@@ -44,20 +51,37 @@ import sys
 from pathlib import Path
 
 IN_SYNC = "in_sync"
+IN_SYNC_SECRETS_UNVERIFIED = "in_sync_secrets_unverified"
 DRIFT = "drift"
 FAILED = "failed"
 SKIPPED = "skipped"
 NOT_COMPLETED = "not_completed"
 
-OUTCOMES = (IN_SYNC, DRIFT, FAILED, SKIPPED, NOT_COMPLETED)
+OUTCOMES = (
+    IN_SYNC,
+    IN_SYNC_SECRETS_UNVERIFIED,
+    DRIFT,
+    FAILED,
+    SKIPPED,
+    NOT_COMPLETED,
+)
 
-# Only `in_sync` is evidence that a gateway was compared and matched.
+# Only `in_sync` is evidence that a gateway was compared and fully matched.
 SUCCESSFUL_COMPARISON = frozenset({IN_SYNC})
+# Compared with no drift, but not fully verified: reported, never blocking.
+WARNING = frozenset({IN_SYNC_SECRETS_UNVERIFIED})
 # `skipped` is a configured absence of a live surface, not an unknown.
 BLOCKING = frozenset({DRIFT, FAILED, NOT_COMPLETED})
 
 LABELS = {
     IN_SYNC: ("✅", "In sync", "the gateway was read and matches the repository"),
+    IN_SYNC_SECRETS_UNVERIFIED: (
+        "⚠️",
+        "In sync, secrets unverified",
+        "no drift in an alerted category; fingerprinted secrets were not "
+        "verified because the viewer credential cannot compute their "
+        "fingerprints",
+    ),
     DRIFT: ("🔶", "Drift detected", "the gateway was read and differs"),
     FAILED: (
         "❌",
@@ -76,17 +100,20 @@ LABELS = {
     ),
 }
 
-# `gitforgeops diff --exit-on-drift`.
-EXIT_CODES = {0: IN_SYNC, 2: DRIFT}
+# `gitforgeops diff --exit-on-drift`: 0 in sync, 2 drift
+# (`DRIFT_EXIT_CODE`), 6 no drift but secrets unverified
+# (`SECRETS_UNVERIFIED_EXIT_CODE`), both in `src/verdict.rs`.
+EXIT_CODES = {0: IN_SYNC, 2: DRIFT, 6: IN_SYNC_SECRETS_UNVERIFIED}
 
 
 def outcome_for_exit_code(exit_code: int) -> str:
     """Map a `diff --exit-on-drift` exit code onto an outcome.
 
-    Anything that is neither 0 nor the drift code is a failure of the check,
-    never a statement about the gateway. That includes exit 1, which covers
-    authentication, connectivity, a cached (non-authoritative) backup, and
-    configuration errors alike.
+    Anything that is not 0, the drift code or the secrets-unverified code is
+    a failure of the check, never a statement about the gateway. That
+    includes exit 1, which covers authentication, connectivity, a cached
+    (non-authoritative) read, a whole value fingerprinted around a secret,
+    and configuration errors alike.
     """
     return EXIT_CODES.get(exit_code, FAILED)
 
@@ -156,6 +183,7 @@ def summarize(entries: list[dict]) -> tuple[str, int]:
         )
 
     compared = [item for item in entries if item["outcome"] in SUCCESSFUL_COMPARISON]
+    warnings = [item for item in entries if item["outcome"] in WARNING]
     blocking = [item for item in entries if item["outcome"] in BLOCKING]
     skipped = [item for item in entries if item["outcome"] == SKIPPED]
 
@@ -164,10 +192,24 @@ def summarize(entries: list[dict]) -> tuple[str, int]:
         f"**{len(compared)} of {len(entries)} environments were compared and "
         "matched.**",
         "",
-        "Only `In sync` means a gateway was read and matched. `Check failed`, "
-        "`Not completed` and `Skipped` each say something different about "
-        "coverage and none of them is a clean result.",
+        "Only `In sync` means a gateway was read and matched. `In sync, "
+        "secrets unverified`, `Check failed`, `Not completed` and `Skipped` "
+        "each say something different about coverage and none of them is a "
+        "clean result.",
     ]
+    if warnings:
+        names = ", ".join(f"`{item['environment']}`" for item in warnings)
+        message = (
+            f"{names} showed no drift in an alerted category, but fingerprinted "
+            "secrets were not verified. The viewer credential cannot compute a "
+            "secret's fingerprint, so only a fingerprint baseline can detect a "
+            "changed secret. This does not fail monitoring; drift in an alerted "
+            "category still does."
+        )
+        lines.append(f"\nWarning: {message}")
+        # The step summary is not the checks page, so make the warning a visible
+        # annotation on an otherwise green run.
+        print(f"::warning title=Secrets unverified::{message}")
     if skipped:
         names = ", ".join(f"`{item['environment']}`" for item in skipped)
         lines.append(

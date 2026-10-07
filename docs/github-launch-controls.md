@@ -397,8 +397,9 @@ Unless the gateway also sets `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, the viewer
 key reads every namespace. Repository namespace scopes and gateway viewer
 namespace restrictions still apply. The workflow does not pass
 `--accept-unverified-secrets` and does not automatically store fingerprint
-baselines: a comparison with unverified secrets fails instead of certifying
-"in sync". Explicit CLI acceptance retains its documented limits.
+baselines. A comparison with no drift but unverified secrets exits `6` and is
+reported as `In sync, secrets unverified`: a warning, never "in sync", and not
+a failure. Explicit CLI acceptance retains its documented limits.
 
 **Human deployment step (#440).** Before deploying the viewer-only workflow,
 a repository administrator must provision the gateway's distinct viewer key as
@@ -414,21 +415,26 @@ prints or copies secret values. See [Scheduled monitoring](reference.md#schedule
 
 ### 3.2 Monitoring outcomes
 
-The scheduled check reports five outcomes. Only `In sync` says a gateway was
+The scheduled check reports six outcomes. Only `In sync` says a gateway was
 compared and matched:
 
 | Outcome | Meaning |
 | --- | --- |
 | `In sync` | the gateway was read and matches the repository |
+| `In sync, secrets unverified` | `diff` exit `6`: no drift in an alerted category, but fingerprinted secrets were not verified because the viewer credential cannot compute their fingerprints; a warning, not a failure |
 | `Drift detected` | the gateway was read and differs |
-| `Check failed` | authentication, connectivity, a cached (non-authoritative) export, unverified secrets, or a configuration error — **nothing is known about the gateway** |
+| `Check failed` | authentication, connectivity, a cached (non-authoritative) export, a whole value fingerprinted around a secret, or a configuration error — **nothing is known about the gateway** |
 | `Skipped (file mode)` | no live Admin API to compare against; a configured absence, not a gap |
 | `Not completed` | the comparison never ran: approval pending, cancelled, or the runner was lost |
 
 `drift_report.py` classifies each result and writes the table to the job
 summary. `Drift detected`, `Check failed` and `Not completed` fail the
-workflow; `Skipped` does not. A matrix entry that produced no record is shown
-as `Not completed`, so an environment waiting for approval still appears in the
+workflow; `Skipped` and `In sync, secrets unverified` do not. The latter is
+listed as a warning in the summary and emitted as a `::warning::` annotation, so
+a successful run with it still counts as monitoring evidence for the settings
+audit, while drift in an alerted category
+still fails the run. A matrix entry that produced no record is shown as
+`Not completed`, so an environment waiting for approval still appears in the
 table.
 
 ### The gateway URL must be `https://`
@@ -544,18 +550,127 @@ the old one). If the checker-first change cannot pass the trusted check, park
 it until a policy-compatible sequence is available; do not merge past a red
 required check. The next run on `main` uses the new policy.
 
-Guarded `run:` interpolation requires a proven source and is inspected after
-GitHub scalar conversion, before Bash comment removal. The reader preserves
-plain versus quoted YAML provenance: plain `null`, `Null`, `NULL` and `~`
-render empty, while quoted `"null"` remains literal text. Plain booleans render
-lowercase. Numeric interpolation fails closed because GitHub reformats numbers;
-quote a numeric value when its literal spelling is intended. These conversions
-follow the runner's [YAML reader](https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs)
-and [expression string conversion](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/EvaluationResult.cs).
-The shell scan keeps quote and command-substitution context across physical
-lines, so a line starting with `#` inside a multiline quote cannot hide an
-active command. Unsupported shell contexts retain text conservatively. Binding
-checks, output-producer proofs and runtime env-file tracking use the same scan.
+The workflow binding rules read workflow text, never what a command
+computes. They pin the guarded steps exactly: the Verify traffic script and the
+credential-file hand-off in each `Load credential bundles` step must match
+their pinned lines (comment lines are ignored unless they hold an expression).
+Outside that hand-off, every workflow is banned from spelling `GITHUB_ENV`,
+`GITHUB_PATH`, `GITHUB_STATE` or `BASH_ENV`, the runner's file-command file
+names (`set_env_`, `add_path_`, `save_state_`, `_runner_file_commands`), the
+`github.env`/`github.path` contexts, indirect expansion (`${!name}`), or a
+redirect or `tee` into any GitHub file channel other than `GITHUB_OUTPUT` and
+`GITHUB_STEP_SUMMARY`. Those two may appear only as a plain `>>` or `tee -a`
+target (and the summary as a `--summary` argument), never inside a parameter
+expansion or `dirname` that could derive another file-command path. Quotes,
+backslashes and line continuations are removed before matching, never
+decoded, and shell comments count: `GITH\UB_ENV` reads as `GITHUB_ENV`, as
+Bash reads it outside quotes. Bash ANSI-C quoting (`$'...'`) is not supported
+in any workflow or the local actions it runs: it spells a name by character
+code (`$'GITHUB_\x45NV'`, `$'\x67'itforgeops`), and judging it would need a
+quote-state lexer, so any scalar holding `$'` is refused, even in a comment or
+as a plain quoted `$`. A name Bash computes by expansion is still program
+behavior (below). A `run:` interpolation may not adjoin a name character, with
+quotes removed. Every `run:` interpolation must be allowlisted (below); the
+Environment-bound workflows may interpolate only a per-job allowlist. Each of
+those per-job values is pinned to its producer: the job outputs and matrices
+that carry it must be exactly the reviewed expressions, the environment enumerator
+step is pinned whole (including its safe-name `jq` guard), and trusted review's
+metadata step must check the event head SHA as 40 hex digits first, never
+reassign it, take the trusted SHA from `git rev-parse`, and write each SHA
+output only through its pinned `echo`. Apply's hand-off keeps
+`id: load-bundles`, only the `Load credential bundles` step in each job may
+carry that id (compared without regard to case, like every producer id), and
+Apply and Verify traffic read the finalized bundle path only from that step's
+output. An `env:` mapping at any level may not bind, in any case, `ENV`,
+`BASH_ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4` or any `LD_*` loader
+variable (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, ...), each of which
+changes what a later step's shell or loader runs before its script. A job
+container or service container may not set `options:`, a `docker create`
+command line whose `-e`, `--env` or `--env-file` would bind the same variables
+for every step of the job, and may not be computed. Its image must be pinned by
+digest (`@sha256:<64 hex>`), because an image's own `ENV` reaches every step
+the same way. In `apply-on-merge.yml`, every scalar outside the guarded Apply
+steps is read for the binary, not only `run:`: a step's or a default's
+`shell:` and an action input count, a `run:` line may name it only as a pinned
+`envs`, `validate` or `verify` line, and any other scalar only as a pinned
+display name. A display name is the `name:` of
+the workflow (or local action), a job or a step; an action input or env value
+called `name` is not one.
+
+GitHub renders a `run:` interpolation before the shell parses the script, so
+its value becomes shell source that no text rule reads. Env, matrix, input,
+job- and step-output and event values can all carry text computed or chosen
+elsewhere: `env.A` set by `fromJSON(...)` or `format(...)`, a matrix entry, a
+job output, a `with:` input, a pull request title or branch name. So in every
+workflow, and every local action a workflow runs, a `run:` interpolation must
+be exactly one of a short allowlist of values GitHub or the runner sets from a
+closed alphabet: `github.event_name`, `github.sha`, `github.run_id`,
+`github.run_attempt`, `runner.os` and `runner.arch`, spelled exactly so. The
+Environment-bound workflows allow only their per-job pinned values instead, and
+their local actions allow none. Everything else is refused, including `env.*`,
+`matrix.*`, `inputs.*`, `vars.*`, `secrets.*`, `steps.*.outputs.*`,
+`needs.*.outputs.*`, `github.event.*`, `github.head_ref`, `github.ref_name`,
+and any function call, literal or operator. Quotes around the interpolation
+change nothing, and one in a shell comment counts. Every key named `run` is
+read wherever it sits, so a composite action's `runs.steps` count. Pass any other value through step `env:` and read
+it in the script as a quoted variable:
+
+```yaml
+- env:
+    TITLE: ${{ github.event.pull_request.title }}
+  run: echo "$TITLE"
+```
+
+A local action (`uses: ./...`) carries no commit pin, so the checker reads what
+it runs. Every local reference must name, by a plain path, a composite action
+under `.github/actions/` with exactly one `action.yml` or `action.yaml`, reached
+through no symbolic link and written in the same YAML subset as workflows.
+Anything else is refused: another action type, a path into another checkout, a
+missing or unparsable file, and a local reusable workflow
+(`jobs.<id>.uses: ./...`), which would carry none of its caller's pins. Each
+local action a workflow reaches, directly or through another local action, is
+judged by that workflow's fences: the env-file channel and startup-key bans,
+its protected names, the `run:` interpolation allowlist above (no
+interpolation at all when the workflow is Environment-bound), and in
+`apply-on-merge.yml` the binary pin above. Every
+action file under `.github/actions/`, reached or not, must be in that subset,
+and its remote `uses:` are pinned to 40-hex commits from the parsed file, in
+any key case.
+
+A local action is judged as the tree carries it, but the runner reads it from
+the workspace when its step runs. So no job may run a local action after an
+`actions/checkout` step that checks another revision out over the workspace
+root: a `ref` other than `${{ github.event.repository.default_branch }}`
+(judged when it merged) or a `repository` other than `${{ github.repository }}`,
+with no `path` or one that is not a plain subdirectory (`.`, `.github`, `..`,
+an absolute or computed path). A local action may not make such a checkout at
+all, since a later local action would run from it. Check another revision out
+into a subdirectory instead. A `git checkout` in a `run:` script is program
+behavior, outside these rules.
+
+`.github/actions/**` is a deployment input (it schedules and supersedes
+`apply-on-merge.yml` like `.github/scripts/**`), a `security.yml` push path and
+code-owned in `CODEOWNERS`; the checker requires all three.
+
+Program-level writes are out of scope. A program a step invokes (the binary, a
+helper script, or Bash evaluating computed text such as `base64 -d | bash` or
+`eval "$text"`) can still write `$GITHUB_ENV` or rebind a variable, and no text
+rule can prove otherwise. That includes a file-command path the step discovers
+rather than derives from a spelled name: a glob over the runner's temp directory
+(`"$RUNNER_TEMP"/*/set_e*`), `/proc/$$/fd`, or the environment read back through
+`env | sed`. Review of every workflow change is the control for that.
+
+These text rules can refuse legitimate workflow text: a redirect or `tee` into
+`$GITHUB_WORKSPACE/...`, any name containing `GITHUB_ENV`, `GITHUB_PATH` or a
+file-command prefix (`GITHUB_ENVIRONMENT`, say), an interpolation glued to a
+name (`v${{ matrix.version }}`), any `run:` interpolation outside the
+allowlist (`echo "${{ matrix.os }}"`), indexed or whole `github` context access
+(`toJSON(github)`, `github.event.commits[0]`), a shell comment naming a
+protected variable or channel, and Bash ANSI-C quoting (`$'`). For example,
+`grep -cx $'.*: test$'` is refused; write it as `grep -cx '.*: test'` instead.
+A plain single-quoted pattern ending in `$` is refused the same way, because
+`$` meets the closing quote: `grep -c ': test$'` holds `$'`. Rephrase such
+text, or pass the value through step `env:`.
 
 Review and merge tighter guard logic into the protected branch first. If the
 workflow binding form must change, do that in a subsequent pull request judged

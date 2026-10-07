@@ -58,7 +58,7 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 | Command | Codes |
 |---|---|
 | all | `0` success, `1` error or blocking finding |
-| `diff --exit-on-drift` | `0` in sync, `2` drift, `1` the check could not complete |
+| `diff --exit-on-drift` | `0` in sync, `2` drift, `6` no alerted drift but fingerprinted secrets unverified with no baseline supplied (viewer credential), `1` the check could not complete |
 | `verify` | `0` all checks passed, `4` a check failed, `5` no checks declared (skipped), `1` could not run |
 | `doctor` | `0` nothing blocking, `3` something blocking, `1` the diagnosis itself failed |
 
@@ -72,15 +72,24 @@ changed since the baseline counts as a managed modification.
 
 - **Cached read** (`X-Data-Source: cached`): always `1`, whether or not drift
   was seen, because the snapshot may be stale. Nothing overrides this.
-- **Unverified secrets on a fresh read** (viewer-credential path): no
-  `--fingerprint-baseline`, a baseline missing a namespace or a declared
-  resource, or a gateway fingerprint key that changed since the baseline.
-  Every declared Consumer counts here, because its hidden-credentials
-  fingerprint can only be checked against a baseline.
+- **Unverified secrets on a fresh read** (viewer-credential path): the viewer
+  cannot compute a secret's fingerprint, so only a fingerprint baseline can
+  verify it. Every declared Consumer counts here, because its
+  hidden-credentials fingerprint can only be checked against a baseline.
   - Drift found: `2`, as usual. The drift is real; unverified secrets only
     undermine a "no drift" claim.
-  - No drift found: `1`, because "in sync" cannot be claimed.
-    `--accept-unverified-secrets` returns `0` instead.
+  - No drift found, and no baseline was supplied (or it only lacks an
+    incremental entry: a namespace or a resource not yet recorded): `6`
+    ("in sync, secrets unverified"), because "in sync" cannot be claimed, yet
+    every field the read could compare matched. It is distinct from `0`, `2`
+    and `1` so scheduled monitoring can report it as a warning rather than a
+    failed check. `--accept-unverified-secrets` returns `0` instead. A refused
+    `--write-fingerprint-baseline` in the same run still exits `1`.
+  - No drift found, but `--fingerprint-baseline` was supplied and could not
+    verify secrets — the file is missing, the gateway's fingerprint key changed
+    since it was recorded, or a recorded namespace came back incomplete. The
+    verification control the operator set up failed, so the run exits `1`
+    (never `6`). `--accept-unverified-secrets` still returns `0`.
 - **Whole values fingerprinted around a secret** (viewer-credential path):
   Edge fingerprinted a value that only *contains* a secret (for example a
   plugin `headers` map holding an API key), and its non-secret contents were
@@ -398,18 +407,21 @@ with the admin credential.
   file are kept; refused for cached data). `--fingerprint-baseline PATH`
   compares each declared resource with it and reports secrets `CHANGED`,
   `ADDED` or `REMOVED` since, as managed drift. A missing file means no
-  baseline yet. Both flags need the viewer secret. Recording is refused (exit
-  `1`) when the same run found differences or secret changes, since the
-  baseline would carry the drift forward; `--force-baseline` overrides that.
+  baseline has been recorded; with `--exit-on-drift` that is a failed check
+  (`1`), not the no-baseline warning, because the verification the operator
+  requested could not run. Both flags need the viewer secret. Recording is
+  refused (exit `1`) when the same run found differences or secret changes,
+  since the baseline would carry the drift forward; `--force-baseline`
+  overrides that.
   `diff` warns when either baseline path lies inside a git worktree. A baseline
-  shows change
-  between two exports, never agreement with the repository. Fingerprints are
-  comparable only under one `redaction.fingerprint_key_id`; after the
-  gateway's `FERRUM_ADMIN_JWT_SECRET` rotates (or a gateway without one
-  restarts), `diff` says the baseline is not comparable and reports no secret
-  drift. Record the baseline from a trusted state, such as right after a
-  successful apply; a baseline rewritten by every drift check alerts on a
-  change once. It holds keyed fingerprints only; keep it out of the repository.
+  shows change between two exports, never agreement with the repository.
+  Fingerprints are comparable only under one `redaction.fingerprint_key_id`;
+  after the gateway's `FERRUM_ADMIN_JWT_SECRET` rotates (or a gateway without
+  one restarts), the baseline is not comparable, so `--exit-on-drift` fails
+  (`1`) rather than reporting no secret drift. Record the baseline from a
+  trusted state, such as right after a successful apply; a baseline rewritten by
+  every drift check alerts on a change once. It holds keyed fingerprints only;
+  keep it out of the repository.
 - **Hidden credentials.** `basicauth` and custom credential types are omitted
   from the export. Each consumer carries one `hidden_credentials_fingerprint`
   over them, which only a baseline can compare, so it is unverified on every
@@ -466,12 +478,17 @@ value through the protected secret-entry UI.
 
 The workflow keeps `diff --exit-on-drift` without
 `--accept-unverified-secrets` or automatic fingerprint-baseline storage. A fresh
-viewer export with no drift but unverified secrets exits `1` and reports a failed
-comparison; it never certifies "in sync". The CLI's explicit acceptance flag
-still permits exit `0` for unverified secret leaves, while JSON remains
-`in_sync: false`; it cannot accept a cached read or masked ancestors. The
-settings-audit environment and secretless template mode are unchanged. File-mode
-drift jobs still skip before receiving gateway credentials.
+viewer export with no drift but unverified secrets exits `6`, which
+`drift_report.py` records as `In sync, secrets unverified`: a warning in the job
+summary and a `::warning::` annotation, never "in sync", and not a failure, so
+the workflow stays green and the settings audit's last-successful-run evidence
+keeps advancing. Drift in an alerted category still exits `2` and fails the
+workflow; a cached read or a whole value fingerprinted around a secret still
+exits `1` and fails it. The CLI's
+explicit acceptance flag still permits exit `0` for unverified secret leaves,
+while JSON remains `in_sync: false`; it cannot accept a cached read or masked
+ancestors. The settings-audit environment and secretless template mode are
+unchanged. File-mode drift jobs still skip before receiving gateway credentials.
 
 **Breaking changes** (also in `plan`):
 

@@ -23,6 +23,7 @@
 /src/state.rs @jeremyjpj0916
 /src/reconcile.rs @jeremyjpj0916
 /src/secrets/ @jeremyjpj0916
+/.github/actions/ @jeremyjpj0916
 # Repository settings must require "Agent Setup Policy / validate-trusted-policy"
 # alongside exact-head root review for these entries. They stay the
 # final rules so no later pattern can override them.

@@ -328,7 +328,7 @@ fragments are covered in [Writing resources](docs/resources.md).
 [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts) is Ferrum's central store for
 shared vocabularies, JSON schemas and fixtures. GitForgeOps consumes its plugin catalog,
 `provisioned-by` vocabulary and resource fixtures, and publishes its `gitforgeops-resource` schema.
-These files are pinned to `contracts-edge-0.9.12` in
+These files are pinned to `contracts-edge-0.9.13` in
 [`contracts/ferrum-contracts/PIN`](contracts/ferrum-contracts/PIN) and vendored under
 `contracts/ferrum-contracts/`.
 See the [contracts guide](docs/contracts.md) for the pin and conformance checks.
@@ -572,10 +572,11 @@ ownership and field safety before broker publication and uses row `If-Match`.
 GET-only doctor probes report capability availability, while qualification must
 establish enforcement on the exact released gateway bytes. See
 [conditional apply behavior](docs/apply.md#changes-made-during-an-apply). The new
-owner contract was published in Edge v0.9.11. The candidate pairing now pins the
-verified Edge v0.9.12 binary and image bytes; the existing conditional API
-implementation and vendored Contracts pin remain unchanged. Hosted GitForgeOps
-qualification against those exact bytes remains required; the
+owner contract was published in Edge v0.9.11. The candidate pairing now pins
+published Edge v0.9.13 at `9b83115de7ec23ab51ec4feae6bed65e596db425`, with its
+verified x86_64 validator and multi-platform gateway image. The existing
+conditional API implementation and vendored Contracts pin remain unchanged.
+Hosted GitForgeOps qualification against those exact bytes remains required; the
 [first-release record](release/README.md) stays pending.
 
 ### What if apply fails after merge?
@@ -610,6 +611,7 @@ lives in [`.github/scripts/deployment_scope.py`](.github/scripts/deployment_scop
 | `resources/**`, `overlays/**` | the desired gateway configuration |
 | `.gitforgeops/**` | environments, ownership and policy |
 | `src/**`, `build.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain`, `rust-toolchain.toml`, `.cargo/**` | the `gitforgeops` binary the job builds |
+| `.github/actions/**` | local composite actions a step runs |
 | `.github/scripts/**` | helper programs the job runs |
 | `.github/ferrum-edge-checksums.txt` | which validator build is trusted |
 | `.github/workflows/apply-on-merge.yml` | the deployment procedure itself |
@@ -709,13 +711,14 @@ daily. By default `shared` mode alerts on managed resources that were modified
 or deleted, not on unmanaged additions (see `ownership.drift_alert_on`).
 `exclusive` mode also treats unmanaged resources as drift. API-spec ownership
 conflicts are always drift. Each environment is reported as `In sync`,
-`Drift detected`, `Check failed`, `Skipped (file mode)` or `Not completed`.
-Only `In sync` means the gateway was read and matched; `Drift detected`,
-`Check failed` and `Not completed` fail the workflow. See
+`In sync, secrets unverified`, `Drift detected`, `Check failed`,
+`Skipped (file mode)` or `Not completed`. Only `In sync` means the gateway was
+read and matched; `Drift detected`, `Check failed` and `Not completed` fail the
+workflow. `In sync, secrets unverified` is a non-blocking warning. See
 [Monitoring outcomes](docs/github-launch-controls.md#32-monitoring-outcomes).
 
 ```bash
-gitforgeops --env production diff --exit-on-drift   # exit 0 in sync, 2 drift, 1 error
+gitforgeops --env production diff --exit-on-drift   # exit 0 in sync, 2 drift, 6 secrets unverified, 1 error
 ```
 
 ### Reading with a viewer-capped credential
@@ -738,8 +741,9 @@ What the export cannot tell you:
   those fields are not compared with the repository. `diff` says how many it
   left unverified and does not print `Configuration is in sync.` while any
   are; JSON `in_sync` is `false`. With `--exit-on-drift`, drift that was found
-  still exits `2`, but "no drift" exits `1` (not authoritative) unless
-  `--accept-unverified-secrets` is passed. A
+  still exits `2`, but "no drift" exits `6` ("in sync, secrets unverified")
+  unless `--accept-unverified-secrets` is passed. Scheduled monitoring reports
+  `6` as a warning, not a failure. A
   fingerprinted credential the repository does not declare, and a
   fingerprint-shaped value in a non-secret field, are still reported.
 - **Fingerprints only show change between two exports.**
@@ -752,9 +756,11 @@ What the export cannot tell you:
   `--force-baseline` is passed. If the drift check rewrites the baseline on
   every run, a change alerts once. Rotating the gateway's
   `FERRUM_ADMIN_JWT_SECRET`, or restarting a gateway that has none, changes
-  every fingerprint; `diff` then reports the baseline as not comparable, which
-  is not authoritative either. The baseline holds keyed fingerprints only; keep
-  it outside the repository (`diff` warns when it is inside a git worktree).
+  every fingerprint; `diff` then reports the baseline as not comparable, and
+  `--exit-on-drift` exits `1` — a supplied baseline that cannot verify secrets
+  is a failed check, unlike the no-baseline `6` warning. The baseline holds
+  keyed fingerprints only; keep it outside the repository (`diff` warns when it
+  is inside a git worktree).
 - **`basicauth` is hidden.** The export omits it (and custom types, and an
   `mtls_auth` type with no identity Edge accepts) and gives each consumer one
   fingerprint over all hidden credentials. Only a baseline can use it, so every
@@ -776,8 +782,8 @@ What the export cannot tell you:
   `diff` warn, report no authoritative result, refuse `--exit-on-drift`
   (exit 1) and refuse to write a baseline.
 
-The bundled `drift-check.yml` does not bind the viewer secret yet, so
-scheduled checks still use the admin credential.
+The bundled `drift-check.yml` binds only the viewer secret. See
+[Scheduled monitoring](docs/reference.md#scheduled-monitoring).
 
 ### Unattended monitoring, and when it is approval-gated
 
