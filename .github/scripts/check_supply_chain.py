@@ -12,6 +12,7 @@ of every workflow change.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -3076,6 +3077,51 @@ def run_expression_violations(workflow: str, document: dict) -> list[str]:
     )
 
 
+def shell_expression_violations(label: str, document) -> list[str]:
+    """No `shell:` value holds an expression, and no `defaults:` is computed.
+
+    A step's `shell:`, and the `defaults.run.shell` a workflow or job gives its
+    steps, is the command GitHub runs each script with. A rendered value there
+    picks an interpreter no text rule read, as a `run:` interpolation renders
+    script, so it must be spelled literally. Every key named `shell` counts,
+    wherever it sits (an action input of that name too), and a `defaults:` or
+    its `run:` must be a mapping, never a computed value.
+    """
+    violations: list[str] = []
+
+    def visit(node, path: str) -> None:
+        if isinstance(node, list):
+            for index, item in enumerate(node):
+                visit(item, f"{path}[{index}]")
+            return
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            child = f"{path}.{key}"
+            folded = key.casefold() if isinstance(key, str) else ""
+            if folded == "shell" and (not isinstance(value, str) or "${{" in value):
+                violations.append(
+                    f"{label}: {child}: a shell may not be computed; spell the command literally"
+                )
+            elif folded == "defaults":
+                if not isinstance(value, dict):
+                    violations.append(f"{label}: {child}: run defaults may not be computed")
+                else:
+                    for name, defaults in value.items():
+                        if (
+                            isinstance(name, str)
+                            and name.casefold() == "run"
+                            and not isinstance(defaults, dict)
+                        ):
+                            violations.append(
+                                f"{label}: {child}.{name}: run defaults may not be computed"
+                            )
+            visit(value, child)
+
+    visit(document, "workflow")
+    return violations
+
+
 def _producer_step(job: dict, step_id: str):
     """The one step of `job` with id `step_id` in any case, or None.
 
@@ -3623,6 +3669,7 @@ def local_action_fence_violations(workflow: str, label: str, action: dict) -> li
     violations.extend(
         _run_interpolation_violations(label, action, lambda job: allowed, refusal)
     )
+    violations.extend(shell_expression_violations(label, action))
     runs = action.get("runs")
     steps = runs.get("steps") if isinstance(runs, dict) else None
     for index, step in enumerate(steps if isinstance(steps, list) else ()):
@@ -4124,6 +4171,338 @@ def state_push_retry_violations(workflow: str, text: str, commit_step: str) -> l
     return violations
 
 
+# -- Release gate --------------------------------------------------------------
+#
+# `release.yml`'s `authorize-release` job decides whether a pushed commit may be
+# published: the commit must map to exactly one merged pull request whose
+# launch checks passed on its head. The gate runs either inline (bash and jq in
+# the step) or as `RELEASE_GATE_HELPER` from the release commit's own checkout
+# (#473). Either way the code comes from the release commit, which this checker
+# judged on its pull request, so the checker pins what a pull request must not
+# weaken: the launch check lists, the GitHub Actions App binding and the
+# sampling budget, and for the helper its exact invocation and a small import
+# and call surface. The helper's control flow is program behavior; review of
+# every change to it is the control for that, as for any other script.
+RELEASE_GATE_WORKFLOW = ".github/workflows/release.yml"
+RELEASE_GATE_HELPER = ".github/scripts/release_gate.py"
+RELEASE_GATE_JOB = "authorize-release"
+RELEASE_GATE_STEP = "Verify the published commit passed every required check"
+# The contexts `bootstrap_repo_settings.py` requires on `main`, plus the one
+# being added to the ruleset (GHSA-x5m2-4555-q4cr), as `<workflow> / <job>`.
+RELEASE_GATE_REQUIRED_CHECKS = (
+    "Rust CI / rust-ci-check",
+    "Security / security-cargo-audit",
+    "Security / security-supply-chain-policy",
+    "GitForgeOps State Guard / state-guard-reject-state-edits",
+    "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
+)
+RELEASE_GATE_ACCEPTED_CHECKS = (
+    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
+)
+RELEASE_GATE_APP_ID = 15368
+RELEASE_GATE_BUDGET_SECONDS = 900
+RELEASE_GATE_TIMEOUT_MINUTES = "16"
+RELEASE_GATE_HELPER_RUN = (f"python3 -I {RELEASE_GATE_HELPER}",)
+RELEASE_GATE_ENV = {
+    "GH_TOKEN": "${{ github.token }}",
+    "REPO": "${{ github.repository }}",
+    "RELEASE_SHA": "${{ github.sha }}",
+    "DEFAULT_BRANCH": "${{ github.event.repository.default_branch }}",
+}
+RELEASE_GATE_MARKERS = (
+    "release commit must map to exactly one merged PR",
+    "Release merge association is not yet available and unambiguous",
+)
+RELEASE_GATE_INLINE_MARKERS = RELEASE_GATE_MARKERS + (
+    'gh pr checks "$pr" --repo "$REPO" --required',
+    f"deadline=$(( $(date +%s) + {RELEASE_GATE_BUDGET_SECONDS} ))",
+    f".app == {RELEASE_GATE_APP_ID})",
+    f"$setting.app != {RELEASE_GATE_APP_ID}",
+    f"app: {RELEASE_GATE_APP_ID}}}",
+)
+RELEASE_GATE_HELPER_MARKERS = RELEASE_GATE_MARKERS + ("--required", "bucket,name,workflow")
+RELEASE_GATE_INLINE_LISTS = re.compile(
+    r"--argjson required '(\[.*?\])' --argjson accepted '(\[.*?\])'", re.DOTALL
+)
+# Module constants of the helper, each bound exactly once, to exactly this.
+RELEASE_GATE_PINS = {
+    "REQUIRED_CHECKS": RELEASE_GATE_REQUIRED_CHECKS,
+    "ACCEPTED_CHECKS": RELEASE_GATE_ACCEPTED_CHECKS,
+    "ACTIONS_APP_ID": RELEASE_GATE_APP_ID,
+    "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
+}
+RELEASE_GATE_IMPORTS = frozenset(
+    {"__future__", "json", "os", "re", "subprocess", "sys", "time", "typing", "urllib.parse"}
+)
+RELEASE_GATE_FROM_IMPORTS = frozenset({"__future__", "typing"})
+# These modules may be named only as `<module>.<attribute>` with an allowed
+# attribute, so no alias can reach `os.system` or `subprocess.Popen`.
+RELEASE_GATE_MODULE_ATTRIBUTES = {
+    "os": frozenset({"environ"}),
+    "subprocess": frozenset({"run", "TimeoutExpired"}),
+    "sys": frozenset({"stdout", "stderr"}),
+}
+RELEASE_GATE_FORBIDDEN_NAMES = frozenset(
+    {
+        "__builtins__",
+        "__import__",
+        "breakpoint",
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "input",
+        "locals",
+        "open",
+        "setattr",
+        "vars",
+    }
+)
+RELEASE_GATE_RUN_KEYWORDS = frozenset({"capture_output", "check", "env", "timeout"})
+RELEASE_GATE_MAIN_GUARD = "if __name__ == '__main__':\n    raise SystemExit(main())"
+
+
+def _python_bindings(tree: ast.AST, name: str) -> int:
+    """How many places in `tree` bind `name`, in any form Python allows."""
+    count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            count += node.id == name and not isinstance(node.ctx, ast.Load)
+        elif isinstance(node, ast.arg):
+            count += node.arg == name
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            count += node.name == name
+        elif isinstance(node, ast.alias):
+            count += (node.asname or node.name.split(".")[0]) == name
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            count += name in node.names
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            count += node.name == name
+        elif isinstance(node, ast.MatchMapping):
+            count += node.rest == name
+    return count
+
+
+def _module_constant(tree: ast.Module, name: str):
+    """The literal value a top-level statement assigns to `name`, or None."""
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            targets = [statement.target]
+        else:
+            continue
+        if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == name:
+            try:
+                return ast.literal_eval(statement.value)
+            except (ValueError, TypeError, SyntaxError, RecursionError):
+                return None
+    return None
+
+
+def release_gate_helper_violations(root: Path, required: bool) -> list[str]:
+    """The helper keeps its pinned constants, imports, calls and entry point.
+
+    Judged whenever the file exists, and required when `release.yml` runs it.
+    """
+    label = RELEASE_GATE_HELPER
+    path = root / RELEASE_GATE_HELPER
+    if not path.exists() and not path.is_symlink():
+        return [f"{label}: release.yml runs the helper, so it must exist"] if required else []
+    if path.is_symlink() or not path.is_file():
+        return [f"{label}: must be a regular file"]
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=label)
+    except (SyntaxError, UnicodeDecodeError, ValueError) as error:
+        return [f"{label}: the helper must parse as Python: {error}"]
+    violations: list[str] = []
+    for name, expected in RELEASE_GATE_PINS.items():
+        value = _module_constant(tree, name)
+        if type(value) is not type(expected) or value != expected:
+            violations.append(f"{label}: {name} must be assigned exactly {expected!r}")
+        if _python_bindings(tree, name) != 1:
+            violations.append(f"{label}: {name} must be bound once, at module level")
+        if not any(
+            isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)
+            for node in ast.walk(tree)
+        ):
+            violations.append(f"{label}: {name} must be read by the gate")
+    attribute_owners: set[int] = set()
+    called: set[int] = set()
+    strings: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name not in RELEASE_GATE_IMPORTS or alias.asname is not None:
+                    violations.append(
+                        f"{label}: line {node.lineno}: import {alias.name!r} is not allowed "
+                        f"(only {', '.join(sorted(RELEASE_GATE_IMPORTS))}, unaliased)"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or node.module not in RELEASE_GATE_FROM_IMPORTS:
+                violations.append(
+                    f"{label}: line {node.lineno}: `from` imports are allowed only from "
+                    + ", ".join(sorted(RELEASE_GATE_FROM_IMPORTS))
+                )
+        elif isinstance(node, ast.Call):
+            called.add(id(node.func))
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                violations.append(
+                    f"{label}: line {node.lineno}: dunder attribute {node.attr!r} is not allowed"
+                )
+            owner = node.value
+            if isinstance(owner, ast.Name) and owner.id in RELEASE_GATE_MODULE_ATTRIBUTES:
+                attribute_owners.add(id(owner))
+                if node.attr not in RELEASE_GATE_MODULE_ATTRIBUTES[owner.id]:
+                    violations.append(
+                        f"{label}: line {node.lineno}: {owner.id}.{node.attr} is not allowed"
+                    )
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            strings.append(node.value)
+            if _FILE_CHANNEL.search(_scan_text(node.value)):
+                violations.append(
+                    f"{label}: line {node.lineno}: the helper may not name a GitHub "
+                    "env-file channel"
+                )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id in RELEASE_GATE_FORBIDDEN_NAMES:
+                violations.append(f"{label}: line {node.lineno}: {node.id!r} is not allowed")
+            elif node.id in RELEASE_GATE_MODULE_ATTRIBUTES and id(node) not in attribute_owners:
+                violations.append(
+                    f"{label}: line {node.lineno}: {node.id!r} may be used only as "
+                    f"{node.id}.<allowed attribute>"
+                )
+        elif (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "subprocess"
+            and node.attr == "run"
+            and id(node) not in called
+        ):
+            violations.append(f"{label}: line {node.lineno}: subprocess.run must be called")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "subprocess"
+            and node.func.attr == "run"
+        ):
+            command = node.args[0] if len(node.args) == 1 else None
+            if not (
+                isinstance(command, ast.List)
+                and command.elts
+                and isinstance(command.elts[0], ast.Constant)
+                and command.elts[0].value == "gh"
+            ) or any(keyword.arg not in RELEASE_GATE_RUN_KEYWORDS for keyword in node.keywords):
+                violations.append(
+                    f"{label}: line {node.lineno}: subprocess.run may only run a literal "
+                    "`gh` argument list, with "
+                    + ", ".join(sorted(RELEASE_GATE_RUN_KEYWORDS))
+                )
+    for marker in RELEASE_GATE_HELPER_MARKERS:
+        if not any(marker in text for text in strings):
+            violations.append(f"{label}: missing checked-merge publication gate {marker!r}")
+    if not tree.body or ast.unparse(tree.body[-1]) != RELEASE_GATE_MAIN_GUARD:
+        violations.append(
+            f"{label}: the helper must end with `if __name__ == \"__main__\": "
+            "raise SystemExit(main())`"
+        )
+    return violations
+
+
+def _release_gate_inline_violations(script: str) -> list[str]:
+    """The inline gate lists exactly the launch checks and keeps its pins."""
+    label = f"{RELEASE_GATE_WORKFLOW}: step {RELEASE_GATE_STEP!r}"
+    violations: list[str] = []
+    match = RELEASE_GATE_INLINE_LISTS.search(script)
+    lists = None
+    if match is not None:
+        try:
+            lists = (json.loads(match.group(1)), json.loads(match.group(2)))
+        except ValueError:
+            lists = None
+    if lists != (list(RELEASE_GATE_REQUIRED_CHECKS), list(RELEASE_GATE_ACCEPTED_CHECKS)):
+        violations.append(
+            f"{label}: the inline gate must pass exactly the launch-required and accepted "
+            "check lists to jq"
+        )
+    for marker in RELEASE_GATE_INLINE_MARKERS:
+        if marker not in script:
+            violations.append(f"{label}: missing checked-merge publication gate {marker!r}")
+    return violations
+
+
+def _release_gate_invocation_violations(
+    document: dict, job: dict, steps: list, step: dict
+) -> list[str]:
+    """The helper runs right after a plain checkout of the release commit."""
+    label = f"{RELEASE_GATE_WORKFLOW}: job {RELEASE_GATE_JOB!r}, step {RELEASE_GATE_STEP!r}"
+    violations: list[str] = []
+    if any(
+        key in step for key in ("uses", "shell", "working-directory", "if", "continue-on-error")
+    ):
+        violations.append(f"{label} runs the helper unconditionally, in the default shell")
+    if any(key.casefold() in ("defaults", "env") for node in (document, job) for key in node):
+        violations.append(
+            f"{label}: workflow and job env or run defaults may not change what the helper "
+            "or gh reads"
+        )
+    if step.get("env") != RELEASE_GATE_ENV:
+        violations.append(
+            f"{label} must bind exactly "
+            + ", ".join(f"{name}: {value}" for name, value in RELEASE_GATE_ENV.items())
+        )
+    if step.get("timeout-minutes") != RELEASE_GATE_TIMEOUT_MINUTES:
+        violations.append(
+            f"{label} must keep timeout-minutes: {RELEASE_GATE_TIMEOUT_MINUTES}, above the "
+            f"{RELEASE_GATE_BUDGET_SECONDS}-second sampling budget"
+        )
+    index = next(position for position, candidate in enumerate(steps) if candidate is step)
+    checkout = steps[0] if index == 1 else None
+    uses = checkout.get("uses") if isinstance(checkout, dict) else None
+    if not (
+        isinstance(uses, str)
+        and uses.split("@", 1)[0] == "actions/checkout"
+        and set(checkout) == {"uses", "with"}
+        and checkout["with"] == {"persist-credentials": "false"}
+    ):
+        violations.append(
+            f"{label} must be the job's second step, right after one `actions/checkout` of "
+            "the release commit with only `persist-credentials: false` (no ref, repository "
+            "or path)"
+        )
+    return violations
+
+
+def release_gate_violations(root: Path, document: dict) -> list[str]:
+    """`authorize-release` runs the pinned inline gate or the pinned helper."""
+    jobs = document.get("jobs")
+    job = jobs.get(RELEASE_GATE_JOB) if isinstance(jobs, dict) else None
+    steps = job.get("steps") if isinstance(job, dict) else None
+    steps = steps if isinstance(steps, list) else []
+    gates = [
+        step for step in steps
+        if isinstance(step, dict) and step.get("name") == RELEASE_GATE_STEP
+    ]
+    if len(gates) != 1 or not isinstance(gates[0].get("run"), str):
+        return [
+            f"{RELEASE_GATE_WORKFLOW}: job {RELEASE_GATE_JOB!r} must run step "
+            f"{RELEASE_GATE_STEP!r} exactly once"
+        ]
+    step = gates[0]
+    if pinned_run_matches(step["run"], RELEASE_GATE_HELPER_RUN):
+        return _release_gate_invocation_violations(
+            document, job, steps, step
+        ) + release_gate_helper_violations(root, required=True)
+    return _release_gate_inline_violations(step["run"]) + release_gate_helper_violations(
+        root, required=False
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -4246,6 +4625,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 run_expression_violations(workflow.relative_to(root).as_posix(), document)
+            )
+            violations.extend(
+                shell_expression_violations(workflow.relative_to(root).as_posix(), document)
             )
             violations.extend(
                 run_expression_source_violations(workflow.relative_to(root).as_posix(), document)
@@ -4374,18 +4756,14 @@ def main(argv: list[str] | None = None) -> int:
         violations.append(
             "release.yml: a fork test does not distinguish a template copy from upstream"
         )
-    for required in (
-        "authorize-release:",
-        "needs: authorize-release",
-        "release commit must map to exactly one merged PR",
-        "Release merge association is not yet available and unambiguous",
-        'gh pr checks "$pr" --repo "$REPO" --required',
-        "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-    ):
+    for required in ("authorize-release:", "needs: authorize-release"):
         if required not in release:
             violations.append(
                 f"release.yml: missing checked-merge publication gate {required!r}"
             )
+    release_document = workflow_documents.get(RELEASE_GATE_WORKFLOW)
+    if release_document is not None:
+        violations.extend(release_gate_violations(root, release_document))
 
     apply_workflow = (workflows / "apply-on-merge.yml").read_text(encoding="utf-8")
     if "vars.FERRUM_GATEWAY_MODE != 'file'" in apply_workflow:
