@@ -77,6 +77,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Replace the placeholder Required Notice in `LICENSE.md` ("Yoyodyne, Inc.") with Ferrum Edge LLC as the copyright holder.
 - Refresh the Ferrum Edge validator and bundled gateway pins to published
   v0.9.13: validator SHA-256
   `bdb8756c30bd2c04c3483ebff26bf0163ebeb0d5dfdc887897a7eb473305ed6c` and
