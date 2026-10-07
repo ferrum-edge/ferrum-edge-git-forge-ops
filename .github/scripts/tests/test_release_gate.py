@@ -1,7 +1,15 @@
-"""Exercise the actual release shell with hosted gh, clock and sleep stubs."""
+"""Exercise the release gate with hosted gh, clock and sleep stubs.
+
+Every scenario runs twice: against the inline shell `release.yml` runs today,
+and against `release_gate.py`, the helper it will run instead (#473). Both must
+reach the same verdict through the same gh calls and waits.
+"""
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import re
@@ -13,6 +21,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+HELPER = ROOT / ".github" / "scripts" / "release_gate.py"
+SPEC = importlib.util.spec_from_file_location("release_gate", HELPER)
+release_gate = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(release_gate)
 
 REQUIRED = [
     "Rust CI / rust-ci-check",
@@ -273,12 +285,124 @@ class ReleaseGateListTests(unittest.TestCase):
         self.assertNotIn("STUB_", gate_script())
         self.assertIn('gh pr checks "$pr" --repo "$REPO" --required', gate_script())
 
+    def test_the_helper_pins_the_same_lists_and_budget(self) -> None:
+        # Until release.yml runs the helper, both copies must agree.
+        match = gate()
+        self.assertEqual(list(release_gate.REQUIRED_CHECKS), json.loads(match.group("required")))
+        self.assertEqual(list(release_gate.ACCEPTED_CHECKS), json.loads(match.group("accepted")))
+        self.assertEqual(list(release_gate.REQUIRED_CHECKS), REQUIRED)
+        self.assertEqual(list(release_gate.ACCEPTED_CHECKS), ACCEPTED)
+        self.assertEqual(release_gate.ACTIONS_APP_ID, 15368)
+        self.assertEqual(release_gate.BUDGET_SECONDS, 900)
+        self.assertEqual(release_gate.POLL_SECONDS, 15)
+        self.assertEqual(release_gate.ASSOCIATION_ATTEMPTS, 5)
+        self.assertEqual(release_gate.RETRY_DELAY_SECONDS, 2)
+        self.assertNotIn("STUB_", HELPER.read_text(encoding="utf-8"))
 
-@unittest.skipUnless(
-    shutil.which("jq") and shutil.which("bash") and shutil.which("timeout"),
-    "jq, bash and timeout are required to exercise the release gate",
-)
-class ReleaseGateTests(unittest.TestCase):
+
+class ReleaseGateHelperUnitTests(unittest.TestCase):
+    ASSOCIATION = {
+        "number": 452,
+        "id": 12345,
+        "merged_at": MERGED_PR["merged_at"],
+        "merge_commit_sha": RELEASE_SHA,
+        "head_sha": HEAD_SHA,
+    }
+
+    def test_slurp_reads_concatenated_values_like_jq(self) -> None:
+        self.assertEqual(release_gate.slurp(""), [])
+        self.assertEqual(release_gate.slurp(" [1]\n[2] "), [[1], [2]])
+        self.assertEqual(release_gate.slurp("[][]"), [[], []])
+        for text in ("not JSON", "[1", "NaN", "[Infinity]", "[-Infinity]", "[]x"):
+            with self.subTest(text=text), self.assertRaises(release_gate.GateError):
+                release_gate.slurp(text)
+
+    def test_numbers_and_booleans_compare_as_jq_compares_them(self) -> None:
+        for value in (True, 0, -1, 1.5, float("inf"), "1", None):
+            with self.subTest(value=value):
+                self.assertFalse(release_gate.positive_integer(value))
+        self.assertTrue(release_gate.positive_integer(5))
+        self.assertTrue(release_gate.positive_integer(5.0))
+        self.assertTrue(release_gate.non_negative_integer(0))
+        self.assertFalse(release_gate.non_negative_integer(False))
+        self.assertFalse(release_gate.same(True, 1))
+        self.assertFalse(release_gate.same([1], [True]))
+        self.assertTrue(release_gate.same(5, 5.0))
+        self.assertTrue(release_gate.same({"a": [1, None]}, {"a": [1.0, None]}))
+
+    def test_identity_requires_the_exact_typed_association(self) -> None:
+        def matches(pr: dict) -> bool:
+            found = release_gate.identity_matches(
+                json.dumps(pr), self.ASSOCIATION, "main", REPO
+            )
+            return found is not None
+
+        self.assertTrue(matches(MERGED_PR))
+        for change in (
+            {"merged": 1},
+            {"id": "12345"},
+            {"number": 452.5},
+            {"head": "not an object"},
+            {"base": {"ref": "main", "repo": None}},
+        ):
+            with self.subTest(change=change):
+                self.assertFalse(matches(dict(MERGED_PR, **change)))
+        for text in ("", "[]", json.dumps(MERGED_PR) * 2):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    release_gate.identity_matches(text, self.ASSOCIATION, "main", REPO)
+                )
+
+    def test_association_absence_retries_and_ambiguity_refuses(self) -> None:
+        def associate(pages: list) -> dict | None:
+            return release_gate.merged_association(json.dumps(pages), RELEASE_SHA, "main", REPO)
+
+        self.assertIsNone(associate([[]]))
+        self.assertEqual(associate([[MERGED_PR]]), self.ASSOCIATION)
+        open_pr = dict(MERGED_PR, state="open", merged_at=None)
+        with self.assertRaises(release_gate.GateError):
+            associate([[open_pr]])
+        other = dict(MERGED_PR, id=54321, number=453, merge_commit_sha="c" * 40)
+        self.assertEqual(associate([[other, MERGED_PR]]), self.ASSOCIATION)
+        rebased = dict(MERGED_PR, merge_commit_sha="c" * 40)
+        with self.assertRaisesRegex(release_gate.GateError, "exactly one merged PR"):
+            associate([[rebased, dict(other, merge_commit_sha="d" * 40)]])
+        with self.assertRaisesRegex(release_gate.GateError, "invalid merged PR identity"):
+            associate([[dict(MERGED_PR, head={"sha": HEAD_SHA + "\n", "ref": "feature"})]])
+
+    def test_missing_environment_fails_before_any_call(self) -> None:
+        for name in ("REPO", "RELEASE_SHA", "DEFAULT_BRANCH"):
+            with self.subTest(name=name):
+                environ = {
+                    "REPO": REPO, "RELEASE_SHA": RELEASE_SHA, "DEFAULT_BRANCH": "main", "PATH": ""
+                }
+                environ[name] = ""
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    status = release_gate.main(environ, clock=lambda: 0, sleep=self.fail)
+                self.assertEqual(status, 1)
+                self.assertIn(f"::error::{name} is required.", stdout.getvalue())
+
+    def test_an_unrunnable_gh_fails_closed(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as empty:
+            environ = {
+                "REPO": REPO, "RELEASE_SHA": RELEASE_SHA, "DEFAULT_BRANCH": "main", "PATH": empty
+            }
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                status = release_gate.main(environ, clock=lambda: 0, sleep=self.fail)
+        self.assertEqual(status, 1)
+        self.assertIn("Release merge association could not be read", stdout.getvalue())
+        self.assertIn("gh could not be run", stderr.getvalue())
+
+
+class ReleaseGateBehavior:
+    """Scenarios shared by the inline gate and the helper.
+
+    Subclasses provide `execute(root, bin_dir, env)`, which runs one gate with
+    the stub `gh` first on `PATH` and returns its exit status and streams.
+    """
+
     def run_gate(
         self,
         checks: list[dict[str, str | bool]],
@@ -303,9 +427,6 @@ class ReleaseGateTests(unittest.TestCase):
             bin_dir.mkdir()
             (bin_dir / "gh").write_text(STUB_GH, encoding="utf-8")
             (bin_dir / "gh").chmod(0o755)
-            for name in ("sleep", "date"):
-                (bin_dir / name).write_text(STUB_TIME, encoding="utf-8")
-                (bin_dir / name).chmod(0o755)
             default_contexts = REQUIRED + [
                 f"{check.get('workflow', '')} / {check.get('name', '')}"
                 for sample in (samples if samples is not None else [checks])
@@ -347,15 +468,7 @@ class ReleaseGateTests(unittest.TestCase):
             }
             if sleep_advance is not None:
                 env["STUB_SLEEP_ADVANCE"] = str(sleep_advance)
-            result = subprocess.run(
-                ["bash", "--noprofile", "--norc", "-c", gate_script()],
-                cwd=root,
-                env=env,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            result = self.execute(root, bin_dir, env)
             calls = [
                 json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()
             ]
@@ -1232,6 +1345,62 @@ class ReleaseGateTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
+
+
+
+@unittest.skipUnless(
+    shutil.which("jq") and shutil.which("bash") and shutil.which("timeout"),
+    "jq, bash and timeout are required to exercise the release gate",
+)
+class WorkflowReleaseGateTests(ReleaseGateBehavior, unittest.TestCase):
+    """The inline shell `release.yml` runs today."""
+
+    def execute(
+        self, root: Path, bin_dir: Path, env: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        for name in ("sleep", "date"):
+            (bin_dir / name).write_text(STUB_TIME, encoding="utf-8")
+            (bin_dir / name).chmod(0o755)
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-c", gate_script()],
+            cwd=root,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+
+class HelperReleaseGateTests(ReleaseGateBehavior, unittest.TestCase):
+    """`release_gate.py`, with the same stub gh and an injected clock and sleep."""
+
+    def execute(
+        self, root: Path, bin_dir: Path, env: dict[str, str]
+    ) -> subprocess.CompletedProcess[str]:
+        state_path = Path(env["STUB_STATE"])
+        calls_path = Path(env["STUB_CALLS"])
+
+        def clock() -> int:
+            return json.loads(state_path.read_text(encoding="utf-8"))["clock"]
+
+        def sleep(seconds: int) -> None:
+            # The production clock is whole seconds; so is every wait.
+            self.assertIs(type(seconds), int)
+            self.assertGreater(seconds, 0)
+            with calls_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(["sleep", str(seconds)]) + "\n")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["sample"] += 1
+            state["clock"] += int(env.get("STUB_SLEEP_ADVANCE", seconds))
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = release_gate.main(dict(env), clock=clock, sleep=sleep)
+        return subprocess.CompletedProcess(
+            [str(HELPER)], status, stdout.getvalue(), stderr.getvalue()
+        )
 
 
 if __name__ == "__main__":

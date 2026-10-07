@@ -612,14 +612,22 @@ their local actions allow none. Everything else is refused, including `env.*`,
 `needs.*.outputs.*`, `github.event.*`, `github.head_ref`, `github.ref_name`,
 and any function call, literal or operator. Quotes around the interpolation
 change nothing, and one in a shell comment counts. Every key named `run` is
-read wherever it sits, so a composite action's `runs.steps` count. Pass any other value through step `env:` and read
-it in the script as a quoted variable:
+read wherever it sits, so a composite action's `runs.steps` count. Pass any
+other value through step `env:` and read it in the script as a quoted
+variable:
 
 ```yaml
 - env:
     TITLE: ${{ github.event.pull_request.title }}
   run: echo "$TITLE"
 ```
+
+The shell is held to the same rule. A step's `shell:`, and the
+`defaults.run.shell` a workflow or job gives its steps, names the command each
+script runs with, so a rendered value there picks an interpreter no text rule
+read. No `shell:` value may hold an expression, in any workflow or local
+action (an action input named `shell` included), and `defaults:` and its
+`run:` must be mappings, never computed values.
 
 A local action (`uses: ./...`) carries no commit pin, so the checker reads what
 it runs. Every local reference must name, by a plain path, a composite action
@@ -791,6 +799,54 @@ Until the `main` ruleset requires `trusted-supply-chain-policy`
 ([Switching the supply-chain policy check](#switching-the-supply-chain-policy-check)),
 a green `security-supply-chain-policy` is trustworthy only together with
 exact-head review of every change under `.github/workflows/`.
+
+### The release gate
+
+`release.yml`'s `authorize-release` job publishes only a commit that maps to
+exactly one merged pull request whose launch-required checks passed on its
+head, each bound to the GitHub Actions app: `rust-ci-check`,
+`security-cargo-audit`, `security-supply-chain-policy`,
+`state-guard-reject-state-edits` and `gitforgeops-required-static-validation`,
+plus `trusted-supply-chain-policy` once it is reported or required. Today that
+gate is inline bash and jq in the step. `.github/scripts/release_gate.py` is
+the same gate as a Python helper, and the workflow switches to it in a
+separate pull request (#473).
+
+Either way the gate's code comes from the release commit, which the checker
+judged on its pull request. So the checker pins what a pull request must not
+be able to weaken:
+
+- **Inline gate.** The jq launch lists are exactly the pinned launch-required
+  and accepted contexts, and the step keeps the 900-second budget, the GitHub
+  Actions app binding (`15368`) and the merged-PR association messages.
+- **Helper invocation.** A step that runs the helper must be exactly
+  `python3 -I .github/scripts/release_gate.py`, bind only `GH_TOKEN`, `REPO`,
+  `RELEASE_SHA` and `DEFAULT_BRANCH`, keep `timeout-minutes: 16`, and carry no
+  `shell`, `working-directory`, `if` or `continue-on-error`. The workflow and
+  job may set no `env` or `defaults`. It must be the job's second step, right
+  after a plain `actions/checkout` of the release commit with only
+  `persist-credentials: false`, and the helper must exist.
+- **Helper content.** Whenever the helper exists, `REQUIRED_CHECKS`,
+  `ACCEPTED_CHECKS`, `ACTIONS_APP_ID` and `BUDGET_SECONDS` are each assigned
+  their pinned value once at module level, never rebound, and read. It imports
+  only `json`, `os`, `re`, `subprocess`, `sys`, `time` and `urllib.parse`
+  (plus `__future__` and `typing`), unaliased. It names `os` only as
+  `os.environ`, `sys` only as `sys.stdout` or `sys.stderr`, and `subprocess`
+  only as `subprocess.TimeoutExpired` or a call to `subprocess.run` with a
+  literal `gh` argument list and no `shell`. It uses no `eval`, `exec`,
+  `open`, `getattr` or similar dynamic builtin, no dunder attribute and no
+  GitHub env-file channel name, and it ends with the standard `main()` guard.
+
+These pins bound what the helper can reach and the lists it judges against;
+they do not prove its control flow. `.github/scripts/tests/test_release_gate.py`
+runs every behavior scenario against both the inline gate and the helper, and
+exact-head review of every helper change is the control for the rest.
+
+The switch follows the checker-first rule above. This checker learned the
+helper before `release.yml` runs it; the follow-up pull request moves the
+release commit's checkout ahead of the gate step, replaces the inline script
+with the pinned invocation, and is judged by the protected checker that
+already knows the helper.
 
 ### Repository security features
 

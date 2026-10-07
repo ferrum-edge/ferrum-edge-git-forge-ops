@@ -721,8 +721,11 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     )
 
     def test_computed_values_cannot_reach_run_through_indirection(self):
-        # Each value passes the channel fence where it is computed; only the
-        # run allowlist stops it rendering as shell source.
+        # The run allowlist refuses each interpolation whatever its value. This
+        # `fromJSON` literal also names GITHUB_ENV, which the channel fence
+        # refuses where it is written, but nothing here relies on that: a value
+        # computed or chosen elsewhere (a variable, a title) never passes that
+        # fence, and only the allowlist stops it rendering as shell source.
         workflow = ".github/workflows/rust-ci.yml"
         computed = "${{ fromJSON('\"x; echo X=1 >> $GITHUB_ENV\"') }}"
         cases = (
@@ -6964,6 +6967,262 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    # -- release gate -------------------------------------------------------
+
+    RELEASE = ".github/workflows/release.yml"
+    RELEASE_HELPER_STEP = (
+        "      - name: Verify the published commit passed every required check\n"
+        "        timeout-minutes: 16\n"
+        "        env:\n"
+        "          GH_TOKEN: ${{ github.token }}\n"
+        "          REPO: ${{ github.repository }}\n"
+        "          RELEASE_SHA: ${{ github.sha }}\n"
+        "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}\n"
+        "        run: python3 -I .github/scripts/release_gate.py\n"
+    )
+
+    def _helper_release(self, step: str | None = None) -> str:
+        """release.yml as #473's second step writes it: checkout, then the helper."""
+        text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
+        start = text.index(
+            "      - name: Verify the published commit passed every required check\n"
+        )
+        checkout = re.compile(
+            r"      - uses: actions/checkout@[0-9a-f]{40} # v7\n"
+            r"        with:\n          persist-credentials: false\n\n"
+        ).search(text, start)
+        self.assertIsNotNone(checkout)
+        return (
+            text[:start] + checkout.group(0) + (step or self.RELEASE_HELPER_STEP) + "\n"
+            + text[checkout.end():]
+        )
+
+    def _release_gate_refusals(self, text: str, root: Path = ROOT) -> list[str]:
+        return check_supply_chain.release_gate_violations(
+            root, check_supply_chain.parse_workflow(text)
+        )
+
+    def _helper_violations(self, source: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / check_supply_chain.RELEASE_GATE_HELPER
+            path.parent.mkdir(parents=True)
+            path.write_text(source, encoding="utf-8")
+            return check_supply_chain.release_gate_helper_violations(root, required=True)
+
+    def test_shipped_release_gate_and_helper_pass(self):
+        text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
+        self.assertEqual(self._release_gate_refusals(text), [])
+        self.assertEqual(self._release_gate_refusals(self._helper_release()), [])
+        self.assertEqual(
+            check_supply_chain.release_gate_helper_violations(ROOT, required=True), []
+        )
+
+    def test_release_gate_pins_match_the_ruleset_contexts(self):
+        # The launch list is REQUIRED_CHECK_WORKFLOWS minus the job being added
+        # to the ruleset, which the gate tolerates while absent.
+        jobs = [
+            context.split(" / ")[-1]
+            for context in check_supply_chain.RELEASE_GATE_REQUIRED_CHECKS
+            + check_supply_chain.RELEASE_GATE_ACCEPTED_CHECKS
+        ]
+        self.assertEqual(sorted(jobs), sorted(check_supply_chain.REQUIRED_CHECK_WORKFLOWS))
+        self.assertEqual(
+            [context.split(" / ")[-1] for context in check_supply_chain.RELEASE_GATE_ACCEPTED_CHECKS],
+            [check_supply_chain.SUPPLY_CHAIN_POLICY_JOB],
+        )
+
+    def test_inline_release_gate_keeps_its_launch_lists_and_pins(self):
+        text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
+        for old, new in (
+            ('              "Security / security-cargo-audit",\n', ""),
+            ('"GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy"', '"Other / job"'),
+            ("+ 900 ))", "+ 9000 ))"),
+            (".app == 15368)", ".app == 42)"),
+            ("release commit must map to exactly one merged PR", "release commit maps"),
+        ):
+            with self.subTest(old=old):
+                changed = text.replace(old, new, 1)
+                self.assertNotEqual(changed, text)
+                self.assertTrue(self._release_gate_refusals(changed))
+
+    def test_helper_invocation_is_pinned(self):
+        step = self.RELEASE_HELPER_STEP
+        for name, changed in (
+            ("no isolation", self._helper_release(step.replace("python3 -I ", "python3 "))),
+            ("other script", self._helper_release(
+                step.replace("release_gate.py", "check_release_baseline.py")
+            )),
+            ("extra env", self._helper_release(step.replace(
+                "        run:", "          PATH: /tmp/bin\n        run:"
+            ))),
+            ("missing env", self._helper_release(
+                step.replace("          GH_TOKEN: ${{ github.token }}\n", "")
+            )),
+            ("shell", self._helper_release(step + "        shell: sh\n")),
+            ("condition", self._helper_release(step + "        if: always()\n")),
+            ("tolerated", self._helper_release(step + "        continue-on-error: true\n")),
+            ("short timeout", self._helper_release(
+                step.replace("timeout-minutes: 16", "timeout-minutes: 5")
+            )),
+            ("checkout ref", self._helper_release().replace(
+                "          persist-credentials: false\n\n"
+                "      - name: Verify the published commit",
+                "          persist-credentials: false\n          ref: main\n\n"
+                "      - name: Verify the published commit",
+                1,
+            )),
+            ("job env", self._helper_release().replace(
+                "    timeout-minutes: 45\n", "    timeout-minutes: 45\n    env:\n      X: y\n", 1
+            )),
+        ):
+            with self.subTest(case=name):
+                self.assertNotEqual(changed, self._helper_release())
+                self.assertTrue(self._release_gate_refusals(changed), changed)
+        # A step that runs before the checkout-then-helper pair could rewrite
+        # the helper the gate then runs.
+        text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
+        start = text.index("      - name: Verify the published commit passed every required check\n")
+        early = self._helper_release().replace(
+            text[start - len("    steps:\n"):start],
+            "    steps:\n      - run: echo early\n\n",
+            1,
+        )
+        self.assertNotEqual(early, self._helper_release())
+        self.assertTrue(
+            any("second step" in item for item in self._release_gate_refusals(early))
+        )
+
+    def test_helper_must_exist_once_release_runs_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            refusals = self._release_gate_refusals(self._helper_release(), root)
+            self.assertTrue(any("must exist" in item for item in refusals), refusals)
+            text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
+            self.assertEqual(self._release_gate_refusals(text, root), [])
+
+    def test_helper_pins_constants_imports_and_calls(self):
+        source = (ROOT / check_supply_chain.RELEASE_GATE_HELPER).read_text(encoding="utf-8")
+        self.assertEqual(self._helper_violations(source), [])
+        guard = 'if __name__ == "__main__":\n    raise SystemExit(main())\n'
+        self.assertTrue(source.endswith(guard))
+        body = source[: -len(guard)]
+        cases = (
+            ("dropped check", source.replace('    "Security / security-cargo-audit",\n', "", 1)),
+            ("budget", source.replace("BUDGET_SECONDS = 900", "BUDGET_SECONDS = 9000", 1)),
+            ("app", source.replace("ACTIONS_APP_ID = 15368", "ACTIONS_APP_ID = True", 1)),
+            ("rebound", body + "REQUIRED_CHECKS = ()\n" + guard),
+            ("shadowed", body + "def f(BUDGET_SECONDS=1):\n    return BUDGET_SECONDS\n" + guard),
+            ("global", body + "def f():\n    global ACTIONS_APP_ID\n" + guard),
+            ("aliased import", body + "import os as o\n" + guard),
+            ("other import", body + "import importlib\n" + guard),
+            ("from import", body + "from subprocess import Popen\n" + guard),
+            ("os call", body + "os.system('true')\n" + guard),
+            ("module alias", body + "runner = subprocess\n" + guard),
+            ("run reference", body + "runner = subprocess.run\n" + guard),
+            ("shell run", body + "subprocess.run('gh', shell=True)\n" + guard),
+            ("other command", body + "subprocess.run(['sh', '-c', 'true'])\n" + guard),
+            ("dynamic lookup", body + "getattr(time, 'sleep')\n" + guard),
+            ("dunder", body + "time.__dict__\n" + guard),
+            ("file write", body + "open('x', 'w')\n" + guard),
+            ("env-file name", body + "TARGET = 'GITHUB_ENV'\n" + guard),
+            ("no guard", body),
+            ("marker", source.replace("exactly one merged PR", "one merged PR", 1)),
+            ("syntax", source + "def (\n"),
+        )
+        for name, changed in cases:
+            with self.subTest(case=name):
+                self.assertNotEqual(changed, source)
+                self.assertTrue(self._helper_violations(changed))
+
+    def test_mirrored_repository_running_the_helper_is_a_clean_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            (root / self.RELEASE).write_text(self._helper_release(), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--root", str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    # -- shell values -------------------------------------------------------
+
+    def test_shell_values_and_run_defaults_may_not_be_computed(self):
+        workflow = ".github/workflows/rust-ci.yml"
+        for name, mutate in (
+            ("step shell", lambda document, job: self._first_steps(document).insert(
+                0, {"shell": "${{ vars.SHELL }} {0}", "run": "true"}
+            )),
+            ("job default", lambda document, job: job.update(
+                {"defaults": {"run": {"shell": "${{ matrix.shell }}"}}}
+            )),
+            ("workflow default", lambda document, job: document.update(
+                {"defaults": {"run": {"shell": "bash ${{ inputs.flags }} {0}"}}}
+            )),
+            ("computed defaults", lambda document, job: document.update(
+                {"defaults": "${{ fromJSON(vars.DEFAULTS) }}"}
+            )),
+            ("computed run defaults", lambda document, job: job.update(
+                {"defaults": {"run": "${{ fromJSON(vars.RUN) }}"}}
+            )),
+            ("non-scalar shell", lambda document, job: self._first_steps(document).insert(
+                0, {"shell": ["bash"], "run": "true"}
+            )),
+        ):
+            with self.subTest(case=name):
+                document = self._probe_document(workflow)
+                mutate(document, document["jobs"]["rust-ci-check"])
+                self.assertTrue(
+                    check_supply_chain.shell_expression_violations(workflow, document)
+                )
+        document = self._probe_document(workflow)
+        document["defaults"] = {"run": {"shell": "bash"}}
+        self._first_steps(document).insert(0, {"shell": "bash -eo pipefail {0}", "run": "true"})
+        self.assertEqual(check_supply_chain.shell_expression_violations(workflow, document), [])
+
+    def test_shipped_workflows_spell_every_shell_literally(self):
+        for workflow in self._shipped_workflows():
+            with self.subTest(workflow=workflow):
+                self.assertEqual(
+                    check_supply_chain.shell_expression_violations(
+                        workflow, self._probe_document(workflow)
+                    ),
+                    [],
+                )
+
+    def test_local_action_shell_values_may_not_be_computed(self):
+        rust = ".github/workflows/rust-ci.yml"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference = self._local_action(
+                root, "local", "    - shell: ${{ inputs.shell }}\n      run: echo hello\n"
+            )
+            document = self._probe_document(rust)
+            self._first_steps(document).insert(0, {"name": "Local", "uses": reference})
+            violations = check_supply_chain.local_action_violations(root, rust, document)
+        self.assertTrue(
+            any("a shell may not be computed" in item for item in violations), violations
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / rust
+            original = path.read_text(encoding="utf-8")
+            changed = original.replace(
+                "    steps:\n",
+                "    steps:\n      - name: Computed shell\n"
+                "        shell: ${{ vars.SHELL }}\n"
+                "        run: echo hello\n",
+                1,
+            )
+            self.assertNotEqual(changed, original)
+            path.write_text(changed, encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any("a shell may not be computed" in item for item in violations), violations
+        )
+
     # -- helpers ------------------------------------------------------------
 
     def _cargo_audit_workflow(self, pin: str) -> str:
@@ -6995,6 +7254,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ".github/scripts/credential_bundles.py",
             ".github/scripts/deployment_scope.py",
             ".github/scripts/install-ferrum-edge.sh",
+            ".github/scripts/release_gate.py",
             ".github/scripts/refresh-ferrum-edge-pin.sh",
             ".github/ferrum-edge-checksums.txt",
             ".github/CODEOWNERS",
