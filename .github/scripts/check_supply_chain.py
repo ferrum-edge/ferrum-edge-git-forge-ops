@@ -4183,10 +4183,10 @@ def state_push_retry_violations(workflow: str, text: str, commit_step: str) -> l
 #
 # It also pins a small import, reference and call surface. Those pins catch
 # drift and accidental reach; they are not a sandbox. A value passed through a
-# variable is invisible to them, and the helper's control flow is program
-# behavior: a rewritten helper could simply report success. Exact-head review
-# of every change to the helper is the control against a deliberate rewrite,
-# as for any other script.
+# variable or computed indirectly may be invisible to them, and the helper's
+# control flow is program behavior: a rewritten helper could simply report
+# success. Exact-head review of every change to the helper is the control
+# against a deliberate rewrite, as for any other script.
 RELEASE_GATE_WORKFLOW = ".github/workflows/release.yml"
 RELEASE_GATE_HELPER = ".github/scripts/release_gate.py"
 RELEASE_GATE_JOB = "authorize-release"
@@ -4282,6 +4282,21 @@ RELEASE_GATE_FORBIDDEN_NAMES = frozenset(
     }
 )
 RELEASE_GATE_RUN_KEYWORDS = frozenset({"capture_output", "check", "env", "timeout"})
+RELEASE_GATE_RUN_ENV = "self.subprocess_env"
+RELEASE_GATE_FRAME_ATTRIBUTES = frozenset(
+    {
+        "ag_frame",
+        "cr_frame",
+        "f_back",
+        "f_builtins",
+        "f_globals",
+        "f_locals",
+        "gi_code",
+        "gi_frame",
+        "tb_frame",
+        "tb_next",
+    }
+)
 RELEASE_GATE_MAIN_GUARD = "if __name__ == '__main__':\n    raise SystemExit(main())"
 
 
@@ -4381,16 +4396,20 @@ def _release_gate_run_violations(label: str, call: ast.Call) -> list[str]:
         if not (isinstance(element, ast.Constant) and isinstance(element.value, str)):
             break
         words.append(element.value)
+    env_keywords = [keyword for keyword in call.keywords if keyword.arg == "env"]
     if (
         words[:1] == ["gh"]
         and any(tuple(words[1 : 1 + len(sub)]) == sub for sub in RELEASE_GATE_GH_COMMANDS)
         and all(keyword.arg in RELEASE_GATE_RUN_KEYWORDS for keyword in call.keywords)
+        and len(env_keywords) == 1
+        and ast.unparse(env_keywords[0].value) == RELEASE_GATE_RUN_ENV
     ):
         return []
     return [
         f"{label}: line {call.lineno}: subprocess.run may only run a literal `gh api` or "
         "`gh pr checks` argument list, with "
         + ", ".join(sorted(RELEASE_GATE_RUN_KEYWORDS))
+        + f" and env={RELEASE_GATE_RUN_ENV}"
     ]
 
 
@@ -4421,6 +4440,11 @@ def release_gate_helper_violations(root: Path) -> list[str]:
     parents = {
         id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
     }
+    main_guard_name = None
+    if tree.body and isinstance(tree.body[-1], ast.If):
+        guard_test = tree.body[-1].test
+        if isinstance(guard_test, ast.Compare) and isinstance(guard_test.left, ast.Name):
+            main_guard_name = guard_test.left
     imported: dict[str, int] = {}
     strings: list[str] = []
     channel_lines: set[int] = set()
@@ -4451,6 +4475,11 @@ def release_gate_helper_violations(root: Path) -> list[str]:
             violations.append(
                 f"{label}: line {node.lineno}: dunder attribute {node.attr!r} is not allowed"
             )
+        elif isinstance(node, ast.Attribute) and node.attr in RELEASE_GATE_FRAME_ATTRIBUTES:
+            violations.append(
+                f"{label}: line {node.lineno}: frame or generator attribute "
+                f"{node.attr!r} is not allowed"
+            )
         elif isinstance(node, ast.MatchClass):
             violations.append(
                 f"{label}: line {node.lineno}: class patterns read attributes no rule judges"
@@ -4475,6 +4504,11 @@ def release_gate_helper_violations(root: Path) -> list[str]:
         violations.append(f"{label}: 'dict' may not be rebound")
     for node in ast.walk(tree):
         if not isinstance(node, ast.Name):
+            continue
+        if node.id.startswith("__") and not (
+            node.id == "__name__" and node is main_guard_name
+        ):
+            violations.append(f"{label}: line {node.lineno}: dunder name {node.id!r} is not allowed")
             continue
         if node.id in RELEASE_GATE_FORBIDDEN_NAMES:
             violations.append(f"{label}: line {node.lineno}: {node.id!r} is not allowed")

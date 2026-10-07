@@ -7100,6 +7100,17 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("other command", body + "subprocess.run(['sh', '-c', 'true'])\n" + guard),
             ("dynamic lookup", body + "getattr(time, 'sleep')\n" + guard),
             ("dunder", body + "time.__dict__\n" + guard),
+            ("dunder name", body + "loader = __loader__\n" + guard),
+            ("generator frame", body + "frame = value.gi_frame\n" + guard),
+            ("generator code", body + "code = value.gi_code\n" + guard),
+            ("frame globals", body + "globals_ = value.f_globals\n" + guard),
+            ("frame locals", body + "locals_ = value.f_locals\n" + guard),
+            ("frame back", body + "back = value.f_back\n" + guard),
+            ("frame builtins", body + "builtins_ = value.f_builtins\n" + guard),
+            ("coroutine frame", body + "frame = value.cr_frame\n" + guard),
+            ("async generator frame", body + "frame = value.ag_frame\n" + guard),
+            ("traceback frame", body + "frame = value.tb_frame\n" + guard),
+            ("traceback next", body + "next_ = value.tb_next\n" + guard),
             ("file write", body + "open('x', 'w')\n" + guard),
             ("env-file name", body + "TARGET = 'GITHUB_ENV'\n" + guard),
             # Reach through an allowed module, or past an allowed reference.
@@ -7123,6 +7134,14 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("gh computed", body + "subprocess.run(['gh', *ARGS])\n" + guard),
             ("gh pr other", body + "subprocess.run(['gh', 'pr', 'checkout', '1'])\n" + guard),
             ("gh kwargs", body + "subprocess.run(['gh', 'api', 'user'], **OPTIONS)\n" + guard),
+            (
+                "gh environment expression",
+                body + "subprocess.run(['gh', 'api', 'user'], env=os.environ)\n" + guard,
+            ),
+            (
+                "gh missing environment",
+                body + "subprocess.run(['gh', 'api', 'user'])\n" + guard,
+            ),
             # Runner variable and channel names, even split across literals.
             ("split channel", body + "TARGET = 'GITHUB_' + 'ENV'\n" + guard),
             ("f-string channel", body + "TARGET = f\"GIT{'HUB_'}ENV\"\n" + guard),

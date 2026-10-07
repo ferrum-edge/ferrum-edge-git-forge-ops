@@ -7,6 +7,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Tighten the protected release-gate helper pins to reject direct frame,
+  generator and traceback attributes, dunder names outside the required main
+  guard, and any `subprocess.run` environment other than
+  `self.subprocess_env`. Clarify that the AST checks detect drift and selected
+  accidental reach; they are not a sandbox. (#500)
 - `.github/scripts/release_gate.py`, the release gate as a Python helper
   (#473). `release.yml`'s `authorize-release` job now checks out the release
   commit first and runs `python3 -I .github/scripts/release_gate.py` in place
