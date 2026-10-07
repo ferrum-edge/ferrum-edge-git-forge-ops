@@ -807,46 +807,57 @@ exactly one merged pull request whose launch-required checks passed on its
 head, each bound to the GitHub Actions app: `rust-ci-check`,
 `security-cargo-audit`, `security-supply-chain-policy`,
 `state-guard-reject-state-edits` and `gitforgeops-required-static-validation`,
-plus `trusted-supply-chain-policy` once it is reported or required. Today that
-gate is inline bash and jq in the step. `.github/scripts/release_gate.py` is
-the same gate as a Python helper, and the workflow switches to it in a
-separate pull request (#473).
+plus `trusted-supply-chain-policy` once it is reported or required. The job
+checks out the release commit and runs `.github/scripts/release_gate.py` from
+it (#473).
 
-Either way the gate's code comes from the release commit, which the checker
-judged on its pull request. So the checker pins what a pull request must not
-be able to weaken:
+The gate's code comes from the release commit, which the checker judged on its
+pull request. So the checker pins what a pull request must not be able to
+weaken:
 
-- **Inline gate.** The jq launch lists are exactly the pinned launch-required
-  and accepted contexts, and the step keeps the 900-second budget, the GitHub
-  Actions app binding (`15368`) and the merged-PR association messages.
-- **Helper invocation.** A step that runs the helper must be exactly
-  `python3 -I .github/scripts/release_gate.py`, bind only `GH_TOKEN`, `REPO`,
-  `RELEASE_SHA` and `DEFAULT_BRANCH`, keep `timeout-minutes: 16`, and carry no
-  `shell`, `working-directory`, `if` or `continue-on-error`. The workflow and
-  job may set no `env` or `defaults`. It must be the job's second step, right
-  after a plain `actions/checkout` of the release commit with only
+- **Invocation.** The gate step runs exactly
+  `python3 -I .github/scripts/release_gate.py`, binds only `GH_TOKEN`, `REPO`,
+  `RELEASE_SHA` and `DEFAULT_BRANCH`, keeps `timeout-minutes: 16`, and carries
+  no `shell`, `working-directory`, `if` or `continue-on-error`. The workflow
+  and job set no `env` or `defaults`. It is the job's second step, right after
+  a plain `actions/checkout` of the release commit with only
   `persist-credentials: false`, and the helper must exist.
-- **Helper content.** Whenever the helper exists, `REQUIRED_CHECKS`,
-  `ACCEPTED_CHECKS`, `ACTIONS_APP_ID` and `BUDGET_SECONDS` are each assigned
-  their pinned value once at module level, never rebound, and read. It imports
-  only `json`, `os`, `re`, `subprocess`, `sys`, `time` and `urllib.parse`
-  (plus `__future__` and `typing`), unaliased. It names `os` only as
-  `os.environ`, `sys` only as `sys.stdout` or `sys.stderr`, and `subprocess`
-  only as `subprocess.TimeoutExpired` or a call to `subprocess.run` with a
-  literal `gh` argument list and no `shell`. It uses no `eval`, `exec`,
-  `open`, `getattr` or similar dynamic builtin, no dunder attribute and no
-  GitHub env-file channel name, and it ends with the standard `main()` guard.
+- **Launch lists, app and budget.** `REQUIRED_CHECKS`, `ACCEPTED_CHECKS`,
+  `ACTIONS_APP_ID` and `BUDGET_SECONDS` are each assigned their pinned value
+  once at module level, never rebound, and read.
+- **Imports and references.** The helper imports only `json`, `os`, `re`,
+  `subprocess`, `sys`, `time` and `urllib.parse`, plus
+  `from __future__ import annotations` and `from typing import Callable`,
+  unaliased. Each imported name is bound only by its import and used only as
+  one listed reference: `json.JSONDecoder`, `os.environ`, `re.compile`,
+  `subprocess.run`, `subprocess.TimeoutExpired`, `sys.stdout`, `sys.stderr`
+  (and their `write`), `time.monotonic`, `time.sleep`, `urllib.parse.quote`
+  and bare `Callable`. Nothing may follow a reference, so the helper cannot
+  walk from an allowed module to another one, such as `re.enum.sys`.
+- **Environment and commands.** `os.environ` is read only as
+  `dict(os.environ)`, so the helper never changes the environment `gh`
+  inherits. `subprocess.run` is always called, with a literal `gh api` or
+  `gh pr checks` argument list and only `capture_output`, `check`, `env` and
+  `timeout`. Any other `gh` subcommand, such as `alias` or `extension`, is
+  refused.
+- **Builtins and names.** No `eval`, `exec`, `open`, `getattr`, `help` or
+  similar dynamic builtin, no dunder attribute, and no class pattern. No
+  string literal names a `GITHUB_*` runner variable or env-file channel, even
+  when built from several literals with `+`, an f-string or `"".join`. The
+  file ends with the standard `main()` guard.
 
-These pins bound what the helper can reach and the lists it judges against;
-they do not prove its control flow. `.github/scripts/tests/test_release_gate.py`
-runs every behavior scenario against both the inline gate and the helper, and
-exact-head review of every helper change is the control for the rest.
+These pins catch drift in the lists, app id and budget, and accidental reach.
+They are not a sandbox. A name built through a variable, or a value passed
+through one, is invisible to them, and they do not prove the helper's control
+flow: a rewritten helper could simply report success. Exact-head review of
+every change to the helper is the control against a deliberate rewrite.
+`.github/scripts/tests/test_release_gate.py` runs every release-gate scenario
+against the helper with a stub `gh`.
 
-The switch follows the checker-first rule above. This checker learned the
-helper before `release.yml` runs it; the follow-up pull request moves the
-release commit's checkout ahead of the gate step, replaces the inline script
-with the pinned invocation, and is judged by the protected checker that
-already knows the helper.
+The switch followed the checker-first rule above. The checker learned the
+helper before `release.yml` ran it, so the pull request that moved the release
+commit's checkout ahead of the gate step and replaced the inline script was
+judged by a protected checker that already knew the helper.
 
 ### Repository security features
 

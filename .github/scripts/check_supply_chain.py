@@ -4175,14 +4175,18 @@ def state_push_retry_violations(workflow: str, text: str, commit_step: str) -> l
 #
 # `release.yml`'s `authorize-release` job decides whether a pushed commit may be
 # published: the commit must map to exactly one merged pull request whose
-# launch checks passed on its head. The gate runs either inline (bash and jq in
-# the step) or as `RELEASE_GATE_HELPER` from the release commit's own checkout
-# (#473). Either way the code comes from the release commit, which this checker
-# judged on its pull request, so the checker pins what a pull request must not
-# weaken: the launch check lists, the GitHub Actions App binding and the
-# sampling budget, and for the helper its exact invocation and a small import
-# and call surface. The helper's control flow is program behavior; review of
-# every change to it is the control for that, as for any other script.
+# launch checks passed on its head. The job checks out the release commit and
+# runs `RELEASE_GATE_HELPER` from it (#473). That code comes from the release
+# commit, which this checker judged on its pull request, so the checker pins
+# what a pull request must not weaken: the helper's exact invocation, the
+# launch check lists, the GitHub Actions App binding and the sampling budget.
+#
+# It also pins a small import, reference and call surface. Those pins catch
+# drift and accidental reach; they are not a sandbox. A value passed through a
+# variable is invisible to them, and the helper's control flow is program
+# behavior: a rewritten helper could simply report success. Exact-head review
+# of every change to the helper is the control against a deliberate rewrite,
+# as for any other script.
 RELEASE_GATE_WORKFLOW = ".github/workflows/release.yml"
 RELEASE_GATE_HELPER = ".github/scripts/release_gate.py"
 RELEASE_GATE_JOB = "authorize-release"
@@ -4212,17 +4216,8 @@ RELEASE_GATE_ENV = {
 RELEASE_GATE_MARKERS = (
     "release commit must map to exactly one merged PR",
     "Release merge association is not yet available and unambiguous",
-)
-RELEASE_GATE_INLINE_MARKERS = RELEASE_GATE_MARKERS + (
-    'gh pr checks "$pr" --repo "$REPO" --required',
-    f"deadline=$(( $(date +%s) + {RELEASE_GATE_BUDGET_SECONDS} ))",
-    f".app == {RELEASE_GATE_APP_ID})",
-    f"$setting.app != {RELEASE_GATE_APP_ID}",
-    f"app: {RELEASE_GATE_APP_ID}}}",
-)
-RELEASE_GATE_HELPER_MARKERS = RELEASE_GATE_MARKERS + ("--required", "bucket,name,workflow")
-RELEASE_GATE_INLINE_LISTS = re.compile(
-    r"--argjson required '(\[.*?\])' --argjson accepted '(\[.*?\])'", re.DOTALL
+    "--required",
+    "bucket,name,workflow",
 )
 # Module constants of the helper, each bound exactly once, to exactly this.
 RELEASE_GATE_PINS = {
@@ -4232,16 +4227,41 @@ RELEASE_GATE_PINS = {
     "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
 }
 RELEASE_GATE_IMPORTS = frozenset(
-    {"__future__", "json", "os", "re", "subprocess", "sys", "time", "typing", "urllib.parse"}
+    {"json", "os", "re", "subprocess", "sys", "time", "urllib.parse"}
 )
-RELEASE_GATE_FROM_IMPORTS = frozenset({"__future__", "typing"})
-# These modules may be named only as `<module>.<attribute>` with an allowed
-# attribute, so no alias can reach `os.system` or `subprocess.Popen`.
-RELEASE_GATE_MODULE_ATTRIBUTES = {
-    "os": frozenset({"environ"}),
-    "subprocess": frozenset({"run", "TimeoutExpired"}),
-    "sys": frozenset({"stdout", "stderr"}),
+# `from` imports, by module, with the names each may import.
+RELEASE_GATE_FROM_IMPORTS = {
+    "__future__": frozenset({"annotations"}),
+    "typing": frozenset({"Callable"}),
 }
+# Every use of an imported name, as the whole dotted chain it heads. An
+# imported name may not be used bare (except `Callable`), rebound, or followed
+# by any other attribute, so the helper cannot walk from an allowed module to
+# another (`re.enum.sys`, `urllib.parse.sys`, `json.codecs.open`).
+RELEASE_GATE_REFERENCES = frozenset(
+    {
+        ("Callable",),
+        ("json", "JSONDecoder"),
+        ("os", "environ"),
+        ("re", "compile"),
+        ("subprocess", "TimeoutExpired"),
+        ("subprocess", "run"),
+        ("sys", "stderr"),
+        ("sys", "stderr", "write"),
+        ("sys", "stdout"),
+        ("sys", "stdout", "write"),
+        ("time", "monotonic"),
+        ("time", "sleep"),
+        ("urllib", "parse", "quote"),
+    }
+)
+# References that may only be called, never passed on.
+RELEASE_GATE_CALLED = frozenset(
+    {("subprocess", "run"), ("sys", "stderr", "write"), ("sys", "stdout", "write")}
+)
+# The `gh` subcommands the helper may run. Any other (`alias`, `extension`,
+# `config`) could define, install or run another program.
+RELEASE_GATE_GH_COMMANDS = (("api",), ("pr", "checks"))
 RELEASE_GATE_FORBIDDEN_NAMES = frozenset(
     {
         "__builtins__",
@@ -4253,6 +4273,7 @@ RELEASE_GATE_FORBIDDEN_NAMES = frozenset(
         "exec",
         "getattr",
         "globals",
+        "help",
         "input",
         "locals",
         "open",
@@ -4302,15 +4323,83 @@ def _module_constant(tree: ast.Module, name: str):
     return None
 
 
-def release_gate_helper_violations(root: Path, required: bool) -> list[str]:
-    """The helper keeps its pinned constants, imports, calls and entry point.
+def _folded_string(node: ast.AST) -> str | None:
+    """The text a literal string expression builds, or None if it is not one.
 
-    Judged whenever the file exists, and required when `release.yml` runs it.
+    Folds literals joined by `+`, f-strings of literals and `"sep".join` of a
+    literal list or tuple, so `"GITHUB_" + "ENV"` reads as one name. A name
+    built from a variable is program behavior, left to review.
     """
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _folded_string(node.left), _folded_string(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.FormattedValue):
+                value = value.value
+            text = _folded_string(value)
+            if text is None:
+                return None
+            parts.append(text)
+        return "".join(parts)
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        separator = _folded_string(node.func.value)
+        items = [_folded_string(item) for item in node.args[0].elts]
+        if separator is None or any(item is None for item in items):
+            return None
+        return separator.join(items)
+    return None
+
+
+def _reference_chain(node: ast.Name, parents: dict[int, ast.AST]) -> tuple[tuple, ast.expr]:
+    """The dotted chain `node` heads (`sys.stdout.write`) and its outermost node."""
+    chain = [node.id]
+    top: ast.expr = node
+    parent = parents.get(id(top))
+    while isinstance(parent, ast.Attribute) and parent.value is top:
+        chain.append(parent.attr)
+        top = parent
+        parent = parents.get(id(top))
+    return tuple(chain), top
+
+
+def _release_gate_run_violations(label: str, call: ast.Call) -> list[str]:
+    """`subprocess.run` runs a literal `gh api` or `gh pr checks` argument list."""
+    command = call.args[0] if len(call.args) == 1 else None
+    words: list[str] = []
+    for element in command.elts if isinstance(command, ast.List) else []:
+        if not (isinstance(element, ast.Constant) and isinstance(element.value, str)):
+            break
+        words.append(element.value)
+    if (
+        words[:1] == ["gh"]
+        and any(tuple(words[1 : 1 + len(sub)]) == sub for sub in RELEASE_GATE_GH_COMMANDS)
+        and all(keyword.arg in RELEASE_GATE_RUN_KEYWORDS for keyword in call.keywords)
+    ):
+        return []
+    return [
+        f"{label}: line {call.lineno}: subprocess.run may only run a literal `gh api` or "
+        "`gh pr checks` argument list, with "
+        + ", ".join(sorted(RELEASE_GATE_RUN_KEYWORDS))
+    ]
+
+
+def release_gate_helper_violations(root: Path) -> list[str]:
+    """The helper keeps its pinned constants, imports, references and calls."""
     label = RELEASE_GATE_HELPER
     path = root / RELEASE_GATE_HELPER
     if not path.exists() and not path.is_symlink():
-        return [f"{label}: release.yml runs the helper, so it must exist"] if required else []
+        return [f"{label}: release.yml runs the helper, so it must exist"]
     if path.is_symlink() or not path.is_file():
         return [f"{label}: must be a regular file"]
     try:
@@ -4329,9 +4418,12 @@ def release_gate_helper_violations(root: Path, required: bool) -> list[str]:
             for node in ast.walk(tree)
         ):
             violations.append(f"{label}: {name} must be read by the gate")
-    attribute_owners: set[int] = set()
-    called: set[int] = set()
+    parents = {
+        id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    imported: dict[str, int] = {}
     strings: list[str] = []
+    channel_lines: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -4340,70 +4432,83 @@ def release_gate_helper_violations(root: Path, required: bool) -> list[str]:
                         f"{label}: line {node.lineno}: import {alias.name!r} is not allowed "
                         f"(only {', '.join(sorted(RELEASE_GATE_IMPORTS))}, unaliased)"
                     )
+                name = alias.asname or alias.name.split(".")[0]
+                imported[name] = imported.get(name, 0) + 1
         elif isinstance(node, ast.ImportFrom):
-            if node.level or node.module not in RELEASE_GATE_FROM_IMPORTS:
-                violations.append(
-                    f"{label}: line {node.lineno}: `from` imports are allowed only from "
-                    + ", ".join(sorted(RELEASE_GATE_FROM_IMPORTS))
-                )
-        elif isinstance(node, ast.Call):
-            called.add(id(node.func))
-        elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("__"):
-                violations.append(
-                    f"{label}: line {node.lineno}: dunder attribute {node.attr!r} is not allowed"
-                )
-            owner = node.value
-            if isinstance(owner, ast.Name) and owner.id in RELEASE_GATE_MODULE_ATTRIBUTES:
-                attribute_owners.add(id(owner))
-                if node.attr not in RELEASE_GATE_MODULE_ATTRIBUTES[owner.id]:
+            allowed = RELEASE_GATE_FROM_IMPORTS.get(node.module or "", frozenset())
+            for alias in node.names:
+                if node.level or alias.name not in allowed or alias.asname is not None:
                     violations.append(
-                        f"{label}: line {node.lineno}: {owner.id}.{node.attr} is not allowed"
+                        f"{label}: line {node.lineno}: `from` imports are allowed only as "
+                        + "; ".join(
+                            f"from {module} import {', '.join(sorted(names))}"
+                            for module, names in sorted(RELEASE_GATE_FROM_IMPORTS.items())
+                        )
                     )
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                name = alias.asname or alias.name
+                imported[name] = imported.get(name, 0) + 1
+        elif isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+            violations.append(
+                f"{label}: line {node.lineno}: dunder attribute {node.attr!r} is not allowed"
+            )
+        elif isinstance(node, ast.MatchClass):
+            violations.append(
+                f"{label}: line {node.lineno}: class patterns read attributes no rule judges"
+            )
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
             strings.append(node.value)
-            if _FILE_CHANNEL.search(_scan_text(node.value)):
-                violations.append(
-                    f"{label}: line {node.lineno}: the helper may not name a GitHub "
-                    "env-file channel"
-                )
+        text = _folded_string(node)
+        if text is not None:
+            scanned = _scan_text(text)
+            if "github_" in scanned or _FILE_CHANNEL.search(scanned):
+                channel_lines.add(node.lineno)
+    for line in sorted(channel_lines):
+        violations.append(
+            f"{label}: line {line}: the helper may not name a GitHub runner variable or "
+            "env-file channel, even split across literals"
+        )
+    roots = {reference[0] for reference in RELEASE_GATE_REFERENCES} | set(imported)
+    for name in sorted(roots):
+        if imported.get(name, 0) > 1 or _python_bindings(tree, name) != imported.get(name, 0):
+            violations.append(f"{label}: {name!r} may be bound only by its one import")
+    if _python_bindings(tree, "dict"):
+        violations.append(f"{label}: 'dict' may not be rebound")
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            if node.id in RELEASE_GATE_FORBIDDEN_NAMES:
-                violations.append(f"{label}: line {node.lineno}: {node.id!r} is not allowed")
-            elif node.id in RELEASE_GATE_MODULE_ATTRIBUTES and id(node) not in attribute_owners:
-                violations.append(
-                    f"{label}: line {node.lineno}: {node.id!r} may be used only as "
-                    f"{node.id}.<allowed attribute>"
-                )
-        elif (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "subprocess"
-            and node.attr == "run"
-            and id(node) not in called
+        if not isinstance(node, ast.Name):
+            continue
+        if node.id in RELEASE_GATE_FORBIDDEN_NAMES:
+            violations.append(f"{label}: line {node.lineno}: {node.id!r} is not allowed")
+            continue
+        if node.id not in roots or not isinstance(node.ctx, ast.Load):
+            continue
+        chain, top = _reference_chain(node, parents)
+        parent = parents.get(id(top))
+        dotted = ".".join(chain)
+        if chain not in RELEASE_GATE_REFERENCES:
+            violations.append(
+                f"{label}: line {node.lineno}: {dotted} is not an allowed reference"
+            )
+        elif not isinstance(top.ctx, ast.Load):
+            violations.append(f"{label}: line {node.lineno}: {dotted} may only be read")
+        elif chain in RELEASE_GATE_CALLED and not (
+            isinstance(parent, ast.Call) and parent.func is top
         ):
-            violations.append(f"{label}: line {node.lineno}: subprocess.run must be called")
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "subprocess"
-            and node.func.attr == "run"
+            violations.append(f"{label}: line {node.lineno}: {dotted} must be called")
+        elif chain == ("os", "environ") and not (
+            isinstance(parent, ast.Call)
+            and isinstance(parent.func, ast.Name)
+            and parent.func.id == "dict"
+            and len(parent.args) == 1
+            and parent.args[0] is top
+            and not parent.keywords
         ):
-            command = node.args[0] if len(node.args) == 1 else None
-            if not (
-                isinstance(command, ast.List)
-                and command.elts
-                and isinstance(command.elts[0], ast.Constant)
-                and command.elts[0].value == "gh"
-            ) or any(keyword.arg not in RELEASE_GATE_RUN_KEYWORDS for keyword in node.keywords):
-                violations.append(
-                    f"{label}: line {node.lineno}: subprocess.run may only run a literal "
-                    "`gh` argument list, with "
-                    + ", ".join(sorted(RELEASE_GATE_RUN_KEYWORDS))
-                )
-    for marker in RELEASE_GATE_HELPER_MARKERS:
+            violations.append(
+                f"{label}: line {node.lineno}: os.environ may be read only as "
+                "`dict(os.environ)`, so the helper never changes the environment gh inherits"
+            )
+        elif chain == ("subprocess", "run"):
+            violations.extend(_release_gate_run_violations(label, parent))
+    for marker in RELEASE_GATE_MARKERS:
         if not any(marker in text for text in strings):
             violations.append(f"{label}: missing checked-merge publication gate {marker!r}")
     if not tree.body or ast.unparse(tree.body[-1]) != RELEASE_GATE_MAIN_GUARD:
@@ -4414,34 +4519,26 @@ def release_gate_helper_violations(root: Path, required: bool) -> list[str]:
     return violations
 
 
-def _release_gate_inline_violations(script: str) -> list[str]:
-    """The inline gate lists exactly the launch checks and keeps its pins."""
-    label = f"{RELEASE_GATE_WORKFLOW}: step {RELEASE_GATE_STEP!r}"
-    violations: list[str] = []
-    match = RELEASE_GATE_INLINE_LISTS.search(script)
-    lists = None
-    if match is not None:
-        try:
-            lists = (json.loads(match.group(1)), json.loads(match.group(2)))
-        except ValueError:
-            lists = None
-    if lists != (list(RELEASE_GATE_REQUIRED_CHECKS), list(RELEASE_GATE_ACCEPTED_CHECKS)):
-        violations.append(
-            f"{label}: the inline gate must pass exactly the launch-required and accepted "
-            "check lists to jq"
-        )
-    for marker in RELEASE_GATE_INLINE_MARKERS:
-        if marker not in script:
-            violations.append(f"{label}: missing checked-merge publication gate {marker!r}")
-    return violations
-
-
-def _release_gate_invocation_violations(
-    document: dict, job: dict, steps: list, step: dict
-) -> list[str]:
-    """The helper runs right after a plain checkout of the release commit."""
+def release_gate_violations(root: Path, document: dict) -> list[str]:
+    """`authorize-release` runs the pinned helper right after a plain checkout."""
     label = f"{RELEASE_GATE_WORKFLOW}: job {RELEASE_GATE_JOB!r}, step {RELEASE_GATE_STEP!r}"
+    jobs = document.get("jobs")
+    job = jobs.get(RELEASE_GATE_JOB) if isinstance(jobs, dict) else None
+    steps = job.get("steps") if isinstance(job, dict) else None
+    steps = steps if isinstance(steps, list) else []
+    gates = [
+        step for step in steps
+        if isinstance(step, dict) and step.get("name") == RELEASE_GATE_STEP
+    ]
+    if len(gates) != 1 or not isinstance(gates[0].get("run"), str):
+        return [
+            f"{RELEASE_GATE_WORKFLOW}: job {RELEASE_GATE_JOB!r} must run step "
+            f"{RELEASE_GATE_STEP!r} exactly once"
+        ]
+    step = gates[0]
     violations: list[str] = []
+    if not pinned_run_matches(step["run"], RELEASE_GATE_HELPER_RUN):
+        violations.append(f"{label} must run exactly `{RELEASE_GATE_HELPER_RUN[0]}`")
     if any(
         key in step for key in ("uses", "shell", "working-directory", "if", "continue-on-error")
     ):
@@ -4475,32 +4572,7 @@ def _release_gate_invocation_violations(
             "the release commit with only `persist-credentials: false` (no ref, repository "
             "or path)"
         )
-    return violations
-
-
-def release_gate_violations(root: Path, document: dict) -> list[str]:
-    """`authorize-release` runs the pinned inline gate or the pinned helper."""
-    jobs = document.get("jobs")
-    job = jobs.get(RELEASE_GATE_JOB) if isinstance(jobs, dict) else None
-    steps = job.get("steps") if isinstance(job, dict) else None
-    steps = steps if isinstance(steps, list) else []
-    gates = [
-        step for step in steps
-        if isinstance(step, dict) and step.get("name") == RELEASE_GATE_STEP
-    ]
-    if len(gates) != 1 or not isinstance(gates[0].get("run"), str):
-        return [
-            f"{RELEASE_GATE_WORKFLOW}: job {RELEASE_GATE_JOB!r} must run step "
-            f"{RELEASE_GATE_STEP!r} exactly once"
-        ]
-    step = gates[0]
-    if pinned_run_matches(step["run"], RELEASE_GATE_HELPER_RUN):
-        return _release_gate_invocation_violations(
-            document, job, steps, step
-        ) + release_gate_helper_violations(root, required=True)
-    return _release_gate_inline_violations(step["run"]) + release_gate_helper_violations(
-        root, required=False
-    )
+    return violations + release_gate_helper_violations(root)
 
 
 def main(argv: list[str] | None = None) -> int:

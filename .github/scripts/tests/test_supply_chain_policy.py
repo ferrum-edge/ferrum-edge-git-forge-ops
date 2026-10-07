@@ -6982,20 +6982,10 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
     )
 
     def _helper_release(self, step: str | None = None) -> str:
-        """release.yml as #473's second step writes it: checkout, then the helper."""
+        """The shipped release.yml, optionally with another gate step."""
         text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
-        start = text.index(
-            "      - name: Verify the published commit passed every required check\n"
-        )
-        checkout = re.compile(
-            r"      - uses: actions/checkout@[0-9a-f]{40} # v7\n"
-            r"        with:\n          persist-credentials: false\n\n"
-        ).search(text, start)
-        self.assertIsNotNone(checkout)
-        return (
-            text[:start] + checkout.group(0) + (step or self.RELEASE_HELPER_STEP) + "\n"
-            + text[checkout.end():]
-        )
+        self.assertEqual(text.count(self.RELEASE_HELPER_STEP), 1)
+        return text.replace(self.RELEASE_HELPER_STEP, step or self.RELEASE_HELPER_STEP, 1)
 
     def _release_gate_refusals(self, text: str, root: Path = ROOT) -> list[str]:
         return check_supply_chain.release_gate_violations(
@@ -7008,15 +6998,11 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             path = root / check_supply_chain.RELEASE_GATE_HELPER
             path.parent.mkdir(parents=True)
             path.write_text(source, encoding="utf-8")
-            return check_supply_chain.release_gate_helper_violations(root, required=True)
+            return check_supply_chain.release_gate_helper_violations(root)
 
     def test_shipped_release_gate_and_helper_pass(self):
-        text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
-        self.assertEqual(self._release_gate_refusals(text), [])
         self.assertEqual(self._release_gate_refusals(self._helper_release()), [])
-        self.assertEqual(
-            check_supply_chain.release_gate_helper_violations(ROOT, required=True), []
-        )
+        self.assertEqual(check_supply_chain.release_gate_helper_violations(ROOT), [])
 
     def test_release_gate_pins_match_the_ruleset_contexts(self):
         # The launch list is REQUIRED_CHECK_WORKFLOWS minus the job being added
@@ -7032,24 +7018,19 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             [check_supply_chain.SUPPLY_CHAIN_POLICY_JOB],
         )
 
-    def test_inline_release_gate_keeps_its_launch_lists_and_pins(self):
-        text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
-        for old, new in (
-            ('              "Security / security-cargo-audit",\n', ""),
-            ('"GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy"', '"Other / job"'),
-            ("+ 900 ))", "+ 9000 ))"),
-            (".app == 15368)", ".app == 42)"),
-            ("release commit must map to exactly one merged PR", "release commit maps"),
-        ):
-            with self.subTest(old=old):
-                changed = text.replace(old, new, 1)
-                self.assertNotEqual(changed, text)
-                self.assertTrue(self._release_gate_refusals(changed))
-
     def test_helper_invocation_is_pinned(self):
         step = self.RELEASE_HELPER_STEP
         for name, changed in (
             ("no isolation", self._helper_release(step.replace("python3 -I ", "python3 "))),
+            ("inline script", self._helper_release(step.replace(
+                "        run: python3 -I .github/scripts/release_gate.py\n",
+                "        run: |\n          set -euo pipefail\n          echo published\n",
+            ))),
+            ("extra command", self._helper_release(step.replace(
+                "        run: python3 -I .github/scripts/release_gate.py\n",
+                "        run: |\n          python3 -I .github/scripts/release_gate.py\n"
+                "          echo published\n",
+            ))),
             ("other script", self._helper_release(
                 step.replace("release_gate.py", "check_release_baseline.py")
             )),
@@ -7081,14 +7062,11 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 self.assertTrue(self._release_gate_refusals(changed), changed)
         # A step that runs before the checkout-then-helper pair could rewrite
         # the helper the gate then runs.
-        text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
-        start = text.index("      - name: Verify the published commit passed every required check\n")
-        early = self._helper_release().replace(
-            text[start - len("    steps:\n"):start],
-            "    steps:\n      - run: echo early\n\n",
-            1,
+        text = self._helper_release()
+        checkout = text.rindex(
+            "      - uses: actions/checkout@", 0, text.index(self.RELEASE_HELPER_STEP)
         )
-        self.assertNotEqual(early, self._helper_release())
+        early = text[:checkout] + "      - run: echo early\n\n" + text[checkout:]
         self.assertTrue(
             any("second step" in item for item in self._release_gate_refusals(early))
         )
@@ -7098,8 +7076,6 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             root = Path(directory)
             refusals = self._release_gate_refusals(self._helper_release(), root)
             self.assertTrue(any("must exist" in item for item in refusals), refusals)
-            text = (ROOT / self.RELEASE).read_text(encoding="utf-8")
-            self.assertEqual(self._release_gate_refusals(text, root), [])
 
     def test_helper_pins_constants_imports_and_calls(self):
         source = (ROOT / check_supply_chain.RELEASE_GATE_HELPER).read_text(encoding="utf-8")
@@ -7126,6 +7102,38 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("dunder", body + "time.__dict__\n" + guard),
             ("file write", body + "open('x', 'w')\n" + guard),
             ("env-file name", body + "TARGET = 'GITHUB_ENV'\n" + guard),
+            # Reach through an allowed module, or past an allowed reference.
+            ("parse traversal", body + "urllib.parse.sys.modules\n" + guard),
+            ("re traversal", body + "re.enum.sys\n" + guard),
+            ("json traversal", body + "json.codecs.open('x', 'a')\n" + guard),
+            ("typing import", body + "import typing\n" + guard),
+            ("typing name", body + "from typing import Any\n" + guard),
+            ("future name", body + "from __future__ import division\n" + guard),
+            ("bare module", body + "print(json)\n" + guard),
+            ("stream traversal", body + "sys.stdout.buffer.write(b'x')\n" + guard),
+            ("stream method", body + "sys.stderr.reconfigure()\n" + guard),
+            ("unlisted attribute", body + "time.perf_counter()\n" + guard),
+            ("rebound module", body + "def f(json):\n    return json\n" + guard),
+            ("rebound dict", body + "dict = list\n" + guard),
+            ("class pattern", body + "match 1:\n    case int(real=x):\n        pass\n" + guard),
+            ("pager", body + "help(slurp)\n" + guard),
+            # gh may run only `gh api` and `gh pr checks`.
+            ("gh alias", body + "subprocess.run(['gh', 'alias', 'set', 'x', 'y'])\n" + guard),
+            ("gh extension", body + "subprocess.run(['gh', 'extension', 'install', 'x'])\n" + guard),
+            ("gh computed", body + "subprocess.run(['gh', *ARGS])\n" + guard),
+            ("gh pr other", body + "subprocess.run(['gh', 'pr', 'checkout', '1'])\n" + guard),
+            ("gh kwargs", body + "subprocess.run(['gh', 'api', 'user'], **OPTIONS)\n" + guard),
+            # Runner variable and channel names, even split across literals.
+            ("split channel", body + "TARGET = 'GITHUB_' + 'ENV'\n" + guard),
+            ("f-string channel", body + "TARGET = f\"GIT{'HUB_'}ENV\"\n" + guard),
+            ("joined channel", body + "TARGET = ''.join(['GITHUB', '_OUTPUT'])\n" + guard),
+            ("runner variable", body + "TARGET = 'GITHUB_' + 'TOKEN'\n" + guard),
+            # The process environment is read only as a copy.
+            ("environment write", body + "os.environ['GH_HOST'] = 'x'\n" + guard),
+            ("environment update", body + "os.environ.update({})\n" + guard),
+            ("environment alias", body + "ENVIRONMENT = os.environ\n" + guard),
+            ("environment augment", body + "os.environ |= {}\n" + guard),
+            ("environment delete", body + "del os.environ\n" + guard),
             ("no guard", body),
             ("marker", source.replace("exactly one merged PR", "one merged PR", 1)),
             ("syntax", source + "def (\n"),
