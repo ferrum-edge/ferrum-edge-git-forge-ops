@@ -225,6 +225,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Allowlist `run:` interpolations in every workflow (#495). GitHub renders a
+  `run:` interpolation into the script before the shell parses it, and an env,
+  matrix, input, job- or step-output or event value can carry text computed or
+  chosen elsewhere (`env.A` set by `fromJSON(...)`, a pull request title), so
+  refusing only computed expressions inside `run:` would be bypassed by
+  indirection. A `run:` interpolation is now accepted only when it
+  is exactly `github.event_name`, `github.sha`, `github.run_id`,
+  `github.run_attempt`, `runner.os` or `runner.arch`, or in an
+  Environment-bound job one of its existing per-job pins. Every key named `run`
+  is read, so composite actions' `runs.steps` count, and each local action a
+  workflow reaches is judged by the same allowlist (Environment-bound
+  workflows' local actions still interpolate nothing). Pass any other value
+  through step `env:` and read it as `"$NAME"`. The shipped workflows already
+  comply.
 - Close the remaining supply-chain checker residuals (#493). `env:` mappings may
   no longer bind any `LD_*` loader variable (`LD_AUDIT` included), and job and
   service containers may no longer set `options:` (whose `-e`/`--env`/

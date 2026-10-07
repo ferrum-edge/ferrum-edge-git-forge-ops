@@ -865,12 +865,20 @@ Consumer plus every labelled Consumer, names only
   workflow, and allows `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY`
   only as a plain `>>` or `tee -a` target (or the summary as `--summary`); the
   bundle loader's credential-file hand-off, pinned line for line, is the only
-  permitted env-file write. `run_expression_source_violations` pins where each
-  allowlisted `run:` interpolation comes from (job outputs, matrices and the
-  producing step's lines). `local_action_violations` refuses any `uses: ./`
-  reference that is not a parseable composite action under `.github/actions/`
-  (local reusable workflows included) and judges each one a workflow reaches
-  by that workflow's fences; `workspace_checkout_violations` refuses a local
+  permitted env-file write. `run_expression_violations` allows a `run:`
+  interpolation, in every workflow and every local action it reaches, only
+  when it is exactly one of `RUN_TRUSTED_EXPRESSIONS` (`github.event_name`,
+  `github.sha`, `github.run_id`, `github.run_attempt`, `runner.os`,
+  `runner.arch`), or in an Environment-bound job one of its `RUN_EXPRESSIONS`
+  pins (their local actions interpolate nothing). Env, matrix, input, output,
+  `vars`/`secrets` and event values, functions and literals reach a script
+  only through step `env:`, read as `"$NAME"`.
+  `run_expression_source_violations` pins where each Environment-bound `run:`
+  interpolation comes from (job outputs, matrices and the producing step's
+  lines). `local_action_violations` refuses any `uses: ./` reference that is
+  not a parseable composite action under `.github/actions/` (local reusable
+  workflows included) and judges each one a workflow reaches by that
+  workflow's fences; `workspace_checkout_violations` refuses a local
   action after a root checkout of another revision. These are text rules
   (#476): a program a step runs can still write `$GITHUB_ENV`, and review of
   every workflow change covers that.
