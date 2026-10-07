@@ -82,7 +82,6 @@ class SupplyChainPolicyTests(unittest.TestCase):
     def _guarded_bindings(self, workflow, document):
         violations = check_supply_chain.workflow_channel_violations(workflow, document)
         violations += check_supply_chain.run_expression_violations(workflow, document)
-        violations += check_supply_chain.run_script_expression_violations(workflow, document)
         violations += check_supply_chain.run_expression_source_violations(workflow, document)
         if workflow == ".github/workflows/drift-check.yml":
             return violations + check_supply_chain.monitoring_jwt_binding_violations(
@@ -655,51 +654,225 @@ class SupplyChainPolicyTests(unittest.TestCase):
         })
         self.assertEqual(check_supply_chain.run_expression_violations(workflow, document), [])
 
-    def test_required_and_privileged_run_expressions_cannot_render_shell_source(self):
+    # Values whose text is computed or chosen elsewhere: env, matrix, input,
+    # output and event values, literals and string functions. None may reach
+    # `run:` outside an Environment-bound job's pins.
+    UNTRUSTED_RUN_EXPRESSIONS = (
+        "env.A",
+        "matrix.c",
+        "needs.build.outputs.script",
+        "steps.compute.outputs.script",
+        "inputs.cmd",
+        "vars.SCRIPT",
+        "secrets.TOKEN",
+        "github.event.pull_request.title",
+        "github.event.comment.body",
+        "github.head_ref",
+        "github.ref_name",
+        "github.workflow",
+        "fromJSON(vars.SCRIPT)",
+        "format('{0}', vars.SCRIPT)",
+        "join(matrix.parts, '')",
+        "toJSON(github.event)",
+        "'echo injected'",
+        "github.sha || 'x; echo injected'",
+        "GITHUB.SHA",
+        "Github.Event_Name",
+    )
+
+    def _run_refusals(self, workflow, document):
+        return [
+            item for item in check_supply_chain.run_expression_violations(workflow, document)
+            if "is not an allowlisted run value" in item
+        ]
+
+    def test_run_interpolations_are_allowlisted_in_every_workflow(self):
+        unbound = [
+            workflow for workflow in self._shipped_workflows()
+            if workflow not in check_supply_chain.RUN_EXPRESSIONS
+        ]
+        self.assertIn(".github/workflows/rust-ci.yml", unbound)
+        self.assertIn(".github/workflows/lifecycle.yml", unbound)
+        for workflow in unbound:
+            document = self._probe_document(workflow)
+            steps = self._first_steps(document)
+            for expression in self.UNTRUSTED_RUN_EXPRESSIONS:
+                for script in (
+                    "echo ${{ " + expression + " }} done",
+                    'echo "${{ ' + expression + ' }}"',
+                    "echo '${{ " + expression + " }}'",
+                    "echo safe\n${{ " + expression + " }}",
+                    "# ${{ " + expression + " }}\ntrue",
+                ):
+                    with self.subTest(workflow=workflow, script=script):
+                        steps.insert(0, {"run": script})
+                        self.assertTrue(self._run_refusals(workflow, document), script)
+                        steps.pop(0)
+        for workflow in unbound:
+            for expression in check_supply_chain.RUN_TRUSTED_EXPRESSIONS:
+                with self.subTest(workflow=workflow, allowed=expression):
+                    document = self._probe_document(workflow)
+                    self._first_steps(document).insert(0, {
+                        "run": 'echo "${{ ' + expression + ' }}"\n'
+                               'if [[ "${{ ' + expression + ' }}" == x ]]; then true; fi',
+                    })
+                    self.assertEqual(
+                        check_supply_chain.run_expression_violations(workflow, document), []
+                    )
+
+    def test_computed_values_cannot_reach_run_through_indirection(self):
+        # Each value passes the channel fence where it is computed; only the
+        # run allowlist stops it rendering as shell source.
         workflow = ".github/workflows/rust-ci.yml"
-        guarded_scripts = (
-            ("${{ fromJSON(vars.SCRIPT) }}", "computed fromJSON() expression"),
-            ("${{ format('{0}', vars.SCRIPT) }}", "computed format() expression"),
-            ("${{ join(matrix.parts, '') }}", "computed join() expression"),
-            ("${{ toJSON(github.event) }}", "computed toJSON() expression"),
-            ("${{ 'echo injected' }}", "string-literal expression"),
-            ("${{ github.event.comment.body }}", "standalone interpolation"),
+        computed = "${{ fromJSON('\"x; echo X=1 >> $GITHUB_ENV\"') }}"
+        cases = (
+            ("env", {"env": {"A": computed}, "run": "echo ${{ env.A }} done"}, None),
+            ("quoted env", {"env": {"A": computed}, "run": 'echo "${{ env.A }}"'}, None),
+            ("matrix", {"run": "echo ${{ matrix.c }} ."}, {"strategy": {"matrix": {
+                "c": ["${{ format('{0}', vars.SCRIPT) }}"],
+            }}}),
+            ("job output", {"run": "echo ${{ needs.build.outputs.script }} ."}, {
+                "needs": "build",
+            }),
+            ("step output", {"run": "echo ${{ steps.compute.outputs.script }} ."}, None),
+            ("event", {"run": "echo ${{ github.event.pull_request.title }} ."}, None),
         )
-        for expression, expected in guarded_scripts:
-            with self.subTest(expression=expression):
-                document = {
-                    "jobs": {
-                        "job": {"steps": [{"run": "echo safe\n" + expression}]}
+        for name, step, job_fields in cases:
+            with self.subTest(case=name):
+                document = self._probe_document(workflow)
+                job = document["jobs"]["rust-ci-check"]
+                job.update(job_fields or {})
+                job["steps"].insert(0, step)
+                if name == "job output":
+                    document["jobs"]["build"] = {
+                        "runs-on": "ubuntu-24.04",
+                        "outputs": {"script": "${{ format('{0}', vars.SCRIPT) }}"},
+                        "steps": [{"run": "true"}],
                     }
-                }
-                violations = check_supply_chain.run_script_expression_violations(
-                    workflow, document
-                )
-                self.assertTrue(any(expected in item for item in violations), violations)
-
-        for workflow in (
-            ".github/workflows/rust-ci.yml",
-            ".github/workflows/apply-on-merge.yml",
-        ):
-            with self.subTest(workflow=workflow, case="inline value"):
-                document = {
-                    "jobs": {
-                        "job": {
-                            "steps": [{"run": 'echo "${{ github.sha }}"'}]
-                        }
-                    }
-                }
-                self.assertEqual(
-                    check_supply_chain.run_script_expression_violations(workflow, document),
-                    [],
-                )
-
-        self.assertEqual(
-            check_supply_chain.run_script_expression_violations(
-                ".github/workflows/lifecycle.yml",
-                {"jobs": {"job": {"steps": [{"run": "${{ fromJSON(vars.SCRIPT) }}"}]}}},
+                self.assertTrue(self._run_refusals(workflow, document), step)
+        # The same value through env, read by the shell, is data.
+        document = self._probe_document(workflow)
+        document["jobs"]["rust-ci-check"]["steps"].insert(0, {
+            "env": {"TITLE": "${{ github.event.pull_request.title }}"},
+            "run": 'echo "$TITLE"',
+        })
+        self.assertEqual(check_supply_chain.run_expression_violations(workflow, document), [])
+        # The checker run refuses it, not only the helper.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / workflow
+            original = path.read_text(encoding="utf-8")
+            changed = original.replace(
+                "    steps:\n",
+                "    steps:\n      - name: Indirect\n        env:\n"
+                "          A: ${{ vars.SCRIPT }}\n"
+                '        run: echo "${{ env.A }}"\n',
+                1,
+            )
+            self.assertNotEqual(changed, original)
+            path.write_text(changed, encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith(f"{workflow}: jobs.")
+                and "'env.A' is not an allowlisted run value" in item
+                for item in violations
             ),
-            [],
+            violations,
+        )
+
+    def test_local_actions_interpolate_only_allowlisted_run_values(self):
+        rust = ".github/workflows/rust-ci.yml"
+        label = f".github/actions/local/action.yml (run by {rust})"
+        for expression in self.UNTRUSTED_RUN_EXPRESSIONS:
+            for run in (
+                "echo ${{ " + expression + " }} x",
+                '"${{ ' + expression + ' }}"',
+                "${{ " + expression + " }}",
+            ):
+                with self.subTest(run=run), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    document = self._probe_document(rust)
+                    reference = self._local_action(
+                        root, "local",
+                        "    - shell: bash\n      run: |\n        " + run + "\n",
+                    )
+                    self._first_steps(document).insert(0, {"name": "Local", "uses": reference})
+                    violations = check_supply_chain.local_action_violations(root, rust, document)
+                    self.assertTrue(
+                        any(
+                            item.startswith(f"{label}: runs.steps[0].run:")
+                            and "is not an allowlisted run value" in item
+                            for item in violations
+                        ),
+                        violations,
+                    )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # Reached through another local action, with an input from `with:`.
+            outer = self._local_action(
+                root, "outer",
+                "    - uses: ./.github/actions/inner\n      with:\n"
+                "        cmd: ${{ inputs.cmd }}\n",
+            )
+            self._local_action(
+                root, "inner", "    - shell: bash\n      run: echo ${{ inputs.cmd }} x\n"
+            )
+            document = self._probe_document(rust)
+            self._first_steps(document).insert(
+                0, {"name": "Local", "uses": outer, "with": {"cmd": "${{ vars.SCRIPT }}"}}
+            )
+            violations = check_supply_chain.local_action_violations(root, rust, document)
+            self.assertTrue(any(
+                item.startswith(f".github/actions/inner/action.yml (run by {rust})")
+                and "'inputs.cmd' is not an allowlisted run value" in item
+                for item in violations
+            ), violations)
+            # An allowlisted value is accepted in a local action too.
+            allowed = self._local_action(
+                root, "allowed",
+                "    - shell: bash\n      run: |\n"
+                + "".join(
+                    '        echo "${{ ' + expression + ' }}"\n'
+                    for expression in check_supply_chain.RUN_TRUSTED_EXPRESSIONS
+                ),
+            )
+            document = self._probe_document(rust)
+            self._first_steps(document).insert(0, {"name": "Local", "uses": allowed})
+            self.assertEqual(
+                check_supply_chain.local_action_violations(root, rust, document), []
+            )
+            # An Environment-bound workflow's local action interpolates nothing.
+            review = ".github/workflows/trusted-pr-review.yml"
+            document = self._probe_document(review)
+            self._first_steps(document).insert(0, {"name": "Local", "uses": allowed})
+            violations = check_supply_chain.local_action_violations(root, review, document)
+            self.assertTrue(any(
+                "may not interpolate into run:" in item for item in violations
+            ), violations)
+        # The checker run reaches the local action through `uses: ./...`.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            self._local_action(
+                root, "local", "    - shell: bash\n      run: echo ${{ inputs.cmd }} x\n"
+            )
+            path = root / rust
+            original = path.read_text(encoding="utf-8")
+            changed = original.replace(
+                "    steps:\n",
+                "    steps:\n      - name: Local\n        uses: ./.github/actions/local\n",
+                1,
+            )
+            self.assertNotEqual(changed, original)
+            path.write_text(changed, encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith(f"{label}: runs.steps[0].run:")
+                and "is not an allowlisted run value" in item
+                for item in violations
+            ),
+            violations,
         )
 
     def test_run_values_keep_their_pinned_producers(self):

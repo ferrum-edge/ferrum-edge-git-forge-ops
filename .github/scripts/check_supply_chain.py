@@ -258,10 +258,26 @@ APPLIED_BUNDLE_BINDINGS = {
 # writes, so neither scope may name them.
 CREDENTIAL_HANDOFF_DRIVERS = ("RUNNER_TEMP", "GITHUB_RUN_ID", "GITHUB_JOB")
 # GitHub renders a `run:` interpolation before Bash reads the script, so no
-# text rule sees the rendered value. In the Environment-bound workflows each
-# job may interpolate only these: environment names the binary and the
-# enumerator validate as safe path components, and full commit SHAs. Pass any
-# other value through step `env:`, where it stays data.
+# text rule sees the rendered value, and an env, matrix, input, output or event
+# value can carry text computed or chosen elsewhere (`env.A` set by
+# `fromJSON(...)`, a pull request title). So `run:` may interpolate only an
+# allowlisted value, in every workflow and every local action it runs. Outside
+# the Environment-bound workflows that is one of these exact spellings: values
+# GitHub or the runner sets from a closed alphabet (an event name, a 40-hex
+# commit, decimal run counters, a fixed OS or architecture name). Pass any other
+# value through step `env:`, where it stays data, and read it as "$NAME".
+RUN_TRUSTED_EXPRESSIONS = (
+    "github.event_name",
+    "github.sha",
+    "github.run_id",
+    "github.run_attempt",
+    "runner.os",
+    "runner.arch",
+)
+# In the Environment-bound workflows each job may interpolate only these:
+# environment names the binary and the enumerator validate as safe path
+# components, and full commit SHAs. Their local actions may not interpolate
+# into `run:` at all.
 RUN_EXPRESSIONS = {
     ".github/workflows/apply-on-merge.yml": {
         "apply": ("matrix.environment",),
@@ -3007,87 +3023,57 @@ def container_options_violations(workflow: str, document: dict) -> list[str]:
     return violations
 
 
-def run_expression_violations(workflow: str, document: dict) -> list[str]:
-    """Environment-bound jobs interpolate into `run:` only the pinned values.
+def _run_scripts(node, path: str = "", job: str | None = None):
+    """Every string `run:` value under `node`: its path, its script and its job id.
 
-    `run_expression_source_violations` pins where those values come from.
+    Any key spelled `run` in any case counts, wherever it sits, so a workflow's
+    `jobs.<id>.steps` and a composite action's `runs.steps` are both read. The
+    job id is the key under the top-level `jobs:`, or None outside one.
     """
-    if workflow not in RUN_EXPRESSIONS:
-        return []
+    if isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _run_scripts(item, f"{path}[{index}]", job)
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            if isinstance(key, str) and key.casefold() == "run" and isinstance(value, str):
+                yield child, value, job
+            else:
+                yield from _run_scripts(value, child, str(key) if path == "jobs" else job)
+
+
+def _run_interpolation_violations(label: str, document: dict, allowed, refusal: str) -> list[str]:
+    """Each `run:` interpolation under `document` is exactly one of `allowed(job)`."""
     violations: list[str] = []
-    jobs = document.get("jobs")
-    for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
-        allowed = RUN_EXPRESSIONS[workflow].get(job_name, ())
-        steps = job.get("steps") if isinstance(job, dict) else None
-        for index, step in enumerate(steps if isinstance(steps, list) else ()):
-            script = step.get("run") if isinstance(step, dict) else None
-            if not isinstance(script, str):
-                continue
-            for match in WORKFLOW_EXPRESSION.finditer(script):
-                if match.group(1).strip() not in allowed:
-                    violations.append(
-                        f"{workflow}: jobs.{job_name}.steps[{index}].run: interpolation "
-                        f"{match.group(1).strip()!r} is not pinned for this job; pass the "
-                        "value through step env instead"
-                    )
-    return violations
-
-
-RUN_SCRIPT_RENDERING_FUNCTION = re.compile(
-    r"\b(fromjson|format|join|tojson)\s*\(", re.IGNORECASE
-)
-RUN_SCRIPT_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
-
-
-def run_script_expression_violations(workflow: str, document: dict) -> list[str]:
-    """Refuse expressions that can supply shell source in required or privileged workflows.
-
-    GitHub expands expressions before the runner shell parses a `run:` script. In
-    particular, computed strings and a standalone interpolation can introduce
-    shell syntax that the text rules never see. Simple inline values remain
-    available, with step `env:` preferred for untrusted data.
-    """
-    guarded_workflows = (
-        set(REQUIRED_CHECK_WORKFLOWS.values())
-        | {f".github/workflows/{name}" for name in PRIVILEGED_WORKFLOWS}
-        | set(RUN_EXPRESSIONS)
-    )
-    if workflow not in guarded_workflows:
-        return []
-
-    violations: list[str] = []
-    jobs = document.get("jobs")
-    for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
-        steps = job.get("steps") if isinstance(job, dict) else None
-        for index, step in enumerate(steps if isinstance(steps, list) else ()):
-            script = step.get("run") if isinstance(step, dict) else None
-            if not isinstance(script, str):
-                continue
-            for match in WORKFLOW_EXPRESSION.finditer(script):
-                expression = match.group(1).strip()
-                start_of_line = script.rfind("\n", 0, match.start()) + 1
-                end_of_line = script.find("\n", match.end())
-                if end_of_line < 0:
-                    end_of_line = len(script)
-                standalone = (
-                    not script[start_of_line:match.start()].strip(" \t")
-                    and not script[match.end():end_of_line].strip(" \t")
+    for path, script, job in _run_scripts(document):
+        permitted = allowed(job)
+        for match in WORKFLOW_EXPRESSION.finditer(script):
+            expression = match.group(1).strip()
+            if expression not in permitted:
+                violations.append(
+                    f"{label}: {path}: interpolation {expression!r} {refusal}; pass the "
+                    'value through step env and read it in the script as "$NAME"'
                 )
-                reasons = []
-                function = RUN_SCRIPT_RENDERING_FUNCTION.search(expression)
-                if function is not None:
-                    reasons.append(f"computed {function.group(1)}() expression")
-                if RUN_SCRIPT_STRING_LITERAL.search(expression) is not None:
-                    reasons.append("string-literal expression")
-                if standalone:
-                    reasons.append("standalone interpolation")
-                if reasons:
-                    violations.append(
-                        f"{workflow}: jobs.{job_name}.steps[{index}].run: "
-                        f"{' and '.join(reasons)} can render arbitrary shell text; "
-                        "pass values through step env instead"
-                    )
     return violations
+
+
+def run_expression_violations(workflow: str, document: dict) -> list[str]:
+    """A `run:` interpolation renders only an allowlisted value, in every workflow.
+
+    Environment-bound jobs may interpolate only their pinned values
+    (`RUN_EXPRESSIONS`), and `run_expression_source_violations` pins where those
+    come from. Every other workflow may interpolate only
+    `RUN_TRUSTED_EXPRESSIONS`.
+    """
+    pinned = RUN_EXPRESSIONS.get(workflow)
+    if pinned is None:
+        return _run_interpolation_violations(
+            workflow, document, lambda job: RUN_TRUSTED_EXPRESSIONS,
+            "is not an allowlisted run value",
+        )
+    return _run_interpolation_violations(
+        workflow, document, lambda job: pinned.get(job, ()), "is not pinned for this job"
+    )
 
 
 def _producer_step(job: dict, step_id: str):
@@ -3627,7 +3613,16 @@ def workspace_checkout_violations(workflow: str, document: dict) -> list[str]:
 def local_action_fence_violations(workflow: str, label: str, action: dict) -> list[str]:
     """The text fences of `workflow`, applied to a local action it runs."""
     violations = workflow_channel_violations(label, action)
-    violations.extend(run_script_expression_violations(workflow, action))
+    if workflow in RUN_EXPRESSIONS:
+        allowed, refusal = (), (
+            "is refused: an action an Environment-bound workflow runs may not "
+            "interpolate into run:"
+        )
+    else:
+        allowed, refusal = RUN_TRUSTED_EXPRESSIONS, "is not an allowlisted run value"
+    violations.extend(
+        _run_interpolation_violations(label, action, lambda job: allowed, refusal)
+    )
     runs = action.get("runs")
     steps = runs.get("steps") if isinstance(runs, dict) else None
     for index, step in enumerate(steps if isinstance(steps, list) else ()):
@@ -3639,13 +3634,6 @@ def local_action_fence_violations(workflow: str, label: str, action: dict) -> li
     protected = protected_environment_names(workflow)
     if protected:
         violations.extend(guarded_environment_violations(label, action, (), protected))
-    if workflow in RUN_EXPRESSIONS and any(
-        isinstance(script, str) and "${{" in script for script in _values_for_key(action, "run")
-    ):
-        violations.append(
-            f"{label}: an action an Environment-bound workflow runs may not interpolate "
-            "into run:; pass the value through step env instead"
-        )
     if workflow == ".github/workflows/apply-on-merge.yml":
         violations.extend(gitforgeops_scalar_violations(label, action, set()))
     return violations
@@ -4258,11 +4246,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 run_expression_violations(workflow.relative_to(root).as_posix(), document)
-            )
-            violations.extend(
-                run_script_expression_violations(
-                    workflow.relative_to(root).as_posix(), document
-                )
             )
             violations.extend(
                 run_expression_source_violations(workflow.relative_to(root).as_posix(), document)

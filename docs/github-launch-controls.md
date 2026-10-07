@@ -570,10 +570,10 @@ code (`$'GITHUB_\x45NV'`, `$'\x67'itforgeops`), and judging it would need a
 quote-state lexer, so any scalar holding `$'` is refused, even in a comment or
 as a plain quoted `$`. A name Bash computes by expansion is still program
 behavior (below). A `run:` interpolation may not adjoin a name character, with
-quotes removed. The Environment-bound workflows may interpolate into `run:`
-only a per-job allowlist; pass any other value through step `env:`. Each
-allowlisted value is pinned to its producer: the job outputs and matrices that
-carry it must be exactly the reviewed expressions, the environment enumerator
+quotes removed. Every `run:` interpolation must be allowlisted (below); the
+Environment-bound workflows may interpolate only a per-job allowlist. Each of
+those per-job values is pinned to its producer: the job outputs and matrices
+that carry it must be exactly the reviewed expressions, the environment enumerator
 step is pinned whole (including its safe-name `jq` guard), and trusted review's
 metadata step must check the event head SHA as 40 hex digits first, never
 reassign it, take the trusted SHA from `git rev-parse`, and write each SHA
@@ -597,16 +597,29 @@ display name. A display name is the `name:` of
 the workflow (or local action), a job or a step; an action input or env value
 called `name` is not one.
 
-In every workflow that reports a launch-required check, and every
-Environment-bound privileged workflow, a `run:` interpolation is refused if
-it calls `fromJSON()`, `format()`, `join()` or `toJSON()`, contains a
-single-quoted expression literal, or is the only non-whitespace text on its
-script line. GitHub renders expressions before the shell parses the script, so
-computed strings, literals and standalone values can introduce shell source
-that the text rules cannot inspect. Pass dynamic data through step `env:` and
-quote the environment variable in the script. Ordinary inline values such as
-`${{ github.sha }}` remain available where the other run-expression rules
-allow them.
+GitHub renders a `run:` interpolation before the shell parses the script, so
+its value becomes shell source that no text rule reads. Env, matrix, input,
+job- and step-output and event values can all carry text computed or chosen
+elsewhere: `env.A` set by `fromJSON(...)` or `format(...)`, a matrix entry, a
+job output, a `with:` input, a pull request title or branch name. So in every
+workflow, and every local action a workflow runs, a `run:` interpolation must
+be exactly one of a short allowlist of values GitHub or the runner sets from a
+closed alphabet: `github.event_name`, `github.sha`, `github.run_id`,
+`github.run_attempt`, `runner.os` and `runner.arch`, spelled exactly so. The
+Environment-bound workflows allow only their per-job pinned values instead, and
+their local actions allow none. Everything else is refused, including `env.*`,
+`matrix.*`, `inputs.*`, `vars.*`, `secrets.*`, `steps.*.outputs.*`,
+`needs.*.outputs.*`, `github.event.*`, `github.head_ref`, `github.ref_name`,
+and any function call, literal or operator. Quotes around the interpolation
+change nothing, and one in a shell comment counts. Every key named `run` is
+read wherever it sits, so a composite action's `runs.steps` count. Pass any other value through step `env:` and read
+it in the script as a quoted variable:
+
+```yaml
+- env:
+    TITLE: ${{ github.event.pull_request.title }}
+  run: echo "$TITLE"
+```
 
 A local action (`uses: ./...`) carries no commit pin, so the checker reads what
 it runs. Every local reference must name, by a plain path, a composite action
@@ -617,8 +630,8 @@ missing or unparsable file, and a local reusable workflow
 (`jobs.<id>.uses: ./...`), which would carry none of its caller's pins. Each
 local action a workflow reaches, directly or through another local action, is
 judged by that workflow's fences: the env-file channel and startup-key bans,
-its protected names, no `run:` interpolation when the workflow is
-Environment-bound, the shell-source expression refusal above, and in
+its protected names, the `run:` interpolation allowlist above (no
+interpolation at all when the workflow is Environment-bound), and in
 `apply-on-merge.yml` the binary pin above. Every
 action file under `.github/actions/`, reached or not, must be in that subset,
 and its remote `uses:` are pinned to 40-hex commits from the parsed file, in
@@ -650,11 +663,14 @@ rather than derives from a spelled name: a glob over the runner's temp directory
 These text rules can refuse legitimate workflow text: a redirect or `tee` into
 `$GITHUB_WORKSPACE/...`, any name containing `GITHUB_ENV`, `GITHUB_PATH` or a
 file-command prefix (`GITHUB_ENVIRONMENT`, say), an interpolation glued to a
-name (`v${{ matrix.version }}`), indexed or whole `github` context access
+name (`v${{ matrix.version }}`), any `run:` interpolation outside the
+allowlist (`echo "${{ matrix.os }}"`), indexed or whole `github` context access
 (`toJSON(github)`, `github.event.commits[0]`), a shell comment naming a
 protected variable or channel, and Bash ANSI-C quoting (`$'`). For example,
 `grep -cx $'.*: test$'` is refused; write it as `grep -cx '.*: test'` instead.
-Rephrase such text, or pass the value through step `env:`.
+A plain single-quoted pattern ending in `$` is refused the same way, because
+`$` meets the closing quote: `grep -c ': test$'` holds `$'`. Rephrase such
+text, or pass the value through step `env:`.
 
 Review and merge tighter guard logic into the protected branch first. If the
 workflow binding form must change, do that in a subsequent pull request judged
