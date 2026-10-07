@@ -836,9 +836,10 @@ weaken:
   walk from an allowed module to another one, such as `re.enum.sys`.
 - **Environment and commands.** `os.environ` is read only as
   `dict(os.environ)`. Each `subprocess.run` call passes exactly
-  `env=self.subprocess_env`; in production that value is `None`, so `gh`
-  inherits the process environment unchanged. Tests that inject an environment
-  pass its copy instead. Calls use a literal `gh api` or `gh pr checks`
+  `env=self.subprocess_env`. The pin covers only that expression: today the
+  helper sets it to `None` in production, so `gh` inherits the process
+  environment unchanged, and tests that inject an environment pass its copy,
+  but exact-head review, not the checker, keeps that value. Calls use a literal `gh api` or `gh pr checks`
   argument list and only `capture_output`, `check`, `env` and `timeout`. Any
   other `gh` subcommand, such as `alias` or `extension`, is refused.
 - **Builtins and names.** No `eval`, `exec`, `open`, `getattr`, `help` or

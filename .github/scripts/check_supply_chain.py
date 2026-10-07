@@ -4285,10 +4285,13 @@ RELEASE_GATE_RUN_KEYWORDS = frozenset({"capture_output", "check", "env", "timeou
 RELEASE_GATE_RUN_ENV = "self.subprocess_env"
 RELEASE_GATE_FRAME_ATTRIBUTES = frozenset(
     {
+        "ag_code",
         "ag_frame",
+        "cr_code",
         "cr_frame",
         "f_back",
         "f_builtins",
+        "f_code",
         "f_globals",
         "f_locals",
         "gi_code",

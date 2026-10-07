@@ -7110,6 +7110,10 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("coroutine frame", body + "frame = value.cr_frame\n" + guard),
             ("async generator frame", body + "frame = value.ag_frame\n" + guard),
             ("traceback frame", body + "frame = value.tb_frame\n" + guard),
+            ("coroutine code", body + "code = value.cr_code\n" + guard),
+            ("async generator code", body + "code = value.ag_code\n" + guard),
+            ("frame code", body + "code = value.f_code\n" + guard),
+            ("dunder name outside guard", body + "MODULE = __name__\n" + guard),
             ("traceback next", body + "next_ = value.tb_next\n" + guard),
             ("file write", body + "open('x', 'w')\n" + guard),
             ("env-file name", body + "TARGET = 'GITHUB_ENV'\n" + guard),
@@ -7136,7 +7140,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("gh kwargs", body + "subprocess.run(['gh', 'api', 'user'], **OPTIONS)\n" + guard),
             (
                 "gh environment expression",
-                body + "subprocess.run(['gh', 'api', 'user'], env=os.environ)\n" + guard,
+                body + "subprocess.run(['gh', 'api', 'user'], env=None)\n" + guard,
             ),
             (
                 "gh missing environment",
