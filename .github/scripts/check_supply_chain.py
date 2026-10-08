@@ -3166,8 +3166,24 @@ def _metadata_line_violations(label: str, script: str) -> list[str]:
         ]
         if any(line not in permitted for line in named):
             violations.append(f"{label}: {name} may only be produced by its pinned lines")
-    if exact_lines.count(_strip_shell_quotes_and_escapes(REVIEW_TRUSTED_SHA_ASSIGNMENT)) != 1:
+    assignment = _strip_shell_quotes_and_escapes(REVIEW_TRUSTED_SHA_ASSIGNMENT)
+    if exact_lines.count(assignment) != 1:
         violations.append(f"{label}: trusted_sha must be assigned once, from git rev-parse")
+    else:
+        echo = _strip_shell_quotes_and_escapes(REVIEW_METADATA_LINES["trusted_sha"][0])
+        published = next(
+            (index for index, line in enumerate(exact_lines) if line == echo), None
+        )
+        if published is not None and exact_lines.index(assignment) > published:
+            violations.append(
+                f"{label}: trusted_sha must be assigned before it is published"
+            )
+    # The pinned `set -euo pipefail` and the single assignment together mean a
+    # line that never runs (a false conditional, an uncalled function, a quoted
+    # heredoc) leaves `trusted_sha` unset at its echo, aborting the step. The
+    # line model cannot prove a line runs, so that residual rests on `set -u`;
+    # env bindings for the produced names are refused at every scope below so
+    # none can stand in for the value.
     return violations
 
 
@@ -3215,16 +3231,25 @@ def run_expression_source_violations(workflow: str, document: dict) -> list[str]
             if not pinned_run_matches(step["run"], shape):
                 violations.append(f"{label} must match its pinned script")
             continue
-        environment = step.get("env")
+        # `step.get("env")` misses an `Env` key while the other rules casefold
+        # scope keys, so every env scope that reaches the step is read here.
+        step_scopes = _env_scopes(step)
+        environment = step_scopes[0] if len(step_scopes) == 1 else None
         if not isinstance(environment, dict) or (
             environment.get("EVENT_HEAD_SHA") != REVIEW_EVENT_HEAD_SHA
         ):
             violations.append(f"{label} must bind EVENT_HEAD_SHA: {REVIEW_EVENT_HEAD_SHA}")
-        if isinstance(environment, dict) and any(
-            isinstance(key, str) and key.casefold() in {"head_sha", "trusted_sha"}
-            for key in environment
-        ):
-            violations.append(f"{label}: env may not bind a produced SHA name")
+        # A produced SHA name bound in any scope (workflow, prepare job, or the
+        # step) would supply its value if the pinned assignment were
+        # neutralized, so every scope is compared casefolded against the
+        # registry of produced SHA names (the pinned producer lines).
+        produced = {name.casefold() for name in REVIEW_METADATA_LINES}
+        for scope in _env_scopes(document) + _env_scopes(job) + step_scopes:
+            if isinstance(scope, dict) and any(
+                isinstance(key, str) and key.casefold() in produced for key in scope
+            ):
+                violations.append(f"{label}: env may not bind a produced SHA name")
+                break
         violations.extend(_metadata_line_violations(label, step["run"]))
     return violations
 

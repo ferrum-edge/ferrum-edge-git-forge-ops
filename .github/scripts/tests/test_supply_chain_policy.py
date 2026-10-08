@@ -917,8 +917,28 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     step[key] = value
             return mutate
 
+        def edit_job(job, key, value):
+            def mutate(document):
+                document["jobs"][job][key] = value
+            return mutate
+
+        def edit_workflow(key, value):
+            def mutate(document):
+                document[key] = value
+            return mutate
+
+        def move_assignment_after_publish(job, step_id):
+            def mutate(document):
+                step = producer(document, job, step_id)
+                self.assertIn(assignment, step["run"])
+                self.assertIn(echo, step["run"])
+                step["run"] = step["run"].replace(assignment, "", 1)
+                step["run"] = step["run"].replace(echo, echo + "\n" + assignment, 1)
+            return mutate
+
         guard = check_supply_chain.REVIEW_METADATA_PREAMBLE[1]
         assignment = check_supply_chain.REVIEW_TRUSTED_SHA_ASSIGNMENT
+        echo = check_supply_chain.REVIEW_METADATA_LINES["trusted_sha"][0]
         branch = "${{ github.event.workflow_run.head_branch }}"
         message = "${{ github.event.head_commit.message }}"
         cases = {
@@ -957,6 +977,16 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     "prepare", "metadata", "env",
                     {"trusted_sha": "${{ github.event.workflow_run.head_branch }}"},
                 ),
+                # The same refusal reaches the step's `Env`, the job and the
+                # workflow scopes, in either case, and the assignment must
+                # precede its echo.
+                edit_step("prepare", "metadata", "Env", {"trusted_sha": branch}),
+                edit_step("prepare", "metadata", "env", {"Trusted_SHA": branch}),
+                edit_job("prepare", "env", {"trusted_sha": branch}),
+                edit_job("prepare", "env", {"TRUSTED_SHA": branch}),
+                edit_workflow("env", {"trusted_sha": branch}),
+                edit_workflow("Env", {"Trusted_SHA": branch}),
+                move_assignment_after_publish("prepare", "metadata"),
                 edit_step("prepare", "metadata", "id", "workflow-run"),
                 edit_step("prepare", "metadata", "shell", "sh {0}"),
             ),
