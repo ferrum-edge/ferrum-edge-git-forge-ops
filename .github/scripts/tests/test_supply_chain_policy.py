@@ -949,6 +949,14 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 ),
                 edit_run("prepare", "metadata", assignment, assignment + "\n" + assignment),
                 edit_step("prepare", "metadata", "env", {"EVENT_HEAD_SHA": branch}),
+                edit_run(
+                    "prepare", "metadata", assignment,
+                    assignment.replace("trusted_sha", "TRUSTED_SHA", 1),
+                ),
+                edit_step(
+                    "prepare", "metadata", "env",
+                    {"trusted_sha": "${{ github.event.workflow_run.head_branch }}"},
+                ),
                 edit_step("prepare", "metadata", "id", "workflow-run"),
                 edit_step("prepare", "metadata", "shell", "sh {0}"),
             ),
