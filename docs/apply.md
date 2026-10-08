@@ -302,7 +302,7 @@ using GET only. No consumer to probe means unknown, never pass. Ordinary diff,
 plan, review and viewer drift reads retain their current endpoints and explain
 these runtime requirements. The conditional API owner contract was published at
 Edge `c764084b3b51c3f7ffde268c039688d35e49c553`. The current candidate gateway is
-published v0.9.13 at `9b83115de7ec23ab51ec4feae6bed65e596db425`, with exact binary
+published v0.9.14 at `9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d`, with exact binary
 and image pins in the [pending release record](../release/baseline.json).
 GitForgeOps enforcement qualification against those bytes remains required before
 release acceptance. This pin refresh leaves the conditional API implementation
