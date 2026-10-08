@@ -2763,8 +2763,15 @@ def _uses_ansi_c_quoting(text: str) -> bool:
     return "$'" in text.replace("\\\n", "")
 
 
+def _strip_shell_quotes_and_escapes(text: str) -> str:
+    """Text with quotes, escapes and line continuations removed, preserving case."""
+    return text.replace("\\\n", "").replace("$'", "'").replace('$"', '"').translate(
+        str.maketrans("", "", "'\"\\")
+    )
+
+
 def _scan_text(text: str) -> str:
-    """Casefolded text with quotes, escapes and line continuations removed.
+    """Casefolded shell text with quotes, escapes and continuations removed.
 
     Bash reads `GITHUB_""ENV`, `GITHUB_E\\NV`, `$'GITHUB_ENV'` and a name split
     by a backslash-newline as the same word, so every text rule judges this
@@ -2772,8 +2779,7 @@ def _scan_text(text: str) -> str:
     quoting is refused instead (`_uses_ansi_c_quoting`). A name computed by
     expansion (`GITHUB_E${x}NV`) is program behavior.
     """
-    text = text.replace("\\\n", "").replace("$'", "'").replace('$"', '"')
-    return text.translate(str.maketrans("", "", "'\"\\")).casefold()
+    return _strip_shell_quotes_and_escapes(text).casefold()
 
 
 def pinned_run_matches(script: str, shape: tuple[str, ...]) -> bool:
@@ -3142,22 +3148,42 @@ def _metadata_line_violations(label: str, script: str) -> list[str]:
     violations: list[str] = []
     if tuple(_script_lines(script)[:len(REVIEW_METADATA_PREAMBLE)]) != REVIEW_METADATA_PREAMBLE:
         violations.append(f"{label}: the event head SHA must be checked as 40 hex digits first")
-    lines = [line.strip(" \t") for line in _scan_text(script).split("\n")]
+    exact_lines = [
+        line.strip(" \t") for line in _strip_shell_quotes_and_escapes(script).split("\n")
+    ]
+    lines = [line.casefold() for line in exact_lines]
     if re.search(r"event_head_sha", re.sub(
         r"\$(?:event_head_sha\b|\{event_head_sha\})", "", "\n".join(lines)
     )):
         violations.append(f"{label}: EVENT_HEAD_SHA may only be read, never reassigned")
     for name, allowed in REVIEW_METADATA_LINES.items():
-        permitted = {_scan_text(line) for line in allowed}
+        permitted = {_strip_shell_quotes_and_escapes(line) for line in allowed}
         reads = re.compile(r"\$(?:" + name + r"\b|\{" + name + r"\})")
         named = [
-            line for line in lines
+            exact_lines[index]
+            for index, line in enumerate(lines)
             if re.search(r"\b" + name + r"\b", reads.sub("", line))
         ]
         if any(line not in permitted for line in named):
             violations.append(f"{label}: {name} may only be produced by its pinned lines")
-    if lines.count(_scan_text(REVIEW_TRUSTED_SHA_ASSIGNMENT)) != 1:
+    assignment = _strip_shell_quotes_and_escapes(REVIEW_TRUSTED_SHA_ASSIGNMENT)
+    if exact_lines.count(assignment) != 1:
         violations.append(f"{label}: trusted_sha must be assigned once, from git rev-parse")
+    else:
+        echo = _strip_shell_quotes_and_escapes(REVIEW_METADATA_LINES["trusted_sha"][0])
+        published = next(
+            (index for index, line in enumerate(exact_lines) if line == echo), None
+        )
+        if published is not None and exact_lines.index(assignment) > published:
+            violations.append(
+                f"{label}: trusted_sha must be assigned before it is published"
+            )
+    # The pinned `set -euo pipefail` and the single assignment together mean a
+    # line that never runs (a false conditional, an uncalled function, a quoted
+    # heredoc) leaves `trusted_sha` unset at its echo, aborting the step. The
+    # line model cannot prove a line runs, so that residual rests on `set -u`;
+    # env bindings for the produced names are refused at every scope below so
+    # none can stand in for the value.
     return violations
 
 
@@ -3205,11 +3231,25 @@ def run_expression_source_violations(workflow: str, document: dict) -> list[str]
             if not pinned_run_matches(step["run"], shape):
                 violations.append(f"{label} must match its pinned script")
             continue
-        environment = step.get("env")
+        # `step.get("env")` misses an `Env` key while the other rules casefold
+        # scope keys, so every env scope that reaches the step is read here.
+        step_scopes = _env_scopes(step)
+        environment = step_scopes[0] if len(step_scopes) == 1 else None
         if not isinstance(environment, dict) or (
             environment.get("EVENT_HEAD_SHA") != REVIEW_EVENT_HEAD_SHA
         ):
             violations.append(f"{label} must bind EVENT_HEAD_SHA: {REVIEW_EVENT_HEAD_SHA}")
+        # A produced SHA name bound in any scope (workflow, prepare job, or the
+        # step) would supply its value if the pinned assignment were
+        # neutralized, so every scope is compared casefolded against the
+        # registry of produced SHA names (the pinned producer lines).
+        produced = {name.casefold() for name in REVIEW_METADATA_LINES}
+        for scope in _env_scopes(document) + _env_scopes(job) + step_scopes:
+            if isinstance(scope, dict) and any(
+                isinstance(key, str) and key.casefold() in produced for key in scope
+            ):
+                violations.append(f"{label}: env may not bind a produced SHA name")
+                break
         violations.extend(_metadata_line_violations(label, step["run"]))
     return violations
 

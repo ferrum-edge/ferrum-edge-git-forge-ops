@@ -258,6 +258,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Compare trusted-review SHA producer lines with case preserved, require the pinned `trusted_sha`
+  assignment to precede its echo, and reject a `trusted_sha` or `head_sha` environment binding in
+  every scope that reaches the metadata step (workflow, prepare job and step), so a differently
+  cased shell variable or an injected env value cannot redirect the trusted checkout. Add
+  regressions for each case. (#505)
 - Tighten the protected release-gate helper pins to reject direct frame,
   code, generator and traceback attributes, dunder names outside the
   required main guard, and any `subprocess.run` environment other than
