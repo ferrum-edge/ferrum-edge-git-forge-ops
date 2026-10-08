@@ -75,7 +75,7 @@ released binary contains or enforces the capability. The
 qualify it, including the CLI's namespace and credential checks. This
 qualification also covers the gateway's backup and consumer representations.
 The consumer-verification and coherent replacement scenarios target published
-Edge v0.9.14 at `9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d`, with the exact approved
+Edge v0.9.15 at `25b37395ff61bfea0f3ffd189d9011c4984fa755`, with the exact approved
 x86_64 binary recorded in `release/baseline.json`. Hosted qualification of this
 client revision against those bytes remains required. The old v0.9.10 fixture
 cannot certify these endpoints; no scenario is skipped to make an older pin pass.
@@ -249,5 +249,5 @@ The conditional trust fixture is public test material copied verbatim from
 `c764084b3b51c3f7ffde268c039688d35e49c553`; it contains no private key.
 `conditional-full-replace` seeds a real spec-owned proxy/upstream/plugin graph
 and trust bundle, verifies document and trust preservation, and then exercises
-client-confirmed spec deletion. These checks must run on the published v0.9.14
+client-confirmed spec deletion. These checks must run on the published v0.9.15
 release bytes, without skipping old-pin incompatibilities.
