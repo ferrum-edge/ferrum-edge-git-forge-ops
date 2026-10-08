@@ -74,9 +74,9 @@ fn string_set<'a>(values: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
 #[test]
 fn vendored_contract_files_match_the_pin_hashes() {
     let (tag, commit, edge_version, hashes) = parse_pin();
-    assert_eq!(tag, "contracts-edge-0.9.13");
-    assert_eq!(commit, "9626821eb089c71f5d4d71268c7b8276a8a5ab50");
-    assert_eq!(edge_version, "v0.9.13");
+    assert_eq!(tag, "contracts-edge-0.9.14");
+    assert_eq!(commit, "ddbdd845733b7046c4393ac951011dafb774db33");
+    assert_eq!(edge_version, "v0.9.14");
 
     let mut vendored = BTreeSet::new();
     contract_files(&contract_dir(), &contract_dir(), &mut vendored);
@@ -112,6 +112,7 @@ fn pinned_contract_tag_matches_the_qualified_edge_version() {
         ("v0.9.11", "contracts-edge-0.9.11"),
         ("v0.9.12", "contracts-edge-0.9.12"),
         ("v0.9.13", "contracts-edge-0.9.13"),
+        ("v0.9.14", "contracts-edge-0.9.14"),
     ];
     let expected_tag = edge_contract_tags
         .iter()

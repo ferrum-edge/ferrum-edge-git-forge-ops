@@ -74,8 +74,8 @@ def check(root: Path) -> list[str]:
         for line in policy.splitlines()
     ):
         issues.append("validator SHA-256 must appear in the checked-in allowlist")
-    if validator.get("version") != "v0.9.13":
-        issues.append("the first baseline must name the verified v0.9.13 validator")
+    if validator.get("version") != "v0.9.14":
+        issues.append("the first baseline must name the verified v0.9.14 validator")
 
     image = gateway.get("image")
     image_digest = gateway.get("image_digest")

@@ -28,7 +28,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GET-only capability probes and reports unavailable evidence as unknown.
 - Lifecycle coverage for hidden consumer edits and namespace restore conditions,
   including ABA, empty replacement and confirmed spec deletion. Qualification
-  on the published Edge v0.9.13 release, content-pinned (SHA-256), remains
+  on the published Edge v0.9.14 release, content-pinned (SHA-256), remains
   required; an older fixture or passing parser tests do not establish first-release
   acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
@@ -91,6 +91,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Refresh the Ferrum Edge validator and bundled gateway pins to published
+  v0.9.14: validator SHA-256
+  `d0e89b11dbc29f29e6ea8cab4355b7c551638d370fb4c6a52a0ba7444fc6c020` and
+  Docker Hub multi-platform index
+  `sha256:15442f1b1d1758023fe871fe57be50f19caf34bbe6c499a6812f4ffd0da5e3f8`.
+  Retain all earlier approved validator digests for in-flight pull requests and
+  preserve publisher-checksum verification. Edge release 405571232 was
+  published at `9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d`; all 20 release jobs
+  passed. GitForgeOps hosted validation and exact-revision lifecycle acceptance
+  remain required, and the release baseline stays pending.
 - Replace the placeholder Required Notice in `LICENSE.md` ("Yoyodyne, Inc.") with Ferrum Edge LLC as the copyright holder.
 - Refresh the Ferrum Edge validator and bundled gateway pins to published
   v0.9.13: validator SHA-256
@@ -165,6 +175,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `admin-deployment-snapshot` v2 schemas are not consumed here. This pin update
   adds no deployment profiles or Alloy manifest/report consumption and does not
   qualify production apply or first-release acceptance.
+- Refresh the existing 13-file ferrum-contracts adoption to published
+  `contracts-edge-0.9.14` at `ddbdd845733b7046c4393ac951011dafb774db33`, with an
+  explicit Edge v0.9.14 mapping and updated vocabulary byte hashes. The resource
+  schema and ten fixtures are unchanged. GitForgeOps does not consume the new
+  backend-egress-policy v2, deployment acknowledgement, or gateway-errors
+  surfaces, so no parser adaptation is needed. The pin update adds no deployment
+  profiles or Alloy manifest/report consumption and does not qualify production
+  apply or first-release acceptance.
 - Mutation acknowledgements refuse duplicate keys, malformed field types and
   ambiguous envelopes without exposing response bytes (#462). Invalid responses
   cannot authorize retries, pruning, ownership ledger updates or rotation
