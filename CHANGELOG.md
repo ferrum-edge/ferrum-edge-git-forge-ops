@@ -28,7 +28,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GET-only capability probes and reports unavailable evidence as unknown.
 - Lifecycle coverage for hidden consumer edits and namespace restore conditions,
   including ABA, empty replacement and confirmed spec deletion. Qualification
-  on the published Edge v0.9.14 release, content-pinned (SHA-256), remains
+  on the published Edge v0.9.15 release, content-pinned (SHA-256), remains
   required; an older fixture or passing parser tests do not establish first-release
   acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
@@ -91,6 +91,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Refresh the Ferrum Edge validator and bundled gateway pins to published
+  v0.9.15: validator SHA-256
+  `69ae2402e1741d96b48ce0011d94088c9a4ec8240019e9dbb17d596cfa2082c5` and
+  Docker Hub multi-platform index
+  `sha256:29b468dfeea13b1ecaac8dfbc7e019f310e71e647611d43800a1dc64436eaca3`.
+  Retain earlier approved validator digests for in-flight pull requests and
+  preserve publisher-checksum verification. Edge release 407222520 was
+  published at `25b37395ff61bfea0f3ffd189d9011c4984fa755`; its release CI
+  succeeded. GitForgeOps hosted validation and exact-revision lifecycle
+  acceptance remain required, and the release baseline stays pending.
+- Adopt the published `contracts-edge-0.9.15` pin at
+  `6fb64c5dc2e014204c17609fc717d976f3b4589e`, updating the adopted plugin
+  catalog and attribution vocabulary provenance and byte hashes. The resource
+  schema and ten fixtures are unchanged. Edge v0.9.15 changes external identity
+  headers and confines plugin-config environment references to
+  `FERRUM_PLUGIN_SECRET_<NAME>`, removes LDAP `consumer_mapping`, changes
+  `ferrum-mesh` chart ServiceAccounts, and groups IPv6 per-source quotas by `/64`
+  by default. Current checked-in examples contain no affected plugin configs and
+  this repository does not generate Helm chart manifests; deployments using
+  those features must follow the upstream
+  [0.9.15 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915).
+  This pin update does not qualify production apply or first-release acceptance.
 - Refresh the Ferrum Edge validator and bundled gateway pins to published
   v0.9.14: validator SHA-256
   `d0e89b11dbc29f29e6ea8cab4355b7c551638d370fb4c6a52a0ba7444fc6c020` and

@@ -3,35 +3,36 @@
 GitForgeOps pins the shared Ferrum contracts release in
 [`contracts/ferrum-contracts/PIN`](../contracts/ferrum-contracts/PIN). The vendored plugin
 catalog, `provisioned-by` vocabulary, GitForgeOps resource-envelope fixtures, and the
-GitForgeOps-owned resource schema are byte-for-byte copies from `contracts-edge-0.9.14`. The
+GitForgeOps-owned resource schema are byte-for-byte copies from `contracts-edge-0.9.15`. The
 contract test verifies every file's SHA-256, checks that the pinned Edge version maps to the
 contracts tag and appears in the validator checksum allowlist, compares plugin names and
 priorities plus retired and reserved names with the local catalog, checks the assembler's
 `provisioned-by` label, parses valid and invalid resource fixtures with the local `Resource` serde
 type, and checks the schema's top-level envelope against that type.
 
-The published [contracts-edge-0.9.14 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.14)
-resolves to `ddbdd845733b7046c4393ac951011dafb774db33`. It was published on
-2026-10-08 at 09:22:24 UTC. Its Edge vocabulary provenance identifies published
-Edge v0.9.14 at `9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d`; the plugin catalog
+The published [contracts-edge-0.9.15 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.15)
+resolves to `6fb64c5dc2e014204c17609fc717d976f3b4589e`. It was published on
+2026-10-08 at 20:42:07 UTC. Its Edge vocabulary provenance identifies published
+Edge v0.9.15 at `25b37395ff61bfea0f3ffd189d9011c4984fa755`; the plugin catalog
 pins that source's `openapi.yaml` SHA-256 to
-`6d286649ae744691e2eeb7d16607c538ca02e31bdeaafe98ab07fc861e7b9da4`.
+`f6c7d8b1d247060c4d0ae66e5c149ad3d76721addb8176eff45b6fc3d1b4d6b2`.
 The resource schema and all ten fixtures are unchanged from the previous pin.
 
-The release also updates the `backend-egress-policy` v2 schema with optional
-`data_plane_attestation`, adds durable descriptions to the deployment mutation
-acknowledgement contract, and updates gateway error classification notes. GitForgeOps
-vendors none of those surfaces and has no parser for a backend egress policy or its
-control-plane answers. They do not flow through the repository's resource loader,
-gateway config mirror, or admin response parsers, so this pin needs no implementation
-adaptation for those changes.
+The release does not change adopted schema wire rules. It updates vocabulary values,
+descriptions and provenance and adds fixtures. The plugin catalog points to Edge's
+updated plugin schemas, including the removed LDAP `consumer_mapping` option, the
+external identity header change, and the `FERRUM_PLUGIN_SECRET_<NAME>` environment
+reference namespace. Current GitForgeOps resources and examples contain none of
+those affected plugin settings. Operators using them should follow the Edge
+[0.9.15 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915).
+Other new contract surfaces remain outside this repository's adopted scope.
 
 The previous published [contracts-edge-0.9.13 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.13)
 resolves to `9626821eb089c71f5d4d71268c7b8276a8a5ab50`, with Edge v0.9.13 provenance
 at `9b83115de7ec23ab51ec4feae6bed65e596db425`.
 
 The plugin catalog and attribution vocabulary retain their values from the prior pin;
-their Edge release and source metadata now identify v0.9.14. Attribution still grants no
+their Edge release and source metadata now identify v0.9.15. Attribution still grants no
 ownership or authorization.
 
 This repository vendors only the resource schema, its fixtures and the two

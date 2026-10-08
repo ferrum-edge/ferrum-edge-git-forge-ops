@@ -17,9 +17,9 @@ live operations.
 Shared contracts live in [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts); see
 [README.md's Contracts section](README.md#contracts) for the vendored pin and update rule.
 
-The 13 adopted files are pinned to published `contracts-edge-0.9.14` at
-`ddbdd845733b7046c4393ac951011dafb774db33`, with Edge v0.9.14 provenance at
-`9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d`. Adoption covers only the GitForgeOps
+The 13 adopted files are pinned to published `contracts-edge-0.9.15` at
+`6fb64c5dc2e014204c17609fc717d976f3b4589e`, with Edge v0.9.15 provenance at
+`25b37395ff61bfea0f3ffd189d9011c4984fa755`. Adoption covers only the GitForgeOps
 resource-envelope schema, its ten fixtures, and the plugin-catalog and
 `provisioned-by` vocabularies. Retain upstream preparation prose verbatim; the
 [contracts guide](docs/contracts.md) distinguishes actual publication from metadata

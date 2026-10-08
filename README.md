@@ -328,7 +328,7 @@ fragments are covered in [Writing resources](docs/resources.md).
 [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts) is Ferrum's central store for
 shared vocabularies, JSON schemas and fixtures. GitForgeOps consumes its plugin catalog,
 `provisioned-by` vocabulary and resource fixtures, and publishes its `gitforgeops-resource` schema.
-These files are pinned to `contracts-edge-0.9.14` in
+These files are pinned to `contracts-edge-0.9.15` in
 [`contracts/ferrum-contracts/PIN`](contracts/ferrum-contracts/PIN) and vendored under
 `contracts/ferrum-contracts/`.
 See the [contracts guide](docs/contracts.md) for the pin and conformance checks.
@@ -573,10 +573,13 @@ GET-only doctor probes report capability availability, while qualification must
 establish enforcement on the exact released gateway bytes. See
 [conditional apply behavior](docs/apply.md#changes-made-during-an-apply). The new
 owner contract was published in Edge v0.9.11. The candidate pairing now pins
-published Edge v0.9.14 at `9bd4d5f9caa4ebe8f0ea13e76d8a6e2172eaca7d`, with its
+published Edge v0.9.15 at `25b37395ff61bfea0f3ffd189d9011c4984fa755`, with its
 verified x86_64 validator and multi-platform gateway image. The existing
 conditional API implementation remains unchanged. The vendored Contracts pin
-adopts `contracts-edge-0.9.14` without changing the implementation.
+adopts `contracts-edge-0.9.15` without changing the implementation. Edge v0.9.15
+also changes external identity headers and confines plugin-config environment
+references to `FERRUM_PLUGIN_SECRET_<NAME>`; affected deployments must follow the
+[Edge upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915).
 Hosted GitForgeOps qualification against those exact bytes remains required; the
 [first-release record](release/README.md) stays pending.
 
