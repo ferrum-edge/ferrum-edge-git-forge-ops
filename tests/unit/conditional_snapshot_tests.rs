@@ -1098,7 +1098,10 @@ async fn rotation_refuses_a_minimal_health_tier_before_any_other_request() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, gitforgeops::error::Error::GatewayWriteStateUnknown(_)),
+        matches!(
+            error,
+            gitforgeops::error::Error::GatewayWriteStateUnknown(_)
+        ),
         "{error:?}"
     );
     let message = error.to_string();

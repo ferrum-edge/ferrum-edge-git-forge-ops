@@ -1955,7 +1955,10 @@ fn a_minimal_health_tier_is_an_unknown_write_state_not_a_writable_one() {
     for bounded in [true, false] {
         let error = require_writes_enabled(&health, bounded).unwrap_err();
         assert!(
-            matches!(error, gitforgeops::error::Error::GatewayWriteStateUnknown(_)),
+            matches!(
+                error,
+                gitforgeops::error::Error::GatewayWriteStateUnknown(_)
+            ),
             "{error:?}"
         );
         let message = error.to_string();
