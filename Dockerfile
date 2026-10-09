@@ -25,12 +25,11 @@ COPY src/ src/
 COPY .github/scripts/audit_settings.py .github/scripts/audit_settings.py
 RUN cargo build --release --locked
 
-# Debian point-release security update for CVE-2026-103111 (HIGH): the Trixie
-# package index still lists libpcre2-8-0 10.46-1~deb13u2, while
-# 10.46-1~deb13u3 fixes the out-of-bounds write. Pin the .deb by version and
-# SHA-256 from its content-immutable security pool path; never consult a mutable package index
-# here. The security pool drops a version once a newer update supersedes it;
-# the build then fails closed (404) and the base-image pin canary reports it.
+# Debian point-release security updates for CVE-2026-103111 (HIGH) and
+# DSA-6549-1 / GHSA-5qpq-xqfv-j9pg. Pin each .deb by version and SHA-256 from
+# its content-immutable security pool path; never consult a mutable package
+# index here. The security pool drops a version once a newer update supersedes
+# it; the build then fails closed (404) and the base-image pin canary reports it.
 ARG TARGETARCH
 RUN set -eu; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
@@ -39,15 +38,18 @@ RUN set -eu; \
     case "$arch" in \
       amd64) printf '%s  %s\n' \
         e226f661d918f04daf38cdbc4806b7ed7d6ef95c7eb0ade692fc350e31970040 libpcre2-8-0_10.46-1~deb13u3_amd64.deb \
+        b38acab30f295bf1066a6632e31cbd0a1980f2924b38040cda131d5dea5384ec liblzma5_5.8.1-1+deb13u2_amd64.deb \
         > SHA256SUMS ;; \
       arm64) printf '%s  %s\n' \
         1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7 libpcre2-8-0_10.46-1~deb13u3_arm64.deb \
+        88f3aa499dc30edf01b9209ab40f11e37edfbecef971f84f4721de1874ed4827 liblzma5_5.8.1-1+deb13u2_arm64.deb \
         > SHA256SUMS ;; \
       *) echo "unsupported target architecture: $arch" >&2; exit 1 ;; \
     esac; \
     while read -r digest file; do \
       case "$file" in \
         libpcre2-8-0_*) pool=pool/updates/main/p/pcre2 ;; \
+        liblzma5_*) pool=pool/updates/main/x/xz-utils ;; \
         *) echo "unexpected package: $file" >&2; exit 1 ;; \
       esac; \
       curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
@@ -63,9 +65,11 @@ RUN set -eu; \
 # `ferrum-edge`, overrides inspect Git, delivery execs `age`. Trixie matches
 # the glibc of the upstream ferrum-edge image so the copied binary links cleanly.
 # The current Debian Trixie package index still lists libpcre2-8-0
-# 10.46-1~deb13u2 on amd64 and arm64; the reviewed security fix is u3. Keep the
-# exact-version, SHA-256-verified package update until the base's installed
-# package metadata confirms it already carries the fix. Never `apt-get`.
+# 10.46-1~deb13u2 on amd64 and arm64; the reviewed security fix is u3. The
+# pinned base carries liblzma5 5.8.1-1+deb13u1 from the xz-utils source package;
+# the reviewed security fix is u2. Keep the exact-version, SHA-256-verified
+# package updates until the base's installed package metadata confirms it
+# already carries the fixes. Never `apt-get`.
 FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 # Install only bytes the builder already verified against the reviewed digests.
 COPY --from=builder /opt/runtime-security-updates /tmp/runtime-security-updates
