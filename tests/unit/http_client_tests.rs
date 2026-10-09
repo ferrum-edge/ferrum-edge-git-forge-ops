@@ -1909,6 +1909,130 @@ fn write_block_reason_tolerates_a_sparse_health_body() {
     assert!(write_block_reason(&health).is_none());
 }
 
+// --- Namespace-bounded tokens (Ferrum Edge v0.9.16) -------------------------
+//
+// Edge v0.9.16 bounds an admin JWT carrying an `ns` claim to the
+// namespace-scoped routes for its claimed namespaces plus an allowlist of
+// global ones. Each route class GitForgeOps reaches with such a token:
+//
+// * namespace-scoped (`/backup`, `/restore`, `/batch`, resource CRUD, consumer
+//   verification, `/config/export`): always sent with an `X-Ferrum-Namespace`
+//   inside the claim (`conditional_snapshot_tests`);
+// * allowlisted `GET /health`: the detailed tier (v0.9.15) or the tenant tier
+//   (v0.9.16) reports the write state, the minimal tier does not (below);
+// * allowlisted `GET /namespaces`: filtered to the claim; the doctor's token
+//   proof (`doctor_tests`);
+// * fleet-global `GET /cluster`: `403`, reported as a namespace-scoped
+//   refusal, never as a rejected token (below and `doctor_tests`).
+
+/// Ferrum Edge v0.9.15's detailed tier (abridged), served to any valid admin
+/// JWT whether or not it carries an `ns` claim.
+const DETAILED_HEALTH: &str = r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true,"database":{"status":"connected","type":"postgres"},"cached_config":{"available":false}}"#;
+
+/// Ferrum Edge v0.9.16's tenant tier, served to a token with an `ns` claim.
+const TENANT_HEALTH: &str = r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true,"namespace":{"active":"team-alpha","serving_scope":"single_namespace_data_plane","data_plane_single_namespace":true}}"#;
+
+/// The minimal tier: an unauthenticated probe, or a token the gateway does
+/// not serve more.
+const MINIMAL_HEALTH: &str = r#"{"status":"ok","ready":true}"#;
+
+#[test]
+fn the_write_state_is_read_from_the_detailed_and_tenant_health_tiers() {
+    use gitforgeops::http_client::require_writes_enabled;
+    for body in [DETAILED_HEALTH, TENANT_HEALTH] {
+        let health = serde_json::from_str::<HealthStatus>(body).unwrap();
+        assert_eq!(health.admin_writes_enabled, Some(true), "{body}");
+        for bounded in [true, false] {
+            require_writes_enabled(&health, bounded).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_minimal_health_tier_is_an_unknown_write_state_not_a_writable_one() {
+    use gitforgeops::http_client::require_writes_enabled;
+    let health = serde_json::from_str::<HealthStatus>(MINIMAL_HEALTH).unwrap();
+    for bounded in [true, false] {
+        let error = require_writes_enabled(&health, bounded).unwrap_err();
+        assert!(
+            matches!(error, gitforgeops::error::Error::GatewayWriteStateUnknown(_)),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("admin_writes_enabled"), "{message}");
+        assert!(message.contains("nothing was written"), "{message}");
+        if bounded {
+            assert!(message.contains("`ns` claim"), "{message}");
+            assert!(message.contains("tenant tier"), "{message}");
+            assert!(message.contains("do not switch"), "{message}");
+        } else {
+            assert!(message.contains("signing secret"), "{message}");
+        }
+    }
+}
+
+#[test]
+fn a_tenant_tier_that_reports_writes_disabled_is_read_only() {
+    use gitforgeops::http_client::require_writes_enabled;
+    let body = TENANT_HEALTH.replace(
+        r#""admin_writes_enabled":true"#,
+        r#""admin_writes_enabled":false"#,
+    );
+    let health = serde_json::from_str::<HealthStatus>(&body).unwrap();
+    let error = require_writes_enabled(&health, true).unwrap_err();
+    assert!(
+        matches!(error, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn only_a_client_with_a_namespace_scope_is_namespace_bounded() {
+    let env = base_env();
+    let scoped = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+    assert!(scoped.is_namespace_bounded());
+    let empty: [&str; 0] = [];
+    let unscoped = AdminClient::new_scoped(&env, empty).unwrap();
+    assert!(!unscoped.is_namespace_bounded());
+    // Blank entries are dropped, so they do not make a claim either.
+    let blank = AdminClient::new_scoped(&env, [""]).unwrap();
+    assert!(!blank.is_namespace_bounded());
+}
+
+#[tokio::test]
+async fn a_cluster_refusal_of_a_namespace_scoped_token_is_reported_as_such() {
+    let url = spawn_stub_gateway(vec![(
+        "GET /cluster ",
+        403,
+        r#"{"error":"global route '/cluster' is unavailable to admin JWTs with an `ns` claim"}"#,
+    )]);
+    let scoped = AdminClient::new_scoped(&stub_env(url.clone()), TEST_NAMESPACES).unwrap();
+    assert_eq!(
+        scoped.convergence_report().await,
+        gitforgeops::http_client::CONVERGENCE_NAMESPACE_BOUNDED
+    );
+    let empty: [&str; 0] = [];
+    let unscoped = AdminClient::new_scoped(&stub_env(url), empty).unwrap();
+    assert_eq!(
+        unscoped.convergence_report().await,
+        gitforgeops::http_client::CONVERGENCE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn a_readable_cluster_view_keeps_the_full_convergence_line() {
+    let url = spawn_stub_gateway(vec![(
+        "GET /cluster ",
+        200,
+        r#"{"mode":"database","message":"no cluster"}"#,
+    )]);
+    let scoped = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    assert_eq!(
+        scoped.convergence_report().await,
+        "convergence: mode=database (no cluster)"
+    );
+}
+
 // --- GET /cluster + convergence summary --------------------------------------
 
 #[test]

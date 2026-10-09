@@ -6,12 +6,23 @@
 //!
 //! * `GET /health` — is the gateway reachable over this transport, and does it
 //!   accept admin writes? Ferrum Edge serves `/health` **without
-//!   authentication**, so an answer here says nothing about the token.
+//!   authentication**, so an answer here says nothing about the token. The
+//!   token only decides the tier: `admin_writes_enabled` is absent from the
+//!   minimal tier, and that is reported as unknown, never as writable.
 //! * `GET /cluster` — does the gateway accept the token we mint? It sits behind
 //!   the admin JWT gate with no role requirement, so a 401/403 there is the
 //!   signing secret or a claim being wrong, and a 200 proves the gateway
 //!   accepts the token. It does not prove the role: `/backup` and every write
 //!   need `admin`, which the local `admin-jwt-claims` check enforces.
+//!
+//!   The one exception is a namespace-scoped token. The client is scoped to
+//!   the environment's namespace filter, so its token carries an `ns` claim
+//!   whenever the environment has one, as the tokens `apply` mints do. Ferrum
+//!   Edge v0.9.16 and later refuse every fleet-global route, `/cluster`
+//!   included, to such a token with `403`. That refusal is expected, so the
+//!   token is instead proven by `GET /namespaces`, which Edge keeps open to
+//!   namespace-scoped tokens, and the missing cluster view is reported as
+//!   skipped with its reason.
 //! * `GET /namespaces`, one list page and one single-resource `GET` — does the
 //!   gateway issue the strong `ETag` incremental apply needs to send every
 //!   overwrite conditionally? This checks for the tag only; it does not test
@@ -27,7 +38,7 @@
 use super::{Check, Scope, Status};
 use crate::config::env::GatewayMode;
 use crate::config::EnvConfig;
-use crate::http_client::AdminClient;
+use crate::http_client::{health_tier_remedy, AdminClient};
 
 /// Reads only. Returns one group of checks for the given environment.
 pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
@@ -58,7 +69,7 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
         )];
     }
 
-    let client = match AdminClient::new_scoped(env, std::iter::empty::<&str>()) {
+    let client = match AdminClient::new_scoped(env, env.namespace_filter.iter()) {
         Ok(client) => client,
         Err(error) => {
             return vec![Check::new(
@@ -94,8 +105,7 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
                     "Gateway is reachable",
                     Scope::Gateway,
                     format!(
-                        "GET /health (unauthenticated) answered: mode={}, ready={}, \
-                         admin_writes_enabled={}",
+                        "GET /health answered: mode={}, ready={}, admin_writes_enabled={}",
                         health.mode.as_deref().unwrap_or("unknown"),
                         health
                             .ready
@@ -127,6 +137,21 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
                          `apply` will refuse at its health preflight. Re-enable admin \
                          writes on the gateway before deploying.",
                     ),
+                );
+            } else if health.admin_writes_enabled.is_none() {
+                // The minimal tier. `apply` still proceeds (its preflight is
+                // advisory), but `rotate` refuses an unknown write state.
+                checks.push(
+                    Check::new(
+                        "gateway-writable",
+                        "Gateway accepts administrative writes",
+                        Scope::Gateway,
+                        Status::Unknown,
+                        "GET /health did not report admin_writes_enabled; credential \
+                         rotation will refuse until it does",
+                    )
+                    .for_environment(environment)
+                    .remedy(health_tier_remedy(client.is_namespace_bounded())),
                 );
             }
         }
@@ -185,6 +210,14 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
                 .for_environment(environment),
             )
         }
+        Err(error) if client.is_namespace_bounded_refusal(&error) => {
+            checks.extend(
+                namespace_bounded_token_checks(&client, env)
+                    .await
+                    .into_iter()
+                    .map(|check| check.for_environment(environment)),
+            );
+        }
         Err(error) => {
             let rejected = matches!(
                 error,
@@ -208,19 +241,7 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
                 )
                 .for_environment(environment)
                 .remedy(if rejected {
-                    // The four claim settings are the usual cause, and an
-                    // unset one means "use the default", not "send nothing".
-                    format!(
-                        "The gateway was reached but rejected the token. The signing \
-                         secret and every claim must equal the gateway's own \
-                         configuration: issuer={}, role={}, audience={}, ttl={}s. \
-                         `/backup` and `/restore` are admin-only, and a gateway with no \
-                         audience rejects a token that carries one.",
-                        env.admin_jwt_issuer,
-                        env.admin_jwt_role,
-                        env.admin_jwt_audience.as_deref().unwrap_or("<unset>"),
-                        env.admin_jwt_ttl_secs,
-                    )
+                    rejected_token_remedy(env)
                 } else {
                     "The authenticated read did not complete, so whether the gateway \
                      accepts this token is not known. Re-run once the gateway answers \
@@ -240,6 +261,85 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
             .map(|check| check.for_environment(environment)),
     );
     checks
+}
+
+/// The four claim settings are the usual cause of a rejected token, and an
+/// unset one means "use the default", not "send nothing".
+fn rejected_token_remedy(env: &EnvConfig) -> String {
+    format!(
+        "The gateway was reached but rejected the token. The signing secret and every claim \
+         must equal the gateway's own configuration: issuer={}, role={}, audience={}, ttl={}s. \
+         `/backup` and `/restore` are admin-only, and a gateway with no audience rejects a \
+         token that carries one.",
+        env.admin_jwt_issuer,
+        env.admin_jwt_role,
+        env.admin_jwt_audience.as_deref().unwrap_or("<unset>"),
+        env.admin_jwt_ttl_secs,
+    )
+}
+
+/// `GET /cluster` refused a namespace-scoped token with `403`, which Ferrum
+/// Edge v0.9.16 and later do on every fleet-global route. Prove the token on
+/// `GET /namespaces` instead (open to namespace-scoped tokens, filtered to
+/// the claim) and report the cluster view as skipped rather than failed.
+async fn namespace_bounded_token_checks(client: &AdminClient, env: &EnvConfig) -> Vec<Check> {
+    const ID: &str = "gateway-token";
+    const TITLE: &str = "Gateway accepts our admin token";
+    let error = match client.list_namespaces().await {
+        Ok(_) => {
+            return vec![
+                Check::pass(
+                    ID,
+                    TITLE,
+                    Scope::Gateway,
+                    "GET /namespaces accepted the minted namespace-scoped token (GET /cluster \
+                     refused it as fleet-global)",
+                ),
+                Check::new(
+                    "gateway-cluster-view",
+                    "Cluster view is readable",
+                    Scope::Gateway,
+                    Status::Skipped,
+                    "cluster view not available to a namespace-scoped credential: GET /cluster \
+                     is fleet-global, and the gateway refuses it to a token carrying an `ns` \
+                     claim",
+                )
+                .remedy(
+                    "Expected on Ferrum Edge v0.9.16 and later. This environment's token is \
+                     scoped by its namespace filter, and apply, rotate, review and drift \
+                     checks use only routes open to it; the post-apply convergence line \
+                     reports the cluster view as unavailable. Read cluster state with a \
+                     separate operator credential outside GitForgeOps; do not widen this \
+                     environment's token.",
+                ),
+            ];
+        }
+        Err(error) => error,
+    };
+    let rejected = matches!(
+        error,
+        crate::error::Error::ApiError {
+            status: 401 | 403,
+            ..
+        }
+    );
+    let status = if rejected {
+        Status::Fail
+    } else {
+        Status::Unknown
+    };
+    let remedy = if rejected {
+        rejected_token_remedy(env)
+    } else {
+        "The authenticated read did not complete, so whether the gateway accepts this token \
+         is not known. Re-run once the gateway answers GET /namespaces."
+            .to_string()
+    };
+    let detail = format!(
+        "GET /cluster refused the namespace-scoped token and GET /namespaces failed: {error}"
+    );
+    let check = Check::new(ID, TITLE, Scope::Gateway, status, detail);
+    vec![check.remedy(remedy)]
 }
 
 /// Does the gateway issue the strong `ETag` every incremental overwrite is

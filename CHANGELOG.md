@@ -91,6 +91,26 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Work with Ferrum Edge v0.9.16's namespace-bounded admin tokens
+  ([ferrum-edge#6095](https://github.com/ferrum-edge/ferrum-edge/issues/6095)).
+  Edge v0.9.16 limits an admin JWT with an `ns` claim to namespace-scoped
+  routes and a short allowlist, and every other fleet-global route answers
+  `403`. GitForgeOps works against both v0.9.15 and v0.9.16 with no new setting
+  and no wider token:
+  - `rotate` reads `admin_writes_enabled` from the detailed `/health` tier
+    (v0.9.15) or the tenant tier (v0.9.16). A minimal-tier body without it now
+    refuses before any broker or gateway write, with the new
+    `GatewayWriteStateUnknown` error and a remedy. It no longer fails as
+    unavailable conditional evidence.
+  - `doctor --scope gateway` mints its token with the environment's namespace
+    filter as the `ns` claim, as `apply` does. A `403` from fleet-global
+    `GET /cluster` to that token is proven on `GET /namespaces` instead of
+    being reported as a rejected token. The cluster view is reported as `SKIP`
+    with the reason, and a missing write state is reported as `UNKNOWN`.
+  - The post-apply convergence line says when `/cluster` is not served to the
+    run's namespace-scoped token.
+  - [Namespace-scoped admin tokens](docs/reference.md#namespace-scoped-admin-tokens)
+    lists each route class GitForgeOps calls and its behaviour.
 - Refresh the Ferrum Edge validator and bundled gateway pins to published
   v0.9.15: validator SHA-256
   `69ae2402e1741d96b48ce0011d94088c9a4ec8240019e9dbb17d596cfa2082c5` and

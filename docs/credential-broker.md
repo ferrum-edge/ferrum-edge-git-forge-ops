@@ -326,7 +326,9 @@ Rules:
   override does not carry over. Broker the literal with `alloc=require`, seed it
   and apply first.
 
-Before any broker write, rotation establishes writable health, repository ownership,
+Before any broker write, rotation establishes writable health (`GET /health` must
+report `admin_writes_enabled: true`; a minimal-tier body without it refuses, see
+[Namespace-scoped admin tokens](reference.md#namespace-scoped-admin-tokens)), repository ownership,
 complete authoritative verification and representability of the stored row. The
 current target must match an available old bundle value when directly comparable;
 Basic's gateway-keyed HMAC remains opaque. Without an old target value, the

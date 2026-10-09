@@ -251,6 +251,29 @@ impl AdminClient {
         self.jwt_options = self.jwt_options.clone().with_namespaces(namespaces);
     }
 
+    /// True when this client's tokens carry an `ns` claim.
+    ///
+    /// Ferrum Edge v0.9.16 and later treat such a token as a tenant credential
+    /// whatever `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` says: it reaches the
+    /// namespace-scoped routes for its claimed namespaces plus a short
+    /// allowlist of global ones (`GET /health`, `GET /namespaces`, `GET
+    /// /plugins`, …), and every other fleet-global route, `GET /cluster`
+    /// included, answers `403`. Callers use this to tell that expected refusal
+    /// from a rejected token. Earlier releases give such a token full access.
+    pub fn is_namespace_bounded(&self) -> bool {
+        !self.jwt_options.namespaces.is_empty()
+    }
+
+    /// True when `error` is a `403` to a
+    /// [namespace-bounded](AdminClient::is_namespace_bounded) client: on a
+    /// fleet-global route that is Edge v0.9.16's expected refusal, not a
+    /// rejected token. Only meaningful for routes outside Edge's `ns`-claim
+    /// allowlist; keyed on the typed status, never on the gateway's text.
+    pub fn is_namespace_bounded_refusal(&self, error: &crate::error::Error) -> bool {
+        self.is_namespace_bounded()
+            && matches!(error, crate::error::Error::ApiError { status: 403, .. })
+    }
+
     /// True when any `/backup` in this run was served from the in-memory
     /// snapshot rather than the config database.
     pub fn served_from_cache(&self) -> bool {
@@ -463,7 +486,9 @@ impl AdminClient {
     }
 
     /// Authenticated `GET /health`. Carries `mode`, `ready` and
-    /// `admin_writes_enabled` — the ahead-of-time signal for read-only mode.
+    /// `admin_writes_enabled` — the ahead-of-time signal for read-only mode —
+    /// when the gateway serves this token more than its minimal tier. See
+    /// [`HealthStatus`] for the tiers.
     pub async fn get_health(&self) -> crate::error::Result<HealthStatus> {
         let target = self.authorized("/health")?;
         let resp = self
@@ -483,6 +508,23 @@ impl AdminClient {
     pub async fn get_cluster(&self) -> crate::error::Result<ClusterStatus> {
         let body = self.get_cluster_body().await?;
         parse_cluster_status(&body)
+    }
+
+    /// One-line post-apply convergence report from `GET /cluster`.
+    ///
+    /// Never an error: convergence is advisory. A `403` to a
+    /// [namespace-bounded](AdminClient::is_namespace_bounded) client is the
+    /// expected fleet-global refusal of Ferrum Edge v0.9.16 and later and is
+    /// reported as such ([`CONVERGENCE_NAMESPACE_BOUNDED`]); any other failure
+    /// is [`CONVERGENCE_UNAVAILABLE`].
+    pub async fn convergence_report(&self) -> String {
+        match self.get_cluster().await {
+            Ok(status) => convergence_summary(&status),
+            Err(error) if self.is_namespace_bounded_refusal(&error) => {
+                CONVERGENCE_NAMESPACE_BOUNDED.to_string()
+            }
+            Err(_) => CONVERGENCE_UNAVAILABLE.to_string(),
+        }
     }
 
     /// `GET /cluster` up to, but not including, parsing the body.
@@ -2940,6 +2982,19 @@ pub(crate) fn batch_dependency_groups(mut batch: BatchCreate) -> Vec<BatchCreate
 
 /// Authenticated `GET /health` projection. Only the fields gitforgeops acts on
 /// are modeled; the endpoint returns considerably more.
+///
+/// Ferrum Edge answers in tiers, all of which deserialize here:
+///
+/// * **detailed** — an admin JWT the gateway accepts for detail. Carries
+///   `mode` and `admin_writes_enabled`. Through Edge v0.9.15 every valid
+///   admin JWT gets it, including one with an `ns` claim.
+/// * **tenant** — Edge v0.9.16 and later, for a namespace-bounded token (one
+///   carrying an `ns` claim). Carries `mode`, `admin_writes_enabled` and the
+///   `namespace` serving block, and nothing fleet-wide.
+/// * **minimal** — `status` and `ready` only: an unauthenticated probe, a
+///   token the gateway did not accept for detail, or a namespace-bounded token
+///   on a gateway without the tenant tier. `admin_writes_enabled` is absent,
+///   so the write state is unknown; [`require_writes_enabled`] refuses it.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HealthStatus {
     #[serde(default)]
@@ -2984,6 +3039,52 @@ pub fn write_block_reason(health: &HealthStatus) -> Option<String> {
         ));
     }
     None
+}
+
+/// Refuse unless `GET /health` positively reports that the gateway accepts
+/// config writes.
+///
+/// For operations that must not start on an unknown write state: consumer
+/// credential rotation publishes the new secret to the broker before its
+/// gateway write, so it establishes a writable plane first. A plane that
+/// refuses writes is [`crate::error::Error::GatewayReadOnly`]; a body without
+/// `admin_writes_enabled` (the minimal tier, see [`HealthStatus`]) is
+/// [`crate::error::Error::GatewayWriteStateUnknown`], whose remediation depends
+/// on whether the token was `namespace_bounded`
+/// ([`AdminClient::is_namespace_bounded`]).
+pub fn require_writes_enabled(
+    health: &HealthStatus,
+    namespace_bounded: bool,
+) -> crate::error::Result<()> {
+    if let Some(reason) = write_block_reason(health) {
+        return Err(crate::error::Error::GatewayReadOnly(reason));
+    }
+    if health.admin_writes_enabled == Some(true) {
+        return Ok(());
+    }
+    Err(crate::error::Error::GatewayWriteStateUnknown(format!(
+        "GET /health did not report admin_writes_enabled (status={}, mode={}), so whether the \
+         gateway accepts config writes is unknown; nothing was written. {}",
+        health.status.as_deref().unwrap_or("unknown"),
+        health.mode.as_deref().unwrap_or("unknown"),
+        health_tier_remedy(namespace_bounded),
+    )))
+}
+
+/// What to do when `GET /health` answered with its minimal tier.
+pub fn health_tier_remedy(namespace_bounded: bool) -> &'static str {
+    if namespace_bounded {
+        "The gateway served its minimal health tier to this run's namespace-scoped admin \
+         token (it carries an `ns` claim). Ferrum Edge v0.9.15 and earlier report the write \
+         state to that token in the detailed tier, and v0.9.16 and later in the tenant tier \
+         for namespace-scoped tokens. Upgrade the gateway to a release that serves the tenant \
+         health tier; do not switch to a token without an `ns` claim. Run `gitforgeops doctor \
+         --scope gateway` to confirm the gateway accepts the token."
+    } else {
+        "The gateway served its minimal health tier, which it serves when it does not accept \
+         the admin token for detail. Run `gitforgeops doctor --scope gateway` and check that \
+         the signing secret, issuer, audience and role match the gateway."
+    }
 }
 
 // --- Cluster / convergence ---------------------------------------------------
@@ -3065,6 +3166,13 @@ pub struct ControlPlaneStatus {
 /// convergence is advisory, and a gateway that does not serve `/cluster` is
 /// perfectly healthy.
 pub const CONVERGENCE_UNAVAILABLE: &str = "convergence status unavailable";
+
+/// Text shown when `/cluster` refused a namespace-bounded token. Ferrum Edge
+/// v0.9.16 and later keep fleet-global routes from tokens carrying an `ns`
+/// claim, so this is expected and, like every convergence line, advisory.
+pub const CONVERGENCE_NAMESPACE_BOUNDED: &str = "convergence status unavailable: GET /cluster \
+     is fleet-global, and the gateway does not serve it to this run's namespace-scoped admin \
+     token";
 
 impl ClusterStatus {
     /// Number of connected nodes, preferring the CP's own counters over the

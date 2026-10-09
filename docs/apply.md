@@ -92,7 +92,9 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
 - **`GatewayReadOnly`.** An authenticated `GET /health` preflight runs before
   the first write. A gateway with `admin_writes_enabled: false`, or in `file`,
   `dp`, `mesh` or `node_agent` mode, fails the run once instead of producing a
-  403 per resource. An unreachable `/health` only prints a warning.
+  403 per resource. An unreachable `/health` only prints a warning. So does a
+  minimal-tier body without `admin_writes_enabled`; `rotate` refuses that one
+  (see [Namespace-scoped admin tokens](reference.md#namespace-scoped-admin-tokens)).
 - **`ApiSpecsAtRisk`** (409 with `api_specs_at_risk`) points at
   `--confirm-api-spec-deletion`. See
   [Spec-owned resources](ownership.md#spec-owned-resources).
@@ -402,6 +404,10 @@ After an api-mode apply, GitForgeOps calls `GET /cluster` and prints a
 one-line summary: gateway mode, connected data-plane and mesh-node counts, the
 oldest `last_sync_at`, and a warning if any node reports `config_diverged`. It
 is advisory: an unanswered call prints "unknown" and never fails the apply.
+`GET /cluster` is fleet-global. Ferrum Edge v0.9.16 and later answer `403` to
+the run's namespace-scoped token, and the line then says that the cluster view
+is not served to a namespace-scoped token. See
+[Namespace-scoped admin tokens](reference.md#namespace-scoped-admin-tokens).
 
 ## Timeouts
 

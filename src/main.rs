@@ -1154,12 +1154,10 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
 
 /// Best-effort post-apply convergence line. Never fails an apply — a gateway
 /// that cannot answer `GET /cluster` (older build, DP/CP not in play, network
-/// blip) produces one "unavailable" line and nothing else.
+/// blip, or a fleet-global refusal of this run's namespace-scoped token)
+/// produces one "unavailable" line and nothing else.
 async fn convergence_line(client: &AdminClient) -> String {
-    match client.get_cluster().await {
-        Ok(status) => gitforgeops::http_client::convergence_summary(&status),
-        Err(_) => gitforgeops::http_client::CONVERGENCE_UNAVAILABLE.to_string(),
-    }
+    client.convergence_report().await
 }
 
 fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) -> Option<String> {
@@ -4528,7 +4526,13 @@ async fn cmd_doctor(
     if selected.contains(&cli::DoctorScope::Gateway) {
         match (&env_config, resolve_runtime(explicit_env)) {
             (Some(env), Ok((_, resolved, _))) => {
-                report.extend(doctor::gateway::run(&resolved.name, env).await);
+                // Probe with the token shape the environment's runs mint: its
+                // `ns` claim is the environment's namespace filter when it has
+                // one, so the gateway sees the same namespace-scoped
+                // credential `apply` sends.
+                let mut env = env.clone();
+                env.namespace_filter = resolved.namespace_filter.clone();
+                report.extend(doctor::gateway::run(&resolved.name, &env).await);
             }
             (_, Err(error)) => report.push(
                 Check::new(

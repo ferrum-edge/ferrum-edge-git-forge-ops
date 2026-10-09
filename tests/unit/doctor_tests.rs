@@ -568,6 +568,263 @@ async fn the_gateway_scope_without_credentials_is_unknown() {
     assert_eq!(find(&checks, "gateway-reachable").status, Status::Unknown);
 }
 
+// -- namespace-scoped tokens (Ferrum Edge v0.9.16) --------------------------
+
+type EdgeReply = (u16, &'static str);
+
+/// A gateway that answers from `reply` and records each request's head
+/// (request line and headers), so a test can read the token it carried.
+fn spawn_edge_stub(
+    reply: impl Fn(&str) -> EdgeReply + Send + Sync + 'static,
+    requests: Arc<Mutex<Vec<String>>>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let addr = listener.local_addr().expect("addr");
+    let reply = Arc::new(reply);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let requests = Arc::clone(&requests);
+            let reply = Arc::clone(&reply);
+            std::thread::spawn(move || loop {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut buf = [0_u8; 8192];
+                let mut n = 0;
+                while !buf[..n].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if n == buf.len()
+                        || remaining.is_zero()
+                        || stream.set_read_timeout(Some(remaining)).is_err()
+                    {
+                        return;
+                    }
+                    match stream.read(&mut buf[n..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => n += read,
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                requests.lock().expect("lock").push(request.clone());
+                let (status, body) = reply(&request);
+                if write!(
+                    stream,
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .is_err()
+                {
+                    return;
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The `ns` claim of the admin token a recorded request carried (`null` when
+/// the token has none).
+fn ns_claim(request: &str) -> serde_json::Value {
+    use base64::Engine as _;
+    let token = request
+        .lines()
+        .find_map(|line| line.strip_prefix("authorization: Bearer "))
+        .expect("authorization header");
+    let payload = token.split('.').nth(1).expect("JWT payload");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).expect("JSON claims");
+    claims["ns"].clone()
+}
+
+/// The detailed `/health` tier Ferrum Edge v0.9.15 serves any valid admin
+/// JWT, `ns` claim or not (abridged).
+const DETAILED_HEALTH: &str = r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true,"cached_config":{"available":false}}"#;
+
+/// Ferrum Edge v0.9.16's tenant `/health` tier for a token with an `ns`
+/// claim: the write state and namespace block, nothing fleet-wide.
+const TENANT_HEALTH: &str = r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true,"namespace":{"active":"team-alpha","serving_scope":"single_namespace_data_plane","data_plane_single_namespace":true}}"#;
+
+/// Ferrum Edge v0.9.16's answer to a token with an `ns` claim on a
+/// fleet-global route.
+const FLEET_GLOBAL_REFUSAL: &str = r#"{"error":"global route '/cluster' is unavailable to admin JWTs with an `ns` claim; fleet-global routes require a token without one"}"#;
+
+fn has(checks: &[Check], id: &str) -> bool {
+    checks.iter().any(|check| check.id == id)
+}
+
+fn scoped_env(url: String) -> EnvConfig {
+    EnvConfig {
+        namespace_filter: Some("team-alpha".to_string()),
+        gateway_max_retries: 0,
+        ..stub_env(url)
+    }
+}
+
+#[tokio::test]
+async fn a_namespace_scoped_token_refused_on_cluster_is_proven_on_namespaces() {
+    // Edge v0.9.16 refuses every fleet-global route, /cluster included, to a
+    // token with an `ns` claim. That refusal is expected: the token is proven
+    // on GET /namespaces, which stays open to it, and the cluster view is
+    // skipped with its reason rather than failed.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_edge_stub(
+        |request| {
+            if request.starts_with("GET /health") {
+                (200, TENANT_HEALTH)
+            } else if request.starts_with("GET /cluster") {
+                if ns_claim(request).is_null() {
+                    (200, r#"{"mode":"database","message":"no cluster"}"#)
+                } else {
+                    (403, FLEET_GLOBAL_REFUSAL)
+                }
+            } else if request.starts_with("GET /namespaces") {
+                (200, r#"{"data":["team-alpha"],"pagination":{"total":1}}"#)
+            } else {
+                (404, r#"{"error":"not found"}"#)
+            }
+        },
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &scoped_env(url)).await;
+
+    assert_eq!(find(&checks, "gateway-reachable").status, Status::Pass);
+    let token = find(&checks, "gateway-token");
+    assert_eq!(token.status, Status::Pass, "{token:?}");
+    assert!(token.detail.contains("GET /namespaces"));
+    let cluster = find(&checks, "gateway-cluster-view");
+    assert_eq!(cluster.status, Status::Skipped);
+    assert!(
+        cluster.detail.contains("namespace-scoped credential"),
+        "{}",
+        cluster.detail
+    );
+    let remediation = cluster.remediation.as_deref().expect("remediation");
+    assert!(remediation.contains("v0.9.16"), "{remediation}");
+    assert_eq!(cluster.environment.as_deref(), Some("production"));
+    // The tenant tier reports the write state, so nothing is unknown there.
+    assert!(!has(&checks, "gateway-writable"));
+    assert!(checks.iter().all(|check| check.status != Status::Fail));
+
+    // Every request carried the environment's namespace-scoped token, and
+    // every one was a read.
+    let seen = requests.lock().expect("lock").clone();
+    assert!(seen.iter().any(|line| line.starts_with("GET /cluster")));
+    for request in &seen {
+        assert!(request.starts_with("GET "), "non-read request: {request}");
+        assert_eq!(ns_claim(request), serde_json::json!(["team-alpha"]));
+    }
+}
+
+#[tokio::test]
+async fn a_full_cluster_view_is_kept_when_the_scoped_token_can_read_it() {
+    // Through Edge v0.9.15 a token with an `ns` claim still reads /cluster;
+    // the convergence detail stays in the token check.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_edge_stub(
+        |request| {
+            if request.starts_with("GET /cluster") {
+                (200, r#"{"mode":"database","message":"no cluster"}"#)
+            } else if request.starts_with("GET /health") {
+                (200, DETAILED_HEALTH)
+            } else {
+                (200, r#"{"data":[]}"#)
+            }
+        },
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &scoped_env(url)).await;
+    let token = find(&checks, "gateway-token");
+    assert_eq!(token.status, Status::Pass);
+    assert!(
+        token.detail.contains("convergence: mode=database"),
+        "{}",
+        token.detail
+    );
+    assert!(!has(&checks, "gateway-cluster-view"));
+}
+
+#[tokio::test]
+async fn a_namespace_scoped_token_rejected_on_namespaces_too_is_a_rejected_token() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_edge_stub(
+        |request| {
+            if request.starts_with("GET /health") {
+                (200, TENANT_HEALTH)
+            } else if request.starts_with("GET /cluster") {
+                (403, FLEET_GLOBAL_REFUSAL)
+            } else {
+                (401, r#"{"error":"InvalidSignature"}"#)
+            }
+        },
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &scoped_env(url)).await;
+    let token = find(&checks, "gateway-token");
+    assert_eq!(token.status, Status::Fail);
+    let remediation = token.remediation.as_deref().expect("remediation");
+    assert!(remediation.contains("issuer="), "{remediation}");
+    // The cluster view is not excused when the token itself is not proven.
+    assert!(!has(&checks, "gateway-cluster-view"));
+}
+
+#[tokio::test]
+async fn a_cluster_refusal_of_a_token_without_an_ns_claim_is_still_a_rejected_token() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_edge_stub(
+        |request| {
+            if request.starts_with("GET /cluster") {
+                (403, r#"{"error":"forbidden"}"#)
+            } else if request.starts_with("GET /health") {
+                (200, TENANT_HEALTH)
+            } else {
+                (200, r#"{"data":[]}"#)
+            }
+        },
+        Arc::clone(&requests),
+    );
+    let mut env = scoped_env(url);
+    env.namespace_filter = None;
+    let checks = doctor::gateway::run("production", &env).await;
+    assert_eq!(find(&checks, "gateway-token").status, Status::Fail);
+    assert!(!has(&checks, "gateway-cluster-view"));
+    let seen = requests.lock().expect("lock").clone();
+    assert!(seen.iter().all(|request| ns_claim(request).is_null()));
+}
+
+#[tokio::test]
+async fn a_minimal_health_tier_leaves_the_write_state_unknown() {
+    // A namespace-scoped token on a gateway without the tenant tier gets only
+    // `status` and `ready`. That is not evidence the plane is writable.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_edge_stub(
+        |request| {
+            if request.starts_with("GET /health") {
+                (200, r#"{"status":"ok","ready":true}"#)
+            } else if request.starts_with("GET /cluster") {
+                (403, FLEET_GLOBAL_REFUSAL)
+            } else {
+                (200, r#"{"data":[]}"#)
+            }
+        },
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &scoped_env(url)).await;
+    let reachable = find(&checks, "gateway-reachable");
+    assert_eq!(reachable.status, Status::Pass);
+    assert!(
+        reachable.detail.contains("admin_writes_enabled=unknown"),
+        "{}",
+        reachable.detail
+    );
+    let writable = find(&checks, "gateway-writable");
+    assert_eq!(writable.status, Status::Unknown);
+    let remediation = writable.remediation.as_deref().expect("remediation");
+    assert!(remediation.contains("`ns` claim"), "{remediation}");
+    assert!(remediation.contains("tenant"), "{remediation}");
+    assert!(checks.iter().all(|check| check.status != Status::Fail));
+}
+
 // -- no secret value is ever printed ---------------------------------------
 
 #[tokio::test]
