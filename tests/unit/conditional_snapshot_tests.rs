@@ -1478,7 +1478,7 @@ async fn doctor_is_get_only_and_reports_missing_consumer_capability_as_unknown()
             panic!("doctor must only use bounded capability reads")
         }
     });
-    let checks = gitforgeops::doctor::gateway::run("fixture", &env).await;
+    let checks = gitforgeops::doctor::gateway::run("fixture", &env, &[]).await;
     assert!(checks.iter().any(|check| {
         check.id == "gateway-conditional-snapshot" && check.status == Status::Pass
     }));

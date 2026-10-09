@@ -241,8 +241,10 @@ impl AdminClient {
     }
 
     /// Narrow the `ns` claim minted into admin tokens to the namespaces this
-    /// run actually touches. Only consulted by gateways running with
-    /// `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`; elsewhere it is inert.
+    /// run actually touches. Through Ferrum Edge v0.9.15 only gateways running
+    /// with `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` read it; Edge v0.9.16
+    /// and later bound every token that carries it (see
+    /// [`AdminClient::is_namespace_bounded`]).
     pub fn set_namespace_scope<I, S>(&mut self, namespaces: I)
     where
         I: IntoIterator<Item = S>,
@@ -266,9 +268,10 @@ impl AdminClient {
 
     /// True when `error` is a `403` to a
     /// [namespace-bounded](AdminClient::is_namespace_bounded) client: on a
-    /// fleet-global route that is Edge v0.9.16's expected refusal, not a
-    /// rejected token. Only meaningful for routes outside Edge's `ns`-claim
-    /// allowlist; keyed on the typed status, never on the gateway's text.
+    /// fleet-global route the gateway (Edge v0.9.16 and later) or an
+    /// intermediary refused the route to this token, which is not a rejected
+    /// token. Only meaningful for routes outside Edge's `ns`-claim allowlist;
+    /// keyed on the typed status, never on the gateway's text.
     pub fn is_namespace_bounded_refusal(&self, error: &crate::error::Error) -> bool {
         self.is_namespace_bounded()
             && matches!(error, crate::error::Error::ApiError { status: 403, .. })
@@ -3075,11 +3078,14 @@ pub fn require_writes_enabled(
 pub fn health_tier_remedy(namespace_bounded: bool) -> &'static str {
     if namespace_bounded {
         "The gateway served its minimal health tier to this run's namespace-scoped admin \
-         token (it carries an `ns` claim). Ferrum Edge v0.9.15 and earlier report the write \
-         state to that token in the detailed tier, and v0.9.16 and later in the tenant tier \
-         for namespace-scoped tokens. Upgrade the gateway to a release that serves the tenant \
-         health tier; do not switch to a token without an `ns` claim. Run `gitforgeops doctor \
-         --scope gateway` to confirm the gateway accepts the token."
+         token (it carries an `ns` claim). That has two causes. Either the gateway did not \
+         accept the token: check that the signing secret, issuer, audience and role match the \
+         gateway. Or the gateway accepted it but has no tenant tier: Ferrum Edge v0.9.15 and \
+         earlier report the write state to an accepted token in the detailed tier, and Edge \
+         v0.9.16 and later are to report it to a namespace-scoped token in the tenant tier; \
+         upgrade the gateway to a release that serves the tenant health tier. Either way, do \
+         not switch to a token without an `ns` claim. Run `gitforgeops doctor --scope \
+         gateway` to tell the two apart."
     } else {
         "The gateway served its minimal health tier, which it serves when it does not accept \
          the admin token for detail. Run `gitforgeops doctor --scope gateway` and check that \

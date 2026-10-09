@@ -467,8 +467,8 @@ namespace payload is built before the first mutation.
   reconciliation all use this evidence. Basic gateway-keyed HMACs remain opaque;
   never infer equality using the admin signing key. Rotation establishes health
   (`http_client::require_writes_enabled`: `admin_writes_enabled` from Edge's
-  detailed or v0.9.16 tenant `/health` tier; the minimal tier is
-  `GatewayWriteStateUnknown`, never writable),
+  detailed `/health` tier or, for an `ns` token on Edge v0.9.16 and later, its
+  tenant tier; the minimal tier is `GatewayWriteStateUnknown`, never writable),
   ownership and representability before broker publication and changes only the
   authorized credential with row `If-Match`; post-delivery refusal does not record
   completion. `plan` retains ordinary `/backup` reads and explains runtime gates.
@@ -1282,10 +1282,12 @@ misconfigured?" without provisioning anything.
 1. **Never mutates.** No settings write, gateway write, credential allocation
    or state lock. `doctor::gateway` issues only `GET`s: `/health`
    (unauthenticated on Edge), `/cluster` (proves the admin JWT) and capability
-   reads. Its token carries the environment's namespace filter as `ns`. Edge
-   v0.9.16 answers that token `403` on fleet-global `/cluster`
-   (`AdminClient::is_namespace_bounded_refusal`), so `GET /namespaces` proves
-   it and `gateway-cluster-view` is `Skipped`, never a rejected token.
+   reads. Its token is the one the environment's runs mint: `ns` is
+   `reconcile::resolved_namespaces` (also without a namespace filter). A `403`
+   on fleet-global `/cluster` to that token (Edge v0.9.16 and later, or an
+   intermediary; `AdminClient::is_namespace_bounded_refusal`) is proven on
+   `GET /namespaces` instead, and `gateway-cluster-view` is `Skipped`, never a
+   rejected token.
 2. **Never guesses.** `Status::Unknown` (check could not run: no
    administration-read token, no environment credentials) is never a pass, and
    the text report says so. `Skipped` means the check does not apply (file mode

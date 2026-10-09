@@ -15,14 +15,17 @@
 //!   accepts the token. It does not prove the role: `/backup` and every write
 //!   need `admin`, which the local `admin-jwt-claims` check enforces.
 //!
-//!   The one exception is a namespace-scoped token. The client is scoped to
-//!   the environment's namespace filter, so its token carries an `ns` claim
-//!   whenever the environment has one, as the tokens `apply` mints do. Ferrum
-//!   Edge v0.9.16 and later refuse every fleet-global route, `/cluster`
-//!   included, to such a token with `403`. That refusal is expected, so the
-//!   token is instead proven by `GET /namespaces`, which Edge keeps open to
-//!   namespace-scoped tokens, and the missing cluster view is reported as
-//!   skipped with its reason.
+//!   The one exception is a namespace-scoped token. The caller passes the
+//!   namespaces this environment's runs claim
+//!   ([`crate::reconcile::resolved_namespaces`], the list `apply`, `plan`,
+//!   `review` and drift checks mint their tokens from), so the token carries
+//!   the same `ns` claim theirs does, including for an environment without a
+//!   namespace filter. It is claim-less only when a run would resolve no
+//!   namespace. Ferrum Edge v0.9.16 and later refuse every fleet-global route,
+//!   `/cluster` included, to such a token with `403`. A `403` to it is
+//!   therefore not taken as a rejected token: the token is instead proven by
+//!   `GET /namespaces`, which Edge keeps open to namespace-scoped tokens, and
+//!   the missing cluster view is reported as skipped with its reason.
 //! * `GET /namespaces`, one list page and one single-resource `GET` — does the
 //!   gateway issue the strong `ETag` incremental apply needs to send every
 //!   overwrite conditionally? This checks for the tag only; it does not test
@@ -41,7 +44,11 @@ use crate::config::EnvConfig;
 use crate::http_client::{health_tier_remedy, AdminClient};
 
 /// Reads only. Returns one group of checks for the given environment.
-pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
+///
+/// `token_namespaces` is the `ns` claim of the token to probe with: the
+/// namespaces a run of this environment resolves, so doctor tests the token
+/// class `apply` and `rotate` send. Empty mints a token without the claim.
+pub async fn run(environment: &str, env: &EnvConfig, token_namespaces: &[String]) -> Vec<Check> {
     if matches!(env.gateway_mode, GatewayMode::File) {
         return vec![Check::new(
             "gateway-reachable",
@@ -69,7 +76,7 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
         )];
     }
 
-    let client = match AdminClient::new_scoped(env, env.namespace_filter.iter()) {
+    let client = match AdminClient::new_scoped(env, token_namespaces) {
         Ok(client) => client,
         Err(error) => {
             return vec![Check::new(
@@ -278,10 +285,12 @@ fn rejected_token_remedy(env: &EnvConfig) -> String {
     )
 }
 
-/// `GET /cluster` refused a namespace-scoped token with `403`, which Ferrum
-/// Edge v0.9.16 and later do on every fleet-global route. Prove the token on
-/// `GET /namespaces` instead (open to namespace-scoped tokens, filtered to
-/// the claim) and report the cluster view as skipped rather than failed.
+/// `GET /cluster` refused a namespace-scoped token with `403`. Ferrum Edge
+/// v0.9.16 and later do that on every fleet-global route, and an intermediary
+/// that blocks `/cluster` answers the same way, so the status alone says
+/// nothing about the token. Prove the token on `GET /namespaces` instead (open
+/// to namespace-scoped tokens, filtered to the claim) and report the cluster
+/// view as skipped rather than failed.
 async fn namespace_bounded_token_checks(client: &AdminClient, env: &EnvConfig) -> Vec<Check> {
     const ID: &str = "gateway-token";
     const TITLE: &str = "Gateway accepts our admin token";
@@ -293,7 +302,7 @@ async fn namespace_bounded_token_checks(client: &AdminClient, env: &EnvConfig) -
                     TITLE,
                     Scope::Gateway,
                     "GET /namespaces accepted the minted namespace-scoped token (GET /cluster \
-                     refused it as fleet-global)",
+                     refused it with 403)",
                 ),
                 Check::new(
                     "gateway-cluster-view",
@@ -301,16 +310,16 @@ async fn namespace_bounded_token_checks(client: &AdminClient, env: &EnvConfig) -
                     Scope::Gateway,
                     Status::Skipped,
                     "cluster view not available to a namespace-scoped credential: GET /cluster \
-                     is fleet-global, and the gateway refuses it to a token carrying an `ns` \
-                     claim",
+                     is fleet-global, and it was refused to this namespace-scoped token",
                 )
                 .remedy(
-                    "Expected on Ferrum Edge v0.9.16 and later. This environment's token is \
-                     scoped by its namespace filter, and apply, rotate, review and drift \
-                     checks use only routes open to it; the post-apply convergence line \
-                     reports the cluster view as unavailable. Read cluster state with a \
-                     separate operator credential outside GitForgeOps; do not widen this \
-                     environment's token.",
+                    "Ferrum Edge v0.9.16 and later refuse fleet-global routes to a token with \
+                     an `ns` claim, and a proxy or firewall that blocks /cluster in front of \
+                     the admin API answers the same way. This environment's token claims the \
+                     namespaces its runs touch, and apply, rotate, review and drift checks use \
+                     only routes open to it; the post-apply convergence line reports the \
+                     cluster view as unavailable. Read cluster state with a separate operator \
+                     credential outside GitForgeOps; do not widen this environment's token.",
                 ),
             ];
         }

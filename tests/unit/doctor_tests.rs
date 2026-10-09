@@ -15,9 +15,12 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
 use gitforgeops::config::env::GatewayMode;
-use gitforgeops::config::EnvConfig;
+use gitforgeops::config::{resolve_env, EnvConfig, GatewayConfig, RepoConfig};
+use gitforgeops::diff::state_key;
 use gitforgeops::doctor::local::RepositoryKind;
 use gitforgeops::doctor::{self, Check, Report, Scope, Status};
+use gitforgeops::reconcile::resolved_namespaces;
+use gitforgeops::state::StateFile;
 use tempfile::TempDir;
 
 const SECRET: &str = "super-secret-signing-key-that-is-long-enough";
@@ -457,7 +460,7 @@ fn stub_env(url: String) -> EnvConfig {
 async fn the_gateway_scope_issues_reads_only() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let url = spawn_gateway_stub(200, Arc::clone(&requests));
-    let checks = doctor::gateway::run("production", &stub_env(url)).await;
+    let checks = doctor::gateway::run("production", &stub_env(url), &[]).await;
 
     assert_eq!(find(&checks, "gateway-transport").status, Status::Pass);
     assert_eq!(find(&checks, "gateway-reachable").status, Status::Pass);
@@ -496,7 +499,7 @@ async fn a_rejected_token_is_reported_with_the_claim_settings_to_compare() {
     let url = spawn_gateway_stub(401, Arc::clone(&requests));
     let mut env = stub_env(url);
     env.admin_jwt_issuer = "wrong-issuer".to_string();
-    let checks = doctor::gateway::run("production", &env).await;
+    let checks = doctor::gateway::run("production", &env, &[]).await;
 
     // `/health` is unauthenticated, so reaching it proves nothing about the
     // token: the gateway is reachable AND rejects the token, and the report
@@ -521,7 +524,7 @@ async fn a_server_error_mentioning_401_is_not_a_rejected_token() {
     );
     let mut env = stub_env(url);
     env.gateway_max_retries = 0;
-    let checks = doctor::gateway::run("production", &env).await;
+    let checks = doctor::gateway::run("production", &env, &[]).await;
     assert_eq!(find(&checks, "gateway-token").status, Status::Unknown);
 }
 
@@ -533,7 +536,7 @@ async fn an_accepted_token_with_an_unparseable_cluster_body_still_passes() {
         Some(r#"{"mode":"cp","data_planes":"three"}"#),
         Arc::clone(&requests),
     );
-    let checks = doctor::gateway::run("production", &stub_env(url)).await;
+    let checks = doctor::gateway::run("production", &stub_env(url), &[]).await;
     let token = find(&checks, "gateway-token");
     assert_eq!(token.status, Status::Pass);
     assert!(
@@ -546,7 +549,7 @@ async fn an_accepted_token_with_an_unparseable_cluster_body_still_passes() {
 #[tokio::test]
 async fn an_unreachable_gateway_leaves_the_token_question_unknown() {
     let env = stub_env("http://127.0.0.1:1".to_string());
-    let checks = doctor::gateway::run("production", &env).await;
+    let checks = doctor::gateway::run("production", &env, &[]).await;
     assert_eq!(find(&checks, "gateway-reachable").status, Status::Fail);
     // Not attempted, and said so rather than silently missing from the report.
     assert_eq!(find(&checks, "gateway-token").status, Status::Unknown);
@@ -558,13 +561,13 @@ async fn file_mode_skips_the_gateway_scope_rather_than_failing_it() {
         gateway_mode: GatewayMode::File,
         ..EnvConfig::default()
     };
-    let checks = doctor::gateway::run("sandbox", &env).await;
+    let checks = doctor::gateway::run("sandbox", &env, &[]).await;
     assert_eq!(find(&checks, "gateway-reachable").status, Status::Skipped);
 }
 
 #[tokio::test]
 async fn the_gateway_scope_without_credentials_is_unknown() {
-    let checks = doctor::gateway::run("production", &api_env()).await;
+    let checks = doctor::gateway::run("production", &api_env(), &[]).await;
     assert_eq!(find(&checks, "gateway-reachable").status, Status::Unknown);
 }
 
@@ -661,6 +664,11 @@ fn scoped_env(url: String) -> EnvConfig {
     }
 }
 
+/// The `ns` claim a run of [`scoped_env`] mints: its namespace filter.
+fn team_alpha() -> Vec<String> {
+    vec!["team-alpha".to_string()]
+}
+
 #[tokio::test]
 async fn a_namespace_scoped_token_refused_on_cluster_is_proven_on_namespaces() {
     // Edge v0.9.16 refuses every fleet-global route, /cluster included, to a
@@ -686,7 +694,7 @@ async fn a_namespace_scoped_token_refused_on_cluster_is_proven_on_namespaces() {
         },
         Arc::clone(&requests),
     );
-    let checks = doctor::gateway::run("production", &scoped_env(url)).await;
+    let checks = doctor::gateway::run("production", &scoped_env(url), &team_alpha()).await;
 
     assert_eq!(find(&checks, "gateway-reachable").status, Status::Pass);
     let token = find(&checks, "gateway-token");
@@ -733,7 +741,7 @@ async fn a_full_cluster_view_is_kept_when_the_scoped_token_can_read_it() {
         },
         Arc::clone(&requests),
     );
-    let checks = doctor::gateway::run("production", &scoped_env(url)).await;
+    let checks = doctor::gateway::run("production", &scoped_env(url), &team_alpha()).await;
     let token = find(&checks, "gateway-token");
     assert_eq!(token.status, Status::Pass);
     assert!(
@@ -759,7 +767,7 @@ async fn a_namespace_scoped_token_rejected_on_namespaces_too_is_a_rejected_token
         },
         Arc::clone(&requests),
     );
-    let checks = doctor::gateway::run("production", &scoped_env(url)).await;
+    let checks = doctor::gateway::run("production", &scoped_env(url), &team_alpha()).await;
     let token = find(&checks, "gateway-token");
     assert_eq!(token.status, Status::Fail);
     let remediation = token.remediation.as_deref().expect("remediation");
@@ -785,7 +793,7 @@ async fn a_cluster_refusal_of_a_token_without_an_ns_claim_is_still_a_rejected_to
     );
     let mut env = scoped_env(url);
     env.namespace_filter = None;
-    let checks = doctor::gateway::run("production", &env).await;
+    let checks = doctor::gateway::run("production", &env, &[]).await;
     assert_eq!(find(&checks, "gateway-token").status, Status::Fail);
     assert!(!has(&checks, "gateway-cluster-view"));
     let seen = requests.lock().expect("lock").clone();
@@ -809,7 +817,7 @@ async fn a_minimal_health_tier_leaves_the_write_state_unknown() {
         },
         Arc::clone(&requests),
     );
-    let checks = doctor::gateway::run("production", &scoped_env(url)).await;
+    let checks = doctor::gateway::run("production", &scoped_env(url), &team_alpha()).await;
     let reachable = find(&checks, "gateway-reachable");
     assert_eq!(reachable.status, Status::Pass);
     assert!(
@@ -823,6 +831,100 @@ async fn a_minimal_health_tier_leaves_the_write_state_unknown() {
     assert!(remediation.contains("`ns` claim"), "{remediation}");
     assert!(remediation.contains("tenant"), "{remediation}");
     assert!(checks.iter().all(|check| check.status != Status::Fail));
+}
+
+// -- doctor probes with the token the environment's runs mint --------------
+
+/// An environment-file environment with no namespace filter, shared mode.
+const UNFILTERED_SHARED: &str = r#"
+version: 1
+environments:
+  production:
+    ownership:
+      mode: shared
+"#;
+
+/// An environment-file environment with no namespace filter, exclusive mode.
+const UNFILTERED_EXCLUSIVE: &str = r#"
+version: 1
+environments:
+  production:
+    ownership:
+      mode: exclusive
+      namespaces: [team-alpha, team-beta]
+"#;
+
+/// The namespaces a run of the one environment in `config_yaml` claims,
+/// resolved as `cmd_doctor` and `apply` resolve them: the environment comes
+/// from the environment file (no `FERRUM_NAMESPACE`), and the claim from
+/// `resolved_namespaces` over the desired configuration and the state ledger.
+fn run_token_namespaces(config_yaml: &str, env: &EnvConfig, state: &StateFile) -> Vec<String> {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("config.yaml");
+    std::fs::write(&path, config_yaml).expect("write config");
+    let repo = RepoConfig::load_from_path(&path).unwrap().unwrap();
+    let resolved = resolve_env(Some(&repo), env, None).unwrap();
+    assert_eq!(resolved.name, "production");
+    assert_eq!(resolved.namespace_filter, None, "the environment has no filter");
+    resolved_namespaces(&resolved, &GatewayConfig::default(), state)
+}
+
+#[tokio::test]
+async fn an_unfiltered_shared_environment_is_probed_with_the_namespaces_its_runs_claim() {
+    // Without a namespace filter, a shared-mode run still mints an `ns` claim:
+    // every declared and previously managed namespace. Doctor must probe with
+    // that token, not a claim-less fleet-global one, or a gateway that bounds
+    // `ns` tokens passes doctor and then refuses the environment's runs.
+    let mut state = StateFile::default();
+    for ns in ["team-beta", "team-alpha"] {
+        let key = state_key(ns, "Proxy", "orders");
+        state.resources.insert(key, "managed".to_string());
+    }
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_edge_stub(
+        |request| {
+            if request.starts_with("GET /health") {
+                (200, TENANT_HEALTH)
+            } else if request.starts_with("GET /cluster") {
+                if ns_claim(request).is_null() {
+                    (200, r#"{"mode":"database","message":"no cluster"}"#)
+                } else {
+                    (403, FLEET_GLOBAL_REFUSAL)
+                }
+            } else if request.starts_with("GET /namespaces") {
+                (200, r#"{"data":["team-alpha","team-beta"]}"#)
+            } else {
+                (404, r#"{"error":"not found"}"#)
+            }
+        },
+        Arc::clone(&requests),
+    );
+    let env = EnvConfig {
+        gateway_max_retries: 0,
+        ..stub_env(url)
+    };
+    let namespaces = run_token_namespaces(UNFILTERED_SHARED, &env, &state);
+    assert_eq!(namespaces, ["team-alpha", "team-beta"]);
+
+    let checks = doctor::gateway::run("production", &env, &namespaces).await;
+    // A claim-less token would have read /cluster. The run's token is refused
+    // it and proven on /namespaces, as the environment's runs would be.
+    assert_eq!(find(&checks, "gateway-token").status, Status::Pass);
+    let cluster = find(&checks, "gateway-cluster-view");
+    assert_eq!(cluster.status, Status::Skipped);
+    let seen = requests.lock().expect("lock").clone();
+    assert!(seen.iter().any(|line| line.starts_with("GET /cluster")));
+    let claim = serde_json::json!(["team-alpha", "team-beta"]);
+    for request in &seen {
+        assert_eq!(ns_claim(request), claim);
+    }
+}
+
+#[test]
+fn an_unfiltered_exclusive_environment_claims_its_owned_namespaces() {
+    let state = StateFile::default();
+    let namespaces = run_token_namespaces(UNFILTERED_EXCLUSIVE, &api_env(), &state);
+    assert_eq!(namespaces, ["team-alpha", "team-beta"]);
 }
 
 // -- no secret value is ever printed ---------------------------------------
@@ -842,7 +944,7 @@ async fn no_rendered_output_contains_a_credential_value() {
 
     let mut report = Report::default();
     report.extend(doctor::local::run(dir.path(), Some(&env)));
-    report.extend(doctor::gateway::run("production", &env).await);
+    report.extend(doctor::gateway::run("production", &env, &[]).await);
 
     let text = report.render_text();
     let json = gitforgeops::json_output::pretty(&report).expect("json");

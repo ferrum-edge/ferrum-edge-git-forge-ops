@@ -1152,7 +1152,18 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
     match client.get_health().await {
         Ok(health) => match http_client::write_block_reason(&health) {
             Some(reason) => Err(crate::error::Error::GatewayReadOnly(reason)),
-            None => Ok(()),
+            None => {
+                // The minimal tier: the write state is unknown. The preflight
+                // stays advisory, and the first refused write reports it.
+                if health.admin_writes_enabled.is_none() {
+                    eprintln!(
+                        "Warning: admin preflight GET /health did not report \
+                         admin_writes_enabled; continuing. {}",
+                        http_client::health_tier_remedy(client.is_namespace_bounded())
+                    );
+                }
+                Ok(())
+            }
         },
         Err(crate::error::Error::GatewayReadOnly(reason)) => {
             Err(crate::error::Error::GatewayReadOnly(reason))

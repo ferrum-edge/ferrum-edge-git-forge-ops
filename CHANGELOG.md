@@ -93,20 +93,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Work with Ferrum Edge v0.9.16's namespace-bounded admin tokens
   ([ferrum-edge#6095](https://github.com/ferrum-edge/ferrum-edge/issues/6095)).
-  Edge v0.9.16 limits an admin JWT with an `ns` claim to namespace-scoped
-  routes and a short allowlist, and every other fleet-global route answers
-  `403`. GitForgeOps works against both v0.9.15 and v0.9.16 with no new setting
-  and no wider token:
+  Edge v0.9.16 and later limit an admin JWT with an `ns` claim to
+  namespace-scoped routes and a short allowlist, and every other fleet-global
+  route answers `403`. GitForgeOps works against v0.9.15 and against v0.9.16
+  and later with no new setting and no wider token:
   - `rotate` reads `admin_writes_enabled` from the detailed `/health` tier
-    (v0.9.15) or the tenant tier (v0.9.16). A minimal-tier body without it now
-    refuses before any broker or gateway write, with the new
-    `GatewayWriteStateUnknown` error and a remedy. It no longer fails as
-    unavailable conditional evidence.
-  - `doctor --scope gateway` mints its token with the environment's namespace
-    filter as the `ns` claim, as `apply` does. A `403` from fleet-global
-    `GET /cluster` to that token is proven on `GET /namespaces` instead of
-    being reported as a rejected token. The cluster view is reported as `SKIP`
-    with the reason, and a missing write state is reported as `UNKNOWN`.
+    (v0.9.15) or the tenant tier (v0.9.16 and later). A minimal-tier body
+    without it now refuses before any broker or gateway write, with the new
+    `GatewayWriteStateUnknown` error and a remedy naming both causes: a token
+    the gateway did not accept, or a gateway without the tenant tier. It no
+    longer fails as unavailable conditional evidence. `apply` keeps its
+    advisory preflight and prints a warning with the same remedy.
+  - `doctor --scope gateway` mints exactly the token the environment's runs
+    send: its `ns` claim is the namespace list `apply` reconciles, so an
+    environment without a namespace filter is probed with its owned (exclusive)
+    or declared and previously managed (shared) namespaces, not a claim-less
+    token. A `403` from fleet-global `GET /cluster` to a namespace-scoped token
+    is proven on `GET /namespaces` instead of being reported as a rejected
+    token. The cluster view is reported as `SKIP` with the reason, and a
+    missing write state is reported as `UNKNOWN`.
   - The post-apply convergence line says when `/cluster` is not served to the
     run's namespace-scoped token.
   - [Namespace-scoped admin tokens](docs/reference.md#namespace-scoped-admin-tokens)
