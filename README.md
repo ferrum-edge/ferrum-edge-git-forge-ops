@@ -833,7 +833,7 @@ gitforgeops doctor --format json
 | --- | --- | --- |
 | `local` (default) | nothing | config and overlays, template vs deployment repository, resource tree, policy file, validator binary and digest, per-mode requirements, environment variables |
 | `github` (default) | `GH_TOKEN` with Administration: read | runs `audit_settings.py` (the same audit the bootstrap and `settings-audit.yml` use): rulesets, App bypass, environments, labels, required checks |
-| `gateway` (opt-in) | the environment's credentials | `GET /health` (connectivity, TLS, writes enabled) and `GET /cluster` (proves the JWT secret and claims are accepted) |
+| `gateway` (opt-in) | the environment's credentials | `GET /health` (connectivity, TLS, writes enabled) and `GET /cluster` (proves an unbounded token is accepted); for namespace-scoped tokens, the bounded health tier can confirm token acceptance when `/cluster` is forbidden |
 
 Each check is `PASS`, `FAIL`, `WARN`, `UNKNOWN` (could not be performed, for
 example without a token; never counted as a pass) or `SKIP` (does not apply,

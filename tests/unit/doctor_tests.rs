@@ -372,10 +372,9 @@ fn github_doctor_uses_its_bundled_auditor_when_checkout_copy_is_missing() {
 /// Answer `GET /health` and `GET /cluster` the way Ferrum Edge does, recording
 /// every request line so a test can prove nothing was mutated.
 ///
-/// `/health` is unauthenticated on the real gateway — it answers 200 whatever
-/// token is presented — so only `/cluster`, which sits behind the admin JWT
-/// gate, takes `status`. A stub that rejected `/health` would test a gateway
-/// that does not exist, and let a token check pass on the one that does.
+/// The basic `/health` tier is unauthenticated on the real gateway. Its
+/// `admin_writes_enabled` detail is available to a valid namespace token on
+/// newer Edge releases, while `/cluster` is fleet-global.
 fn spawn_gateway_stub(status: u16, requests: Arc<Mutex<Vec<String>>>) -> String {
     spawn_gateway_stub_with(status, None, requests)
 }
@@ -384,6 +383,15 @@ fn spawn_gateway_stub(status: u16, requests: Arc<Mutex<Vec<String>>>) -> String 
 fn spawn_gateway_stub_with(
     status: u16,
     cluster_body: Option<&'static str>,
+    requests: Arc<Mutex<Vec<String>>>,
+) -> String {
+    spawn_gateway_stub_with_health(status, cluster_body, None, requests)
+}
+
+fn spawn_gateway_stub_with_health(
+    status: u16,
+    cluster_body: Option<&'static str>,
+    health_body: Option<&'static str>,
     requests: Arc<Mutex<Vec<String>>>,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
@@ -413,6 +421,8 @@ fn spawn_gateway_stub_with(
                 requests.lock().expect("lock").push(first.clone());
                 let body = if first.contains("/cluster") {
                     r#"{"mode":"cp","control_plane":null,"data_planes":[]}"#.to_string()
+                } else if let Some(custom) = health_body {
+                    custom.to_string()
                 } else {
                     r#"{"status":"ok","ready":true,"mode":"cp","admin_writes_enabled":true}"#
                         .to_string()
@@ -441,6 +451,44 @@ fn spawn_gateway_stub_with(
         }
     });
     format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn a_scoped_token_can_use_the_bounded_health_tier_when_cluster_is_forbidden() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_gateway_stub(403, Arc::clone(&requests));
+    let env = EnvConfig {
+        namespace_filter: Some("ferrum".to_string()),
+        ..stub_env(url)
+    };
+
+    let checks = doctor::gateway::run("production", &env).await;
+    let token = find(&checks, "gateway-token");
+    assert_eq!(token.status, Status::Pass);
+    assert!(token.detail.contains("bounded GET /health"), "{}", token.detail);
+    assert!(requests
+        .lock()
+        .expect("lock")
+        .iter()
+        .any(|line| line.starts_with("GET /cluster ")));
+}
+
+#[tokio::test]
+async fn a_scoped_cluster_refusal_without_bounded_health_fields_does_not_accept_the_token() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_gateway_stub_with_health(
+        403,
+        None,
+        Some(r#"{"status":"ok","ready":true}"#),
+        Arc::clone(&requests),
+    );
+    let env = EnvConfig {
+        namespace_filter: Some("ferrum".to_string()),
+        ..stub_env(url)
+    };
+
+    let checks = doctor::gateway::run("production", &env).await;
+    assert_eq!(find(&checks, "gateway-token").status, Status::Fail);
 }
 
 fn stub_env(url: String) -> EnvConfig {

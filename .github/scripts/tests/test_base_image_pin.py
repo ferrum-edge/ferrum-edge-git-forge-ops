@@ -190,18 +190,29 @@ class RealDockerfileTests(unittest.TestCase):
     def test_the_live_dockerfile_keeps_the_libpcre2_fix_until_base_metadata_is_verified(self):
         self.assertEqual(
             self.pin.versions_by_name(),
-            {"libpcre2-8-0": {"amd64": "10.46-1~deb13u3", "arm64": "10.46-1~deb13u3"}},
+            {
+                "libpcre2-8-0": {"amd64": "10.46-1~deb13u3", "arm64": "10.46-1~deb13u3"},
+                "liblzma5": {
+                    "amd64": "5.8.1-1+deb13u2",
+                    "arm64": "5.8.1-1+deb13u2",
+                },
+            },
         )
         self.assertEqual(
-            {package.arch: package.digest for package in self.pin.packages},
+            {(package.name, package.arch): package.digest for package in self.pin.packages},
             {
-                "amd64": "e226f661d918f04daf38cdbc4806b7ed7d6ef95c7eb0ade692fc350e31970040",
-                "arm64": "1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7",
+                ("libpcre2-8-0", "amd64"): "e226f661d918f04daf38cdbc4806b7ed7d6ef95c7eb0ade692fc350e31970040",
+                ("libpcre2-8-0", "arm64"): "1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7",
+                ("liblzma5", "amd64"): "b38acab30f295bf1066a6632e31cbd0a1980f2924b38040cda131d5dea5384ec",
+                ("liblzma5", "arm64"): "88f3aa499dc30edf01b9209ab40f11e37edfbecef971f84f4721de1874ed4827",
             },
         )
         self.assertEqual(
             self.pin.pools,
-            {"libpcre2-8-0": "pool/updates/main/p/pcre2"},
+            {
+                "libpcre2-8-0": "pool/updates/main/p/pcre2",
+                "liblzma5": "pool/updates/main/x/xz-utils",
+            },
         )
         self.assertEqual(self.pin.mirror, "https://deb.debian.org/debian-security/")
         instructions = "\n".join(
