@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   scope:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       relevant: ${{ steps.classify.outputs.relevant }}
     steps:
@@ -89,7 +89,7 @@ jobs:
   list-envs:
     needs: scope
     if: needs.scope.outputs.relevant == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       envs: ${{ steps.list.outputs.envs }}
     steps:
@@ -131,7 +131,7 @@ jobs:
   validate:
     needs: list-envs
     if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -210,7 +210,7 @@ jobs:
   # this job fast and self-contained: the Alloy consumer qualification lives in
   # the non-required alloy-consumer.yml workflow.
   validator-pairing:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -244,7 +244,7 @@ jobs:
     name: gitforgeops-required-static-validation
     if: always()
     needs: [validator-pairing, scope, list-envs, validate]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       PAIRING_RESULT: ${{ needs.validator-pairing.result }}
       SCOPE_RESULT: ${{ needs.scope.result }}

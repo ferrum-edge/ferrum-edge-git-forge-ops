@@ -775,7 +775,7 @@ What the checker enforces for this check:
   action commits and the Rust toolchain (pinned by their own rules) are free.
   A workflow-level `env:` or `defaults:` in `security.yml` is refused, since
   either reaches the job's shell without appearing in it. The pinned shape
-  also fixes `runs-on: ubuntu-24.04`, and `security.yml`'s `on:` triggers are
+  also fixes `runs-on: ubuntu-26.04`, and `security.yml`'s `on:` triggers are
   pinned to the reviewed events (the `pull_request` types and branch, the
   `push` branch and the `schedule`): a runner-image bump or an added trigger
   such as `workflow_dispatch` — which could post a second

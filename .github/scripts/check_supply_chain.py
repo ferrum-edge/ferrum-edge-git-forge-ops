@@ -2108,7 +2108,7 @@ SUPPLY_CHAIN_POLICY_SHAPE = (
     "  cancel-in-progress: true",
     "jobs:",
     f"  {SUPPLY_CHAIN_POLICY_JOB}:",
-    "    runs-on: ubuntu-24.04",
+    "    runs-on: ubuntu-26.04",
     "    timeout-minutes: 10",
     "    steps:",
     "      - name: Check out protected supply-chain policy",
@@ -3891,7 +3891,7 @@ PINNED_RUST_TOOLCHAIN = "<rust toolchain>"
 # `SUPPLY_CHAIN_POLICY_SHAPE`: only action commits (the repository-wide rule
 # and `CARGO_AUDIT_ACTIONS` judge them) and the toolchain are free.
 CARGO_AUDIT_JOB_SHAPE = {
-    "runs-on": "ubuntu-24.04",
+    "runs-on": "ubuntu-26.04",
     "permissions": {"contents": "read"},
     "steps": [
         {
@@ -5169,7 +5169,7 @@ def main(argv: list[str] | None = None) -> int:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: read
@@ -5333,7 +5333,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest = {
             "schema_version": 1,
             "source_sha": os.environ.get("GITHUB_SHA", "local"),
-            "runner_image": "ubuntu-24.04",
+            "runner_image": "ubuntu-26.04",
             "rust_toolchain": rust_channel,
             "actions": action_pins,
             "docker_bases": FROM.findall(dockerfile),
