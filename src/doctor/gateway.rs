@@ -5,14 +5,13 @@
 //! then three questions are asked:
 //!
 //! * `GET /health` — is the gateway reachable over this transport, and does it
-//!   accept admin writes? The basic tier is unauthenticated. A namespace-bounded
-//!   token on newer Edge releases also gets a small health tier; its
-//!   `admin_writes_enabled` field proves that scoped token was accepted.
-//! * `GET /cluster` — does the gateway accept an unbounded token? This fleet-global
-//!   route is forbidden to namespace-bounded tokens on newer Edge releases. A
-//!   403 is accepted as expected only when the bounded health tier was returned.
-//!   The local `admin-jwt-claims` check still enforces the `admin` role needed by
-//!   `/backup` and writes.
+//!   accept admin writes? Ferrum Edge serves `/health` **without
+//!   authentication**, so an answer here says nothing about the token.
+//! * `GET /cluster` — does the gateway accept the token we mint? It sits behind
+//!   the admin JWT gate with no role requirement, so a 401/403 there is the
+//!   signing secret or a claim being wrong, and a 200 proves the gateway
+//!   accepts the token. It does not prove the role: `/backup` and every write
+//!   need `admin`, which the local `admin-jwt-claims` check enforces.
 //! * `GET /namespaces`, one list page and one single-resource `GET` — does the
 //!   gateway issue the strong `ETag` incremental apply needs to send every
 //!   overwrite conditionally? This checks for the tag only; it does not test
@@ -59,7 +58,7 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
         )];
     }
 
-    let client = match AdminClient::new_scoped(env, env.namespace_filter.iter()) {
+    let client = match AdminClient::new_scoped(env, std::iter::empty::<&str>()) {
         Ok(client) => client,
         Err(error) => {
             return vec![Check::new(
@@ -87,11 +86,8 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
     )
     .for_environment(environment)];
 
-    let mut bounded_health_tier = false;
     match client.get_health().await {
         Ok(health) => {
-            bounded_health_tier = env.namespace_filter.is_some()
-                && health.admin_writes_enabled.is_some();
             checks.push(
                 Check::pass(
                     "gateway-reachable",
@@ -166,9 +162,8 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
         }
     }
 
-    // `/cluster` remains the token probe for fleet-wide environments and for
-    // older Edge releases. Newer Edge releases reject namespace-bounded tokens
-    // here; their detailed health tier is the token evidence for that case.
+    // The authenticated half. `/cluster` passes the admin JWT gate and has no
+    // role requirement, so its answer is about the token and nothing else.
     // Classification keys on the typed status, never on the error text: that
     // text carries the gateway's body and, for transport errors, the URL, so a
     // `401`/`403` substring there proves nothing.
@@ -198,64 +193,41 @@ pub async fn run(environment: &str, env: &EnvConfig) -> Vec<Check> {
                     ..
                 }
             );
-            let bounded_cluster_refusal = bounded_health_tier
-                && matches!(
-                    error,
-                    crate::error::Error::ApiError {
-                        status: 403,
-                        ..
-                    }
-                );
-            if bounded_cluster_refusal {
-                checks.push(
-                    Check::pass(
-                        "gateway-token",
-                        "Gateway accepts our admin token",
-                        Scope::Gateway,
-                        "GET /cluster is outside the namespace token's scope; the bounded \
-                         GET /health tier accepted the scoped token",
-                    )
-                    .for_environment(environment),
-                );
-                // The expected denial is specific to the token's route ceiling.
-                // Do not expose or parse the fleet-global cluster response.
-            } else {
-                let message = error.to_string();
-                checks.push(
-                    Check::new(
-                        "gateway-token",
-                        "Gateway accepts our admin token",
-                        Scope::Gateway,
-                        if rejected {
-                            Status::Fail
-                        } else {
-                            Status::Unknown
-                        },
-                        format!("GET /cluster failed: {message}"),
-                    )
-                    .for_environment(environment)
-                    .remedy(if rejected {
-                        // The four claim settings are the usual cause, and an
-                        // unset one means "use the default", not "send nothing".
-                        format!(
-                            "The gateway was reached but rejected the token. The signing \
-                             secret and every claim must equal the gateway's own \
-                             configuration: issuer={}, role={}, audience={}, ttl={}s. \
-                             `/backup` and `/restore` are admin-only, and a gateway with no \
-                             audience rejects a token that carries one.",
-                            env.admin_jwt_issuer,
-                            env.admin_jwt_role,
-                            env.admin_jwt_audience.as_deref().unwrap_or("<unset>"),
-                            env.admin_jwt_ttl_secs,
-                        )
+            let message = error.to_string();
+            checks.push(
+                Check::new(
+                    "gateway-token",
+                    "Gateway accepts our admin token",
+                    Scope::Gateway,
+                    if rejected {
+                        Status::Fail
                     } else {
-                        "The authenticated read did not complete, so whether the gateway \
-                         accepts this token is not known. Re-run once the gateway answers \
-                         GET /cluster."
-                            .to_string()
-                    }),
-                );
-            }
+                        Status::Unknown
+                    },
+                    format!("GET /cluster failed: {message}"),
+                )
+                .for_environment(environment)
+                .remedy(if rejected {
+                    // The four claim settings are the usual cause, and an
+                    // unset one means "use the default", not "send nothing".
+                    format!(
+                        "The gateway was reached but rejected the token. The signing \
+                         secret and every claim must equal the gateway's own \
+                         configuration: issuer={}, role={}, audience={}, ttl={}s. \
+                         `/backup` and `/restore` are admin-only, and a gateway with no \
+                         audience rejects a token that carries one.",
+                        env.admin_jwt_issuer,
+                        env.admin_jwt_role,
+                        env.admin_jwt_audience.as_deref().unwrap_or("<unset>"),
+                        env.admin_jwt_ttl_secs,
+                    )
+                } else {
+                    "The authenticated read did not complete, so whether the gateway \
+                     accepts this token is not known. Re-run once the gateway answers \
+                     GET /cluster."
+                        .to_string()
+                }),
+            );
         }
     }
 

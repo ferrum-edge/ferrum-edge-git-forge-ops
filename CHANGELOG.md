@@ -94,10 +94,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Cover Trivy alerts #299 (DSA-6549-1) and #300 (GHSA-5qpq-xqfv-j9pg) with
   checksum-pinned Debian Trixie `liblzma5` `5.8.1-1+deb13u2` updates for amd64
   and arm64 (the affected library comes from the `xz-utils` source package).
-  Keep the base image and ferrum-edge v0.9.15 pins unchanged. `doctor` now
-  recognizes the bounded `/health` tier as token evidence when a
-  namespace-scoped token receives the expected 403 from fleet-global
-  `/cluster`, preserving compatibility with Edge v0.9.15 and v0.9.16 (#6095).
+  Keep the base image and ferrum-edge v0.9.15 pins unchanged.
 - Refresh the Ferrum Edge validator and bundled gateway pins to published
   v0.9.15: validator SHA-256
   `69ae2402e1741d96b48ce0011d94088c9a4ec8240019e9dbb17d596cfa2082c5` and
