@@ -228,13 +228,12 @@ impl PreparedConsumerRotation {
         credential: &str,
         expected_target: Option<&str>,
     ) -> Result<Self> {
+        // A namespace-scoped token reads the write state from Edge's detailed
+        // tier through v0.9.15 and from its tenant tier on v0.9.16 and later.
+        // Without it (the minimal tier) the write state is unknown, and
+        // rotation never publishes a secret on an unknown write state.
         let health = client.get_health().await?;
-        if let Some(reason) = super::write_block_reason(&health) {
-            return Err(Error::GatewayReadOnly(reason));
-        }
-        if health.admin_writes_enabled != Some(true) {
-            return Err(invalid());
-        }
+        super::require_writes_enabled(&health, client.is_namespace_bounded())?;
         let evidence = client
             .get_consumer_verification(&current.id, &current.namespace)
             .await?

@@ -1154,12 +1154,10 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
 
 /// Best-effort post-apply convergence line. Never fails an apply — a gateway
 /// that cannot answer `GET /cluster` (older build, DP/CP not in play, network
-/// blip) produces one "unavailable" line and nothing else.
+/// blip, or a fleet-global refusal of this run's namespace-scoped token)
+/// produces one "unavailable" line and nothing else.
 async fn convergence_line(client: &AdminClient) -> String {
-    match client.get_cluster().await {
-        Ok(status) => gitforgeops::http_client::convergence_summary(&status),
-        Err(_) => gitforgeops::http_client::CONVERGENCE_UNAVAILABLE.to_string(),
-    }
+    client.convergence_report().await
 }
 
 fn fmt_resolution_note(resolved: &ResolvedEnv, report: &secrets::ResolveReport) -> Option<String> {
@@ -4528,7 +4526,37 @@ async fn cmd_doctor(
     if selected.contains(&cli::DoctorScope::Gateway) {
         match (&env_config, resolve_runtime(explicit_env)) {
             (Some(env), Ok((_, resolved, _))) => {
-                report.extend(doctor::gateway::run(&resolved.name, env).await);
+                // Probe with exactly the token the environment's runs mint:
+                // its `ns` claim is the namespace list apply, plan, review and
+                // drift checks reconcile. Without a namespace filter that is
+                // still a claim (the owned namespaces, or the declared and
+                // previously managed ones), never a fleet-global token.
+                let mut env = env.clone();
+                env.namespace_filter = resolved.namespace_filter.clone();
+                match doctor_token_namespaces(&resolved, &env) {
+                    Ok(namespaces) => {
+                        let checks = doctor::gateway::run(&resolved.name, &env, &namespaces).await;
+                        report.extend(checks);
+                    }
+                    Err(error) => report.push(
+                        Check::new(
+                            "gateway-token-scope",
+                            "The environment's token scope resolves",
+                            Scope::Gateway,
+                            Status::Unknown,
+                            format!(
+                                "the namespaces this environment's runs claim could not be \
+                                 resolved, so no gateway check ran: {error}"
+                            ),
+                        )
+                        .for_environment(&resolved.name)
+                        .remedy(
+                            "Doctor probes with the token apply mints, whose `ns` claim comes \
+                             from the resources and the state ledger. Fix the error above \
+                             (`gitforgeops validate` reports it too) and re-run.",
+                        ),
+                    ),
+                }
             }
             (_, Err(error)) => report.push(
                 Check::new(
@@ -4558,6 +4586,18 @@ async fn cmd_doctor(
         process::exit(report.exit_code());
     }
     Ok(())
+}
+
+/// The `ns` claim a run of `resolved` mints: [`resolved_namespaces`] over the
+/// assembled desired configuration and the state ledger, exactly as `apply`,
+/// `plan`, `review` and `diff` compute it. Reads only.
+fn doctor_token_namespaces(
+    resolved: &ResolvedEnv,
+    env_config: &EnvConfig,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let desired = load_and_assemble_for(resolved, env_config)?;
+    let state = StateFile::load(&resolved.name)?;
+    Ok(resolved_namespaces(resolved, &desired, &state))
 }
 
 fn cmd_version(format: cli::ReportFormat) -> Result<(), Box<dyn std::error::Error>> {

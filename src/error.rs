@@ -102,6 +102,14 @@ pub enum Error {
     #[error("gateway admin API is read-only, refusing to apply: {}", safe_block(.0))]
     GatewayReadOnly(String),
 
+    /// `GET /health` did not report `admin_writes_enabled`, so whether the
+    /// admin plane accepts config writes is unknown. Raised by operations that
+    /// must establish a writable plane before an irreversible step (consumer
+    /// credential rotation publishes a secret before its gateway write).
+    /// Carries the actionable remediation.
+    #[error("{}", safe_block(.0))]
+    GatewayWriteStateUnknown(String),
+
     /// `POST /restore` refused because the namespace holds API specs the
     /// payload would delete. Carries the actionable remediation.
     #[error("{}", safe_block(.0))]

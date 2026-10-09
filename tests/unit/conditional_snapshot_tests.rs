@@ -1009,6 +1009,109 @@ async fn rotation_establishes_health_and_exact_fields_before_delivery_and_fences
     }
 }
 
+/// The `ns` claim of the admin token a recorded request carried.
+fn ns_claim(request: &str) -> Value {
+    use base64::Engine as _;
+    let token = request
+        .lines()
+        .find_map(|line| line.strip_prefix("authorization: Bearer "))
+        .expect("authorization header");
+    let payload = token.split('.').nth(1).expect("JWT payload");
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .expect("base64url payload");
+    let claims: Value = serde_json::from_slice(&decoded).expect("JSON claims");
+    claims["ns"].clone()
+}
+
+#[tokio::test]
+async fn rotation_reads_the_write_state_from_the_detailed_or_tenant_health_tier() {
+    // A rotation client's token carries an `ns` claim. Ferrum Edge v0.9.15
+    // serves it the detailed `/health` tier; v0.9.16 serves it the tenant
+    // tier (`mode`, `admin_writes_enabled`, `namespace`, nothing fleet-wide).
+    // Either reports the write state, and every namespace-scoped request stays
+    // inside the claim, as v0.9.16 requires.
+    let current = consumer();
+    let raw = serde_json::to_value(&current).unwrap();
+    let tenant = json!({
+        "status": "ok", "ready": true, "mode": "database", "admin_writes_enabled": true,
+        "namespace": {
+            "active": NS, "serving_scope": "single_namespace_data_plane",
+            "data_plane_single_namespace": true
+        }
+    });
+    let detailed = json!({
+        "status": "ok", "ready": true, "mode": "database", "admin_writes_enabled": true,
+        "database": {"status": "connected", "type": "postgres"},
+        "cached_config": {"available": false}
+    });
+    for health in [tenant, detailed] {
+        let served = raw.clone();
+        let (client, requests) = gateway(move |request, _| {
+            if request.starts_with("GET /health") {
+                (200, health.to_string(), vec![])
+            } else if request.starts_with("GET /consumers/c1/verification ") {
+                verified(&served, ROW_TAG)
+            } else if request.starts_with("PUT /consumers/c1 ") {
+                (200, "{}".to_string(), vec![])
+            } else {
+                panic!("rotation reaches only health and its consumer routes")
+            }
+        });
+        assert!(client.is_namespace_bounded());
+        let key = "keyauth/key";
+        let prepared = PreparedConsumerRotation::prepare(&client, &current, key, Some(SECRET))
+            .await
+            .unwrap();
+        prepared
+            .publish(&client, "tenant-tier-rotation-fixture")
+            .await
+            .unwrap();
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for request in seen.iter() {
+            assert_eq!(ns_claim(request), json!([NS]));
+            if !request.starts_with("GET /health") {
+                let header = format!("x-ferrum-namespace: {NS}\r\n");
+                assert!(request.contains(&header));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rotation_refuses_a_minimal_health_tier_before_any_other_request() {
+    // A gateway that serves the namespace-scoped token only `status` and
+    // `ready` leaves the write state unknown. Rotation publishes the new
+    // secret before its gateway write, so it stops at the health read.
+    let current = consumer();
+    let minimal = json!({"status": "ok", "ready": true}).to_string();
+    let (client, requests) = gateway(move |request, _| {
+        if request.starts_with("GET /health") {
+            (200, minimal.clone(), vec![])
+        } else {
+            panic!("an unknown write state must stop rotation at its health read")
+        }
+    });
+    let key = "keyauth/key";
+    let error = PreparedConsumerRotation::prepare(&client, &current, key, Some(SECRET))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::GatewayWriteStateUnknown(_)
+        ),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("admin_writes_enabled"), "{message}");
+    assert!(message.contains("`ns` claim"), "{message}");
+    assert!(message.contains("tenant tier"), "{message}");
+    assert!(!message.contains(SECRET));
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn basic_rotation_keeps_hmac_opaque_and_committed_not_live_never_records_completion() {
     let mut current = consumer();
@@ -1375,7 +1478,7 @@ async fn doctor_is_get_only_and_reports_missing_consumer_capability_as_unknown()
             panic!("doctor must only use bounded capability reads")
         }
     });
-    let checks = gitforgeops::doctor::gateway::run("fixture", &env).await;
+    let checks = gitforgeops::doctor::gateway::run("fixture", &env, &[]).await;
     assert!(checks.iter().any(|check| {
         check.id == "gateway-conditional-snapshot" && check.status == Status::Pass
     }));

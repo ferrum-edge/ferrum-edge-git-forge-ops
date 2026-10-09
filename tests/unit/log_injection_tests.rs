@@ -246,6 +246,10 @@ fn untrusted_error_variants_cannot_emit_a_workflow_command() {
     );
     check("AmbiguousMutation", Error::AmbiguousMutation(bad.clone()));
     check("GatewayReadOnly", Error::GatewayReadOnly(bad.clone()));
+    check(
+        "GatewayWriteStateUnknown",
+        Error::GatewayWriteStateUnknown(bad.clone()),
+    );
     check("HttpClient", Error::HttpClient(bad.clone()));
     check(
         "CredentialSlotRemap",

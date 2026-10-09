@@ -191,8 +191,56 @@ gateway exactly, or every admin call returns `401`. A blank secret means
 binds none, because it never calls the Admin API.
 
 Minted tokens also carry an `ns` claim listing the namespaces the run touches.
-Only gateways running with `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true` read it,
-and it is omitted when the run covers all namespaces.
+It is omitted only when a run resolves no namespace. Through Ferrum Edge
+v0.9.15, only gateways running with `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM=true`
+read it. Edge v0.9.16 and later read it on every gateway; see
+[Namespace-scoped admin tokens](#namespace-scoped-admin-tokens).
+
+### Namespace-scoped admin tokens
+
+Ferrum Edge v0.9.16 and later treat an admin JWT that carries an `ns` claim as
+a tenant credential, whatever `FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM` says. The token
+reaches the namespace-scoped routes for its claimed namespaces and a short
+allowlist of global routes. Every other fleet-global route answers `403`.
+Earlier releases give the same token full access. GitForgeOps works against
+both without a new setting, and never switches to a token without an `ns`
+claim to get around the boundary.
+
+| Route GitForgeOps calls | Edge v0.9.16 and later, with an `ns` claim | GitForgeOps behaviour |
+|---|---|---|
+| `/backup`, `/restore`, `/batch`, resource CRUD, `/consumers/{id}/verification`, `/config/export` | Allowed for the claimed namespaces | Every request sends an `X-Ferrum-Namespace` inside the claim. |
+| `GET /health` | Allowed. A token with an `ns` claim gets the tenant tier: `mode`, `admin_writes_enabled` and the `namespace` block, nothing fleet-wide | `rotate` reads the write state from the detailed tier (v0.9.15) or the tenant tier (v0.9.16 and later). |
+| `GET /namespaces` | Allowed, filtered to the claim | Used for live-filter hints, the `doctor` entity-tag probe and the `doctor` token check. |
+| `GET /cluster` | `403` (fleet-global) | Post-apply convergence and `doctor` report the cluster view as unavailable to a namespace-scoped credential. |
+
+`GET /health` comes in three tiers. Edge v0.9.15 serves the detailed tier to
+any valid admin JWT. Edge v0.9.16 and later serve the tenant tier to a token
+with an `ns` claim. The minimal tier carries only `status` and `ready`. A gateway serves it
+to an unauthenticated probe, to a token it does not accept for detail, and to
+a namespace-scoped token when the build has no tenant tier. On the minimal
+tier the write state is unknown:
+
+- `rotate` refuses before any broker or gateway write with
+  `GatewayWriteStateUnknown`. Rotation publishes the new secret before its
+  gateway write, so it never starts when the write state is unknown. The error
+  names both causes: the gateway did not accept the token (check the signing
+  secret and claims), or, for a token with an `ns` claim, the gateway has no
+  tenant tier (upgrade it to a release that serves one).
+- `apply` keeps its advisory preflight. It prints a warning with the same
+  remedy and proceeds, and the first refused write reports the truth.
+- `doctor --scope gateway` reports `gateway-writable` as `UNKNOWN`.
+
+`doctor --scope gateway` mints the token the environment's runs send: its
+`ns` claim is the namespace list `apply`, `plan`, `review` and `diff`
+reconcile. With a namespace filter that is the filter. Without one it is the
+owned namespaces in exclusive mode, and the declared and previously managed
+namespaces in shared mode, so an unfiltered environment is probed with a
+namespace-scoped token too. The claim is omitted only when a run would resolve
+no namespace. A `403` from `GET /cluster` to a namespace-scoped token is not
+taken as a rejected token, because a gateway that bounds `ns` tokens and an
+intermediary that blocks `/cluster` both answer that way: the token is proven
+on `GET /namespaces`, and `gateway-cluster-view` is `SKIP` with the reason. To read cluster state, use a separate operator
+credential outside GitForgeOps. Do not widen the environment's token.
 
 `SETTINGS_AUDIT_TOKEN` (Administration: read) belongs to the separate
 `settings-audit` environment, never to a deployment environment or the
