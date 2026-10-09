@@ -227,7 +227,7 @@ class RealDockerfileTests(unittest.TestCase):
             "sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f",
         )
         self.assertIn(
-            "installed\n# package metadata confirms it already carries the fix",
+            "installed package metadata confirms it\n# already carries the fixes",
             (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8"),
         )
 
