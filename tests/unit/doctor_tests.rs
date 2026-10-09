@@ -865,7 +865,10 @@ fn run_token_namespaces(config_yaml: &str, env: &EnvConfig, state: &StateFile) -
     let repo = RepoConfig::load_from_path(&path).unwrap().unwrap();
     let resolved = resolve_env(Some(&repo), env, None).unwrap();
     assert_eq!(resolved.name, "production");
-    assert_eq!(resolved.namespace_filter, None, "the environment has no filter");
+    assert_eq!(
+        resolved.namespace_filter, None,
+        "the environment has no filter"
+    );
     resolved_namespaces(&resolved, &GatewayConfig::default(), state)
 }
 
