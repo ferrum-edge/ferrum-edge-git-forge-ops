@@ -42,7 +42,7 @@ permissions:
 
 jobs:
   list-envs:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       envs: ${{ steps.list.outputs.envs }}
       promotions: ${{ steps.list.outputs.promotions }}
@@ -121,7 +121,7 @@ jobs:
   apply:
     needs: list-envs
     if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: write
@@ -724,7 +724,7 @@ jobs:
   promote:
     needs: [list-envs, apply]
     if: needs.list-envs.outputs.promotions != '[]' && needs.list-envs.outputs.promotions != ''
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: write
@@ -1350,7 +1350,7 @@ jobs:
   promotion-summary:
     needs: [apply, promote]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

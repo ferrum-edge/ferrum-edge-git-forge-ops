@@ -28,7 +28,7 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: read
@@ -262,7 +262,7 @@ jobs:
       needs.prepare.outputs.privileged == 'true' &&
       needs.prepare.outputs.targets != '[]' &&
       needs.prepare.outputs.targets != ''
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       pull-requests: write

@@ -35,7 +35,7 @@ jobs:
     # upstream Docker Hub namespace on its first push to `main` and fail.
     # Naming the repository is the check that actually means upstream.
     if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops' || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # Fifteen minutes for PR checks, then the existing twenty-minute lifecycle
     # wait and artifact verification. Individual API calls share the PR budget.
     timeout-minutes: 45
@@ -184,7 +184,7 @@ jobs:
     # derives from `github.repository`, so no override needed there).
     needs: authorize-release
     if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops' || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       packages: write

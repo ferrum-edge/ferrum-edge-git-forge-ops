@@ -748,7 +748,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 job["steps"].insert(0, step)
                 if name == "job output":
                     document["jobs"]["build"] = {
-                        "runs-on": "ubuntu-24.04",
+                        "runs-on": "ubuntu-26.04",
                         "outputs": {"script": "${{ format('{0}', vars.SCRIPT) }}"},
                         "steps": [{"run": "true"}],
                     }
@@ -1596,8 +1596,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
             path = root / workflow
             original = path.read_text(encoding="utf-8")
             changed = original.replace(
-                "    runs-on: ubuntu-24.04\n",
-                "    runs-on: ubuntu-24.04\n    container:\n      image: alpine\n"
+                "    runs-on: ubuntu-26.04\n",
+                "    runs-on: ubuntu-26.04\n    container:\n      image: alpine\n"
                 "      options: '-e LD_PRELOAD=/tmp/x.so'\n",
                 1,
             )
@@ -2441,7 +2441,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "            python3 trusted-cargo-audit/.github/scripts/tests/"
             "test_check_cargo_audit.py\n"
         )
-        job = "  security-cargo-audit:\n    runs-on: ubuntu-24.04\n"
+        job = "  security-cargo-audit:\n    runs-on: ubuntu-26.04\n"
         for anchor in (enforce, trusted_enforce, trusted_tests, job, "\njobs:\n"):
             self.assertEqual(workflow.count(anchor), 1, anchor)
         commented = "".join(
@@ -3012,21 +3012,21 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 "defaults:\n  run:\n    working-directory: candidate\n\njobs:\n",
             ),
             "skipped_job": (
-                "    runs-on: ubuntu-24.04\n",
-                "    if: false\n    runs-on: ubuntu-24.04\n",
+                "    runs-on: ubuntu-26.04\n",
+                "    if: false\n    runs-on: ubuntu-26.04\n",
             ),
             "environment": (
-                "    runs-on: ubuntu-24.04\n",
-                "    runs-on: ubuntu-24.04\n    environment: production\n",
+                "    runs-on: ubuntu-26.04\n",
+                "    runs-on: ubuntu-26.04\n    environment: production\n",
             ),
             "secret": (
-                "    runs-on: ubuntu-24.04\n",
-                "    runs-on: ubuntu-24.04\n    env:\n"
+                "    runs-on: ubuntu-26.04\n",
+                "    runs-on: ubuntu-26.04\n    env:\n"
                 "      TOKEN: ${{ secrets.FERRUM_GH_PROVISIONER_TOKEN }}\n",
             ),
             "tolerated_failure": (
-                "    runs-on: ubuntu-24.04\n",
-                "    runs-on: ubuntu-24.04\n    continue-on-error: true\n",
+                "    runs-on: ubuntu-26.04\n",
+                "    runs-on: ubuntu-26.04\n    continue-on-error: true\n",
             ),
             "no_timeout": ("    timeout-minutes: 10\n", ""),
             "default_timeout": ("    timeout-minutes: 10\n", "    timeout-minutes: 360\n"),
@@ -3112,7 +3112,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         "  contents: read\n"
         "jobs:\n"
         "  build:\n"
-        "    runs-on: ubuntu-24.04\n"
+        "    runs-on: ubuntu-26.04\n"
         "    steps:\n"
         "      - run: true\n"
     )
@@ -3208,7 +3208,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # Every spelling both reviews used to hide a job name or a permission,
         # and every construct the subset leaves out.
         base = self.SUBSET_WORKFLOW
-        job = "  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n"
+        job = "  build:\n    runs-on: ubuntu-26.04\n    steps:\n      - run: true\n"
         self.assertIn(job, base)
         cases = {
             "indented_root": "".join("  " + line + "\n" for line in base.splitlines()),
@@ -3219,7 +3219,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "directive": "%YAML 1.2\n" + base,
             "byte_order_mark": "﻿" + base,
             "tab_indentation": base.replace("    runs-on", "\truns-on"),
-            "tab_in_value": base.replace("ubuntu-24.04", "ubuntu-24.04\t"),
+            "tab_in_value": base.replace("ubuntu-26.04", "ubuntu-26.04\t"),
             "vertical_tab": base.replace("# x", "") + "# a\x0bjobs:\n",
             "next_line": base + "# \x85\n",
             "line_separator": base.replace("name: Fixture", "name: Fixture #  x"),
@@ -3231,7 +3231,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "anchored_key": base.replace("  contents: read\n", "  &k checks: write\n"),
             "tagged_key": base.replace("  contents: read\n", "  !!str statuses: write\n"),
             "aliased_key": base.replace("  contents: read\n", "  *k : write\n"),
-            "anchored_value": base.replace("ubuntu-24.04", "&os ubuntu-24.04"),
+            "anchored_value": base.replace("ubuntu-26.04", "&os ubuntu-26.04"),
             "aliased_value": base.replace("contents: read", "contents: *level"),
             "tagged_value": base.replace("contents: read", "contents: !!str read"),
             "merge_key": base.replace("    runs-on:", "    <<: *defaults\n    runs-on:"),
@@ -3240,8 +3240,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "flow_mapping": base.replace(
                 "permissions:\n  contents: read\n", "permissions: {contents: read}\n"
             ),
-            "flow_job": base.replace(job, "  build: {runs-on: ubuntu-24.04}\n"),
-            "flow_top_level": "{jobs: {build: {runs-on: ubuntu-24.04}}}\n",
+            "flow_job": base.replace(job, "  build: {runs-on: ubuntu-26.04}\n"),
+            "flow_top_level": "{jobs: {build: {runs-on: ubuntu-26.04}}}\n",
             "flow_sequence_elsewhere": base.replace(
                 "    steps:\n      - run: true\n", "    steps: [{run: 'true'}]\n"
             ),
@@ -3260,18 +3260,18 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 job, "  build:\n    name:\n      trusted-supply-chain-policy\n"
             ),
             "continued_plain": base.replace(
-                "    runs-on: ubuntu-24.04\n",
-                "    name: build\n      ${{ format('{0}', 'x') }}\n    runs-on: ubuntu-24.04\n",
+                "    runs-on: ubuntu-26.04\n",
+                "    name: build\n      ${{ format('{0}', 'x') }}\n    runs-on: ubuntu-26.04\n",
             ),
             "unterminated_quote": base.replace(
                 "    runs-on:", '    name: "build\n      x"\n    runs-on:'
             ),
-            "text_after_quote": base.replace("ubuntu-24.04", "'ubuntu'-24.04"),
-            "bad_escape": base.replace("ubuntu-24.04", '"ubuntu\\q"'),
-            "plain_with_colon": base.replace("ubuntu-24.04", "ubuntu: 24.04"),
+            "text_after_quote": base.replace("ubuntu-26.04", "'ubuntu'-24.04"),
+            "bad_escape": base.replace("ubuntu-26.04", '"ubuntu\\q"'),
+            "plain_with_colon": base.replace("ubuntu-26.04", "ubuntu: 24.04"),
             "duplicate_key": base.replace(
-                "    runs-on: ubuntu-24.04\n",
-                "    runs-on: ubuntu-24.04\n    runs-on: ubuntu-22.04\n",
+                "    runs-on: ubuntu-26.04\n",
+                "    runs-on: ubuntu-26.04\n    runs-on: ubuntu-22.04\n",
             ),
             "indentless_sequence": base.replace(
                 "    steps:\n      - run: true\n", "    steps:\n    - run: true\n"
@@ -3322,8 +3322,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
         )
         # An `if:` expression may still fold: it runs no shell.
         conditional = base.replace(
-            "    runs-on: ubuntu-24.04\n",
-            "    if: >-\n      always() &&\n      success()\n    runs-on: ubuntu-24.04\n",
+            "    runs-on: ubuntu-26.04\n",
+            "    if: >-\n      always() &&\n      success()\n    runs-on: ubuntu-26.04\n",
         )
         self.assertEqual(
             check_supply_chain.parse_workflow(conditional)["jobs"]["build"]["if"],
@@ -3396,7 +3396,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                         "jobs:",
                         "  a:",
                         "    name: ${{ format('{0}-supply-chain-policy', 'trusted') }}",
-                        "    runs-on: ubuntu-24.04",
+                        "    runs-on: ubuntu-26.04",
                     )
                 ),
                 encoding="utf-8",
@@ -3421,8 +3421,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
             )
 
         self.assertEqual(rule(base), [])
-        job = "  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n"
-        named = "  build:\n    name: {}\n    runs-on: ubuntu-24.04\n"
+        job = "  build:\n    runs-on: ubuntu-26.04\n    steps:\n      - run: true\n"
+        named = "  build:\n    name: {}\n    runs-on: ubuntu-26.04\n"
         computed = "${{ format('{0}-supply-chain-policy', 'trusted') }}"
         defines = "may define the 'trusted-supply-chain-policy' check"
         literal = "a job display name must be a literal"
@@ -3455,7 +3455,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     "jobs:\n" + job,
                     "jobs:\n    build:\n"
                     f"        name: {computed}\n"
-                    "        runs-on: ubuntu-24.04\n",
+                    "        runs-on: ubuntu-26.04\n",
                 ),
                 literal,
             ),
@@ -3485,8 +3485,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
 
     def test_only_a_required_checks_own_job_may_define_it(self):
         base = self.SUBSET_WORKFLOW
-        job = "  build:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: true\n"
-        named = "  build:\n    name: {}\n    runs-on: ubuntu-24.04\n"
+        job = "  build:\n    runs-on: ubuntu-26.04\n    steps:\n      - run: true\n"
+        named = "  build:\n    name: {}\n    runs-on: ubuntu-26.04\n"
         impostor = ".github/workflows/impostor.yml"
 
         def rule(text: str, path: str) -> list[str]:
@@ -3595,8 +3595,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "write_all": base.replace("permissions:\n  contents: read\n", "permissions: write-all\n"),
             "bare_write": base.replace("permissions:\n  contents: read\n", "permissions: write\n"),
             "job_level": base.replace(
-                "    runs-on: ubuntu-24.04\n",
-                "    permissions:\n      checks: write\n    runs-on: ubuntu-24.04\n",
+                "    runs-on: ubuntu-26.04\n",
+                "    permissions:\n      checks: write\n    runs-on: ubuntu-26.04\n",
             ),
             "empty_level": base.replace("  contents: read\n", "  contents: read\n  checks:\n"),
         }
@@ -3767,7 +3767,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 "  contents: read\n"
                 "jobs:\n"
                 "  trusted-supply-chain-policy:\n"
-                "    runs-on: ubuntu-24.04\n"
+                "    runs-on: ubuntu-26.04\n"
                 "    steps:\n"
                 "      - run: exit 0\n",
                 encoding="utf-8",
@@ -5032,7 +5032,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         spellings = {
             "double_quoted": '"concurrency": state-guard\n',
             "single_quoted": "'concurrency': state-guard\n",
-            "flow_mapping": "jobs: {guard: {runs-on: ubuntu-24.04, concurrency: g}}\n",
+            "flow_mapping": "jobs: {guard: {runs-on: ubuntu-26.04, concurrency: g}}\n",
             "flow_mapping_quoted": 'jobs: {guard: {"concurrency": g, runs-on: x}}\n',
             "explicit_key": "? concurrency\n: state-guard\n",
             "explicit_quoted_key": "? 'concurrency'\n: state-guard\n",
