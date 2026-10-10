@@ -64,13 +64,13 @@ repository.
 
 The trusted supply-chain checker allows the viewer secret only in the
 scheduled drift-check workflow (`drift-check.yml`) and refuses it in every
-other workflow. For now, that workflow may still bind the admin secret, and
-binding both is a warning. The follow-up change (#440, step 2) binds the
-viewer secret there, removes the admin secret from monitoring, and makes
-binding it a policy violation. Before it merges, add
-`FERRUM_ADMIN_JWT_VIEWER_SECRET` to every environment the drift check binds:
+other workflow. The drift check requires the viewer binding and refuses the
+admin secret, including when both are bound. The remaining deployment step
+in #440 is to provision the gateway's distinct viewer key as
+`FERRUM_ADMIN_JWT_VIEWER_SECRET` in every environment the drift check binds:
 `<env>-monitor` when `monitoring.unattended` is true, otherwise the deployment
-environment itself. Deployment environments keep `FERRUM_ADMIN_JWT_SECRET`,
+environment itself. After the switch, remove `FERRUM_ADMIN_JWT_SECRET` from
+each `<env>-monitor`. Deployment environments keep that admin secret,
 because apply, review and rotate need it. See
 [GitHub launch controls §3.1](docs/github-launch-controls.md#31-unattended-drift-monitoring).
 
