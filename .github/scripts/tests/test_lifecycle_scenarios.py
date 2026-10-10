@@ -312,6 +312,7 @@ class TransportTests(unittest.TestCase):
             "http://gateway.example:18080",
             "http://192.0.2.1:18080",
             "http://[::ffff:127.0.0.1]:18080",
+            "http://[::ffff:7f00:1]:18080",
             "http://127.0.0.1.example:18080",
             "http://2130706433:18080",
             "http://[::1%25interface]:18080",

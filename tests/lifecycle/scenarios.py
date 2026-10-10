@@ -93,7 +93,14 @@ def _credential_target(target: str) -> str:
         # Accessing port also rejects a malformed or out-of-range port.
         _ = parsed.port
         if parsed.scheme == "http":
-            if "%" in parsed.hostname or not ipaddress.ip_address(parsed.hostname).is_loopback:
+            address = ipaddress.ip_address(parsed.hostname)
+            # Keep the documented boundary stable across Python versions:
+            # IPv4-mapped IPv6 loopback is not the permitted native ::1.
+            if (
+                "%" in parsed.hostname
+                or not address.is_loopback
+                or (address.version == 6 and address != ipaddress.IPv6Address("::1"))
+            ):
                 raise ValueError("non-loopback HTTP target")
         elif parsed.scheme != "https":
             raise ValueError("unsupported scheme")
