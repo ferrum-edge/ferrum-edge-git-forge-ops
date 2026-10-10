@@ -978,7 +978,9 @@ class AbandonedTemporaryTests(unittest.TestCase):
             self._leave(f".github/scripts/{name}")
             for name in (
                 "helper.py.template-update-0123456789abcdef",
-                ".helper.py.template-update-0123456789ABCDEF",
+                # Use a distinct base name: case-insensitive filesystems
+                # otherwise alias this survivor with the removable fixture.
+                ".upper.py.template-update-0123456789ABCDEF",
                 ".helper.py.template-update-0123456789abcde",
                 ".helper.py.template-update-0123456789abcdef0",
                 ".helper.py.template-update-0123456789abcdef.bak",
