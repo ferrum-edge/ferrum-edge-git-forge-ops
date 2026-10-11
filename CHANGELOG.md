@@ -28,7 +28,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GET-only capability probes and reports unavailable evidence as unknown.
 - Lifecycle coverage for hidden consumer edits and namespace restore conditions,
   including ABA, empty replacement and confirmed spec deletion. Qualification
-  on the published Edge v0.9.15 release, content-pinned (SHA-256), remains
+  on the published Edge v0.9.17 release, content-pinned (SHA-256), remains
   required; an older fixture or passing parser tests do not establish first-release
   acceptance.
 - A hosted consumer qualification check for Alloy's generated GitForgeOps
@@ -91,6 +91,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Align #266's pending first-release pairing with the reviewed Edge v0.9.17
+  validator allowed by #529 and its signed standard multi-platform image.
+  The release record, explicit baseline check, bundled gateway and current
+  candidate documentation now agree. Earlier validator allowlist entries stay
+  valid for in-flight PRs; supported status, publication fields and all
+  exact-revision lifecycle acceptance requirements remain pending.
 - Work with Ferrum Edge v0.9.16's namespace-bounded admin tokens
   ([ferrum-edge#6095](https://github.com/ferrum-edge/ferrum-edge/issues/6095)).
   Edge v0.9.16 and later limit an admin JWT with an `ns` claim to

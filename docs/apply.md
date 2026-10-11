@@ -304,13 +304,17 @@ using GET only. No consumer to probe means unknown, never pass. Ordinary diff,
 plan, review and viewer drift reads retain their current endpoints and explain
 these runtime requirements. The conditional API owner contract was published at
 Edge `c764084b3b51c3f7ffde268c039688d35e49c553`. The current candidate gateway is
-published v0.9.15 at `25b37395ff61bfea0f3ffd189d9011c4984fa755`, with exact binary
+published v0.9.17 at `669c574c1d1e88e84dccb26a8159939e6694644d`, with exact binary
 and image pins in the [pending release record](../release/baseline.json).
 GitForgeOps enforcement qualification against those bytes remains required before
 release acceptance. This pin refresh leaves the conditional API implementation
 unchanged. Edge v0.9.15 changes external identity header semantics and requires
 plugin-config environment references under `FERRUM_PLUGIN_SECRET_<NAME>`; see
 the [Edge 0.9.15 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915).
+Also review the candidate's
+[v0.9.17 operator changes](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917),
+including namespace-bounded admin tokens and cached admin misses that report
+unavailable rather than deleted.
 
 **Proxies and their plugins.** Ferrum Edge rewrites a proxy's association list
 itself when a scoped plugin is created, retargeted or removed. A proxy this

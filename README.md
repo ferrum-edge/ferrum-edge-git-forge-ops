@@ -573,13 +573,15 @@ GET-only doctor probes report capability availability, while qualification must
 establish enforcement on the exact released gateway bytes. See
 [conditional apply behavior](docs/apply.md#changes-made-during-an-apply). The new
 owner contract was published in Edge v0.9.11. The candidate pairing now pins
-published Edge v0.9.15 at `25b37395ff61bfea0f3ffd189d9011c4984fa755`, with its
+published Edge v0.9.17 at `669c574c1d1e88e84dccb26a8159939e6694644d`, with its
 verified x86_64 validator and multi-platform gateway image. The existing
 conditional API implementation remains unchanged. The vendored Contracts pin
 adopts `contracts-edge-0.9.15` without changing the implementation. Edge v0.9.15
 also changes external identity headers and confines plugin-config environment
 references to `FERRUM_PLUGIN_SECRET_<NAME>`; affected deployments must follow the
 [Edge upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915).
+The v0.9.17 candidate also requires the
+[namespace-aware client and operator changes](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917).
 Hosted GitForgeOps qualification against those exact bytes remains required; the
 [first-release record](release/README.md) stays pending.
 
