@@ -204,15 +204,15 @@ pub fn load_resources_with_options(
                 // name; without it, two fragments in the same namespace would
                 // be indistinguishable to `apply_overlay`.
                 if let Resource::MeshConfig { id, .. } = &mut resource {
-                    if let Some(raw) = id.as_deref()
-                        && raw.trim() != raw
-                    {
-                        return Err(crate::error::Error::Config(format!(
-                            "resource file {} declares a MeshConfig id with surrounding \
-                             whitespace; fragment ids are matched exactly, so remove the \
-                             whitespace",
-                            path.display()
-                        )));
+                    if let Some(raw) = id.as_deref() {
+                        if raw.trim() != raw {
+                            return Err(crate::error::Error::Config(format!(
+                                "resource file {} declares a MeshConfig id with surrounding \
+                                 whitespace; fragment ids are matched exactly, so remove the \
+                                 whitespace",
+                                path.display()
+                            )));
+                        }
                     }
                     if id.as_deref().map(str::trim).unwrap_or("").is_empty() {
                         *id = path
