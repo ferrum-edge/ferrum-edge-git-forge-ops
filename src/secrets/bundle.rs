@@ -85,8 +85,96 @@ pub fn load_bundles_from_env(
 
 /// Parse the wrapper document without emitting warnings, so tests can assert
 /// on unrecognized top-level keys.
+/// A JSON value that refuses repeated object members at every depth.
+///
+/// `serde_json::Value` (and `BTreeMap`) silently keep the last of a repeated
+/// member, so duplicate detection has to happen during parsing, before any
+/// map conversion — the later cross-shard check can only see what survived.
+/// Errors name the repeated member, never a value.
+struct NoDuplicateMembers(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for NoDuplicateMembers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = NoDuplicateMembers;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value without duplicate object members")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(NoDuplicateMembers(serde_json::Value::Bool(value)))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateMembers(serde_json::json!(value)))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateMembers(serde_json::json!(value)))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateMembers(
+                    serde_json::Number::from_f64(value)
+                        .map(serde_json::Value::Number)
+                        .unwrap_or(serde_json::Value::Null),
+                ))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(NoDuplicateMembers(serde_json::Value::String(
+                    value.to_string(),
+                )))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(NoDuplicateMembers(serde_json::Value::String(value)))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(NoDuplicateMembers(serde_json::Value::Null))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(NoDuplicateMembers(serde_json::Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(next) = access.next_element::<NoDuplicateMembers>()? {
+                    items.push(next.0);
+                }
+                Ok(NoDuplicateMembers(serde_json::Value::Array(items)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = access.next_key::<String>()? {
+                    if object.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON object member '{key}' in credential bundle input"
+                        )));
+                    }
+                    let value = access.next_value::<NoDuplicateMembers>()?;
+                    object.insert(key, value.0);
+                }
+                Ok(NoDuplicateMembers(serde_json::Value::Object(object)))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 pub fn parse_bundles_from_json(raw: &str) -> crate::error::Result<LoadedBundles> {
-    let outer: serde_json::Value = serde_json::from_str(raw)?;
+    let outer: serde_json::Value = serde_json::from_str::<NoDuplicateMembers>(raw)?.0;
     let obj = outer.as_object().ok_or_else(|| {
         crate::error::Error::Config("FERRUM_CREDS_JSON is not a JSON object".to_string())
     })?;
@@ -112,16 +200,21 @@ pub fn parse_bundles_from_json(raw: &str) -> crate::error::Result<LoadedBundles>
         }
         let inner: CredentialBundle = match secret_value {
             serde_json::Value::String(s) if s.is_empty() => BTreeMap::new(),
-            serde_json::Value::String(s) => serde_json::from_str(s).map_err(|e| {
-                crate::error::Error::Config(format!(
-                    "shard {secret_name}: malformed JSON value: {e}"
-                ))
-            })?,
+            serde_json::Value::String(s) => {
+                // A JSON-string shard is a second document: it gets the same
+                // duplicate-member refusal before it becomes a slot map.
+                let checked: NoDuplicateMembers = serde_json::from_str(s).map_err(|e| {
+                    crate::error::Error::Config(format!(
+                        "shard {secret_name}: malformed JSON value: {e}"
+                    ))
+                })?;
+                serde_json::from_value(checked.0)?
+            }
             serde_json::Value::Object(_) => serde_json::from_value(secret_value.clone())?,
             _ => {
                 return Err(crate::error::Error::Config(format!(
                     "shard {secret_name}: unexpected value type (need object or JSON string)"
-                )))
+                )));
             }
         };
 

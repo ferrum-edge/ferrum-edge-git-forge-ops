@@ -231,7 +231,13 @@ def audit_main_ruleset(
     template_repo: bool = False,
 ) -> None:
     rules = {rule.get("type"): rule for rule in ruleset.get("rules", [])}
-    for rule_type in ("deletion", "non_fast_forward", "pull_request", "required_status_checks"):
+    for rule_type in (
+        "deletion",
+        "non_fast_forward",
+        "pull_request",
+        "required_status_checks",
+        "commit_message_pattern",
+    ):
         audit.require(
             rule_type in rules,
             f"main ruleset is missing required rule: {rule_type}",
@@ -261,6 +267,21 @@ def audit_main_ruleset(
     audit.require(
         pull_request.get("dismiss_stale_reviews_on_push") is True,
         "main ruleset must dismiss stale approvals after reviewable pushes",
+    )
+
+    # `[skip ci]` suppresses every workflow, required checks included, so the
+    # documented negated contains-rule is a launch control in its own right:
+    # an absent, non-negated or differently-patterned rule is not the baseline
+    # bootstrap installs (docs/github-launch-controls.md).
+    message_parameters = rules.get("commit_message_pattern", {}).get("parameters", {})
+    audit.require(
+        message_parameters.get("name") == "no skip-ci on main"
+        and message_parameters.get("operator") == "contains"
+        and message_parameters.get("pattern") == "[skip ci]"
+        and message_parameters.get("negate") is True,
+        "main ruleset must reject [skip ci] commit messages via a negated "
+        "contains commit_message_pattern rule",
+        f"commit message pattern: {message_parameters}",
     )
 
     status_parameters = rules.get("required_status_checks", {}).get("parameters", {})

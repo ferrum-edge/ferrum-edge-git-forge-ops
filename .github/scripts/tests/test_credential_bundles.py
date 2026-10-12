@@ -60,6 +60,16 @@ class CredentialBundleTests(unittest.TestCase):
             self.assertEqual(credential_bundles.extract({}, destination), 0)
             self.assertEqual(json.loads(destination.read_text()), {})
 
+    def test_duplicate_json_members_fail_closed_without_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "creds.json"
+            environ = {
+                "FERRUM_CREDS_BUNDLE": '{"ferrum/app/key": "first", "ferrum/app/key": "second"}',
+            }
+            with self.assertRaises(credential_bundles.BundleError):
+                credential_bundles.extract(environ, destination)
+            self.assertFalse(destination.exists())
+
     def test_malformed_bundles_fail_closed_without_output(self):
         cases = [
             {"FERRUM_CREDS_BUNDLE": "not-json"},

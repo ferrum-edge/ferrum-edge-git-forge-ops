@@ -344,6 +344,33 @@ fn a_consumer_exported_without_its_hidden_fingerprint_is_never_verified() {
 }
 
 #[test]
+fn a_malformed_hidden_fingerprint_is_never_verified() {
+    // Present-but-invalid is no better than absent: fingerprint collection
+    // ignores malformed values, so presence alone must not let two empty
+    // maps compare complete. A baseline recorded from the malformed export
+    // and reread against it still refuses.
+    for bad in [json!(null), json!(42), json!("not-a-fingerprint")] {
+        let desired = desired();
+        let mut consumer = live_consumer(&[fp('a')], &fp('b'));
+        consumer["hidden_credentials_fingerprint"] = bad;
+        let body = document(
+            "ferrum",
+            KEY_ID,
+            json!([consumer]),
+            json!([live_plugin(&fp('e'), "grpc")]),
+        )
+        .to_string();
+        let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+        let exports = [export];
+        let mut baseline = FingerprintBaseline::default();
+        baseline.record(&exports[0]);
+        let summary = SecretFingerprintSummary::evaluate(&exports, 1, Some(&baseline), &desired);
+        assert!(!summary.verified());
+        assert!(summary.baseline_invalidated());
+    }
+}
+
+#[test]
 fn a_placeholder_stays_secret_bearing_after_the_bundle_resolves_it() {
     // An unclassified plugin field is secret-bearing only because the
     // repository brokers it; resolution must not erase that.

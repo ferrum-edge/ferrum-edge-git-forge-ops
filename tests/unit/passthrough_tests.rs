@@ -276,6 +276,54 @@ spec:
 }
 
 #[test]
+fn additive_array_exceptions_stay_scoped_to_their_documented_kinds() {
+    // `spec.plugins` is additive only on Proxy (and `spec.targets` only on
+    // Upstream). On any other kind the same-named passthrough array replaces.
+    let base = tree(&[(
+        "ferrum/consumers/app.yaml",
+        r#"
+kind: Consumer
+spec:
+  id: app
+  username: app
+  plugins:
+    - base-a
+    - base-b
+"#,
+    )]);
+    let overlay = tree(&[(
+        "ferrum/consumers/app.yaml",
+        r#"
+kind: Consumer
+spec:
+  id: app
+  plugins:
+    - overlay-c
+"#,
+    )]);
+    let mut resources =
+        load_resources_with_options(base.path(), LoadOptions::ALLOW_UNKNOWN_FIELDS).unwrap();
+    apply_overlay_with_options(
+        &mut resources,
+        overlay.path(),
+        LoadOptions::ALLOW_UNKNOWN_FIELDS,
+    )
+    .unwrap();
+    let consumer = resources
+        .iter()
+        .find_map(|(_, resource)| match resource {
+            Resource::Consumer { spec } => Some(spec),
+            _ => None,
+        })
+        .expect("expected exactly one consumer");
+    assert_eq!(
+        consumer.passthrough().get("plugins"),
+        Some(&serde_json::json!(["overlay-c"])),
+        "a wrong-kind plugins array replaces; base members must not survive"
+    );
+}
+
+#[test]
 fn overlays_cannot_introduce_unknown_fields_by_default() {
     let base = tree(&[(
         "ferrum/proxies/edge.yaml",
