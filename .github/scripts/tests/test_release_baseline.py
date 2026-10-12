@@ -98,7 +98,7 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.write_record(record)
         issues = check_release_baseline.check(self.root)
         self.assertIn(
-            "the first baseline must name the verified v0.9.15 validator",
+            "the first baseline must name the verified v0.9.17 validator",
             issues,
         )
 
@@ -109,6 +109,24 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.assertTrue(any("Cargo.toml" in issue for issue in issues), issues)
         self.assertTrue(any("README Development status" in issue for issue in issues), issues)
         self.assertTrue(any("quickstart" in issue for issue in issues), issues)
+
+    def test_former_allowlisted_pairing_does_not_certify_the_new_baseline(self):
+        record = self.record()
+        previous_pin = "69ae2402e1741d96b48ce0011d94088c9a4ec8240019e9dbb17d596cfa2082c5"
+        previous_image = "sha256:29b468dfeea13b1ecaac8dfbc7e019f310e71e647611d43800a1dc64436eaca3"
+        record["validator"]["version"] = "v0.9.15"
+        record["validator"]["sha256"] = previous_pin
+        record["tested_gateway"]["version"] = "v0.9.15"
+        record["tested_gateway"]["binary_sha256"] = previous_pin
+        record["tested_gateway"]["image_digest"] = previous_image
+        self.write_record(record)
+        (self.root / "Dockerfile").write_text(
+            f"FROM ferrumedge/ferrum-edge:v0.9.15@{previous_image} AS ferrum-edge\n"
+        )
+        self.assertEqual(
+            check_release_baseline.check(self.root),
+            ["the first baseline must name the verified v0.9.17 validator"],
+        )
 
     def test_quickstart_must_require_a_supported_record(self):
         quickstart = self.root / "docs/quickstart.md"
