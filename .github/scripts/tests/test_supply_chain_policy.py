@@ -7034,6 +7034,14 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("apply-on-merge.yml", "on:\n  push:\n",
              "on:\n  pull_request:\n  push:\n",
              "apply-on-merge.yml: trigger 'pull_request' is not reviewed"),
+            ("validate-pr.yml", pr_key,
+             "key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+             "      - uses: actions/cache@" + "c" * 40 + "\n"
+             "        with: ${{ fromJSON('{\"path\":\"target\",\"key\":\"Linux-cargo-x\"}') }}\n",
+             "validate-pr.yml: a cache step must spell"),
+            ("drift-check.yml", "on:\n  schedule:\n",
+             "on: [push, schedule]\nx-was:\n  schedule:\n",
+             "drift-check.yml: a privileged cache workflow's push trigger"),
             ("apply-on-merge.yml", "on:\n  push:\n    branches: [main]\n",
              "on:\n  push:\n",
              "apply-on-merge.yml: a privileged cache workflow's push trigger"),
@@ -7137,6 +7145,26 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "        with:\n"
             "          path: target\n"
             "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        )
+        computed = job.replace(
+            "        with:\n          REF_PLACEHOLDER: ${{ github.event.workflow_run.head_sha }}\n"
+            "          persist-credentials: false\n",
+            "        with: ${{ fromJSON(format('{{\"ref\":\"{0}\"}}', "
+            "github.event.workflow_run.head_sha)) }}\n",
+        )
+        self.assertNotEqual(computed, job)
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/trusted-pr-review.yml"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text.replace("jobs:\n", "jobs:\n" + computed, 1), encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith("trusted-pr-review.yml job poison: a checkout in a privileged")
+                for item in violations
+            ),
+            violations,
         )
         # Actions matches input names case-insensitively, so every spelling counts.
         for spelling in ("ref", "Ref", "REF"):

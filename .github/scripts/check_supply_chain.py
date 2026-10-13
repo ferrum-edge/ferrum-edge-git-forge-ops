@@ -1113,6 +1113,20 @@ def cache_key_families(document: dict) -> list[tuple[str, str, str | None]]:
     over-reading can only add violations.
     """
     entries: list[tuple[str, str, str | None]] = []
+    # A computed `with:` (one `${{ }}` expression) hides the key from this
+    # reading, so a cache step must spell its inputs as a mapping with a key.
+    for steps in _values_for_key(document, "steps"):
+        for step in steps if isinstance(steps, list) else []:
+            uses = step.get("uses") if isinstance(step, dict) else None
+            if not isinstance(uses, str) or not uses.casefold().startswith("actions/cache"):
+                continue
+            inputs = step.get("with")
+            if not isinstance(inputs, dict) or not any(
+                str(name).casefold() == "key" for name in inputs
+            ):
+                entries.append(
+                    (uses, "", "a cache step must spell `with:` as a mapping with a `key`")
+                )
     for field in ("key", "restore-keys"):
         for value in _values_for_key(document, field):
             items = value if isinstance(value, list) else [value]
@@ -1167,7 +1181,14 @@ def privileged_trigger_violations(name: str, document: dict) -> list[str]:
     ]
     # A checkout without `ref` builds the triggering revision, so a push
     # trigger must be limited to the protected branch: no other branch, no
-    # tags, no ignore lists.
+    # tags, no ignore lists. The scalar and list forms run on every branch.
+    if not isinstance(on, dict) and any(
+        isinstance(event, str) and event.casefold() == "push" for event in events
+    ):
+        violations.append(
+            f"{name}: a privileged cache workflow's push trigger must be "
+            "limited to `branches: [main]` with no tag or ignore filters"
+        )
     if isinstance(on, dict):
         for event, config in on.items():
             if not isinstance(event, str) or event.casefold() != "push":
@@ -1214,7 +1235,13 @@ def privileged_cache_job_violations(root: Path, name: str, document: dict) -> li
                     uses = item.get("uses") if isinstance(item, dict) else None
                     if not isinstance(uses, str) or not uses.casefold().startswith("actions/checkout@"):
                         continue
-                    raw_inputs = item.get("with") if isinstance(item.get("with"), dict) else {}
+                    if "with" in item and not isinstance(item["with"], dict):
+                        violations.append(
+                            f"{label}: a checkout in a privileged cache job must spell "
+                            "`with:` as a mapping"
+                        )
+                        continue
+                    raw_inputs = item.get("with") or {}
                     # Actions matches input names case-insensitively.
                     inputs: dict[str, object] = {}
                     for input_name, value in raw_inputs.items():
