@@ -70,11 +70,12 @@ the privileged boundary.
 Overlay object fields deep-merge onto the resource with the same `kind` and
 `spec.id`. Arrays replace by default, so an environment can narrow lists such
 as `allowed_methods`, `hosts`, `allowed_ws_origins` or `acl_groups`. The
-exceptions merge by item identity:
+exceptions merge by item identity; a same-named array on any other kind
+(for example an unknown passthrough field) replaces like every other array:
 
 | List | Merged by |
 |---|---|
-| `spec.plugins`, `spec.targets` | item identity (additive) |
+| Proxy `spec.plugins`, Upstream `spec.targets` | item identity (additive) |
 | mesh `spec.workloads` | `spiffe_id` |
 | mesh `spec.services` | `name` + `namespace` |
 
@@ -239,7 +240,8 @@ more fields.
 
 ```yaml
 kind: MeshConfig
-id: minimal         # optional; defaults to the file stem. Overlays match on it.
+id: minimal         # optional; defaults to the file stem. Overlays match on it exactly;
+                    # leading or trailing whitespace is rejected.
 spec:
   workloads:
     - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/api

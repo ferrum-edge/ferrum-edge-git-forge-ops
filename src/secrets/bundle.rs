@@ -83,8 +83,6 @@ pub fn load_bundles_from_env(
     Ok((loaded.merged, loaded.per_shard))
 }
 
-/// Parse the wrapper document without emitting warnings, so tests can assert
-/// on unrecognized top-level keys.
 /// A JSON value that refuses repeated object members at every depth.
 ///
 /// `serde_json::Value` (and `BTreeMap`) silently keep the last of a repeated
@@ -173,6 +171,8 @@ impl<'de> serde::Deserialize<'de> for NoDuplicateMembers {
     }
 }
 
+/// Parse the wrapper document without emitting warnings, so tests can assert
+/// on unrecognized top-level keys.
 pub fn parse_bundles_from_json(raw: &str) -> crate::error::Result<LoadedBundles> {
     let outer: serde_json::Value = serde_json::from_str::<NoDuplicateMembers>(raw)?.0;
     let obj = outer.as_object().ok_or_else(|| {
