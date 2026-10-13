@@ -45,6 +45,47 @@ Push and schedule runs use the tree's own checker and policy. Those events have
 no untrusted author, and pinning them to the default branch would stop a merged
 policy change from ever taking effect.
 
+### PR-built caches stay out of privileged jobs
+
+`validate-pr.yml` builds pull-request code, including build scripts and proc
+macros, into a cached `target/`. It saves that cache under the
+`<os>-pr-cargo-<Cargo.lock hash>` key. The privileged workflows
+(`apply-on-merge.yml`, `drift-check.yml`, `materialize-file.yml`, `rotate.yml`)
+use the `<os>-cargo-<Cargo.lock hash>` key with no `restore-keys`, and
+`trusted-pr-review.yml` uses its own `<os>-trusted-pr-` family.
+`actions/cache` restores an exact key, then the newest entry whose key starts
+with the primary key, then each `restore-keys` prefix, so neither family may
+be a prefix of the other. GitHub's branch cache scoping already keeps a pull
+request's cache entries away from default-branch runs. The separate families
+keep PR-built artifacts out of privileged jobs even if that scoping or a later
+workflow edit goes wrong.
+
+`check_supply_chain.py` reads every `key` and `restore-keys` entry from the
+parsed workflows (comments, block indicators and quoting decoded). It
+normalizes `${{ }}` spacing and case and cuts each key at its first
+`hashFiles(`. `runner.os` is expanded to each of `linux`, `windows` and
+`macos`, so a literal `Linux-cargo-` key collides with `${{ runner.os }}-cargo-`.
+Keys in local composite actions (`./.github/actions/...`) and local reusable
+workflows count as their caller's, recursively. The checker then refuses any
+family in any other workflow (`validate-pr.yml`, `rust-ci.yml`,
+`alloy-consumer.yml`, `lifecycle.yml` and any workflow added later) that is
+a prefix of a privileged family, or the reverse. `lifecycle.yml` therefore
+uses its own `<os>-lifecycle-cargo-` family. A key may contain only printable
+ASCII without spaces, and may not start with `!`: `actions/cache` trims
+Unicode spaces such as U+FEFF and rewrites `!`-prefixed restore keys, and a
+textual comparison would miss both. A privileged workflow keeps its exemption
+only while it runs on `push`, `schedule`, `workflow_dispatch` or
+`workflow_run`. A pull-request trigger on one of them is refused, and a push
+trigger must be limited to `branches: [main]`. Within a privileged workflow, a
+job that saves a cache may check out only the triggering revision (no `ref`)
+or the default branch, from this repository, with input names matched
+case-insensitively. A job that builds a pull request's head therefore cannot
+use the privileged family. The triggering revision is `main` for push,
+schedule and `workflow_run`. For `workflow_dispatch` it is whichever ref the
+dispatching maintainer selects, which needs write access. A key prefix may use no expression except
+`runner.os`: any other expression could evaluate to anything, so the
+separation could not be checked.
+
 ### Candidate cargo configuration is ignored
 
 A trusted checker is not enough if the commands it runs read configuration

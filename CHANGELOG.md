@@ -344,6 +344,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- PR validation (`validate-pr.yml`) caches its PR-built cargo `target/` under
+  its own `<os>-pr-cargo-` key family instead of the `<os>-cargo-` key the
+  privileged apply, drift, materialize and rotate jobs restore.
+  `lifecycle.yml` moves to its own `<os>-lifecycle-cargo-` family.
+  `check_supply_chain.py` refuses a cache key or restore prefix in any
+  non-privileged workflow (or a local action or reusable workflow it reaches)
+  that overlaps a privileged workflow's family. It compares parsed keys with
+  `runner.os` expanded, and refuses other expressions and non-ASCII
+  characters. PR-built build scripts and proc macros therefore cannot reach a
+  privileged run even if branch cache scoping fails. (#547)
 - Resource and overlay YAML files are read through the bounded repository-file
   reader: a regular file of at most 1 MiB, the same per-file cap PR input
   staging applies, checked by inspected length and by bytes read. A larger

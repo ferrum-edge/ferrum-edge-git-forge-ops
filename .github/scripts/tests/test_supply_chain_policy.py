@@ -6993,6 +6993,218 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("trusted-pr-review-" in item for item in violations), violations
         )
 
+    def test_pr_code_cache_cannot_share_a_privileged_key_family(self):
+        # #547: validate-pr builds PR code into `target/`; the privileged
+        # workflows restore `<os>-cargo-<lock>`. Reusing that family in any
+        # spelling, or a privileged restore prefix covering a PR family in any
+        # YAML form, must fail.
+        privileged_key = "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        pr_key = "key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        cases = (
+            ("validate-pr.yml", pr_key,
+             "key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key family"),
+            ("validate-pr.yml", pr_key,
+             "key: ${{runner.os}}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key family"),
+            ("validate-pr.yml", pr_key,
+             "key: ${{ RUNNER.OS }}-Cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key family"),
+            ("validate-pr.yml", pr_key,
+             "key: ${{ github.ref }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key prefix"),
+            ("validate-pr.yml", pr_key,
+             "key: Linux-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key family"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + "          restore-keys: Linux-\n",
+             "validate-pr.yml: cache key family"),
+            ("validate-pr.yml", pr_key,
+             'key: "\\uFEFF${{ runner.os }}-cargo-${{ hashFiles(\'**/Cargo.lock\') }}"\n',
+             "validate-pr.yml: cache key prefix"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + '          restore-keys: "\\uFEFFLinux-"\n',
+             "apply-on-merge.yml: cache key prefix"),
+            ("validate-pr.yml", pr_key,
+             'key: "!Linux-cargo-${{ hashFiles(\'**/Cargo.lock\') }}"\n',
+             "validate-pr.yml: cache key prefix"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + '          restore-keys: "! Linux-cargo-"\n',
+             "apply-on-merge.yml: cache key prefix"),
+            ("apply-on-merge.yml", "on:\n  push:\n",
+             "on:\n  pull_request:\n  push:\n",
+             "apply-on-merge.yml: trigger 'pull_request' is not reviewed"),
+            ("validate-pr.yml", pr_key,
+             "key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+             "      - uses: actions/cache@" + "c" * 40 + "\n"
+             "        with: ${{ fromJSON('{\"path\":\"target\",\"key\":\"Linux-cargo-x\"}') }}\n",
+             "validate-pr.yml: a cache step must spell"),
+            ("drift-check.yml", "on:\n  schedule:\n",
+             "on:\n  - push\n  - schedule\nx-was:\n  schedule:\n",
+             "drift-check.yml: a privileged cache workflow's push trigger"),
+            ("apply-on-merge.yml", "on:\n  push:\n    branches: [main]\n",
+             "on:\n  push:\n",
+             "apply-on-merge.yml: a privileged cache workflow's push trigger"),
+            ("apply-on-merge.yml", "on:\n  push:\n    branches: [main]\n",
+             "on:\n  push:\n    branches: [main, 'feature/**']\n",
+             "apply-on-merge.yml: a privileged cache workflow's push trigger"),
+            ("lifecycle.yml",
+             "key: ${{ runner.os }}-lifecycle-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "lifecycle.yml: cache key family"),
+            ("alloy-consumer.yml", "      - name: Install Rust toolchain\n",
+             "      - uses: actions/cache@" + "a" * 40 + "\n"
+             "        with:\n"
+             "          path: target\n"
+             "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+             "\n      - name: Install Rust toolchain\n",
+             "alloy-consumer.yml: cache key family"),
+            ("rust-ci.yml", "            ${{ runner.os }}-rust-ci-\n",
+             "            ${{ runner.os }}-\n", "rust-ci.yml: cache key family"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + "          restore-keys: | # fallback\n            ${{ runner.os }}-\n",
+             "validate-pr.yml: cache key family"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + "          restore-keys: |+\n            ${{ runner.os }}-\n",
+             "validate-pr.yml: cache key family"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + '          restore-keys: "${{ runner.os }}-"\n',
+             "validate-pr.yml: cache key family"),
+        )
+        for workflow, old, new, expected in cases:
+            with self.subTest(workflow=workflow, new=new):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = self._mirror_repo(Path(directory))
+                    path = root / ".github/workflows" / workflow
+                    text = path.read_text(encoding="utf-8")
+                    self.assertIn(old, text)
+                    path.write_text(text.replace(old, new), encoding="utf-8")
+                    violations = self._violations(root)
+                self.assertTrue(
+                    any(item.startswith(expected) for item in violations),
+                    violations,
+                )
+
+    def test_pr_cache_inside_nested_local_actions_is_compared(self):
+        # #547: moving the cache step into a composite action (here two levels
+        # deep) keeps the caller's trust, so its key family still counts.
+        pr_key = "          key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/validate-pr.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(pr_key, text)
+            path.write_text(
+                text.replace(
+                    pr_key,
+                    pr_key + "\n      - name: Nested cache\n        uses: ./.github/actions/outer\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            for name, steps in (
+                ("outer", "    - uses: ./.github/actions/inner\n"),
+                (
+                    "inner",
+                    "    - uses: actions/cache@" + "a" * 40 + "\n"
+                    "      with:\n"
+                    "        path: target\n"
+                    "        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+                ),
+            ):
+                action = root / ".github/actions" / name / "action.yml"
+                action.parent.mkdir(parents=True)
+                action.write_text(
+                    f"name: {name}\ndescription: {name}\nruns:\n  using: composite\n  steps:\n"
+                    + steps,
+                    encoding="utf-8",
+                )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith("validate-pr.yml via .github/actions/outer/action.yml via ")
+                and "cache key family" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_privileged_cache_job_must_not_build_a_pull_request_head(self):
+        # #547: a job added to a privileged workflow that checks out the PR
+        # head and saves the privileged family would poison apply's cache from
+        # the default-branch context; the filename alone must not exempt it.
+        job = (
+            "  poison:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@" + "a" * 40 + "\n"
+            "        with:\n"
+            "          REF_PLACEHOLDER: ${{ github.event.workflow_run.head_sha }}\n"
+            "          persist-credentials: false\n"
+            "      - uses: actions/cache@" + "b" * 40 + "\n"
+            "        with:\n"
+            "          path: target\n"
+            "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        )
+        computed = job.replace(
+            "        with:\n          REF_PLACEHOLDER: ${{ github.event.workflow_run.head_sha }}\n"
+            "          persist-credentials: false\n",
+            "        with: ${{ fromJSON(format('{{\"ref\":\"{0}\"}}', "
+            "github.event.workflow_run.head_sha)) }}\n",
+        )
+        self.assertNotEqual(computed, job)
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/trusted-pr-review.yml"
+            text = path.read_text(encoding="utf-8")
+            path.write_text(text.replace("jobs:\n", "jobs:\n" + computed, 1), encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith("trusted-pr-review.yml job poison: a checkout in a privileged")
+                for item in violations
+            ),
+            violations,
+        )
+        # Actions matches input names case-insensitively, so every spelling counts.
+        for spelling in ("ref", "Ref", "REF"):
+            with self.subTest(spelling=spelling):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = self._mirror_repo(Path(directory))
+                    path = root / ".github/workflows/trusted-pr-review.yml"
+                    text = path.read_text(encoding="utf-8")
+                    self.assertIn("jobs:\n", text)
+                    poisoned = job.replace("REF_PLACEHOLDER", spelling)
+                    path.write_text(
+                        text.replace("jobs:\n", "jobs:\n" + poisoned, 1), encoding="utf-8"
+                    )
+                    violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        item.startswith("trusted-pr-review.yml job poison: a privileged job")
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_runner_os_expands_to_concrete_families(self):
+        self.assertEqual(
+            check_supply_chain.expand_runner_os("${{runner.os}}-cargo-"),
+            ["linux-cargo-", "windows-cargo-", "macos-cargo-"],
+        )
+        self.assertEqual(check_supply_chain.expand_runner_os("linux-cargo-"), ["linux-cargo-"])
+
+    def test_cache_key_family_normalizes_expressions(self):
+        family = check_supply_chain.cache_key_family
+        self.assertEqual(
+            family("${{runner.os}}-cargo-${{ hashFiles('**/Cargo.lock') }}"),
+            ("${{runner.os}}-cargo-", None),
+        )
+        self.assertEqual(family("${{ RUNNER.OS }}-Cargo-")[0], "${{runner.os}}-cargo-")
+        self.assertIsNotNone(family("${{ inputs.prefix }}-cargo-")[1])
+        self.assertIsNotNone(family("${{ runner.os -cargo-")[1])
+        self.assertEqual(family("${{ hashFiles('x') }}"), ("", None))
+
     def test_mirrored_repository_is_a_clean_baseline(self):
         # Every mutation test above asserts the checker FAILS. That only proves
         # something if the unmutated mirror passes — otherwise a broken helper

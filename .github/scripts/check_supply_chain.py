@@ -1049,6 +1049,314 @@ def deployment_scope_violations(root: Path, apply_workflow: str) -> list[str]:
     return violations
 
 
+# The privileged workflows whose cargo caches must never be fed by other
+# workflows (#547). Every other workflow (the ones that build pull-request
+# code, and any added later) is compared against them, so a new or
+# unclassified workflow fails closed instead of escaping the rule.
+PRIVILEGED_CACHE_WORKFLOWS = (*PRIVILEGED_WORKFLOWS, "trusted-pr-review.yml")
+_CACHE_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+# The only expression a cache key prefix may contain. Anything else (a ref,
+# an input, a step output) can evaluate to any text, so two prefixes that use
+# it cannot be shown to be disjoint.
+_COMPARABLE_CACHE_EXPRESSIONS = frozenset({"runner.os"})
+
+
+def cache_key_family(raw: str) -> tuple[str, str | None]:
+    """Normalize one cache key or restore prefix to its comparable family.
+
+    Whitespace inside `${{ }}` is removed and the whole key is case-folded,
+    so `${{runner.os}}` and `${{ RUNNER.OS }}` compare equal. The family is
+    the text before the first `hashFiles(` expression. Returns the family and
+    a problem when the family holds an expression other than `runner.os` or an
+    unterminated `${{`, since such a prefix cannot be compared statically.
+    """
+    # actions/cache trims its inputs with JavaScript `trim()`, which also drops
+    # U+FEFF and other Unicode spaces Python's `strip()` keeps. Refuse anything
+    # outside printable ASCII rather than model each trimming rule.
+    if any(not (" " <= character <= "~") for character in raw.strip(" \t\r\n")):
+        return "", (
+            f"cache key prefix {raw.strip()!r} has a non-ASCII or control character "
+            "the policy cannot compare"
+        )
+    normalized = _CACHE_EXPRESSION.sub(
+        lambda match: "${{" + "".join(match.group(1).split()).casefold() + "}}",
+        raw.strip(),
+    ).casefold()
+    family = normalized.split("${{hashfiles(", 1)[0]
+    expressions = _CACHE_EXPRESSION.findall(family)
+    for expression in expressions:
+        if expression not in _COMPARABLE_CACHE_EXPRESSIONS:
+            return family, (
+                f"cache key prefix {raw.strip()!r} uses an expression ({expression}) "
+                "the policy cannot compare"
+            )
+    literal = _CACHE_EXPRESSION.sub("", family)
+    if "${{" in literal:
+        return family, f"cache key prefix {raw.strip()!r} has an unterminated expression"
+    # actions/cache rewrites restore keys that start with `!` (dropping the
+    # whitespace after it), and a literal space is never needed in a key.
+    # Refuse both rather than model the rewrite.
+    if family.startswith("!") or any(character.isspace() for character in literal):
+        return family, (
+            f"cache key prefix {raw.strip()!r} starts with `!` or holds whitespace, "
+            "which actions/cache rewrites"
+        )
+    return family, None
+
+
+def cache_key_families(document: dict) -> list[tuple[str, str, str | None]]:
+    """`(raw, family, problem)` for every `key` and `restore-keys` entry.
+
+    Reads the parsed workflow, so comments, block indicators (`|`, `|+`,
+    `>-`) and quoting are decoded as GitHub decodes them, and each line of a
+    `restore-keys` value is one prefix. Every mapping key named `key` counts;
+    over-reading can only add violations.
+    """
+    entries: list[tuple[str, str, str | None]] = []
+    # A computed `with:` (one `${{ }}` expression) hides the key from this
+    # reading, so a cache step must spell its inputs as a mapping with a key.
+    for steps in _values_for_key(document, "steps"):
+        for step in steps if isinstance(steps, list) else []:
+            uses = step.get("uses") if isinstance(step, dict) else None
+            if not isinstance(uses, str) or not uses.casefold().startswith("actions/cache"):
+                continue
+            inputs = step.get("with")
+            if not isinstance(inputs, dict) or not any(
+                str(name).casefold() == "key" for name in inputs
+            ):
+                entries.append(
+                    (uses, "", "a cache step must spell `with:` as a mapping with a `key`")
+                )
+    for field in ("key", "restore-keys"):
+        for value in _values_for_key(document, field):
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if not isinstance(item, str):
+                    entries.append((repr(item), "", "cache key is not a string"))
+                    continue
+                lines = item.splitlines() if field == "restore-keys" else [item]
+                for line in lines:
+                    if line.strip():
+                        entries.append((line.strip(), *cache_key_family(line)))
+    return entries
+
+
+# `runner.os` evaluates to one of these (case-folded). A family is compared in
+# every concrete form, so `Linux-cargo-` and `${{ runner.os }}-cargo-` collide.
+RUNNER_OS_VALUES = ("linux", "windows", "macos")
+
+
+def expand_runner_os(family: str) -> list[str]:
+    """Every concrete text a normalized family can take on a hosted runner."""
+    if "${{runner.os}}" not in family:
+        return [family]
+    return [family.replace("${{runner.os}}", value) for value in RUNNER_OS_VALUES]
+
+
+# Events a privileged cache workflow may run on. None of them executes
+# pull-request bytes by default, which is what lets the workflow's cache keys
+# count as privileged rather than be compared like any other workflow's.
+PRIVILEGED_CACHE_TRIGGERS = frozenset({"push", "schedule", "workflow_dispatch", "workflow_run"})
+
+
+def privileged_trigger_violations(name: str, document: dict) -> list[str]:
+    """A privileged cache workflow must not run on a pull-request event."""
+    candidates = [value for key, value in document.items() if str(key).casefold() == "on"]
+    if len(candidates) != 1:
+        return [f"{name}: a privileged cache workflow must declare exactly one `on:`"]
+    on = candidates[0]
+    if isinstance(on, str):
+        events = [on]
+    elif isinstance(on, list):
+        events = on
+    elif isinstance(on, dict):
+        events = list(on)
+    else:
+        return [f"{name}: a privileged cache workflow has an unreadable `on:`"]
+    violations = [
+        f"{name}: trigger {event!r} is not reviewed for a privileged cache workflow; "
+        f"only {', '.join(sorted(PRIVILEGED_CACHE_TRIGGERS))} keep its cache keys trusted"
+        for event in events
+        if not isinstance(event, str) or event.casefold() not in PRIVILEGED_CACHE_TRIGGERS
+    ]
+    # A checkout without `ref` builds the triggering revision, so a push
+    # trigger must be limited to the protected branch: no other branch, no
+    # tags, no ignore lists. The scalar and list forms run on every branch.
+    if not isinstance(on, dict) and any(
+        isinstance(event, str) and event.casefold() == "push" for event in events
+    ):
+        violations.append(
+            f"{name}: a privileged cache workflow's push trigger must be "
+            "limited to `branches: [main]` with no tag or ignore filters"
+        )
+    if isinstance(on, dict):
+        for event, config in on.items():
+            if not isinstance(event, str) or event.casefold() != "push":
+                continue
+            filters = (
+                {str(key).casefold(): value for key, value in config.items()}
+                if isinstance(config, dict)
+                else {}
+            )
+            branches = filters.get("branches")
+            extra = sorted(set(filters) - {"branches", "paths", "paths-ignore"})
+            if branches not in (["main"], "main") or extra:
+                violations.append(
+                    f"{name}: a privileged cache workflow's push trigger must be "
+                    "limited to `branches: [main]` with no tag or ignore filters"
+                )
+    return violations
+
+
+def privileged_cache_job_violations(root: Path, name: str, document: dict) -> list[str]:
+    """A privileged job that saves a cache must build only protected code.
+
+    The privileged exemption covers a cache only when every checkout in the
+    same job (including checkouts inside local actions it calls) takes the
+    triggering protected revision (no `ref`) or the default branch, from this
+    repository. A job that checks out a pull request's head, or any computed
+    ref, could build PR code into a cache privileged jobs restore.
+    """
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return violations
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        reached = _cache_key_documents(root, f"{name} job {job_name}", job, set(), violations)
+        if not any(cache_key_families(part) for _, part in reached):
+            continue
+        for label, part in reached:
+            for step in _values_for_key(part, "steps"):
+                if not isinstance(step, list):
+                    continue
+                for item in step:
+                    uses = item.get("uses") if isinstance(item, dict) else None
+                    if not isinstance(uses, str) or not uses.casefold().startswith("actions/checkout@"):
+                        continue
+                    if "with" in item and not isinstance(item["with"], dict):
+                        violations.append(
+                            f"{label}: a checkout in a privileged cache job must spell "
+                            "`with:` as a mapping"
+                        )
+                        continue
+                    raw_inputs = item.get("with") or {}
+                    # Actions matches input names case-insensitively.
+                    inputs: dict[str, object] = {}
+                    for input_name, value in raw_inputs.items():
+                        folded = str(input_name).casefold()
+                        if folded in inputs:
+                            violations.append(
+                                f"{label}: checkout input {input_name!r} is spelled twice"
+                            )
+                        inputs[folded] = value
+                    ref, repository = inputs.get("ref"), inputs.get("repository")
+                    if (ref is not None and ref not in JUDGED_CHECKOUT_REFS) or (
+                        repository is not None and repository not in JUDGED_CHECKOUT_REPOSITORIES
+                    ):
+                        violations.append(
+                            f"{label}: a privileged job that saves a cache may check out only "
+                            f"the protected revision; checkout ref {ref!r} repository "
+                            f"{repository!r} is not reviewed"
+                        )
+    return violations
+
+
+def _cache_key_documents(
+    root: Path, label: str, document: dict, seen: set[str], violations: list[str]
+) -> list[tuple[str, dict]]:
+    """`document` plus every local action or reusable workflow it reaches.
+
+    A cache step moved into `./.github/actions/<name>` or a local reusable
+    workflow still runs with the caller's trust, so its keys count as the
+    caller's. A `./` reference that cannot be read is refused.
+    """
+    documents = [(label, document)]
+    for reference in _values_for_key(document, "uses"):
+        if not isinstance(reference, str) or not reference.startswith("./"):
+            continue
+        if reference in seen:
+            continue
+        seen.add(reference)
+        if reference.startswith("./.github/workflows/"):
+            path = root / reference[2:].split("@", 1)[0]
+            try:
+                nested = parse_workflow(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, WorkflowSyntaxError) as error:
+                violations.append(f"{label}: cache keys in {reference} cannot be read: {error}")
+                continue
+            relative = reference[2:]
+        else:
+            relative, nested, refusal = resolve_local_action(root, reference)
+            if nested is None:
+                violations.append(f"{label}: cache keys in {reference} cannot be read: {refusal}")
+                continue
+        documents.extend(
+            _cache_key_documents(root, f"{label} via {relative}", nested, seen, violations)
+        )
+    return documents
+
+
+def cache_trust_split_violations(root: Path) -> list[str]:
+    """A PR-code cache key must not share a key family with a privileged cache.
+
+    `actions/cache` restores an exact key, then the newest entry whose key has
+    the primary key as a prefix, then each `restore-keys` prefix. If a
+    pull-request job saved `target/` (compiled build scripts and proc macros)
+    under a key a privileged job can restore, PR-built code would run with the
+    privileged job's credentials whenever branch cache scoping failed. So no
+    family in any other workflow may be a prefix of a privileged family or the
+    reverse, in
+    any concrete `runner.os` form, including keys in local actions and
+    reusable workflows either side reaches. Every family must be statically
+    comparable.
+    """
+    workflows = root / ".github" / "workflows"
+    violations: list[str] = []
+
+    def families(name: str) -> list[tuple[str, str, str]]:
+        try:
+            document = parse_workflow((workflows / name).read_text(encoding="utf-8"))
+        except WorkflowSyntaxError as error:
+            violations.append(f"{name}: cache keys cannot be read: {error}")
+            return []
+        if name in PRIVILEGED_CACHE_WORKFLOWS:
+            violations.extend(privileged_trigger_violations(name, document))
+            violations.extend(privileged_cache_job_violations(root, name, document))
+        found = []
+        for label, reached in _cache_key_documents(root, name, document, set(), violations):
+            for raw, family, problem in cache_key_families(reached):
+                if problem:
+                    violations.append(f"{label}: {problem}")
+                    continue
+                for concrete in expand_runner_os(family):
+                    found.append((label, raw, concrete))
+        return found
+
+    privileged = [found for name in PRIVILEGED_CACHE_WORKFLOWS for found in families(name)]
+    reported: set[tuple[str, str, str, str]] = set()
+    others = sorted(
+        path.name
+        for path in workflows.iterdir()
+        if path.suffix in {".yml", ".yaml"} and path.name not in PRIVILEGED_CACHE_WORKFLOWS
+    )
+    for pr_name in others:
+        for pr_label, pr_raw, pr_family in families(pr_name):
+            for priv_label, priv_raw, priv_family in privileged:
+                key = (pr_label, pr_raw, priv_label, priv_raw)
+                if key in reported:
+                    continue
+                if pr_family.startswith(priv_family) or priv_family.startswith(pr_family):
+                    reported.add(key)
+                    violations.append(
+                        f"{pr_label}: cache key family {pr_raw!r} overlaps "
+                        f"{priv_label} family {priv_raw!r}; PR-built caches "
+                        "must use a key family privileged jobs cannot restore"
+                    )
+    return violations
+
+
 def monitoring_workflow_violations(text: str) -> list[str]:
     """Unattended monitoring must be able to read a gateway and nothing else.
 
@@ -4983,6 +5291,7 @@ def main(argv: list[str] | None = None) -> int:
 
     monitoring_text = (workflows / MONITORING_WORKFLOW).read_text(encoding="utf-8")
     violations.extend(monitoring_workflow_violations(monitoring_text))
+    violations.extend(cache_trust_split_violations(root))
 
     for state_writer_workflow in ("apply-on-merge.yml", "rotate.yml"):
         violations.extend(
