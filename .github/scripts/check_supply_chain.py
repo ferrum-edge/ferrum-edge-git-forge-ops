@@ -1159,12 +1159,32 @@ def privileged_trigger_violations(name: str, document: dict) -> list[str]:
         events = list(on)
     else:
         return [f"{name}: a privileged cache workflow has an unreadable `on:`"]
-    return [
+    violations = [
         f"{name}: trigger {event!r} is not reviewed for a privileged cache workflow; "
         f"only {', '.join(sorted(PRIVILEGED_CACHE_TRIGGERS))} keep its cache keys trusted"
         for event in events
         if not isinstance(event, str) or event.casefold() not in PRIVILEGED_CACHE_TRIGGERS
     ]
+    # A checkout without `ref` builds the triggering revision, so a push
+    # trigger must be limited to the protected branch: no other branch, no
+    # tags, no ignore lists.
+    if isinstance(on, dict):
+        for event, config in on.items():
+            if not isinstance(event, str) or event.casefold() != "push":
+                continue
+            filters = (
+                {str(key).casefold(): value for key, value in config.items()}
+                if isinstance(config, dict)
+                else {}
+            )
+            branches = filters.get("branches")
+            extra = sorted(set(filters) - {"branches", "paths", "paths-ignore"})
+            if branches not in (["main"], "main") or extra:
+                violations.append(
+                    f"{name}: a privileged cache workflow's push trigger must be "
+                    "limited to `branches: [main]` with no tag or ignore filters"
+                )
+    return violations
 
 
 def privileged_cache_job_violations(root: Path, name: str, document: dict) -> list[str]:
@@ -1194,7 +1214,16 @@ def privileged_cache_job_violations(root: Path, name: str, document: dict) -> li
                     uses = item.get("uses") if isinstance(item, dict) else None
                     if not isinstance(uses, str) or not uses.casefold().startswith("actions/checkout@"):
                         continue
-                    inputs = item.get("with") if isinstance(item.get("with"), dict) else {}
+                    raw_inputs = item.get("with") if isinstance(item.get("with"), dict) else {}
+                    # Actions matches input names case-insensitively.
+                    inputs: dict[str, object] = {}
+                    for input_name, value in raw_inputs.items():
+                        folded = str(input_name).casefold()
+                        if folded in inputs:
+                            violations.append(
+                                f"{label}: checkout input {input_name!r} is spelled twice"
+                            )
+                        inputs[folded] = value
                     ref, repository = inputs.get("ref"), inputs.get("repository")
                     if (ref is not None and ref not in JUDGED_CHECKOUT_REFS) or (
                         repository is not None and repository not in JUDGED_CHECKOUT_REPOSITORIES

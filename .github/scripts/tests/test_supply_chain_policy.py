@@ -7034,6 +7034,12 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("apply-on-merge.yml", "on:\n  push:\n",
              "on:\n  pull_request:\n  push:\n",
              "apply-on-merge.yml: trigger 'pull_request' is not reviewed"),
+            ("apply-on-merge.yml", "on:\n  push:\n    branches: [main]\n",
+             "on:\n  push:\n",
+             "apply-on-merge.yml: a privileged cache workflow's push trigger"),
+            ("apply-on-merge.yml", "on:\n  push:\n    branches: [main]\n",
+             "on:\n  push:\n    branches: [main, 'feature/**']\n",
+             "apply-on-merge.yml: a privileged cache workflow's push trigger"),
             ("lifecycle.yml",
              "key: ${{ runner.os }}-lifecycle-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
              "key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
@@ -7125,27 +7131,33 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "    steps:\n"
             "      - uses: actions/checkout@" + "a" * 40 + "\n"
             "        with:\n"
-            "          ref: ${{ github.event.workflow_run.head_sha }}\n"
+            "          REF_PLACEHOLDER: ${{ github.event.workflow_run.head_sha }}\n"
             "          persist-credentials: false\n"
             "      - uses: actions/cache@" + "b" * 40 + "\n"
             "        with:\n"
             "          path: target\n"
             "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
         )
-        with tempfile.TemporaryDirectory() as directory:
-            root = self._mirror_repo(Path(directory))
-            path = root / ".github/workflows/trusted-pr-review.yml"
-            text = path.read_text(encoding="utf-8")
-            self.assertIn("jobs:\n", text)
-            path.write_text(text.replace("jobs:\n", "jobs:\n" + job, 1), encoding="utf-8")
-            violations = self._violations(root)
-        self.assertTrue(
-            any(
-                item.startswith("trusted-pr-review.yml job poison: a privileged job")
-                for item in violations
-            ),
-            violations,
-        )
+        # Actions matches input names case-insensitively, so every spelling counts.
+        for spelling in ("ref", "Ref", "REF"):
+            with self.subTest(spelling=spelling):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = self._mirror_repo(Path(directory))
+                    path = root / ".github/workflows/trusted-pr-review.yml"
+                    text = path.read_text(encoding="utf-8")
+                    self.assertIn("jobs:\n", text)
+                    poisoned = job.replace("REF_PLACEHOLDER", spelling)
+                    path.write_text(
+                        text.replace("jobs:\n", "jobs:\n" + poisoned, 1), encoding="utf-8"
+                    )
+                    violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        item.startswith("trusted-pr-review.yml job poison: a privileged job")
+                        for item in violations
+                    ),
+                    violations,
+                )
 
     def test_runner_os_expands_to_concrete_families(self):
         self.assertEqual(
