@@ -75,7 +75,11 @@ ASCII without spaces, and may not start with `!`: `actions/cache` trims
 Unicode spaces such as U+FEFF and rewrites `!`-prefixed restore keys, and a
 textual comparison would miss both. A privileged workflow keeps its exemption
 only while it runs on `push`, `schedule`, `workflow_dispatch` or
-`workflow_run`; a pull-request trigger on one of them is refused. A key prefix may use no expression except
+`workflow_run`; a pull-request trigger on one of them is refused. Within a
+privileged workflow, a job that saves a cache may check out only the
+triggering protected revision (no `ref`) or the default branch of this
+repository, so a job that builds a pull request's head cannot use the
+privileged family. A key prefix may use no expression except
 `runner.os`: any other expression could evaluate to anything, so the
 separation could not be checked.
 

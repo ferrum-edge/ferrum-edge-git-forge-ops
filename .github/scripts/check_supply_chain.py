@@ -1167,6 +1167,46 @@ def privileged_trigger_violations(name: str, document: dict) -> list[str]:
     ]
 
 
+def privileged_cache_job_violations(root: Path, name: str, document: dict) -> list[str]:
+    """A privileged job that saves a cache must build only protected code.
+
+    The privileged exemption covers a cache only when every checkout in the
+    same job (including checkouts inside local actions it calls) takes the
+    triggering protected revision (no `ref`) or the default branch, from this
+    repository. A job that checks out a pull request's head, or any computed
+    ref, could build PR code into a cache privileged jobs restore.
+    """
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict):
+        return violations
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        reached = _cache_key_documents(root, f"{name} job {job_name}", job, set(), violations)
+        if not any(cache_key_families(part) for _, part in reached):
+            continue
+        for label, part in reached:
+            for step in _values_for_key(part, "steps"):
+                if not isinstance(step, list):
+                    continue
+                for item in step:
+                    uses = item.get("uses") if isinstance(item, dict) else None
+                    if not isinstance(uses, str) or not uses.casefold().startswith("actions/checkout@"):
+                        continue
+                    inputs = item.get("with") if isinstance(item.get("with"), dict) else {}
+                    ref, repository = inputs.get("ref"), inputs.get("repository")
+                    if (ref is not None and ref not in JUDGED_CHECKOUT_REFS) or (
+                        repository is not None and repository not in JUDGED_CHECKOUT_REPOSITORIES
+                    ):
+                        violations.append(
+                            f"{label}: a privileged job that saves a cache may check out only "
+                            f"the protected revision; checkout ref {ref!r} repository "
+                            f"{repository!r} is not reviewed"
+                        )
+    return violations
+
+
 def _cache_key_documents(
     root: Path, label: str, document: dict, seen: set[str], violations: list[str]
 ) -> list[tuple[str, dict]]:
@@ -1227,6 +1267,7 @@ def cache_trust_split_violations(root: Path) -> list[str]:
             return []
         if name in PRIVILEGED_CACHE_WORKFLOWS:
             violations.extend(privileged_trigger_violations(name, document))
+            violations.extend(privileged_cache_job_violations(root, name, document))
         found = []
         for label, reached in _cache_key_documents(root, name, document, set(), violations):
             for raw, family, problem in cache_key_families(reached):

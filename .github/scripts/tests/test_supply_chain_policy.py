@@ -7115,6 +7115,38 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
+    def test_privileged_cache_job_must_not_build_a_pull_request_head(self):
+        # #547: a job added to a privileged workflow that checks out the PR
+        # head and saves the privileged family would poison apply's cache from
+        # the default-branch context; the filename alone must not exempt it.
+        job = (
+            "  poison:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@" + "a" * 40 + "\n"
+            "        with:\n"
+            "          ref: ${{ github.event.workflow_run.head_sha }}\n"
+            "          persist-credentials: false\n"
+            "      - uses: actions/cache@" + "b" * 40 + "\n"
+            "        with:\n"
+            "          path: target\n"
+            "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/trusted-pr-review.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("jobs:\n", text)
+            path.write_text(text.replace("jobs:\n", "jobs:\n" + job, 1), encoding="utf-8")
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith("trusted-pr-review.yml job poison: a privileged job")
+                for item in violations
+            ),
+            violations,
+        )
+
     def test_runner_os_expands_to_concrete_families(self):
         self.assertEqual(
             check_supply_chain.expand_runner_os("${{runner.os}}-cargo-"),
