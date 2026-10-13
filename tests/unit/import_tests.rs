@@ -450,7 +450,10 @@ fn file_import_honors_the_namespace_selection() {
     assert!(error.contains("team-b"), "{error}");
     assert!(error.contains("ferrum"), "{error}");
     assert!(!output.exists(), "no tree may be staged: {error}");
-    assert!(!bundle.exists(), "no credential bundle may be written: {error}");
+    assert!(
+        !bundle.exists(),
+        "no credential bundle may be written: {error}"
+    );
 
     // Without a selection the whole document imports, as before.
     let unselected = tempfile::tempdir().unwrap();
@@ -479,7 +482,10 @@ fn file_import_honors_the_namespace_selection() {
     )
     .unwrap();
     assert_eq!((result.proxies, result.consumers), (1, 1));
-    assert!(selected.path().join("ferrum/proxies/proxy-test.yaml").exists());
+    assert!(selected
+        .path()
+        .join("ferrum/proxies/proxy-test.yaml")
+        .exists());
 }
 
 #[test]
