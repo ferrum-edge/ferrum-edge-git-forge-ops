@@ -918,6 +918,13 @@ fn file_import_without_a_selection_imports_every_namespace() {
     assert!(bundle.exists());
 }
 
+/// A label, the repository files, and extra environment for one oversize case.
+type OversizeCase = (
+    &'static str,
+    Vec<(&'static str, String)>,
+    Vec<(&'static str, &'static str)>,
+);
+
 /// #546: an oversized resource or overlay file stops `validate`, `plan` and
 /// `apply` with a size error before any gateway request, and nothing is
 /// written: the refusal is in the loader, ahead of every plan or apply step.
@@ -927,7 +934,7 @@ fn oversized_resource_or_overlay_files_stop_the_cli_before_the_gateway() {
     let cap = gitforgeops::config::MAX_REPO_CONFIG_FILE_BYTES as usize;
     let padded = |body: &str| format!("{body}#{}\n", "x".repeat(cap + 1 - body.len() - 2));
     let overlay = "kind: Proxy\nspec:\n  id: \"app\"\n  backend_host: \"overlay.internal\"\n";
-    let cases: [(&str, Vec<(&str, String)>, Vec<(&str, &str)>); 2] = [
+    let cases: [OversizeCase; 2] = [
         (
             "resource",
             vec![("resources/ferrum/proxies/app.yaml", padded(PROXY))],
