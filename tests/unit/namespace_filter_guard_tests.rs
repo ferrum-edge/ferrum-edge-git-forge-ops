@@ -846,10 +846,7 @@ fn two_namespace_backup() -> String {
 
 /// Runs `import --from-file` from `repo` into a fresh scratch directory and
 /// returns the output, the tree path and the bundle path.
-fn run_file_import(
-    repo: &Repo,
-    extra_env: &[(&str, &str)],
-) -> (Output, TempDir, PathBuf, PathBuf) {
+fn run_file_import(repo: &Repo, extra_env: &[(&str, &str)]) -> (Output, TempDir, PathBuf, PathBuf) {
     let scratch = TempDir::new().expect("scratch");
     let source = scratch.path().join("backup.json");
     std::fs::write(&source, two_namespace_backup()).expect("backup");
