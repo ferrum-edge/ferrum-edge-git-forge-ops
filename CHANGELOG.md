@@ -344,6 +344,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Pre-authorize `taiki-e/install-action` v2.87.27
+  (`ab6895351a88b908e96a4697860d4ffea5e57dbe`) as a cargo-audit installer pin
+  alongside v2.87.22, so Dependabot's #542 can switch the workflow under the
+  trusted checker. v2.87.22..v2.87.27 changes no action source (`action.yml`,
+  `main.sh`) and leaves `manifests/cargo-audit.json` byte-identical; only other
+  tools' manifests, upstream CI and codegen changed.
+
 - Compare trusted-review SHA producer lines with case preserved, require the pinned `trusted_sha`
   assignment to precede its echo, and reject a `trusted_sha` or `head_sha` environment binding in
   every scope that reaches the metadata step (workflow, prepare job and step), so a differently
