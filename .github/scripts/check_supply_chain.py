@@ -1053,69 +1053,102 @@ def deployment_scope_violations(root: Path, apply_workflow: str) -> list[str]:
 # workflows whose cargo caches must never be fed by them (#547).
 PR_CODE_CACHE_WORKFLOWS = ("rust-ci.yml", "validate-pr.yml")
 PRIVILEGED_CACHE_WORKFLOWS = (*PRIVILEGED_WORKFLOWS, "trusted-pr-review.yml")
-_CACHE_KEY_LINE = re.compile(
-    r"^(?P<indent>\s*)(?P<field>key|restore-keys)\s*:\s*(?P<value>.*)$"
-)
+_CACHE_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+# The only expression a cache key prefix may contain. Anything else (a ref,
+# an input, a step output) can evaluate to any text, so two prefixes that use
+# it cannot be shown to be disjoint.
+_COMPARABLE_CACHE_EXPRESSIONS = frozenset({"runner.os"})
 
 
-def cache_key_families(text: str) -> list[str]:
-    """Literal key prefixes that `key:` and `restore-keys:` lines in `text` name.
+def cache_key_family(raw: str) -> tuple[str, str | None]:
+    """Normalize one cache key or restore prefix to its comparable family.
 
-    Each key is cut at its first `${{ hashFiles` expression, so
-    `${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}` becomes
-    `${{ runner.os }}-cargo-`. A `restore-keys` block contributes each entry.
-    Every `key:` line is treated as a cache key; that over-approximates, which
-    can only add violations.
+    Whitespace inside `${{ }}` is removed and the whole key is case-folded,
+    so `${{runner.os}}` and `${{ RUNNER.OS }}` compare equal. The family is
+    the text before the first `hashFiles(` expression. Returns the family and
+    a problem when the family holds an expression other than `runner.os` or an
+    unterminated `${{`, since such a prefix cannot be compared statically.
     """
-    families: list[str] = []
-    lines = text.splitlines()
-    index = 0
-    while index < len(lines):
-        match = _CACHE_KEY_LINE.match(lines[index])
-        index += 1
-        if match is None:
-            continue
-        value = match["value"].strip()
-        values = [value]
-        if match["field"] == "restore-keys" and value in {"|", ">", "|-", ">-", ""}:
-            values = []
-            indent = len(match["indent"])
-            while index < len(lines):
-                entry = lines[index]
-                if entry.strip() and len(entry) - len(entry.lstrip()) <= indent:
-                    break
-                if entry.strip():
-                    values.append(entry.strip())
-                index += 1
-        for raw in values:
-            families.append(raw.strip("'\"").split("${{ hashFiles", 1)[0].strip())
-    return families
+    normalized = _CACHE_EXPRESSION.sub(
+        lambda match: "${{" + "".join(match.group(1).split()).casefold() + "}}",
+        raw.strip(),
+    ).casefold()
+    family = normalized.split("${{hashfiles(", 1)[0]
+    expressions = _CACHE_EXPRESSION.findall(family)
+    for expression in expressions:
+        if expression not in _COMPARABLE_CACHE_EXPRESSIONS:
+            return family, (
+                f"cache key prefix {raw.strip()!r} uses an expression ({expression}) "
+                "the policy cannot compare"
+            )
+    if "${{" in _CACHE_EXPRESSION.sub("", family):
+        return family, f"cache key prefix {raw.strip()!r} has an unterminated expression"
+    return family, None
+
+
+def cache_key_families(document: dict) -> list[tuple[str, str, str | None]]:
+    """`(raw, family, problem)` for every `key` and `restore-keys` entry.
+
+    Reads the parsed workflow, so comments, block indicators (`|`, `|+`,
+    `>-`) and quoting are decoded as GitHub decodes them, and each line of a
+    `restore-keys` value is one prefix. Every mapping key named `key` counts;
+    over-reading can only add violations.
+    """
+    entries: list[tuple[str, str, str | None]] = []
+    for field in ("key", "restore-keys"):
+        for value in _values_for_key(document, field):
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if not isinstance(item, str):
+                    entries.append((repr(item), "", "cache key is not a string"))
+                    continue
+                lines = item.splitlines() if field == "restore-keys" else [item]
+                for line in lines:
+                    if line.strip():
+                        entries.append((line.strip(), *cache_key_family(line)))
+    return entries
 
 
 def cache_trust_split_violations(root: Path) -> list[str]:
     """A PR-code cache key must not share a key family with a privileged cache.
 
-    `actions/cache` restores by exact key, then by `restore-keys` prefix. If a
+    `actions/cache` restores an exact key, then the newest entry whose key has
+    the primary key as a prefix, then each `restore-keys` prefix. If a
     pull-request job saved `target/` (compiled build scripts and proc macros)
     under a key a privileged job can restore, PR-built code would run with the
     privileged job's credentials whenever branch cache scoping failed. So no
-    PR-code family may be a prefix of a privileged family or the reverse.
+    PR-code family may be a prefix of a privileged family or the reverse, and
+    every family must be statically comparable.
     """
     workflows = root / ".github" / "workflows"
-    privileged = [
-        (name, family)
-        for name in PRIVILEGED_CACHE_WORKFLOWS
-        for family in cache_key_families((workflows / name).read_text(encoding="utf-8"))
-    ]
     violations: list[str] = []
+
+    def families(name: str) -> list[tuple[str, str]]:
+        try:
+            document = parse_workflow((workflows / name).read_text(encoding="utf-8"))
+        except WorkflowSyntaxError as error:
+            violations.append(f"{name}: cache keys cannot be read: {error}")
+            return []
+        found = []
+        for raw, family, problem in cache_key_families(document):
+            if problem:
+                violations.append(f"{name}: {problem}")
+            else:
+                found.append((raw, family))
+        return found
+
+    privileged = [
+        (name, raw, family)
+        for name in PRIVILEGED_CACHE_WORKFLOWS
+        for raw, family in families(name)
+    ]
     for pr_name in PR_CODE_CACHE_WORKFLOWS:
-        text = (workflows / pr_name).read_text(encoding="utf-8")
-        for pr_family in sorted(set(cache_key_families(text))):
-            for priv_name, priv_family in privileged:
+        for pr_raw, pr_family in sorted(set(families(pr_name))):
+            for priv_name, priv_raw, priv_family in privileged:
                 if pr_family.startswith(priv_family) or priv_family.startswith(pr_family):
                     violations.append(
-                        f"{pr_name}: cache key family {pr_family!r} overlaps "
-                        f"{priv_name} family {priv_family!r}; PR-built caches "
+                        f"{pr_name}: cache key family {pr_raw!r} overlaps "
+                        f"{priv_name} family {priv_raw!r}; PR-built caches "
                         "must use a key family privileged jobs cannot restore"
                     )
     return violations

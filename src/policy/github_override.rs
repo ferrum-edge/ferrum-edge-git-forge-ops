@@ -223,12 +223,12 @@ async fn check_override_context(
         )));
     }
 
-    // Issue events are paginated (default 30 per page). On busy PRs the
-    // relevant `labeled` event may live on a later page, so we must follow
-    // the `Link: rel="next"` header rather than trusting a single response.
-    // We track the latest matching `labeled` event across all pages and the
-    // matching `unlabeled` events, so a label that was added, removed, and
-    // re-added is correctly attributed to the last add.
+    // Issue events are paginated. On busy PRs the relevant `labeled` event
+    // may live on a later page, so every numbered page is read from the fixed
+    // API origin (never a response-supplied `Link` URL). We track the latest
+    // matching `labeled` event across all pages and the matching `unlabeled`
+    // events, so a label that was added, removed, and re-added is correctly
+    // attributed to the last add.
     let approver =
         match find_override_labeler(&client, repo, pr_number, token, &override_cfg.require_label)
             .await
@@ -356,10 +356,6 @@ async fn check_override_context(
 /// unlabel supersedes it.
 const MAX_ISSUE_EVENT_PAGES: usize = 20;
 
-pub fn hit_pagination_safety_cap(page_idx: usize, has_next_page: bool) -> bool {
-    page_idx + 1 == MAX_ISSUE_EVENT_PAGES && has_next_page
-}
-
 async fn find_override_labeler(
     client: &Client,
     repo: &str,
@@ -367,49 +363,43 @@ async fn find_override_labeler(
     token: &str,
     label_name: &str,
 ) -> crate::error::Result<Option<String>> {
-    let mut next_url = Some(format!(
-        "https://api.github.com/repos/{repo}/issues/{pr_number}/events?per_page=100"
-    ));
+    find_override_labeler_at(
+        client,
+        crate::secrets::DEFAULT_GITHUB_API_BASE,
+        repo,
+        pr_number,
+        token,
+        label_name,
+    )
+    .await
+}
 
+/// [`find_override_labeler`] against an explicit API origin.
+///
+/// Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`]; tests pass a
+/// loopback stub. Pages are requested by number from `api_base`. A response's
+/// `Link` header is never followed, so the bearer token cannot be sent to a
+/// host or path a response names. An exactly full page requires another read
+/// to prove completeness, and reaching the page cap with a full page fails
+/// closed so a later relabel cannot be missed.
+pub async fn find_override_labeler_at(
+    client: &Client,
+    api_base: &str,
+    repo: &str,
+    pr_number: u64,
+    token: &str,
+    label_name: &str,
+) -> crate::error::Result<Option<String>> {
+    let api_base = api_base.trim_end_matches('/');
     let mut latest_labeler: Option<String> = None;
 
-    // Hard cap on pages so a pathological PR can't spin this forever.
-    // Fail closed if the cap is reached while another page still exists;
-    // otherwise a later relabel could supersede the actor we observed.
-    for page_idx in 0..MAX_ISSUE_EVENT_PAGES {
-        let url = match next_url.take() {
-            Some(u) => u,
-            None => break,
-        };
-        let resp = client
-            .get(&url)
-            .bearer_auth(token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .send()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
-
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(crate::error::Error::ApiError {
-                status,
-                message: body,
-            });
-        }
-
-        // Capture the Link header *before* consuming the body.
-        next_url = resp
-            .headers()
-            .get(reqwest::header::LINK)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_next_link);
-
-        let events: Vec<IssueEvent> = resp
-            .json()
-            .await
-            .map_err(|e| crate::error::Error::HttpClient(format!("parse events: {e}")))?;
+    for page in 1..=MAX_ISSUE_EVENT_PAGES {
+        let url =
+            format!("{api_base}/repos/{repo}/issues/{pr_number}/events?per_page=100&page={page}");
+        let events: Vec<IssueEvent> =
+            serde_json::from_value(fetch_json(client, &url, token).await?)
+                .map_err(|e| crate::error::Error::HttpClient(format!("parse events: {e}")))?;
+        let complete = events.len() < 100;
 
         for event in events {
             let matches_label = event
@@ -431,15 +421,15 @@ async fn find_override_labeler(
             }
         }
 
-        if hit_pagination_safety_cap(page_idx, next_url.is_some()) {
-            return Err(crate::error::Error::Config(
-                "override label event history exceeds pagination safety cap; refusing stale approver attribution"
-                    .to_string(),
-            ));
+        if complete {
+            return Ok(latest_labeler);
         }
     }
 
-    Ok(latest_labeler)
+    Err(crate::error::Error::Config(
+        "override label event history exceeds pagination safety cap; refusing stale approver attribution"
+            .to_string(),
+    ))
 }
 
 async fn fetch_reviews(

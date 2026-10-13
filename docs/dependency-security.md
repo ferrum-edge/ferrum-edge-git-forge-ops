@@ -51,14 +51,22 @@ policy change from ever taking effect.
 macros, into a cached `target/`. It saves that cache under the
 `<os>-pr-cargo-<Cargo.lock hash>` key. The privileged workflows
 (`apply-on-merge.yml`, `drift-check.yml`, `materialize-file.yml`, `rotate.yml`)
-restore only the exact `<os>-cargo-<Cargo.lock hash>` key with no
-`restore-keys`, and `trusted-pr-review.yml` uses its own
-`<os>-trusted-pr-` family. GitHub's branch cache scoping already keeps a pull
-request's cache entries away from default-branch runs. The separate key
-families keep PR-built artifacts out of privileged jobs even if that scoping
-or a later workflow edit goes wrong. `check_supply_chain.py` refuses a key or
-restore prefix in `validate-pr.yml` or `rust-ci.yml` that overlaps a
-privileged workflow's cache key family, in either direction.
+use the `<os>-cargo-<Cargo.lock hash>` key with no `restore-keys`, and
+`trusted-pr-review.yml` uses its own `<os>-trusted-pr-` family.
+`actions/cache` restores an exact key, then the newest entry whose key starts
+with the primary key, then each `restore-keys` prefix, so neither family may
+be a prefix of the other. GitHub's branch cache scoping already keeps a pull
+request's cache entries away from default-branch runs. The separate families
+keep PR-built artifacts out of privileged jobs even if that scoping or a later
+workflow edit goes wrong.
+
+`check_supply_chain.py` reads every `key` and `restore-keys` entry from the
+parsed workflows (comments, block indicators and quoting decoded). It
+normalizes `${{ }}` spacing and case and cuts each key at its first
+`hashFiles(`. It then refuses any family in `validate-pr.yml` or `rust-ci.yml`
+that is a prefix of a privileged family, or the reverse. A key prefix may use
+no expression except `runner.os`: any other expression could evaluate to
+anything, so the separation could not be checked.
 
 ### Candidate cargo configuration is ignored
 

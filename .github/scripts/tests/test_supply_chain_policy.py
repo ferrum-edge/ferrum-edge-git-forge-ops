@@ -6995,21 +6995,38 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
 
     def test_pr_code_cache_cannot_share_a_privileged_key_family(self):
         # #547: validate-pr builds PR code into `target/`; the privileged
-        # workflows restore `<os>-cargo-<lock>`. Reusing that family, or a
-        # restore prefix covering it, must fail.
-        for workflow, old, new in (
-            (
-                "validate-pr.yml",
-                "key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
-                "key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
-            ),
-            (
-                "rust-ci.yml",
-                "            ${{ runner.os }}-rust-ci-\n",
-                "            ${{ runner.os }}-\n",
-            ),
-        ):
-            with self.subTest(workflow=workflow):
+        # workflows restore `<os>-cargo-<lock>`. Reusing that family in any
+        # spelling, or a privileged restore prefix covering a PR family in any
+        # YAML form, must fail.
+        privileged_key = "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        pr_key = "key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        cases = (
+            ("validate-pr.yml", pr_key,
+             "key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key family"),
+            ("validate-pr.yml", pr_key,
+             "key: ${{runner.os}}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key family"),
+            ("validate-pr.yml", pr_key,
+             "key: ${{ RUNNER.OS }}-Cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key family"),
+            ("validate-pr.yml", pr_key,
+             "key: ${{ github.ref }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key prefix"),
+            ("rust-ci.yml", "            ${{ runner.os }}-rust-ci-\n",
+             "            ${{ runner.os }}-\n", "rust-ci.yml: cache key family"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + "          restore-keys: | # fallback\n            ${{ runner.os }}-\n",
+             "validate-pr.yml: cache key family"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + "          restore-keys: |+\n            ${{ runner.os }}-\n",
+             "validate-pr.yml: cache key family"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + '          restore-keys: "${{ runner.os }}-"\n',
+             "validate-pr.yml: cache key family"),
+        )
+        for workflow, old, new, expected in cases:
+            with self.subTest(workflow=workflow, new=new):
                 with tempfile.TemporaryDirectory() as directory:
                     root = self._mirror_repo(Path(directory))
                     path = root / ".github/workflows" / workflow
@@ -7018,33 +7035,20 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     path.write_text(text.replace(old, new), encoding="utf-8")
                     violations = self._violations(root)
                 self.assertTrue(
-                    any(
-                        item.startswith(f"{workflow}: cache key family")
-                        for item in violations
-                    ),
+                    any(item.startswith(expected) for item in violations),
                     violations,
                 )
 
-    def test_cache_key_families_reads_keys_and_restore_prefixes(self):
-        text = textwrap.dedent(
-            """\
-            steps:
-              - uses: actions/cache@x
-                with:
-                  key: ${{ runner.os }}-a-${{ hashFiles('**/Cargo.lock') }}
-                  restore-keys: |
-                    ${{ runner.os }}-a-
-
-                    ${{ runner.os }}-
-              - uses: actions/create-github-app-token@x
-                with:
-                  private-key: ${{ secrets.KEY }}
-            """
-        )
+    def test_cache_key_family_normalizes_expressions(self):
+        family = check_supply_chain.cache_key_family
         self.assertEqual(
-            check_supply_chain.cache_key_families(text),
-            ["${{ runner.os }}-a-", "${{ runner.os }}-a-", "${{ runner.os }}-"],
+            family("${{runner.os}}-cargo-${{ hashFiles('**/Cargo.lock') }}"),
+            ("${{runner.os}}-cargo-", None),
         )
+        self.assertEqual(family("${{ RUNNER.OS }}-Cargo-")[0], "${{runner.os}}-cargo-")
+        self.assertIsNotNone(family("${{ inputs.prefix }}-cargo-")[1])
+        self.assertIsNotNone(family("${{ runner.os -cargo-")[1])
+        self.assertEqual(family("${{ hashFiles('x') }}"), ("", None))
 
     def test_mirrored_repository_is_a_clean_baseline(self):
         # Every mutation test above asserts the checker FAILS. That only proves

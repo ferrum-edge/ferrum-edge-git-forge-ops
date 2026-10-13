@@ -1423,3 +1423,125 @@ async fn an_invalid_recipient_login_is_refused_before_any_request() {
         );
     }
 }
+
+const OVERRIDE_LABEL: &str = "gitforgeops/policy-override";
+
+fn events_page(repo_pr: &str, page: usize) -> String {
+    format!("GET /repos/{repo_pr}/events?per_page=100&page={page} ")
+}
+
+fn label_event(event: &str, login: &str) -> serde_json::Value {
+    serde_json::json!({
+        "event": event,
+        "label": {"name": OVERRIDE_LABEL},
+        "actor": {"login": login},
+    })
+}
+
+fn full_events_page(first: serde_json::Value) -> String {
+    let mut events = vec![first];
+    events.extend((1..100).map(|_| serde_json::json!({"event": "commented"})));
+    serde_json::Value::Array(events).to_string()
+}
+
+/// #545: override-label pagination requests numbered pages from the fixed API
+/// origin and never follows a response's `Link` header, so the bearer token
+/// cannot be sent to a host or path that a response names.
+#[tokio::test]
+async fn override_labeler_pagination_ignores_response_link_urls() {
+    use gitforgeops::policy::github_override::find_override_labeler_at;
+    let repo_pr = format!("{REPO}/issues/7");
+    // A second loopback origin stands in for an attacker host. Page 1 names it
+    // as `rel="next"` with the legitimate events path; page 2 names a
+    // same-origin path outside the events endpoint.
+    let (other_origin, other_requests) =
+        spawn_github_stub(vec![(String::from("GET /"), 200, "[]".to_string())]);
+    let off_origin_link = format!(
+        "Link: <{other_origin}/repos/{repo_pr}/events?per_page=100&page=2>; rel=\"next\"\r\n"
+    );
+    let off_path_link = "Link: <{base}/steal?page=3>; rel=\"next\"\r\n".to_string();
+    let routes = vec![
+        (
+            events_page(&repo_pr, 1),
+            200,
+            full_events_page(label_event("labeled", "earlier")),
+            off_origin_link,
+        ),
+        (
+            events_page(&repo_pr, 2),
+            200,
+            serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+            off_path_link,
+        ),
+        (
+            String::from("/steal"),
+            200,
+            serde_json::json!([label_event("labeled", "attacker")]).to_string(),
+            String::new(),
+        ),
+    ];
+    let (api_base, requests) = spawn_github_stub_with_headers(routes);
+    let labeler =
+        find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+            .await
+            .expect("labeler lookup");
+    assert_eq!(labeler.as_deref(), Some("maintainer"));
+
+    let recorded = requests.lock().expect("recorded").clone();
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert!(recorded[0].starts_with(&events_page(&repo_pr, 1)));
+    assert!(recorded[1].starts_with(&events_page(&repo_pr, 2)));
+    for request in &recorded {
+        assert!(!request.contains("/steal"), "{request}");
+        assert_github_headers(request);
+    }
+    assert!(
+        other_requests.lock().expect("recorded").is_empty(),
+        "the off-origin Link target must receive no request (and no token)"
+    );
+}
+
+/// A later `unlabeled` event on a later page clears the approver.
+#[tokio::test]
+async fn override_labeler_honours_a_later_unlabel_on_a_later_page() {
+    use gitforgeops::policy::github_override::find_override_labeler_at;
+    let repo_pr = format!("{REPO}/issues/7");
+    let routes = vec![
+        (
+            events_page(&repo_pr, 1),
+            200,
+            full_events_page(label_event("labeled", "maintainer")),
+        ),
+        (
+            events_page(&repo_pr, 2),
+            200,
+            serde_json::json!([label_event("unlabeled", "maintainer")]).to_string(),
+        ),
+    ];
+    let (api_base, _requests) = spawn_github_stub(routes);
+    let labeler =
+        find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+            .await
+            .expect("labeler lookup");
+    assert_eq!(labeler, None);
+}
+
+/// Reaching the page cap with a still-full page fails closed.
+#[tokio::test]
+async fn override_labeler_pagination_cap_fails_closed() {
+    use gitforgeops::policy::github_override::find_override_labeler_at;
+    let routes = vec![(
+        format!("GET /repos/{REPO}/issues/7/events?per_page=100&page="),
+        200,
+        full_events_page(label_event("labeled", "maintainer")),
+    )];
+    let (api_base, requests) = spawn_github_stub(routes);
+    let error = find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+        .await
+        .expect_err("cap reached with more events");
+    assert!(
+        error.to_string().contains("pagination safety cap"),
+        "{error}"
+    );
+    assert_eq!(requests.lock().expect("recorded").len(), 20);
+}
