@@ -352,6 +352,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   validate or apply job. `import` refuses to render a resource file over the
   same cap, before anything is written, instead of publishing a tree the
   loader would refuse. (#546)
+- Policy-override label lookup no longer follows the `Link: rel="next"` URL a
+  GitHub response supplies. It requests numbered issue-event pages from the
+  compiled-in API origin, like the review lookup, so a spoofed or misdirected
+  response cannot send the bearer token to another host or path. A full final
+  page still needs another read, and the 20-page cap still fails closed. Stub
+  tests show a response `Link` is never requested. (#545)
 - Pre-authorize `taiki-e/install-action` v2.87.27
   (`ab6895351a88b908e96a4697860d4ffea5e57dbe`) as a cargo-audit installer pin
   alongside v2.87.22, so Dependabot's #542 can switch the workflow under the

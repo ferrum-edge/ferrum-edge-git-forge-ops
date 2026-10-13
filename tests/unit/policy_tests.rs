@@ -3392,7 +3392,7 @@ fn forbid_tls_verify_disabled_triggers_on_false() {
 
 #[test]
 fn parse_next_link_extracts_next_page_url() {
-    // Verifies the Link header parser used by override pagination.
+    // Verifies the Link header parser used by SSH key discovery pagination.
     use gitforgeops::policy::github_override::parse_next_link;
 
     let header = r#"<https://api.github.com/repos/x/y/issues/1/events?page=2>; rel="next", <https://api.github.com/repos/x/y/issues/1/events?page=5>; rel="last""#;
@@ -3404,15 +3404,6 @@ fn parse_next_link_extracts_next_page_url() {
     // Last page: only `prev` + `first`, no `next`.
     let last_page = r#"<...?page=4>; rel="prev", <...?page=1>; rel="first""#;
     assert_eq!(parse_next_link(last_page), None);
-}
-
-#[test]
-fn override_pagination_cap_fails_closed_when_more_pages_exist() {
-    use gitforgeops::policy::github_override::hit_pagination_safety_cap;
-
-    assert!(!hit_pagination_safety_cap(0, true));
-    assert!(!hit_pagination_safety_cap(19, false));
-    assert!(hit_pagination_safety_cap(19, true));
 }
 
 #[test]
