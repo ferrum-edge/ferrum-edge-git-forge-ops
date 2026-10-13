@@ -1090,8 +1090,17 @@ def cache_key_family(raw: str) -> tuple[str, str | None]:
                 f"cache key prefix {raw.strip()!r} uses an expression ({expression}) "
                 "the policy cannot compare"
             )
-    if "${{" in _CACHE_EXPRESSION.sub("", family):
+    literal = _CACHE_EXPRESSION.sub("", family)
+    if "${{" in literal:
         return family, f"cache key prefix {raw.strip()!r} has an unterminated expression"
+    # actions/cache rewrites restore keys that start with `!` (dropping the
+    # whitespace after it), and a literal space is never needed in a key.
+    # Refuse both rather than model the rewrite.
+    if family.startswith("!") or any(character.isspace() for character in literal):
+        return family, (
+            f"cache key prefix {raw.strip()!r} starts with `!` or holds whitespace, "
+            "which actions/cache rewrites"
+        )
     return family, None
 
 
@@ -1128,6 +1137,34 @@ def expand_runner_os(family: str) -> list[str]:
     if "${{runner.os}}" not in family:
         return [family]
     return [family.replace("${{runner.os}}", value) for value in RUNNER_OS_VALUES]
+
+
+# Events a privileged cache workflow may run on. None of them executes
+# pull-request bytes by default, which is what lets the workflow's cache keys
+# count as privileged rather than be compared like any other workflow's.
+PRIVILEGED_CACHE_TRIGGERS = frozenset({"push", "schedule", "workflow_dispatch", "workflow_run"})
+
+
+def privileged_trigger_violations(name: str, document: dict) -> list[str]:
+    """A privileged cache workflow must not run on a pull-request event."""
+    candidates = [value for key, value in document.items() if str(key).casefold() == "on"]
+    if len(candidates) != 1:
+        return [f"{name}: a privileged cache workflow must declare exactly one `on:`"]
+    on = candidates[0]
+    if isinstance(on, str):
+        events = [on]
+    elif isinstance(on, list):
+        events = on
+    elif isinstance(on, dict):
+        events = list(on)
+    else:
+        return [f"{name}: a privileged cache workflow has an unreadable `on:`"]
+    return [
+        f"{name}: trigger {event!r} is not reviewed for a privileged cache workflow; "
+        f"only {', '.join(sorted(PRIVILEGED_CACHE_TRIGGERS))} keep its cache keys trusted"
+        for event in events
+        if not isinstance(event, str) or event.casefold() not in PRIVILEGED_CACHE_TRIGGERS
+    ]
 
 
 def _cache_key_documents(
@@ -1188,6 +1225,8 @@ def cache_trust_split_violations(root: Path) -> list[str]:
         except WorkflowSyntaxError as error:
             violations.append(f"{name}: cache keys cannot be read: {error}")
             return []
+        if name in PRIVILEGED_CACHE_WORKFLOWS:
+            violations.extend(privileged_trigger_violations(name, document))
         found = []
         for label, reached in _cache_key_documents(root, name, document, set(), violations):
             for raw, family, problem in cache_key_families(reached):

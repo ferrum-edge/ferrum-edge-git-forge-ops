@@ -71,8 +71,11 @@ family in any other workflow (`validate-pr.yml`, `rust-ci.yml`,
 `alloy-consumer.yml`, `lifecycle.yml` and any workflow added later) that is
 a prefix of a privileged family, or the reverse. `lifecycle.yml` therefore
 uses its own `<os>-lifecycle-cargo-` family. A key may contain only printable
-ASCII, because `actions/cache` trims Unicode spaces such as U+FEFF that a
-textual comparison would keep. A key prefix may use no expression except
+ASCII without spaces, and may not start with `!`: `actions/cache` trims
+Unicode spaces such as U+FEFF and rewrites `!`-prefixed restore keys, and a
+textual comparison would miss both. A privileged workflow keeps its exemption
+only while it runs on `push`, `schedule`, `workflow_dispatch` or
+`workflow_run`; a pull-request trigger on one of them is refused. A key prefix may use no expression except
 `runner.os`: any other expression could evaluate to anything, so the
 separation could not be checked.
 
