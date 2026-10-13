@@ -7013,6 +7013,12 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("validate-pr.yml", pr_key,
              "key: ${{ github.ref }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
              "validate-pr.yml: cache key prefix"),
+            ("validate-pr.yml", pr_key,
+             "key: Linux-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "validate-pr.yml: cache key family"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + "          restore-keys: Linux-\n",
+             "validate-pr.yml: cache key family"),
             ("rust-ci.yml", "            ${{ runner.os }}-rust-ci-\n",
              "            ${{ runner.os }}-\n", "rust-ci.yml: cache key family"),
             ("apply-on-merge.yml", privileged_key,
@@ -7038,6 +7044,57 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     any(item.startswith(expected) for item in violations),
                     violations,
                 )
+
+    def test_pr_cache_inside_nested_local_actions_is_compared(self):
+        # #547: moving the cache step into a composite action (here two levels
+        # deep) keeps the caller's trust, so its key family still counts.
+        pr_key = "          key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/validate-pr.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(pr_key, text)
+            path.write_text(
+                text.replace(
+                    pr_key,
+                    pr_key + "\n      - name: Nested cache\n        uses: ./.github/actions/outer\n",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            for name, steps in (
+                ("outer", "    - uses: ./.github/actions/inner\n"),
+                (
+                    "inner",
+                    "    - uses: actions/cache@" + "a" * 40 + "\n"
+                    "      with:\n"
+                    "        path: target\n"
+                    "        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+                ),
+            ):
+                action = root / ".github/actions" / name / "action.yml"
+                action.parent.mkdir(parents=True)
+                action.write_text(
+                    f"name: {name}\ndescription: {name}\nruns:\n  using: composite\n  steps:\n"
+                    + steps,
+                    encoding="utf-8",
+                )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                item.startswith("validate-pr.yml via .github/actions/outer/action.yml via ")
+                and "cache key family" in item
+                for item in violations
+            ),
+            violations,
+        )
+
+    def test_runner_os_expands_to_concrete_families(self):
+        self.assertEqual(
+            check_supply_chain.expand_runner_os("${{runner.os}}-cargo-"),
+            ["linux-cargo-", "windows-cargo-", "macos-cargo-"],
+        )
+        self.assertEqual(check_supply_chain.expand_runner_os("linux-cargo-"), ["linux-cargo-"])
 
     def test_cache_key_family_normalizes_expressions(self):
         family = check_supply_chain.cache_key_family

@@ -1109,6 +1109,53 @@ def cache_key_families(document: dict) -> list[tuple[str, str, str | None]]:
     return entries
 
 
+# `runner.os` evaluates to one of these (case-folded). A family is compared in
+# every concrete form, so `Linux-cargo-` and `${{ runner.os }}-cargo-` collide.
+RUNNER_OS_VALUES = ("linux", "windows", "macos")
+
+
+def expand_runner_os(family: str) -> list[str]:
+    """Every concrete text a normalized family can take on a hosted runner."""
+    if "${{runner.os}}" not in family:
+        return [family]
+    return [family.replace("${{runner.os}}", value) for value in RUNNER_OS_VALUES]
+
+
+def _cache_key_documents(
+    root: Path, label: str, document: dict, seen: set[str], violations: list[str]
+) -> list[tuple[str, dict]]:
+    """`document` plus every local action or reusable workflow it reaches.
+
+    A cache step moved into `./.github/actions/<name>` or a local reusable
+    workflow still runs with the caller's trust, so its keys count as the
+    caller's. A `./` reference that cannot be read is refused.
+    """
+    documents = [(label, document)]
+    for reference in _values_for_key(document, "uses"):
+        if not isinstance(reference, str) or not reference.startswith("./"):
+            continue
+        if reference in seen:
+            continue
+        seen.add(reference)
+        if reference.startswith("./.github/workflows/"):
+            path = root / reference[2:].split("@", 1)[0]
+            try:
+                nested = parse_workflow(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, WorkflowSyntaxError) as error:
+                violations.append(f"{label}: cache keys in {reference} cannot be read: {error}")
+                continue
+            relative = reference[2:]
+        else:
+            relative, nested, refusal = resolve_local_action(root, reference)
+            if nested is None:
+                violations.append(f"{label}: cache keys in {reference} cannot be read: {refusal}")
+                continue
+        documents.extend(
+            _cache_key_documents(root, f"{label} via {relative}", nested, seen, violations)
+        )
+    return documents
+
+
 def cache_trust_split_violations(root: Path) -> list[str]:
     """A PR-code cache key must not share a key family with a privileged cache.
 
@@ -1117,38 +1164,43 @@ def cache_trust_split_violations(root: Path) -> list[str]:
     pull-request job saved `target/` (compiled build scripts and proc macros)
     under a key a privileged job can restore, PR-built code would run with the
     privileged job's credentials whenever branch cache scoping failed. So no
-    PR-code family may be a prefix of a privileged family or the reverse, and
-    every family must be statically comparable.
+    PR-code family may be a prefix of a privileged family or the reverse, in
+    any concrete `runner.os` form, including keys in local actions and
+    reusable workflows either side reaches. Every family must be statically
+    comparable.
     """
     workflows = root / ".github" / "workflows"
     violations: list[str] = []
 
-    def families(name: str) -> list[tuple[str, str]]:
+    def families(name: str) -> list[tuple[str, str, str]]:
         try:
             document = parse_workflow((workflows / name).read_text(encoding="utf-8"))
         except WorkflowSyntaxError as error:
             violations.append(f"{name}: cache keys cannot be read: {error}")
             return []
         found = []
-        for raw, family, problem in cache_key_families(document):
-            if problem:
-                violations.append(f"{name}: {problem}")
-            else:
-                found.append((raw, family))
+        for label, reached in _cache_key_documents(root, name, document, set(), violations):
+            for raw, family, problem in cache_key_families(reached):
+                if problem:
+                    violations.append(f"{label}: {problem}")
+                    continue
+                for concrete in expand_runner_os(family):
+                    found.append((label, raw, concrete))
         return found
 
-    privileged = [
-        (name, raw, family)
-        for name in PRIVILEGED_CACHE_WORKFLOWS
-        for raw, family in families(name)
-    ]
+    privileged = [found for name in PRIVILEGED_CACHE_WORKFLOWS for found in families(name)]
+    reported: set[tuple[str, str, str, str]] = set()
     for pr_name in PR_CODE_CACHE_WORKFLOWS:
-        for pr_raw, pr_family in sorted(set(families(pr_name))):
-            for priv_name, priv_raw, priv_family in privileged:
+        for pr_label, pr_raw, pr_family in families(pr_name):
+            for priv_label, priv_raw, priv_family in privileged:
+                key = (pr_label, pr_raw, priv_label, priv_raw)
+                if key in reported:
+                    continue
                 if pr_family.startswith(priv_family) or priv_family.startswith(pr_family):
+                    reported.add(key)
                     violations.append(
-                        f"{pr_name}: cache key family {pr_raw!r} overlaps "
-                        f"{priv_name} family {priv_raw!r}; PR-built caches "
+                        f"{pr_label}: cache key family {pr_raw!r} overlaps "
+                        f"{priv_label} family {priv_raw!r}; PR-built caches "
                         "must use a key family privileged jobs cannot restore"
                     )
     return violations

@@ -63,10 +63,14 @@ workflow edit goes wrong.
 `check_supply_chain.py` reads every `key` and `restore-keys` entry from the
 parsed workflows (comments, block indicators and quoting decoded). It
 normalizes `${{ }}` spacing and case and cuts each key at its first
-`hashFiles(`. It then refuses any family in `validate-pr.yml` or `rust-ci.yml`
-that is a prefix of a privileged family, or the reverse. A key prefix may use
-no expression except `runner.os`: any other expression could evaluate to
-anything, so the separation could not be checked.
+`hashFiles(`. `runner.os` is expanded to each of `linux`, `windows` and
+`macos`, so a literal `Linux-cargo-` key collides with `${{ runner.os }}-cargo-`.
+Keys in local composite actions (`./.github/actions/...`) and local reusable
+workflows count as their caller's, recursively. The checker then refuses any
+family in `validate-pr.yml` or `rust-ci.yml` that is a prefix of a privileged
+family, or the reverse. A key prefix may use no expression except
+`runner.os`: any other expression could evaluate to anything, so the
+separation could not be checked.
 
 ### Candidate cargo configuration is ignored
 
