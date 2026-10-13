@@ -589,3 +589,29 @@ fn loader_rejects_yaml_merge_keys_as_an_unknown_field() {
     assert!(error.contains("unknown configuration field"), "{error}");
     assert!(error.contains(".spec.<<"), "{error}");
 }
+
+/// Pads `body` with a trailing YAML comment so the file is exactly `len` bytes.
+fn padded_yaml(body: &str, len: usize) -> String {
+    let padding = len - body.len() - 2;
+    format!("{body}#{}\n", "x".repeat(padding))
+}
+
+/// #546: a resource file larger than the 1 MiB repository-file cap is refused
+/// with a size error before it is buffered or parsed; one at the cap loads.
+#[test]
+fn loader_refuses_a_resource_file_over_the_size_cap() {
+    use gitforgeops::config::MAX_REPO_CONFIG_FILE_BYTES;
+    let cap = MAX_REPO_CONFIG_FILE_BYTES as usize;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let directory = tmp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&directory).unwrap();
+    let file = directory.join("api.yaml");
+    std::fs::write(&file, padded_yaml(&minimal_proxy(""), cap)).unwrap();
+    assert_eq!(load_resources(tmp.path()).unwrap().len(), 1);
+
+    std::fs::write(&file, padded_yaml(&minimal_proxy(""), cap + 1)).unwrap();
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("byte limit"), "{error}");
+    assert!(error.contains(&file.display().to_string()), "{error}");
+}

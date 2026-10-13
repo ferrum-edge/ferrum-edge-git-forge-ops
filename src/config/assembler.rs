@@ -863,12 +863,7 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
             paths.sort();
 
             for path in paths {
-                let contents = std::fs::read_to_string(&path).map_err(|source| {
-                    crate::error::Error::FileRead {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
+                let contents = super::repo_file::read_tree_file(&path)?;
 
                 // Parse as raw YAML then convert to JSON Value
                 let yaml_value: serde_yaml::Value =

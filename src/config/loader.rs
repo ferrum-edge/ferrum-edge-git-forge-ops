@@ -183,12 +183,7 @@ pub fn load_resources_with_options(
             paths.sort();
 
             for path in paths {
-                let contents = std::fs::read_to_string(&path).map_err(|source| {
-                    crate::error::Error::FileRead {
-                        path: path.clone(),
-                        source,
-                    }
-                })?;
+                let contents = super::repo_file::read_tree_file(&path)?;
 
                 let mut resource = strict::resource_from_yaml(&contents, &path, options)?;
                 let declared_kind = strict::resource_kind(&resource);

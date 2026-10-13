@@ -344,6 +344,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Resource and overlay YAML files are read through the bounded repository-file
+  reader: a regular file of at most 1 MiB, the same per-file cap PR input
+  staging applies, checked by inspected length and by bytes read. A larger
+  file is refused with a size error instead of being buffered whole, so a
+  hostile or accidental checkout cannot exhaust memory in the validate or
+  apply job. (#546)
 - Pre-authorize `taiki-e/install-action` v2.87.27
   (`ab6895351a88b908e96a4697860d4ffea5e57dbe`) as a cargo-audit installer pin
   alongside v2.87.22, so Dependabot's #542 can switch the workflow under the
