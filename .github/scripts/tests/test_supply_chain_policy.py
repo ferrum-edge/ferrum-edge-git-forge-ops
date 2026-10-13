@@ -21,7 +21,8 @@ sys.modules[SPEC.name] = check_supply_chain
 SPEC.loader.exec_module(check_supply_chain)
 
 CARGO_AUDIT_ACTION_PINS = (
-    "taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0",
+    "taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0",  # v2.87.22
+    "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",  # v2.87.27
 )
 REJECTED_CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",  # retired v2.87.20
@@ -30,6 +31,7 @@ REJECTED_CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@" + "0" * 40,
     "taiki-e/install-action@v2",
     "taiki-e/install-action@v2.87.22",
+    "taiki-e/install-action@v2.87.27",
     "taiki-e/install-action@main",
 )
 
@@ -2567,7 +2569,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
             action.write_text("name: sample\n", encoding="utf-8")
             self.assertEqual(check_supply_chain.action_files(root), [action])
 
-    def test_cargo_audit_install_accepts_only_the_reviewed_v2_87_22_pin(self):
+    def test_cargo_audit_install_accepts_exactly_the_reviewed_pins(self):
         self.assertEqual(
             check_supply_chain.CARGO_AUDIT_ACTIONS, frozenset(CARGO_AUDIT_ACTION_PINS)
         )
@@ -2597,7 +2599,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     self.assertNotEqual(changed, workflow)
                     self.assertTrue(check_supply_chain.cargo_audit_install_violations(changed))
 
-    def test_cargo_audit_install_keeps_strict_shape_for_the_reviewed_pin(self):
+    def test_cargo_audit_install_keeps_strict_shape_for_each_reviewed_pin(self):
         mutations = (
             ("tool: cargo-audit@0.22.1", "tool: cargo-audit@latest"),
             ("tool: cargo-audit@0.22.1", "tool: cargo-audit@0.22.2"),
@@ -2663,7 +2665,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     check_supply_chain.cargo_audit_install_violations(changed),
                 )
 
-    def test_reviewed_cargo_audit_pin_passes_the_trusted_checker(self):
+    def test_each_reviewed_cargo_audit_pin_passes_the_trusted_checker(self):
         for pin in CARGO_AUDIT_ACTION_PINS:
             with self.subTest(pin=pin), tempfile.TemporaryDirectory() as temporary:
                 root = self._mirror_repo(Path(temporary))

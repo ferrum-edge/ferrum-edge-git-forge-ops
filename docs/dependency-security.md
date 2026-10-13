@@ -16,8 +16,11 @@ on pull requests and by the canary, not here.
 CI installs cargo-audit **0.22.1** with
 `taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0` (v2.87.22), using
 `checksum: true` and `fallback: none`. The action pin fixes the installer code.
-The protected policy accepts only this reviewed revision after the workflow
-switch in #465 and retirement of v2.87.20. The byte-identical v2.87.20
+The protected policy accepts this reviewed revision and the pre-authorized
+v2.87.27 (`taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe`),
+whose action source and cargo-audit manifest are unchanged from v2.87.22, so
+the Dependabot workflow switch (#542) can pass the trusted checker. The v2.87.22
+pin is retired after that switch. The byte-identical v2.87.20
 [committed cargo-audit manifest](https://github.com/taiki-e/install-action/blob/9983c65e42da123ff25d1f78505eb6de315aa172/manifests/cargo-audit.json)
 records the 0.22.1 Linux x86-64 archive SHA-256
 `c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab`, and the
