@@ -288,6 +288,12 @@ isolate_cursor_provider() {
   done < <(compgen -v)
 }
 
+# Muse reads META_API_KEY or its stored account login; an inherited model
+# override must not compete with the launcher's pinned model.
+isolate_muse_provider() {
+  unset MUSE_MODEL
+}
+
 # resolve_agent_bin <command-name> <env-var-name> [candidate-abs-path...]
 # Prints the resolved absolute path on stdout; diagnostics go to stderr.
 resolve_agent_bin() {
