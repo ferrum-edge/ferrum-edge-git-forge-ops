@@ -2,7 +2,7 @@ pub mod from_api;
 pub mod from_file;
 
 pub use from_api::import_from_api;
-pub use from_file::import_from_file;
+pub use from_file::{import_from_file, import_from_file_selected};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;

@@ -3950,9 +3950,12 @@ async fn cmd_import(
         )
         .await?
     } else if let Some(file_path) = from_file {
-        import::import_from_file(
+        // The same selection the API branch requires: a file holding other
+        // namespaces is refused rather than published whole.
+        import::import_from_file_selected(
             &PathBuf::from(file_path),
             &output_path,
+            resolved.namespace_filter.as_deref(),
             credential_bundle_path.as_deref(),
             &passthrough_policy,
             allow_plaintext_plugin_config,

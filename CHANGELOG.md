@@ -336,6 +336,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   trusted `.gitforgeops/smoke.yaml` so the preview shows the declared checks
   (#526). The settings audit requires the negated `[skip ci]` commit-message
   rule on `main` (#527).
+- `import --from-file` honors the namespace selection (#514). Under
+  `FERRUM_NAMESPACE` or an environment `namespace_filter`, a document that
+  contains any other namespace is refused before the tree, import manifest or
+  credential migration bundle is written, instead of being published whole. A
+  document wholly inside the selection imports as before.
 
 ### Security
 

@@ -18,6 +18,33 @@ pub fn import_from_file(
     passthrough_policy: &ImportPassthroughPolicy,
     allow_plaintext_plugin_config: &[String],
 ) -> crate::error::Result<ImportResult> {
+    import_from_file_selected(
+        file_path,
+        output_dir,
+        None,
+        credential_bundle_output,
+        passthrough_policy,
+        allow_plaintext_plugin_config,
+    )
+}
+
+/// [`import_from_file`] under a namespace selection (`FERRUM_NAMESPACE` or the
+/// environment's `namespace_filter`).
+///
+/// File import publishes the whole document: its count seal and source
+/// provenance describe every row in it, so silently dropping rows would make
+/// the manifest disagree with the tree. A selection is therefore honored by
+/// refusing a document that carries any resource outside the selected
+/// namespace, before anything is staged and before credentials are captured.
+/// A document wholly inside the selection imports unchanged.
+pub fn import_from_file_selected(
+    file_path: &Path,
+    output_dir: &Path,
+    namespace_filter: Option<&str>,
+    credential_bundle_output: Option<&Path>,
+    passthrough_policy: &ImportPassthroughPolicy,
+    allow_plaintext_plugin_config: &[String],
+) -> crate::error::Result<ImportResult> {
     if let Some(bundle_path) = credential_bundle_output {
         validate_migration_bundle_source(bundle_path, file_path)?;
     }
@@ -43,6 +70,22 @@ pub fn import_from_file(
     }
     let snapshot = BackupSnapshot::from_value(value)?;
     let namespaces = source_namespaces(&snapshot);
+    if let Some(selected) = namespace_filter {
+        let outside: Vec<&str> = namespaces
+            .iter()
+            .map(String::as_str)
+            .filter(|namespace| *namespace != selected)
+            .collect();
+        if !outside.is_empty() {
+            return Err(crate::error::Error::Config(format!(
+                "the import document contains namespace(s) {outside:?} outside the selected \
+                 namespace {selected:?}; file import publishes the whole document. Import a \
+                 backup of the selected namespace only, use --from-api, or clear \
+                 FERRUM_NAMESPACE and the environment's namespace_filter for this import; no \
+                 tree or credential bundle was published"
+            )));
+        }
+    }
     let source = ImportSourceMetadata::from_snapshot("file", namespaces, &snapshot);
     split_config_with_inventory(
         &snapshot.config,

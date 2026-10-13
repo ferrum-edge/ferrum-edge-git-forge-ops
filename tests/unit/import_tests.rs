@@ -422,6 +422,72 @@ fn split_config_refuses_to_overwrite_existing_file() {
     );
 }
 
+/// A namespace selection (`FERRUM_NAMESPACE` or `namespace_filter`) applies
+/// to file import too (#514): a document carrying any other namespace is
+/// refused before a tree, manifest or credential bundle is written, and a
+/// document wholly inside the selection imports as before.
+#[test]
+fn file_import_honors_the_namespace_selection() {
+    let source = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.consumers[0].namespace = "team-b".to_string();
+    let mixed = source.path().join("mixed.yaml");
+    std::fs::write(&mixed, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination = tempfile::tempdir().unwrap();
+    let output = destination.path().join("resources");
+    let bundle = destination.path().join("bundle.json");
+    let error = gitforgeops::import::import_from_file_selected(
+        &mixed,
+        &output,
+        Some("ferrum"),
+        Some(&bundle),
+        &strict_passthrough(),
+        &[],
+    )
+    .expect_err("a document with another namespace must be refused")
+    .to_string();
+    assert!(error.contains("team-b"), "{error}");
+    assert!(error.contains("ferrum"), "{error}");
+    assert!(!output.exists(), "no tree may be staged: {error}");
+    assert!(
+        !bundle.exists(),
+        "no credential bundle may be written: {error}"
+    );
+
+    // Without a selection the whole document imports, as before.
+    let unselected = tempfile::tempdir().unwrap();
+    let result = gitforgeops::import::import_from_file_selected(
+        &mixed,
+        unselected.path(),
+        None,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!((result.proxies, result.consumers), (1, 1));
+
+    // A document wholly inside the selection imports unchanged.
+    let single = source.path().join("single.yaml");
+    std::fs::write(&single, serde_yaml::to_string(&make_test_config()).unwrap()).unwrap();
+    let selected = tempfile::tempdir().unwrap();
+    let result = gitforgeops::import::import_from_file_selected(
+        &single,
+        selected.path(),
+        Some("ferrum"),
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!((result.proxies, result.consumers), (1, 1));
+    assert!(selected
+        .path()
+        .join("ferrum/proxies/proxy-test.yaml")
+        .exists());
+}
+
 #[test]
 fn import_from_file_roundtrip() {
     let tmp_export = tempfile::tempdir().unwrap();
