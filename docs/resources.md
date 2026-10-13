@@ -54,7 +54,8 @@ Loading is fail-closed and deterministic:
   anywhere in `resources/` or the selected overlay are rejected.
 - Each resource or overlay file must be a regular file of at most 1 MiB, the
   same per-file cap PR input staging applies. A larger file is refused with a
-  size error before it is buffered or parsed.
+  size error before it is buffered or parsed. `import` refuses to render a
+  resource file over the cap, before writing anything.
 - Two overlay files targeting the same resource are an error that names both.
 - Gateway overlay fragments need `kind` and `spec.id`. Mesh fragments use an
   explicit `id` or their file stem.
