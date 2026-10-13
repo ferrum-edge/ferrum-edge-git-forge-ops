@@ -1049,10 +1049,11 @@ impl AdminClient {
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
-        if resp.status == 404 {
-            return Ok(None);
-        }
-        self.check(&resp, RequestKind::Read)?;
+        // Cached evidence is refused before anything is concluded from the
+        // response — including absence. A cached 404 may predate a row the
+        // database still holds; accepting it as "already gone" would let a
+        // prune record a successful delete and discard the ownership
+        // evidence a later shared-mode prune needs.
         let cached = resp
             .data_source
             .as_deref()
@@ -1065,6 +1066,10 @@ impl AdminClient {
                  conditional on. Wait for the database to recover and retry."
             )));
         }
+        if resp.status == 404 {
+            return Ok(None);
+        }
+        self.check(&resp, RequestKind::Read)?;
         let Some(etag) = strong_entity_tag(resp.etag.as_deref()) else {
             return Err(crate::error::Error::ConditionalWriteUnavailable(format!(
                 "GET {path} in namespace `{namespace}` returned no strong ETag, so a write to \
@@ -1697,7 +1702,7 @@ impl ExportEndpoint {
                     "refusing to send the viewer token to a {scheme}:// gateway URL: \
                      GET /config/export needs https://, or http:// to a literal loopback IP \
                      address (127.0.0.1 or [::1])"
-                )))
+                )));
             }
         }
         let base = gateway_url.trim_end_matches('/');

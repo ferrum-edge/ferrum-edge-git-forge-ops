@@ -71,6 +71,27 @@ class CertificationTests(unittest.TestCase):
         found = reasons(result)
         self.assertTrue(any("did not finish" in reason for reason in found), found)
 
+    def test_a_sealed_result_without_sealed_at_certifies_nothing(self):
+        # Removing only the timestamp from an otherwise passing, correctly
+        # revisioned result must still refuse certification.
+        for sealed_at in (None, "", 12345, "not a timestamp"):
+            with self.subTest(sealed_at=sealed_at):
+                result = passing_result()
+                result["sealed_at"] = sealed_at
+                found = reasons(result)
+                self.assertTrue(found, sealed_at)
+        result = passing_result()
+        del result["sealed_at"]
+        self.assertTrue(
+            any("sealed_at" in reason for reason in reasons(result)), reasons(result)
+        )
+
+    def test_a_future_seal_beyond_clock_skew_certifies_nothing(self):
+        result = passing_result()
+        lifecycle_result.seal(result, REVISION, GATEWAY, NOW + timedelta(hours=2))
+        found = reasons(result)
+        self.assertTrue(any("future" in reason for reason in found), found)
+
     def test_a_stale_result_certifies_nothing(self):
         result = passing_result()
         lifecycle_result.seal(result, REVISION, GATEWAY, NOW - timedelta(days=30))

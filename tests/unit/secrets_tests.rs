@@ -294,6 +294,27 @@ fn load_bundles_rejects_duplicate_slots_across_shards() {
     );
 }
 
+#[test]
+fn load_bundles_rejects_duplicate_json_members_before_collapse() {
+    use gitforgeops::secrets::bundle::parse_bundles_from_json;
+
+    for raw in [
+        // Repeated slot inside one object shard.
+        r#"{"FERRUM_CREDS_BUNDLE": {"ferrum/app/key": "v1", "ferrum/app/key": "v2"}}"#,
+        // Repeated slot inside a JSON-string shard.
+        r#"{"FERRUM_CREDS_BUNDLE": "{\"ferrum/app/key\":\"v1\",\"ferrum/app/key\":\"v2\"}"}"#,
+        // Repeated wrapper member.
+        r#"{"FERRUM_CREDS_BUNDLE": {}, "FERRUM_CREDS_BUNDLE": {}}"#,
+    ] {
+        let err = parse_bundles_from_json(raw).unwrap_err().to_string();
+        assert!(err.contains("duplicate JSON object member"), "{raw}: {err}");
+        assert!(
+            !err.contains("v1") && !err.contains("v2"),
+            "values must not be echoed: {err}"
+        );
+    }
+}
+
 /// Regression for #331: `u32::parse` accepted `_0`, `_00`, `_01` and `_+1`,
 /// so a second key aliased an existing shard, one shard's map overwrote the
 /// other's in `per_shard`, and the next PUT of that shard dropped slots.

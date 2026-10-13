@@ -51,6 +51,22 @@ def bundle_names() -> list[str]:
     ]
 
 
+def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Build a JSON object, refusing a repeated member name.
+
+    ``json.loads`` otherwise keeps the last value silently, so a hand-edited
+    bundle could carry two values for one slot (or wrapper member) and a
+    later write would persist whichever happened to win. The error names
+    the member only, never a value.
+    """
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise BundleError(f"credential bundle repeats JSON object member {key!r}")
+        result[key] = value
+    return result
+
+
 def extract(environ: Mapping[str, str], destination: Path) -> int:
     expected = bundle_names()
     bound = set(expected)
@@ -62,7 +78,7 @@ def extract(environ: Mapping[str, str], destination: Path) -> int:
         if not isinstance(encoded, str) or not encoded.strip():
             continue
         try:
-            bundle = json.loads(encoded)
+            bundle = json.loads(encoded, object_pairs_hook=_object_without_duplicates)
         except json.JSONDecodeError as error:
             raise BundleError(f"credential bundle {name} is not valid JSON") from error
         if not isinstance(bundle, dict) or not all(

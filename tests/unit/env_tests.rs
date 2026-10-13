@@ -589,6 +589,42 @@ fn gateway_transport_refuses_embedded_credentials_without_echoing_them() {
     }
 }
 
+/// A base URL is joined by string concatenation, so a query or fragment
+/// would swallow every appended path. Both base URLs refuse them at load;
+/// valid path prefixes (and trailing slashes) still load.
+#[test]
+fn base_urls_refuse_query_strings_and_fragments() {
+    for url in [
+        "https://gateway.example.com/admin?x=1",
+        "https://gateway.example.com/admin#part",
+    ] {
+        let error = validate_gateway_transport(Some(url), true, false, false)
+            .expect_err("a query/fragment base URL must fail at load")
+            .to_string();
+        assert!(error.contains("FERRUM_GATEWAY_URL"), "{url}: {error}");
+        assert!(error.contains("query"), "{url}: {error}");
+        assert!(!error.contains("gateway.example.com"), "{url}: {error}");
+        let error = validate_verify_transport(Some(url), true, false)
+            .expect_err("a query/fragment verify base URL must fail at load")
+            .to_string();
+        assert!(error.contains("FERRUM_VERIFY_BASE_URL"), "{url}: {error}");
+    }
+    assert!(validate_gateway_transport(
+        Some("https://gateway.example.com/prefix/"),
+        false,
+        false,
+        false
+    )
+    .is_ok());
+    assert!(validate_gateway_transport(
+        Some("https://gateway.example.com/prefix"),
+        false,
+        false,
+        false
+    )
+    .is_ok());
+}
+
 /// `verify` sends credential-slot headers to the data plane, so its base URL
 /// gets the admin API's transport rule rather than none at all.
 #[test]

@@ -859,7 +859,23 @@ async fn allocate_if_needed(
             return Err(failure.source.into());
         }
     };
-    journal_allocation(state, &outcome, binding)?;
+    // The shards are externally committed even if journaling them fails:
+    // surface the committed ciphertexts exactly as the partial-failure
+    // branch does, then report the persistence failure. Retry metadata is
+    // not durable in that case, and the error says so instead of letting
+    // the recipient lose material no later pass will redeliver.
+    if let Err(journal_error) = journal_allocation(state, &outcome, binding) {
+        if !outcome.allocated.is_empty() {
+            surface_delivered_credentials(env_config, &outcome).await?;
+        }
+        return Err(format!(
+            "credentials were allocated and committed, but recording them in state failed: \
+             {journal_error}. The delivered ciphertexts above are the committed values; \
+             retry allocation journaling is not durable, so keep them — a retry may refuse \
+             these slots as revived values until state is repaired."
+        )
+        .into());
+    }
 
     // Re-resolve so `desired` picks up freshly allocated values. The
     // allocator only produces values for slots classified as NeedsAllocation
@@ -2783,7 +2799,12 @@ async fn cmd_plan(
             reportln!(
                 json_mode,
                 "  API-spec ownership conflicts block apply in namespace(s): {}. Remove the competing repository declarations or reconcile ownership with the API spec.",
-                safe(conflict_namespaces.into_iter().collect::<Vec<_>>().join(", "))
+                safe(
+                    conflict_namespaces
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             );
         }
         if empty_namespace_error {
@@ -4877,7 +4898,9 @@ async fn cmd_rotate(
         }
         None => {
             if recipient.is_some() {
-                println!("Warning: recipient had no compatible SSH keys; secret written but not delivered.");
+                println!(
+                    "Warning: recipient had no compatible SSH keys; secret written but not delivered."
+                );
             }
         }
     }

@@ -85,6 +85,44 @@ fn overlay_merges_fields() {
     assert!(proxy.strip_listen_path);
 }
 
+/// Write one overlay document under `<root>/<namespace>/<subdir>/<file>`.
+fn write_overlay(root: &std::path::Path, relative: &str, text: &str) {
+    let path = root.join(relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, text).unwrap();
+}
+
+#[test]
+fn overlay_canonicalizes_the_backend_protocol_alias_before_merging() {
+    use gitforgeops::config::schema::BackendScheme;
+
+    // Canonical base (make_proxy carries backend_scheme: http), alias overlay.
+    let temp = tempfile::tempdir().unwrap();
+    write_overlay(
+        temp.path(),
+        "team-alpha/proxies/shared.yaml",
+        "kind: Proxy\nspec:\n  id: shared\n  backend_protocol: https\n",
+    );
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+    apply_overlay(&mut resources, temp.path()).unwrap();
+    let config = assemble_gateway(resources);
+    assert_eq!(config.proxies[0].backend_scheme, Some(BackendScheme::Https));
+
+    // Both spellings with different values are a clear error, not a
+    // duplicate-field parse failure.
+    let temp = tempfile::tempdir().unwrap();
+    write_overlay(
+        temp.path(),
+        "team-alpha/proxies/shared.yaml",
+        "kind: Proxy\nspec:\n  id: shared\n  backend_scheme: http\n  backend_protocol: https\n",
+    );
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+    let error = apply_overlay(&mut resources, temp.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("backend_protocol"), "{error}");
+}
+
 #[test]
 fn configured_overlay_nonexistent_dir_is_an_error() {
     let mut resources = load_resources(&fixtures_dir()).unwrap();
