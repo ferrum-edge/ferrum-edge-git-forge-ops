@@ -212,7 +212,7 @@ jobs:
 
       - name: Upload trusted binary
         if: steps.metadata.outputs.privileged == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.metadata.outputs.binary_artifact_name }}
           path: trusted/target/release/gitforgeops
@@ -248,7 +248,7 @@ jobs:
 
       - name: Upload sanitized input
         if: steps.metadata.outputs.privileged == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ steps.metadata.outputs.artifact_name }}
           path: pr-input
@@ -280,13 +280,13 @@ jobs:
           persist-credentials: false
 
       - name: Download sanitized input
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ needs.prepare.outputs.artifact_name }}
           path: review-input
 
       - name: Download exact trusted binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: ${{ needs.prepare.outputs.binary_artifact_name }}
           path: review-bin
