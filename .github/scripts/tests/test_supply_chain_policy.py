@@ -6993,6 +6993,59 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("trusted-pr-review-" in item for item in violations), violations
         )
 
+    def test_pr_code_cache_cannot_share_a_privileged_key_family(self):
+        # #547: validate-pr builds PR code into `target/`; the privileged
+        # workflows restore `<os>-cargo-<lock>`. Reusing that family, or a
+        # restore prefix covering it, must fail.
+        for workflow, old, new in (
+            (
+                "validate-pr.yml",
+                "key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+                "key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+            ),
+            (
+                "rust-ci.yml",
+                "            ${{ runner.os }}-rust-ci-\n",
+                "            ${{ runner.os }}-\n",
+            ),
+        ):
+            with self.subTest(workflow=workflow):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = self._mirror_repo(Path(directory))
+                    path = root / ".github/workflows" / workflow
+                    text = path.read_text(encoding="utf-8")
+                    self.assertIn(old, text)
+                    path.write_text(text.replace(old, new), encoding="utf-8")
+                    violations = self._violations(root)
+                self.assertTrue(
+                    any(
+                        item.startswith(f"{workflow}: cache key family")
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_cache_key_families_reads_keys_and_restore_prefixes(self):
+        text = textwrap.dedent(
+            """\
+            steps:
+              - uses: actions/cache@x
+                with:
+                  key: ${{ runner.os }}-a-${{ hashFiles('**/Cargo.lock') }}
+                  restore-keys: |
+                    ${{ runner.os }}-a-
+
+                    ${{ runner.os }}-
+              - uses: actions/create-github-app-token@x
+                with:
+                  private-key: ${{ secrets.KEY }}
+            """
+        )
+        self.assertEqual(
+            check_supply_chain.cache_key_families(text),
+            ["${{ runner.os }}-a-", "${{ runner.os }}-a-", "${{ runner.os }}-"],
+        )
+
     def test_mirrored_repository_is_a_clean_baseline(self):
         # Every mutation test above asserts the checker FAILS. That only proves
         # something if the unmutated mirror passes — otherwise a broken helper

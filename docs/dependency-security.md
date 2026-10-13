@@ -45,6 +45,21 @@ Push and schedule runs use the tree's own checker and policy. Those events have
 no untrusted author, and pinning them to the default branch would stop a merged
 policy change from ever taking effect.
 
+### PR-built caches stay out of privileged jobs
+
+`validate-pr.yml` builds pull-request code, including build scripts and proc
+macros, into a cached `target/`. It saves that cache under the
+`<os>-pr-cargo-<Cargo.lock hash>` key. The privileged workflows
+(`apply-on-merge.yml`, `drift-check.yml`, `materialize-file.yml`, `rotate.yml`)
+restore only the exact `<os>-cargo-<Cargo.lock hash>` key with no
+`restore-keys`, and `trusted-pr-review.yml` uses its own
+`<os>-trusted-pr-` family. GitHub's branch cache scoping already keeps a pull
+request's cache entries away from default-branch runs. The separate key
+families keep PR-built artifacts out of privileged jobs even if that scoping
+or a later workflow edit goes wrong. `check_supply_chain.py` refuses a key or
+restore prefix in `validate-pr.yml` or `rust-ci.yml` that overlaps a
+privileged workflow's cache key family, in either direction.
+
 ### Candidate cargo configuration is ignored
 
 A trusted checker is not enough if the commands it runs read configuration

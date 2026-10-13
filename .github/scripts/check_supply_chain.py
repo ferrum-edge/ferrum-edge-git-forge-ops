@@ -1049,6 +1049,78 @@ def deployment_scope_violations(root: Path, apply_workflow: str) -> list[str]:
     return violations
 
 
+# Workflows that build and run pull-request code, and the privileged
+# workflows whose cargo caches must never be fed by them (#547).
+PR_CODE_CACHE_WORKFLOWS = ("rust-ci.yml", "validate-pr.yml")
+PRIVILEGED_CACHE_WORKFLOWS = (*PRIVILEGED_WORKFLOWS, "trusted-pr-review.yml")
+_CACHE_KEY_LINE = re.compile(
+    r"^(?P<indent>\s*)(?P<field>key|restore-keys)\s*:\s*(?P<value>.*)$"
+)
+
+
+def cache_key_families(text: str) -> list[str]:
+    """Literal key prefixes that `key:` and `restore-keys:` lines in `text` name.
+
+    Each key is cut at its first `${{ hashFiles` expression, so
+    `${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}` becomes
+    `${{ runner.os }}-cargo-`. A `restore-keys` block contributes each entry.
+    Every `key:` line is treated as a cache key; that over-approximates, which
+    can only add violations.
+    """
+    families: list[str] = []
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        match = _CACHE_KEY_LINE.match(lines[index])
+        index += 1
+        if match is None:
+            continue
+        value = match["value"].strip()
+        values = [value]
+        if match["field"] == "restore-keys" and value in {"|", ">", "|-", ">-", ""}:
+            values = []
+            indent = len(match["indent"])
+            while index < len(lines):
+                entry = lines[index]
+                if entry.strip() and len(entry) - len(entry.lstrip()) <= indent:
+                    break
+                if entry.strip():
+                    values.append(entry.strip())
+                index += 1
+        for raw in values:
+            families.append(raw.strip("'\"").split("${{ hashFiles", 1)[0].strip())
+    return families
+
+
+def cache_trust_split_violations(root: Path) -> list[str]:
+    """A PR-code cache key must not share a key family with a privileged cache.
+
+    `actions/cache` restores by exact key, then by `restore-keys` prefix. If a
+    pull-request job saved `target/` (compiled build scripts and proc macros)
+    under a key a privileged job can restore, PR-built code would run with the
+    privileged job's credentials whenever branch cache scoping failed. So no
+    PR-code family may be a prefix of a privileged family or the reverse.
+    """
+    workflows = root / ".github" / "workflows"
+    privileged = [
+        (name, family)
+        for name in PRIVILEGED_CACHE_WORKFLOWS
+        for family in cache_key_families((workflows / name).read_text(encoding="utf-8"))
+    ]
+    violations: list[str] = []
+    for pr_name in PR_CODE_CACHE_WORKFLOWS:
+        text = (workflows / pr_name).read_text(encoding="utf-8")
+        for pr_family in sorted(set(cache_key_families(text))):
+            for priv_name, priv_family in privileged:
+                if pr_family.startswith(priv_family) or priv_family.startswith(pr_family):
+                    violations.append(
+                        f"{pr_name}: cache key family {pr_family!r} overlaps "
+                        f"{priv_name} family {priv_family!r}; PR-built caches "
+                        "must use a key family privileged jobs cannot restore"
+                    )
+    return violations
+
+
 def monitoring_workflow_violations(text: str) -> list[str]:
     """Unattended monitoring must be able to read a gateway and nothing else.
 
@@ -4983,6 +5055,7 @@ def main(argv: list[str] | None = None) -> int:
 
     monitoring_text = (workflows / MONITORING_WORKFLOW).read_text(encoding="utf-8")
     violations.extend(monitoring_workflow_violations(monitoring_text))
+    violations.extend(cache_trust_split_violations(root))
 
     for state_writer_workflow in ("apply-on-merge.yml", "rotate.yml"):
         violations.extend(

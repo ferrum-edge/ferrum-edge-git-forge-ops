@@ -344,6 +344,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- PR validation (`validate-pr.yml`) caches its PR-built cargo `target/` under
+  its own `<os>-pr-cargo-` key family instead of the `<os>-cargo-` key the
+  privileged apply, drift, materialize and rotate jobs restore.
+  `check_supply_chain.py` refuses a PR-code cache key or restore prefix
+  (`validate-pr.yml`, `rust-ci.yml`) that overlaps a privileged workflow's
+  family, so PR-built build scripts and proc macros cannot reach a privileged
+  run even if branch cache scoping fails. (#547)
 - Pre-authorize `taiki-e/install-action` v2.87.27
   (`ab6895351a88b908e96a4697860d4ffea5e57dbe`) as a cargo-audit installer pin
   alongside v2.87.22, so Dependabot's #542 can switch the workflow under the

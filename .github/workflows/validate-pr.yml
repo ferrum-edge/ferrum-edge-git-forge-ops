@@ -102,6 +102,10 @@ jobs:
         with:
           toolchain: 1.99.0
 
+      # PR-built `target/` (build scripts, proc macros) stays in its own key
+      # family. The privileged workflows restore `<os>-cargo-<lock>` with no
+      # restore-keys, so they can never select a `<os>-pr-cargo-` entry even if
+      # cache scoping were wrong. `check_supply_chain.py` enforces the split.
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -109,7 +113,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build gitforgeops
         run: cargo install --path . --locked
@@ -182,6 +186,10 @@ jobs:
         with:
           toolchain: 1.99.0
 
+      # PR-built `target/` (build scripts, proc macros) stays in its own key
+      # family. The privileged workflows restore `<os>-cargo-<lock>` with no
+      # restore-keys, so they can never select a `<os>-pr-cargo-` entry even if
+      # cache scoping were wrong. `check_supply_chain.py` enforces the split.
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -189,7 +197,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install gitforgeops
         run: cargo install --path . --locked
