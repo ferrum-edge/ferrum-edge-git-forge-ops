@@ -408,7 +408,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
                 "FERRUM_APPLY_STRATEGY",
                 value,
                 "incremental or full_replace",
-            ))
+            ));
         }
     };
     let admin_jwt_role =
@@ -653,6 +653,18 @@ fn parse_transport_url(var: &str, raw: &str) -> crate::error::Result<Url> {
 
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(invalid_secret_env(var, GATEWAY_URL_ACCEPTED));
+    }
+
+    // A base URL is joined by plain string concatenation, so a query or
+    // fragment would swallow every appended path (`…?x=1/backup` is one
+    // long query value, not a request for `/backup`). Refuse either, the
+    // same way non-http(s) schemes are refused.
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(crate::error::Error::Config(format!(
+            "invalid {var}: a base URL must not carry a query string or fragment; expected \
+             {GATEWAY_URL_ACCEPTED} with at most a path prefix (value withheld from this \
+             message)"
+        )));
     }
 
     // `url` guarantees a non-empty host for http/https, so this is a

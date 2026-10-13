@@ -218,6 +218,14 @@ def staleness(sealed_at: object, max_age_hours: int, now: datetime) -> str | Non
     if completed.tzinfo is None:
         completed = completed.replace(tzinfo=timezone.utc)
     age = (now - completed).total_seconds() / 3600
+    # Explicit clock-skew policy: at most one hour of future seal time is
+    # tolerated (a sealing host whose clock runs ahead); beyond that the
+    # timestamp proves nothing about when the run happened.
+    if age < -1:
+        return (
+            f"was sealed {abs(age):.0f}h in the future, beyond the 1h of "
+            "clock skew this gate tolerates."
+        )
     if age > max_age_hours:
         return (
             f"is {age:.0f}h old, beyond the {max_age_hours}h window. A stale "
@@ -361,8 +369,16 @@ def blockers(
             )
 
     sealed_at = result.get("sealed_at")
-    # An absent sealed_at is already reported above as an unsealed result.
-    if sealed_at:
+    # The seal timestamp is required in its own right: the revision check
+    # above only proves the run finished, not when. Absent, null, empty and
+    # non-string values have no freshness to evaluate.
+    if not isinstance(sealed_at, str) or not sealed_at:
+        reasons.append(
+            "the result carries no sealed_at timestamp, so its freshness "
+            "cannot be established. A sealed result always records when it "
+            "was sealed."
+        )
+    else:
         stale = staleness(sealed_at, max_age_hours, now)
         if stale:
             reasons.append(f"the result {stale}")

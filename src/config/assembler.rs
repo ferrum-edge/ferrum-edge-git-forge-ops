@@ -604,8 +604,8 @@ pub fn apply_overlay_with_options(
     let overlay_fragments = load_overlay_fragments(overlay_dir)?;
 
     let mut overlay_targets: HashMap<ResourceKey, PathBuf> = HashMap::new();
-    for overlay in overlay_fragments {
-        let overlay_id = overlay_fragment_id(&overlay);
+    for mut overlay in overlay_fragments {
+        let overlay_id = overlay_fragment_id(&overlay)?;
 
         if overlay_id.is_empty() {
             return Err(crate::error::Error::Config(format!(
@@ -644,6 +644,14 @@ pub fn apply_overlay_with_options(
             .map(|idx| &mut base[idx])
         {
             Some((ref mut base_ns, ref mut base_resource)) => {
+                // The base serializes the canonical `backend_scheme`; a raw
+                // overlay may still spell the alias `backend_protocol`.
+                // Keeping both keys through the merge makes the strict
+                // parser see one Serde field twice, so canonicalize the
+                // overlay first (both names with different values is an error).
+                if overlay.kind == "Proxy" {
+                    canonicalize_backend_protocol_alias(&mut overlay.value, &overlay.path)?;
+                }
                 let base_value = serde_json::to_value(&*base_resource)?;
                 let merged =
                     deep_merge_values(base_value, overlay.value, &mut Vec::new(), overlay.kind);
@@ -680,31 +688,69 @@ struct OverlayFragment {
     value: serde_json::Value,
 }
 
+/// Rewrite a Proxy overlay's legacy `backend_protocol` key to the canonical
+/// `backend_scheme` before merging. Both spellings with the same value keep
+/// the canonical one; different values are a configuration error.
+fn canonicalize_backend_protocol_alias(
+    overlay: &mut serde_json::Value,
+    path: &Path,
+) -> crate::error::Result<()> {
+    let Some(spec) = overlay.get_mut("spec").and_then(|s| s.as_object_mut()) else {
+        return Ok(());
+    };
+    let Some(alias) = spec.remove("backend_protocol") else {
+        return Ok(());
+    };
+    match spec.get("backend_scheme") {
+        None => {
+            spec.insert("backend_scheme".to_string(), alias);
+        }
+        Some(canonical) if *canonical == alias => {}
+        Some(_) => {
+            return Err(crate::error::Error::Config(format!(
+                "overlay {} sets both backend_scheme and its alias backend_protocol \
+                 with different values; keep only backend_scheme",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Identity an overlay fragment targets.
 ///
 /// Gateway kinds address a resource by `spec.id`. Mesh fragments have no id
 /// in the mesh schema, so they use the gitforgeops-side fragment name:
 /// explicit top-level `id`, else the file stem — matching what
 /// `loader::load_resources` stamps onto the base fragment.
-fn overlay_fragment_id(overlay: &OverlayFragment) -> String {
+fn overlay_fragment_id(overlay: &OverlayFragment) -> crate::error::Result<String> {
     if overlay.kind == "MeshConfig" {
-        return overlay
-            .value
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .unwrap_or(overlay.stem.as_str())
-            .to_string();
+        // Fragment ids are matched verbatim against the base fragment's id,
+        // so surrounding whitespace is rejected at both boundaries rather
+        // than trimmed on one side only (which orphaned identical ids and
+        // let a spaced overlay select an unspaced base).
+        if let Some(raw) = overlay.value.get("id").and_then(|v| v.as_str()) {
+            if raw.trim() != raw {
+                return Err(crate::error::Error::Config(format!(
+                    "overlay {} declares a MeshConfig id with surrounding whitespace; \
+                     fragment ids are matched exactly, so remove the whitespace",
+                    overlay.path.display()
+                )));
+            }
+            if !raw.is_empty() {
+                return Ok(raw.to_string());
+            }
+        }
+        return Ok(overlay.stem.clone());
     }
 
-    overlay
+    Ok(overlay
         .value
         .get("spec")
         .and_then(|s| s.get("id"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .to_string()
+        .to_string())
 }
 
 fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<OverlayFragment>> {
@@ -776,7 +822,7 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
                     return Err(crate::error::Error::FileRead {
                         path: subdir_path,
                         source,
-                    })
+                    });
                 }
             };
             if subdir_metadata.file_type().is_symlink() {
@@ -1032,7 +1078,7 @@ fn array_merge_identity(path: &[String], kind: &'static str) -> Option<ArrayIden
         ("MeshConfig", "workloads") => Some(ArrayIdentity::MeshWorkloadSpiffeId),
         ("MeshConfig", "services") => Some(ArrayIdentity::MeshServiceNameNamespace),
         ("MeshConfig", _) => None,
-        (_, "plugins") | (_, "targets") => Some(ArrayIdentity::Generic),
+        ("Proxy", "plugins") | ("Upstream", "targets") => Some(ArrayIdentity::Generic),
         _ => None,
     }
 }

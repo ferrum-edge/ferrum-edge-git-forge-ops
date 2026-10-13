@@ -142,6 +142,25 @@ fn validate_reports_each_resource_rejection_in_every_format() {
 }
 
 #[test]
+fn bare_rejection_is_recognized_behind_a_namespace_annotation() {
+    // A multi-namespace run labels every diagnostic line before the
+    // classifier sees it; the bare (TTY) form must still be recognized
+    // behind the runner's own annotation.
+    let diagnostic = edge_error(RESOURCE_FIELDS[0]);
+    let repo = Repo::new(&diagnostic, 1, false);
+    let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "proxies": [
+            { "id": "a", "namespace": "ferrum" },
+            { "id": "b", "namespace": "other" },
+        ],
+    }))
+    .unwrap();
+    let result = run_validation(&config, repo.validator.to_str().unwrap()).unwrap();
+    assert!(!result.success);
+    repo.assert_remedy(&result.stderr);
+}
+
+#[test]
 fn exact_edge_diagnostic_without_location_is_recognized_on_either_stream() {
     let diagnostic = format!("{PREFIX}{}", RESOURCE_FIELDS[1]);
     for use_stdout in [false, true] {

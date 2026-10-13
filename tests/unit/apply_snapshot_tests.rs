@@ -747,6 +747,38 @@ async fn a_row_already_gone_is_neither_deleted_again_nor_recreated() {
 }
 
 #[tokio::test]
+async fn a_cached_404_is_not_absence_evidence_for_a_delete() {
+    // The row is planned for deletion and the read says 404 — but from the
+    // gateway cache, which may predate the database. Accepting it would
+    // record a successful delete and drop the ownership evidence.
+    let planned = document(Kind::Upstream, "u1", None, 1);
+    let cached_missing = (
+        "GET /upstreams/u1".into(),
+        404,
+        "{}".into(),
+        vec![("X-Data-Source".into(), "cached".into())],
+    );
+    let run = apply_exclusive(
+        &GatewayConfig::default(),
+        planned,
+        vec![health(), cached_missing],
+    )
+    .await;
+
+    assert_eq!(run.mutations(), Vec::<String>::new());
+    assert_eq!(run.result.deleted, 0);
+    assert_eq!(run.result.deletes_missing, 0);
+    assert!(
+        run.result
+            .fatal_error
+            .as_deref()
+            .is_some_and(|fatal| fatal.contains("X-Data-Source: cached")),
+        "{:?}",
+        run.result
+    );
+}
+
+#[tokio::test]
 async fn a_cached_read_stops_the_run_before_any_overwrite() {
     let planned = document(Kind::Upstream, "u1", None, 1);
     let desired = document(Kind::Upstream, "u1", None, 2);

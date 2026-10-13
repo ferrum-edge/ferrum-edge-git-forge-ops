@@ -238,12 +238,12 @@ impl ConfigExport {
                 Some(_) => {
                     return Err(Error::Config(format!(
                         "GET {CONFIG_EXPORT_PATH}: `{section}` is not an array"
-                    )))
+                    )));
                 }
                 None => {
                     return Err(Error::Config(format!(
                         "GET {CONFIG_EXPORT_PATH}: required section `{section}` is missing"
-                    )))
+                    )));
                 }
             };
             for entry in entries {
@@ -256,7 +256,7 @@ impl ConfigExport {
                             "configuration export for namespace {namespace:?} returned {section} \
                              {:?} with a missing or foreign namespace or id; refusing the snapshot",
                             id.unwrap_or("?")
-                        )))
+                        )));
                     }
                 };
                 rows.push(ExportRow {
@@ -388,14 +388,24 @@ impl ConfigExport {
         })
     }
 
-    /// Ids of exported consumers that lack [`HIDDEN_CREDENTIALS_FIELD`]. Edge
-    /// always sends it, so its absence means a non-conforming gateway, and no
-    /// baseline can then vouch for the hidden credentials.
+    /// Ids of exported consumers without a *valid*
+    /// [`HIDDEN_CREDENTIALS_FIELD`]: absent, null, non-string, or a string
+    /// that is not a fingerprint. Edge always sends a real one (including
+    /// for an empty hidden-credential set), so anything else means a
+    /// non-conforming gateway, and no baseline can then vouch for the
+    /// hidden credentials. Presence alone is not evidence: fingerprint
+    /// collection ignores malformed values, and two empty maps would
+    /// otherwise compare "complete".
     pub fn consumers_missing_hidden_fingerprint(&self) -> BTreeSet<&str> {
         self.rows
             .iter()
             .filter(|row| row.kind == "Consumer")
-            .filter(|row| row.body.get(HIDDEN_CREDENTIALS_FIELD).is_none())
+            .filter(|row| {
+                !row.body
+                    .get(HIDDEN_CREDENTIALS_FIELD)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_fingerprint)
+            })
             .map(|row| row.id.as_str())
             .collect()
     }

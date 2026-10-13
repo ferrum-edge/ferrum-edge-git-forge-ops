@@ -246,7 +246,7 @@ environment through to a first apply and authenticated traffic.
    |---|---|---|
    | `FERRUM_GATEWAY_URL` | api mode | Must be `https://`. |
    | `FERRUM_ADMIN_JWT_SECRET` | api mode | HS256 key, at least 32 characters. |
-   | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | optional | The gateway's viewer-capped key (Ferrum Edge v0.9.9+). When set, `diff` reads `GET /config/export` with it instead of `GET /backup` with the admin key. The bundled workflows do not bind it yet. See [Reading with a viewer-capped credential](#reading-with-a-viewer-capped-credential). |
+   | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | optional | The gateway's viewer-capped key (Ferrum Edge v0.9.9+). When set, `diff` reads `GET /config/export` with it instead of `GET /backup` with the admin key. The bundled drift-check workflow binds it for scheduled monitoring (see [Scheduled monitoring](docs/reference.md#scheduled-monitoring)); other workflows do not bind it. See [Reading with a viewer-capped credential](#reading-with-a-viewer-capped-credential). |
    | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | yes | From step 5. |
    | `FERRUM_GH_PROVISIONER_TOKEN` | credential broker | App installation token, or fine-grained PAT with `Secrets: write` + `Environments: write`. |
    | `FERRUM_ADMIN_JWT_ISSUER` / `_ROLE` / `_AUDIENCE` / `_TTL_SECS` | optional | Defaults `ferrum-edge`, `admin`, none, `3600`. If set, must match the gateway or every call is `401`. |
@@ -812,12 +812,13 @@ provisioner token or credential bundles). The settings audit,
 environment opts in, the audit also requires a successful drift run in the
 last 48 hours.
 
-**Caveat:** the bundled drift check still reads `GET /backup`, which needs
-the `admin` role, so the monitoring environment's signing secret is
-gateway-write-equivalent. Treat it that way. If that is unacceptable, leave
-`monitoring.unattended` off. `diff` itself can already read with a
-viewer-capped key ([above](#reading-with-a-viewer-capped-credential)); binding
-it in the workflow is a separate change. See
+**Credential scope:** the bundled drift check binds only the viewer-capped
+key and reads `GET /config/export`; the protected checker forbids the admin
+key in that workflow. Existing monitor environments may still hold the older
+admin secret copy: delete `FERRUM_ADMIN_JWT_SECRET` from each
+`<env>-monitor` (keep it in `<env>` itself) — the viewer key is
+read-only by gateway enforcement, the admin key is not. Provisioning order is
+in [Scheduled monitoring](docs/reference.md#scheduled-monitoring); see also
 [GitHub launch controls §3.1](docs/github-launch-controls.md#31-unattended-drift-monitoring).
 
 ## Setup doctor

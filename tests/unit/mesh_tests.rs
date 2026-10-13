@@ -114,6 +114,23 @@ fn loader_keeps_explicit_fragment_id_over_file_stem() {
 }
 
 #[test]
+fn loader_rejects_a_fragment_id_with_surrounding_whitespace() {
+    // Fragment ids are matched exactly at both boundaries; trimming on one
+    // side only used to orphan identical ids and let a spaced overlay
+    // select an unspaced base.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[(
+            "ferrum/mesh/core.yaml",
+            "kind: MeshConfig\nid: ' core '\nspec: {}\n",
+        )],
+    );
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("surrounding whitespace"), "{error}");
+}
+
+#[test]
 fn repo_example_mesh_fragment_is_fully_commented_out() {
     // `resources/ferrum/mesh/_example.yaml` ships in the template and is
     // skipped by the `_` convention. The fixture is a copy of it: the live

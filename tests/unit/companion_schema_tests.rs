@@ -85,6 +85,38 @@ fn spec_keys(resource: &Resource) -> BTreeSet<String> {
         .collect()
 }
 
+/// Keys the fixture *authored* under `spec:` for one kind, read from the raw
+/// YAML. Coverage must be measured here, not on the serialized resource:
+/// Serde defaults are emitted even for fields the fixture never set (a
+/// defaulted field with no skip-on-default, such as `backend_port`, would
+/// count as exercised while nothing ever supplied it). Authored aliases
+/// count toward their canonical field.
+fn authored_spec_keys(matcher: &str) -> BTreeSet<String> {
+    let subdir = match matcher {
+        "Proxy" => "proxies",
+        "Consumer" => "consumers",
+        "Upstream" => "upstreams",
+        "PluginConfig" => "plugins",
+        "MeshConfig" => "mesh",
+        other => panic!("unknown fixture kind {other}"),
+    };
+    let path = fixture_dir().join(format!("ferrum/{subdir}/every-field.yaml"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let document: serde_yaml::Value = serde_yaml::from_str(&text).expect("fixture YAML parses");
+    document["spec"]
+        .as_mapping()
+        .expect("authored spec is a mapping")
+        .keys()
+        .filter_map(|key| key.as_str())
+        .map(|key| match key {
+            // The one declared alias: authoring it exercises the field.
+            "backend_protocol" => "backend_scheme".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
 fn load_fixture() -> Vec<(String, Resource)> {
     // Fail-closed strict loader, no opt-outs: the fixture must be legal input
     // for the default configuration every operator runs.
@@ -178,7 +210,11 @@ fn companion_schema_fixture_covers_every_mirrored_field() {
             .difference(&intentionally_uncovered(struct_name))
             .cloned()
             .collect();
-        let covered = spec_keys(resource);
+        // Authored coverage: what the fixture actually supplies. The
+        // serialized resource is checked separately (round-trip test);
+        // measuring here would let Serde defaults pose as coverage.
+        let covered = authored_spec_keys(matcher);
+        let _ = spec_keys(resource);
         let missing: Vec<&String> = expected.difference(&covered).collect();
         assert!(
             missing.is_empty(),

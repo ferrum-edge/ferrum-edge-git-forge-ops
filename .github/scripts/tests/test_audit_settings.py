@@ -61,6 +61,15 @@ def secure_responses():
                     },
                 },
                 {
+                    "type": "commit_message_pattern",
+                    "parameters": {
+                        "name": "no skip-ci on main",
+                        "operator": "contains",
+                        "pattern": "[skip ci]",
+                        "negate": True,
+                    },
+                },
+                {
                     "type": "required_status_checks",
                     "parameters": {
                         "strict_required_status_checks_policy": True,
@@ -972,6 +981,33 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
             audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), 99
         )
         return audit
+
+    def test_the_skip_ci_commit_message_rule_is_required_unweakened(self):
+        for mutate, label in (
+            ("absent", "absent"),
+            ("non-negated", "negate"),
+            ("different-pattern", "pattern"),
+        ):
+            with self.subTest(mutate=mutate):
+                ruleset = secure_responses()["repos/acme/repo/rulesets/7"]
+                if mutate == "absent":
+                    ruleset["rules"] = [
+                        rule for rule in ruleset["rules"] if rule["type"] != "commit_message_pattern"
+                    ]
+                else:
+                    params = next(
+                        rule for rule in ruleset["rules"] if rule["type"] == "commit_message_pattern"
+                    )["parameters"]
+                    if mutate == "non-negated":
+                        params["negate"] = False
+                    else:
+                        params["pattern"] = "[ci skip]"
+                audit = audit_settings.Audit()
+                audit_settings.audit_main_ruleset(
+                    audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), 99
+                )
+                rendered = "\n".join(audit.violations)
+                self.assertIn("[skip ci]", rendered, label)
 
     def test_the_trusted_check_is_part_of_the_launch_baseline(self):
         self.assertIn(self.TRUSTED, audit_settings.REQUIRED_STATUS_CHECKS)

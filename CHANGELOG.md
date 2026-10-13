@@ -315,6 +315,27 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Audit batch (#531). Proxy overlays canonicalize `backend_protocol` to
+  `backend_scheme` before merging, and refuse conflicting values (#513).
+  Additive array merges apply only to Proxy `spec.plugins` and Upstream
+  `spec.targets`; same-named arrays on other kinds replace (#515). MeshConfig
+  fragment ids with surrounding whitespace are refused by both the loader and
+  the overlay matcher (#516). The bare unknown-`labels` diagnostic is
+  recognized behind the runner's own `[namespace "…"]` annotation (#517).
+  Companion-schema coverage counts authored fixture keys, not Serde defaults
+  (#518). A cached 404 is refused before it can complete a delete or drop
+  ownership evidence (#519). A hidden-credential baseline needs a valid
+  fingerprint per consumer, not just a present field (#520). Committed
+  ciphertexts are surfaced when journaling a successful allocation fails
+  (#521). Credential bundles (Rust loader and workflow extractor) refuse
+  repeated JSON object members without echoing values (#522).
+  `FERRUM_GATEWAY_URL` and `FERRUM_VERIFY_BASE_URL` refuse a query string or
+  fragment (#523). The README describes the shipped viewer-only drift check
+  (#524). Lifecycle certification requires a valid `sealed_at` and allows at
+  most one hour of future clock skew (#525). Trusted live review copies the
+  trusted `.gitforgeops/smoke.yaml` so the preview shows the declared checks
+  (#526). The settings audit requires the negated `[skip ci]` commit-message
+  rule on `main` (#527).
 - `import --from-file` honors the namespace selection (#514). Under
   `FERRUM_NAMESPACE` or an environment `namespace_filter`, a document that
   contains any other namespace is refused before the tree, import manifest or

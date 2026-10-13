@@ -20,7 +20,15 @@ fn resource_labels_rejection(stream: &str) -> Option<&str> {
             return false;
         };
         let envelope = &trimmed[..start];
-        if !envelope.is_empty() && !envelope.ends_with("\"message\":\"") {
+        // The runner's own multi-namespace annotation (`[namespace "name"] `)
+        // is prepended to every diagnostic line before scrubbing, so the
+        // bare form legitimately arrives behind it. Accept exactly that
+        // prefix (a debug-quoted namespace in brackets), never arbitrary
+        // leading text.
+        let is_namespace_annotation =
+            envelope.starts_with("[namespace \"") && envelope.ends_with("\"] ");
+        if !envelope.is_empty() && !envelope.ends_with("\"message\":\"") && !is_namespace_annotation
+        {
             return false;
         }
         let expected = &trimmed[start + PREFIX.len()..];

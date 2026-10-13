@@ -334,7 +334,8 @@ exists:
 
 - `FERRUM_GATEWAY_URL` and `FERRUM_VERIFY_BASE_URL` must be `https://`.
   `http://` needs `FERRUM_ALLOW_INSECURE_HTTP=true`. Other schemes, and URLs
-  with embedded `user:password@`, are always refused.
+  with embedded `user:password@`, a query string or a fragment, are always
+  refused. A path prefix is allowed; request paths are appended to it.
 - `FERRUM_ALLOW_INSECURE_HTTP` and `FERRUM_TLS_NO_VERIFY` print a banner, and
   under `GITHUB_ACTIONS=true` are refused unless the host is literally
   loopback (`localhost`, `127.0.0.0/8`, `::1`). Put a private CA in

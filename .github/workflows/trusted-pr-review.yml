@@ -338,7 +338,7 @@ jobs:
             exit 1
           }
           install -d -m 0700 review-input/.gitforgeops
-          for name in config.yaml policies.yaml; do
+          for name in config.yaml policies.yaml smoke.yaml; do
             source="trusted/.gitforgeops/$name"
             [ -e "$source" ] || continue
             if [ -L "$source" ] || [ ! -f "$source" ]; then
