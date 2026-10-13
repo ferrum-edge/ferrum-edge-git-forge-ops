@@ -379,8 +379,6 @@ STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 # switching the workflow, then retire the previous pin in a follow-up PR.
 CARGO_AUDIT_ACTIONS = frozenset(
     {
-        # v2.87.22 retains v2.87.20's action source and cargo-audit manifest.
-        "taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0",
         # v2.87.27 retains v2.87.22's action source and cargo-audit manifest.
         "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",
     }

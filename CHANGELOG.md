@@ -350,7 +350,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   trusted checker. v2.87.22..v2.87.27 changes no action source (`action.yml`,
   `main.sh`) and leaves `manifests/cargo-audit.json` byte-identical; only other
   tools' manifests, upstream CI and codegen changed.
-
+- Retire the v2.87.22 cargo-audit installer pin
+  (`83ac0ad63c0167e6f06796fab0fce28db1bf3db0`) now that #542 moved
+  `security.yml` to v2.87.27; the trusted checker accepts only the v2.87.27
+  pin and tests reject the retired one.
 - Compare trusted-review SHA producer lines with case preserved, require the pinned `trusted_sha`
   assignment to precede its echo, and reject a `trusted_sha` or `head_sha` environment binding in
   every scope that reaches the metadata step (workflow, prepare job and step), so a differently
