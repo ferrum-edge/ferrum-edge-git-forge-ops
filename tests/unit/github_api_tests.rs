@@ -1451,21 +1451,27 @@ fn full_events_page(first: serde_json::Value) -> String {
 async fn override_labeler_pagination_ignores_response_link_urls() {
     use gitforgeops::policy::github_override::find_override_labeler_at;
     let repo_pr = format!("{REPO}/issues/7");
-    let link = "Link: <{base}/steal?page=2>; rel=\"next\", \
-                <http://198.51.100.7/steal?page=2>; rel=\"last\"\r\n"
-        .to_string();
+    // A second loopback origin stands in for an attacker host. Page 1 names it
+    // as `rel="next"` with the legitimate events path; page 2 names a
+    // same-origin path outside the events endpoint.
+    let (other_origin, other_requests) =
+        spawn_github_stub(vec![(String::from("GET /"), 200, "[]".to_string())]);
+    let off_origin_link = format!(
+        "Link: <{other_origin}/repos/{repo_pr}/events?per_page=100&page=2>; rel=\"next\"\r\n"
+    );
+    let off_path_link = "Link: <{base}/steal?page=3>; rel=\"next\"\r\n".to_string();
     let routes = vec![
         (
             events_page(&repo_pr, 1),
             200,
             full_events_page(label_event("labeled", "earlier")),
-            link.clone(),
+            off_origin_link,
         ),
         (
             events_page(&repo_pr, 2),
             200,
             serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
-            link,
+            off_path_link,
         ),
         (
             String::from("/steal"),
@@ -1489,6 +1495,10 @@ async fn override_labeler_pagination_ignores_response_link_urls() {
         assert!(!request.contains("/steal"), "{request}");
         assert_github_headers(request);
     }
+    assert!(
+        other_requests.lock().expect("recorded").is_empty(),
+        "the off-origin Link target must receive no request (and no token)"
+    );
 }
 
 /// A later `unlabeled` event on a later page clears the approver.
