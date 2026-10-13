@@ -67,8 +67,12 @@ normalizes `${{ }}` spacing and case and cuts each key at its first
 `macos`, so a literal `Linux-cargo-` key collides with `${{ runner.os }}-cargo-`.
 Keys in local composite actions (`./.github/actions/...`) and local reusable
 workflows count as their caller's, recursively. The checker then refuses any
-family in `validate-pr.yml` or `rust-ci.yml` that is a prefix of a privileged
-family, or the reverse. A key prefix may use no expression except
+family in any other workflow (`validate-pr.yml`, `rust-ci.yml`,
+`alloy-consumer.yml`, `lifecycle.yml` and any workflow added later) that is
+a prefix of a privileged family, or the reverse. `lifecycle.yml` therefore
+uses its own `<os>-lifecycle-cargo-` family. A key may contain only printable
+ASCII, because `actions/cache` trims Unicode spaces such as U+FEFF that a
+textual comparison would keep. A key prefix may use no expression except
 `runner.os`: any other expression could evaluate to anything, so the
 separation could not be checked.
 

@@ -1049,9 +1049,10 @@ def deployment_scope_violations(root: Path, apply_workflow: str) -> list[str]:
     return violations
 
 
-# Workflows that build and run pull-request code, and the privileged
-# workflows whose cargo caches must never be fed by them (#547).
-PR_CODE_CACHE_WORKFLOWS = ("rust-ci.yml", "validate-pr.yml")
+# The privileged workflows whose cargo caches must never be fed by other
+# workflows (#547). Every other workflow (the ones that build pull-request
+# code, and any added later) is compared against them, so a new or
+# unclassified workflow fails closed instead of escaping the rule.
 PRIVILEGED_CACHE_WORKFLOWS = (*PRIVILEGED_WORKFLOWS, "trusted-pr-review.yml")
 _CACHE_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 # The only expression a cache key prefix may contain. Anything else (a ref,
@@ -1069,6 +1070,14 @@ def cache_key_family(raw: str) -> tuple[str, str | None]:
     a problem when the family holds an expression other than `runner.os` or an
     unterminated `${{`, since such a prefix cannot be compared statically.
     """
+    # actions/cache trims its inputs with JavaScript `trim()`, which also drops
+    # U+FEFF and other Unicode spaces Python's `strip()` keeps. Refuse anything
+    # outside printable ASCII rather than model each trimming rule.
+    if any(not (" " <= character <= "~") for character in raw.strip(" \t\r\n")):
+        return "", (
+            f"cache key prefix {raw.strip()!r} has a non-ASCII or control character "
+            "the policy cannot compare"
+        )
     normalized = _CACHE_EXPRESSION.sub(
         lambda match: "${{" + "".join(match.group(1).split()).casefold() + "}}",
         raw.strip(),
@@ -1164,7 +1173,8 @@ def cache_trust_split_violations(root: Path) -> list[str]:
     pull-request job saved `target/` (compiled build scripts and proc macros)
     under a key a privileged job can restore, PR-built code would run with the
     privileged job's credentials whenever branch cache scoping failed. So no
-    PR-code family may be a prefix of a privileged family or the reverse, in
+    family in any other workflow may be a prefix of a privileged family or the
+    reverse, in
     any concrete `runner.os` form, including keys in local actions and
     reusable workflows either side reaches. Every family must be statically
     comparable.
@@ -1190,7 +1200,12 @@ def cache_trust_split_violations(root: Path) -> list[str]:
 
     privileged = [found for name in PRIVILEGED_CACHE_WORKFLOWS for found in families(name)]
     reported: set[tuple[str, str, str, str]] = set()
-    for pr_name in PR_CODE_CACHE_WORKFLOWS:
+    others = sorted(
+        path.name
+        for path in workflows.iterdir()
+        if path.suffix in {".yml", ".yaml"} and path.name not in PRIVILEGED_CACHE_WORKFLOWS
+    )
+    for pr_name in others:
         for pr_label, pr_raw, pr_family in families(pr_name):
             for priv_label, priv_raw, priv_family in privileged:
                 key = (pr_label, pr_raw, priv_label, priv_raw)

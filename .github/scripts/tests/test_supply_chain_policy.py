@@ -7019,6 +7019,23 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ("apply-on-merge.yml", privileged_key,
              privileged_key + "          restore-keys: Linux-\n",
              "validate-pr.yml: cache key family"),
+            ("validate-pr.yml", pr_key,
+             'key: "\\uFEFF${{ runner.os }}-cargo-${{ hashFiles(\'**/Cargo.lock\') }}"\n',
+             "validate-pr.yml: cache key prefix"),
+            ("apply-on-merge.yml", privileged_key,
+             privileged_key + '          restore-keys: "\\uFEFFLinux-"\n',
+             "apply-on-merge.yml: cache key prefix"),
+            ("lifecycle.yml",
+             "key: ${{ runner.os }}-lifecycle-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n",
+             "lifecycle.yml: cache key family"),
+            ("alloy-consumer.yml", "      - name: Install Rust toolchain\n",
+             "      - uses: actions/cache@" + "a" * 40 + "\n"
+             "        with:\n"
+             "          path: target\n"
+             "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
+             "\n      - name: Install Rust toolchain\n",
+             "alloy-consumer.yml: cache key family"),
             ("rust-ci.yml", "            ${{ runner.os }}-rust-ci-\n",
              "            ${{ runner.os }}-\n", "rust-ci.yml: cache key family"),
             ("apply-on-merge.yml", privileged_key,
