@@ -809,3 +809,111 @@ fn plan_json_spec_owned_conflict_keeps_report_on_stderr() {
     );
     assert!(report.contains("=== Apply Blockers ==="), "{report}");
 }
+
+/// A two-namespace backup whose `team-b` consumer carries a live credential,
+/// so an unselected import writes both a tree and a migration bundle.
+fn two_namespace_backup() -> String {
+    serde_json::json!({
+        "proxies": [
+            {
+                "id": "app",
+                "namespace": "ferrum",
+                "listen_path": "/app",
+                "backend_scheme": "https",
+                "backend_host": "app.internal",
+                "backend_port": 8080,
+            },
+            {
+                "id": "billing",
+                "namespace": "team-b",
+                "listen_path": "/billing",
+                "backend_scheme": "https",
+                "backend_host": "billing.internal",
+                "backend_port": 8080,
+            },
+        ],
+        "consumers": [{
+            "id": "billing-client",
+            "username": "billing-client",
+            "namespace": "team-b",
+            "credentials": {"keyauth": [{"key": "team-b-live-key"}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [],
+    })
+    .to_string()
+}
+
+/// Runs `import --from-file` from `repo` into a fresh scratch directory and
+/// returns the output, the tree path and the bundle path.
+fn run_file_import(repo: &Repo, extra_env: &[(&str, &str)]) -> (Output, TempDir, PathBuf, PathBuf) {
+    let scratch = TempDir::new().expect("scratch");
+    let source = scratch.path().join("backup.json");
+    std::fs::write(&source, two_namespace_backup()).expect("backup");
+    let tree = scratch.path().join("imported");
+    let bundle = scratch.path().join("bundle.json");
+    let output = repo.run(
+        &[
+            "import",
+            "--from-file",
+            source.to_str().expect("utf-8 path"),
+            "--output-dir",
+            tree.to_str().expect("utf-8 path"),
+            "--credential-bundle-output",
+            bundle.to_str().expect("utf-8 path"),
+        ],
+        extra_env,
+    );
+    (output, scratch, tree, bundle)
+}
+
+fn assert_selection_refused(output: &Output, tree: &Path, bundle: &Path) {
+    let combined = format!("{}{}", stdout(output), stderr(output));
+    assert!(!output.status.success(), "import must fail: {combined}");
+    assert!(
+        combined.contains("outside the selected namespace"),
+        "{combined}"
+    );
+    assert!(combined.contains("team-b"), "{combined}");
+    assert!(!tree.exists(), "no tree may be published: {combined}");
+    assert!(!bundle.exists(), "no bundle may be published: {combined}");
+}
+
+/// #514 at the command level: `FERRUM_NAMESPACE` reaches file import, so a
+/// backup holding another namespace is refused before anything is written.
+#[test]
+fn file_import_refuses_other_namespaces_under_ferrum_namespace() {
+    let repo = Repo::empty_tree();
+    let (output, _scratch, tree, bundle) =
+        run_file_import(&repo, &[("FERRUM_NAMESPACE", "ferrum")]);
+    assert_selection_refused(&output, &tree, &bundle);
+}
+
+/// #514 at the command level: an environment's `namespace_filter` in
+/// `.gitforgeops/config.yaml` reaches file import the same way.
+#[test]
+fn file_import_refuses_other_namespaces_under_environment_namespace_filter() {
+    let repo = Repo::with_files(&[(
+        ".gitforgeops/config.yaml",
+        "version: 1\nenvironments:\n  sandbox:\n    namespace_filter: ferrum\n    live_review: false\n",
+    )]);
+    let (output, _scratch, tree, bundle) = run_file_import(&repo, &[]);
+    assert_selection_refused(&output, &tree, &bundle);
+}
+
+/// Control for the two refusals above: with no selection the same backup
+/// imports whole, tree and bundle included.
+#[test]
+fn file_import_without_a_selection_imports_every_namespace() {
+    let repo = Repo::empty_tree();
+    let (output, _scratch, tree, bundle) = run_file_import(&repo, &[]);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(tree.join("ferrum/proxies/app.yaml").exists());
+    assert!(tree.join("team-b/proxies/billing.yaml").exists());
+    assert!(bundle.exists());
+}
