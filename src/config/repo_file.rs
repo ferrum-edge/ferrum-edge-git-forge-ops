@@ -9,6 +9,12 @@
 //! stall or exhaust the job before a single diagnostic is printed. Every such
 //! loader reads through [`read_bounded_repo_file`], which accepts only a
 //! regular file no larger than the stated cap.
+//!
+//! Resource and overlay YAML files under `resources/` and `overlays/` read
+//! through [`read_tree_file`], which applies the same rule and cap: the PR
+//! input staging step (`.github/scripts/pr_input.py`) already refuses any
+//! declarative file over 1 MiB, and a hostile or accidental local checkout
+//! must not be able to make the apply/validate job buffer a larger one.
 
 use std::fs::Metadata;
 use std::io::Read;
@@ -73,6 +79,23 @@ pub fn read_bounded_repo_file(path: &Path, max_bytes: u64) -> Result<Option<Stri
             Err(file_read_error(path, source))
         }
     }
+}
+
+/// Read a resource or overlay tree file that the tree walk just listed.
+///
+/// Same rules and [`MAX_REPO_CONFIG_FILE_BYTES`] cap as
+/// [`read_bounded_repo_file`]. A file that disappears between the walk and the
+/// read is an error, not an empty document.
+pub(crate) fn read_tree_file(path: &Path) -> Result<String> {
+    read_bounded_repo_file(path, MAX_REPO_CONFIG_FILE_BYTES)?.ok_or_else(|| {
+        file_read_error(
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "file disappeared while the tree was being loaded",
+            ),
+        )
+    })
 }
 
 fn file_read_error(path: &Path, source: std::io::Error) -> Error {

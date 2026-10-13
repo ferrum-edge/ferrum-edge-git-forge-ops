@@ -916,6 +916,16 @@ fn plan_resource_file(
             path.display()
         )));
     }
+    // The loader refuses a resource file over this cap, so writing one would
+    // publish a tree that cannot be loaded. Refuse while nothing is written.
+    let limit = crate::config::MAX_REPO_CONFIG_FILE_BYTES;
+    if yaml.len() as u64 > limit {
+        return Err(crate::error::Error::Config(format!(
+            "import would write {} ({} bytes), over the {limit} byte limit for resource files; nothing has been written",
+            path.display(),
+            yaml.len()
+        )));
+    }
     planned_writes.push((path, yaml));
     Ok(())
 }

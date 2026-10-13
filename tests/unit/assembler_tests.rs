@@ -1059,3 +1059,29 @@ fn provisioner_labels_round_trip_and_do_not_overwrite_imported_origins() {
         serde_json::to_value(&reloaded).unwrap()
     );
 }
+
+/// #546: an overlay file larger than the 1 MiB repository-file cap is refused
+/// with a size error before it is buffered or parsed.
+#[test]
+fn overlay_refuses_a_file_over_the_size_cap() {
+    use gitforgeops::config::MAX_REPO_CONFIG_FILE_BYTES;
+    let cap = MAX_REPO_CONFIG_FILE_BYTES as usize;
+
+    let temp = tempfile::tempdir().unwrap();
+    let overlay_path = temp.path().join("team-alpha/proxies");
+    std::fs::create_dir_all(&overlay_path).unwrap();
+    let body = "kind: Proxy\nspec:\n  id: shared\n  backend_host: overlayed.internal\n";
+    let file = overlay_path.join("shared.yaml");
+    std::fs::write(
+        &file,
+        format!("{body}#{}\n", "x".repeat(cap + 1 - body.len() - 2)),
+    )
+    .unwrap();
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    let error = apply_overlay(&mut resources, temp.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("byte limit"), "{error}");
+    assert!(error.contains(&file.display().to_string()), "{error}");
+}
