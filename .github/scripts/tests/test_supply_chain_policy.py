@@ -7040,7 +7040,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
              "        with: ${{ fromJSON('{\"path\":\"target\",\"key\":\"Linux-cargo-x\"}') }}\n",
              "validate-pr.yml: a cache step must spell"),
             ("drift-check.yml", "on:\n  schedule:\n",
-             "on: [push, schedule]\nx-was:\n  schedule:\n",
+             "on:\n  - push\n  - schedule\nx-was:\n  schedule:\n",
              "drift-check.yml: a privileged cache workflow's push trigger"),
             ("apply-on-merge.yml", "on:\n  push:\n    branches: [main]\n",
              "on:\n  push:\n",
