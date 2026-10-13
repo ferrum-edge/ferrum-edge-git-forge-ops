@@ -917,3 +917,59 @@ fn file_import_without_a_selection_imports_every_namespace() {
     assert!(tree.join("team-b/proxies/billing.yaml").exists());
     assert!(bundle.exists());
 }
+
+/// A label, the repository files, and extra environment for one oversize case.
+type OversizeCase = (
+    &'static str,
+    Vec<(&'static str, String)>,
+    Vec<(&'static str, &'static str)>,
+);
+
+/// #546: an oversized resource or overlay file stops `validate`, `plan` and
+/// `apply` with a size error before any gateway request, and nothing is
+/// written: the refusal is in the loader, ahead of every plan or apply step.
+#[cfg(unix)]
+#[test]
+fn oversized_resource_or_overlay_files_stop_the_cli_before_the_gateway() {
+    let cap = gitforgeops::config::MAX_REPO_CONFIG_FILE_BYTES as usize;
+    let padded = |body: &str| format!("{body}#{}\n", "x".repeat(cap + 1 - body.len() - 2));
+    let overlay = "kind: Proxy\nspec:\n  id: \"app\"\n  backend_host: \"overlay.internal\"\n";
+    let cases: [OversizeCase; 2] = [
+        (
+            "resource",
+            vec![("resources/ferrum/proxies/app.yaml", padded(PROXY))],
+            vec![],
+        ),
+        (
+            "overlay",
+            vec![
+                ("resources/ferrum/proxies/app.yaml", PROXY.to_string()),
+                ("overlays/staging/ferrum/proxies/app.yaml", padded(overlay)),
+            ],
+            vec![("FERRUM_OVERLAY", "staging")],
+        ),
+    ];
+    for (label, files, env) in cases {
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, c)| (*p, c.as_str())).collect();
+        let mut repo = LiveRepo::new(&files, Vec::new(), Vec::new());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        repo.url = spawn_live_stub(Vec::new(), Vec::new(), Arc::clone(&requests));
+        for args in [&["validate"][..], &["plan"], &["apply", "--auto-approve"]] {
+            let output = repo.run(args, &env);
+            let combined = format!("{}{}", stdout(&output), stderr(&output));
+            assert!(!output.status.success(), "{label} {args:?}: {combined}");
+            assert!(
+                combined.contains("byte limit"),
+                "{label} {args:?}: {combined}"
+            );
+        }
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "{label}: the gateway must not be contacted"
+        );
+        assert!(
+            !repo.dir.path().join(".state").exists(),
+            "{label}: no ledger written"
+        );
+    }
+}

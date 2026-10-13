@@ -2877,3 +2877,32 @@ fn nested_unknown_import_refusal_lists_a_bounded_number_of_offenders() {
     assert!(error.ends_with("\n  …and 5 more"), "{error}");
     assert!(!output.exists());
 }
+
+/// #546: the loader refuses a resource file over 1 MiB, so import refuses to
+/// render one instead of publishing a tree that cannot be loaded. Nothing is
+/// written. A large file under the cap still imports and loads.
+#[test]
+fn import_refuses_a_rendered_resource_over_the_loader_size_cap() {
+    let cap = gitforgeops::config::MAX_REPO_CONFIG_FILE_BYTES as usize;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("resources");
+    let mut config = make_test_config();
+    config.proxies[0].name = Some("n".repeat(cap));
+    let error = split_config(&config, &output).unwrap_err().to_string();
+    assert!(error.contains("byte limit for resource files"), "{error}");
+    assert!(error.contains("proxy-test.yaml"), "{error}");
+    assert!(!output.exists(), "nothing may be published");
+
+    let mut config = make_test_config();
+    config.proxies[0].name = Some("n".repeat(cap - 64 * 1024));
+    split_config(&config, &output).unwrap();
+    let rendered = std::fs::metadata(output.join("ferrum/proxies/proxy-test.yaml"))
+        .unwrap()
+        .len();
+    assert!(rendered <= cap as u64, "{rendered}");
+    assert_eq!(
+        gitforgeops::config::load_resources(&output).unwrap().len(),
+        2
+    );
+}

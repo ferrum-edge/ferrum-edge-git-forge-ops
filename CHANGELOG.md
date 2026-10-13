@@ -351,6 +351,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`validate-pr.yml`, `rust-ci.yml`) that overlaps a privileged workflow's
   family, so PR-built build scripts and proc macros cannot reach a privileged
   run even if branch cache scoping fails. (#547)
+- Resource and overlay YAML files are read through the bounded repository-file
+  reader: a regular file of at most 1 MiB, the same per-file cap PR input
+  staging applies, checked by inspected length and by bytes read. A larger
+  file is refused with a size error instead of being buffered whole, so a
+  single oversized resource or overlay file cannot exhaust memory in the
+  validate or apply job. `import` refuses to render a resource file over the
+  same cap, before anything is written, instead of publishing a tree the
+  loader would refuse. (#546)
 - Policy-override label lookup no longer follows the `Link: rel="next"` URL a
   GitHub response supplies. It requests numbered issue-event pages from the
   compiled-in API origin, like the review lookup, so a spoofed or misdirected
