@@ -313,6 +313,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   vendored hashes, fixture deserialization, schema envelope fields, and compatibility with
   the qualified Ferrum Edge version.
 
+### Fixed
+
+- `import --from-file` honors the namespace selection (#514). Under
+  `FERRUM_NAMESPACE` or an environment `namespace_filter`, a document that
+  contains any other namespace is refused before the tree, import manifest or
+  credential migration bundle is written, instead of being published whole. A
+  document wholly inside the selection imports as before.
+
 ### Security
 
 - Compare trusted-review SHA producer lines with case preserved, require the pinned `trusted_sha`

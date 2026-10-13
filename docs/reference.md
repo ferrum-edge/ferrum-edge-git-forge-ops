@@ -152,6 +152,10 @@ environment instead.
 
 API import needs a namespace filter and imports one namespace at a time, with
 a JWT scoped to it.
+File import (`import --from-file`) publishes the whole document, so under a
+namespace filter it refuses a document that contains any other namespace,
+before writing the tree or a credential bundle. Import a single-namespace
+backup, or clear the filter for that import.
 
 ### Credential recipients
 
