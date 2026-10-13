@@ -10,10 +10,10 @@ Complete the assigned continuation work and validation yourself in this session.
 partial work or hand unfinished implementation back to the controller. Perform commit, push, PR,
 review handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
 agent-dispatch skill or script, including `sol-agents`, `luna-agents`, `opus-agents`, `fable-agents`,
-`grok-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or Claude CLI
-workers. Do not spawn nested workers, including through Claude Code's built-in subagent tool: do the
-implementation, review, and verification in this session. The orchestrator selected this model and
-reasoning effort deliberately.
+`grok-agents`, `muse-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI workers, or
+Claude CLI workers. Do not spawn nested workers, including through Claude Code's built-in subagent
+tool: do the implementation, review, and verification in this session. The orchestrator selected
+this model and reasoning effort deliberately.
 
 ## Reconstruct state before editing
 

@@ -117,8 +117,9 @@ commit, push, PR, review, and CI actions only when the prompt assigns them. Do n
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
 skills or scripts (including qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-laguna-agents, grok-agents, sol-agents, opus-agents, fable-agents, composer-agents, or any
-.agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
+opencode-laguna-agents, grok-agents, muse-agents, sol-agents, opus-agents, fable-agents,
+composer-agents, or any .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested
+workers.
 ```
 
 This prevents a worker from replacing the selected model through nested delegation.
