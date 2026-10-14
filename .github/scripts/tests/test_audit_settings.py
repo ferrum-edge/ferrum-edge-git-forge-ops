@@ -962,6 +962,7 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
     """
 
     TRUSTED = "trusted-supply-chain-policy"
+    AGENT_POLICY = "validate-trusted-policy"
     RETIRING = "security-supply-chain-policy"
 
     def audit_ruleset(
@@ -1012,16 +1013,23 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
     def test_the_trusted_check_is_part_of_the_launch_baseline(self):
         self.assertIn(self.TRUSTED, audit_settings.REQUIRED_STATUS_CHECKS)
         self.assertIn(self.RETIRING, audit_settings.REQUIRED_STATUS_CHECKS)
-        self.assertEqual(audit_settings.TRANSITIONAL_STATUS_CHECKS, (self.TRUSTED,))
+        self.assertEqual(
+            audit_settings.TRANSITIONAL_STATUS_CHECKS,
+            (self.TRUSTED, "validate-trusted-policy"),
+        )
+        self.assertIn("validate-trusted-policy", audit_settings.REQUIRED_STATUS_CHECKS)
+        self.assertIn("validate-trusted-policy", audit_settings.SOURCE_BOUND_STATUS_CHECKS)
 
     def test_a_ruleset_before_the_switch_passes_with_a_warning(self):
         audit = self.audit_ruleset(REQUIRED_CHECKS)
         self.assertEqual(audit.violations, [])
-        self.assertEqual(len(audit.warnings), 1, audit.warnings)
-        self.assertIn(self.TRUSTED, audit.warnings[0])
+        self.assertEqual(len(audit.warnings), 2, audit.warnings)
+        rendered = "\n".join(audit.warnings)
+        self.assertIn(self.TRUSTED, rendered)
+        self.assertIn(self.AGENT_POLICY, rendered)
 
     def test_a_ruleset_after_the_switch_passes_cleanly(self):
-        audit = self.audit_ruleset(REQUIRED_CHECKS | {self.TRUSTED})
+        audit = self.audit_ruleset(REQUIRED_CHECKS | {self.TRUSTED, self.AGENT_POLICY})
         self.assertEqual(audit.violations, [])
         self.assertEqual(audit.warnings, [])
 
@@ -1064,19 +1072,24 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
         # Its definition is protected too (pull_request_target), so an
         # own-token commit status is the only way to forge it.
         audit = self.audit_ruleset(
-            REQUIRED_CHECKS | {self.TRUSTED},
+            REQUIRED_CHECKS | {self.TRUSTED, self.AGENT_POLICY},
             unbound=frozenset({"state-guard-reject-state-edits"}),
         )
         rendered = "\n".join(audit.violations)
         self.assertIn("'state-guard-reject-state-edits' to the GitHub Actions app", rendered)
         self.assertEqual(
             audit_settings.SOURCE_BOUND_STATUS_CHECKS,
-            ("trusted-supply-chain-policy", "state-guard-reject-state-edits"),
+            (
+                "trusted-supply-chain-policy",
+                "state-guard-reject-state-edits",
+                "validate-trusted-policy",
+            ),
         )
 
     def test_older_unbound_contexts_are_a_warning(self):
         audit = self.audit_ruleset(
-            REQUIRED_CHECKS | {self.TRUSTED}, unbound=frozenset({"rust-ci-check"})
+            REQUIRED_CHECKS | {self.TRUSTED, self.AGENT_POLICY},
+            unbound=frozenset({"rust-ci-check"}),
         )
         self.assertEqual(audit.violations, [])
         self.assertEqual(len(audit.warnings), 1, audit.warnings)

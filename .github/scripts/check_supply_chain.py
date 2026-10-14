@@ -4077,6 +4077,7 @@ REQUIRED_CHECK_WORKFLOWS = {
     SUPPLY_CHAIN_POLICY_JOB: SUPPLY_CHAIN_POLICY_PATH,
     "state-guard-reject-state-edits": ".github/workflows/state-guard.yml",
     "gitforgeops-required-static-validation": ".github/workflows/validate-pr.yml",
+    "validate-trusted-policy": ".github/workflows/agent-setup-policy.yml",
 }
 
 

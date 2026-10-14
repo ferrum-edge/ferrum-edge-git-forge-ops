@@ -79,6 +79,7 @@ jobs:
             --required-check 'trusted-supply-chain-policy'
             --required-check 'state-guard-reject-state-edits'
             --required-check 'gitforgeops-required-static-validation'
+            --required-check 'validate-trusted-policy'
           )
           if [ "$(printf '%s' "${TEMPLATE_REPO:-}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
             args+=(--template-repo)
