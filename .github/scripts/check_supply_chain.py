@@ -4551,6 +4551,7 @@ RELEASE_GATE_REQUIRED_CHECKS = (
 )
 RELEASE_GATE_ACCEPTED_CHECKS = (
     "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
+    "Agent Setup Policy / validate-trusted-policy",
 )
 RELEASE_GATE_APP_ID = 15368
 RELEASE_GATE_BUDGET_SECONDS = 900

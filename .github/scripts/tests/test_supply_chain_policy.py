@@ -7267,7 +7267,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertEqual(sorted(jobs), sorted(check_supply_chain.REQUIRED_CHECK_WORKFLOWS))
         self.assertEqual(
             [context.split(" / ")[-1] for context in check_supply_chain.RELEASE_GATE_ACCEPTED_CHECKS],
-            [check_supply_chain.SUPPLY_CHAIN_POLICY_JOB],
+            [check_supply_chain.SUPPLY_CHAIN_POLICY_JOB, "validate-trusted-policy"],
         )
 
     def test_helper_invocation_is_pinned(self):
