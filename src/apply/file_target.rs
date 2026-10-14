@@ -494,8 +494,15 @@ fn sync_parent_directory(
 /// `tempfile` creates its files 0600, which would silently tighten the mode of
 /// an output file the gateway (often a different user) has to read. Inherit
 /// the destination's current mode when it already exists, otherwise fall back
-/// to 0644 — what the previous `std::fs::write` produced under a default
-/// umask.
+/// to 0640. A file-mode document carries resolved credentials, so it is never
+/// world-readable: the `other` bits are stripped even from an inherited mode,
+/// while owner/group bits — the channel a different-user gateway reads
+/// through — are preserved exactly.
+#[cfg(unix)]
+fn regular_publication_mode(existing: Option<u32>) -> u32 {
+    existing.map_or(0o640, |mode| mode & 0o770)
+}
+
 #[cfg(unix)]
 fn apply_destination_permissions(
     dest: &Path,
@@ -506,10 +513,11 @@ fn apply_destination_permissions(
 
     let mode = match policy {
         PublicationPermissions::Private => 0o600,
-        PublicationPermissions::Regular => match std::fs::metadata(dest) {
-            Ok(meta) => meta.permissions().mode() & 0o777,
-            Err(_) => 0o644,
-        },
+        PublicationPermissions::Regular => regular_publication_mode(
+            std::fs::metadata(dest)
+                .ok()
+                .map(|meta| meta.permissions().mode() & 0o777),
+        ),
     };
     std::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode))?;
     Ok(())
