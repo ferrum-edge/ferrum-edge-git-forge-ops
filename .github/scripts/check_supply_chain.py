@@ -4553,6 +4553,15 @@ RELEASE_GATE_ACCEPTED_CHECKS = (
     "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "Agent Setup Policy / validate-trusted-policy",
 )
+# TRANSITIONAL: the protected-branch checker pins the candidate's
+# `release_gate.py` to the pre-`validate-trusted-policy` tuple, so the helper
+# cannot change in the same PR as this pin. Until the follow-up PR updates
+# the helper, either tuple satisfies `release_gate_helper_violations`; the
+# follow-up removes the old spelling here in the same change.
+RELEASE_GATE_ACCEPTED_CHECKS_TRANSITIONAL = frozenset({
+    ("GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",),
+    RELEASE_GATE_ACCEPTED_CHECKS,
+})
 RELEASE_GATE_APP_ID = 15368
 RELEASE_GATE_BUDGET_SECONDS = 900
 RELEASE_GATE_TIMEOUT_MINUTES = "16"
@@ -4781,7 +4790,9 @@ def release_gate_helper_violations(root: Path) -> list[str]:
     violations: list[str] = []
     for name, expected in RELEASE_GATE_PINS.items():
         value = _module_constant(tree, name)
-        if type(value) is not type(expected) or value != expected:
+        if name == "ACCEPTED_CHECKS" and value in RELEASE_GATE_ACCEPTED_CHECKS_TRANSITIONAL:
+            pass  # Transitional spellings; see RELEASE_GATE_ACCEPTED_CHECKS_TRANSITIONAL.
+        elif type(value) is not type(expected) or value != expected:
             violations.append(f"{label}: {name} must be assigned exactly {expected!r}")
         if _python_bindings(tree, name) != 1:
             violations.append(f"{label}: {name} must be bound once, at module level")
