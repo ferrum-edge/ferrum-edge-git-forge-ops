@@ -207,8 +207,20 @@ fn regular_publication_is_never_world_readable() {
 
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
         .expect("make destination world-readable");
+    let gid_before = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path).expect("metadata").gid()
+    };
     apply_file(&fixture(), path.to_str().expect("utf-8 path")).expect("second write");
     assert_eq!(mode(&path), 0o660, "other bits are stripped on republish");
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").gid(),
+            gid_before,
+            "the destination group survives the rename, so group read access is real"
+        );
+    }
 }
 
 #[cfg(unix)]
