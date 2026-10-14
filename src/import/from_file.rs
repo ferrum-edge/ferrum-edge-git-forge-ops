@@ -48,21 +48,35 @@ pub fn import_from_file_selected(
     if let Some(bundle_path) = credential_bundle_output {
         validate_migration_bundle_source(bundle_path, file_path)?;
     }
-    let contents =
-        std::fs::read_to_string(file_path).map_err(|source| crate::error::Error::FileRead {
-            path: file_path.to_path_buf(),
-            source,
-        })?;
-    // An import document is a whole backup, so the bound is the response
-    // bound, not the per-resource one — still finite, so a crafted file
-    // cannot spend unbounded memory in the parse.
+    // An import document is a whole backup, so this bound is far above the
+    // per-resource one — still finite, and enforced during the read itself
+    // (one byte past the limit), so a crafted file cannot spend unbounded
+    // memory before the refusal.
     const MAX_IMPORT_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
-    if contents.len() > MAX_IMPORT_DOCUMENT_BYTES {
-        return Err(crate::error::Error::Config(format!(
-            "import document is {} bytes, over the {MAX_IMPORT_DOCUMENT_BYTES}-byte limit; no tree or credential bundle was published",
-            contents.len()
-        )));
-    }
+    let contents = {
+        use std::io::Read as _;
+        let file =
+            std::fs::File::open(file_path).map_err(|source| crate::error::Error::FileRead {
+                path: file_path.to_path_buf(),
+                source,
+            })?;
+        let mut bytes = Vec::new();
+        file.take(MAX_IMPORT_DOCUMENT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| crate::error::Error::FileRead {
+                path: file_path.to_path_buf(),
+                source,
+            })?;
+        if bytes.len() > MAX_IMPORT_DOCUMENT_BYTES {
+            return Err(crate::error::Error::Config(format!(
+                "import document exceeds the {MAX_IMPORT_DOCUMENT_BYTES}-byte limit; no tree or credential bundle was published"
+            )));
+        }
+        String::from_utf8(bytes).map_err(|error| crate::error::Error::FileRead {
+            path: file_path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        })?
+    };
     // YAML is a superset of the JSON returned by GET /backup. Decode to a JSON
     // value, then use the same envelope parser as API import so opaque sections
     // are inventoried consistently instead of being discarded by GatewayConfig.
