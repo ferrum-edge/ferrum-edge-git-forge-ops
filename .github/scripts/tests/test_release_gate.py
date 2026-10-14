@@ -75,6 +75,12 @@ TRUSTED_POLICY_CHECK = {
     "workflow": "GitForgeOps Supply-Chain Policy",
     "required": False,
 }
+AGENT_POLICY_CHECK = {
+    "bucket": "pass",
+    "name": "validate-trusted-policy",
+    "workflow": "Agent Setup Policy",
+    "required": False,
+}
 
 HEAD_SHA = "b" * 40
 RELEASE_SHA = "a" * 40
@@ -806,10 +812,11 @@ class ReleaseGateBehavior:
 
     def test_a_missing_required_trusted_check_waits_then_passes(self) -> None:
         trusted = dict(TRUSTED_POLICY_CHECK, required=True)
+        agent_policy = dict(AGENT_POLICY_CHECK, required=True)
         result = self.run_gate(
             PASSING_CHECKS,
             settings=rules(*REQUIRED, *ACCEPTED),
-            samples=[PASSING_CHECKS, PASSING_CHECKS + [trusted]],
+            samples=[PASSING_CHECKS, PASSING_CHECKS + [trusted, agent_policy]],
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
