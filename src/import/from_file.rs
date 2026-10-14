@@ -53,6 +53,16 @@ pub fn import_from_file_selected(
             path: file_path.to_path_buf(),
             source,
         })?;
+    // An import document is a whole backup, so the bound is the response
+    // bound, not the per-resource one — still finite, so a crafted file
+    // cannot spend unbounded memory in the parse.
+    const MAX_IMPORT_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+    if contents.len() > MAX_IMPORT_DOCUMENT_BYTES {
+        return Err(crate::error::Error::Config(format!(
+            "import document is {} bytes, over the {MAX_IMPORT_DOCUMENT_BYTES}-byte limit; no tree or credential bundle was published",
+            contents.len()
+        )));
+    }
     // YAML is a superset of the JSON returned by GET /backup. Decode to a JSON
     // value, then use the same envelope parser as API import so opaque sections
     // are inventoried consistently instead of being discarded by GatewayConfig.
