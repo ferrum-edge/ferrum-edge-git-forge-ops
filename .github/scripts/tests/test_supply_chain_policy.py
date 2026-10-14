@@ -2752,6 +2752,28 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     )
                 )
 
+    def test_agent_setup_policy_triggers_are_pinned_to_pull_request_target(self):
+        workflow = (ROOT / ".github/workflows/agent-setup-policy.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(
+            check_supply_chain.agent_setup_policy_trigger_violations(workflow), []
+        )
+
+        # A candidate-controlled trigger would run the pull request's own
+        # copy of the workflow and could report the required
+        # `validate-trusted-policy` context without the trusted validator.
+        added = workflow.replace("on:\n", "on:\n  pull_request:\n", 1)
+        self.assertNotEqual(added, workflow)
+        violations = check_supply_chain.agent_setup_policy_trigger_violations(added)
+        self.assertTrue(any("pull_request" in item for item in violations), violations)
+
+        narrowed = workflow.replace("      - edited\n", "", 1)
+        self.assertNotEqual(narrowed, workflow)
+        self.assertTrue(
+            check_supply_chain.agent_setup_policy_trigger_violations(narrowed)
+        )
+
     def test_security_trigger_list_is_pinned_to_the_reviewed_events(self):
         workflow = (ROOT / ".github/workflows/security.yml").read_text(
             encoding="utf-8"
