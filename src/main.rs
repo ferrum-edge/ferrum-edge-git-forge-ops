@@ -626,6 +626,12 @@ fn build_github_api_client(
         .user_agent("gitforgeops/0.1")
         .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        // These calls carry a bearer token to api.github.com only. Never
+        // follow a redirect (a same-host 3xx keeps the Authorization header,
+        // and no endpoint used here legitimately redirects) and never let
+        // a downgraded http:// URL carry the token.
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
         .build()
         .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))
 }

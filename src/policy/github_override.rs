@@ -200,6 +200,11 @@ async fn check_override_context(
         .user_agent("gitforgeops/0.1")
         .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        // Bearer-token calls to api.github.com only: never follow a redirect
+        // with the token, never downgrade to http://. Pagination follows the
+        // `Link` header through fresh requests, not 3xx responses.
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
