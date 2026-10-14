@@ -4080,6 +4080,115 @@ REQUIRED_CHECK_WORKFLOWS = {
 }
 
 
+# Every workflow file the protected branch has reviewed. A candidate may not
+# add a workflow the checker does not know: a new file runs with repository
+# privileges the moment it lands on the default branch, and no per-workflow
+# fence below has ever been written for it. Adding one is a two-step change —
+# land the allowlist entry (and any fences) first, then the workflow.
+KNOWN_WORKFLOWS = frozenset({
+    "agent-setup-ci.yml",
+    "agent-setup-policy.yml",
+    "alloy-consumer.yml",
+    "apply-on-merge.yml",
+    "base-image-pin-canary.yml",
+    "drift-check.yml",
+    "lifecycle.yml",
+    "materialize-file.yml",
+    "release.yml",
+    "rotate.yml",
+    "rust-ci.yml",
+    "security.yml",
+    "settings-audit.yml",
+    "state-guard.yml",
+    "supply-chain-policy.yml",
+    "trusted-pr-review.yml",
+    "validate-pr.yml",
+    "validator-pin-canary.yml",
+})
+
+# Triggers whose definition comes from the protected default branch while the
+# event concerns untrusted pull-request bytes. Only these reviewed workflows
+# may use them; a new user is refused until the protected-branch checker
+# grows an entry (and fences) for it.
+PRIVILEGED_TRIGGER_OWNERS = {
+    "pull_request_target": frozenset({
+        "agent-setup-policy.yml",
+        "state-guard.yml",
+        "supply-chain-policy.yml",
+    }),
+    "workflow_run": frozenset({"trusted-pr-review.yml"}),
+}
+
+# The one hosted runner image every job must name. Exact, not a family: a
+# floating label (`ubuntu-latest`) silently changes the build environment.
+RUNNER_IMAGE = "ubuntu-26.04"
+
+
+def _workflow_events(document: dict) -> list[str] | None:
+    """The trigger event names of a parsed workflow, or None when unreadable."""
+    candidates = [value for key, value in document.items() if str(key).casefold() == "on"]
+    if len(candidates) != 1:
+        return None
+    on = candidates[0]
+    if isinstance(on, str):
+        return [on]
+    if isinstance(on, list):
+        return on
+    if isinstance(on, dict):
+        return list(on)
+    return None
+
+
+def workflow_allowlist_violations(workflow: str, document: dict) -> list[str]:
+    """A candidate adds no unreviewed workflow, privileged trigger, or runner.
+
+    `workflow` is the path relative to the repository root. Read from the
+    parsed workflow: the file must be in `KNOWN_WORKFLOWS`, a privileged
+    trigger (`PRIVILEGED_TRIGGER_OWNERS`) may appear only in its reviewed
+    owners, and every job that runs steps must name `RUNNER_IMAGE` exactly
+    (a reusable-workflow call job, keyed by `uses:`, has no runner of its own).
+    """
+    basename = workflow.rsplit("/", 1)[-1]
+    violations: list[str] = []
+    if basename not in KNOWN_WORKFLOWS:
+        violations.append(
+            f"{workflow}: workflow is not in the reviewed allowlist "
+            "(KNOWN_WORKFLOWS); land the allowlist entry and its fences on the "
+            "protected branch before adding the workflow"
+        )
+    events = _workflow_events(document)
+    if events is None:
+        violations.append(f"{workflow}: a workflow must declare exactly one readable `on:`")
+    else:
+        for event in events:
+            if not isinstance(event, str):
+                violations.append(f"{workflow}: trigger {event!r} is not a plain event name")
+                continue
+            owners = PRIVILEGED_TRIGGER_OWNERS.get(event.casefold())
+            if owners is not None and basename not in owners:
+                violations.append(
+                    f"{workflow}: trigger {event!r} runs the protected-branch "
+                    "definition against untrusted pull-request bytes and is "
+                    f"reviewed only for {', '.join(sorted(owners))}"
+                )
+    for jobs in (value for key, value in document.items() if str(key).casefold() == "jobs"):
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in jobs.items():
+            if not isinstance(job, dict):
+                continue
+            folded = {str(key).casefold(): value for key, value in job.items()}
+            if "uses" in folded:
+                continue
+            runs_on = folded.get("runs-on")
+            if runs_on != RUNNER_IMAGE:
+                violations.append(
+                    f"{workflow}: job {job_id!r} must run on {RUNNER_IMAGE!r} "
+                    f"exactly; found {runs_on!r}"
+                )
+    return violations
+
+
 def _impersonated_check(workflow: str, job_id: str, spelled: str) -> str | None:
     """The required context `spelled` names, unless this is that context's own job."""
     context = spelled.strip().casefold()
@@ -5096,6 +5205,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 monitoring_jwt_binding_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
+                workflow_allowlist_violations(
                     workflow.relative_to(root).as_posix(), document
                 )
             )

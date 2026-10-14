@@ -4039,6 +4039,80 @@ class SupplyChainPolicyTests(unittest.TestCase):
             {"actions/checkout"},
         )
 
+    def test_workflow_allowlist_refuses_unreviewed_workflow_and_trigger(self):
+        def violations(path, document):
+            return check_supply_chain.workflow_allowlist_violations(path, document)
+
+        job = {"runs-on": "ubuntu-26.04", "steps": []}
+        # A reviewed workflow with the pinned runner passes.
+        self.assertEqual(
+            violations(
+                ".github/workflows/rust-ci.yml",
+                {"on": {"pull_request": None}, "jobs": {"check": job}},
+            ),
+            [],
+        )
+        # A brand-new workflow file is refused until the protected branch
+        # allowlists it.
+        self.assertTrue(
+            any(
+                "not in the reviewed allowlist" in item
+                for item in violations(
+                    ".github/workflows/brand-new.yml",
+                    {"on": {"pull_request": None}, "jobs": {"check": job}},
+                )
+            )
+        )
+        # A privileged trigger outside its reviewed owners is refused, even
+        # in an allowlisted workflow file.
+        self.assertTrue(
+            any(
+                "pull_request_target" in item
+                for item in violations(
+                    ".github/workflows/rust-ci.yml",
+                    {"on": {"pull_request_target": None}, "jobs": {"check": job}},
+                )
+            )
+        )
+        self.assertTrue(
+            any(
+                "workflow_run" in item
+                for item in violations(
+                    ".github/workflows/rust-ci.yml",
+                    {"on": ["workflow_run"], "jobs": {"check": job}},
+                )
+            )
+        )
+        # The reviewed owners keep their triggers.
+        self.assertEqual(
+            violations(
+                ".github/workflows/state-guard.yml",
+                {"on": {"pull_request_target": None}, "jobs": {"check": job}},
+            ),
+            [],
+        )
+        # A floating or foreign runner label is refused.
+        self.assertTrue(
+            any(
+                "ubuntu-26.04" in item
+                for item in violations(
+                    ".github/workflows/rust-ci.yml",
+                    {
+                        "on": "push",
+                        "jobs": {"check": {"runs-on": "ubuntu-latest", "steps": []}},
+                    },
+                )
+            )
+        )
+        # A reusable-workflow call job has no runner of its own.
+        self.assertEqual(
+            violations(
+                ".github/workflows/rust-ci.yml",
+                {"on": "push", "jobs": {"call": {"uses": "./.github/workflows/x.yml"}}},
+            ),
+            [],
+        )
+
     def test_alloy_consumer_qualification_is_isolated_and_not_required(self):
         workflow_path = ".github/workflows/alloy-consumer.yml"
         workflow = (ROOT / workflow_path).read_text()
