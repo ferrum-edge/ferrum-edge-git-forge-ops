@@ -174,81 +174,119 @@ fn output_bounded(command: &mut Command) -> std::io::Result<std::process::Output
     output_bounded_with(command, VALIDATOR_TIMEOUT, VALIDATOR_STREAM_CAP)
 }
 
+/// Kill the validator and, on unix, its whole process group: killing only
+/// the direct child leaves descendants holding the output pipes (and
+/// running) after a refusal.
+fn kill_validator_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The child was spawned as a process-group leader, so its pid is
+        // the group id. `kill` is a base-system utility on Linux and macOS;
+        // if it is unavailable the direct kill below still runs.
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn output_bounded_with(
     command: &mut Command,
     timeout: Duration,
     stream_cap: usize,
 ) -> std::io::Result<std::process::Output> {
+    // Readers report over a channel instead of being joined: a descendant
+    // that inherits a pipe can delay EOF arbitrarily past the child's exit,
+    // and the deadline must cover drain completion, not just exit.
     fn drain<R: Read + Send + 'static>(
         pipe: R,
         cap: usize,
-        overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<Vec<u8>> {
+        is_stdout: bool,
+        done: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+    ) {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            // Read one byte past the cap so overflow is detectable; the
-            // caller kills the child as soon as the flag is set, instead of
-            // leaving it blocked on a full pipe until the deadline.
+            // Read one byte past the cap so overflow is detectable.
             let _ = pipe.take(cap as u64 + 1).read_to_end(&mut bytes);
-            if bytes.len() > cap {
-                overflow.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            bytes
-        })
+            let _ = done.send((is_stdout, bytes));
+        });
     }
 
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn()?;
-    let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stdout = drain(
+    let (sender, receiver) = std::sync::mpsc::channel();
+    drain(
         child.stdout.take().expect("stdout is piped"),
         stream_cap,
-        overflow.clone(),
+        true,
+        sender.clone(),
     );
-    let stderr = drain(
+    drain(
         child.stderr.take().expect("stderr is piped"),
         stream_cap,
-        overflow.clone(),
+        false,
+        sender,
     );
+
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        if overflow.load(std::sync::atomic::Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("validator output exceeded the {stream_cap}-byte limit"),
-            ));
+    let mut status = None;
+    let mut stdout: Option<Vec<u8>> = None;
+    let mut stderr: Option<Vec<u8>> = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
         }
-        if let Some(status) = child.try_wait()? {
-            break status;
+        if let (Some(status), Some(stdout), Some(stderr)) = (status, &stdout, &stderr) {
+            return Ok(std::process::Output {
+                status,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            });
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_validator_tree(&mut child);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("validator exceeded the {}s time limit", timeout.as_secs()),
             ));
         }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-    if stdout.len() > stream_cap || stderr.len() > stream_cap {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("validator output exceeded the {stream_cap}-byte limit"),
-        ));
+        match receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok((is_stdout, bytes)) => {
+                if bytes.len() > stream_cap {
+                    kill_validator_tree(&mut child);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("validator output exceeded the {stream_cap}-byte limit"),
+                    ));
+                }
+                if is_stdout {
+                    stdout = Some(bytes);
+                } else {
+                    stderr = Some(bytes);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Both readers ended without reporting (thread panic): fill
+                // whatever is missing so the child-status path can finish
+                // instead of waiting for reports that will never arrive.
+                stdout.get_or_insert_with(Vec::new);
+                stderr.get_or_insert_with(Vec::new);
+            }
+        }
     }
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 fn output_retrying_busy_executable(command: &mut Command) -> std::io::Result<std::process::Output> {
@@ -611,6 +649,21 @@ mod bounded_output_tests {
         let error = output_bounded_with(&mut command, Duration::from_secs(30), 1024)
             .expect_err("output past the cap must be refused");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn validator_deadline_covers_descendants_holding_the_pipes() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & echo started; exit 0"]);
+        let started = Instant::now();
+        let error = output_bounded_with(&mut command, Duration::from_millis(200), 1024)
+            .expect_err("a descendant holding stdout open must not outlive the deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "deadline must bound drain completion, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

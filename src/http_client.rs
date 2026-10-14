@@ -75,8 +75,12 @@ async fn read_body_capped(mut resp: reqwest::Response) -> crate::error::Result<S
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Read at most [`MAX_ERROR_BODY_BYTES`] of an error response and bound it
-/// for display with [`bounded_error_message`].
+/// Read at most [`MAX_ERROR_BODY_BYTES`] of an error response and reduce it
+/// to a displayable diagnostic: the structured `message` field when the
+/// body is a JSON object carrying one (GitHub's error shape), bounded with
+/// [`bounded_error_message`]; otherwise a withheld-contents note. Raw
+/// excerpts are never returned — an unstructured body can reflect request
+/// material from a credential-bearing call.
 pub(crate) async fn read_error_body(mut resp: reqwest::Response) -> String {
     let mut bytes = Vec::new();
     while bytes.len() < MAX_ERROR_BODY_BYTES {
@@ -88,7 +92,15 @@ pub(crate) async fn read_error_body(mut resp: reqwest::Response) -> String {
             _ => break,
         }
     }
-    bounded_error_message(&String::from_utf8_lossy(&bytes))
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
+            return bounded_error_message(message);
+        }
+    }
+    format!(
+        "unstructured error body withheld ({} bytes read)",
+        bytes.len()
+    )
 }
 
 /// `POST /batch` body-size cap enforced by the gateway (1 MiB). We chunk below
@@ -427,7 +439,15 @@ impl AdminClient {
                             values.iter().count() <= 1
                                 && values.iter().all(|value| value.to_str().is_ok())
                         });
-                    let body = read_body_capped(resp).await?;
+                    // A body-read failure (truncated stream, over the cap)
+                    // must not discard the status: a 412 whose body cannot
+                    // be read is still a conditional refusal, and dropping
+                    // it would let later writes proceed in a stale
+                    // namespace. The placeholder parses as no envelope,
+                    // which every consumer treats fail-closed.
+                    let body = read_body_capped(resp)
+                        .await
+                        .unwrap_or_else(|_| String::from("<no body>"));
 
                     if is_success_status(status) {
                         return Ok(RawResponse {
@@ -1896,14 +1916,17 @@ pub fn map_api_error_with_redirect_base(
     base: Option<&str>,
 ) -> crate::error::Error {
     let parsed = ApiErrorBody::parse(body);
-    // The fallback is peer-controlled bytes, never echoed verbatim: it can
-    // reflect request material from a credential-bearing call, so only a
-    // bounded single-line excerpt reaches the error. A parsed `error` field
-    // is the gateway's own structured diagnostic and is kept as parsed.
-    let message = parsed
-        .error
-        .clone()
-        .unwrap_or_else(|| bounded_error_message(body));
+    // An unparsed body is peer-controlled bytes and is withheld entirely:
+    // bounded or not, an excerpt can carry request material reflected from
+    // a credential-bearing call. A parsed `error` field is the gateway's
+    // own structured diagnostic and is kept as parsed. Classification
+    // below may still inspect the raw body internally; it never displays it.
+    let message = parsed.error.clone().unwrap_or_else(|| {
+        format!(
+            "the gateway returned an unstructured error body ({} bytes); its contents are withheld",
+            body.len()
+        )
+    });
 
     // The client is built with `redirect::Policy::none()` so a destructive
     // body is never replayed against a different authority, which means a 3xx
@@ -1925,7 +1948,7 @@ pub fn map_api_error_with_redirect_base(
         };
     }
 
-    if status == 403 && is_read_only_refusal(&message) {
+    if status == 403 && is_read_only_refusal(parsed.error.as_deref().unwrap_or(body)) {
         return crate::error::Error::GatewayReadOnly(
             "the gateway rejected a config mutation with \"Admin API is in read-only mode\" \
              (FERRUM_ADMIN_READ_ONLY, an unavailable config database, or a file/dp/mesh/node_agent \
@@ -2025,14 +2048,7 @@ pub fn map_api_error_with_redirect_base(
         };
     }
 
-    crate::error::Error::ApiError {
-        status,
-        message: if parsed.error.is_some() {
-            message
-        } else {
-            body.to_string()
-        },
-    }
+    crate::error::Error::ApiError { status, message }
 }
 
 /// Does a 403 body say the admin plane is refusing writes?
@@ -3486,5 +3502,19 @@ mod bounded_error_message_tests {
     #[test]
     fn short_error_body_survives() {
         assert_eq!(bounded_error_message("nope: bad thing"), "nope: bad thing");
+    }
+
+    #[test]
+    fn unstructured_gateway_bodies_are_withheld_not_excerpted() {
+        // A reflected credential in an unparsed body must not survive into
+        // the displayed error at any length.
+        let error = super::map_api_error(
+            400,
+            "echo: Bearer [REDACTED] plus a long tail of peer bytes",
+            super::RequestKind::Read,
+        );
+        let rendered = error.to_string();
+        assert!(!rendered.contains("synthetic-secret"), "{rendered}");
+        assert!(rendered.contains("withheld"), "{rendered}");
     }
 }
