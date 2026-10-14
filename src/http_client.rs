@@ -28,6 +28,69 @@ const LIST_PAGE_LIMIT: i64 = 1000;
 /// wedge CI.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
 
+/// Largest gateway response body buffered whole. A `/backup` of a large
+/// namespace is big but bounded; an unbounded read lets a hostile or broken
+/// endpoint exhaust memory before any parse or timeout logic runs.
+const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest error body read from a non-gateway API (GitHub). Only a bounded,
+/// single-line excerpt ever reaches an error message.
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_ERROR_MESSAGE_CHARS: usize = 512;
+
+/// Collapse an API error body to one bounded line for display.
+///
+/// Error bodies are peer-controlled: they can echo request material (which,
+/// on credential-bearing calls, may include a secret), embed newlines that
+/// forge log lines, or be arbitrarily large. Control characters become
+/// spaces and the result is truncated, so what is printed is an excerpt,
+/// never the body verbatim.
+pub(crate) fn bounded_error_message(body: &str) -> String {
+    let mut out = String::with_capacity(body.len().min(MAX_ERROR_MESSAGE_CHARS + 16));
+    for (index, ch) in body.chars().enumerate() {
+        if index >= MAX_ERROR_MESSAGE_CHARS {
+            out.push_str(" …[truncated]");
+            return out;
+        }
+        out.push(if ch.is_control() { ' ' } else { ch });
+    }
+    out
+}
+
+/// Read a response body with a hard byte cap, failing closed past it.
+async fn read_body_capped(mut resp: reqwest::Response) -> crate::error::Result<String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?
+    {
+        if bytes.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+            return Err(crate::error::Error::HttpClient(format!(
+                "gateway response body exceeds the {MAX_RESPONSE_BODY_BYTES}-byte limit; refusing to buffer it"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Read at most [`MAX_ERROR_BODY_BYTES`] of an error response and bound it
+/// for display with [`bounded_error_message`].
+pub(crate) async fn read_error_body(mut resp: reqwest::Response) -> String {
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_ERROR_BODY_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_ERROR_BODY_BYTES - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            _ => break,
+        }
+    }
+    bounded_error_message(&String::from_utf8_lossy(&bytes))
+}
+
 /// `POST /batch` body-size cap enforced by the gateway (1 MiB). We chunk below
 /// it with headroom for the JSON envelope.
 pub const BATCH_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -364,10 +427,7 @@ impl AdminClient {
                             values.iter().count() <= 1
                                 && values.iter().all(|value| value.to_str().is_ok())
                         });
-                    let body = resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| String::from("<no body>"));
+                    let body = read_body_capped(resp).await?;
 
                     if is_success_status(status) {
                         return Ok(RawResponse {
@@ -1836,7 +1896,14 @@ pub fn map_api_error_with_redirect_base(
     base: Option<&str>,
 ) -> crate::error::Error {
     let parsed = ApiErrorBody::parse(body);
-    let message = parsed.error.clone().unwrap_or_else(|| body.to_string());
+    // The fallback is peer-controlled bytes, never echoed verbatim: it can
+    // reflect request material from a credential-bearing call, so only a
+    // bounded single-line excerpt reaches the error. A parsed `error` field
+    // is the gateway's own structured diagnostic and is kept as parsed.
+    let message = parsed
+        .error
+        .clone()
+        .unwrap_or_else(|| bounded_error_message(body));
 
     // The client is built with `redirect::Policy::none()` so a destructive
     // body is never replayed against a different authority, which means a 3xx
@@ -3399,5 +3466,25 @@ impl fmt::Debug for RawResponse {
 impl fmt::Debug for ApiErrorBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ApiErrorBody(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+mod bounded_error_message_tests {
+    use super::bounded_error_message;
+
+    #[test]
+    fn error_body_is_one_bounded_line() {
+        let body = format!("line one\nforged: ok\r\n{}", "x".repeat(5000));
+        let bounded = bounded_error_message(&body);
+        assert!(!bounded.contains('\n'));
+        assert!(!bounded.contains('\r'));
+        assert!(bounded.chars().count() <= 512 + " …[truncated]".chars().count());
+        assert!(bounded.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn short_error_body_survives() {
+        assert_eq!(bounded_error_message("nope: bad thing"), "nope: bad thing");
     }
 }

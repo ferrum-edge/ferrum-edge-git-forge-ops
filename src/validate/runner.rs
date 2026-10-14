@@ -1,7 +1,8 @@
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::{collect_namespaces, GatewayConfig};
 use crate::secrets::SecretScrubber;
@@ -163,11 +164,98 @@ pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
 /// descriptor inherited by a process another thread forked and has not yet
 /// `exec`ed, which clears within milliseconds. Every other spawn error is
 /// returned immediately.
+/// How long one validator invocation may run, and how much it may print on
+/// one stream. `Command::output` bounds neither: a wedged or hostile
+/// validator binary could park CI forever or exhaust memory.
+const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(300);
+const VALIDATOR_STREAM_CAP: usize = 16 * 1024 * 1024;
+
+fn output_bounded(command: &mut Command) -> std::io::Result<std::process::Output> {
+    output_bounded_with(command, VALIDATOR_TIMEOUT, VALIDATOR_STREAM_CAP)
+}
+
+fn output_bounded_with(
+    command: &mut Command,
+    timeout: Duration,
+    stream_cap: usize,
+) -> std::io::Result<std::process::Output> {
+    fn drain<R: Read + Send + 'static>(
+        pipe: R,
+        cap: usize,
+        overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            // Read one byte past the cap so overflow is detectable; the
+            // caller kills the child as soon as the flag is set, instead of
+            // leaving it blocked on a full pipe until the deadline.
+            let _ = pipe.take(cap as u64 + 1).read_to_end(&mut bytes);
+            if bytes.len() > cap {
+                overflow.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            bytes
+        })
+    }
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout = drain(
+        child.stdout.take().expect("stdout is piped"),
+        stream_cap,
+        overflow.clone(),
+    );
+    let stderr = drain(
+        child.stderr.take().expect("stderr is piped"),
+        stream_cap,
+        overflow.clone(),
+    );
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if overflow.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("validator output exceeded the {stream_cap}-byte limit"),
+            ));
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("validator exceeded the {}s time limit", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if stdout.len() > stream_cap || stderr.len() > stream_cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("validator output exceeded the {stream_cap}-byte limit"),
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn output_retrying_busy_executable(command: &mut Command) -> std::io::Result<std::process::Output> {
     const ATTEMPTS: u32 = 6;
     let mut attempt = 0;
     loop {
-        match command.output() {
+        match output_bounded(command) {
             Err(error)
                 if error.kind() == std::io::ErrorKind::ExecutableFileBusy
                     && attempt + 1 < ATTEMPTS =>
@@ -500,5 +588,38 @@ fn bounded_process_diagnostic(diagnostic: &str) -> String {
         format!("{bounded}\n[validator diagnostic truncated]")
     } else {
         bounded
+    }
+}
+
+#[cfg(test)]
+mod bounded_output_tests {
+    use super::*;
+
+    #[test]
+    fn validator_timeout_kills_a_wedged_child() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let error = output_bounded_with(&mut command, Duration::from_millis(100), 1024)
+            .expect_err("a wedged validator must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn validator_stream_cap_refuses_unbounded_output() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'x%.0s' $(seq 1 5000)"]);
+        let error = output_bounded_with(&mut command, Duration::from_secs(30), 1024)
+            .expect_err("output past the cap must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn validator_output_within_bounds_is_returned() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf hello"]);
+        let output = output_bounded_with(&mut command, Duration::from_secs(30), 1024)
+            .expect("bounded output is returned");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello");
     }
 }

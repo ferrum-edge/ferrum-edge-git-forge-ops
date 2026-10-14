@@ -492,7 +492,7 @@ async fn fetch_json(
 
     let status = resp.status().as_u16();
     if status >= 400 {
-        let body = resp.text().await.unwrap_or_default();
+        let body = crate::http_client::read_error_body(resp).await;
         return Err(crate::error::Error::ApiError {
             status,
             message: body,
