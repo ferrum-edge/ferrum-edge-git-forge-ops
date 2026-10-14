@@ -544,6 +544,8 @@ fn is_sensitive_key(key: &str) -> bool {
         || normalized.contains("cookie")
         || normalized.contains("bearer")
         || normalized.contains("password")
+        || normalized.contains("passphrase")
+        || normalized.contains("passwd")
         || normalized.contains("secret")
         || normalized.contains("credential")
         || normalized.contains("privatekey")
@@ -606,6 +608,23 @@ mod tests {
         assert!(paths.contains(&"headers.x-honeycomb-team".to_string()));
         assert!(paths.contains(&"nested.clientSecret".to_string()));
         assert!(!paths.contains(&"safe".to_string()));
+    }
+
+    #[test]
+    fn passphrase_and_passwd_spellings_are_sensitive() {
+        let paths = dotted(sensitive_string_paths(
+            "custom_enterprise_plugin",
+            &serde_json::json!({
+                "tls_passphrase": "open-sesame",
+                "dbPasswd": "hunter2",
+                "signing_pass_phrase": "correct horse",
+                "passage": "a safe word that merely starts alike"
+            }),
+        ));
+        assert!(paths.contains(&"tls_passphrase".to_string()));
+        assert!(paths.contains(&"dbPasswd".to_string()));
+        assert!(paths.contains(&"signing_pass_phrase".to_string()));
+        assert!(!paths.contains(&"passage".to_string()));
     }
 
     #[test]
