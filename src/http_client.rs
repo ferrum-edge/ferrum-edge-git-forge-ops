@@ -46,6 +46,9 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 /// spaces and the result is truncated, so what is printed is an excerpt,
 /// never the body verbatim.
 pub(crate) fn bounded_error_message(body: &str) -> String {
+    // Scrub before truncating: a cut through a secret would leave a prefix
+    // no needle matches.
+    let body = crate::secrets::scrub_for_display(body);
     let mut out = String::with_capacity(body.len().min(MAX_ERROR_MESSAGE_CHARS + 16));
     for (index, ch) in body.chars().enumerate() {
         if index >= MAX_ERROR_MESSAGE_CHARS {
@@ -3667,6 +3670,47 @@ mod bounded_error_message_tests {
         );
         assert!(!message.contains('\n'), "{message}");
         assert!(message.ends_with("[truncated]"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn reflected_resolved_secrets_are_scrubbed_from_displayed_errors() {
+        // A value unique to this test, so registering it process-wide cannot
+        // touch any other test's diagnostics.
+        const SECRET: &str = "zq7-display-scrub-canary-91f3";
+        crate::secrets::register_display_scrubber(crate::secrets::SecretScrubber::for_test_values(
+            &[SECRET],
+        ));
+
+        // Gateway: the structured `error` field echoes the value.
+        let body = serde_json::json!({
+            "error": format!("invalid plugin header value {SECRET} for x-api-key"),
+        })
+        .to_string();
+        let rendered = super::map_api_error(400, &body, super::RequestKind::Read).to_string();
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(
+            rendered.contains("invalid plugin header value [REDACTED] for x-api-key"),
+            "{rendered}"
+        );
+
+        // GitHub: the structured `message` echoes it, JSON-escaped or not.
+        let body = serde_json::json!({
+            "message": format!("Validation Failed: {SECRET} is not allowed"),
+        })
+        .to_string();
+        let message = read_error_body_of(body.into_bytes()).await;
+        assert!(!message.contains(SECRET), "{message}");
+        assert_eq!(message, "Validation Failed: [REDACTED] is not allowed");
+
+        // A fragment that survives redaction withholds the diagnostic.
+        let partial = &SECRET[..SECRET.len() - 1];
+        let body = serde_json::json!({ "error": format!("bad value {partial}") }).to_string();
+        let rendered = super::map_api_error(400, &body, super::RequestKind::Read).to_string();
+        assert!(!rendered.contains(partial), "{rendered}");
+        assert!(
+            rendered.contains(crate::secrets::DISPLAY_WITHHELD),
+            "{rendered}"
+        );
     }
 
     #[test]

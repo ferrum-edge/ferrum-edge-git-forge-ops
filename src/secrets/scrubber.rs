@@ -46,6 +46,8 @@
 //! rather than suppressing.
 
 use std::collections::{BTreeSet, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use base64::Engine;
 
@@ -127,6 +129,78 @@ pub struct SecretScrubber {
     /// [`is_reencoding_hazard`]. Every stream is withheld while this is set,
     /// because a partial substitution reads exactly like a complete one.
     unsafe_to_scrub: bool,
+}
+
+/// Whether secret resolution registers what it resolved for
+/// [`scrub_for_display`]. The CLI turns it on at startup; library callers and
+/// tests opt in, so parallel tests never scrub each other's diagnostics.
+static DISPLAY_SCRUBBING: AtomicBool = AtomicBool::new(false);
+
+/// Every scrubber registered for this process's displayed errors. Kept as
+/// separate scrubbers, not merged values, so each keeps the public document
+/// its fragment scan is measured against.
+static DISPLAY_SCRUBBERS: Mutex<Vec<SecretScrubber>> = Mutex::new(Vec::new());
+
+/// Shown in place of an error diagnostic that still carried a secret after
+/// redaction.
+pub const DISPLAY_WITHHELD: &str =
+    "[diagnostic withheld: it carried a resolved secret that could not be redacted]";
+
+/// Register every secret resolved from now on for [`scrub_for_display`].
+pub fn enable_display_scrubbing() {
+    DISPLAY_SCRUBBING.store(true, Ordering::SeqCst);
+}
+
+/// Register the secrets of one resolved snapshot for [`scrub_for_display`],
+/// if [`enable_display_scrubbing`] was called. The resolver calls this on
+/// every successful resolution.
+pub fn register_resolved_for_display(config: &GatewayConfig, report: &ResolveReport) {
+    if DISPLAY_SCRUBBING.load(Ordering::SeqCst) {
+        register_display_scrubber(SecretScrubber::from_gateway_config_with_report(
+            config, report,
+        ));
+    }
+}
+
+/// Add `scrubber`'s secrets to what [`scrub_for_display`] removes.
+pub fn register_display_scrubber(scrubber: SecretScrubber) {
+    if scrubber.is_empty() {
+        return;
+    }
+    DISPLAY_SCRUBBERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(scrubber);
+}
+
+/// Remove every registered secret from an error diagnostic before it is
+/// displayed.
+///
+/// Peer-supplied error text (a gateway `error` field, GitHub's `message`) can
+/// reflect request material, and the run's requests carry resolved secrets.
+/// Each registered value and its cheap re-encodings become [`REDACTION`], so
+/// the rest of the diagnostic stays readable. If a value or a fragment of one
+/// survives that (a value too short to replace safely, or an encoding the
+/// needles do not cover), the whole diagnostic is replaced by
+/// [`DISPLAY_WITHHELD`].
+pub fn scrub_for_display(text: &str) -> String {
+    let scrubbers = DISPLAY_SCRUBBERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if scrubbers.is_empty() {
+        return text.to_string();
+    }
+    let mut scrubbed = text.to_string();
+    for scrubber in scrubbers.iter() {
+        scrubbed = scrubber.scrub(&scrubbed);
+    }
+    if scrubbers
+        .iter()
+        .any(|scrubber| scrubber.leaks(&scrubbed) || scrubber.leaks_fragment(&scrubbed))
+    {
+        return DISPLAY_WITHHELD.to_string();
+    }
+    scrubbed
 }
 
 /// Why a validator's output was withheld instead of scrubbed.
@@ -280,6 +354,12 @@ impl SecretScrubber {
             public_text: String::new(),
             unsafe_to_scrub,
         }
+    }
+
+    /// A scrubber for exactly `values`, for tests outside a gateway config.
+    #[cfg(test)]
+    pub(crate) fn for_test_values(values: &[&str]) -> Self {
+        Self::from_values(values.iter().map(|value| value.to_string()).collect())
     }
 
     /// True when the config carried no secret material at all.
