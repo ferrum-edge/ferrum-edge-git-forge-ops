@@ -37,6 +37,24 @@ BRIEF_INVARIANTS = (
     "`actionlint`",
     "`shellcheck`",
 )
+# Delivery and state rules the canonical briefs no longer carry. A Claude
+# entrypoint or brief that repeats one would widen a worker's assignment (an
+# unrequested review trigger or CI babysitting) or misstate the ledger, which
+# now stores the constant `managed:v1` marker rather than content hashes.
+STALE_CONTRACT_MARKERS = (
+    "deterministic state hashes",
+    "ONE review trigger",
+    "ONE @codex review",
+    "loop until review-clean",
+    "loop until codex clean",
+)
+PINNED_MODEL_LINE = re.compile(r"^readonly PINNED_MODEL='(?P<model>[^']+)'$", re.MULTILINE)
+# Any `provider/name` model id, for the agent metadata's dispatch prompt.
+ANY_MODEL_ID = re.compile(r"(?<![\w/.-])[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]")
+# A documented `--model provider/name` argument, whatever the provider.
+MODEL_ARGUMENT = re.compile(
+    r"--model[ =]+[`'\"]?(?P<model>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[A-Za-z0-9])"
+)
 STALE_MARKERS = (
     "-p ferrum-edge",
     "--bin ferrum-edge",
@@ -620,6 +638,45 @@ def collect_violations(root: Path) -> list[str]:
                     f"{launcher.relative_to(root)}: Cursor sandboxing blocks required network and tool state"
                 )
 
+    # A hard-pinned launcher and every text describing that skill must name the
+    # same model: the Claude mirror, the canonical skill, its briefs and its
+    # agent metadata. In those texts a model id under the pin's provider, or
+    # any `--model` argument, that is not the pin is a mismatch; the agent
+    # metadata's dispatch prompt may name no model id but the pin at all.
+    for skill_dir in agent_skill_dirs:
+        launcher = skill_dir / "scripts" / "dispatch-agent.sh"
+        if launcher.is_symlink() or not launcher.is_file():
+            continue
+        pin = PINNED_MODEL_LINE.search(read_text(launcher))
+        if pin is None:
+            continue
+        model = pin.group("model")
+        provider = model.split("/", 1)[0]
+        named = re.compile(re.escape(provider) + r"/[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]")
+        described = [
+            skill_dir / "SKILL.md",
+            claude_skills / skill_dir.name / "SKILL.md",
+            skill_dir / "agents" / "openai.yaml",
+            *sorted((skill_dir / "references").glob("*.md")),
+        ]
+        for path in described:
+            if path.is_symlink() or not path.is_file():
+                continue
+            text = read_text(path)
+            if model not in text and path.name in ("SKILL.md", "openai.yaml"):
+                violations.append(
+                    f"{path.relative_to(root)}: does not name the launcher's pinned model {model}"
+                )
+            documented = set(named.findall(text)) | {
+                match.group("model") for match in MODEL_ARGUMENT.finditer(text)
+            }
+            if path.name == "openai.yaml":
+                documented |= set(ANY_MODEL_ID.findall(text))
+            for other in sorted(documented - {model}):
+                violations.append(
+                    f"{path.relative_to(root)}: names {other} but the launcher pins {model}"
+                )
+
     # Main's trusted bootstrap validator predates the canonical references/
     # layout and requires these Claude-side paths. Keep them as exact mirrors,
     # not independent instructions that can silently drift.
@@ -685,6 +742,13 @@ def collect_violations(root: Path) -> list[str]:
             if marker in text:
                 violations.append(
                     f"{relative}: stale companion-repository marker {marker!r}"
+                )
+        # Markdown wraps lines, so compare with whitespace runs collapsed.
+        flattened = " ".join(text.split())
+        for marker in STALE_CONTRACT_MARKERS:
+            if marker in flattened:
+                violations.append(
+                    f"{relative}: stale delivery or state instruction {marker!r}"
                 )
         if STALE_BRANDING.search(text):
             violations.append(f"{relative}: human-facing project branding is not adapted")

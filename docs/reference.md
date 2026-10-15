@@ -40,7 +40,7 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 
 | Command | Does |
 |---|---|
-| `validate` | Loads and assembles the tree, runs the security audit and `ferrum-edge validate`. `--format github` is an alias for `github-annotations`. |
+| `validate` | Loads and assembles the tree, checks namespace scope, resolves credential placeholders and runs `ferrum-edge validate` (and the mesh validator when mesh resources exist). It does **not** run the security audit or policy checks; use `plan` for those. `--format github` is an alias for `github-annotations`. |
 | `diff` | Compares desired state with the live gateway: `GET /config/export` with `FERRUM_ADMIN_JWT_VIEWER_SECRET` when it is set, otherwise `GET /backup` with the admin credential. See [Viewer-credential drift reads](#viewer-credential-drift-reads). |
 | `plan` | Shows what `apply` would do, and exits non-zero for every offline reason `apply` would refuse. |
 | `apply` | Reconciles the gateway (api mode) or writes the assembled files (file mode). |

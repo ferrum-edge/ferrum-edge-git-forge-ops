@@ -94,7 +94,10 @@ trigger — credits come and go); update the briefs if stale.
 
 Every prompt must also PIN THE WORKER'S ROLE explicitly (the briefs repeat it, but the
 prompt is what survives a partial brief read):
-"YOU are the implementer: write, commit, and push the changes yourself in this session.
+"YOU are the implementer: complete every assigned task and validation in this session.
+Perform commit, push, PR, review, and CI actions only when this prompt assigns them; after
+the final requested push and report, exit — the controller owns post-push CI and review
+monitoring.
 Do NOT invoke agent-dispatch skills from your environment (opus-agents, fable-agents,
 grok-agents, muse-agents, .agents/skills/*/scripts/dispatch-agent.sh, claude CLI workers) and do NOT
 spawn nested workers." The repo intentionally ships mirror skills under `.agents/skills/`
@@ -108,24 +111,28 @@ Then append the mode block:
 sibling `<repo>-agents/` dir, branch name, acceptance criteria distilled from the
 issue, repo-invariant callouts relevant to the surface (ownership, namespace identity,
 secret handling, schema compatibility), scope boundaries vs neighboring in-flight PRs.
+State the exact stopping point; do not append review-trigger, CI-wait or shepherding work you
+did not intend to assign.
 
 **Fix round (existing PR):** PR number, existing worktree path, current head SHA,
 the verified findings verbatim (fetch full thread bodies first — findings live in
 reviewThreads via the graphql query in the brief), CI-red diagnosis you already made,
 and per-finding guidance (fix vs acceptable-rebuttal cases).
 
-**Shepherd (drive to clean+green):** like fix round, plus "loop until codex clean
-AND CI green". Only use when the user wants agents babysitting CI.
+**Shepherd:** only when the user asks you to babysit or drive a PR to completion. Give each
+worker a bounded fix round with an exact implementation and validation stopping point. You, not
+the worker, monitor post-push review and CI state and dispatch another round only when new
+actionable work appears. Do not add a review trigger unless you explicitly assign one.
 
 **Cadence override (recommended default — full CI outlasts a worker round):** append:
-"CADENCE OVERRIDE: do NOT wait for in-progress CI. Loop: reconstruct state -> fix
-findings + RED checks -> fmt -> push -> ONE @codex review -> EXIT with report."
-The orchestrator then handles verdicts/green-waiting between rounds.
+"CADENCE OVERRIDE: do NOT wait for in-progress CI. Reconstruct state -> fix findings + RED
+checks -> fmt -> push -> EXIT with report. Post a review trigger only if this prompt explicitly
+assigns one."
 
 ## Orchestrator duties between agent rounds
 
 1. On each agent completion: verify from GitHub (never the agent's claims alone) —
-   head pushed? trigger posted to the CORRECT bot? threads replied?
+   head pushed? any explicitly assigned review trigger posted to the CORRECT bot? threads replied?
 2. Independently review the diff in the agent's worktree before any merge
    (`git fetch origin main && git diff origin/main...HEAD` — three-dot; two-dot lies
    once main moves). Focus: fail-closed posture, reconciliation gating, docs honesty,
@@ -135,8 +142,9 @@ The orchestrator then handles verdicts/green-waiting between rounds.
 4. Salvage protocol for dead agents: check worktree `git status --porcelain` +
    `git log @{u}..HEAD`, commit/push stranded WIP, relaunch a continuation agent
    with a state snapshot (or a handoff file for large context).
-5. Merge only when the user explicitly authorizes that exact PR, the review bot is clean on the
-   current head, CI is green, and your own review is done. Never infer landing permission from a
+5. Merge only when the user explicitly authorizes that exact PR, your own review is done, CI is
+   green, and every completion gate the user assigned is satisfied (a clean review-bot verdict on
+   the current head when review handling was assigned). Never infer landing permission from a
    request to implement, review, or shepherd the PR.
 
 ## Known failure modes

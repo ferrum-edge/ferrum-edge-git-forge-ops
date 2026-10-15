@@ -402,6 +402,124 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("does not enforce a linked worktree", joined)
         self.assertIn("does not lock its target worktree", joined)
 
+    def test_stale_delivery_and_state_instructions_are_refused(self):
+        for marker in check_agent_setup.STALE_CONTRACT_MARKERS:
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_valid_setup(root)
+                mirror = root / ".claude" / "skills" / "sample" / "SKILL.md"
+                mirror.write_text(
+                    mirror.read_text(encoding="utf-8") + f"\n{marker}\n",
+                    encoding="utf-8",
+                )
+                violations = check_agent_setup.collect_violations(root)
+                self.assertTrue(
+                    any("stale delivery or state instruction" in item for item in violations),
+                    violations,
+                )
+
+    def test_agent_metadata_may_name_no_model_but_the_pin(self):
+        pinned = "provider-x/model-1.1-flash"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text(
+                launcher.read_text(encoding="utf-8")
+                + f"readonly PINNED_MODEL='{pinned}'\n",
+                encoding="utf-8",
+            )
+            for skill in (agent / "SKILL.md", root / ".claude" / "skills" / "sample" / "SKILL.md"):
+                skill.write_text(
+                    skill.read_text(encoding="utf-8") + f"\nPinned to `{pinned}`.\n",
+                    encoding="utf-8",
+                )
+            metadata = agent / "agents" / "openai.yaml"
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+            metadata.write_text(
+                f'interface:\n  default_prompt: "Dispatch {pinned} agents."\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+
+            metadata.write_text(
+                'interface:\n  default_prompt: "Dispatch `other-provider/model-z` agents."\n',
+                encoding="utf-8",
+            )
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        self.assertIn("names other-provider/model-z but the launcher pins", joined)
+        self.assertIn("openai.yaml: does not name the launcher's pinned model", joined)
+
+    def test_a_line_wrapped_stale_instruction_is_still_refused(self):
+        for marker in check_agent_setup.STALE_CONTRACT_MARKERS:
+            wrapped = marker.replace(" ", "\n", 1)
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_valid_setup(root)
+                mirror = root / ".claude" / "skills" / "sample" / "SKILL.md"
+                mirror.write_text(
+                    mirror.read_text(encoding="utf-8") + f"\n{wrapped}\n",
+                    encoding="utf-8",
+                )
+                violations = check_agent_setup.collect_violations(root)
+                self.assertTrue(
+                    any("stale delivery or state instruction" in item for item in violations),
+                    violations,
+                )
+
+    def test_skill_text_must_name_the_launchers_pinned_model(self):
+        pinned = "provider-x/model-1.1-flash"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text(
+                launcher.read_text(encoding="utf-8")
+                + f"readonly PINNED_MODEL='{pinned}'\n",
+                encoding="utf-8",
+            )
+            canonical = agent / "SKILL.md"
+            mirror = root / ".claude" / "skills" / "sample" / "SKILL.md"
+            for skill in (canonical, mirror):
+                skill.write_text(
+                    skill.read_text(encoding="utf-8") + f"\nPinned to `{pinned}`.\n",
+                    encoding="utf-8",
+                )
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+
+            mirror.write_text(
+                mirror.read_text(encoding="utf-8").replace(pinned, "provider-x/model-pro-0813"),
+                encoding="utf-8",
+            )
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        self.assertIn("does not name the launcher's pinned model", joined)
+        self.assertIn("names provider-x/model-pro-0813 but the launcher pins", joined)
+
+    def test_a_documented_model_argument_from_another_provider_is_refused(self):
+        pinned = "provider-x/model-1.1-flash"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text(
+                launcher.read_text(encoding="utf-8")
+                + f"readonly PINNED_MODEL='{pinned}'\n",
+                encoding="utf-8",
+            )
+            for skill in (agent / "SKILL.md", root / ".claude" / "skills" / "sample" / "SKILL.md"):
+                skill.write_text(
+                    skill.read_text(encoding="utf-8")
+                    + f"\nPinned to `{pinned}`. Pass `--model provider-y/model-pro`,\n"
+                    + "or --model 'provider-y/model-single' or --model=\"provider-y/model-double\".\n",
+                    encoding="utf-8",
+                )
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        for other in ("model-pro", "model-single", "model-double"):
+            self.assertIn(f"names provider-y/{other} but the launcher pins", joined)
+
     def test_sol_compatibility_briefs_must_match_canonical_references(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

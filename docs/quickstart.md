@@ -82,11 +82,11 @@ the gateway. To run it unattended, set `monitoring.unattended: true`; the
 bootstrap script then creates a separate `<env>-monitor` environment for the
 check to bind. Set its secrets as described in
 [launch controls §3.1](github-launch-controls.md#31-unattended-drift-monitoring).
-Its admin JWT signing secret can write to the gateway even though the workflow
-only reads, so read the
-[caveat](../README.md#unattended-monitoring-and-when-it-is-approval-gated)
-first. You can also run `gitforgeops diff --exit-on-drift` yourself at any
-time.
+Either way the scheduled check authenticates only with the gateway's
+viewer-capped `FERRUM_ADMIN_JWT_VIEWER_SECRET` (step 5), never the admin
+signing secret; see
+[Unattended monitoring](../README.md#unattended-monitoring-and-when-it-is-approval-gated).
+You can also run `gitforgeops diff --exit-on-drift` yourself at any time.
 
 ### Prerequisites
 
@@ -240,6 +240,7 @@ gh secret set FERRUM_ADMIN_JWT_SECRET   --repo OWNER/REPO --env production
 gh secret set GITFORGEOPS_STATE_APP_PRIVATE_KEY --repo OWNER/REPO --env production \
   < app-private-key.pem
 gh secret set FERRUM_GH_PROVISIONER_TOKEN --repo OWNER/REPO --env production
+gh secret set FERRUM_ADMIN_JWT_VIEWER_SECRET --repo OWNER/REPO --env production
 gh secret set SETTINGS_AUDIT_TOKEN      --repo OWNER/REPO --env settings-audit
 ```
 
@@ -249,6 +250,7 @@ gh secret set SETTINGS_AUDIT_TOKEN      --repo OWNER/REPO --env settings-audit
 | `FERRUM_ADMIN_JWT_SECRET` | `production` | the gateway's own signing secret (at least 32 characters) |
 | `GITFORGEOPS_STATE_APP_PRIVATE_KEY` | `production` | PEM key of the App from step 2 |
 | `FERRUM_GH_PROVISIONER_TOKEN` | `production` | writes the credential-broker bundle secrets; needed as soon as a consumer uses `alloc=generate` |
+| `FERRUM_ADMIN_JWT_VIEWER_SECRET` | `production`, or `production-monitor` with `monitoring.unattended: true` | the gateway's distinct viewer key (Ferrum Edge v0.9.9+). The scheduled drift check binds only this key, so without it the check fails authentication and reports nothing. |
 | `SETTINGS_AUDIT_TOKEN` | `settings-audit` | fine-grained PAT or App token with **Administration: read** |
 
 Four more are optional, but must match the gateway if it sets them:
@@ -257,12 +259,17 @@ Four more are optional, but must match the gateway if it sets them:
 configures an audience) and `FERRUM_ADMIN_JWT_TTL_SECS` (default `3600`). A
 mismatch here is the usual cause of a 401 partway through an apply.
 
-If the gateway sets `FERRUM_ADMIN_JWT_VIEWER_SECRET` (Ferrum Edge v0.9.9+), you
-can give a manual `gitforgeops diff` that key instead of the admin secret: it
-then reads `GET /config/export`, which the gateway caps at `viewer`. Secrets
-come back as fingerprints the viewer key cannot reproduce, so `diff` reports
-them as unverified rather than in sync (`--exit-on-drift` exits `6`). Of the
-bundled workflows, only scheduled drift monitoring binds this secret. See
+The viewer key must first be configured on the gateway as its own
+`FERRUM_ADMIN_JWT_VIEWER_SECRET`, distinct from the admin signing secret; set
+the same value here. Put it in the environment the drift check binds:
+`production` while monitoring is approval-gated, or only `production-monitor`
+once `monitoring.unattended: true` (which must not hold
+`FERRUM_ADMIN_JWT_SECRET`). The drift check reads `GET /config/export`, which
+the gateway caps at `viewer`. Secrets come back as fingerprints the viewer key
+cannot reproduce, so `diff` reports them as unverified rather than in sync
+(`--exit-on-drift` exits `6`, a warning). A manual `gitforgeops diff` uses the
+same key when it is set. See
+[Scheduled monitoring](reference.md#scheduled-monitoring) and
 [Reading with a viewer-capped credential](../README.md#reading-with-a-viewer-capped-credential).
 
 Do **not** set `FERRUM_CREDS_BUNDLE[_N]`. The broker writes it on the first
