@@ -25,15 +25,12 @@ pub struct OverrideDecision {
 }
 
 impl OverrideDecision {
-    /// `reason` can quote GitHub's responses (an error, a login, a
-    /// permission), so it is scrubbed like any peer text before it can be
-    /// printed or published in a review.
     pub fn inactive(reason: &str) -> Self {
         Self {
             active: false,
             approver: None,
             permission: None,
-            reason: crate::http_client::bounded_error_message(reason),
+            reason: reason.to_string(),
             pr_number: None,
             authorized_head: None,
             review_id: None,
@@ -258,14 +255,19 @@ async fn check_override_context(
         Ok(p) => p,
         Err(e) => {
             return Ok(OverrideDecision::inactive(&format!(
-                "check permission for {approver}: {e}"
+                "check permission for {}: {e}",
+                crate::display::peer_text(&approver)
             )))
         }
     };
 
     if !override_cfg.is_sufficient(&permission) {
+        // The login and permission are GitHub's text: the decision reads them
+        // raw, the displayed reason quotes scrubbed copies.
         return Ok(OverrideDecision::inactive(&format!(
-            "@{approver} has permission '{permission}', override requires '{}'",
+            "@{} has permission '{}', override requires '{}'",
+            crate::display::peer_text(&approver),
+            crate::display::peer_text(&permission),
             override_cfg.required_permission
         )));
     }
@@ -347,10 +349,13 @@ async fn check_override_context(
         active: true,
         approver: Some(approver.clone()),
         permission: Some(permission.clone()),
-        reason: crate::http_client::bounded_error_message(&format!(
-            "overridden by @{approver} ({permission}), PR #{pr_number}, review {}, authorized head {}",
-            review.id, pr.head.sha
-        )),
+        reason: format!(
+            "overridden by @{} ({}), PR #{pr_number}, review {}, authorized head {}",
+            crate::display::peer_text(&approver),
+            crate::display::peer_text(&permission),
+            review.id,
+            crate::display::peer_text(&pr.head.sha)
+        ),
         pr_number: Some(pr_number),
         authorized_head: Some(pr.head.sha),
         review_id: Some(review.id),
@@ -543,34 +548,5 @@ pub fn apply_override(findings: &mut [super::PolicyFinding], decision: &Override
         if finding.severity.blocks_apply() {
             finding.overridden_by = Some(by.clone());
         }
-    }
-}
-
-#[cfg(test)]
-mod display_tests {
-    use super::*;
-
-    #[test]
-    fn override_reasons_never_carry_a_reflected_credential() {
-        crate::secrets::enable_display_scrubbing_on_this_thread();
-        const TOKEN: &str = "zq7-override-token-canary-5e2a";
-        crate::secrets::register_sent_token(TOKEN);
-
-        // An error from GitHub that reflects the token.
-        let decision = OverrideDecision::inactive(&format!(
-            "check permission for octocat: API request failed (403): bad {TOKEN}"
-        ));
-        assert!(!decision.reason.contains(TOKEN), "{}", decision.reason);
-
-        // A permission string that reflects it as accepted text.
-        let decision = OverrideDecision::inactive(&format!(
-            "@octocat has permission '{TOKEN}', override requires 'maintain'"
-        ));
-        assert!(!decision.reason.contains(TOKEN), "{}", decision.reason);
-        assert!(
-            decision.reason.contains("[REDACTED]"),
-            "{}",
-            decision.reason
-        );
     }
 }

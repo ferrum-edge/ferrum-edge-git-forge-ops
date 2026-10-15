@@ -4,6 +4,7 @@ pub mod config;
 pub mod config_export;
 pub mod diagnostics;
 pub mod diff;
+pub mod display;
 pub mod doctor;
 pub mod error;
 pub mod http_client;

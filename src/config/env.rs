@@ -769,7 +769,7 @@ fn warn_insecure_transport_once(warnings: &[String]) {
         return;
     }
     for warning in warnings {
-        eprintln!("{warning}");
+        crate::eoutln!("{warning}");
     }
 }
 

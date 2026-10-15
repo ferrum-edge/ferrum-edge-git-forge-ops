@@ -65,7 +65,8 @@ async fn post_comment_to(
 ) -> crate::error::Result<()> {
     let url = format!("{api_origin}/repos/{repo}/issues/{pr_number}/comments");
 
-    let body = serde_json::json!({ "body": comment });
+    // Published to the PR: it goes through the display sink like stdout.
+    let body = serde_json::json!({ "body": crate::display::scrub_text(comment) });
 
     // Same-shape bounds as the admin client: connect + total request.
     // Keeps `gitforgeops review --pr N` from hanging forever if GitHub's
