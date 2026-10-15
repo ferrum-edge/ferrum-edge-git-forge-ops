@@ -809,7 +809,10 @@ exactly one merged pull request whose launch-required checks passed on its
 head, each bound to the GitHub Actions app: `rust-ci-check`,
 `security-cargo-audit`, `security-supply-chain-policy`,
 `state-guard-reject-state-edits` and `gitforgeops-required-static-validation`,
-plus `trusted-supply-chain-policy` once it is reported or required. The job
+plus `trusted-supply-chain-policy` and the Agent Setup Policy's
+`validate-trusted-policy` (`ACCEPTED_CHECKS`): each may be absent until the
+`main` ruleset requires it, but once it is reported or required it must pass,
+and a required one that has not reported yet is waited for. The job
 checks out the release commit and runs `.github/scripts/release_gate.py` from
 it (#473).
 
