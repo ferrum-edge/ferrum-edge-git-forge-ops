@@ -386,6 +386,9 @@ impl AdminClient {
     fn authorize(&self, target: String) -> crate::error::Result<Authorized<'_>> {
         let parsed = credential_target(&target)?;
         let token = self.token()?;
+        // A peer's error text can reflect this request's Authorization
+        // header; displayed errors must have the token removed.
+        crate::secrets::register_sent_token(&token);
         Ok(Authorized {
             client: &self.client,
             url: parsed,
@@ -1994,7 +1997,7 @@ pub fn map_api_error_with_redirect_base(
         && status == 500
         && rollback_needs_manual_recovery(parsed.rollback.as_deref())
     {
-        let rollback = parsed.rollback.as_deref().unwrap_or("unknown");
+        let rollback = bounded_error_message(parsed.rollback.as_deref().unwrap_or("unknown"));
         let details = summarize_restore_errors(&parsed.restore_errors);
         return crate::error::Error::RestoreNeedsManualRecovery(format!(
             "rollback={rollback}; the namespace may hold a partially restored configuration. \
@@ -2005,9 +2008,11 @@ pub fn map_api_error_with_redirect_base(
 
     if parsed.applied == Some(false) {
         return crate::error::Error::CommittedNotLive {
+            // Peer text like `error`: scrubbed and bounded before display.
             reason: parsed
                 .reason
-                .clone()
+                .as_deref()
+                .map(bounded_error_message)
                 .unwrap_or_else(|| "unspecified".to_string()),
             message: format!(
                 "{message} — the change is persisted but the running gateway has not picked it up. \
@@ -2075,7 +2080,7 @@ fn describe_api_specs_at_risk(at_risk: &Option<serde_json::Value>) -> String {
     match at_risk {
         Some(serde_json::Value::Array(items)) => format!("{} spec(s)", items.len()),
         Some(serde_json::Value::Number(n)) => format!("{n} spec(s)"),
-        Some(other) => other.to_string(),
+        Some(other) => bounded_error_message(&other.to_string()),
         None => "count unknown".to_string(),
     }
 }
@@ -2084,10 +2089,13 @@ fn summarize_restore_errors(errors: &Option<Vec<serde_json::Value>>) -> String {
     match errors {
         Some(list) if !list.is_empty() => format!(
             "\nrestore_errors: {}",
-            list.iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
+            bounded_error_message(
+                &list
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
         ),
         _ => String::new(),
     }
@@ -3655,6 +3663,100 @@ mod bounded_error_message_tests {
         )
         .await;
         assert_eq!(message, crate::secrets::DISPLAY_WITHHELD);
+    }
+
+    #[test]
+    fn short_registered_values_withhold_peer_text() {
+        // Below the eight-byte replace floor nothing is substituted, so a
+        // surviving value must withhold the text instead. One thread per
+        // length keeps each registration on its own.
+        for length in 1..=7 {
+            std::thread::spawn(move || {
+                let value = &"Zq7xQw9"[..length];
+                crate::secrets::enable_display_scrubbing_on_this_thread();
+                crate::secrets::register_display_scrubber(
+                    crate::secrets::SecretScrubber::for_test_values(&[value]),
+                );
+                let body = serde_json::json!({ "error": format!("bad password {value}") });
+                let rendered =
+                    super::map_api_error(400, &body.to_string(), super::RequestKind::Read)
+                        .to_string();
+                assert!(
+                    rendered.contains(crate::secrets::DISPLAY_WITHHELD),
+                    "{length}: {rendered}"
+                );
+                let body = serde_json::json!({ "error": "unrelated failure" });
+                let rendered =
+                    super::map_api_error(400, &body.to_string(), super::RequestKind::Read)
+                        .to_string();
+                assert!(
+                    rendered.contains("unrelated failure"),
+                    "{length}: {rendered}"
+                );
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_minted_admin_token_is_scrubbed_however_it_is_reflected() {
+        crate::secrets::enable_display_scrubbing_on_this_thread();
+        let client = super::AdminClient::new_scoped(
+            &crate::config::EnvConfig {
+                gateway_url: Some("http://127.0.0.1:9".into()),
+                admin_jwt_secret: Some("test-secret-must-be-32-chars-long".into()),
+                ..Default::default()
+            },
+            ["ferrum"],
+        )
+        .unwrap();
+        let token = client.authorized("/health").unwrap().token;
+        for echoed in [
+            format!("rejected token={token}"),
+            // Glued to another word, so only the registered value catches it.
+            format!("rejected ref:x{token}"),
+        ] {
+            let body = serde_json::json!({ "error": echoed });
+            let rendered =
+                super::map_api_error(401, &body.to_string(), super::RequestKind::Read).to_string();
+            assert!(!rendered.contains(&token), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn every_displayed_peer_field_is_scrubbed() {
+        crate::secrets::enable_display_scrubbing_on_this_thread();
+        const SECRET: &str = "zq7-peer-field-canary-77d0";
+        crate::secrets::register_display_scrubber(crate::secrets::SecretScrubber::for_test_values(
+            &[SECRET],
+        ));
+        let cases = [
+            (
+                200,
+                super::RequestKind::Mutation,
+                serde_json::json!({"error": "failed", "applied": false, "reason": SECRET}),
+            ),
+            (
+                500,
+                super::RequestKind::Restore,
+                serde_json::json!({
+                    "error": "failed", "rollback": "incomplete",
+                    "restore_errors": [format!("row {SECRET}")],
+                }),
+            ),
+            (
+                409,
+                super::RequestKind::Mutation,
+                serde_json::json!({"error": "refused", "api_specs_at_risk": {"note": SECRET}}),
+            ),
+        ];
+        for (status, kind, body) in cases {
+            let error = super::map_api_error(status, &body.to_string(), kind);
+            let rendered = format!("{error} {error:?}");
+            assert!(!rendered.contains(SECRET), "{rendered}");
+        }
     }
 
     #[test]
