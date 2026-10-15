@@ -467,7 +467,9 @@ def main_ruleset_body(bypass_actors: list[dict]) -> dict:
             {
                 "type": "required_status_checks",
                 "parameters": {
-                    "strict_required_status_checks_policy": True,
+                    # Not strict: the owner chose not to require branches to be up
+                    # to date with main before merging (no re-run per merge).
+                    "strict_required_status_checks_policy": False,
                     # Bound to the GitHub Actions app: a status or check run
                     # with the same name from any other source does not count.
                     "required_status_checks": [
