@@ -163,11 +163,12 @@ them to the tree, `diff` shows such a live address as
 
 Displayed errors are scrubbed too. Every value a run resolves or rotates in,
 and the GitHub tokens and admin JWT secret it reads from the environment, are
-replaced with `[REDACTED]` in the error text a gateway (`error`) or GitHub
-(`message`) sends back, as are a `Bearer` credential, a JWT and a GitHub
-token by their shape. Peer text follows the validator-output policy: it is
-withheld whole when a resolved value is not safely scrubbable or a fragment
-of one survives. The CLI's final `Error:` line gets the same replacement but
+replaced with `[REDACTED]` in the error text a gateway (`error`, `reason`,
+`rollback`, `restore_errors`) or GitHub (`message`) sends back. So are the
+admin JWTs the run sends, a `Bearer` credential, and a JWT or GitHub token by
+its shape. Peer text follows the validator-output policy: it is withheld whole
+when a resolved value is not safely scrubbable, or when a value (including
+one too short to replace) or a fragment of one survives. The CLI's final `Error:` line gets the same replacement but
 is never withheld, because it is mostly the tool's own prose.
 
 ## Entry position is the slot identity

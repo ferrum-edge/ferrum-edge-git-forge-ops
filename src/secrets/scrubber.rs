@@ -46,7 +46,7 @@
 //! rather than suppressing.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
@@ -144,7 +144,16 @@ static DISPLAY_SCRUBBING: AtomicBool = AtomicBool::new(false);
 /// its fragment scan is measured against.
 static DISPLAY_SCRUBBERS: Mutex<Vec<SecretScrubber>> = Mutex::new(Vec::new());
 
+/// Most recent bearer tokens this process sent, newest last. Admin JWTs are
+/// minted per request, so they are kept as a bounded window of exact values
+/// rather than as one scrubber each: a reflection comes back in the response
+/// to the request that carried the token.
+static RECENT_TOKENS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+const RECENT_TOKEN_WINDOW: usize = 256;
+
 thread_local! {
+    /// [`RECENT_TOKENS`] registered while only this thread opted in.
+    static THREAD_RECENT_TOKENS: RefCell<VecDeque<String>> = const { RefCell::new(VecDeque::new()) };
     /// [`DISPLAY_SCRUBBING`] for one thread only.
     static DISPLAY_SCRUBBING_ON_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
     /// [`DISPLAY_SCRUBBERS`] registered while only this thread opted in.
@@ -172,21 +181,50 @@ fn display_scrubbing_enabled() -> bool {
     DISPLAY_SCRUBBING.load(Ordering::SeqCst) || DISPLAY_SCRUBBING_ON_THIS_THREAD.with(Cell::get)
 }
 
-/// Run `f` over every scrubber that applies to text scrubbed on this thread:
-/// the process-wide ones plus this thread's own.
-fn with_display_scrubbers<T>(f: impl FnOnce(&[SecretScrubber]) -> T) -> T {
+/// Run `f` over every scrubber and sent token that applies to text scrubbed
+/// on this thread: the process-wide ones plus this thread's own.
+fn with_display_scrubbers<T>(f: impl FnOnce(&[SecretScrubber], &[String]) -> T) -> T {
     let global = DISPLAY_SCRUBBERS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
+    let mut tokens: Vec<String> = RECENT_TOKENS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect();
+    THREAD_RECENT_TOKENS.with(|local| tokens.extend(local.borrow().iter().cloned()));
     THREAD_DISPLAY_SCRUBBERS.with(|local| {
         let local = local.borrow();
         if local.is_empty() {
-            f(&global)
+            f(&global, &tokens)
         } else {
             let all: Vec<SecretScrubber> = global.iter().chain(local.iter()).cloned().collect();
-            f(&all)
+            f(&all, &tokens)
         }
     })
+}
+
+/// Register a bearer token this process is about to send (the admin JWT
+/// minted for one request). Kept in a bounded window of recent tokens.
+pub fn register_sent_token(token: &str) {
+    if token.len() < MIN_SCRUB_LENGTH {
+        return;
+    }
+    let push = |window: &mut VecDeque<String>| {
+        if window.iter().any(|known| known == token) {
+            return;
+        }
+        if window.len() == RECENT_TOKEN_WINDOW {
+            window.pop_front();
+        }
+        window.push_back(token.to_string());
+    };
+    if DISPLAY_SCRUBBING.load(Ordering::SeqCst) {
+        push(&mut RECENT_TOKENS.lock().unwrap_or_else(PoisonError::into_inner));
+    } else if DISPLAY_SCRUBBING_ON_THIS_THREAD.with(Cell::get) {
+        THREAD_RECENT_TOKENS.with(|local| push(&mut local.borrow_mut()));
+    }
 }
 
 /// Register the secrets of one resolved snapshot. The resolver calls this on
@@ -234,12 +272,17 @@ pub fn register_display_scrubber(scrubber: SecretScrubber) {
     }
 }
 
-/// Replace every registered secret, and every credential-shaped word
-/// ([`redact_credential_shapes`]), in `text`.
-fn scrub_registered(scrubbers: &[SecretScrubber], text: &str) -> String {
+/// Replace every registered secret, every recently sent token, and every
+/// credential-shaped word ([`redact_credential_shapes`]), in `text`.
+fn scrub_registered(scrubbers: &[SecretScrubber], tokens: &[String], text: &str) -> String {
     let mut scrubbed = text.to_string();
     for scrubber in scrubbers {
         scrubbed = scrubber.scrub(&scrubbed);
+    }
+    for token in tokens {
+        if scrubbed.contains(token.as_str()) {
+            scrubbed = scrubbed.replace(token.as_str(), REDACTION);
+        }
     }
     redact_credential_shapes(&scrubbed)
 }
@@ -254,21 +297,18 @@ fn scrub_registered(scrubbers: &[SecretScrubber], text: &str) -> String {
 /// [`REDACTION`], as do bearer credentials and JWT- or GitHub-token-shaped
 /// words. The whole text is withheld when a registered value is not safely
 /// scrubbable ([`is_reencoding_hazard`]: a peer can re-encode it past every
-/// needle), or when a [`FRAGMENT_SCAN_LENGTH`]-byte run of one survives.
-///
-/// One difference: a value below [`MIN_SCRUB_LENGTH`] does not withhold the
-/// text. A short value such as `on` cannot be told apart from prose, and
-/// withholding every gateway diagnostic over it would protect nothing that
-/// ordinary text does not already contain.
+/// needle), when a registered value survives verbatim (only possible below
+/// [`MIN_SCRUB_LENGTH`], which is never substring-replaced), or when a
+/// [`FRAGMENT_SCAN_LENGTH`]-byte run of one survives.
 pub fn scrub_peer_text(text: &str) -> String {
-    with_display_scrubbers(|scrubbers| {
+    with_display_scrubbers(|scrubbers, tokens| {
         if scrubbers.iter().any(SecretScrubber::is_unsafe_to_scrub) {
             return DISPLAY_WITHHELD.to_string();
         }
-        let scrubbed = scrub_registered(scrubbers, text);
+        let scrubbed = scrub_registered(scrubbers, tokens, text);
         if scrubbers
             .iter()
-            .any(|scrubber| scrubber.leaks_fragment(&scrubbed))
+            .any(|scrubber| scrubber.leaks(&scrubbed) || scrubber.leaks_fragment(&scrubbed))
         {
             return DISPLAY_WITHHELD.to_string();
         }
@@ -284,7 +324,7 @@ pub fn scrub_peer_text(text: &str) -> String {
 /// went through [`scrub_peer_text`], and a fragment scan over prose would
 /// withhold ordinary remedies that happen to share a run with some secret.
 pub fn scrub_for_display(text: &str) -> String {
-    with_display_scrubbers(|scrubbers| scrub_registered(scrubbers, text))
+    with_display_scrubbers(|scrubbers, tokens| scrub_registered(scrubbers, tokens, text))
 }
 
 /// Replace credential-shaped words with [`REDACTION`]: the word after a
@@ -294,7 +334,9 @@ pub fn scrub_for_display(text: &str) -> String {
 /// never registered one by one.
 pub fn redact_credential_shapes(text: &str) -> String {
     fn is_word_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/' | '=')
+        // Not `=`: it joins `token=<JWT>` into one word that no longer starts
+        // with the JWT. Base64url JWTs and GitHub tokens never contain it.
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/')
     }
     fn is_credential_shaped(word: &str) -> bool {
         let jwt =

@@ -41,7 +41,7 @@ pub use resolver::{
 pub use scrubber::{
     enable_display_scrubbing, enable_display_scrubbing_on_this_thread, is_reencoding_hazard,
     redact_credential_shapes, register_display_scrubber, register_display_values,
-    register_resolved_for_display, scrub_for_display, scrub_peer_text, ScrubbedOutput,
-    SecretScrubber, SuppressionReason, DISPLAY_WITHHELD, FRAGMENT_SCAN_LENGTH, MIN_SCRUB_LENGTH,
-    REDACTION,
+    register_resolved_for_display, register_sent_token, scrub_for_display, scrub_peer_text,
+    ScrubbedOutput, SecretScrubber, SuppressionReason, DISPLAY_WITHHELD, FRAGMENT_SCAN_LENGTH,
+    MIN_SCRUB_LENGTH, REDACTION,
 };
