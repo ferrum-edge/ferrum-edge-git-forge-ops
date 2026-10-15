@@ -597,6 +597,13 @@ fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut BTreeSet<
         // URL credentials in the Consul address are refused by the audit, but
         // `validate` runs without it, so its validator output is scrubbed of
         // them too: the whole userinfo and its password half.
+        let Some(consul) = upstream
+            .service_discovery
+            .as_ref()
+            .and_then(|discovery| discovery.consul.as_ref())
+        else {
+            continue;
+        };
         if let Some(userinfo) = upstream
             .service_discovery
             .as_ref()
@@ -606,6 +613,14 @@ fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut BTreeSet<
                 record_secret(password, out);
             }
             record_secret(&userinfo, out);
+            // Detection ignores embedded tabs and line breaks, so the
+            // normalized userinfo may not occur in the address as written.
+            // Record the address itself then: its raw bytes are what a
+            // validator echoes, and their control characters make
+            // `scrub_streams` withhold the output rather than miss them.
+            if !consul.address.contains(userinfo.as_str()) {
+                record_secret(&consul.address, out);
+            }
         }
     }
 }

@@ -4370,6 +4370,34 @@ fn scrubber_covers_consul_address_credentials_but_keeps_the_host() {
         .contains("@consul.example.test:8501"));
 }
 
+/// A credential split by a tab or line break is detected in its normalized
+/// form, but a validator echoes the raw bytes: those streams are withheld.
+#[test]
+fn consul_address_credentials_with_embedded_breaks_withhold_validator_output() {
+    use gitforgeops::secrets::SecretScrubber;
+
+    for separator in ["\n", "\r", "\t"] {
+        let address =
+            format!("https://svc-user:ABCD1234{separator}EFGH5678@consul.example.test:8501");
+        let mut cfg = config_with_consul_token(None);
+        cfg.upstreams[0]
+            .service_discovery
+            .as_mut()
+            .and_then(|sd| sd.consul.as_mut())
+            .unwrap()
+            .address = address.clone();
+        let scrubber = SecretScrubber::from_gateway_config(&cfg);
+
+        let json_escaped = serde_json::to_string(&address).unwrap();
+        for echoed in [address.as_str(), json_escaped.as_str()] {
+            let output = scrubber.scrub_streams(&format!("error: {echoed}"), "");
+            assert!(output.suppressed.is_some(), "{separator:?}");
+            assert!(!output.stdout.contains("ABCD1234"), "{separator:?}");
+            assert!(!output.stderr.contains("ABCD1234"), "{separator:?}");
+        }
+    }
+}
+
 /// An unresolved placeholder is repository data: leaving it visible is what
 /// lets an operator see that a field is brokered at all.
 #[test]
