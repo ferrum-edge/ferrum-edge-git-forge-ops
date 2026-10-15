@@ -156,14 +156,6 @@ pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
     }
 }
 
-/// Run `command`, retrying a spawn that failed with `ETXTBSY`.
-///
-/// Linux refuses to execute a file while any process holds it open for
-/// writing. A validator binary that was written moments ago — an installer
-/// replacing it, or a stub in the test suite — can still have its write
-/// descriptor inherited by a process another thread forked and has not yet
-/// `exec`ed, which clears within milliseconds. Every other spawn error is
-/// returned immediately.
 /// How long one validator invocation may run, and how much it may print on
 /// one stream. `Command::output` bounds neither: a wedged or hostile
 /// validator binary could park CI forever or exhaust memory.
@@ -289,6 +281,14 @@ fn output_bounded_with(
     }
 }
 
+/// Run `command`, retrying a spawn that failed with `ETXTBSY`.
+///
+/// Linux refuses to execute a file while any process holds it open for
+/// writing. A validator binary that was written moments ago — an installer
+/// replacing it, or a stub in the test suite — can still have its write
+/// descriptor inherited by a process another thread forked and has not yet
+/// `exec`ed, which clears within milliseconds. Every other spawn error is
+/// returned immediately.
 fn output_retrying_busy_executable(command: &mut Command) -> std::io::Result<std::process::Output> {
     const ATTEMPTS: u32 = 6;
     let mut attempt = 0;

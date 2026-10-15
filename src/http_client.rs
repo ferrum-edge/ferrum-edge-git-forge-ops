@@ -3510,7 +3510,7 @@ mod bounded_error_message_tests {
         // the displayed error at any length.
         let error = super::map_api_error(
             400,
-            "echo: Bearer [REDACTED] plus a long tail of peer bytes",
+            "echo: authorization synthetic-secret plus a long tail of peer bytes",
             super::RequestKind::Read,
         );
         let rendered = error.to_string();
