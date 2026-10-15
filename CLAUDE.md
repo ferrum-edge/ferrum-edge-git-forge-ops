@@ -271,12 +271,16 @@ write with `outln!`/`out!`/`eoutln!`/`eout!`, never `println!` or
 `io::stdout()` (`no_direct_output_outside_the_sink` fails otherwise; an
 exception needs a `display-sink:` comment saying why). JSON documents, the
 `Error:` line, panics, the posted review comment and the step summary use it
-too. Data payloads (`export`, bundles, state) do not. The CLI registers every
-resolved snapshot, rotated value, sent admin JWT and environment token; the
+too. Data payloads (`export`, bundles, state) do not; ciphertext for a person
+goes through `display::Composed` (text scrubbed, ciphertext byte for byte).
+Brokered secrets and environment tokens must be at least 8 bytes (refused at
+resolve and registration, naming the source). The CLI registers every
+resolved snapshot, rotated value, sent admin JWT (whole run) and environment
+token; the
 sink replaces them and their encodings and withholds a line still holding an
 8-byte run, unless the run is in the scrubbed configuration or the tool's
 own string literals (`build.rs` collects them). Quote peer-sent strings with
-`display::peer_text` (stricter: short values and hazards withhold), but keep
+`display::peer_text` (stricter: hazards withhold), but keep
 parsed responses raw: decisions must never read a scrubbed value.
 
 ### Resource attribution and validator compatibility

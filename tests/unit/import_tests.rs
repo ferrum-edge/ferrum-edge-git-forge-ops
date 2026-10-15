@@ -1612,7 +1612,7 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = make_test_config();
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
-        "keyauth": [{"key": "first"}, {"key": "second"}],
+        "keyauth": [{"key": "first-value"}, {"key": "second-value"}],
         "jwt": [{"secret": "jwt-secret"}],
         "hmac_auth": [{"nested": {"token": "hmac-nested-secret"}}]
     }))
@@ -1646,11 +1646,11 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
     let bundle = std::collections::BTreeMap::from([
         (
             "ferrum/consumer-test/keyauth/key".to_string(),
-            "first".to_string(),
+            "first-value".to_string(),
         ),
         (
             "ferrum/consumer-test/keyauth/[1]/key".to_string(),
-            "second".to_string(),
+            "second-value".to_string(),
         ),
         (
             "ferrum/consumer-test/jwt/secret".to_string(),

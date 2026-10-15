@@ -288,7 +288,10 @@ fn identity_broker_cli_refuses_before_validator_network_or_file_side_effects() {
 
 #[cfg(unix)]
 #[test]
-fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value() {
+/// Every brokered value is a secret of at least eight bytes. A short one
+/// (here a policy-relevant `mode: dry_run`) is refused at resolution, naming
+/// the slot, before the validator or any gateway request.
+fn api_apply_refuses_a_short_brokered_value_before_any_request() {
     let repo = Repo::with_files(&[
         ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
         (
@@ -341,14 +344,11 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
 
     let stderr = stderr(&output);
     assert!(!output.status.success(), "{}\n{stderr}", stdout(&output));
-    assert!(stderr.contains("after credential resolution"), "{stderr}");
-    assert!(stderr.contains("policy violation(s)"), "{stderr}");
-    assert!(stderr.contains("require_ai_guardrails"), "{stderr}");
-    assert!(stderr.contains(NO_PR_OVERRIDE_NOTE), "{stderr}");
     assert!(
-        stderr.contains("Policy finding details were withheld"),
+        stderr.contains("ferrum/shield/@plugin/ai_prompt_shield/config/mode"),
         "{stderr}"
     );
+    assert!(stderr.contains("shorter than 8 bytes"), "{stderr}");
     assert!(!stderr.contains("[REDACTED]"), "{stderr}");
     assert!(!stderr.contains("dry_run"), "{stderr}");
     assert!(!stderr.contains("Validator diagnostics"), "{stderr}");
@@ -356,7 +356,7 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
     assert!(!repo.dir.path().join(".state/default.json").exists());
     assert!(
         gateway_requests.lock().unwrap().is_empty(),
-        "policy refusal must precede every gateway request"
+        "the refusal must precede every gateway request"
     );
 }
 

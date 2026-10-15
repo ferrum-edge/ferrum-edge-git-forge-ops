@@ -1156,7 +1156,7 @@ async fn a_published_rotation_value_is_scrubbed_from_peer_error_text() {
 #[tokio::test]
 async fn file_mode_still_refuses_writes_when_a_registered_value_cannot_be_scrubbed() {
     gitforgeops::display::enable_display_scrubbing_on_this_thread();
-    gitforgeops::display::register_values(["zq7-signing#key-value-0042"]);
+    gitforgeops::display::register_values("test", ["zq7-signing#key-value-0042"]).unwrap();
     let sparse = json!({"status": "ok", "mode": "file"}).to_string();
     let (client, requests) = gateway(move |request, _| {
         if request.starts_with("GET /health") {

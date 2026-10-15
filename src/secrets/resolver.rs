@@ -657,6 +657,7 @@ fn lookup_slot_value<'a>(
             )));
         }
         check_consumer_secret_not_placeholder_text(slot, committed, value)?;
+        check_min_secret_length(slot, value)?;
         return Ok(Some(value));
     }
     Ok(None)
@@ -706,7 +707,29 @@ fn lookup_exact_slot_value<'a>(
             "secret slot '{slot}' holds the reserved sentinel '{REDACTED_SENTINEL}'; re-seed the bundle from an unredacted GET /backup source"
         )));
     }
+    if let Some(value) = found {
+        check_min_secret_length(slot, value)?;
+    }
     Ok(found)
+}
+
+/// Refuse a brokered value shorter than [`super::MIN_SCRUB_LENGTH`] bytes.
+///
+/// Every value the broker resolves is a secret, and a secret that short
+/// cannot be told apart from ordinary words in this tool's output, so it
+/// could not be removed from it (`crate::display`). The refusal names the
+/// slot, never the value.
+fn check_min_secret_length(slot: &str, value: &str) -> crate::error::Result<()> {
+    if value.len() >= super::MIN_SCRUB_LENGTH {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "secret slot '{slot}' holds a bundle value shorter than {min} bytes. Brokered \
+         secrets must be at least {min} bytes so they can be removed from this tool's \
+         output; re-seed the slot with a longer value or rotate it with \
+         'gitforgeops rotate'.",
+        min = super::MIN_SCRUB_LENGTH
+    )))
 }
 
 /// Build a slot path from the CLI `--credential` argument.

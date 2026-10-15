@@ -315,7 +315,7 @@ impl PreparedConsumerRotation {
         entry.insert(self.field, Value::String(value.to_string()));
         // The new value is in this PUT, so error text reflecting it must
         // have it removed like any resolved secret.
-        crate::display::register_values([value]);
+        crate::display::register_values("the rotated credential", [value])?;
         match client
             .update_if_match(
                 "Consumer",
