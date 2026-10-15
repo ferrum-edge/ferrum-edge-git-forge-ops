@@ -365,7 +365,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   streaming pass. A successful response that does not parse (`/health`,
   `/namespaces`, `/cluster`, `/config/export`, GitHub PR and events) is
   reported by error category and position, never with `serde_json`'s quote
-  of the offending value.
+  of the offending value. Accepted free-text fields of `/health` and
+  `/cluster` (shown by doctor and apply's convergence line) and policy
+  override reasons are scrubbed the same way.
 - Finish bounding error bodies and validator I/O (follow-up to #553). The
   gateway's structured `error` message is now one bounded line like every
   other displayed error body, and a failed PR-comment POST reads GitHub's
