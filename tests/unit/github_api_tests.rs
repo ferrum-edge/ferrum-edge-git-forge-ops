@@ -398,6 +398,31 @@ async fn put_environment_secret_maps_github_error_statuses() {
     }
 }
 
+/// With redirects disabled on the production client, a 3xx arrives as an
+/// un-followed response: nothing was written, so it must never read as a
+/// committed secret. GitHub answers a successful put with 201/204 only.
+#[tokio::test]
+async fn put_environment_secret_rejects_redirect_statuses() {
+    for status in [301, 302, 307, 308] {
+        let (api_base, requests) =
+            spawn_github_stub(vec![(put_secret_path(), status, String::new())]);
+        let err = put_environment_secret_at(
+            &test_client(),
+            &api_base,
+            REPO,
+            ENVIRONMENT,
+            SECRET_NAME,
+            PLAINTEXT.as_bytes(),
+            &fixture_pubkey(),
+            TOKEN,
+        )
+        .await
+        .expect_err("a redirect is not a committed secret write");
+        assert_api_error(&err, status, "");
+        assert_eq!(requests.lock().expect("recorded").len(), 1);
+    }
+}
+
 #[test]
 fn seal_secret_rejects_invalid_base64_and_wrong_length_keys() {
     let invalid =
