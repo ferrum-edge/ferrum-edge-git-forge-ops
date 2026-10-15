@@ -125,7 +125,7 @@ jobs:
           envs=$(gitforgeops envs --format json | jq -c .)
           jq -e '
             type == "array" and
-            all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))
+            all(.[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"))
           ' <<< "$envs" >/dev/null || {
             echo "::error::Every environment must be a single safe path component."
             exit 1

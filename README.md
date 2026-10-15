@@ -395,7 +395,8 @@ default_environment: staging
 | `promotion.requires` | none | See [Staged promotion](#staged-promotion). |
 
 Environment names must equal the GitHub Environment names and are 1–64 ASCII
-letters, digits, `-` or `_`; a name ending in `-monitor` is reserved. Without
+letters, digits, `-` or `_`, starting with a letter or digit
+(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`); a name ending in `-monitor` is reserved. Without
 the file, the CLI falls back to one implicit local environment driven by
 `FERRUM_*` variables, and the workflows deploy nothing.
 

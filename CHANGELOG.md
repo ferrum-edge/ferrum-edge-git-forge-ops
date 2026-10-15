@@ -337,6 +337,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   skill text that omits the pin, names another model under the pin's provider
   or in a `--model` argument, or agent metadata naming any other model id
   (#577).
+- `bootstrap_repo_settings.py` reads inline (`staging: {}`) and commented
+  environment entries and `monitoring:` settings, and stops with the line
+  number on an entry it cannot read instead of leaving that environment out
+  of the plan (#572).
+- One environment-name grammar, `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, in the
+  CLI, bootstrap (including `--environment`), the validate, drift, rotate and
+  materialize workflow guards, and the quickstart. The apply enumerator keeps
+  its looser pinned guard, which cannot refuse a name the CLI emits. The CLI
+  now refuses a leading `_` or `-`, which the workflows already refused;
+  bootstrap and the workflows no longer accept dots or names over 64
+  characters, which the CLI already refused (#573).
 - Credential-slot retirement checks (array shrink, dropped credential type and
   deleted ledger Consumer) now also find values stored under the legacy `[0]`
   and dotted bundle-key spellings the resolver still reads, so a retired value

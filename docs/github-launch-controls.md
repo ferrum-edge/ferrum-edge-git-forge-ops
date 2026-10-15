@@ -26,7 +26,7 @@ Useful flags:
 | --- | --- |
 | `--state-writer-app-id ID` | Makes the §1 App the `main` ruleset's only bypass and sets `GITFORGEOPS_STATE_APP_ID`. Without it the bypass is the Repository Admin role in pull-request mode, which the settings audit rejects. |
 | `--release-tag-bypass SPEC` | Who may push a `v*` tag: `app:<id>`, `user:<login>` or `team:<org/slug>`. The default, `admin`, is a repository role, which the audit rejects. |
-| `--environment NAME` | Environment to protect (repeatable). Default: the environments in `.gitforgeops/config.yaml`. |
+| `--environment NAME` | Environment to protect (repeatable). Default: the environments in `.gitforgeops/config.yaml`; an entry the script cannot read stops it with the line number instead of being left out. |
 | `--reviewer LOGIN`, `--reviewer-team org/slug` | Required deployment reviewers (repeatable). |
 | `--template-repo` | Template mode; see below. |
 
