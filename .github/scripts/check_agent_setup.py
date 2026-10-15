@@ -50,7 +50,9 @@ STALE_CONTRACT_MARKERS = (
 )
 PINNED_MODEL_LINE = re.compile(r"^readonly PINNED_MODEL='(?P<model>[^']+)'$", re.MULTILINE)
 # A documented `--model provider/name` argument, whatever the provider.
-MODEL_ARGUMENT = re.compile(r"--model[ =]+`?(?P<model>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[A-Za-z0-9])")
+MODEL_ARGUMENT = re.compile(
+    r"--model[ =]+[`'\"]?(?P<model>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[A-Za-z0-9])"
+)
 STALE_MARKERS = (
     "-p ferrum-edge",
     "--bin ferrum-edge",

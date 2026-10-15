@@ -461,12 +461,14 @@ class AgentSetupTests(unittest.TestCase):
             for skill in (agent / "SKILL.md", root / ".claude" / "skills" / "sample" / "SKILL.md"):
                 skill.write_text(
                     skill.read_text(encoding="utf-8")
-                    + f"\nPinned to `{pinned}`. Pass `--model provider-y/model-pro`.\n",
+                    + f"\nPinned to `{pinned}`. Pass `--model provider-y/model-pro`,\n"
+                    + "or --model 'provider-y/model-single' or --model=\"provider-y/model-double\".\n",
                     encoding="utf-8",
                 )
             violations = check_agent_setup.collect_violations(root)
         joined = "\n".join(violations)
-        self.assertIn("names provider-y/model-pro but the launcher pins", joined)
+        for other in ("model-pro", "model-single", "model-double"):
+            self.assertIn(f"names provider-y/{other} but the launcher pins", joined)
 
     def test_sol_compatibility_briefs_must_match_canonical_references(self):
         with tempfile.TemporaryDirectory() as directory:
