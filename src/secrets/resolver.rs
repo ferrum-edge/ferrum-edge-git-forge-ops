@@ -1424,7 +1424,7 @@ pub fn resolve_secrets_with_mode_and_options(
     let report = resolve_secrets_in_place(&mut candidate, bundle, mode, options)?;
     // From here on these values travel in requests, so any error text a peer
     // reflects them in must have them removed before it is displayed.
-    super::scrubber::register_resolved_for_display(&candidate, &report);
+    crate::display::register_resolved(&candidate, &report);
     *cfg = candidate;
     Ok(report)
 }
@@ -2048,7 +2048,7 @@ fn push_warning(report: &mut ResolveReport, message: String) {
         return;
     }
     if warn_once(&message) {
-        eprintln!("Warning: {}", safe_line(&message));
+        crate::eoutln!("Warning: {}", safe_line(&message));
     }
     report.warnings.push(message);
 }
@@ -2060,7 +2060,7 @@ fn push_slot_remap(report: &mut ResolveReport, message: String) {
         return;
     }
     if warn_once(&message) {
-        eprintln!("Credential slot remap: {}", safe_line(&message));
+        crate::eoutln!("Credential slot remap: {}", safe_line(&message));
     }
     report.slot_remaps.push(message);
 }

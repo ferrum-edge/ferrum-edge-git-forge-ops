@@ -459,7 +459,7 @@ fn check_passthrough_fields(
 
     // stderr, never stdout: `gitforgeops export` writes the assembled YAML to
     // stdout and a warning interleaved into it would corrupt the document.
-    eprintln!(
+    crate::eoutln!(
         "Warning: {}: {} unknown top-level field(s) kept verbatim because \
          FERRUM_ALLOW_UNKNOWN_FIELDS is set: {}. gitforgeops does not model these — the gateway \
          is the authority on whether they are valid.",

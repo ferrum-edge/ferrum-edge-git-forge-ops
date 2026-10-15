@@ -685,7 +685,7 @@ fn bearer_of(request: &str) -> Option<String> {
 async fn doctor_reflecting(
     reflect: impl Fn(&str, &str) -> EdgeReply + Send + Sync + 'static,
 ) -> (String, Vec<String>) {
-    gitforgeops::secrets::enable_display_scrubbing_on_this_thread();
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let url = spawn_edge_stub(
         move |request| reflect(request, &bearer_of(request).unwrap_or_default()),
@@ -701,7 +701,10 @@ fn assert_no_reflected_token(rendered: &str, seen: &[String]) {
     assert!(!seen.is_empty(), "doctor made no request");
     for token in seen.iter().filter_map(|request| bearer_of(request)) {
         assert!(token.len() > 20, "{token}");
-        assert_no_reflected_token(&rendered, &seen);
+        assert!(
+            !rendered.contains(&token),
+            "a reflected bearer token reached doctor's report: {rendered}"
+        );
     }
 }
 

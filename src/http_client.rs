@@ -38,11 +38,12 @@ const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 
-/// How much of a peer's error text is scrubbed. Only the first
-/// [`MAX_ERROR_MESSAGE_CHARS`] are ever displayed, so the window only needs
-/// room for a secret that starts inside the displayed part to end inside it
-/// too; the rest of a body (up to [`MAX_RESPONSE_BODY_BYTES`]) is never
-/// processed, which bounds scrubbing time and memory.
+/// How much of a peer's error text is scrubbed ([`crate::display::peer_text`]).
+/// Only the first [`MAX_ERROR_MESSAGE_CHARS`] are ever displayed, so the
+/// window only needs room for a secret that starts inside the displayed part
+/// to end inside it too; the rest of a body (up to
+/// [`MAX_RESPONSE_BODY_BYTES`]) is never processed, which bounds scrubbing
+/// time and memory.
 const MAX_SCRUBBED_ERROR_CHARS: usize = 16 * 1024;
 
 /// A diagnostic for a successful response whose body did not parse.
@@ -67,14 +68,17 @@ pub(crate) fn malformed_response(context: &str, error: &serde_json::Error) -> cr
 /// forge log lines, or be arbitrarily large. Control characters become
 /// spaces and the result is truncated, so what is printed is an excerpt,
 /// never the body verbatim.
+///
+/// The excerpt is peer text, so it goes through
+/// [`crate::display::peer_text`] before it is cut: a cut through a secret
+/// would leave a prefix no needle matches. The result is only ever
+/// displayed; nothing decides on it.
 pub(crate) fn bounded_error_message(body: &str) -> String {
-    // Scrub before truncating: a cut through a secret would leave a prefix
-    // no needle matches.
     let window = body
         .char_indices()
         .nth(MAX_SCRUBBED_ERROR_CHARS)
         .map_or(body, |(end, _)| &body[..end]);
-    let body = crate::secrets::scrub_peer_text(window);
+    let body = crate::display::peer_text(window);
     let mut out = String::with_capacity(body.len().min(MAX_ERROR_MESSAGE_CHARS + 16));
     for (index, ch) in body.chars().enumerate() {
         if index >= MAX_ERROR_MESSAGE_CHARS {
@@ -414,7 +418,7 @@ impl AdminClient {
         let token = self.token()?;
         // A peer's error text can reflect this request's Authorization
         // header; displayed errors must have the token removed.
-        crate::secrets::register_sent_token(&token);
+        crate::display::register_sent_token(&token);
         Ok(Authorized {
             client: &self.client,
             url: parsed,
@@ -611,7 +615,6 @@ impl AdminClient {
             .await?;
         self.check(&resp, RequestKind::Read)?;
         serde_json::from_str::<HealthStatus>(&resp.body)
-            .map(HealthStatus::scrubbed)
             .map_err(|e| malformed_response("GET /health", &e))
     }
 
@@ -693,7 +696,7 @@ impl AdminClient {
         // with what it sent — and `import` turns the same notice into a hard
         // refusal, because that document becomes permanent repo state.
         if let Some(notice) = snapshot.seal_violation_notice() {
-            eprintln!(
+            crate::eoutln!(
                 "Warning: GET /backup for namespace '{}' returned a count seal that does not match the document ({}). The seal was discarded; resource data is used as received.",
                 safe(namespace),
                 safe_line(notice)
@@ -2416,10 +2419,12 @@ impl BackupSnapshot {
             if let Some(rows) = value.get(section).and_then(serde_json::Value::as_array) {
                 for row in rows {
                     if row.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace) {
-                        let id = row
-                            .get("id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("?");
+                        // Peer text, only displayed.
+                        let id = crate::display::peer_text(
+                            row.get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("?"),
+                        );
                         return Err(crate::error::Error::BackupNamespace(format!(
                             "namespace-scoped backup for {namespace:?} returned {section} {id:?} \
                              with a missing or foreign namespace; refusing the snapshot"
@@ -3157,9 +3162,10 @@ pub fn write_block_reason(health: &HealthStatus) -> Option<String> {
         let normalized = mode.to_ascii_lowercase();
         if READ_ONLY_MODES.contains(&normalized.as_str()) {
             return Some(format!(
-                "gateway is running in `{mode}` mode, where the admin API never accepts config \
+                "gateway is running in `{}` mode, where the admin API never accepts config \
                  mutations. Point FERRUM_GATEWAY_URL at a database/cp-mode gateway, or switch \
-                 FERRUM_GATEWAY_MODE=file and publish a config file instead."
+                 FERRUM_GATEWAY_MODE=file and publish a config file instead.",
+                crate::display::peer_text(mode)
             ));
         }
     }
@@ -3168,8 +3174,8 @@ pub fn write_block_reason(health: &HealthStatus) -> Option<String> {
             "GET /health reports admin_writes_enabled=false (status={}, mode={}). The admin API is \
              in read-only mode, its config database is unavailable, or the active failover pool \
              disallows writes.",
-            health.status.as_deref().unwrap_or("unknown"),
-            health.mode.as_deref().unwrap_or("unknown"),
+            crate::display::peer_text(health.status.as_deref().unwrap_or("unknown")),
+            crate::display::peer_text(health.mode.as_deref().unwrap_or("unknown")),
         ));
     }
     None
@@ -3199,8 +3205,8 @@ pub fn require_writes_enabled(
     Err(crate::error::Error::GatewayWriteStateUnknown(format!(
         "GET /health did not report admin_writes_enabled (status={}, mode={}), so whether the \
          gateway accepts config writes is unknown; nothing was written. {}",
-        health.status.as_deref().unwrap_or("unknown"),
-        health.mode.as_deref().unwrap_or("unknown"),
+        crate::display::peer_text(health.status.as_deref().unwrap_or("unknown")),
+        crate::display::peer_text(health.mode.as_deref().unwrap_or("unknown")),
         health_tier_remedy(namespace_bounded),
     )))
 }
@@ -3337,65 +3343,11 @@ impl ClusterStatus {
     }
 }
 
-/// Parse a `GET /cluster` body. Its free-text fields are peer text and are
-/// scrubbed like an error body ([`scrub_peer_field`]): they reach apply's
-/// convergence line and doctor's report.
+/// Parse a `GET /cluster` body. Fields stay as the gateway sent them;
+/// [`convergence_summary`] and doctor pass the ones they display through
+/// [`crate::display::peer_text`].
 pub fn parse_cluster_status(body: &str) -> crate::error::Result<ClusterStatus> {
-    serde_json::from_str::<ClusterStatus>(body)
-        .map(ClusterStatus::scrubbed)
-        .map_err(|e| malformed_response("GET /cluster", &e))
-}
-
-/// Scrub one peer-supplied string field for display, exactly like an error
-/// body ([`bounded_error_message`]). An ordinary value (`database`, a
-/// timestamp, a node id) comes back unchanged.
-fn scrub_peer_field(field: &mut Option<String>) {
-    if let Some(value) = field.as_mut() {
-        *value = bounded_error_message(value);
-    }
-}
-
-impl HealthStatus {
-    fn scrubbed(mut self) -> Self {
-        scrub_peer_field(&mut self.status);
-        scrub_peer_field(&mut self.mode);
-        self
-    }
-}
-
-impl ClusterStatus {
-    fn scrubbed(mut self) -> Self {
-        scrub_peer_field(&mut self.mode);
-        scrub_peer_field(&mut self.message);
-        for node in self
-            .data_planes
-            .iter_mut()
-            .chain(self.mesh_nodes.iter_mut())
-        {
-            for field in [
-                &mut node.node_id,
-                &mut node.version,
-                &mut node.namespace,
-                &mut node.status,
-                &mut node.connected_at,
-                &mut node.last_sync_at,
-            ] {
-                scrub_peer_field(field);
-            }
-        }
-        if let Some(control_plane) = self.control_plane.as_mut() {
-            for field in [
-                &mut control_plane.url,
-                &mut control_plane.status,
-                &mut control_plane.connected_since,
-                &mut control_plane.last_config_received_at,
-                &mut control_plane.config_diverged_since,
-            ] {
-                scrub_peer_field(field);
-            }
-        }
-        self
-    }
+    serde_json::from_str::<ClusterStatus>(body).map_err(|e| malformed_response("GET /cluster", &e))
 }
 
 /// One-line post-apply convergence report.
@@ -3404,21 +3356,30 @@ impl ClusterStatus {
 /// whatever `/cluster` returned; anything the response does not carry is simply
 /// left out of the line.
 pub fn convergence_summary(status: &ClusterStatus) -> String {
-    let mode = status.mode.as_deref().unwrap_or("unknown");
+    // Every interpolated field is peer text; decisions above read the raw
+    // values, only this displayed copy is scrubbed.
+    let peer = |value: Option<&str>, missing: &str| match value {
+        Some(value) => crate::display::peer_text(value),
+        None => missing.to_string(),
+    };
+    let mode = peer(status.mode.as_deref(), "unknown");
 
     if let Some(cp) = &status.control_plane {
         let mut line = format!(
             "convergence: mode={mode}, control plane {} is {}",
-            cp.url.as_deref().unwrap_or("<unknown url>"),
-            cp.status.as_deref().unwrap_or("unknown"),
+            peer(cp.url.as_deref(), "<unknown url>"),
+            peer(cp.status.as_deref(), "unknown"),
         );
         if let Some(at) = &cp.last_config_received_at {
-            line.push_str(&format!("; last config received {at}"));
+            line.push_str(&format!(
+                "; last config received {}",
+                crate::display::peer_text(at)
+            ));
         }
         if cp.config_diverged == Some(true) {
             line.push_str(&format!(
                 "; WARNING: config_diverged since {}",
-                cp.config_diverged_since.as_deref().unwrap_or("unknown")
+                peer(cp.config_diverged_since.as_deref(), "unknown")
             ));
         }
         return line;
@@ -3429,7 +3390,10 @@ pub fn convergence_summary(status: &ClusterStatus) -> String {
         // Database/file-mode gateways answer `{mode, message}` — there is no
         // cluster to converge, which is information, not a warning.
         return match status.message.as_deref() {
-            Some(message) => format!("convergence: mode={mode} ({message})"),
+            Some(message) => format!(
+                "convergence: mode={mode} ({})",
+                crate::display::peer_text(message)
+            ),
             None => format!("convergence: mode={mode}, no connected nodes reported"),
         };
     }
@@ -3438,7 +3402,10 @@ pub fn convergence_summary(status: &ClusterStatus) -> String {
         "convergence: mode={mode}, {data_planes} data-plane node(s), {mesh_nodes} mesh node(s) connected"
     );
     match oldest_last_sync(status) {
-        Some(oldest) => line.push_str(&format!("; oldest last_sync_at {oldest}")),
+        Some(oldest) => line.push_str(&format!(
+            "; oldest last_sync_at {}",
+            crate::display::peer_text(oldest)
+        )),
         None => line.push_str("; no last_sync_at reported"),
     }
     if status.diverged() {
@@ -3675,11 +3642,9 @@ mod bounded_error_message_tests {
     #[tokio::test]
     async fn reflected_resolved_secrets_are_scrubbed_from_displayed_errors() {
         // Registered for this test's thread only.
-        crate::secrets::enable_display_scrubbing_on_this_thread();
+        crate::display::enable_display_scrubbing_on_this_thread();
         const SECRET: &str = "zq7-display-scrub-canary-91f3";
-        crate::secrets::register_display_scrubber(crate::secrets::SecretScrubber::for_test_values(
-            &[SECRET],
-        ));
+        crate::display::register_values([SECRET]);
 
         // Gateway: the structured `error` field echoes the value.
         let body = serde_json::json!({
@@ -3707,27 +3672,27 @@ mod bounded_error_message_tests {
         let rendered = super::map_api_error(400, &body, super::RequestKind::Read).to_string();
         assert!(!rendered.contains(partial), "{rendered}");
         assert!(
-            rendered.contains(crate::secrets::DISPLAY_WITHHELD),
+            rendered.contains(crate::display::DISPLAY_WITHHELD),
             "{rendered}"
         );
 
-        // The CLI's own prose is scrubbed but never withheld, even where it
-        // shares a run with a secret.
-        let local = format!("refusing to materialize {SECRET}: rerun `zq7-display-scrub` later");
+        // The tool's own prose around a value is kept by the sink.
+        let local = format!("refusing to materialize {SECRET}: rerun `gitforgeops apply` later");
         assert_eq!(
-            crate::secrets::scrub_for_display(&local),
-            "refusing to materialize [REDACTED]: rerun `zq7-display-scrub` later"
+            crate::display::scrub_text(&local),
+            "refusing to materialize [REDACTED]: rerun `gitforgeops apply` later"
         );
     }
 
     #[tokio::test]
     async fn hazardous_registered_values_withhold_peer_text() {
-        crate::secrets::enable_display_scrubbing_on_this_thread();
+        crate::display::enable_display_scrubbing_on_this_thread();
         // Non-ASCII and multiline values can come back re-encoded
         // (`p\u00e4ss…`, a folded YAML scalar) past every needle.
-        crate::secrets::register_display_scrubber(crate::secrets::SecretScrubber::for_test_values(
-            &["p\u{e4}ssw\u{f6}rd-zq7-123", "zq7-line-one\nzq7-line-two"],
-        ));
+        crate::display::register_values([
+            "p\u{e4}ssw\u{f6}rd-zq7-123",
+            "zq7-line-one\nzq7-line-two",
+        ]);
         for echoed in [
             r#"{"error":"bad password p\u00e4ssw\u00f6rd-zq7-123"}"#,
             r#"{"error":"bad value zq7-line-one\\nzq7-line-two"}"#,
@@ -3736,7 +3701,7 @@ mod bounded_error_message_tests {
             assert!(!rendered.contains("rd-zq7-123"), "{rendered}");
             assert!(!rendered.contains("zq7-line"), "{rendered}");
             assert!(
-                rendered.contains(crate::secrets::DISPLAY_WITHHELD),
+                rendered.contains(crate::display::DISPLAY_WITHHELD),
                 "{rendered}"
             );
         }
@@ -3744,7 +3709,7 @@ mod bounded_error_message_tests {
             br#"{"message":"bad password p\u00e4ssw\u00f6rd-zq7-123"}"#.to_vec(),
         )
         .await;
-        assert_eq!(message, crate::secrets::DISPLAY_WITHHELD);
+        assert_eq!(message, crate::display::DISPLAY_WITHHELD);
     }
 
     #[test]
@@ -3755,16 +3720,14 @@ mod bounded_error_message_tests {
         for length in 1..=7 {
             std::thread::spawn(move || {
                 let value = &"Zq7xQw9"[..length];
-                crate::secrets::enable_display_scrubbing_on_this_thread();
-                crate::secrets::register_display_scrubber(
-                    crate::secrets::SecretScrubber::for_test_values(&[value]),
-                );
+                crate::display::enable_display_scrubbing_on_this_thread();
+                crate::display::register_values([value]);
                 let body = serde_json::json!({ "error": format!("bad password {value}") });
                 let rendered =
                     super::map_api_error(400, &body.to_string(), super::RequestKind::Read)
                         .to_string();
                 assert!(
-                    rendered.contains(crate::secrets::DISPLAY_WITHHELD),
+                    rendered.contains(crate::display::DISPLAY_WITHHELD),
                     "{length}: {rendered}"
                 );
                 let body = serde_json::json!({ "error": "unrelated failure" });
@@ -3781,9 +3744,37 @@ mod bounded_error_message_tests {
         }
     }
 
+    /// A value under eight bytes is never replaced in prose, but its
+    /// encodings are long enough to replace, through both peer paths.
+    #[tokio::test]
+    async fn encoded_short_secrets_are_redacted_from_gateway_and_github_errors() {
+        crate::display::enable_display_scrubbing_on_this_thread();
+        const SHORT: &str = "s3cr3t!";
+        crate::display::register_values([SHORT]);
+        use base64::Engine;
+        for encoded in [
+            base64::engine::general_purpose::STANDARD.encode(SHORT),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(SHORT),
+            "s3cr3t%21".to_string(),
+        ] {
+            let body = serde_json::json!({ "error": format!("bad header value {encoded}") });
+            let rendered =
+                super::map_api_error(400, &body.to_string(), super::RequestKind::Read).to_string();
+            assert!(!rendered.contains(&encoded), "{rendered}");
+            assert!(
+                rendered.contains("bad header value [REDACTED]"),
+                "{rendered}"
+            );
+
+            let body = serde_json::json!({ "message": format!("bad header value {encoded}") });
+            let message = read_error_body_of(body.to_string().into_bytes()).await;
+            assert_eq!(message, "bad header value [REDACTED]");
+        }
+    }
+
     #[test]
     fn a_minted_admin_token_is_scrubbed_however_it_is_reflected() {
-        crate::secrets::enable_display_scrubbing_on_this_thread();
+        crate::display::enable_display_scrubbing_on_this_thread();
         let client = super::AdminClient::new_scoped(
             &crate::config::EnvConfig {
                 gateway_url: Some("http://127.0.0.1:9".into()),
@@ -3818,7 +3809,7 @@ mod bounded_error_message_tests {
             super::map_api_error(401, &body.to_string(), super::RequestKind::Read).to_string();
         assert!(!rendered.contains(fragment), "{rendered}");
         assert!(
-            rendered.contains(crate::secrets::DISPLAY_WITHHELD),
+            rendered.contains(crate::display::DISPLAY_WITHHELD),
             "{rendered}"
         );
     }
@@ -3845,19 +3836,54 @@ mod bounded_error_message_tests {
     }
 
     #[test]
-    fn accepted_cluster_fields_are_scrubbed_before_display() {
-        crate::secrets::enable_display_scrubbing_on_this_thread();
+    fn accepted_cluster_fields_stay_raw_and_are_scrubbed_where_displayed() {
+        crate::display::enable_display_scrubbing_on_this_thread();
         const TOKEN: &str = "zq7-cluster-field-canary-31b9";
-        crate::secrets::register_sent_token(TOKEN);
-        let status = super::parse_cluster_status(&format!(
-            r#"{{"mode":"database","message":"echo {TOKEN}",
-                "control_plane":{{"url":"https://cp/{TOKEN}","status":"connected"}},
-                "data_planes":[{{"node_id":"{TOKEN}","status":"online"}}]}}"#
+        crate::display::register_sent_token(TOKEN);
+        let with_control_plane = super::parse_cluster_status(&format!(
+            r#"{{"mode":"database","control_plane":{{"url":"https://cp/{TOKEN}","status":"{TOKEN}",
+                "last_config_received_at":"{TOKEN}"}}}}"#
         ))
         .unwrap();
-        let rendered = format!("{} {status:?}", super::convergence_summary(&status));
-        assert!(!rendered.contains(TOKEN), "{rendered}");
-        assert_eq!(status.mode.as_deref(), Some("database"));
+        let with_message = super::parse_cluster_status(&format!(
+            r#"{{"mode":"{TOKEN}","message":"echo {TOKEN}"}}"#
+        ))
+        .unwrap();
+        for status in [&with_control_plane, &with_message] {
+            let rendered = super::convergence_summary(status);
+            assert!(!rendered.contains(TOKEN), "{rendered}");
+            assert!(rendered.starts_with("convergence: mode="), "{rendered}");
+        }
+        // Parsed values are what the gateway sent: decisions read them raw.
+        assert_eq!(with_message.mode.as_deref(), Some(TOKEN));
+        assert_eq!(
+            with_message.message.as_deref(),
+            Some(&*format!("echo {TOKEN}"))
+        );
+    }
+
+    /// The `/health` mode decides write safety; scrubbing it for display must
+    /// never change that decision, even when a registered value is not
+    /// safely scrubbable and every peer string is withheld.
+    #[test]
+    fn file_mode_refusal_holds_when_a_registered_value_cannot_be_scrubbed() {
+        crate::display::enable_display_scrubbing_on_this_thread();
+        // `#` makes the value a re-encoding hazard: peer text is withheld.
+        crate::display::register_values(["zq7-signing#key-value-0042"]);
+        assert_eq!(
+            crate::display::peer_text("file"),
+            crate::display::DISPLAY_WITHHELD
+        );
+        // A sparse read-only health response: no `admin_writes_enabled`.
+        let health: super::HealthStatus =
+            serde_json::from_str(r#"{"status":"ok","mode":"file"}"#).unwrap();
+        assert_eq!(health.mode.as_deref(), Some("file"));
+        let reason = super::write_block_reason(&health).expect("file mode must refuse writes");
+        assert!(reason.contains("never accepts config"), "{reason}");
+        assert!(matches!(
+            super::require_writes_enabled(&health, false),
+            Err(crate::error::Error::GatewayReadOnly(_))
+        ));
     }
 
     #[test]
@@ -3866,7 +3892,7 @@ mod bounded_error_message_tests {
         // tokenizer that keeps one entry per word.
         let text = "a ".repeat(4 * 1024 * 1024);
         let (redacted, peak) =
-            crate::alloc_meter::peak_bytes(|| crate::secrets::redact_credential_shapes(&text));
+            crate::alloc_meter::peak_bytes(|| crate::display::redact_credential_shapes(&text));
         assert_eq!(redacted.len(), text.len());
         // The output string itself, and nothing proportional to word count.
         assert!(
@@ -3889,11 +3915,9 @@ mod bounded_error_message_tests {
 
     #[test]
     fn every_displayed_peer_field_is_scrubbed() {
-        crate::secrets::enable_display_scrubbing_on_this_thread();
+        crate::display::enable_display_scrubbing_on_this_thread();
         const SECRET: &str = "zq7-peer-field-canary-77d0";
-        crate::secrets::register_display_scrubber(crate::secrets::SecretScrubber::for_test_values(
-            &[SECRET],
-        ));
+        crate::display::register_values([SECRET]);
         let cases = [
             (
                 200,
@@ -3947,7 +3971,7 @@ mod bounded_error_message_tests {
             assert!(rendered.contains("[REDACTED]"), "{rendered}");
         }
         assert_eq!(
-            crate::secrets::redact_credential_shapes("the bearer of bad news"),
+            crate::display::redact_credential_shapes("the bearer of bad news"),
             "the bearer [REDACTED] bad news"
         );
     }

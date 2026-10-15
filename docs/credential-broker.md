@@ -155,15 +155,20 @@ token is otherwise treated like a consumer credential: `import` captures it,
 `diff` prints `[REDACTED]`, validator output is scrubbed, and a committed
 literal is a blocking finding.
 
-Displayed errors are scrubbed too. Every value a run resolves or rotates in,
-and the GitHub tokens and admin JWT secret it reads from the environment, are
-replaced with `[REDACTED]` in the error text a gateway (`error`, `reason`,
-`rollback`, `restore_errors`) or GitHub (`message`) sends back. So are the
-admin JWTs the run sends, a `Bearer` credential, and a JWT or GitHub token by
-its shape. Peer text follows the validator-output policy: it is withheld whole
-when a resolved value is not safely scrubbable, or when a value (including
-one too short to replace) or a fragment of one survives. The CLI's final `Error:` line gets the same replacement but
-is never withheld, because it is mostly the tool's own prose.
+Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,
+the final `Error:` line and the review comment. Every value a run resolves
+or rotates in, the admin JWTs it sends, and the GitHub tokens and admin JWT
+secrets it reads from the environment become `[REDACTED]`, as do their
+base64, percent, JSON-escaped and single-quoted spellings, a `Bearer`
+credential, and a JWT or GitHub token by its shape. A line that still holds
+an 8-byte run of one (also after decoding escapes, percent-encoding or HTML
+references) is withheld, unless that run is also public text: the scrubbed
+configuration or the tool's own messages. A value shorter than 8 bytes is
+not looked for in the tool's own prose, where it would match ordinary words,
+but text a gateway or GitHub sends back is withheld when it contains one, and
+while any registered value is not safely scrubbable (the validator-output
+rule above). Decisions read responses as received; only the displayed copy
+is scrubbed.
 
 ## Entry position is the slot identity
 

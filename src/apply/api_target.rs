@@ -616,7 +616,7 @@ async fn apply_prepared(
 
     for namespace in namespaces {
         if let Some(reason) = prepared.blocked.get(namespace) {
-            eprintln!("[{}] {}", safe(namespace), safe_line(reason));
+            crate::eoutln!("[{}] {}", safe(namespace), safe_line(reason));
             aggregate.errors.push(format!("[{namespace}] {reason}"));
             continue;
         }
@@ -694,7 +694,7 @@ async fn apply_prepared(
             namespace_result.deleted,
             namespace_result.deletes_missing,
         ) {
-            eprintln!("Warning: {}", safe_line(warning));
+            crate::eoutln!("Warning: {}", safe_line(warning));
         }
 
         aggregate.created += namespace_result.created;
@@ -1156,7 +1156,7 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
                 // The minimal tier: the write state is unknown. The preflight
                 // stays advisory, and the first refused write reports it.
                 if health.admin_writes_enabled.is_none() {
-                    eprintln!(
+                    crate::eoutln!(
                         "Warning: admin preflight GET /health did not report \
                          admin_writes_enabled; continuing. {}",
                         http_client::health_tier_remedy(client.is_namespace_bounded())
@@ -1169,7 +1169,7 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
             Err(crate::error::Error::GatewayReadOnly(reason))
         }
         Err(e) => {
-            eprintln!(
+            crate::eoutln!(
                 "Warning: admin preflight GET /health failed ({}); continuing.",
                 safe_line(&e)
             );
@@ -1645,7 +1645,7 @@ async fn apply_incremental(
         )?,
     );
     for assertion in &assertions {
-        eprintln!(
+        crate::eoutln!(
             "[{}] asserting repository ownership of pending {} `{}` with an idempotent update",
             safe(namespace),
             safe(&assertion.kind),
@@ -1656,7 +1656,7 @@ async fn apply_incremental(
     let diffs = order_incremental_diffs(diffs, desired);
 
     for message in spec_owned_skip_messages(&spec_owned) {
-        eprintln!("[{}] {}", safe(namespace), safe_line(&message));
+        crate::eoutln!("[{}] {}", safe(namespace), safe_line(&message));
     }
     let spec_owned_skipped = spec_owned.iter().filter(|s| !s.pruned).count();
 
@@ -1686,7 +1686,7 @@ async fn apply_incremental(
             Some(batched) => batched_result = Some(batched),
             // 501: standalone-MongoDB gateway with no multi-document
             // transaction. Fall through to per-resource CRUD.
-            None => eprintln!(
+            None => crate::eoutln!(
                 "[{}] gateway does not support POST /batch (501); \
                  falling back to per-resource creates.",
                 safe(namespace)
@@ -1823,7 +1823,7 @@ async fn apply_incremental(
         }
         if writes_failed && matches!(diff.action, DiffAction::Delete) {
             result.deletes_deferred += 1;
-            eprintln!(
+            crate::eoutln!(
                 "[{}] DEFER DELETE {} `{}`: an Add/Modify failed in this namespace; prune not attempted and existing managed ledger entries preserved. Resolve the write failure before retrying.",
                 safe(namespace),
                 safe(&diff.kind),
@@ -1842,7 +1842,7 @@ async fn apply_incremental(
             })
         {
             result.deletes_deferred += 1;
-            eprintln!(
+            crate::eoutln!(
                 "[{}] DEFER DELETE PluginConfig `{}`: a referencing proxy could not be deleted; managed ledger entry preserved.",
                 safe(namespace),
                 safe(&diff.id)
@@ -1925,7 +1925,7 @@ async fn apply_incremental(
 
         match outcome {
             Ok(OpOutcome::Unchanged) => {
-                eprintln!(
+                crate::eoutln!(
                     "[{}] Proxy `{}` already matches after plugin writes; no proxy update needed",
                     safe(namespace),
                     safe(&diff.id)
@@ -2055,7 +2055,7 @@ fn withhold_after_stale_plan(diff: &ResourceDiff, first: &str, result: &mut Appl
     );
     if diff.action == DiffAction::Delete {
         result.deletes_deferred += 1;
-        eprintln!(
+        crate::eoutln!(
             "[{}] DEFER DELETE {} `{}`: {}",
             safe(&diff.namespace),
             safe(&diff.kind),
@@ -2948,7 +2948,7 @@ async fn adopt_matching_rows(
             "not adopting {} already-matching resource(s): {reason}",
             candidates.len()
         );
-        eprintln!("[{}] {}", safe(namespace), safe_line(&message));
+        crate::eoutln!("[{}] {}", safe(namespace), safe_line(&message));
         result
             .adoption_skipped
             .push(format!("[{namespace}] {message}"));
@@ -3001,7 +3001,7 @@ async fn adopt_matching_rows(
         // Exclusive mode asserts nothing, so there is nothing to overwrite and
         // no read to make.
         for resource in resources {
-            eprintln!(
+            crate::eoutln!(
                 "[{}] adopted {} `{}` into the ownership ledger (exclusive ownership needs no assertion)",
                 safe(namespace),
                 safe(resource.kind()),
@@ -3113,7 +3113,7 @@ async fn adopt_matching_rows(
                 continue;
             }
         }
-        eprintln!(
+        crate::eoutln!(
             "[{}] adopted {} `{}` into the ownership ledger with an idempotent update",
             safe(namespace),
             safe(kind),
@@ -3144,7 +3144,7 @@ fn adopted_op(resource: CreateResource<'_>) -> AppliedOp {
 }
 
 fn skip_adoption(result: &mut ApplyResult, namespace: &str, message: &str) {
-    eprintln!("[{}] {}", safe(namespace), safe_line(message));
+    crate::eoutln!("[{}] {}", safe(namespace), safe_line(message));
     result
         .adoption_skipped
         .push(format!("[{namespace}] {message}"));
@@ -3169,7 +3169,7 @@ fn fail_adoption(
     id: &str,
     error: &crate::error::Error,
 ) {
-    eprintln!(
+    crate::eoutln!(
         "[{}] failed to adopt {} `{}`: {}",
         safe(namespace),
         safe(kind),
@@ -3642,7 +3642,7 @@ async fn create_with_reconciliation(
                                 resource.id(),
                             ))
                         })?;
-                    eprintln!(
+                    crate::eoutln!(
                         "[{}] {} `{}` returned an ambiguous response; an authoritative backup found the exact desired resource live and an idempotent update asserted repository ownership without replaying the create",
                         safe(namespace),
                         safe(resource.kind()),
@@ -4007,7 +4007,7 @@ async fn try_batch_create(
             }
             Ok(None) => {
                 allow_nontransactional_attach = options.allow_nontransactional_plugin_attach;
-                eprintln!(
+                crate::eoutln!(
                     "[{}] gateway returned 501 for POST /batch after {} resource(s); \
                      creating the remaining {} resource(s) individually.",
                     safe(namespace),
@@ -4029,7 +4029,7 @@ async fn try_batch_create(
             Err(e) if batch_rejection_allows_replay(&e) => {
                 allow_nontransactional_attach = options.allow_nontransactional_plugin_attach
                     && matches!(e, crate::error::Error::ApiError { status: 413, .. });
-                eprintln!(
+                crate::eoutln!(
                     "[{}] POST /batch chunk {} was definitively rejected ({}); creating the remaining {} resource(s) individually so each failure is reported on its own.",
                     safe(namespace),
                     position + 1,
@@ -4099,7 +4099,7 @@ async fn try_batch_create(
                             note_unattempted_chunks(&chunks, position + 1, namespace, &mut result);
                             return Ok(Some(result));
                         }
-                        eprintln!(
+                        crate::eoutln!(
                             "[{}] POST /batch chunk {} returned an ambiguous response; an authoritative backup found all {} exact desired resources live and idempotent updates asserted repository ownership without replaying the batch",
                             safe(namespace),
                             position + 1,
@@ -4370,7 +4370,7 @@ async fn create_individually(
         let cycles = batch_cycle_proxy_ids(chunk);
         for id in &cycles {
             if allow_nontransactional_attach {
-                eprintln!(
+                crate::eoutln!(
                     "[{}] WARNING: --allow-nontransactional-plugin-attach permits Proxy `{}` to be briefly published without its scoped plugin. If plugin creation fails, the proxy remains published without that protection; repair the attachment immediately.",
                     safe(namespace),
                     safe(id)

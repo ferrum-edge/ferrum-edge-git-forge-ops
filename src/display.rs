@@ -1,0 +1,1316 @@
+//! The one sink for user-visible text.
+//!
+//! Everything this program shows a person goes through here: stdout and
+//! stderr (via [`outln!`](crate::outln), [`out!`](crate::out),
+//! [`eoutln!`](crate::eoutln) and [`eout!`](crate::eout)), every `--format
+//! json` document, the final `Error:` line, panic messages, and the Markdown
+//! the review posts to a pull request or writes to `$GITHUB_STEP_SUMMARY`
+//! ([`scrub_text`]). A test (`no_direct_output_outside_the_sink`) fails when
+//! code writes to stdout or stderr any other way.
+//!
+//! # Why at the sink
+//!
+//! A run sends secrets: resolved credentials travel in gateway requests, a
+//! rotation publishes a freshly generated value, every admin request carries
+//! a minted JWT, GitHub calls carry a token. A peer can reflect any of them
+//! in what it sends back — an error message, a namespace name, a `/health`
+//! field — and that text reaches output by many routes. Scrubbing each route
+//! where a value is parsed changes the values decisions are made on (a
+//! scrubbed `/health` `mode` stops being `file`), and misses the next route
+//! someone adds. So parsed values stay raw for logic, and the secrets are
+//! removed from the final rendered text instead.
+//!
+//! # What is registered
+//!
+//! The CLI calls [`enable_display_scrubbing`] at startup. From then on the
+//! process registers every snapshot the resolver resolves
+//! ([`register_resolved`]), every rotated value it publishes and every token
+//! it reads from the environment ([`register_values`]), and a bounded window
+//! of the admin JWTs it sends ([`register_sent_token`]). Library callers stay
+//! opted out; a test opts in its own thread only
+//! ([`enable_display_scrubbing_on_this_thread`]), so parallel tests never see
+//! each other's canaries.
+//!
+//! # The policy ([`scrub_text`])
+//!
+//! 1. Every registered value and its single-line re-encodings (base64 in four
+//!    alphabets, percent, JSON escaping with and without `\u` escapes for
+//!    non-ASCII, single-quoted YAML) become [`REDACTION`] wherever they are at
+//!    least [`MIN_SCRUB_LENGTH`] bytes long. That includes the encodings of a
+//!    value too short to replace itself: `s3cr3t!` is left alone in prose,
+//!    but its base64 `czNjcjN0IQ==` is not. A `Bearer` credential and a JWT
+//!    or GitHub token by its shape are redacted too, registered or not.
+//! 2. Any [`FRAGMENT_SCAN_LENGTH`]-byte run of a registered value or of one of
+//!    its encodings that survives withholds the whole line (a JSON string
+//!    value, in a JSON document) with [`DISPLAY_WITHHELD`]. The scan covers
+//!    the text as written and as decoded from backslash escapes (JSON, YAML
+//!    double-quoted, Rust; twice, for double encoding), percent-encoding,
+//!    HTML character references and doubled single quotes, so a re-encoded
+//!    value cannot slip past as a different spelling. A run that also occurs
+//!    in public text is not evidence: the scrubbed configuration the value
+//!    came from, or the tool's own string literals (`build.rs` collects them),
+//!    so an ordinary remedy that shares eight letters with a seeded value is
+//!    still printed.
+//!
+//! A raw value shorter than [`MIN_SCRUB_LENGTH`] is not looked for in the
+//! tool's own prose: `on` or `dev` would match ordinary words everywhere.
+//! Text a peer sent gets the stricter [`peer_text`] at the point it is
+//! interpolated, which withholds it when such a value occurs in it at all,
+//! or when a registered value is not safely scrubbable
+//! ([`is_reencoding_hazard`]), the validator-output policy.
+//!
+//! # Not routed through here
+//!
+//! Data a command was asked to write, not text it shows: the `export`
+//! document ([`write_data_stdout`], which `--materialize` fills with real
+//! credentials on purpose), credential bundles, state files, fingerprint
+//! baselines and the files `import` writes. Scrubbing them would corrupt
+//! them.
+
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, PoisonError};
+
+use base64::Engine;
+
+use crate::config::GatewayConfig;
+use crate::secrets::scrubber::{json_escaped, percent_encoded, yaml_single_quoted};
+use crate::secrets::{
+    is_reencoding_hazard, ResolveReport, SecretScrubber, FRAGMENT_SCAN_LENGTH, MIN_SCRUB_LENGTH,
+    REDACTION,
+};
+
+/// Shown in place of a line (or a JSON string, or a peer's text) that could
+/// not be shown without risking a secret.
+pub const DISPLAY_WITHHELD: &str =
+    "[diagnostic withheld: it may carry a secret that could not be redacted]";
+
+/// The string literals of this crate's non-test sources (see `build.rs`).
+/// A run of a secret that occurs here is the tool's own prose, not a leak.
+static PUBLIC_PROSE: &str = include_str!(concat!(env!("OUT_DIR"), "/display_corpus.txt"));
+
+/// How many minted admin tokens stay registered. A token is minted per
+/// request, and a reflection comes back in the response to the request that
+/// carried it, so only the recent ones matter.
+const RECENT_TOKEN_WINDOW: usize = 256;
+
+type Window = [u8; FRAGMENT_SCAN_LENGTH];
+
+fn window_at(bytes: &[u8], at: usize) -> Option<Window> {
+    bytes.get(at..at + FRAGMENT_SCAN_LENGTH)?.try_into().ok()
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|candidate| candidate == needle)
+}
+
+/// One registration: the values of a resolved snapshot, a set of tokens, or
+/// one sent JWT, with everything the sink looks for precomputed.
+struct Entry {
+    /// Runs of this text are public (the scrubbed configuration).
+    public_text: String,
+    windows: Vec<Window>,
+    needles: Vec<String>,
+    short_values: Vec<String>,
+    hazardous: bool,
+}
+
+/// Every spelling of `value` the sink replaces. Only spellings of at least
+/// [`MIN_SCRUB_LENGTH`] bytes are kept, so a short value contributes its
+/// longer encodings but never itself.
+fn spellings(value: &str) -> Vec<String> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let bytes = value.as_bytes();
+    let mut all = vec![
+        value.to_string(),
+        STANDARD.encode(bytes),
+        STANDARD_NO_PAD.encode(bytes),
+        URL_SAFE.encode(bytes),
+        URL_SAFE_NO_PAD.encode(bytes),
+        percent_encoded(value),
+        yaml_single_quoted(value),
+        ascii_json_escaped(value),
+    ];
+    all.extend(json_escaped(value));
+    all.retain(|spelling| spelling.len() >= MIN_SCRUB_LENGTH);
+    all.sort();
+    all.dedup();
+    all
+}
+
+/// JSON escaping with every non-ASCII character as `\uXXXX` (what an
+/// `ensure_ascii` serializer writes), without the surrounding quotes.
+fn ascii_json_escaped(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_ascii() && !c.is_ascii_control() => out.push(c),
+            c => {
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+impl Entry {
+    fn new(values: &[String], public_text: String) -> Self {
+        let mut windows = Vec::new();
+        let mut needles = Vec::new();
+        let mut short_values = Vec::new();
+        let mut hazardous = false;
+        for value in values.iter().filter(|value| !value.is_empty()) {
+            hazardous |= is_reencoding_hazard(value);
+            if value.len() < MIN_SCRUB_LENGTH {
+                short_values.push(value.clone());
+            }
+            for spelling in spellings(value) {
+                windows.extend(
+                    (0..=spelling.len() - FRAGMENT_SCAN_LENGTH)
+                        .filter_map(|at| window_at(spelling.as_bytes(), at)),
+                );
+                needles.push(spelling);
+            }
+        }
+        windows.sort_unstable();
+        windows.dedup();
+        needles.sort();
+        needles.dedup();
+        Self {
+            public_text,
+            windows,
+            needles,
+            short_values,
+            hazardous,
+        }
+    }
+}
+
+/// Every registration, merged for lookup by eight-byte window.
+#[derive(Default)]
+struct Registry {
+    entries: HashMap<u64, Entry>,
+    next_id: u64,
+    /// Sent tokens, oldest first, with their entry ids.
+    tokens: VecDeque<(u64, String)>,
+    /// Window → the entries that own it.
+    windows: HashMap<Window, Vec<u64>>,
+    /// First window of a needle → (needle, owner count), longest first.
+    needles: HashMap<Window, Vec<(String, usize)>>,
+    short_values: HashMap<String, usize>,
+    hazardous: usize,
+}
+
+impl Registry {
+    fn insert(&mut self, entry: Entry) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        for window in &entry.windows {
+            self.windows.entry(*window).or_default().push(id);
+        }
+        for needle in &entry.needles {
+            let Some(prefix) = window_at(needle.as_bytes(), 0) else {
+                continue;
+            };
+            let bucket = self.needles.entry(prefix).or_default();
+            match bucket.iter_mut().find(|(known, _)| known == needle) {
+                Some((_, count)) => *count += 1,
+                None => {
+                    bucket.push((needle.clone(), 1));
+                    bucket.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+                }
+            }
+        }
+        for value in &entry.short_values {
+            *self.short_values.entry(value.clone()).or_default() += 1;
+        }
+        self.hazardous += usize::from(entry.hazardous);
+        self.entries.insert(id, entry);
+        id
+    }
+
+    fn remove(&mut self, id: u64) {
+        let Some(entry) = self.entries.remove(&id) else {
+            return;
+        };
+        for window in &entry.windows {
+            if let Some(owners) = self.windows.get_mut(window) {
+                owners.retain(|owner| *owner != id);
+                if owners.is_empty() {
+                    self.windows.remove(window);
+                }
+            }
+        }
+        for needle in &entry.needles {
+            let Some(prefix) = window_at(needle.as_bytes(), 0) else {
+                continue;
+            };
+            if let Some(bucket) = self.needles.get_mut(&prefix) {
+                if let Some(slot) = bucket.iter_mut().find(|(known, _)| known == needle) {
+                    slot.1 -= 1;
+                }
+                bucket.retain(|(_, count)| *count > 0);
+                if bucket.is_empty() {
+                    self.needles.remove(&prefix);
+                }
+            }
+        }
+        for value in &entry.short_values {
+            if let Some(count) = self.short_values.get_mut(value) {
+                *count -= 1;
+                if *count == 0 {
+                    self.short_values.remove(value);
+                }
+            }
+        }
+        self.hazardous -= usize::from(entry.hazardous);
+    }
+
+    fn add_token(&mut self, token: &str) {
+        if self.tokens.iter().any(|(_, known)| known == token) {
+            return;
+        }
+        if self.tokens.len() == RECENT_TOKEN_WINDOW {
+            if let Some((oldest, _)) = self.tokens.pop_front() {
+                self.remove(oldest);
+            }
+        }
+        let id = self.insert(Entry::new(&[token.to_string()], String::new()));
+        self.tokens.push_back((id, token.to_string()));
+    }
+
+    /// Replace every needle, then every credential-shaped word.
+    fn redact(&self, text: &str) -> String {
+        if self.needles.is_empty() {
+            return redact_credential_shapes(text);
+        }
+        let bytes = text.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        'scan: while at < bytes.len() {
+            if let Some(bucket) = window_at(bytes, at).and_then(|w| self.needles.get(&w)) {
+                for (needle, _) in bucket {
+                    if bytes[at..].starts_with(needle.as_bytes()) {
+                        out.extend_from_slice(REDACTION.as_bytes());
+                        at += needle.len();
+                        continue 'scan;
+                    }
+                }
+            }
+            out.push(bytes[at]);
+            at += 1;
+        }
+        // A needle is whole UTF-8 and starts on a character boundary, so
+        // replacing it keeps the text valid.
+        let replaced = String::from_utf8(out)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+        redact_credential_shapes(&replaced)
+    }
+
+    /// Is this surviving run evidence of a secret, rather than a run that is
+    /// public anyway?
+    fn is_leak(&self, window: &Window, cache: &mut HashMap<Window, bool>) -> bool {
+        let Some(owners) = self.windows.get(window) else {
+            return false;
+        };
+        *cache.entry(*window).or_insert_with(|| {
+            !contains_bytes(PUBLIC_PROSE.as_bytes(), window)
+                && owners.iter().any(|owner| {
+                    self.entries
+                        .get(owner)
+                        .is_some_and(|entry| !contains_bytes(entry.public_text.as_bytes(), window))
+                })
+        })
+    }
+
+    /// Byte ranges of every surviving run in `bytes`.
+    fn leak_ranges(&self, bytes: &[u8], cache: &mut HashMap<Window, bool>) -> Vec<(usize, usize)> {
+        if self.windows.is_empty() || bytes.len() < FRAGMENT_SCAN_LENGTH {
+            return Vec::new();
+        }
+        (0..=bytes.len() - FRAGMENT_SCAN_LENGTH)
+            .filter(|&at| window_at(bytes, at).is_some_and(|w| self.is_leak(&w, cache)))
+            .map(|at| (at, at + FRAGMENT_SCAN_LENGTH))
+            .collect()
+    }
+
+    /// Does a decoded spelling of `text` carry a surviving run?
+    fn leaks_when_decoded(&self, text: &str, cache: &mut HashMap<Window, bool>) -> bool {
+        if self.windows.is_empty() {
+            return false;
+        }
+        decoded_views(text)
+            .iter()
+            .any(|view| !self.leak_ranges(view, cache).is_empty())
+    }
+
+    /// The sink's policy for one block of text (see the module docs).
+    fn scrub_text(&self, text: &str) -> String {
+        let redacted = self.redact(text);
+        if self.windows.is_empty() {
+            return redacted;
+        }
+        let mut cache = HashMap::new();
+        let hits = self.leak_ranges(redacted.as_bytes(), &mut cache);
+        let mut out = String::with_capacity(redacted.len());
+        let mut start = 0;
+        for line in redacted.split_inclusive('\n') {
+            let end = start + line.len();
+            let body = line.trim_end_matches(['\n', '\r']);
+            let withheld = hits.iter().any(|&(from, to)| from < end && to > start)
+                || self.leaks_when_decoded(body, &mut cache);
+            if withheld {
+                out.push_str(DISPLAY_WITHHELD);
+                out.push_str(&line[body.len()..]);
+            } else {
+                out.push_str(line);
+            }
+            start = end;
+        }
+        out
+    }
+
+    /// One JSON string value: redacted, or withheld whole.
+    fn scrub_json_string(&self, value: &str) -> String {
+        let redacted = self.redact(value);
+        let mut cache = HashMap::new();
+        if !self.leak_ranges(redacted.as_bytes(), &mut cache).is_empty()
+            || self.leaks_when_decoded(&redacted, &mut cache)
+        {
+            return DISPLAY_WITHHELD.to_string();
+        }
+        redacted
+    }
+
+    /// The stricter policy for text a peer sent (see [`peer_text`]).
+    fn peer_text(&self, text: &str) -> String {
+        if self.hazardous > 0 {
+            return DISPLAY_WITHHELD.to_string();
+        }
+        let redacted = self.redact(text);
+        let views = decoded_views(&redacted);
+        let short_survives = self.short_values.keys().any(|value| {
+            redacted.contains(value.as_str())
+                || views
+                    .iter()
+                    .any(|view| contains_bytes(view, value.as_bytes()))
+        });
+        let mut cache = HashMap::new();
+        if short_survives
+            || !self.leak_ranges(redacted.as_bytes(), &mut cache).is_empty()
+            || views
+                .iter()
+                .any(|view| !self.leak_ranges(view, &mut cache).is_empty())
+        {
+            return DISPLAY_WITHHELD.to_string();
+        }
+        redacted
+    }
+}
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
+static GLOBAL: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
+
+thread_local! {
+    static THREAD_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static LOCAL: RefCell<Registry> = RefCell::new(Registry::default());
+}
+
+/// Register, from now on, every secret this process resolves, generates or
+/// sends, for the whole process. The CLI calls this first thing.
+pub fn enable_display_scrubbing() {
+    ENABLED.store(true, Ordering::SeqCst);
+}
+
+/// [`enable_display_scrubbing`] for the calling thread only: what it
+/// registers applies only to text scrubbed on that thread. For tests, which
+/// run in parallel threads of one process.
+pub fn enable_display_scrubbing_on_this_thread() {
+    THREAD_ENABLED.with(|enabled| enabled.set(true));
+}
+
+fn registering() -> bool {
+    ENABLED.load(Ordering::SeqCst) || THREAD_ENABLED.with(Cell::get)
+}
+
+fn with_registry<T>(f: impl FnOnce(&Registry) -> T) -> T {
+    if ENABLED.load(Ordering::SeqCst) {
+        f(&GLOBAL.lock().unwrap_or_else(PoisonError::into_inner))
+    } else {
+        LOCAL.with(|local| f(&local.borrow()))
+    }
+}
+
+fn with_registry_mut(f: impl FnOnce(&mut Registry)) {
+    if ENABLED.load(Ordering::SeqCst) {
+        f(&mut GLOBAL.lock().unwrap_or_else(PoisonError::into_inner));
+    } else if THREAD_ENABLED.with(Cell::get) {
+        LOCAL.with(|local| f(&mut local.borrow_mut()));
+    }
+}
+
+/// Register the secrets of `scrubber`, with its scrubbed document as public
+/// text.
+pub fn register_scrubber(scrubber: &SecretScrubber) {
+    if scrubber.is_empty() || !registering() {
+        return;
+    }
+    let entry = Entry::new(scrubber.values(), scrubber.public_text().to_string());
+    with_registry_mut(|registry| {
+        registry.insert(entry);
+    });
+}
+
+/// Register one resolved snapshot. The resolver calls this on every
+/// successful resolution: from then on those values travel in requests.
+pub fn register_resolved(config: &GatewayConfig, report: &ResolveReport) {
+    if registering() {
+        register_scrubber(&SecretScrubber::from_gateway_config_with_report(
+            config, report,
+        ));
+    }
+}
+
+/// Register secrets that are in no gateway document: a generated rotation
+/// value, or a token this process sends (`GITHUB_TOKEN` and friends).
+pub fn register_values<I, S>(values: I)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    if registering() {
+        register_scrubber(&SecretScrubber::from_secret_values(values));
+    }
+}
+
+/// Register an admin JWT this process is about to send, into the bounded
+/// recent-token window.
+pub fn register_sent_token(token: &str) {
+    if !token.is_empty() && registering() {
+        with_registry_mut(|registry| registry.add_token(token));
+    }
+}
+
+/// The sink's policy for text, without writing it: for output that leaves
+/// the process another way (a PR comment, the step summary).
+pub fn scrub_text(text: &str) -> String {
+    with_registry(|registry| registry.scrub_text(text))
+}
+
+/// [`scrub_text`] for a JSON document: each string value is redacted or
+/// withheld on its own, so the document stays valid JSON.
+pub fn scrub_json_text(text: &str) -> String {
+    with_registry(|registry| rewrite_json_strings(text, |value| registry.scrub_json_string(value)))
+}
+
+/// What the sink does to `text` before writing it: [`scrub_json_text`] for a
+/// JSON document, [`scrub_text`] for anything else.
+pub fn scrub_output(text: &str) -> String {
+    let trimmed = text.trim();
+    let json = (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok();
+    if json {
+        scrub_json_text(text)
+    } else {
+        scrub_text(text)
+    }
+}
+
+/// Make text a peer sent safe to interpolate into a diagnostic: a gateway
+/// `error` or `reason`, GitHub's `message`, a namespace name from
+/// `/namespaces`, a `/health` or `/cluster` field, a `/config/export` field.
+///
+/// Stricter than the sink, because nothing in it is the tool's own prose: it
+/// is withheld whole when a registered value is not safely scrubbable
+/// ([`is_reencoding_hazard`]: a peer can re-encode it past every needle),
+/// when a registered value of any length occurs in it, or when a run of one
+/// survives redaction. Use it only on the displayed copy; decisions read the
+/// raw value.
+pub fn peer_text(text: &str) -> String {
+    with_registry(|registry| registry.peer_text(text))
+}
+
+/// Write `text` to stdout through the sink. Used by [`out!`](crate::out) and
+/// [`outln!`](crate::outln).
+pub fn write_stdout(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let scrubbed = scrub_output(text);
+    // display-sink: the one stdout writer.
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = stdout
+        .write_all(scrubbed.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        // `println!`'s behavior: a closed or failing stdout is fatal.
+        panic!("failed printing to stdout: {error}");
+    }
+}
+
+/// Write `text` to stderr through the sink. Used by [`eout!`](crate::eout)
+/// and [`eoutln!`](crate::eoutln).
+pub fn write_stderr(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let scrubbed = scrub_output(text);
+    // A failure is ignored: there is nowhere left to report it.
+    // display-sink: the one stderr writer.
+    let _ = std::io::stderr().lock().write_all(scrubbed.as_bytes());
+}
+
+/// Write a data payload to stdout unchanged: the `export` document, which
+/// `--materialize` fills with real credentials because that is what was asked
+/// for. Not for anything a person reads as diagnostics.
+pub fn write_data_stdout(payload: &[u8]) -> std::io::Result<()> {
+    // display-sink: data, not display (see the module docs).
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(payload)?;
+    stdout.flush()
+}
+
+/// Whether stdout is an interactive terminal.
+pub fn stdout_is_terminal() -> bool {
+    // display-sink: a query, writes nothing.
+    std::io::stdout().is_terminal()
+}
+
+/// Route panic messages through the sink: a panic payload can carry any
+/// value the code was holding.
+pub fn install_panic_hook() {
+    // display-sink: installs the hook, which writes only scrubbed text.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "Box<dyn Any>".to_string());
+        let location = info
+            .location()
+            .map(|location| format!(" at {location}"))
+            .unwrap_or_default();
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        let message = format!("\nthread '{name}' panicked{location}:\n{payload}\n");
+        // The panic can come from inside the sink with the registry held;
+        // never wait for it.
+        let scrubbed = if ENABLED.load(Ordering::SeqCst) {
+            match GLOBAL.try_lock() {
+                Ok(registry) => Some(registry.scrub_text(&message)),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().scrub_text(&message))
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            }
+        } else {
+            LOCAL
+                .try_with(|local| {
+                    local
+                        .try_borrow()
+                        .ok()
+                        .map(|registry| registry.scrub_text(&message))
+                })
+                .ok()
+                .flatten()
+        };
+        let text = scrubbed.unwrap_or_else(|| format!("\nthread '{name}' panicked{location}\n"));
+        // display-sink: the panic hook, already scrubbed above.
+        let _ = std::io::stderr().lock().write_all(text.as_bytes());
+    }));
+}
+
+/// `println!` through the display sink.
+#[macro_export]
+macro_rules! outln {
+    () => {
+        $crate::display::write_stdout("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::display::write_stdout(&::std::format!("{}\n", ::std::format_args!($($arg)*)))
+    };
+}
+
+/// `print!` through the display sink.
+#[macro_export]
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::display::write_stdout(&::std::format!($($arg)*))
+    };
+}
+
+/// `eprintln!` through the display sink.
+#[macro_export]
+macro_rules! eoutln {
+    () => {
+        $crate::display::write_stderr("\n")
+    };
+    ($($arg:tt)*) => {
+        $crate::display::write_stderr(&::std::format!("{}\n", ::std::format_args!($($arg)*)))
+    };
+}
+
+/// `eprint!` through the display sink.
+#[macro_export]
+macro_rules! eout {
+    ($($arg:tt)*) => {
+        $crate::display::write_stderr(&::std::format!($($arg)*))
+    };
+}
+
+/// Replace credential-shaped words with [`REDACTION`]: the word after a
+/// `Bearer` scheme, a JWT (`eyJ…` in three dot-separated parts, which is what
+/// the admin client sends), and a GitHub token by its documented prefix.
+/// These are caught by shape as a backstop to the registered values.
+///
+/// One streaming pass: besides the output, it keeps only the bounds of the
+/// previous word and whether the gap after it was blank, so memory does not
+/// grow with the number of words.
+pub fn redact_credential_shapes(text: &str) -> String {
+    // Not `=`: it would join `token=<JWT>` into one word that no longer starts
+    // with the JWT. Base64url JWTs and GitHub tokens never contain it.
+    fn is_word_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '+' | '/')
+    }
+    fn is_credential_shaped(word: &str) -> bool {
+        let jwt =
+            word.starts_with("eyJ") && word.split('.').filter(|part| !part.is_empty()).count() == 3;
+        let github = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]
+            .iter()
+            .any(|prefix| word.starts_with(prefix) && word.len() >= prefix.len() + 16);
+        jwt || github
+    }
+    fn run_end(text: &str, start: usize, word: bool) -> usize {
+        text[start..]
+            .char_indices()
+            .find(|&(_, c)| is_word_char(c) != word)
+            .map_or(text.len(), |(offset, _)| start + offset)
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut previous_word: Option<(usize, usize)> = None;
+    let mut blank_gap = false;
+    let mut position = 0;
+    while let Some(c) = text[position..].chars().next() {
+        if is_word_char(c) {
+            let end = run_end(text, position, true);
+            let segment = &text[position..end];
+            let after_bearer = blank_gap
+                && previous_word
+                    .is_some_and(|(start, end)| text[start..end].eq_ignore_ascii_case("bearer"));
+            if after_bearer || is_credential_shaped(segment) {
+                out.push_str(REDACTION);
+            } else {
+                out.push_str(segment);
+            }
+            previous_word = Some((position, end));
+            blank_gap = false;
+            position = end;
+        } else {
+            let end = run_end(text, position, false);
+            let segment = &text[position..end];
+            blank_gap = segment.chars().all(|c| c == ' ' || c == '\t');
+            out.push_str(segment);
+            position = end;
+        }
+    }
+    out
+}
+
+/// Re-encode every string literal of a JSON document through `scrub`,
+/// leaving structure, key order and formatting alone. A literal `scrub`
+/// returns unchanged is kept byte for byte.
+fn rewrite_json_strings(text: &str, scrub: impl Fn(&str) -> String) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'"' {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        at += 1;
+        while at < bytes.len() && bytes[at] != b'"' {
+            at += if bytes[at] == b'\\' { 2 } else { 1 };
+        }
+        let end = (at + 1).min(bytes.len());
+        let literal = &text[start..end];
+        out.push_str(&text[copied..start]);
+        match serde_json::from_str::<String>(literal) {
+            Ok(value) => {
+                let scrubbed = scrub(&value);
+                if scrubbed == value {
+                    out.push_str(literal);
+                } else {
+                    out.push_str(
+                        &serde_json::to_string(&scrubbed)
+                            .unwrap_or_else(|_| format!("\"{DISPLAY_WITHHELD}\"")),
+                    );
+                }
+            }
+            Err(_) => out.push_str(&format!("\"{DISPLAY_WITHHELD}\"")),
+        }
+        copied = end;
+        at = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// The spellings of `text` a peer's re-encoding would hide a value behind,
+/// decoded: backslash escapes (once and twice), percent-encoding, HTML
+/// character references and doubled single quotes. Only the ones `text` can
+/// contain are produced.
+fn decoded_views(text: &str) -> Vec<Vec<u8>> {
+    // Each decoder, then each decoder again on its result: two layers cover
+    // a value escaped for one format and then for another (a Markdown
+    // comment escapes `_` with a backslash and `.` as `&#46;`).
+    let mut views: Vec<Vec<u8>> = Vec::new();
+    for decode in DECODERS {
+        let Some(once) = decode(text.as_bytes()) else {
+            continue;
+        };
+        for decode_again in DECODERS {
+            if let Some(twice) = decode_again(&once) {
+                views.push(twice);
+            }
+        }
+        views.push(once);
+    }
+    views.dedup();
+    views
+}
+
+type Decoder = fn(&[u8]) -> Option<Vec<u8>>;
+
+/// The decoders [`decoded_views`] applies; each returns `None` when the
+/// input has nothing for it to decode.
+const DECODERS: [Decoder; 4] = [
+    |bytes| bytes.contains(&b'\\').then(|| unescape_backslashes(bytes)),
+    |bytes| bytes.contains(&b'%').then(|| percent_decode(bytes)),
+    |bytes| bytes.contains(&b'&').then(|| html_unescape(bytes)),
+    |bytes| {
+        bytes.windows(2).any(|pair| pair == b"''").then(|| {
+            String::from_utf8_lossy(bytes)
+                .replace("''", "'")
+                .into_bytes()
+        })
+    },
+];
+
+fn hex_value(digits: &[u8]) -> Option<u32> {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+}
+
+fn push_char(out: &mut Vec<u8>, code: u32) -> bool {
+    match char::from_u32(code) {
+        Some(character) => {
+            let mut buffer = [0u8; 4];
+            out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Decode JSON, YAML double-quoted and Rust escapes. Anything unrecognized is
+/// kept as written.
+fn unescape_backslashes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'\\' || at + 1 >= bytes.len() {
+            out.push(bytes[at]);
+            at += 1;
+            continue;
+        }
+        let kind = bytes[at + 1];
+        let simple = match kind {
+            b'n' => Some(b'\n'),
+            b'r' => Some(b'\r'),
+            b't' => Some(b'\t'),
+            b'0' => Some(0),
+            b'b' => Some(8),
+            b'f' => Some(12),
+            b'v' => Some(11),
+            b'e' => Some(27),
+            // Any other escaped ASCII punctuation is the character itself
+            // (JSON's `\/`, Markdown's `\_`, a shell's `\#`).
+            other if other.is_ascii_punctuation() || other == b' ' => Some(other),
+            _ => None,
+        };
+        if let Some(byte) = simple {
+            out.push(byte);
+            at += 2;
+            continue;
+        }
+        match kind {
+            b'x' => {
+                if let Some(byte) = bytes.get(at + 2..at + 4).and_then(hex_value) {
+                    out.push(byte as u8);
+                    at += 4;
+                    continue;
+                }
+            }
+            b'u' if bytes.get(at + 2) == Some(&b'{') => {
+                if let Some(close) = bytes[at + 3..].iter().position(|&b| b == b'}') {
+                    if let Some(code) = hex_value(&bytes[at + 3..at + 3 + close]) {
+                        if push_char(&mut out, code) {
+                            at += 4 + close;
+                            continue;
+                        }
+                    }
+                }
+            }
+            b'u' => {
+                if let Some(high) = bytes.get(at + 2..at + 6).and_then(hex_value) {
+                    if (0xD800..0xDC00).contains(&high)
+                        && bytes.get(at + 6) == Some(&b'\\')
+                        && bytes.get(at + 7) == Some(&b'u')
+                    {
+                        if let Some(low) = bytes.get(at + 8..at + 12).and_then(hex_value) {
+                            if (0xDC00..0xE000).contains(&low) {
+                                let code = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+                                if push_char(&mut out, code) {
+                                    at += 12;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if push_char(&mut out, high) {
+                        at += 6;
+                        continue;
+                    }
+                }
+            }
+            b'U' => {
+                if let Some(code) = bytes.get(at + 2..at + 10).and_then(hex_value) {
+                    if push_char(&mut out, code) {
+                        at += 10;
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    out
+}
+
+fn percent_decode(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            if let Some(byte) = bytes.get(at + 1..at + 3).and_then(hex_value) {
+                out.push(byte as u8);
+                at += 3;
+                continue;
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    out
+}
+
+/// HTML named references for the characters [`is_reencoding_hazard`] cares
+/// about and the ASCII punctuation an encoder might spell by name.
+const HTML_NAMED: &[(&str, char)] = &[
+    ("amp", '&'),
+    ("lt", '<'),
+    ("gt", '>'),
+    ("quot", '"'),
+    ("apos", '\''),
+    ("nbsp", '\u{a0}'),
+    ("num", '#'),
+    ("colon", ':'),
+    ("bsol", '\\'),
+    ("sol", '/'),
+    ("NewLine", '\n'),
+    ("Tab", '\t'),
+    ("excl", '!'),
+    ("dollar", '$'),
+    ("percnt", '%'),
+    ("lpar", '('),
+    ("rpar", ')'),
+    ("ast", '*'),
+    ("plus", '+'),
+    ("comma", ','),
+    ("period", '.'),
+    ("semi", ';'),
+    ("equals", '='),
+    ("quest", '?'),
+    ("commat", '@'),
+    ("lsqb", '['),
+    ("lbrack", '['),
+    ("rsqb", ']'),
+    ("rbrack", ']'),
+    ("Hat", '^'),
+    ("lowbar", '_'),
+    ("grave", '`'),
+    ("lcub", '{'),
+    ("lbrace", '{'),
+    ("verbar", '|'),
+    ("vert", '|'),
+    ("rcub", '}'),
+    ("rbrace", '}'),
+];
+
+fn html_unescape(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'&' {
+            if let Some(length) = bytes[at + 1..]
+                .iter()
+                .take(12)
+                .position(|&byte| byte == b';')
+            {
+                let Ok(reference) = std::str::from_utf8(&bytes[at + 1..at + 1 + length]) else {
+                    out.push(bytes[at]);
+                    at += 1;
+                    continue;
+                };
+                let code = if let Some(hex) = reference
+                    .strip_prefix("#x")
+                    .or_else(|| reference.strip_prefix("#X"))
+                {
+                    hex_value(hex.as_bytes())
+                } else if let Some(decimal) = reference.strip_prefix('#') {
+                    decimal.parse::<u32>().ok()
+                } else {
+                    HTML_NAMED
+                        .iter()
+                        .find(|(name, _)| *name == reference)
+                        .map(|(_, character)| *character as u32)
+                };
+                if let Some(code) = code {
+                    if push_char(&mut out, code) {
+                        at += length + 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enable() {
+        enable_display_scrubbing_on_this_thread();
+    }
+
+    #[test]
+    fn registered_values_and_their_encodings_are_redacted() {
+        enable();
+        const SECRET: &str = "zq7-sink-canary-value-5d1c";
+        register_values([SECRET]);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(SECRET);
+        let text = format!("plain {SECRET}\nbase64 {encoded}\nquoted '{SECRET}'\n");
+        assert_eq!(
+            scrub_text(&text),
+            "plain [REDACTED]\nbase64 [REDACTED]\nquoted '[REDACTED]'\n"
+        );
+    }
+
+    /// Too short to replace in prose, but their encodings are long enough
+    /// to be unambiguous.
+    #[test]
+    fn encodings_of_short_values_are_redacted() {
+        enable();
+        register_values(["s3cr3t!"]);
+        let base64 = base64::engine::general_purpose::STANDARD.encode("s3cr3t!");
+        assert_eq!(base64, "czNjcjN0IQ==");
+        assert_eq!(
+            scrub_text(&format!("header {base64} and s3cr3t%21")),
+            "header [REDACTED] and [REDACTED]"
+        );
+        // Ordinary prose that happens to contain the raw value is left to
+        // `peer_text`, which withholds peer text carrying it.
+        assert_eq!(peer_text("bad password s3cr3t!"), DISPLAY_WITHHELD);
+        assert_eq!(peer_text("unrelated failure"), "unrelated failure");
+    }
+
+    #[test]
+    fn a_surviving_run_withholds_only_its_line() {
+        enable();
+        const SECRET: &str = "zq7-sink-fragment-canary-77ab";
+        register_values([SECRET]);
+        let partial = &SECRET[..SECRET.len() - 2];
+        let text = format!("first line\nreflected {partial}\nlast line\n");
+        assert_eq!(
+            scrub_text(&text),
+            format!("first line\n{DISPLAY_WITHHELD}\nlast line\n")
+        );
+    }
+
+    /// A run of a secret that is also the tool's own prose is not evidence:
+    /// the remedy still prints.
+    #[test]
+    fn runs_shared_with_the_tools_own_prose_are_public() {
+        enable();
+        register_values(["seeded-materialized-key"]);
+        let line = "refusing to materialize: 1 credential slot(s) have no value yet";
+        assert!(PUBLIC_PROSE.contains("refusing to materialize"));
+        assert_eq!(scrub_text(line), line);
+        // A longer run than the prose explains is still withheld.
+        assert_eq!(scrub_text("got seeded-materialized"), DISPLAY_WITHHELD);
+    }
+
+    /// Re-encoded spellings are decoded before the scan, so a non-ASCII or
+    /// multi-line value cannot pass as escapes, percent-encoding or HTML
+    /// references.
+    #[test]
+    fn re_encoded_values_are_caught_when_decoded() {
+        enable();
+        register_values(["p\u{e4}ssw\u{f6}rd-zq7-123", "zq7-line-one\nzq7-line-two"]);
+        for reflected in [
+            r"bad password p\u00e4ssw\u00f6rd-zq7-123",
+            r"bad password p\xc3\xa4ssw\xc3\xb6rd-zq7-123",
+            "bad password p%C3%A4ssw%C3%B6rd-zq7-123",
+            "bad password p&#228;ssw&#xf6;rd-zq7-123",
+            r"bad value zq7-line-one\\nzq7-line-two",
+        ] {
+            let scrubbed = scrub_text(reflected);
+            assert!(
+                scrubbed == DISPLAY_WITHHELD || !scrubbed.contains("zq7"),
+                "{reflected} -> {scrubbed}"
+            );
+        }
+        // Peer text is withheld outright while such a value is registered.
+        assert_eq!(peer_text("anything at all"), DISPLAY_WITHHELD);
+    }
+
+    /// Escaped for Markdown (`_` as `\_`, `.` as `&#46;`, the way the PR
+    /// comment writes untrusted text): two encodings in one value.
+    #[test]
+    fn values_escaped_twice_over_are_caught() {
+        enable();
+        const SECRET: &str = "zq7_md.ca_ny.va_ue.x9";
+        register_values([SECRET]);
+        let markdown = SECRET.replace('_', "\\_").replace('.', "&#46;");
+        assert_eq!(scrub_text(&format!("- {markdown}")), DISPLAY_WITHHELD);
+    }
+
+    #[test]
+    fn json_documents_keep_their_shape() {
+        enable();
+        const SECRET: &str = "zq7-json-canary-value-0c4e";
+        register_values([SECRET]);
+        let partial = &SECRET[..SECRET.len() - 3];
+        // Written by hand: `json!` would sort the keys.
+        let document = format!(
+            "{{\n  \"zeta\": \"value {SECRET}\",\n  \"alpha\": \"{partial}\",\n  \
+             \"nested\": [\"p\\\\{partial}\", \"fine\"]\n}}\n"
+        );
+        let scrubbed = scrub_output(&document);
+        let parsed: serde_json::Value = serde_json::from_str(&scrubbed).unwrap();
+        assert_eq!(parsed["zeta"], "value [REDACTED]");
+        assert_eq!(parsed["alpha"], DISPLAY_WITHHELD);
+        assert_eq!(parsed["nested"][0], DISPLAY_WITHHELD);
+        assert_eq!(parsed["nested"][1], "fine");
+        // Key order and formatting are the document's own.
+        assert!(scrubbed.find("zeta").unwrap() < scrubbed.find("alpha").unwrap());
+        assert!(!scrubbed.contains(partial), "{scrubbed}");
+    }
+
+    #[test]
+    fn credential_shapes_are_redacted_unregistered() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ6cTcifQ.c2lnbmF0dXJlLXpxNw";
+        assert_eq!(
+            scrub_text(&format!("rejected Authorization: Bearer {jwt}")),
+            "rejected Authorization: Bearer [REDACTED]"
+        );
+        assert_eq!(
+            scrub_text("token ghs_zq7AAAABBBBCCCCDDDDEEEE lacks scope"),
+            "token [REDACTED] lacks scope"
+        );
+    }
+
+    #[test]
+    fn the_sent_token_window_is_bounded() {
+        enable();
+        let token = |n: usize| format!("zq7-sent-token-{n:04}-padding");
+        for n in 0..=RECENT_TOKEN_WINDOW {
+            register_sent_token(&token(n));
+        }
+        LOCAL.with(|local| {
+            let registry = local.borrow();
+            assert_eq!(registry.tokens.len(), RECENT_TOKEN_WINDOW);
+            assert_eq!(registry.entries.len(), RECENT_TOKEN_WINDOW);
+        });
+        assert_eq!(scrub_text(&token(RECENT_TOKEN_WINDOW)), REDACTION);
+        // The evicted token no longer has a needle of its own.
+        assert_ne!(scrub_text(&token(0)), REDACTION);
+    }
+
+    /// Nothing is registered unless this process or thread opted in.
+    #[test]
+    fn registration_is_opt_in() {
+        register_values(["zq7-unregistered-value-9e0d"]);
+        assert_eq!(
+            scrub_text("zq7-unregistered-value-9e0d"),
+            "zq7-unregistered-value-9e0d"
+        );
+    }
+
+    /// Accepted `/namespaces` names reach the empty-filter warning and the
+    /// JSON scope fields as scrubbed copies; the comparison keeps the raw
+    /// names.
+    #[test]
+    fn live_namespace_names_are_scrubbed_where_displayed() {
+        enable();
+        const TOKEN: &str = "zq7-namespace-token-canary-0b7f";
+        register_sent_token(TOKEN);
+        let partial = &TOKEN[2..TOKEN.len() - 2];
+        let scope = crate::config::NamespaceScope {
+            filter: Some("team-alpha".to_string()),
+            on_disk_namespaces: vec!["team-alpha".to_string()],
+            on_disk_count: 1,
+            desired_count: 1,
+            live_count: Some(0),
+            live_namespaces: vec![TOKEN.to_string(), partial.to_string()],
+        };
+        assert!(scope.live_filter_matched_nothing());
+        let warning = scope.live_warning().unwrap();
+        let json = scope.json_fields().to_string();
+        for rendered in [&warning, &json] {
+            assert!(!rendered.contains(partial), "{rendered}");
+        }
+        assert!(warning.contains(DISPLAY_WITHHELD), "{warning}");
+    }
+
+    /// `/config/export` and `/backup` diagnostics quote response fields; a
+    /// fragment of a sent token there never survives.
+    #[test]
+    fn export_and_backup_diagnostics_never_quote_a_reflected_fragment() {
+        enable();
+        const TOKEN: &str = "zq7-export-token-canary-4a9e";
+        register_sent_token(TOKEN);
+        let fragment = &TOKEN[3..TOKEN.len() - 3];
+        let namespace = serde_json::json!({ "namespace": fragment }).to_string();
+        let fingerprint = serde_json::json!({
+            "namespace": "team-alpha",
+            "redaction": { "fingerprint_algorithm": fragment, "fingerprint_prefix": fragment },
+        })
+        .to_string();
+        let backup = serde_json::json!({
+            "consumers": [{ "id": fragment, "namespace": "other" }],
+        })
+        .to_string();
+        let errors = [
+            crate::config_export::ConfigExport::from_response(&namespace, "team-alpha", false)
+                .err()
+                .unwrap(),
+            crate::config_export::ConfigExport::from_response(&fingerprint, "team-alpha", false)
+                .err()
+                .unwrap(),
+            crate::http_client::BackupSnapshot::from_scoped_body(&backup, "team-alpha")
+                .err()
+                .unwrap(),
+        ];
+        for error in errors {
+            let rendered = format!("{error} {error:?}");
+            assert!(!rendered.contains(fragment), "{rendered}");
+            assert!(rendered.contains(DISPLAY_WITHHELD), "{rendered}");
+        }
+    }
+
+    /// Every write to stdout or stderr goes through this module. A new
+    /// `println!` (or `io::stdout()`, or an inherited child stream) fails
+    /// here; an exception needs a `display-sink:` comment on its line or the
+    /// line above saying why it is safe.
+    #[test]
+    fn no_direct_output_outside_the_sink() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let forbidden = [
+            "println!",
+            "eprintln!",
+            "print!",
+            "eprint!",
+            "dbg!",
+            "io::stdout",
+            "io::stderr",
+            "stdout()",
+            "stderr()",
+            "Stdio::inherit",
+            "set_hook",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        let mut violations = Vec::new();
+        for file in files {
+            let source = std::fs::read_to_string(&file).unwrap();
+            // This module's own tests name the patterns.
+            let source = if file.ends_with("display.rs") {
+                &source[..source.find("#[cfg(test)]\nmod tests").unwrap()]
+            } else {
+                &source[..]
+            };
+            let lines: Vec<&str> = source.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                let hit = forbidden.iter().any(|pattern| {
+                    code.match_indices(pattern).any(|(at, _)| {
+                        !code[..at]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    })
+                });
+                let justified = line.contains("display-sink:")
+                    || index
+                        .checked_sub(1)
+                        .is_some_and(|above| lines[above].contains("display-sink:"));
+                if hit && !justified {
+                    violations.push(format!("{}:{}: {}", file.display(), index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "write through crate::display (outln!/eoutln!/out!/eout!) instead:\n{}",
+            violations.join("\n")
+        );
+    }
+}
