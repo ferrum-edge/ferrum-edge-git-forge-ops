@@ -72,7 +72,10 @@ REQUIRED_CHECKS = (
 )
 # Being added to the ruleset (GHSA-x5m2-4555-q4cr): tolerated while absent,
 # but a reported result must pass, and once required it is waited for.
-ACCEPTED_CHECKS = ("GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",)
+ACCEPTED_CHECKS = (
+    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
+    "Agent Setup Policy / validate-trusted-policy",
+)
 ACTIONS_APP_ID = 15368
 BUDGET_SECONDS = 900
 ASSOCIATION_ATTEMPTS = 5
