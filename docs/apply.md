@@ -319,9 +319,12 @@ unavailable rather than deleted.
 **Proxies and their plugins.** Ferrum Edge rewrites a proxy's association list
 itself when a scoped plugin is created, retargeted or removed. A proxy this
 run reads after its own plugin writes is compared without the associations to
-the plugin configs this run wrote, and with every other association: one
-someone attached or detached concurrently is a change, so the repository's
-list never silently reverts it. The same exclusion lets one apply move a
+the plugin configs this run created or retargeted, and with every other
+association: one someone attached or detached concurrently is a change, so the
+repository's list never silently reverts it. A `proxy`-scoped write may attach
+the plugin to its target, so those associations are left out; an update that
+keeps a plugin's `proxy_group` or `global` scope rewrites no association, so
+every association to that plugin stays in the comparison. The same exclusion lets one apply move a
 scoped plugin to another proxy and delete the proxy it left.
 
 A delete compares the row as this build decodes it, so a concurrent change
