@@ -3734,7 +3734,7 @@ mod bounded_error_message_tests {
         // Registered for this test's thread only.
         crate::display::enable_display_scrubbing_on_this_thread();
         const SECRET: &str = "zq7-display-scrub-canary-91f3";
-        crate::display::register_values([SECRET]);
+        crate::display::register_values("test", [SECRET]).unwrap();
 
         // Gateway: the structured `error` field echoes the value.
         let body = serde_json::json!({
@@ -3779,10 +3779,11 @@ mod bounded_error_message_tests {
         crate::display::enable_display_scrubbing_on_this_thread();
         // Non-ASCII and multiline values can come back re-encoded
         // (`p\u00e4ss…`, a folded YAML scalar) past every needle.
-        crate::display::register_values([
-            "p\u{e4}ssw\u{f6}rd-zq7-123",
-            "zq7-line-one\nzq7-line-two",
-        ]);
+        crate::display::register_values(
+            "test",
+            ["p\u{e4}ssw\u{f6}rd-zq7-123", "zq7-line-one\nzq7-line-two"],
+        )
+        .unwrap();
         for echoed in [
             r#"{"error":"bad password p\u00e4ssw\u00f6rd-zq7-123"}"#,
             r#"{"error":"bad value zq7-line-one\\nzq7-line-two"}"#,
@@ -3800,68 +3801,6 @@ mod bounded_error_message_tests {
         )
         .await;
         assert_eq!(message, crate::display::DISPLAY_WITHHELD);
-    }
-
-    #[test]
-    fn short_registered_values_withhold_peer_text() {
-        // Below the eight-byte replace floor nothing is substituted, so a
-        // surviving value must withhold the text instead. One thread per
-        // length keeps each registration on its own.
-        for length in 1..=7 {
-            std::thread::spawn(move || {
-                let value = &"Zq7xQw9"[..length];
-                crate::display::enable_display_scrubbing_on_this_thread();
-                crate::display::register_values([value]);
-                // Glued to another word: not a token the sink can replace, so
-                // peer text carrying it is withheld.
-                let body = serde_json::json!({ "error": format!("bad password x{value}") });
-                let rendered =
-                    super::map_api_error(400, &body.to_string(), super::RequestKind::Read)
-                        .to_string();
-                assert!(
-                    rendered.contains(crate::display::DISPLAY_WITHHELD),
-                    "{length}: {rendered}"
-                );
-                let body = serde_json::json!({ "error": "unrelated failure" });
-                let rendered =
-                    super::map_api_error(400, &body.to_string(), super::RequestKind::Read)
-                        .to_string();
-                assert!(
-                    rendered.contains("unrelated failure"),
-                    "{length}: {rendered}"
-                );
-            })
-            .join()
-            .unwrap();
-        }
-    }
-
-    /// A value under eight bytes is never replaced in prose, but its
-    /// encodings are long enough to replace, through both peer paths.
-    #[tokio::test]
-    async fn encoded_short_secrets_are_redacted_from_gateway_and_github_errors() {
-        crate::display::enable_display_scrubbing_on_this_thread();
-        const SHORT: &str = "s3cr3t!";
-        crate::display::register_values([SHORT]);
-        use base64::Engine;
-        for encoded in [
-            base64::engine::general_purpose::STANDARD.encode(SHORT),
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(SHORT),
-            "s3cr3t%21".to_string(),
-        ] {
-            let body = serde_json::json!({ "error": format!("bad header value {encoded}") });
-            let rendered =
-                super::map_api_error(400, &body.to_string(), super::RequestKind::Read).to_string();
-            assert!(!rendered.contains(&encoded), "{rendered}");
-            assert!(
-                rendered.contains("bad header value [REDACTED]"),
-                "{rendered}"
-            );
-
-            let body = serde_json::json!({ "message": format!("bad header value {encoded}") });
-            let message = read_error_body_of(body.to_string().into_bytes()).await;
-            assert_eq!(message, "bad header value [REDACTED]");
-        }
     }
 
     #[test]
@@ -3961,7 +3900,7 @@ mod bounded_error_message_tests {
     fn file_mode_refusal_holds_when_a_registered_value_cannot_be_scrubbed() {
         crate::display::enable_display_scrubbing_on_this_thread();
         // `#` makes the value a re-encoding hazard: peer text is withheld.
-        crate::display::register_values(["zq7-signing#key-value-0042"]);
+        crate::display::register_values("test", ["zq7-signing#key-value-0042"]).unwrap();
         assert_eq!(
             crate::display::peer_text("file"),
             crate::display::DISPLAY_WITHHELD
@@ -4009,7 +3948,7 @@ mod bounded_error_message_tests {
     fn every_displayed_peer_field_is_scrubbed() {
         crate::display::enable_display_scrubbing_on_this_thread();
         const SECRET: &str = "zq7-peer-field-canary-77d0";
-        crate::display::register_values([SECRET]);
+        crate::display::register_values("test", [SECRET]).unwrap();
         let cases = [
             (
                 200,

@@ -25,8 +25,11 @@
 //! The CLI calls [`enable_display_scrubbing`] at startup. From then on the
 //! process registers every snapshot the resolver resolves
 //! ([`register_resolved`]), every rotated value it publishes and every token
-//! it reads from the environment ([`register_values`]), and a bounded window
-//! of the admin JWTs it sends ([`register_sent_token`]). Library callers stay
+//! it reads from the environment ([`register_values`]), and every admin JWT
+//! it sends ([`register_sent_token`]), for the rest of the run. Every secret
+//! is at least [`MIN_SCRUB_LENGTH`] bytes: the resolver refuses a shorter
+//! brokered value and [`register_values`] a shorter token, naming where it
+//! came from, so no secret is too short to find. Library callers stay
 //! opted out; a test opts in its own thread only
 //! ([`enable_display_scrubbing_on_this_thread`]), so parallel tests never see
 //! each other's canaries.
@@ -36,10 +39,9 @@
 //! 1. Every registered value and its single-line re-encodings (base64 in four
 //!    alphabets, percent, JSON escaping with and without `\u` escapes for
 //!    non-ASCII, single-quoted YAML, and the forms this crate's sanitizers
-//!    give control characters) become [`REDACTION`] wherever they are at
-//!    least [`MIN_SCRUB_LENGTH`] bytes long, and wherever they stand as a
-//!    whole token below that (see below). A `Bearer` credential and a JWT or
-//!    GitHub token by its shape are redacted too, registered or not.
+//!    give control characters) become [`REDACTION`]. A `Bearer` credential
+//!    and a JWT or GitHub token by its shape are redacted too, registered or
+//!    not.
 //! 2. Any [`FRAGMENT_SCAN_LENGTH`]-byte run of a registered value or of one of
 //!    its encodings that survives withholds the whole line (a JSON string
 //!    value, in a JSON document) with [`DISPLAY_WITHHELD`]. The scan covers
@@ -52,14 +54,13 @@
 //!    so an ordinary remedy that shares eight letters with a seeded value is
 //!    still printed.
 //!
-//! A spelling shorter than [`MIN_SCRUB_LENGTH`] (a short value, or a short
-//! encoding such as `YWJj` for `abc`) is replaced only where it stands as a
-//! whole token, and withholds the line when it stands as one only once
-//! decoded: `on` as a value goes, the `on` in `connection` stays. Text a peer
-//! sent gets the stricter [`peer_text`] at the point it is interpolated,
-//! which withholds it when a short spelling occurs in it at all, or when a
-//! registered value is not safely scrubbable ([`is_reencoding_hazard`]), the
-//! validator-output policy.
+//! Text a peer sent gets the stricter [`peer_text`] at the point it is
+//! interpolated, which withholds it while a registered value is not safely
+//! scrubbable ([`is_reencoding_hazard`]), the validator-output policy.
+//!
+//! Ciphertext a run produces for a person (an age-encrypted credential) is
+//! written byte for byte: [`Composed`] scrubs the text around it and leaves
+//! the ciphertext alone, so a registered value can never corrupt it.
 //!
 //! # Not routed through here
 //!
@@ -70,7 +71,7 @@
 //! them.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -92,11 +93,6 @@ pub const DISPLAY_WITHHELD: &str =
 /// The string literals of this crate's non-test sources (see `build.rs`).
 /// A run of a secret that occurs here is the tool's own prose, not a leak.
 static PUBLIC_PROSE: &str = include_str!(concat!(env!("OUT_DIR"), "/display_corpus.txt"));
-
-/// How many minted admin tokens stay registered. A token is minted per
-/// request, and a reflection comes back in the response to the request that
-/// carried it, so only the recent ones matter.
-const RECENT_TOKEN_WINDOW: usize = 256;
 
 /// The longest excerpt of peer text [`peer_text`] processes and returns.
 const MAX_PEER_TEXT_CHARS: usize = 16 * 1024;
@@ -122,9 +118,6 @@ struct Entry {
     public_text: String,
     windows: Vec<Window>,
     needles: Vec<String>,
-    /// Spellings shorter than [`MIN_SCRUB_LENGTH`]: a short value itself and
-    /// its short encodings (`abc` and `YWJj`).
-    short_spellings: Vec<String>,
     hazardous: bool,
 }
 
@@ -188,13 +181,17 @@ impl Entry {
     fn new(values: &[String], public_text: String) -> Self {
         let mut windows = Vec::new();
         let mut needles = Vec::new();
-        let mut short_spellings = Vec::new();
         let mut hazardous = false;
-        for value in values.iter().filter(|value| !value.is_empty()) {
+        // Shorter values never reach here as secrets: the resolver and
+        // [`register_values`] refuse them, so a short value in a document is a
+        // committed literal, readable in the repository.
+        for value in values
+            .iter()
+            .filter(|value| value.len() >= MIN_SCRUB_LENGTH)
+        {
             hazardous |= is_reencoding_hazard(value);
             for spelling in spellings(value) {
                 if spelling.len() < MIN_SCRUB_LENGTH {
-                    short_spellings.push(spelling);
                     continue;
                 }
                 windows.extend(
@@ -208,13 +205,10 @@ impl Entry {
         windows.dedup();
         needles.sort();
         needles.dedup();
-        short_spellings.sort();
-        short_spellings.dedup();
         Self {
             public_text,
             windows,
             needles,
-            short_spellings,
             hazardous,
         }
     }
@@ -225,14 +219,16 @@ impl Entry {
 struct Registry {
     entries: HashMap<u64, Entry>,
     next_id: u64,
-    /// Sent tokens, oldest first, with their entry ids.
-    tokens: VecDeque<(u64, String)>,
+    /// Every admin JWT this run sent. Kept for the whole run: a response
+    /// can be held and rendered long after later requests.
+    tokens: HashSet<String>,
+    /// Windows of the sent tokens and their spellings. Tokens have no
+    /// public document, so a set is enough (no owners to consult).
+    token_windows: HashSet<Window>,
     /// Window → the entries that own it.
     windows: HashMap<Window, Vec<u64>>,
-    /// First window of a needle → (needle, owner count), longest first.
-    needles: HashMap<Window, Vec<(String, usize)>>,
-    /// Short spellings → owner count. Replaced only as whole tokens.
-    short_spellings: HashMap<String, usize>,
+    /// First window of a needle → the needles, longest first.
+    needles: HashMap<Window, Vec<String>>,
     hazardous: usize,
 }
 
@@ -243,89 +239,45 @@ impl Registry {
         for window in &entry.windows {
             self.windows.entry(*window).or_default().push(id);
         }
-        for needle in &entry.needles {
-            let Some(prefix) = window_at(needle.as_bytes(), 0) else {
-                continue;
-            };
-            let bucket = self.needles.entry(prefix).or_default();
-            match bucket.iter_mut().find(|(known, _)| known == needle) {
-                Some((_, count)) => *count += 1,
-                None => {
-                    bucket.push((needle.clone(), 1));
-                    bucket.sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
-                }
-            }
-        }
-        for value in &entry.short_spellings {
-            *self.short_spellings.entry(value.clone()).or_default() += 1;
-        }
+        self.add_needles(&entry.needles);
         self.hazardous += usize::from(entry.hazardous);
         self.entries.insert(id, entry);
         id
     }
 
-    fn remove(&mut self, id: u64) {
-        let Some(entry) = self.entries.remove(&id) else {
+    fn add_token(&mut self, token: &str) {
+        if !self.tokens.insert(token.to_string()) {
             return;
-        };
-        for window in &entry.windows {
-            if let Some(owners) = self.windows.get_mut(window) {
-                owners.retain(|owner| *owner != id);
-                if owners.is_empty() {
-                    self.windows.remove(window);
-                }
-            }
         }
-        for needle in &entry.needles {
+        let entry = Entry::new(&[token.to_string()], String::new());
+        self.token_windows.extend(entry.windows.iter().copied());
+        self.add_needles(&entry.needles);
+    }
+
+    fn add_needles(&mut self, needles: &[String]) {
+        for needle in needles {
             let Some(prefix) = window_at(needle.as_bytes(), 0) else {
                 continue;
             };
-            if let Some(bucket) = self.needles.get_mut(&prefix) {
-                if let Some(slot) = bucket.iter_mut().find(|(known, _)| known == needle) {
-                    slot.1 -= 1;
-                }
-                bucket.retain(|(_, count)| *count > 0);
-                if bucket.is_empty() {
-                    self.needles.remove(&prefix);
-                }
+            let bucket = self.needles.entry(prefix).or_default();
+            if !bucket.iter().any(|known| known == needle) {
+                bucket.push(needle.clone());
+                bucket.sort_by_key(|known| std::cmp::Reverse(known.len()));
             }
         }
-        for value in &entry.short_spellings {
-            if let Some(count) = self.short_spellings.get_mut(value) {
-                *count -= 1;
-                if *count == 0 {
-                    self.short_spellings.remove(value);
-                }
-            }
-        }
-        self.hazardous -= usize::from(entry.hazardous);
     }
 
-    fn add_token(&mut self, token: &str) {
-        if self.tokens.iter().any(|(_, known)| known == token) {
-            return;
-        }
-        if self.tokens.len() == RECENT_TOKEN_WINDOW {
-            if let Some((oldest, _)) = self.tokens.pop_front() {
-                self.remove(oldest);
-            }
-        }
-        let id = self.insert(Entry::new(&[token.to_string()], String::new()));
-        self.tokens.push_back((id, token.to_string()));
-    }
-
-    /// Replace every needle, then every short spelling standing as a whole
-    /// token, then every credential-shaped word.
+    /// Replace every needle, then every credential-shaped word.
     fn redact(&self, text: &str) -> String {
         if self.needles.is_empty() {
-            return redact_credential_shapes(&self.redact_short(text));
+            return redact_credential_shapes(text);
         }
         let bytes = text.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
         let mut at = 0;
         'scan: while at < bytes.len() {
             if let Some(bucket) = window_at(bytes, at).and_then(|w| self.needles.get(&w)) {
-                for (needle, _) in bucket {
+                for needle in bucket {
                     if bytes[at..].starts_with(needle.as_bytes()) {
                         out.extend_from_slice(REDACTION.as_bytes());
                         at += needle.len();
@@ -340,58 +292,24 @@ impl Registry {
         // replacing it keeps the text valid.
         let replaced = String::from_utf8(out)
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
-        redact_credential_shapes(&self.redact_short(&replaced))
-    }
-
-    /// Replace each short spelling where it stands as a whole token: not
-    /// glued to a letter or digit on a side where the spelling itself starts
-    /// or ends with one. `s3cr3t!` as a resource id goes; the `on` inside
-    /// `connection` stays. A short value glued into a longer word cannot be
-    /// told from prose here; [`Self::peer_text`] withholds peer text that
-    /// carries one at all.
-    fn redact_short(&self, text: &str) -> String {
-        if self.short_spellings.is_empty() {
-            return text.to_string();
-        }
-        let mut spellings: Vec<&str> = self.short_spellings.keys().map(String::as_str).collect();
-        spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
-        let alnum = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        'scan: while let Some(next) = rest.chars().next() {
-            let before = text[..text.len() - rest.len()].chars().next_back();
-            for spelling in &spellings {
-                if !rest.starts_with(spelling) {
-                    continue;
-                }
-                let after = rest[spelling.len()..].chars().next();
-                let open = !(alnum(spelling.chars().next()) && alnum(before));
-                let close = !(alnum(spelling.chars().next_back()) && alnum(after));
-                if open && close {
-                    out.push_str(REDACTION);
-                    rest = &rest[spelling.len()..];
-                    continue 'scan;
-                }
-            }
-            out.push(next);
-            rest = &rest[next.len_utf8()..];
-        }
-        out
+        redact_credential_shapes(&replaced)
     }
 
     /// Is this surviving run evidence of a secret, rather than a run that is
     /// public anyway?
     fn is_leak(&self, window: &Window, cache: &mut HashMap<Window, bool>) -> bool {
-        let Some(owners) = self.windows.get(window) else {
+        let owners = self.windows.get(window);
+        if owners.is_none() && !self.token_windows.contains(window) {
             return false;
-        };
+        }
         *cache.entry(*window).or_insert_with(|| {
             !contains_bytes(PUBLIC_PROSE.as_bytes(), window)
-                && owners.iter().any(|owner| {
-                    self.entries
-                        .get(owner)
-                        .is_some_and(|entry| !contains_bytes(entry.public_text.as_bytes(), window))
-                })
+                && (self.token_windows.contains(window)
+                    || owners.into_iter().flatten().any(|owner| {
+                        self.entries.get(owner).is_some_and(|entry| {
+                            !contains_bytes(entry.public_text.as_bytes(), window)
+                        })
+                    }))
         })
     }
 
@@ -404,7 +322,7 @@ impl Registry {
 
     /// Byte ranges of every surviving run in `bytes`.
     fn leak_ranges(&self, bytes: &[u8], cache: &mut HashMap<Window, bool>) -> Vec<(usize, usize)> {
-        if self.windows.is_empty() || bytes.len() < FRAGMENT_SCAN_LENGTH {
+        if !self.has_windows() || bytes.len() < FRAGMENT_SCAN_LENGTH {
             return Vec::new();
         }
         (0..=bytes.len() - FRAGMENT_SCAN_LENGTH)
@@ -413,37 +331,20 @@ impl Registry {
             .collect()
     }
 
-    /// Does a short spelling stand as a whole token in `bytes` (the rule of
-    /// [`Self::redact_short`])?
-    fn has_short_token(&self, bytes: &[u8]) -> bool {
-        self.short_spellings.keys().any(|spelling| {
-            let spelling = spelling.as_bytes();
-            let alnum = |b: Option<&u8>| b.is_some_and(u8::is_ascii_alphanumeric);
-            bytes.len() >= spelling.len()
-                && (0..=bytes.len() - spelling.len()).any(|at| {
-                    bytes[at..].starts_with(spelling)
-                        && !(alnum(spelling.first()) && alnum(at.checked_sub(1).map(|i| &bytes[i])))
-                        && !(alnum(spelling.last()) && alnum(bytes.get(at + spelling.len())))
-                })
-        })
+    fn has_windows(&self) -> bool {
+        !self.windows.is_empty() || !self.token_windows.is_empty()
     }
 
-    /// Does a decoded spelling of `text` carry a surviving run, or a short
-    /// spelling as a whole token? Those cannot be replaced in place, so the
-    /// caller withholds.
+    /// Does a decoded spelling of `text` carry a surviving run? It cannot be
+    /// replaced in place, so the caller withholds.
     fn leaks_when_decoded(&self, text: &str, cache: &mut HashMap<Window, bool>) -> bool {
-        if self.windows.is_empty() && self.short_spellings.is_empty() {
-            return false;
-        }
-        any_decoded_view(text.as_bytes(), |view| {
-            self.has_short_token(view) || self.has_leak(view, cache)
-        })
+        self.has_windows() && any_decoded_view(text.as_bytes(), |view| self.has_leak(view, cache))
     }
 
     /// The sink's policy for one block of text (see the module docs).
     fn scrub_text(&self, text: &str) -> String {
         let redacted = self.redact(text);
-        if self.windows.is_empty() && self.short_spellings.is_empty() {
+        if !self.has_windows() {
             return redacted;
         }
         let mut cache = HashMap::new();
@@ -491,14 +392,8 @@ impl Registry {
         };
         let mut redacted = self.redact(text);
         let mut cache = HashMap::new();
-        let leaks = |bytes: &[u8], cache: &mut HashMap<Window, bool>| {
-            self.short_spellings
-                .keys()
-                .any(|spelling| contains_bytes(bytes, spelling.as_bytes()))
-                || self.has_leak(bytes, cache)
-        };
-        if leaks(redacted.as_bytes(), &mut cache)
-            || any_decoded_view(redacted.as_bytes(), |view| leaks(view, &mut cache))
+        if self.has_leak(redacted.as_bytes(), &mut cache)
+            || self.leaks_when_decoded(&redacted, &mut cache)
         {
             return DISPLAY_WITHHELD.to_string();
         }
@@ -574,18 +469,35 @@ pub fn register_resolved(config: &GatewayConfig, report: &ResolveReport) {
 
 /// Register secrets that are in no gateway document: a generated rotation
 /// value, or a token this process sends (`GITHUB_TOKEN` and friends).
-pub fn register_values<I, S>(values: I)
+///
+/// A non-empty value shorter than [`MIN_SCRUB_LENGTH`] is refused with an
+/// error naming `source` (never the value): it could not be found again in
+/// output without matching ordinary words.
+pub fn register_values<I, S>(source: &str, values: I) -> crate::error::Result<()>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    let values: Vec<String> = values
+        .into_iter()
+        .map(Into::into)
+        .filter(|value| !value.is_empty())
+        .collect();
+    if values.iter().any(|value| value.len() < MIN_SCRUB_LENGTH) {
+        return Err(crate::error::Error::Config(format!(
+            "{source} holds a secret shorter than {MIN_SCRUB_LENGTH} bytes; secrets this tool \
+             handles must be at least {MIN_SCRUB_LENGTH} bytes so they can be removed from \
+             its output. Use a longer value."
+        )));
+    }
     if registering() {
         register_scrubber(&SecretScrubber::from_secret_values(values));
     }
+    Ok(())
 }
 
-/// Register an admin JWT this process is about to send, into the bounded
-/// recent-token window.
+/// Register an admin JWT this process is about to send, for the rest of the
+/// run.
 pub fn register_sent_token(token: &str) {
     if !token.is_empty() && registering() {
         with_registry_mut(|registry| registry.add_token(token));
@@ -624,9 +536,8 @@ pub fn scrub_output(text: &str) -> String {
 /// Stricter than the sink, because nothing in it is the tool's own prose: it
 /// is withheld whole when a registered value is not safely scrubbable
 /// ([`is_reencoding_hazard`]: a peer can re-encode it past every needle),
-/// when a registered value of any length occurs in it, or when a run of one
-/// survives redaction. Use it only on the displayed copy; decisions read the
-/// raw value.
+/// or when a run of one survives redaction, and only a bounded excerpt is
+/// kept. Use it only on the displayed copy; decisions read the raw value.
 pub fn peer_text(text: &str) -> String {
     with_registry(|registry| registry.peer_text(text))
 }
@@ -669,6 +580,55 @@ pub fn write_data_stdout(payload: &[u8]) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(payload)?;
     stdout.flush()
+}
+
+/// Output that mixes text with ciphertext the run produced for a person (an
+/// age-encrypted credential). [`Composed::render`] scrubs the text parts and
+/// keeps every data part byte for byte, so the recipient can still decrypt
+/// whatever values are registered.
+#[derive(Debug, Clone, Default)]
+pub struct Composed {
+    parts: Vec<(bool, String)>,
+}
+
+impl Composed {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Text that goes through the sink.
+    pub fn text(&mut self, text: impl Into<String>) -> &mut Self {
+        self.parts.push((false, text.into()));
+        self
+    }
+
+    /// Ciphertext, written unchanged. Only for data this process produced
+    /// (never peer text): it is not scrubbed.
+    pub fn data(&mut self, data: impl Into<String>) -> &mut Self {
+        self.parts.push((true, data.into()));
+        self
+    }
+
+    /// The text parts scrubbed, the data parts as given.
+    pub fn render(&self) -> String {
+        self.parts
+            .iter()
+            .map(|(data, part)| {
+                if *data {
+                    part.clone()
+                } else {
+                    scrub_text(part)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Write a [`Composed`] message to stdout.
+pub fn write_composed_stdout(message: &Composed) {
+    if let Err(error) = write_data_stdout(message.render().as_bytes()) {
+        panic!("failed printing to stdout: {error}");
+    }
 }
 
 /// Whether stdout is an interactive terminal.
@@ -1122,75 +1082,13 @@ mod tests {
     fn registered_values_and_their_encodings_are_redacted() {
         enable();
         const SECRET: &str = "zq7-sink-canary-value-5d1c";
-        register_values([SECRET]);
+        register_values("test", [SECRET]).unwrap();
         let encoded = base64::engine::general_purpose::STANDARD.encode(SECRET);
         let text = format!("plain {SECRET}\nbase64 {encoded}\nquoted '{SECRET}'\n");
         assert_eq!(
             scrub_text(&text),
             "plain [REDACTED]\nbase64 [REDACTED]\nquoted '[REDACTED]'\n"
         );
-    }
-
-    /// Too short to replace in prose, but their encodings are long enough
-    /// to be unambiguous.
-    #[test]
-    fn encodings_of_short_values_are_redacted() {
-        enable();
-        register_values(["s3cr3t!"]);
-        let base64 = base64::engine::general_purpose::STANDARD.encode("s3cr3t!");
-        assert_eq!(base64, "czNjcjN0IQ==");
-        assert_eq!(
-            scrub_text(&format!("header {base64} and s3cr3t%21")),
-            "header [REDACTED] and [REDACTED]"
-        );
-        // The value itself goes where it stands as a token (a live resource
-        // id, a field value) ...
-        assert_eq!(
-            scrub_text("  MODIFY Proxy s3cr3t! (team-alpha)"),
-            "  MODIFY Proxy [REDACTED] (team-alpha)"
-        );
-        // ... and a line holding it only once decoded is withheld.
-        assert_eq!(scrub_text(r"- s3cr3t\! changed"), DISPLAY_WITHHELD);
-        // Peer text holding it anywhere, even glued to a word, is withheld.
-        assert_eq!(peer_text("bad password s3cr3t!"), "bad password [REDACTED]");
-        assert_eq!(peer_text("bad password xs3cr3t!"), DISPLAY_WITHHELD);
-        assert_eq!(peer_text("unrelated failure"), "unrelated failure");
-    }
-
-    /// Short values of every length, and their padded and unpadded base64,
-    /// as whole tokens; a word that merely contains one is left alone.
-    #[test]
-    fn short_values_are_redacted_as_tokens_only() {
-        for length in 1..=7 {
-            std::thread::spawn(move || {
-                enable();
-                let value = &"Zq7xQw9"[..length];
-                register_values([value]);
-                use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
-                for spelling in [
-                    value.to_string(),
-                    STANDARD.encode(value),
-                    STANDARD_NO_PAD.encode(value),
-                ] {
-                    assert_eq!(
-                        scrub_text(&format!("value {spelling} here")),
-                        "value [REDACTED] here",
-                        "{length}: {spelling}"
-                    );
-                    assert_eq!(
-                        peer_text(&format!("bad value {spelling}")),
-                        "bad value [REDACTED]",
-                        "{length}: {spelling}"
-                    );
-                }
-                assert_eq!(
-                    scrub_text(&format!("x{value}x stays")),
-                    format!("x{value}x stays")
-                );
-            })
-            .join()
-            .unwrap();
-        }
     }
 
     /// A peer field is processed and shown only up to a bounded excerpt.
@@ -1202,11 +1100,69 @@ mod tests {
         assert!(peak <= 2 * 1024 * 1024, "peer_text peaked at {peak} bytes");
     }
 
+    /// A secret too short to find in output is refused, naming where it
+    /// came from and never the value.
+    #[test]
+    fn short_secrets_are_refused_by_source() {
+        enable();
+        let error = register_values("GITHUB_TOKEN", ["s3cr3t!"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("GITHUB_TOKEN"), "{error}");
+        assert!(error.contains("8 bytes"), "{error}");
+        assert!(!error.contains("s3cr3t"), "{error}");
+        register_values("GITHUB_TOKEN", ["", "long-enough-value"]).unwrap();
+    }
+
+    /// Every sent token stays registered for the whole run, however many
+    /// requests follow: a response can be rendered long after it arrived.
+    #[test]
+    fn sent_tokens_stay_registered_for_the_run() {
+        enable();
+        let token = |n: usize| format!("zq7-sent-token-{n:04}-signature-part");
+        for n in 0..1000 {
+            register_sent_token(&token(n));
+        }
+        assert_eq!(scrub_text(&token(0)), REDACTION);
+        // A fragment of the first token is still recognized.
+        assert_eq!(
+            scrub_text(&format!("id {}", &token(0)[4..20])),
+            DISPLAY_WITHHELD
+        );
+    }
+
+    /// Ciphertext is written byte for byte, whatever is registered; only the
+    /// text around it is scrubbed.
+    #[test]
+    fn composed_output_keeps_ciphertext_intact() {
+        enable();
+        const ARMOR: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
+        let payload = format!("{ARMOR}\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IHNzaC1lZDI1NTE5\n-----END AGE ENCRYPTED FILE-----\n");
+        // Values that occur inside the armor and the base64.
+        register_values("test", [ARMOR, "YWdlLWVuY3J5cHRpb24"]).unwrap();
+        // Short punctuation values cannot be registered at all; force them
+        // into this thread's registry to prove the data path ignores it.
+        LOCAL.with(|local| {
+            local
+                .borrow_mut()
+                .add_needles(&["-----".to_string(), "/////////".to_string()])
+        });
+        let mut message = Composed::new();
+        message.text(format!("Encrypted to @octocat, header {ARMOR}:\n"));
+        message.data(payload.as_str());
+        let rendered = message.render();
+        assert!(rendered.ends_with(&payload), "{rendered}");
+        assert!(
+            rendered.starts_with("Encrypted to @octocat, header [REDACTED]"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn a_surviving_run_withholds_only_its_line() {
         enable();
         const SECRET: &str = "zq7-sink-fragment-canary-77ab";
-        register_values([SECRET]);
+        register_values("test", [SECRET]).unwrap();
         let partial = &SECRET[..SECRET.len() - 2];
         let text = format!("first line\nreflected {partial}\nlast line\n");
         assert_eq!(
@@ -1220,7 +1176,7 @@ mod tests {
     #[test]
     fn runs_shared_with_the_tools_own_prose_are_public() {
         enable();
-        register_values(["seeded-materialized-key"]);
+        register_values("test", ["seeded-materialized-key"]).unwrap();
         let line = "refusing to materialize: 1 credential slot(s) have no value yet";
         assert!(PUBLIC_PROSE.contains("refusing to materialize"));
         assert_eq!(scrub_text(line), line);
@@ -1234,7 +1190,11 @@ mod tests {
     #[test]
     fn re_encoded_values_are_caught_when_decoded() {
         enable();
-        register_values(["p\u{e4}ssw\u{f6}rd-zq7-123", "zq7-line-one\nzq7-line-two"]);
+        register_values(
+            "test",
+            ["p\u{e4}ssw\u{f6}rd-zq7-123", "zq7-line-one\nzq7-line-two"],
+        )
+        .unwrap();
         for reflected in [
             r"bad password p\u00e4ssw\u00f6rd-zq7-123",
             r"bad password p\xc3\xa4ssw\xc3\xb6rd-zq7-123",
@@ -1258,7 +1218,7 @@ mod tests {
     fn values_escaped_twice_over_are_caught() {
         enable();
         const SECRET: &str = "zq7_md.ca_ny.va_ue.x9";
-        register_values([SECRET]);
+        register_values("test", [SECRET]).unwrap();
         let markdown = SECRET.replace('_', "\\_").replace('.', "&#46;");
         assert_eq!(scrub_text(&format!("- {markdown}")), DISPLAY_WITHHELD);
     }
@@ -1267,7 +1227,7 @@ mod tests {
     fn json_documents_keep_their_shape() {
         enable();
         const SECRET: &str = "zq7-json-canary-value-0c4e";
-        register_values([SECRET]);
+        register_values("test", [SECRET]).unwrap();
         let partial = &SECRET[..SECRET.len() - 3];
         // Written by hand: `json!` would sort the keys.
         let document = format!(
@@ -1298,27 +1258,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_sent_token_window_is_bounded() {
-        enable();
-        let token = |n: usize| format!("zq7-sent-token-{n:04}-padding");
-        for n in 0..=RECENT_TOKEN_WINDOW {
-            register_sent_token(&token(n));
-        }
-        LOCAL.with(|local| {
-            let registry = local.borrow();
-            assert_eq!(registry.tokens.len(), RECENT_TOKEN_WINDOW);
-            assert_eq!(registry.entries.len(), RECENT_TOKEN_WINDOW);
-        });
-        assert_eq!(scrub_text(&token(RECENT_TOKEN_WINDOW)), REDACTION);
-        // The evicted token no longer has a needle of its own.
-        assert_ne!(scrub_text(&token(0)), REDACTION);
-    }
-
     /// Nothing is registered unless this process or thread opted in.
     #[test]
     fn registration_is_opt_in() {
-        register_values(["zq7-unregistered-value-9e0d"]);
+        register_values("test", ["zq7-unregistered-value-9e0d"]).unwrap();
         assert_eq!(
             scrub_text("zq7-unregistered-value-9e0d"),
             "zq7-unregistered-value-9e0d"

@@ -506,14 +506,17 @@ fn resolver_replaces_known_slot_and_reports_resolved() {
     cfg.consumers.push(consumer);
 
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/keyauth".to_string(), "abcdef".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth".to_string(),
+        "abcdef-key-0001".to_string(),
+    );
 
     let report = resolve_secrets(&mut cfg, &bundle).unwrap();
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].status, SlotStatus::Resolved);
     assert_eq!(
         cfg.consumers[0].credentials.get("keyauth").unwrap(),
-        &serde_json::Value::String("abcdef".to_string())
+        &serde_json::Value::String("abcdef-key-0001".to_string())
     );
 }
 
@@ -1869,8 +1872,14 @@ fn steady_multi_entry_credential_array_still_resolves() {
         serde_json::Value::Array(vec![entry("key", GENERATE), entry("key", GENERATE)]),
     );
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/keyauth/key".to_string(), "a".to_string());
-    bundle.insert("ferrum/app/keyauth/[1]/key".to_string(), "b".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "value-aaaa".to_string(),
+    );
+    bundle.insert(
+        "ferrum/app/keyauth/[1]/key".to_string(),
+        "value-bbbb".to_string(),
+    );
 
     let report = report_secrets(&cfg, &bundle).unwrap();
 
@@ -1913,7 +1922,10 @@ fn shrunk_credential_array_refuses_the_orphaned_slot_remap() {
         serde_json::Value::Array(vec![entry("key", REQUIRE)]),
     );
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/keyauth/key".to_string(), "live".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "live-value".to_string(),
+    );
     bundle.insert(
         "ferrum/app/keyauth/[1]/key".to_string(),
         "retired-but-still-stored".to_string(),
@@ -1937,7 +1949,7 @@ fn shrunk_credential_array_refuses_the_orphaned_slot_remap() {
     );
     // Slot names are structural; stored values are not. Neither may leak.
     assert!(
-        !err.contains("retired-but-still-stored") && !err.contains("live"),
+        !err.contains("retired-but-still-stored") && !err.contains("live-value"),
         "a refusal must never echo bundle values: {err}"
     );
 }
@@ -1953,10 +1965,13 @@ fn allowed_slot_remap_downgrades_the_shrink_refusal_to_a_report() {
         serde_json::Value::Array(vec![entry("key", REQUIRE)]),
     );
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/keyauth/key".to_string(), "live".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "live-value".to_string(),
+    );
     bundle.insert(
         "ferrum/app/keyauth/[1]/key".to_string(),
-        "retired".to_string(),
+        "retired-value".to_string(),
     );
 
     let report =
@@ -1985,8 +2000,14 @@ fn resolve_secrets_refuses_the_same_shrink_report_secrets_refuses() {
         serde_json::Value::Array(vec![entry("key", REQUIRE)]),
     );
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/keyauth/key".to_string(), "live".to_string());
-    bundle.insert("ferrum/app/keyauth/[1]/key".to_string(), "old".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "live-value".to_string(),
+    );
+    bundle.insert(
+        "ferrum/app/keyauth/[1]/key".to_string(),
+        "old-value".to_string(),
+    );
 
     assert!(
         resolve_secrets(&mut cfg, &bundle).is_err(),
@@ -2005,7 +2026,10 @@ fn single_entry_placeholder_consumer_still_resolves() {
         serde_json::Value::Array(vec![entry("key", REQUIRE)]),
     );
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/keyauth/key".to_string(), "live".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "live-value".to_string(),
+    );
 
     let report = report_secrets(&cfg, &bundle).expect("single-entry arrays are the common case");
 
@@ -2039,8 +2063,14 @@ fn matching_bundle_slots_raise_no_orphan_warning() {
         serde_json::Value::Array(vec![entry("key", REQUIRE), entry("key", REQUIRE)]),
     );
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/keyauth/key".to_string(), "a".to_string());
-    bundle.insert("ferrum/app/keyauth/[1]/key".to_string(), "b".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "value-aaaa".to_string(),
+    );
+    bundle.insert(
+        "ferrum/app/keyauth/[1]/key".to_string(),
+        "value-bbbb".to_string(),
+    );
 
     let report = report_secrets(&cfg, &bundle).unwrap();
 
@@ -2069,8 +2099,14 @@ fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
         serde_json::Value::Array(vec![entry("key", REQUIRE), entry("key", REQUIRE)]),
     );
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/app/keyauth/key".to_string(), "a".to_string());
-    bundle.insert("ferrum/app/keyauth/[1]/key".to_string(), "b".to_string());
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "value-aaaa".to_string(),
+    );
+    bundle.insert(
+        "ferrum/app/keyauth/[1]/key".to_string(),
+        "value-bbbb".to_string(),
+    );
 
     let report = report_secrets(&cfg, &bundle).expect("rotation preflight must not be blocked");
 
@@ -2967,7 +3003,7 @@ fn revival_check_is_limited_to_consumer_slots() {
     let mut bundle = BTreeMap::new();
     bundle.insert(
         "ferrum/opaque/@plugin/custom_fixture/config/display_mode".to_string(),
-        "stored".to_string(),
+        "stored-value".to_string(),
     );
     let ledger = ledger_of(&[], ConsumerCoverage::Complete);
     let report = report_with_ledger(&cfg, &bundle, &ledger, false).expect("not a Consumer slot");
@@ -4149,7 +4185,7 @@ fn reserve_shard_keeps_a_slot_on_its_existing_shard() {
     shards
         .entry(3)
         .or_default()
-        .insert(slot.to_string(), "old".to_string());
+        .insert(slot.to_string(), "old-value".to_string());
 
     let mut shard_count = 8;
     let shard = reserve_shard(slot, 64, &shards, &mut shard_count, "rotating")

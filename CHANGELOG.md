@@ -110,6 +110,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   platform that cannot enforce owner-only permissions. Unix behavior and
   ordinary (non-private) publications are unchanged.
 
+- **BREAKING:** brokered secrets must be at least 8 bytes. A bundle value
+  shorter than that is refused when it is resolved (every command that reads
+  the slot, before any request), and a non-empty `GH_TOKEN`, `GITHUB_TOKEN`,
+  `FERRUM_GH_PROVISIONER_TOKEN`, `FERRUM_ADMIN_JWT_SECRET` or
+  `FERRUM_ADMIN_JWT_VIEWER_SECRET` shorter than that stops the CLI at
+  startup. The error names the slot or variable, never the value. A secret
+  that short cannot be found in output without matching ordinary words, so
+  it could not be kept out of what the CLI displays. Re-seed such a slot with
+  a longer value or rotate it (generated values are always longer).
+  Short enum-like plugin settings (`mode: dry_run`) belong in the resource
+  YAML, not the broker.
+
 - The release gate also accepts the Agent Setup Policy's
   `validate-trusted-policy` check (#565): absent is tolerated until the `main`
   ruleset requires it, but a reported result must pass and a required one is
@@ -472,23 +484,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Error:` line, panic messages, and the review comment posted to a PR or
   written to `$GITHUB_STEP_SUMMARY` go through one sink (`src/display.rs`);
   a unit test fails on any other write to stdout or stderr. Each run
-  registers every value it resolves, every rotated value it publishes, a
-  window of the admin JWTs it sends, and the GitHub tokens and admin JWT
+  registers every value it resolves, every rotated value it publishes, every
+  admin JWT it sends (for the whole run), and the GitHub tokens and admin JWT
   secrets in its environment. The sink replaces those values and their
   base64, percent, JSON-escaped and single-quoted spellings and any
-  `Bearer`, JWT- or GitHub-token-shaped word with `[REDACTED]`; a value or
-  encoding under 8 bytes is replaced where it stands as a whole token. A line (or a JSON string value)
-  that still holds an 8-byte run of one, as written or after decoding
-  escapes, percent-encoding or HTML references, is withheld; runs that are
-  also in the scrubbed configuration or in the tool's own messages are
-  public. Peer text (a gateway `error`, `reason` or `rollback`, GitHub's
-  `message`, `/namespaces`, `/health`, `/cluster` and `/config/export`
-  fields, override logins and permissions) is additionally withheld where it
-  is quoted when it holds a registered value of any length, or while a
-  registered value is not safely scrubbable. Parsed responses keep their raw
-  values, so decisions such as the file-mode write refusal never see a
-  scrubbed copy. A successful response that does not parse is reported by
-  error category and position only.
+  `Bearer`, JWT- or GitHub-token-shaped word with `[REDACTED]`. A line (or a
+  JSON string value) that still holds an 8-byte run of one, as written or
+  after decoding escapes, percent-encoding or HTML references, is withheld;
+  runs that are also in the scrubbed configuration or in the tool's own
+  messages are public. Peer text (a gateway `error`, `reason` or `rollback`,
+  GitHub's `message`, `/namespaces`, `/health`, `/cluster` and
+  `/config/export` fields, override logins and permissions) is additionally
+  withheld while a registered value is not safely scrubbable. Parsed
+  responses keep their raw values, so decisions such as the file-mode write
+  refusal never see a scrubbed copy. Age-encrypted credential deliveries are
+  written byte for byte; only the text around them is scrubbed. A successful
+  response that does not parse is reported by error category and position
+  only.
 - Finish bounding error bodies and validator I/O (follow-up to #553). The
   gateway's structured `error` message is now one bounded line like every
   other displayed error body, and a failed PR-comment POST reads GitHub's

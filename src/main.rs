@@ -49,17 +49,20 @@ async fn main() {
     // echo them.
     display::enable_display_scrubbing();
     display::install_panic_hook();
-    display::register_values(
-        [
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-            "FERRUM_GH_PROVISIONER_TOKEN",
-            "FERRUM_ADMIN_JWT_SECRET",
-            "FERRUM_ADMIN_JWT_VIEWER_SECRET",
-        ]
-        .into_iter()
-        .filter_map(|name| std::env::var(name).ok()),
-    );
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "FERRUM_GH_PROVISIONER_TOKEN",
+        "FERRUM_ADMIN_JWT_SECRET",
+        "FERRUM_ADMIN_JWT_VIEWER_SECRET",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            if let Err(error) = display::register_values(name, [value]) {
+                eoutln!("Error: {}", safe_block(&error));
+                process::exit(1);
+            }
+        }
+    }
     // Help, version and usage errors go through the sink like everything
     // else.
     let cli = cli::Cli::try_parse().unwrap_or_else(|error| {
@@ -712,32 +715,35 @@ async fn surface_delivered_credentials(
         return Ok(());
     }
 
-    let mut body = String::from("## GitForgeOps — New Credentials Allocated\n\n");
-    body.push_str(
+    // The ciphertext is data for the recipient: written byte for byte, while
+    // the text around it goes through the display sink.
+    let mut body = display::Composed::new();
+    body.text("## GitForgeOps — New Credentials Allocated\n\n");
+    body.text(
         "The credentials below were generated during apply. Each blob is age-encrypted to the recipient's GitHub-published SSH key. Decrypt locally:\n\n",
     );
-    body.push_str("```\nage -d -i ~/.ssh/id_ed25519 < blob.age\n```\n\n");
+    body.text("```\nage -d -i ~/.ssh/id_ed25519 < blob.age\n```\n\n");
 
     let mut undelivered: Vec<&str> = Vec::new();
 
     for slot in &outcome.allocated {
-        body.push_str(&format!("### `{}`\n\n", slot.slot));
+        body.text(format!("### `{}`\n\n", slot.slot));
         match &slot.delivered {
             Some(d) => {
-                body.push_str(&format!(
+                body.text(format!(
                     "Encrypted to **@{}** (SSH fingerprint `{}`):\n\n",
                     d.login, d.key_fingerprint
                 ));
-                body.push_str("```\n");
-                body.push_str(&d.encrypted_b64);
+                body.text("```\n");
+                body.data(d.encrypted_b64.as_str());
                 if !d.encrypted_b64.ends_with('\n') {
-                    body.push('\n');
+                    body.text("\n");
                 }
-                body.push_str("```\n\n");
+                body.text("```\n\n");
             }
             None => {
                 undelivered.push(slot.slot.as_str());
-                body.push_str(
+                body.text(
                     "**NOT DELIVERED** — the recipient had no SSH key on file or was not provided. Run `gitforgeops rotate` after adding an SSH key to deliver the value.\n\n",
                 );
             }
@@ -752,7 +758,7 @@ async fn surface_delivered_credentials(
         && env_config.github_repository.is_some();
 
     if let (Some(pr), true) = (pr_number, can_post_pr) {
-        match review::post_pr_comment(env_config, pr, &body).await {
+        match review::post_composed_pr_comment(env_config, pr, &body).await {
             Ok(()) => {
                 eoutln!(
                     "Posted encrypted credential delivery to PR #{pr} ({} slot(s)).",
@@ -772,7 +778,8 @@ async fn surface_delivered_credentials(
 
     // Stdout fallback. Also warn if any slots weren't delivered at all.
     outln!();
-    outln!("{}", body);
+    body.text("\n");
+    display::write_composed_stdout(&body);
     if !undelivered.is_empty() {
         eoutln!(
             "Warning: {} slot(s) could not be delivered (no recipient SSH key): {}",
@@ -4938,7 +4945,9 @@ async fn cmd_rotate(
                 safe(&d.login),
                 safe(&d.key_fingerprint)
             );
-            outln!("{}", d.encrypted_b64);
+            let mut blob = display::Composed::new();
+            blob.data(d.encrypted_b64.as_str()).text("\n");
+            display::write_composed_stdout(&blob);
         }
         None => {
             if recipient.is_some() {
