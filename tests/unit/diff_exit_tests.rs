@@ -1797,3 +1797,41 @@ fn a_whole_value_fingerprinted_around_a_secret_is_never_accepted() {
     assert_eq!(report["secret_fingerprints"]["masked_ancestor_fields"], 1);
     assert_eq!(report["secret_fingerprints"]["authoritative"], false);
 }
+
+/// A successful live read can carry a registered value in an ordinary
+/// field. Even a value under eight bytes never reaches the diff output.
+#[test]
+fn a_short_registered_value_in_a_live_field_is_not_displayed() {
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let config = serde_json::json!({ "service_label": placeholder, "protocol": "grpc" });
+    let live = serde_json::json!({ "service_label": fingerprint('e'), "protocol": "grpc" });
+    // The gateway also holds a proxy whose id is the value.
+    let mut export: serde_json::Value = serde_json::from_str(&plugin_export(live)).unwrap();
+    export["proxies"] = serde_json::json!([{
+        "id": "s3cr3t!",
+        "namespace": "ferrum",
+        "listen_path": "/reflected",
+        "backend_protocol": "http",
+        "backend_host": "backend.internal",
+        "backend_port": 8080,
+    }]);
+    export["counts"]["proxies"] = serde_json::json!(1);
+    let repo = Repo::new(
+        &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+        vec![("ferrum".to_string(), export.to_string())],
+    );
+    let slot = "ferrum/otel/@plugin/otel_tracing/config/service_label";
+    let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: "s3cr3t!" } }).to_string();
+    let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+    env.push(("FERRUM_CREDS_JSON", &bundle));
+
+    let output = repo.run_with_env(&["diff", "--accept-unverified-secrets"], &env);
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(shown.contains("Proxy [REDACTED] (ferrum)"), "{shown}");
+    assert!(!shown.contains("s3cr3t!"), "{shown}");
+
+    let args = ["diff", "--format", "json", "--accept-unverified-secrets"];
+    let output = repo.run_with_env(&args, &env);
+    serde_json::from_str::<serde_json::Value>(&stdout(&output)).unwrap();
+    assert!(!format!("{}{}", stdout(&output), stderr(&output)).contains("s3cr3t!"));
+}

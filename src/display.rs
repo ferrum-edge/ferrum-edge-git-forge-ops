@@ -35,11 +35,11 @@
 //!
 //! 1. Every registered value and its single-line re-encodings (base64 in four
 //!    alphabets, percent, JSON escaping with and without `\u` escapes for
-//!    non-ASCII, single-quoted YAML) become [`REDACTION`] wherever they are at
-//!    least [`MIN_SCRUB_LENGTH`] bytes long. That includes the encodings of a
-//!    value too short to replace itself: `s3cr3t!` is left alone in prose,
-//!    but its base64 `czNjcjN0IQ==` is not. A `Bearer` credential and a JWT
-//!    or GitHub token by its shape are redacted too, registered or not.
+//!    non-ASCII, single-quoted YAML, and the forms this crate's sanitizers
+//!    give control characters) become [`REDACTION`] wherever they are at
+//!    least [`MIN_SCRUB_LENGTH`] bytes long, and wherever they stand as a
+//!    whole token below that (see below). A `Bearer` credential and a JWT or
+//!    GitHub token by its shape are redacted too, registered or not.
 //! 2. Any [`FRAGMENT_SCAN_LENGTH`]-byte run of a registered value or of one of
 //!    its encodings that survives withholds the whole line (a JSON string
 //!    value, in a JSON document) with [`DISPLAY_WITHHELD`]. The scan covers
@@ -52,12 +52,14 @@
 //!    so an ordinary remedy that shares eight letters with a seeded value is
 //!    still printed.
 //!
-//! A raw value shorter than [`MIN_SCRUB_LENGTH`] is not looked for in the
-//! tool's own prose: `on` or `dev` would match ordinary words everywhere.
-//! Text a peer sent gets the stricter [`peer_text`] at the point it is
-//! interpolated, which withholds it when such a value occurs in it at all,
-//! or when a registered value is not safely scrubbable
-//! ([`is_reencoding_hazard`]), the validator-output policy.
+//! A spelling shorter than [`MIN_SCRUB_LENGTH`] (a short value, or a short
+//! encoding such as `YWJj` for `abc`) is replaced only where it stands as a
+//! whole token, and withholds the line when it stands as one only once
+//! decoded: `on` as a value goes, the `on` in `connection` stays. Text a peer
+//! sent gets the stricter [`peer_text`] at the point it is interpolated,
+//! which withholds it when a short spelling occurs in it at all, or when a
+//! registered value is not safely scrubbable ([`is_reencoding_hazard`]), the
+//! validator-output policy.
 //!
 //! # Not routed through here
 //!
@@ -96,6 +98,9 @@ static PUBLIC_PROSE: &str = include_str!(concat!(env!("OUT_DIR"), "/display_corp
 /// carried it, so only the recent ones matter.
 const RECENT_TOKEN_WINDOW: usize = 256;
 
+/// The longest excerpt of peer text [`peer_text`] processes and returns.
+const MAX_PEER_TEXT_CHARS: usize = 16 * 1024;
+
 type Window = [u8; FRAGMENT_SCAN_LENGTH];
 
 fn window_at(bytes: &[u8], at: usize) -> Option<Window> {
@@ -117,13 +122,15 @@ struct Entry {
     public_text: String,
     windows: Vec<Window>,
     needles: Vec<String>,
-    short_values: Vec<String>,
+    /// Spellings shorter than [`MIN_SCRUB_LENGTH`]: a short value itself and
+    /// its short encodings (`abc` and `YWJj`).
+    short_spellings: Vec<String>,
     hazardous: bool,
 }
 
-/// Every spelling of `value` the sink replaces. Only spellings of at least
-/// [`MIN_SCRUB_LENGTH`] bytes are kept, so a short value contributes its
-/// longer encodings but never itself.
+/// Every spelling of `value` the sink looks for: the value, its encodings,
+/// and the forms this crate's own sanitizers turn it into (control
+/// characters as U+FFFD or as spaces).
 fn spellings(value: &str) -> Vec<String> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
     let bytes = value.as_bytes();
@@ -138,7 +145,17 @@ fn spellings(value: &str) -> Vec<String> {
         ascii_json_escaped(value),
     ];
     all.extend(json_escaped(value));
-    all.retain(|spelling| spelling.len() >= MIN_SCRUB_LENGTH);
+    if value.chars().any(char::is_control) {
+        let replaced = |with: char| {
+            value
+                .chars()
+                .map(|c| if c.is_control() { with } else { c })
+                .collect::<String>()
+        };
+        all.push(replaced(crate::diagnostics::REPLACEMENT));
+        all.push(replaced(' '));
+    }
+    all.retain(|spelling| !spelling.is_empty());
     all.sort();
     all.dedup();
     all
@@ -171,14 +188,15 @@ impl Entry {
     fn new(values: &[String], public_text: String) -> Self {
         let mut windows = Vec::new();
         let mut needles = Vec::new();
-        let mut short_values = Vec::new();
+        let mut short_spellings = Vec::new();
         let mut hazardous = false;
         for value in values.iter().filter(|value| !value.is_empty()) {
             hazardous |= is_reencoding_hazard(value);
-            if value.len() < MIN_SCRUB_LENGTH {
-                short_values.push(value.clone());
-            }
             for spelling in spellings(value) {
+                if spelling.len() < MIN_SCRUB_LENGTH {
+                    short_spellings.push(spelling);
+                    continue;
+                }
                 windows.extend(
                     (0..=spelling.len() - FRAGMENT_SCAN_LENGTH)
                         .filter_map(|at| window_at(spelling.as_bytes(), at)),
@@ -190,11 +208,13 @@ impl Entry {
         windows.dedup();
         needles.sort();
         needles.dedup();
+        short_spellings.sort();
+        short_spellings.dedup();
         Self {
             public_text,
             windows,
             needles,
-            short_values,
+            short_spellings,
             hazardous,
         }
     }
@@ -211,7 +231,8 @@ struct Registry {
     windows: HashMap<Window, Vec<u64>>,
     /// First window of a needle → (needle, owner count), longest first.
     needles: HashMap<Window, Vec<(String, usize)>>,
-    short_values: HashMap<String, usize>,
+    /// Short spellings → owner count. Replaced only as whole tokens.
+    short_spellings: HashMap<String, usize>,
     hazardous: usize,
 }
 
@@ -235,8 +256,8 @@ impl Registry {
                 }
             }
         }
-        for value in &entry.short_values {
-            *self.short_values.entry(value.clone()).or_default() += 1;
+        for value in &entry.short_spellings {
+            *self.short_spellings.entry(value.clone()).or_default() += 1;
         }
         self.hazardous += usize::from(entry.hazardous);
         self.entries.insert(id, entry);
@@ -269,11 +290,11 @@ impl Registry {
                 }
             }
         }
-        for value in &entry.short_values {
-            if let Some(count) = self.short_values.get_mut(value) {
+        for value in &entry.short_spellings {
+            if let Some(count) = self.short_spellings.get_mut(value) {
                 *count -= 1;
                 if *count == 0 {
-                    self.short_values.remove(value);
+                    self.short_spellings.remove(value);
                 }
             }
         }
@@ -293,10 +314,11 @@ impl Registry {
         self.tokens.push_back((id, token.to_string()));
     }
 
-    /// Replace every needle, then every credential-shaped word.
+    /// Replace every needle, then every short spelling standing as a whole
+    /// token, then every credential-shaped word.
     fn redact(&self, text: &str) -> String {
         if self.needles.is_empty() {
-            return redact_credential_shapes(text);
+            return redact_credential_shapes(&self.redact_short(text));
         }
         let bytes = text.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
@@ -318,7 +340,43 @@ impl Registry {
         // replacing it keeps the text valid.
         let replaced = String::from_utf8(out)
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
-        redact_credential_shapes(&replaced)
+        redact_credential_shapes(&self.redact_short(&replaced))
+    }
+
+    /// Replace each short spelling where it stands as a whole token: not
+    /// glued to a letter or digit on a side where the spelling itself starts
+    /// or ends with one. `s3cr3t!` as a resource id goes; the `on` inside
+    /// `connection` stays. A short value glued into a longer word cannot be
+    /// told from prose here; [`Self::peer_text`] withholds peer text that
+    /// carries one at all.
+    fn redact_short(&self, text: &str) -> String {
+        if self.short_spellings.is_empty() {
+            return text.to_string();
+        }
+        let mut spellings: Vec<&str> = self.short_spellings.keys().map(String::as_str).collect();
+        spellings.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
+        let alnum = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        'scan: while let Some(next) = rest.chars().next() {
+            let before = text[..text.len() - rest.len()].chars().next_back();
+            for spelling in &spellings {
+                if !rest.starts_with(spelling) {
+                    continue;
+                }
+                let after = rest[spelling.len()..].chars().next();
+                let open = !(alnum(spelling.chars().next()) && alnum(before));
+                let close = !(alnum(spelling.chars().next_back()) && alnum(after));
+                if open && close {
+                    out.push_str(REDACTION);
+                    rest = &rest[spelling.len()..];
+                    continue 'scan;
+                }
+            }
+            out.push(next);
+            rest = &rest[next.len_utf8()..];
+        }
+        out
     }
 
     /// Is this surviving run evidence of a secret, rather than a run that is
@@ -337,6 +395,13 @@ impl Registry {
         })
     }
 
+    /// Does `bytes` hold a surviving run?
+    fn has_leak(&self, bytes: &[u8], cache: &mut HashMap<Window, bool>) -> bool {
+        bytes.len() >= FRAGMENT_SCAN_LENGTH
+            && (0..=bytes.len() - FRAGMENT_SCAN_LENGTH)
+                .any(|at| window_at(bytes, at).is_some_and(|w| self.is_leak(&w, cache)))
+    }
+
     /// Byte ranges of every surviving run in `bytes`.
     fn leak_ranges(&self, bytes: &[u8], cache: &mut HashMap<Window, bool>) -> Vec<(usize, usize)> {
         if self.windows.is_empty() || bytes.len() < FRAGMENT_SCAN_LENGTH {
@@ -348,20 +413,37 @@ impl Registry {
             .collect()
     }
 
-    /// Does a decoded spelling of `text` carry a surviving run?
+    /// Does a short spelling stand as a whole token in `bytes` (the rule of
+    /// [`Self::redact_short`])?
+    fn has_short_token(&self, bytes: &[u8]) -> bool {
+        self.short_spellings.keys().any(|spelling| {
+            let spelling = spelling.as_bytes();
+            let alnum = |b: Option<&u8>| b.is_some_and(u8::is_ascii_alphanumeric);
+            bytes.len() >= spelling.len()
+                && (0..=bytes.len() - spelling.len()).any(|at| {
+                    bytes[at..].starts_with(spelling)
+                        && !(alnum(spelling.first()) && alnum(at.checked_sub(1).map(|i| &bytes[i])))
+                        && !(alnum(spelling.last()) && alnum(bytes.get(at + spelling.len())))
+                })
+        })
+    }
+
+    /// Does a decoded spelling of `text` carry a surviving run, or a short
+    /// spelling as a whole token? Those cannot be replaced in place, so the
+    /// caller withholds.
     fn leaks_when_decoded(&self, text: &str, cache: &mut HashMap<Window, bool>) -> bool {
-        if self.windows.is_empty() {
+        if self.windows.is_empty() && self.short_spellings.is_empty() {
             return false;
         }
-        decoded_views(text)
-            .iter()
-            .any(|view| !self.leak_ranges(view, cache).is_empty())
+        any_decoded_view(text.as_bytes(), |view| {
+            self.has_short_token(view) || self.has_leak(view, cache)
+        })
     }
 
     /// The sink's policy for one block of text (see the module docs).
     fn scrub_text(&self, text: &str) -> String {
         let redacted = self.redact(text);
-        if self.windows.is_empty() {
+        if self.windows.is_empty() && self.short_spellings.is_empty() {
             return redacted;
         }
         let mut cache = HashMap::new();
@@ -388,7 +470,7 @@ impl Registry {
     fn scrub_json_string(&self, value: &str) -> String {
         let redacted = self.redact(value);
         let mut cache = HashMap::new();
-        if !self.leak_ranges(redacted.as_bytes(), &mut cache).is_empty()
+        if self.has_leak(redacted.as_bytes(), &mut cache)
             || self.leaks_when_decoded(&redacted, &mut cache)
         {
             return DISPLAY_WITHHELD.to_string();
@@ -401,22 +483,27 @@ impl Registry {
         if self.hazardous > 0 {
             return DISPLAY_WITHHELD.to_string();
         }
-        let redacted = self.redact(text);
-        let views = decoded_views(&redacted);
-        let short_survives = self.short_values.keys().any(|value| {
-            redacted.contains(value.as_str())
-                || views
-                    .iter()
-                    .any(|view| contains_bytes(view, value.as_bytes()))
-        });
+        // Only a bounded excerpt is ever shown, so only that much is
+        // processed: an accepted response field can be tens of megabytes.
+        let (text, truncated) = match text.char_indices().nth(MAX_PEER_TEXT_CHARS) {
+            Some((end, _)) => (&text[..end], true),
+            None => (text, false),
+        };
+        let mut redacted = self.redact(text);
         let mut cache = HashMap::new();
-        if short_survives
-            || !self.leak_ranges(redacted.as_bytes(), &mut cache).is_empty()
-            || views
-                .iter()
-                .any(|view| !self.leak_ranges(view, &mut cache).is_empty())
+        let leaks = |bytes: &[u8], cache: &mut HashMap<Window, bool>| {
+            self.short_spellings
+                .keys()
+                .any(|spelling| contains_bytes(bytes, spelling.as_bytes()))
+                || self.has_leak(bytes, cache)
+        };
+        if leaks(redacted.as_bytes(), &mut cache)
+            || any_decoded_view(redacted.as_bytes(), |view| leaks(view, &mut cache))
         {
             return DISPLAY_WITHHELD.to_string();
+        }
+        if truncated {
+            redacted.push_str(" [truncated]");
         }
         redacted
     }
@@ -774,33 +861,34 @@ fn rewrite_json_strings(text: &str, scrub: impl Fn(&str) -> String) -> String {
     out
 }
 
-/// The spellings of `text` a peer's re-encoding would hide a value behind,
-/// decoded: backslash escapes (once and twice), percent-encoding, HTML
-/// character references and doubled single quotes. Only the ones `text` can
-/// contain are produced.
-fn decoded_views(text: &str) -> Vec<Vec<u8>> {
-    // Each decoder, then each decoder again on its result: two layers cover
-    // a value escaped for one format and then for another (a Markdown
-    // comment escapes `_` with a backslash and `.` as `&#46;`).
-    let mut views: Vec<Vec<u8>> = Vec::new();
+/// Run `check` over each spelling of `bytes` a peer's re-encoding would
+/// hide a value behind, decoded: backslash escapes, percent-encoding, HTML
+/// character references and doubled single quotes, each alone and each
+/// followed by another (a Markdown comment escapes `_` with a backslash and
+/// `.` as `&#46;`). Views are built one at a time and dropped, and the walk
+/// stops at the first `true`, so memory stays at two copies of `bytes`.
+fn any_decoded_view(bytes: &[u8], mut check: impl FnMut(&[u8]) -> bool) -> bool {
     for decode in DECODERS {
-        let Some(once) = decode(text.as_bytes()) else {
+        let Some(once) = decode(bytes).filter(|once| once.as_slice() != bytes) else {
             continue;
         };
+        if check(&once) {
+            return true;
+        }
         for decode_again in DECODERS {
-            if let Some(twice) = decode_again(&once) {
-                views.push(twice);
+            if let Some(twice) = decode_again(&once).filter(|twice| *twice != once) {
+                if check(&twice) {
+                    return true;
+                }
             }
         }
-        views.push(once);
     }
-    views.dedup();
-    views
+    false
 }
 
 type Decoder = fn(&[u8]) -> Option<Vec<u8>>;
 
-/// The decoders [`decoded_views`] applies; each returns `None` when the
+/// The decoders [`any_decoded_view`] applies; each returns `None` when the
 /// input has nothing for it to decode.
 const DECODERS: [Decoder; 4] = [
     |bytes| bytes.contains(&b'\\').then(|| unescape_backslashes(bytes)),
@@ -1055,10 +1143,63 @@ mod tests {
             scrub_text(&format!("header {base64} and s3cr3t%21")),
             "header [REDACTED] and [REDACTED]"
         );
-        // Ordinary prose that happens to contain the raw value is left to
-        // `peer_text`, which withholds peer text carrying it.
-        assert_eq!(peer_text("bad password s3cr3t!"), DISPLAY_WITHHELD);
+        // The value itself goes where it stands as a token (a live resource
+        // id, a field value) ...
+        assert_eq!(
+            scrub_text("  MODIFY Proxy s3cr3t! (team-alpha)"),
+            "  MODIFY Proxy [REDACTED] (team-alpha)"
+        );
+        // ... and a line holding it only once decoded is withheld.
+        assert_eq!(scrub_text(r"- s3cr3t\! changed"), DISPLAY_WITHHELD);
+        // Peer text holding it anywhere, even glued to a word, is withheld.
+        assert_eq!(peer_text("bad password s3cr3t!"), "bad password [REDACTED]");
+        assert_eq!(peer_text("bad password xs3cr3t!"), DISPLAY_WITHHELD);
         assert_eq!(peer_text("unrelated failure"), "unrelated failure");
+    }
+
+    /// Short values of every length, and their padded and unpadded base64,
+    /// as whole tokens; a word that merely contains one is left alone.
+    #[test]
+    fn short_values_are_redacted_as_tokens_only() {
+        for length in 1..=7 {
+            std::thread::spawn(move || {
+                enable();
+                let value = &"Zq7xQw9"[..length];
+                register_values([value]);
+                use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+                for spelling in [
+                    value.to_string(),
+                    STANDARD.encode(value),
+                    STANDARD_NO_PAD.encode(value),
+                ] {
+                    assert_eq!(
+                        scrub_text(&format!("value {spelling} here")),
+                        "value [REDACTED] here",
+                        "{length}: {spelling}"
+                    );
+                    assert_eq!(
+                        peer_text(&format!("bad value {spelling}")),
+                        "bad value [REDACTED]",
+                        "{length}: {spelling}"
+                    );
+                }
+                assert_eq!(
+                    scrub_text(&format!("x{value}x stays")),
+                    format!("x{value}x stays")
+                );
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    /// A peer field is processed and shown only up to a bounded excerpt.
+    #[test]
+    fn peer_text_memory_is_bounded() {
+        let field = r"\%&'' ".repeat(10 * 1024 * 1024);
+        let (shown, peak) = crate::alloc_meter::peak_bytes(|| peer_text(&field));
+        assert!(shown.ends_with("[truncated]"), "{}", shown.len());
+        assert!(peak <= 2 * 1024 * 1024, "peer_text peaked at {peak} bytes");
     }
 
     #[test]
