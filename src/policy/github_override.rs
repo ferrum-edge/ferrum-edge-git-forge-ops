@@ -212,7 +212,11 @@ async fn check_override_context(
     let pr: PullRequest = match fetch_json(&client, &pr_url, token).await {
         Ok(value) => match serde_json::from_value(value) {
             Ok(pr) => pr,
-            Err(e) => return Ok(OverrideDecision::inactive(&format!("parse PR: {e}"))),
+            Err(e) => {
+                return Ok(OverrideDecision::inactive(
+                    &crate::http_client::malformed_response("parse PR", &e).to_string(),
+                ))
+            }
         },
         Err(e) => return Ok(OverrideDecision::inactive(&format!("fetch PR: {e}"))),
     };
@@ -403,7 +407,7 @@ pub async fn find_override_labeler_at(
             format!("{api_base}/repos/{repo}/issues/{pr_number}/events?per_page=100&page={page}");
         let events: Vec<IssueEvent> =
             serde_json::from_value(fetch_json(client, &url, token).await?)
-                .map_err(|e| crate::error::Error::HttpClient(format!("parse events: {e}")))?;
+                .map_err(|e| crate::http_client::malformed_response("parse events", &e))?;
         let complete = events.len() < 100;
 
         for event in events {

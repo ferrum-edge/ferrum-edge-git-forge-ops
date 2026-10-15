@@ -173,7 +173,7 @@ impl ConfigExport {
         header_cached: bool,
     ) -> crate::error::Result<Self> {
         let value: Value = serde_json::from_str(body)
-            .map_err(|e| Error::HttpClient(format!("GET {CONFIG_EXPORT_PATH}: {e}")))?;
+            .map_err(|e| crate::http_client::malformed_response(CONFIG_EXPORT_PATH, &e))?;
         let Value::Object(mut document) = value else {
             return Err(Error::Config(format!(
                 "GET {CONFIG_EXPORT_PATH} did not return a JSON object"
