@@ -149,7 +149,6 @@ no other include or exclude patterns. It must:
   last-push or unattributed-change approval requirement;
 - require all review conversations to be resolved;
 - dismiss stale approvals when new commits are pushed;
-- require branches to be up to date with `main` before merging;
 - block deletion and non-fast-forward updates;
 - reject `[skip ci]` in commit messages (a `commit_message_pattern` rule with
   `negate: true`). That marker suppresses every workflow, required checks

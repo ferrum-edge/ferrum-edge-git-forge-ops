@@ -287,10 +287,8 @@ def audit_main_ruleset(
     )
 
     status_parameters = rules.get("required_status_checks", {}).get("parameters", {})
-    audit.require(
-        status_parameters.get("strict_required_status_checks_policy") is True,
-        "main ruleset must test pull requests against the latest main commit",
-    )
+    # `strict_required_status_checks_policy` (require branches to be up to
+    # date before merging) is an owner choice; either value is accepted.
     configured_sources = {
         check.get("context"): check.get("integration_id")
         for check in status_parameters.get("required_status_checks", [])

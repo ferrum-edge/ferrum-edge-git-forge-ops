@@ -72,7 +72,7 @@ def secure_responses():
                 {
                     "type": "required_status_checks",
                     "parameters": {
-                        "strict_required_status_checks_policy": True,
+                        "strict_required_status_checks_policy": False,
                         "required_status_checks": [
                             {
                                 "context": context,
@@ -338,15 +338,30 @@ class SettingsAuditTests(unittest.TestCase):
         self.assertIn("configured state-writer App", rendered)
         self.assertIn("missing required rule: update", rendered)
 
-    def test_stale_reviews_loose_checks_and_broad_tag_bypass_fail(self):
+    def test_up_to_date_branch_requirement_is_accepted_either_way(self):
+        for strict in (True, False):
+            responses = secure_responses()
+            next(
+                rule
+                for rule in responses["repos/acme/repo/rulesets/7"]["rules"]
+                if rule["type"] == "required_status_checks"
+            )["parameters"]["strict_required_status_checks_policy"] = strict
+            with patch.object(
+                audit_settings,
+                "gh_json",
+                side_effect=lambda path, paginate=False: responses[path],
+            ):
+                audit = audit_settings.run(
+                    "acme/repo", "main", REQUIRED_CHECKS, 99, "refs/tags/v*"
+                )
+            self.assertEqual(audit.violations, [], (strict, audit.violations))
+
+    def test_stale_reviews_and_broad_tag_bypass_fail(self):
         responses = secure_responses()
         main_rules = responses["repos/acme/repo/rulesets/7"]["rules"]
         next(
             rule for rule in main_rules if rule["type"] == "pull_request"
         )["parameters"]["dismiss_stale_reviews_on_push"] = False
-        next(
-            rule for rule in main_rules if rule["type"] == "required_status_checks"
-        )["parameters"]["strict_required_status_checks_policy"] = False
         responses["repos/acme/repo/rulesets/8"]["bypass_actors"] = [
             {
                 "actor_type": "RepositoryRole",
@@ -364,7 +379,6 @@ class SettingsAuditTests(unittest.TestCase):
             )
         rendered = "\n".join(audit.violations)
         self.assertIn("dismiss stale approvals", rendered)
-        self.assertIn("latest main commit", rendered)
         self.assertIn("broad repository roles", rendered)
 
     def test_tag_ruleset_without_a_bypass_actor_fails(self):
