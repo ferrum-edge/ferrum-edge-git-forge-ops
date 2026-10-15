@@ -320,6 +320,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Credential-slot retirement checks (array shrink, dropped credential type and
+  deleted ledger Consumer) now also find values stored under the legacy `[0]`
+  and dotted bundle-key spellings the resolver still reads, so a retired value
+  cannot be resolved again by a later regrowth or a reused id.
+- A Consul `service_discovery.consul.address` with URL credentials (detected
+  as leniently as a URL parser reads them) is a blocking security finding, is
+  refused by `import` instead of being written to the resource tree, has its
+  userinfo redacted in `diff` output, and is scrubbed from validator output.
 - A stale-plan refusal during ambiguous `POST /batch` reconciliation now stops
   every later write in that namespace, as a stale direct write already did:
   remaining creates and updates are reported as withheld, deletes are deferred
