@@ -113,7 +113,7 @@ pub async fn run(environment: &str, env: &EnvConfig, token_namespaces: &[String]
                     Scope::Gateway,
                     format!(
                         "GET /health answered: mode={}, ready={}, admin_writes_enabled={}",
-                        health.mode.as_deref().unwrap_or("unknown"),
+                        crate::display::peer_text(health.mode.as_deref().unwrap_or("unknown")),
                         health
                             .ready
                             .map(|ready| ready.to_string())

@@ -1797,3 +1797,109 @@ fn a_whole_value_fingerprinted_around_a_secret_is_never_accepted() {
     assert_eq!(report["secret_fingerprints"]["masked_ancestor_fields"], 1);
     assert_eq!(report["secret_fingerprints"]["authoritative"], false);
 }
+
+/// Brokered secrets shorter than eight bytes are refused at resolution: the
+/// refusal names the slot and never the value.
+#[test]
+fn a_short_brokered_value_is_refused_by_slot() {
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let config = serde_json::json!({ "service_label": placeholder, "protocol": "grpc" });
+    let live = serde_json::json!({ "service_label": fingerprint('e'), "protocol": "grpc" });
+    let repo = Repo::new(
+        &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+        vec![("ferrum".to_string(), plugin_export(live))],
+    );
+    let slot = "ferrum/otel/@plugin/otel_tracing/config/service_label";
+    let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: "s3cr3t!" } }).to_string();
+    let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+    env.push(("FERRUM_CREDS_JSON", &bundle));
+
+    let output = repo.run_with_env(&["diff", "--accept-unverified-secrets"], &env);
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains(slot), "{shown}");
+    assert!(shown.contains("shorter than 8 bytes"), "{shown}");
+    assert!(!shown.contains("s3cr3t"), "{shown}");
+}
+
+/// A token in the environment shorter than eight bytes is refused by name
+/// before anything runs.
+#[test]
+fn a_short_environment_token_is_refused_by_name() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+    let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+    env.push(("GITHUB_TOKEN", "abc"));
+    let output = repo.run_with_env(&["diff"], &env);
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains("GITHUB_TOKEN holds a secret shorter than 8 bytes"),
+        "{shown}"
+    );
+}
+
+/// A secret quoted through `safe()` reaches the sink in sanitized form
+/// (`##[` broken up, U+2028 replaced). The diff printer must still never
+/// show it.
+#[test]
+fn a_secret_sanitized_on_its_way_to_the_sink_is_still_removed() {
+    for secret in ["Q7##[x9!-key", "zq7\u{2028}line-sep-key"] {
+        let placeholder = "${gh-env-secret:alloc=require}";
+        let config = serde_json::json!({ "service_label": placeholder, "protocol": "grpc" });
+        let live = serde_json::json!({ "service_label": fingerprint('e'), "protocol": "grpc" });
+        let mut export: serde_json::Value = serde_json::from_str(&plugin_export(live)).unwrap();
+        export["proxies"] = serde_json::json!([{
+            "id": secret,
+            "namespace": "ferrum",
+            "listen_path": "/reflected",
+            "backend_protocol": "http",
+            "backend_host": "backend.internal",
+            "backend_port": 8080,
+        }]);
+        export["counts"]["proxies"] = serde_json::json!(1);
+        let repo = Repo::new(
+            &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+            vec![("ferrum".to_string(), export.to_string())],
+        );
+        let slot = "ferrum/otel/@plugin/otel_tracing/config/service_label";
+        let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: secret } }).to_string();
+        let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+        env.push(("FERRUM_CREDS_JSON", &bundle));
+
+        let output = repo.run_with_env(&["diff", "--accept-unverified-secrets"], &env);
+        let shown = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(shown.contains("Proxy"), "{shown}");
+        for leaked in ["Q7##", "x9!-key", "line-sep-key"] {
+            assert!(!shown.contains(leaked), "{leaked}: {shown}");
+        }
+    }
+}
+
+/// A resolved value that equals a fixed report key must not rename that key
+/// in JSON output; the value itself is still scrubbed wherever it appears.
+#[test]
+fn a_secret_equal_to_a_report_key_keeps_the_json_contract() {
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let config = serde_json::json!({ "service_label": placeholder, "protocol": "grpc" });
+    let live = serde_json::json!({ "service_label": fingerprint('e'), "protocol": "grpc" });
+    let repo = Repo::new(
+        &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+        vec![("ferrum".to_string(), plugin_export(live))],
+    );
+    let slot = "ferrum/otel/@plugin/otel_tracing/config/service_label";
+    let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: "live_source" } }).to_string();
+    let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+    env.push(("FERRUM_CREDS_JSON", &bundle));
+
+    let args = ["diff", "--format", "json", "--accept-unverified-secrets"];
+    let output = repo.run_with_env(&args, &env);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    for key in ["live_source", "in_sync", "namespace", "diff_count"] {
+        assert!(report.get(key).is_some(), "{key} missing: {report}");
+    }
+    assert!(
+        !stdout(&output).contains("\"[REDACTED]\":"),
+        "{}",
+        stdout(&output)
+    );
+}

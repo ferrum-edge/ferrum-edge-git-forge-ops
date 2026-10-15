@@ -75,7 +75,7 @@ pub fn load_bundles_from_env(
 ) -> crate::error::Result<(CredentialBundle, BTreeMap<u32, CredentialBundle>)> {
     let loaded = parse_bundles_from_json(raw)?;
     if !loaded.unrecognized_keys.is_empty() {
-        eprintln!(
+        crate::eoutln!(
             "Warning: {}",
             safe_line(unrecognized_bundle_keys_warning(&loaded.unrecognized_keys))
         );

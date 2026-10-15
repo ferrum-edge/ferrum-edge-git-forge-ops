@@ -1112,6 +1112,72 @@ async fn rotation_refuses_a_minimal_health_tier_before_any_other_request() {
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
+/// The rotated value never passed through secret resolution, so publication
+/// itself must register it: a peer's error text reflecting the new
+/// credential is scrubbed like any resolved secret.
+#[tokio::test]
+async fn a_published_rotation_value_is_scrubbed_from_peer_error_text() {
+    const ROTATED: &str = "zq7-rotated-display-canary-4c1e";
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    let current = consumer();
+    let served = serde_json::to_value(&current).unwrap();
+    let (client, _requests) = gateway(move |request, _| {
+        if request.starts_with("GET /health") {
+            healthy()
+        } else if request.starts_with("GET /consumers/c1/verification ") {
+            verified(&served, ROW_TAG)
+        } else if request.starts_with("PUT /consumers/c1 ") {
+            (200, "{}".to_string(), vec![])
+        } else {
+            panic!("unexpected request; body withheld")
+        }
+    });
+    let prepared =
+        PreparedConsumerRotation::prepare(&client, &current, "keyauth/key", Some(SECRET))
+            .await
+            .unwrap();
+    let echoed = format!("credential {ROTATED} rejected");
+    assert_eq!(gitforgeops::display::peer_text(&echoed), echoed);
+    prepared.publish(&client, ROTATED).await.unwrap();
+    assert_eq!(
+        gitforgeops::display::peer_text(&echoed),
+        "credential [REDACTED] rejected"
+    );
+    assert_eq!(
+        gitforgeops::display::scrub_text(&echoed),
+        "credential [REDACTED] rejected"
+    );
+}
+
+/// Display scrubbing never touches the values write safety is decided on:
+/// with a registered value that is not safely scrubbable (so every peer
+/// string is withheld from display), a sparse `/health` that reports file
+/// mode still refuses rotation as read-only, before any other request.
+#[tokio::test]
+async fn file_mode_still_refuses_writes_when_a_registered_value_cannot_be_scrubbed() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    gitforgeops::display::register_values("test", ["zq7-signing#key-value-0042"]).unwrap();
+    let sparse = json!({"status": "ok", "mode": "file"}).to_string();
+    let (client, requests) = gateway(move |request, _| {
+        if request.starts_with("GET /health") {
+            (200, sparse.clone(), vec![])
+        } else {
+            panic!("a file-mode gateway must stop rotation at its health read")
+        }
+    });
+    let health = client.get_health().await.unwrap();
+    assert_eq!(health.mode.as_deref(), Some("file"));
+    let current = consumer();
+    let error = PreparedConsumerRotation::prepare(&client, &current, "keyauth/key", Some(SECRET))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{error:?}"
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn basic_rotation_keeps_hmac_opaque_and_committed_not_live_never_records_completion() {
     let mut current = consumer();

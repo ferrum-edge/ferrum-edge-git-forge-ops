@@ -30,7 +30,28 @@ pub fn enforce_required_comment_delivery(
     Ok(())
 }
 
+/// Post `comment` to the PR. It is published, so it goes through the display
+/// sink like stdout.
 pub async fn post_pr_comment(
+    env_config: &EnvConfig,
+    pr_number: u64,
+    comment: &str,
+) -> crate::error::Result<()> {
+    post_rendered_pr_comment(env_config, pr_number, &crate::display::scrub_text(comment)).await
+}
+
+/// Post a comment carrying ciphertext: its text parts are scrubbed, the
+/// ciphertext is posted byte for byte ([`crate::display::Composed`]).
+pub async fn post_composed_pr_comment(
+    env_config: &EnvConfig,
+    pr_number: u64,
+    comment: &crate::display::Composed,
+) -> crate::error::Result<()> {
+    post_rendered_pr_comment(env_config, pr_number, &comment.render()).await
+}
+
+/// Post a body that already went through the display sink.
+async fn post_rendered_pr_comment(
     env_config: &EnvConfig,
     pr_number: u64,
     comment: &str,
@@ -65,6 +86,7 @@ async fn post_comment_to(
 ) -> crate::error::Result<()> {
     let url = format!("{api_origin}/repos/{repo}/issues/{pr_number}/comments");
 
+    // Callers hand in a body that already went through the display sink.
     let body = serde_json::json!({ "body": comment });
 
     // Same-shape bounds as the admin client: connect + total request.

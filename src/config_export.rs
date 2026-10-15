@@ -173,19 +173,22 @@ impl ConfigExport {
         header_cached: bool,
     ) -> crate::error::Result<Self> {
         let value: Value = serde_json::from_str(body)
-            .map_err(|e| Error::HttpClient(format!("GET {CONFIG_EXPORT_PATH}: {e}")))?;
+            .map_err(|e| crate::http_client::malformed_response(CONFIG_EXPORT_PATH, &e))?;
         let Value::Object(mut document) = value else {
             return Err(Error::Config(format!(
                 "GET {CONFIG_EXPORT_PATH} did not return a JSON object"
             )));
         };
 
+        // Response fields quoted in a diagnostic are peer text: the
+        // comparisons read them raw, the messages show
+        // `display::peer_text` copies.
         let exported_namespace = document.get("namespace").and_then(Value::as_str);
         if exported_namespace != Some(namespace) {
             return Err(Error::BackupNamespace(format!(
                 "configuration export for namespace {namespace:?} reported namespace {:?}; \
                  refusing the snapshot",
-                exported_namespace.unwrap_or("<missing>")
+                crate::display::peer_text(exported_namespace.unwrap_or("<missing>"))
             )));
         }
 
@@ -205,8 +208,8 @@ impl ConfigExport {
                 "GET {CONFIG_EXPORT_PATH} for namespace {namespace:?} uses fingerprint algorithm \
                  {:?} with prefix {:?}; this build understands only {FINGERPRINT_ALGORITHM:?} \
                  with prefix {FINGERPRINT_PREFIX:?}",
-                algorithm.as_deref().unwrap_or("<missing>"),
-                prefix.as_deref().unwrap_or("<missing>")
+                crate::display::peer_text(algorithm.as_deref().unwrap_or("<missing>")),
+                crate::display::peer_text(prefix.as_deref().unwrap_or("<missing>"))
             )));
         }
         let fingerprint_key_id = redaction_field("fingerprint_key_id").unwrap_or_default();
@@ -255,7 +258,7 @@ impl ConfigExport {
                         return Err(Error::BackupNamespace(format!(
                             "configuration export for namespace {namespace:?} returned {section} \
                              {:?} with a missing or foreign namespace or id; refusing the snapshot",
-                            id.unwrap_or("?")
+                            crate::display::peer_text(id.unwrap_or("?"))
                         )));
                     }
                 };

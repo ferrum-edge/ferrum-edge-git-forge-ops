@@ -155,6 +155,30 @@ token is otherwise treated like a consumer credential: `import` captures it,
 `diff` prints `[REDACTED]`, validator output is scrubbed, and a committed
 literal is a blocking finding.
 
+Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,
+the final `Error:` line and the review comment. Every value a run resolves
+or rotates in, the secrets of every live snapshot it reads or restore it
+sends, every admin JWT it sends, and the GitHub tokens and admin JWT
+secrets it reads from the environment become `[REDACTED]`, as do their
+base64, percent, JSON-escaped and single-quoted spellings, a `Bearer`
+credential, and a JWT or GitHub token by its shape. A line that still holds
+an 8-byte run of one (also after decoding escapes, percent-encoding or HTML
+references) is withheld, unless that run is also public text: the scrubbed
+configuration or the tool's own messages. Text a gateway or GitHub sends
+back is withheld while any registered value is not safely scrubbable (the
+validator-output rule above). Decisions read responses as received; only the
+displayed copy is scrubbed. Age-encrypted deliveries are written byte for
+byte.
+
+**Minimum length.** Brokered secrets must be at least 8 bytes. A shorter
+bundle value is refused when the slot is resolved, and a shorter non-empty
+`GH_TOKEN`, `GITHUB_TOKEN`, `FERRUM_GH_PROVISIONER_TOKEN`,
+`FERRUM_ADMIN_JWT_SECRET` or `FERRUM_ADMIN_JWT_VIEWER_SECRET` stops the CLI
+at startup. The error names the slot or variable, never the value. A value
+that short could not be told apart from ordinary words in output. Generated
+values (`alloc=generate`, `len` 16 or more) always qualify; keep short
+non-secret settings such as `mode: dry_run` in the resource YAML.
+
 ## Entry position is the slot identity
 
 Only an entry's **index** goes into its slot name. For a credential type with

@@ -1654,3 +1654,28 @@ fn the_mesh_retraction_banner_names_the_destination_and_the_outcome() {
     let narrowed = narrowed.expect("a skipped publication is reported");
     assert!(narrowed.contains("Mesh publication skipped"), "{narrowed}");
 }
+
+/// A registered value carried by a live field reaches the PR comment only
+/// through the display sink, which removes it even under Markdown escaping.
+#[test]
+fn review_comment_bodies_lose_registered_values_at_the_sink() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    gitforgeops::display::register_values("test", ["zq7Secret-v1", "zq7_live.field_canary.v1"])
+        .unwrap();
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Modify,
+        kind: "PluginConfig".to_string(),
+        id: "zq7Secret-v1".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![FieldChange {
+            field: "protocol".to_string(),
+            old_value: "zq7_live.field_canary.v1".to_string(),
+            new_value: "zq7Secret-v1".to_string(),
+        }],
+    }];
+    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    let published = gitforgeops::display::scrub_text(&comment);
+    assert!(!published.contains("s3cr3t"), "{published}");
+    assert!(!published.contains("canary"), "{published}");
+    assert!(!published.contains("field\\_canary"), "{published}");
+}

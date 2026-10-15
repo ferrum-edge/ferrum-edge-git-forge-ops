@@ -282,6 +282,33 @@ impl SecretScrubber {
         }
     }
 
+    /// A scrubber for exactly `values` (a generated rotation value, a token
+    /// this process sends) with no public document.
+    pub fn from_secret_values<I, S>(values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::from_values(
+            values
+                .into_iter()
+                .map(Into::into)
+                .filter(|value: &String| !value.is_empty())
+                .collect(),
+        )
+    }
+
+    /// The raw secret values, including those below [`MIN_SCRUB_LENGTH`].
+    pub(crate) fn values(&self) -> &[String] {
+        &self.values
+    }
+
+    /// The document with every secret replaced: runs that occur in it are
+    /// public. Empty for a scrubber built from bare values.
+    pub(crate) fn public_text(&self) -> &str {
+        &self.public_text
+    }
+
     /// True when the config carried no secret material at all.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
@@ -528,7 +555,7 @@ pub fn is_reencoding_hazard(value: &str) -> bool {
 /// `\r` spell the same way in both, so every other character JSON would write
 /// as `\u00NN` is refused by [`is_reencoding_hazard`], which withholds the
 /// stream rather than relying on this needle.
-fn json_escaped(value: &str) -> Option<String> {
+pub(crate) fn json_escaped(value: &str) -> Option<String> {
     let quoted = serde_json::to_string(value).ok()?;
     let inner = quoted
         .strip_prefix('"')
@@ -538,7 +565,7 @@ fn json_escaped(value: &str) -> Option<String> {
 
 /// The value as single-quoted YAML would write it, without the surrounding
 /// quotes: the only escape in that style is a doubled `'`.
-fn yaml_single_quoted(value: &str) -> String {
+pub(crate) fn yaml_single_quoted(value: &str) -> String {
     value.replace('\'', "''")
 }
 
@@ -608,7 +635,7 @@ fn record_secret(text: &str, out: &mut BTreeSet<String>) {
 }
 
 /// Percent-encode every byte outside RFC 3986's unreserved set.
-fn percent_encoded(value: &str) -> String {
+pub(crate) fn percent_encoded(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {

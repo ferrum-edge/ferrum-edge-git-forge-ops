@@ -212,7 +212,11 @@ async fn check_override_context(
     let pr: PullRequest = match fetch_json(&client, &pr_url, token).await {
         Ok(value) => match serde_json::from_value(value) {
             Ok(pr) => pr,
-            Err(e) => return Ok(OverrideDecision::inactive(&format!("parse PR: {e}"))),
+            Err(e) => {
+                return Ok(OverrideDecision::inactive(
+                    &crate::http_client::malformed_response("parse PR", &e).to_string(),
+                ))
+            }
         },
         Err(e) => return Ok(OverrideDecision::inactive(&format!("fetch PR: {e}"))),
     };
@@ -251,14 +255,19 @@ async fn check_override_context(
         Ok(p) => p,
         Err(e) => {
             return Ok(OverrideDecision::inactive(&format!(
-                "check permission for {approver}: {e}"
+                "check permission for {}: {e}",
+                crate::display::peer_text(&approver)
             )))
         }
     };
 
     if !override_cfg.is_sufficient(&permission) {
+        // The login and permission are GitHub's text: the decision reads them
+        // raw, the displayed reason quotes scrubbed copies.
         return Ok(OverrideDecision::inactive(&format!(
-            "@{approver} has permission '{permission}', override requires '{}'",
+            "@{} has permission '{}', override requires '{}'",
+            crate::display::peer_text(&approver),
+            crate::display::peer_text(&permission),
             override_cfg.required_permission
         )));
     }
@@ -341,8 +350,11 @@ async fn check_override_context(
         approver: Some(approver.clone()),
         permission: Some(permission.clone()),
         reason: format!(
-            "overridden by @{approver} ({permission}), PR #{pr_number}, review {}, authorized head {}",
-            review.id, pr.head.sha
+            "overridden by @{} ({}), PR #{pr_number}, review {}, authorized head {}",
+            crate::display::peer_text(&approver),
+            crate::display::peer_text(&permission),
+            review.id,
+            crate::display::peer_text(&pr.head.sha)
         ),
         pr_number: Some(pr_number),
         authorized_head: Some(pr.head.sha),
@@ -403,7 +415,7 @@ pub async fn find_override_labeler_at(
             format!("{api_base}/repos/{repo}/issues/{pr_number}/events?per_page=100&page={page}");
         let events: Vec<IssueEvent> =
             serde_json::from_value(fetch_json(client, &url, token).await?)
-                .map_err(|e| crate::error::Error::HttpClient(format!("parse events: {e}")))?;
+                .map_err(|e| crate::http_client::malformed_response("parse events", &e))?;
         let complete = events.len() < 100;
 
         for event in events {
@@ -451,7 +463,8 @@ async fn fetch_reviews(
             "https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}"
         );
         let batch: Vec<OverrideReview> =
-            serde_json::from_value(fetch_json(client, &url, token).await?)?;
+            serde_json::from_value(fetch_json(client, &url, token).await?)
+                .map_err(|e| crate::http_client::malformed_response("parse reviews", &e))?;
         let complete = batch.len() < 100;
         reviews.extend(batch);
         if complete {
@@ -516,7 +529,8 @@ async fn fetch_permission(
 ) -> crate::error::Result<String> {
     let url = format!("https://api.github.com/repos/{repo}/collaborators/{login}/permission");
     let value = fetch_json(client, &url, token).await?;
-    let parsed: PermissionResponse = serde_json::from_value(value)?;
+    let parsed: PermissionResponse = serde_json::from_value(value)
+        .map_err(|e| crate::http_client::malformed_response("parse permission", &e))?;
     Ok(parsed.effective_permission().to_string())
 }
 
