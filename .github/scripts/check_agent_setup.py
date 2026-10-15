@@ -737,8 +737,10 @@ def collect_violations(root: Path) -> list[str]:
                 violations.append(
                     f"{relative}: stale companion-repository marker {marker!r}"
                 )
+        # Markdown wraps lines, so compare with whitespace runs collapsed.
+        flattened = " ".join(text.split())
         for marker in STALE_CONTRACT_MARKERS:
-            if marker in text:
+            if marker in flattened:
                 violations.append(
                     f"{relative}: stale delivery or state instruction {marker!r}"
                 )

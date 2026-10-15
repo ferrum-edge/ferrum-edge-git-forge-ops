@@ -418,6 +418,23 @@ class AgentSetupTests(unittest.TestCase):
                     violations,
                 )
 
+    def test_a_line_wrapped_stale_instruction_is_still_refused(self):
+        for marker in check_agent_setup.STALE_CONTRACT_MARKERS:
+            wrapped = marker.replace(" ", "\n", 1)
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_valid_setup(root)
+                mirror = root / ".claude" / "skills" / "sample" / "SKILL.md"
+                mirror.write_text(
+                    mirror.read_text(encoding="utf-8") + f"\n{wrapped}\n",
+                    encoding="utf-8",
+                )
+                violations = check_agent_setup.collect_violations(root)
+                self.assertTrue(
+                    any("stale delivery or state instruction" in item for item in violations),
+                    violations,
+                )
+
     def test_skill_text_must_name_the_launchers_pinned_model(self):
         pinned = "provider-x/model-1.1-flash"
         with tempfile.TemporaryDirectory() as directory:
