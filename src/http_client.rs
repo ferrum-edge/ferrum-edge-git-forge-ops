@@ -48,7 +48,7 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 pub(crate) fn bounded_error_message(body: &str) -> String {
     // Scrub before truncating: a cut through a secret would leave a prefix
     // no needle matches.
-    let body = crate::secrets::scrub_for_display(body);
+    let body = crate::secrets::scrub_peer_text(body);
     let mut out = String::with_capacity(body.len().min(MAX_ERROR_MESSAGE_CHARS + 16));
     for (index, ch) in body.chars().enumerate() {
         if index >= MAX_ERROR_MESSAGE_CHARS {
@@ -3584,8 +3584,8 @@ mod bounded_error_message_tests {
 
     #[tokio::test]
     async fn reflected_resolved_secrets_are_scrubbed_from_displayed_errors() {
-        // A value unique to this test, so registering it process-wide cannot
-        // touch any other test's diagnostics.
+        // Registered for this test's thread only.
+        crate::secrets::enable_display_scrubbing_on_this_thread();
         const SECRET: &str = "zq7-display-scrub-canary-91f3";
         crate::secrets::register_display_scrubber(crate::secrets::SecretScrubber::for_test_values(
             &[SECRET],
@@ -3603,16 +3603,15 @@ mod bounded_error_message_tests {
             "{rendered}"
         );
 
-        // GitHub: the structured `message` echoes it, JSON-escaped or not.
+        // GitHub: the structured `message` echoes it.
         let body = serde_json::json!({
             "message": format!("Validation Failed: {SECRET} is not allowed"),
         })
         .to_string();
         let message = read_error_body_of(body.into_bytes()).await;
-        assert!(!message.contains(SECRET), "{message}");
         assert_eq!(message, "Validation Failed: [REDACTED] is not allowed");
 
-        // A fragment that survives redaction withholds the diagnostic.
+        // A fragment that survives redaction withholds the peer text.
         let partial = &SECRET[..SECRET.len() - 1];
         let body = serde_json::json!({ "error": format!("bad value {partial}") }).to_string();
         let rendered = super::map_api_error(400, &body, super::RequestKind::Read).to_string();
@@ -3620,6 +3619,72 @@ mod bounded_error_message_tests {
         assert!(
             rendered.contains(crate::secrets::DISPLAY_WITHHELD),
             "{rendered}"
+        );
+
+        // The CLI's own prose is scrubbed but never withheld, even where it
+        // shares a run with a secret.
+        let local = format!("refusing to materialize {SECRET}: rerun `zq7-display-scrub` later");
+        assert_eq!(
+            crate::secrets::scrub_for_display(&local),
+            "refusing to materialize [REDACTED]: rerun `zq7-display-scrub` later"
+        );
+    }
+
+    #[tokio::test]
+    async fn hazardous_registered_values_withhold_peer_text() {
+        crate::secrets::enable_display_scrubbing_on_this_thread();
+        // Non-ASCII and multiline values can come back re-encoded
+        // (`p\u00e4ss…`, a folded YAML scalar) past every needle.
+        crate::secrets::register_display_scrubber(crate::secrets::SecretScrubber::for_test_values(
+            &["p\u{e4}ssw\u{f6}rd-zq7-123", "zq7-line-one\nzq7-line-two"],
+        ));
+        for echoed in [
+            r#"{"error":"bad password p\u00e4ssw\u00f6rd-zq7-123"}"#,
+            r#"{"error":"bad value zq7-line-one\\nzq7-line-two"}"#,
+        ] {
+            let rendered = super::map_api_error(400, echoed, super::RequestKind::Read).to_string();
+            assert!(!rendered.contains("rd-zq7-123"), "{rendered}");
+            assert!(!rendered.contains("zq7-line"), "{rendered}");
+            assert!(
+                rendered.contains(crate::secrets::DISPLAY_WITHHELD),
+                "{rendered}"
+            );
+        }
+        let message = read_error_body_of(
+            br#"{"message":"bad password p\u00e4ssw\u00f6rd-zq7-123"}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(message, crate::secrets::DISPLAY_WITHHELD);
+    }
+
+    #[test]
+    fn reflected_bearer_credentials_are_redacted_without_registration() {
+        // Minted per request (the admin JWT) or read from the environment
+        // (GitHub tokens): caught by shape, not by a registry entry.
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ6cTcifQ.c2lnbmF0dXJlLXpxNw";
+        let github = "ghs_zq7AAAABBBBCCCCDDDDEEEE";
+        for (body, leaked) in [
+            (
+                serde_json::json!({ "error": format!("rejected Authorization: Bearer {jwt}") }),
+                jwt,
+            ),
+            (
+                serde_json::json!({ "error": format!("token {github} lacks scope") }),
+                github,
+            ),
+            (
+                serde_json::json!({ "error": "header was 'bearer opaque-zq7-token-value'" }),
+                "opaque-zq7-token-value",
+            ),
+        ] {
+            let rendered =
+                super::map_api_error(401, &body.to_string(), super::RequestKind::Read).to_string();
+            assert!(!rendered.contains(leaked), "{rendered}");
+            assert!(rendered.contains("[REDACTED]"), "{rendered}");
+        }
+        assert_eq!(
+            crate::secrets::redact_credential_shapes("the bearer of bad news"),
+            "the bearer [REDACTED] bad news"
         );
     }
 

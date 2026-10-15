@@ -39,7 +39,9 @@ pub use resolver::{
     MIN32_CREDENTIAL_TYPES, MIN_ENTROPY_BYTES_FOR_32_CHARS, REDACTED_SENTINEL,
 };
 pub use scrubber::{
-    enable_display_scrubbing, is_reencoding_hazard, register_display_scrubber,
-    register_resolved_for_display, scrub_for_display, ScrubbedOutput, SecretScrubber,
-    SuppressionReason, DISPLAY_WITHHELD, FRAGMENT_SCAN_LENGTH, MIN_SCRUB_LENGTH, REDACTION,
+    enable_display_scrubbing, enable_display_scrubbing_on_this_thread, is_reencoding_hazard,
+    redact_credential_shapes, register_display_scrubber, register_display_values,
+    register_resolved_for_display, scrub_for_display, scrub_peer_text, ScrubbedOutput,
+    SecretScrubber, SuppressionReason, DISPLAY_WITHHELD, FRAGMENT_SCAN_LENGTH, MIN_SCRUB_LENGTH,
+    REDACTION,
 };

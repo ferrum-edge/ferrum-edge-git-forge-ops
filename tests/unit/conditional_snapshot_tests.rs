@@ -1112,6 +1112,39 @@ async fn rotation_refuses_a_minimal_health_tier_before_any_other_request() {
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
+/// The rotated value never passed through secret resolution, so publication
+/// itself must register it: a peer's error text reflecting the new
+/// credential is scrubbed like any resolved secret.
+#[tokio::test]
+async fn a_published_rotation_value_is_scrubbed_from_peer_error_text() {
+    const ROTATED: &str = "zq7-rotated-display-canary-4c1e";
+    gitforgeops::secrets::enable_display_scrubbing_on_this_thread();
+    let current = consumer();
+    let served = serde_json::to_value(&current).unwrap();
+    let (client, _requests) = gateway(move |request, _| {
+        if request.starts_with("GET /health") {
+            healthy()
+        } else if request.starts_with("GET /consumers/c1/verification ") {
+            verified(&served, ROW_TAG)
+        } else if request.starts_with("PUT /consumers/c1 ") {
+            (200, "{}".to_string(), vec![])
+        } else {
+            panic!("unexpected request; body withheld")
+        }
+    });
+    let prepared =
+        PreparedConsumerRotation::prepare(&client, &current, "keyauth/key", Some(SECRET))
+            .await
+            .unwrap();
+    let echoed = format!("credential {ROTATED} rejected");
+    assert_eq!(gitforgeops::secrets::scrub_peer_text(&echoed), echoed);
+    prepared.publish(&client, ROTATED).await.unwrap();
+    assert_eq!(
+        gitforgeops::secrets::scrub_peer_text(&echoed),
+        "credential [REDACTED] rejected"
+    );
+}
+
 #[tokio::test]
 async fn basic_rotation_keeps_hmac_opaque_and_committed_not_live_never_records_completion() {
     let mut current = consumer();
