@@ -418,6 +418,39 @@ class AgentSetupTests(unittest.TestCase):
                     violations,
                 )
 
+    def test_agent_metadata_may_name_no_model_but_the_pin(self):
+        pinned = "provider-x/model-1.1-flash"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text(
+                launcher.read_text(encoding="utf-8")
+                + f"readonly PINNED_MODEL='{pinned}'\n",
+                encoding="utf-8",
+            )
+            for skill in (agent / "SKILL.md", root / ".claude" / "skills" / "sample" / "SKILL.md"):
+                skill.write_text(
+                    skill.read_text(encoding="utf-8") + f"\nPinned to `{pinned}`.\n",
+                    encoding="utf-8",
+                )
+            metadata = agent / "agents" / "openai.yaml"
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+            metadata.write_text(
+                f'interface:\n  default_prompt: "Dispatch {pinned} agents."\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+
+            metadata.write_text(
+                'interface:\n  default_prompt: "Dispatch `other-provider/model-z` agents."\n',
+                encoding="utf-8",
+            )
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        self.assertIn("names other-provider/model-z but the launcher pins", joined)
+        self.assertIn("openai.yaml: does not name the launcher's pinned model", joined)
+
     def test_a_line_wrapped_stale_instruction_is_still_refused(self):
         for marker in check_agent_setup.STALE_CONTRACT_MARKERS:
             wrapped = marker.replace(" ", "\n", 1)

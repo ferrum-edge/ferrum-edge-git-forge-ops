@@ -333,8 +333,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   review trigger or CI babysitting unless assigned, and the controller owns
   post-push monitoring. Implementer briefs describe the ledger's constant
   `managed:v1` marker instead of state hashes. `check_agent_setup.py` now
-  refuses those stale instructions and any skill text naming a model other
-  than its launcher's pin (#577).
+  refuses those stale instructions, and for a hard-pinned launcher refuses
+  skill text that omits the pin, names another model under the pin's provider
+  or in a `--model` argument, or agent metadata naming any other model id
+  (#577).
 - The template updater now treats the vendored `contracts/` tree as
   upstream-managed, so adopting a revision that introduces or re-pins
   `contracts/ferrum-contracts/` also adopts the PIN, schemas, vocabularies and

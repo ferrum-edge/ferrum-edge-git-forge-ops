@@ -49,6 +49,8 @@ STALE_CONTRACT_MARKERS = (
     "loop until codex clean",
 )
 PINNED_MODEL_LINE = re.compile(r"^readonly PINNED_MODEL='(?P<model>[^']+)'$", re.MULTILINE)
+# Any `provider/name` model id, for the agent metadata's dispatch prompt.
+ANY_MODEL_ID = re.compile(r"(?<![\w/.-])[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]")
 # A documented `--model provider/name` argument, whatever the provider.
 MODEL_ARGUMENT = re.compile(
     r"--model[ =]+[`'\"]?(?P<model>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[A-Za-z0-9])"
@@ -638,7 +640,9 @@ def collect_violations(root: Path) -> list[str]:
 
     # A hard-pinned launcher and every text describing that skill must name the
     # same model: the Claude mirror, the canonical skill, its briefs and its
-    # agent metadata. Any other model under the pin's provider is a mismatch.
+    # agent metadata. In those texts a model id under the pin's provider, or
+    # any `--model` argument, that is not the pin is a mismatch; the agent
+    # metadata's dispatch prompt may name no model id but the pin at all.
     for skill_dir in agent_skill_dirs:
         launcher = skill_dir / "scripts" / "dispatch-agent.sh"
         if launcher.is_symlink() or not launcher.is_file():
@@ -659,13 +663,15 @@ def collect_violations(root: Path) -> list[str]:
             if path.is_symlink() or not path.is_file():
                 continue
             text = read_text(path)
-            if model not in text and path.name == "SKILL.md":
+            if model not in text and path.name in ("SKILL.md", "openai.yaml"):
                 violations.append(
                     f"{path.relative_to(root)}: does not name the launcher's pinned model {model}"
                 )
             documented = set(named.findall(text)) | {
                 match.group("model") for match in MODEL_ARGUMENT.finditer(text)
             }
+            if path.name == "openai.yaml":
+                documented |= set(ANY_MODEL_ID.findall(text))
             for other in sorted(documented - {model}):
                 violations.append(
                     f"{path.relative_to(root)}: names {other} but the launcher pins {model}"
