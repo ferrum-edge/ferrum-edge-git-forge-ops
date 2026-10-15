@@ -313,6 +313,9 @@ impl PreparedConsumerRotation {
             entry.remove("password_hash");
         }
         entry.insert(self.field, Value::String(value.to_string()));
+        // The new value is in this PUT, so error text reflecting it must
+        // have it removed like any resolved secret.
+        crate::secrets::register_display_values([value]);
         match client
             .update_if_match(
                 "Consumer",

@@ -161,11 +161,14 @@ finding, `import` refuses a gateway whose address has them rather than writing
 them to the tree, `diff` shows such a live address as
 `https://[REDACTED]@host`, and validator output is scrubbed of them. Put a Consul ACL token in `consul.token` instead.
 
-Displayed errors are scrubbed too. Every value a run resolves is removed from
-the error text a gateway (`error`) or GitHub (`message`) sends back, and from
-the CLI's final `Error:` line, so a peer that echoes a credential from the
-request shows `[REDACTED]` in its place. If a value or a fragment of one
-survives that, the whole diagnostic is withheld instead.
+Displayed errors are scrubbed too. Every value a run resolves or rotates in,
+and the GitHub tokens and admin JWT secret it reads from the environment, are
+replaced with `[REDACTED]` in the error text a gateway (`error`) or GitHub
+(`message`) sends back, as are a `Bearer` credential, a JWT and a GitHub
+token by their shape. Peer text follows the validator-output policy: it is
+withheld whole when a resolved value is not safely scrubbable or a fragment
+of one survives. The CLI's final `Error:` line gets the same replacement but
+is never withheld, because it is mostly the tool's own prose.
 
 ## Entry position is the slot identity
 

@@ -445,6 +445,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with `[REDACTED]`, and a diagnostic is withheld if a value or a fragment of
   one survives. Follow-up to #553, which bounded these messages but still
   displayed whatever a peer reflected from the request.
+
+- Scrub secrets from displayed errors (follow-up to #553, which bounded these
+  messages but still displayed whatever a peer reflected from the request).
+  Each CLI run registers every value it resolves, every rotated value it
+  publishes, and the GitHub tokens and admin JWT secret in its environment.
+  The gateway's structured `error`, GitHub's `message` and the final `Error:`
+  line show those values, and any `Bearer`, JWT- or GitHub-token-shaped word,
+  as `[REDACTED]`. Peer text is withheld whole when a resolved value is not
+  safely scrubbable or a fragment of one survives. The final `Error:` line is
+  never withheld.
 - Finish bounding error bodies and validator I/O (follow-up to #553). The
   gateway's structured `error` message is now one bounded line like every
   other displayed error body, and a failed PR-comment POST reads GitHub's

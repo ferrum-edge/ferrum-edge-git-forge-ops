@@ -44,6 +44,17 @@ macro_rules! reportln {
 async fn main() {
     // Every secret resolved in this run is removed from displayed errors.
     secrets::enable_display_scrubbing();
+    // Tokens this process sends; a peer's error text can echo them.
+    secrets::register_display_values(
+        [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "FERRUM_GH_PROVISIONER_TOKEN",
+            "FERRUM_ADMIN_JWT_SECRET",
+        ]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok()),
+    );
     let cli = cli::Cli::parse();
     let explicit_env = cli.env.clone();
     // `--allow-credential-slot-remap` downgrades the credential-slot-remap
