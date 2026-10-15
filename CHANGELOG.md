@@ -327,9 +327,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - One environment-name grammar, `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, in the
   CLI, bootstrap (including `--environment`), the validate, drift, rotate and
   materialize workflow guards, and the quickstart. The apply enumerator keeps
-  its looser pinned guard, which cannot refuse a name the CLI emits. The CLI now refuses a leading `_` or `-`, which the workflows
-  already refused; bootstrap and the workflows no longer accept dots or names
-  over 64 characters, which the CLI already refused (#573).
+  its looser pinned guard, which cannot refuse a name the CLI emits. The CLI
+  now refuses a leading `_` or `-`, which the workflows already refused;
+  bootstrap and the workflows no longer accept dots or names over 64
+  characters, which the CLI already refused (#573).
 - A stale-plan refusal during ambiguous `POST /batch` reconciliation now stops
   every later write in that namespace, as a stale direct write already did:
   remaining creates and updates are reported as withheld, deletes are deferred
