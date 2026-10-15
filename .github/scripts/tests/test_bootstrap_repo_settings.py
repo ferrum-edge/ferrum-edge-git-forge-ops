@@ -249,6 +249,71 @@ class ConfigReaderTests(unittest.TestCase):
     def test_a_missing_config_resolves_no_environments(self):
         self.assertEqual(bootstrap.resolve_environments(namespace()), [])
 
+    def test_inline_maps_and_trailing_comments_are_read(self):
+        # docs/promotion.md declares `staging: {}` beside a block-mapped
+        # `production:`; neither may drop out of the plan.
+        self.assertEqual(
+            bootstrap.environment_names_from_config(
+                "version: 1\nenvironments:\n  staging: {}\n  production:\n"
+                "    promotion:\n      requires: staging\n"
+            ),
+            ["staging", "production"],
+        )
+        self.assertEqual(
+            bootstrap.environment_names_from_config(
+                "\ufeffversion: 1\nenvironments:  # deployments\n"
+                "  staging:   # pre-production\n    overlay: staging\n"
+                "  'qa': {}\n  \"production\":\n"
+                "    overlay: production\n"
+            ),
+            ["staging", "qa", "production"],
+        )
+
+    def test_an_entry_the_reader_cannot_represent_fails_instead_of_dropping_out(self):
+        for text in (
+            # A sequence, not a mapping.
+            "environments:\n  - staging\n  - production\n",
+            # An inline environment list.
+            "environments: {staging: {}, production: {}}\n",
+            # A name outside the shared environment grammar.
+            "environments:\n  prod.eu: {}\n  production:\n",
+            "environments:\n  _staging: {}\n",
+            "environments:\n  " + "a" * 65 + ": {}\n",
+            # Inconsistent indentation would hide the second environment.
+            "environments:\n    staging: {}\n  production: {}\n",
+            # Declared twice.
+            "environments:\n  staging: {}\n  staging:\n",
+            "environments:\n  staging: {}\nenvironments:\n  production: {}\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    bootstrap.environment_names_from_config(text)
+
+    def test_an_indented_root_mapping_is_read(self):
+        self.assertEqual(
+            bootstrap.environment_names_from_config(
+                "---\n  version: 1\n  environments:\n    staging: {}\n"
+                "    production:\n      overlay: production\n"
+            ),
+            ["staging", "production"],
+        )
+        with self.assertRaises(ValueError):
+            bootstrap.environment_names_from_config(
+                "  version: 1\nenvironments:\n  staging: {}\n"
+            )
+        with self.assertRaises(ValueError):
+            bootstrap.environment_names_from_config("environments:\n  staging: *base\n")
+
+    def test_explicit_environment_names_use_the_same_grammar(self):
+        for name in ("prod.eu", "_staging", "a" * 65, "../x", ""):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    bootstrap.resolve_environments(namespace(environment=[name]))
+        self.assertEqual(
+            bootstrap.resolve_environments(namespace(environment=["a" * 64, "eu_1-b"])),
+            ["a" * 64, "eu_1-b"],
+        )
+
 
 MONITORING_CONFIG_YAML = """version: 1
 
@@ -280,6 +345,51 @@ class MonitoringConfigReaderTests(unittest.TestCase):
             bootstrap.unattended_environments_from_config(MONITORING_CONFIG_YAML),
             ["staging"],
         )
+
+    def test_inline_and_commented_monitoring_settings_are_read(self):
+        self.assertEqual(
+            bootstrap.unattended_environments_from_config(
+                "environments:\n  staging: {}\n"
+                "  qa:\n    monitoring: {unattended: true}\n"
+                "  production:   # gated\n    monitoring:   # scheduled\n"
+                "      unattended: true   # opt in\n"
+                "  sandbox:\n    monitoring: {}\n"
+            ),
+            ["qa", "production"],
+        )
+
+    def test_a_monitoring_setting_the_reader_cannot_represent_fails(self):
+        for text in (
+            "environments:\n  staging: {monitoring: {unattended: true}}\n",
+            'environments:\n  staging: {"monitor\\x69ng": {unattended: true}}\n',
+            "environments:\n  staging: {overlay: staging}\n",
+            "environments:\n  staging: &base {overlay: staging}\n",
+            "environments:\n  staging:\n    monitoring: {unattended: true, x: 1}\n",
+            # Valid YAML the CLI reads as `true`, which must not become an
+            # opt-out here.
+            "environments:\n  staging:\n    monitoring:\n      unattended:\n"
+            "        true\n",
+            "environments:\n  staging:\n    monitoring:\n      {unattended: true}\n",
+            "environments:\n  staging:\n    monitoring:\n      unattended: yes\n",
+            "environments:\n  staging:\n    monitoring:\n      unattended: tRuE\n",
+            "environments:\n  staging:\n    monitoring: {unattended: tRuE}\n",
+            "environments:\n  base: &base\n    overlay: x\n  staging:\n"
+            "    <<: *base\n",
+            # An environment body written as a flow mapping.
+            "environments:\n  staging:\n    {monitoring: {unattended: true}}\n",
+            # A structural key spelled with an escape.
+            'environments:\n  staging:\n    "monitor\\x69ng":\n      unattended: true\n',
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    bootstrap.unattended_environments_from_config(text)
+
+    def test_nested_monitoring_content_is_refused_not_read_as_opted_out(self):
+        with self.assertRaises(ValueError):
+            bootstrap.unattended_environments_from_config(
+                "environments:\n  staging:\n    monitoring:\n      nested:\n"
+                "        unattended: true\n"
+            )
 
     def test_an_absent_monitoring_block_is_opted_out(self):
         self.assertEqual(
@@ -383,6 +493,56 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
         )
         self.assertEqual(step.action, bootstrap.UNCHANGED)
         self.assertEqual(step.writes, [])
+
+    def test_inline_and_commented_entries_reach_the_plan(self):
+        plan, _ = self._plan(
+            "version: 1\nenvironments:\n  staging:   # pre-production\n"
+            "    monitoring: {unattended: true}\n  production: {}\n",
+            existing=("production",),
+        )
+        performed = actions(plan)
+        for target in (
+            "environment staging",
+            "environment staging-monitor",
+            "environment production",
+        ):
+            self.assertIn(target, performed)
+        self.assertNotIn("environment production-monitor", performed)
+
+    def test_a_byte_order_mark_does_not_hide_the_environments(self):
+        plan, _ = self._plan(
+            "\ufeffenvironments:\n  staging:\n    monitoring:\n"
+            "      unattended: true\n"
+        )
+        self.assertIn("environment staging-monitor", actions(plan))
+
+    def test_a_flow_key_without_a_separating_space_stops_the_plan(self):
+        # YAML reads `{unattended:true}` as one key with a null value, which
+        # the CLI refuses; it is never an opt-in.
+        with self.assertRaises(ValueError):
+            self._plan(
+                "environments:\n  staging:\n    monitoring: {unattended:true}\n"
+            )
+
+    def test_an_inline_environment_mapping_stops_the_plan(self):
+        with self.assertRaises(ValueError):
+            self._plan('environments:\n  staging: {"monitor\\x69ng": {unattended: true}}\n')
+
+    def test_a_flow_style_root_stops_the_plan(self):
+        for text in (
+            "{version: 1, environments: {staging: {}, production: {}}}\n",
+            '"environ\\x6dents":\n  staging: {}\n',
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    self._plan(text)
+
+    def test_an_unreadable_monitoring_setting_stops_the_plan(self):
+        with self.assertRaises(ValueError):
+            self._plan(
+                "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+                "      unattended:\n        true\n"
+            )
 
     def test_opting_out_creates_nothing_and_says_monitoring_is_gated(self):
         plan, _ = self._plan(

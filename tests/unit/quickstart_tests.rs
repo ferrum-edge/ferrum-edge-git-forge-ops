@@ -126,15 +126,15 @@ fn the_environment_name_is_one_the_workflow_matrix_and_audit_accept() {
 }
 
 /// The enumerator's contract, spelled out rather than pulled in as a dependency:
-/// `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`.
+/// `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
 fn regex_lite_matches(name: &str) -> bool {
     let mut characters = name.chars();
     let Some(first) = characters.next() else {
         return false;
     };
     first.is_ascii_alphanumeric()
-        && name.len() <= 100
-        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && name.len() <= 64
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
 }
 
 #[test]

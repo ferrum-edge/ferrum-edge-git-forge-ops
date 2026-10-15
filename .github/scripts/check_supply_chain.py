@@ -317,6 +317,11 @@ RUN_EXPRESSION_MATRICES = {
 # The enumerator step, whole. An entry holding a newline is one command over
 # several lines (a quoted jq program): its lines match consecutively, with no
 # comment lines dropped inside it.
+# The enumerator's `{0,99}` guard is deliberately looser than the shared
+# environment-name grammar (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`) the CLI
+# enforces on the names it emits, so it cannot refuse a name the CLI accepts.
+# Tightening it is a two-step change: the protected policy that judges a
+# candidate must accept the new script before a workflow can carry it.
 APPLY_ENVIRONMENT_LIST_RUN = (
     "set -euo pipefail",
     "if [[ ! -f .gitforgeops/config.yaml ]]; then",

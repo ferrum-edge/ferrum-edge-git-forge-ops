@@ -157,7 +157,12 @@ MONITORING_ENVIRONMENT_SECRETS = (
     ("FERRUM_GATEWAY_CLIENT_KEY", "optional; base64 PEM, mTLS (needs the cert too)"),
 )
 
-ENVIRONMENT_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
+# One environment-name grammar for the CLI, this script and every workflow
+# guard: it becomes a `.state/<name>.json` path, a GitHub Environment, an
+# Actions matrix value and (with `-monitor`) a monitoring environment name.
+# Keep in step with `validate_env_name_is_safe_path_component` in
+# `src/config/resolved.rs`.
+ENVIRONMENT_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 REPOSITORY_NAME = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\Z")
 HTTP_STATUS = re.compile(r"\(HTTP (\d{3})\)")
 
@@ -266,93 +271,227 @@ def optional_get(api: GitHubApi, path: str, *, absent_statuses=(404,)):
 # --------------------------------------------------------------------------
 
 
-def environment_names_from_config(text: str) -> list[str]:
-    """Read the environment names out of `.gitforgeops/config.yaml`.
+_COMMENT = re.compile(r"(?:\A|\s)#.*\Z")
+_MAPPING_KEY = re.compile(
+    r"""\A(?P<key>"[^"]*"|'[^']*'|[^\s"'#{}\[\],:&*!|>%@`-][^:#]*?)\s*:"""
+    r"""(?:\s+(?P<value>.*))?\Z"""
+)
+_FLOW_UNATTENDED = re.compile(
+    # YAML needs whitespace after the colon: `{unattended:true}` is one key.
+    r"\A\{\s*unattended\s*:\s+(?P<value>[A-Za-z]+)\s*\}\Z"
+)
+
+
+def _strip_comment(line: str) -> str:
+    return _COMMENT.sub("", line).rstrip()
+
+
+def _mapping_entry(stripped: str) -> tuple[str, str] | None:
+    """`key: value` -> (key, value); None for anything that is not one."""
+    match = _MAPPING_KEY.match(stripped)
+    if match is None:
+        return None
+    key = match["key"].strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in "'\"":
+        # An escape or doubled quote could spell a structural key some other
+        # way; treat it as unreadable rather than as an unrelated key.
+        if "\\" in key or (key[0] == "'" and "''" in key[1:-1]):
+            return None
+        key = key[1:-1]
+    return key, (match["value"] or "").strip()
+
+
+def _environment_entries(
+    text: str,
+) -> list[tuple[str, str, list[tuple[int, int, str]]]]:
+    """Each key directly under `environments:`, its inline value and body.
 
     This is a deliberately small reader rather than a YAML parse: the script
-    runs on a customer's laptop, PyYAML is not in the standard library, and the
-    only thing needed here is the set of keys directly under `environments:`.
-    Anything that is not a plain, correctly indented mapping key is ignored,
-    and `--environment` overrides the file entirely.
+    runs on a customer's laptop and PyYAML is not in the standard library. It
+    reads block-mapped and inline (`staging: {}`) entries, quoted keys,
+    trailing comments and a root mapping at any indentation, and refuses, with
+    the line number, anything it cannot read rather than silently leaving an
+    environment out of the plan. Body lines are `(line, indent, text)`.
     """
-    names: list[str] = []
+    entries: list[tuple[str, str, list[tuple[int, int, str]]]] = []
     inside = False
+    seen_block = False
+    root: int | None = None
     depth: int | None = None
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        if not line.strip() or line.lstrip().startswith("#"):
+    # A YAML parser accepts one leading byte-order mark; so does this reader.
+    text = text.removeprefix("\ufeff")
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = _strip_comment(raw.rstrip())
+        if not line.strip() or line.strip() in ("---", "..."):
             continue
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
-        if indent == 0:
-            inside = stripped.rstrip() == "environments:"
+        if root is None:
+            root = indent
+        if indent < root:
+            raise ValueError(
+                f"config line {number}: inconsistent indentation of the top-level "
+                "mapping; bootstrap cannot read this configuration"
+            )
+        if indent == root:
+            entry = _mapping_entry(stripped)
+            if entry is None:
+                raise ValueError(
+                    f"config line {number}: write the configuration as a block "
+                    "mapping (one `key:` per line); bootstrap cannot read this "
+                    "top-level syntax"
+                )
+            inside = entry[0] == "environments"
             depth = None
+            if inside:
+                if seen_block:
+                    raise ValueError(
+                        f"config line {number}: `environments:` appears twice"
+                    )
+                seen_block = True
+                if entry[1] not in ("", "{}"):
+                    raise ValueError(
+                        f"config line {number}: write `environments:` as a block "
+                        "mapping, one environment per line; bootstrap cannot read "
+                        "an inline environment list"
+                    )
             continue
         if not inside:
             continue
         if depth is None:
             depth = indent
-        if indent != depth or not stripped.endswith(":"):
+        if indent < depth:
+            raise ValueError(
+                f"config line {number}: inconsistent indentation under "
+                "`environments:`; bootstrap cannot read this configuration"
+            )
+        if indent > depth:
+            if entries:
+                entries[-1][2].append((number, indent, stripped))
             continue
-        name = stripped[:-1].strip().strip("'\"")
-        if ENVIRONMENT_NAME.match(name) and name not in names:
-            names.append(name)
-    return names
+        entry = _mapping_entry(stripped)
+        if entry is None:
+            raise ValueError(
+                f"config line {number}: cannot read an environment entry under "
+                "`environments:`; write `name:` or `name: {}`"
+            )
+        name, value = entry
+        if not ENVIRONMENT_NAME.match(name):
+            raise ValueError(
+                f"config line {number}: environment name {name!r} must be 1-64 "
+                "ASCII letters, digits, '-' or '_', starting with a letter or digit"
+            )
+        if value.startswith(("*", "!")):
+            raise ValueError(
+                f"config line {number}: environment {name!r} uses a YAML alias or "
+                "tag, which bootstrap cannot read; write its settings out"
+            )
+        # Only an empty mapping (or none, or a bare anchor) can be read
+        # inline; anything else could hide a setting such as monitoring.
+        if value not in ("", "{}", "~", "null") and not re.fullmatch(r"&[^\s{}\[\],]+", value):
+            raise ValueError(
+                f"config line {number}: write environment {name!r}'s settings as a "
+                "block mapping (one `key:` per line); bootstrap reads only "
+                "`name:` or `name: {}` inline"
+            )
+        if any(existing == name for existing, _, _ in entries):
+            raise ValueError(f"config line {number}: environment {name!r} is declared twice")
+        entries.append((name, value, []))
+    return entries
+
+
+def environment_names_from_config(text: str) -> list[str]:
+    """Read the environment names out of `.gitforgeops/config.yaml`."""
+    return [name for name, _, _ in _environment_entries(text)]
+
+
+def _unattended_value(name: str, number: int, value: str) -> bool:
+    # YAML's boolean spellings only; the CLI refuses anything else.
+    if value in ("true", "True", "TRUE"):
+        return True
+    if value in ("false", "False", "FALSE"):
+        return False
+    raise ValueError(
+        f"config line {number}: environment {name!r} sets `monitoring.unattended` "
+        f"to {value!r}; write `unattended: true` or `unattended: false` on one line"
+    )
 
 
 def unattended_environments_from_config(text: str) -> list[str]:
     """Which environments asked for an unattended drift check?
 
-    Same deliberately small reader as `environment_names_from_config`, one
-    level deeper: an environment counts when its `monitoring:` block sets
-    `unattended: true`. Anything else — absent, `false`, a comment, a
-    differently indented key — reads as opted out, which leaves that
-    environment's monitoring approval-gated exactly as it is today.
+    An environment counts when its `monitoring:` block sets `unattended: true`
+    (block-mapped, or the inline `monitoring: {unattended: true}`). An absent
+    setting, `false`, or an `unattended:` key outside `monitoring:` reads as
+    opted out, which leaves that environment's monitoring approval-gated. A
+    monitoring setting the reader cannot represent is refused rather than read
+    as opted out, because the CLI would still route that environment's drift
+    check to a `-monitor` environment bootstrap never created.
     """
     names: list[str] = []
-    inside = False
-    depth: int | None = None
-    current: str | None = None
-    monitoring_depth: int | None = None
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        if indent == 0:
-            inside = stripped.rstrip() == "environments:"
-            depth = None
-            current = None
-            monitoring_depth = None
-            continue
-        if not inside:
-            continue
-        if depth is None:
-            depth = indent
-        if indent == depth:
-            name = stripped[:-1].strip().strip("'\"") if stripped.endswith(":") else ""
-            current = name if ENVIRONMENT_NAME.match(name) else None
-            monitoring_depth = None
-            continue
-        if current is None or indent <= depth:
-            continue
-        if monitoring_depth is not None and indent <= monitoring_depth:
-            monitoring_depth = None
-        if stripped.rstrip() == "monitoring:":
-            monitoring_depth = indent
-            continue
-        if monitoring_depth is None or indent <= monitoring_depth:
-            continue
-        key, separator, value = stripped.partition(":")
-        if separator and key.strip() == "unattended":
-            if value.split("#")[0].strip().lower() == "true" and current not in names:
-                names.append(current)
+
+    def unrepresentable(name: str, number: int) -> ValueError:
+        return ValueError(
+            f"config line {number}: write environment {name!r}'s `monitoring:` "
+            "setting as a block mapping with `unattended: true|false` on one line "
+            "so bootstrap can read it"
+        )
+
+    for name, value, body in _environment_entries(text):
+        child_depth: int | None = None
+        monitoring_depth: int | None = None
+        setting_depth: int | None = None
+        for number, indent, stripped in body:
+            if child_depth is None or indent < child_depth:
+                child_depth = indent
+            if indent == child_depth:
+                monitoring_depth = None
+                setting_depth = None
+                entry = _mapping_entry(stripped)
+                if entry is None:
+                    raise unrepresentable(name, number)
+                if entry[0] == "<<":
+                    raise ValueError(
+                        f"config line {number}: environment {name!r} uses a YAML "
+                        "merge key, which bootstrap cannot read; write its "
+                        "settings out"
+                    )
+                if entry[0] != "monitoring":
+                    continue
+                if entry[1] == "":
+                    monitoring_depth = indent
+                    continue
+                if entry[1] == "{}":
+                    continue
+                flow = _FLOW_UNATTENDED.match(entry[1])
+                if flow is None:
+                    raise unrepresentable(name, number)
+                if _unattended_value(name, number, flow["value"]) and name not in names:
+                    names.append(name)
+                continue
+            if monitoring_depth is None or indent <= monitoring_depth:
+                continue
+            # Inside `monitoring:`: every line must be one `key: scalar`
+            # setting at a single depth.
+            if setting_depth is None:
+                setting_depth = indent
+            entry = _mapping_entry(stripped)
+            if indent != setting_depth or entry is None:
+                raise unrepresentable(name, number)
+            if entry[0] == "unattended":
+                if _unattended_value(name, number, entry[1]) and name not in names:
+                    names.append(name)
     return names
 
 
 def resolve_environments(args) -> list[str]:
     if args.environment:
+        for name in args.environment:
+            if not ENVIRONMENT_NAME.match(name):
+                raise ValueError(
+                    f"--environment {name!r} must be 1-64 ASCII letters, digits, "
+                    "'-' or '_', starting with a letter or digit"
+                )
         return list(dict.fromkeys(args.environment))
     config = Path(args.config)
     if not config.is_file():
