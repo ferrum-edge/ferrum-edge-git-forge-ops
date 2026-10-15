@@ -320,6 +320,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `bootstrap_repo_settings.py` reads inline (`staging: {}`) and commented
+  environment entries and `monitoring:` settings, and stops with the line
+  number on an entry it cannot read instead of leaving that environment out
+  of the plan (#572).
+- One environment-name grammar, `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, in the
+  CLI, bootstrap (including `--environment`), every workflow guard and the
+  quickstart. The CLI now refuses a leading `_` or `-`, which the workflows
+  already refused; bootstrap and the workflows no longer accept dots or names
+  over 64 characters, which the CLI already refused (#573).
 - Audit batch (#531). Proxy overlays canonicalize `backend_protocol` to
   `backend_scheme` before merging, and refuse conflicting values (#513).
   Additive array merges apply only to Proxy `spec.plugins` and Upstream

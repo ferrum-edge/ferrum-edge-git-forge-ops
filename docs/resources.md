@@ -45,7 +45,8 @@ block `team-beta`.
 Loading is fail-closed and deterministic:
 
 - Overlay names (in `.gitforgeops/config.yaml` or `FERRUM_OVERLAY`) and
-  environment names are 1–64 ASCII letters, digits, `-` or `_`. An overlay
+  environment names are 1–64 ASCII letters, digits, `-` or `_`; an
+  environment name also starts with a letter or digit. An overlay
   name selects one directory under `overlays/`; paths and traversal segments
   are rejected.
 - A selected overlay directory must exist. The error names the environment,

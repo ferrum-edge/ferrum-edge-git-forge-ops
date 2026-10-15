@@ -67,7 +67,7 @@ jobs:
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
-          [[ "$INPUT_ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]] || {
+          [[ "$INPUT_ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || {
             echo "::error::Environment must be a single safe path component."
             exit 1
           }

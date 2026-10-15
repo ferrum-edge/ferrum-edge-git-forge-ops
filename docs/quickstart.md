@@ -212,7 +212,7 @@ environments:
 default_environment: production
 ```
 
-The environment name must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, because
+The environment name must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`, because
 it becomes a GitHub Actions matrix value, an `environment:` binding and a
 `.state/<name>.json` path. It must also equal the GitHub Environment name the
 bootstrap script created.

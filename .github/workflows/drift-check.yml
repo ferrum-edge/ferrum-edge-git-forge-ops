@@ -77,8 +77,8 @@ jobs:
           jq -e '
             type == "array" and
             all(.[]; .environment as $e | .monitoring_environment as $m |
-              ($e | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")) and
-              ($m | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")))
+              ($e | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")) and
+              ($m | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}(-monitor)?$")))
           ' <<< "$scopes" >/dev/null || {
             echo "::error::Every environment must be a single safe path component."
             exit 1

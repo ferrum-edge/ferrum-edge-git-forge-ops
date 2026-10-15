@@ -249,6 +249,56 @@ class ConfigReaderTests(unittest.TestCase):
     def test_a_missing_config_resolves_no_environments(self):
         self.assertEqual(bootstrap.resolve_environments(namespace()), [])
 
+    def test_inline_maps_and_trailing_comments_are_read(self):
+        # docs/promotion.md declares `staging: {}` beside a block-mapped
+        # `production:`; neither may drop out of the plan.
+        self.assertEqual(
+            bootstrap.environment_names_from_config(
+                "version: 1\nenvironments:\n  staging: {}\n  production:\n"
+                "    promotion:\n      requires: staging\n"
+            ),
+            ["staging", "production"],
+        )
+        self.assertEqual(
+            bootstrap.environment_names_from_config(
+                "version: 1\nenvironments:  # deployments\n"
+                "  staging:   # pre-production\n    overlay: staging\n"
+                "  'qa': {overlay: qa}\n  \"production\":\n"
+                "    overlay: production\n"
+            ),
+            ["staging", "qa", "production"],
+        )
+
+    def test_an_entry_the_reader_cannot_represent_fails_instead_of_dropping_out(self):
+        for text in (
+            # A sequence, not a mapping.
+            "environments:\n  - staging\n  - production\n",
+            # An inline environment list.
+            "environments: {staging: {}, production: {}}\n",
+            # A name outside the shared environment grammar.
+            "environments:\n  prod.eu: {}\n  production:\n",
+            "environments:\n  _staging: {}\n",
+            "environments:\n  " + "a" * 65 + ": {}\n",
+            # Inconsistent indentation would hide the second environment.
+            "environments:\n    staging: {}\n  production: {}\n",
+            # Declared twice.
+            "environments:\n  staging: {}\n  staging:\n",
+            "environments:\n  staging: {}\nenvironments:\n  production: {}\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    bootstrap.environment_names_from_config(text)
+
+    def test_explicit_environment_names_use_the_same_grammar(self):
+        for name in ("prod.eu", "_staging", "a" * 65, "../x", ""):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    bootstrap.resolve_environments(namespace(environment=[name]))
+        self.assertEqual(
+            bootstrap.resolve_environments(namespace(environment=["a" * 64, "eu_1-b"])),
+            ["a" * 64, "eu_1-b"],
+        )
+
 
 MONITORING_CONFIG_YAML = """version: 1
 
@@ -279,6 +329,36 @@ class MonitoringConfigReaderTests(unittest.TestCase):
         self.assertEqual(
             bootstrap.unattended_environments_from_config(MONITORING_CONFIG_YAML),
             ["staging"],
+        )
+
+    def test_inline_and_commented_monitoring_settings_are_read(self):
+        self.assertEqual(
+            bootstrap.unattended_environments_from_config(
+                "environments:\n  staging: {}\n"
+                "  qa:\n    monitoring: {unattended: true}\n"
+                "  production:   # gated\n    monitoring:   # scheduled\n"
+                "      unattended: true   # opt in\n"
+                "  sandbox:\n    monitoring: {}\n"
+            ),
+            ["qa", "production"],
+        )
+
+    def test_a_monitoring_setting_the_reader_cannot_represent_fails(self):
+        for text in (
+            "environments:\n  staging: {monitoring: {unattended: true}}\n",
+            "environments:\n  staging:\n    monitoring: {unattended: true, x: 1}\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    bootstrap.unattended_environments_from_config(text)
+
+    def test_only_a_direct_unattended_child_of_monitoring_counts(self):
+        self.assertEqual(
+            bootstrap.unattended_environments_from_config(
+                "environments:\n  staging:\n    monitoring:\n      nested:\n"
+                "        unattended: true\n"
+            ),
+            [],
         )
 
     def test_an_absent_monitoring_block_is_opted_out(self):

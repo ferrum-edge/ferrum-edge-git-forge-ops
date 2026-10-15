@@ -330,6 +330,30 @@ fn env_name_allowlist_rejects_shell_metacharacters() {
 }
 
 #[test]
+fn env_names_share_one_grammar_with_bootstrap_and_workflow_guards() {
+    // `bootstrap_repo_settings.py` and every workflow guard enforce
+    // `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`; the CLI must make the same call.
+    use gitforgeops::config::resolved::validate_env_name_is_safe_path_component;
+    let longest = "a".repeat(64);
+    let too_long = "a".repeat(65);
+    for bad in ["_staging", "-staging", "prod.eu", too_long.as_str()] {
+        assert!(
+            validate_env_name_is_safe_path_component(bad).is_err(),
+            "expected {bad:?} to be rejected"
+        );
+    }
+    for good in ["0prod", "staging_", "eu-1", longest.as_str()] {
+        assert!(
+            validate_env_name_is_safe_path_component(good).is_ok(),
+            "expected {good:?} to be accepted"
+        );
+    }
+    let file = write_repo_config("environments:\n  _staging:\n    overlay: staging\n");
+    let err = RepoConfig::load_from_path(file.path()).unwrap_err();
+    assert!(err.to_string().contains("must start with"), "{err}");
+}
+
+#[test]
 fn repo_config_rejects_env_name_with_shell_metacharacters() {
     // Full path: YAML loader + validator rejects a weaponized env name at
     // load time, so `envs --format json` can never emit a name that could

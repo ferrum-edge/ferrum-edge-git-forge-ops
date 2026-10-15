@@ -89,12 +89,20 @@ impl ResolvedEnv {
 /// `gitforgeops envs --format json`) into CI matrix values that end up on
 /// shell command lines. A strict allowlist is the safest enforcement.
 ///
-/// Accepted: ASCII letters, digits, `-`, `_`. Length 1..=64. That's
-/// enough for any sensible environment identifier and rejects shell
-/// metacharacters, whitespace, path separators, and traversal segments by
-/// construction.
+/// Accepted: ASCII letters, digits, `-`, `_`, starting with a letter or
+/// digit. Length 1..=64. That's enough for any sensible environment
+/// identifier and rejects shell metacharacters, whitespace, path separators,
+/// and traversal segments by construction. This is the one environment-name
+/// grammar: `bootstrap_repo_settings.py` and every workflow guard enforce the
+/// same `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`.
 pub fn validate_env_name_is_safe_path_component(name: &str) -> crate::error::Result<()> {
-    validate_component_name("environment", name)
+    validate_component_name("environment", name)?;
+    if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return Err(crate::error::Error::Config(format!(
+            "environment name {name:?} must start with an ASCII letter or digit."
+        )));
+    }
+    Ok(())
 }
 
 /// Overlay selections are names beneath the overlay root, never paths.

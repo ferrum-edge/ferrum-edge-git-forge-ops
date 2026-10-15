@@ -330,8 +330,8 @@ APPLY_ENVIRONMENT_LIST_RUN = (
     "jq -e '\n"
     'type == "array" and\n'
     "all(.[];\n"
-    '(.environment | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"))\n'
-    'and ((.promotion_requires // "x") | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")))\n'
+    '(.environment | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"))\n'
+    'and ((.promotion_requires // "x") | test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")))\n'
     "' <<< \"$scopes\" >/dev/null || {",
     'echo "::error::Every environment must be a single safe path component."',
     "exit 1",
