@@ -330,6 +330,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   its looser pinned guard, which cannot refuse a name the CLI emits. The CLI now refuses a leading `_` or `-`, which the workflows
   already refused; bootstrap and the workflows no longer accept dots or names
   over 64 characters, which the CLI already refused (#573).
+- A stale-plan refusal during ambiguous `POST /batch` reconciliation now stops
+  every later write in that namespace, as a stale direct write already did:
+  remaining creates and updates are reported as withheld, deletes are deferred
+  and adoption is skipped (#578).
+- After a PluginConfig write, a proxy's precondition check leaves out only the
+  associations that write could have rewritten (a `proxy`-scoped write or a
+  retarget). An update that keeps a `proxy_group` or `global` scope keeps every
+  association to that plugin in the comparison, so a proxy update cannot
+  remove an attachment made after the plan.
 - The template updater now treats the vendored `contracts/` tree as
   upstream-managed, so adopting a revision that introduces or re-pins
   `contracts/ferrum-contracts/` also adopts the PIN, schemas, vocabularies and
