@@ -669,6 +669,32 @@ fn team_alpha() -> Vec<String> {
     vec!["team-alpha".to_string()]
 }
 
+/// A successful response whose body does not parse can quote anything the
+/// request carried. `serde_json`'s message quotes the offending value, so the
+/// doctor must report the failure without it.
+#[tokio::test]
+async fn malformed_successful_responses_are_reported_without_their_contents() {
+    const REFLECTED: &str = "zq7-reflected-request-material";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_edge_stub(
+        |request| {
+            if request.starts_with("GET /health") {
+                (200, r#"{"ready":"zq7-reflected-request-material"}"#)
+            } else if request.starts_with("GET /cluster") {
+                (200, r#"{"mode":["zq7-reflected-request-material"]}"#)
+            } else if request.starts_with("GET /namespaces") {
+                (200, r#"{"data":"zq7-reflected-request-material"}"#)
+            } else {
+                (404, r#"{"error":"not found"}"#)
+            }
+        },
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &scoped_env(url), &team_alpha()).await;
+    let rendered = format!("{checks:?}");
+    assert!(!rendered.contains(REFLECTED), "{rendered}");
+}
+
 #[tokio::test]
 async fn a_namespace_scoped_token_refused_on_cluster_is_proven_on_namespaces() {
     // Edge v0.9.16 refuses every fleet-global route, /cluster included, to a

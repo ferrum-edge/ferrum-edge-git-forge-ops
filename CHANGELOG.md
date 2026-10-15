@@ -457,6 +457,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `[REDACTED]`. Peer text is withheld whole when a resolved value is not
   safely scrubbable, or when a value (including one too short to replace) or a
   fragment of one survives. The final `Error:` line is never withheld.
+  Admin JWTs get the same re-encoding and fragment checks as resolved
+  secrets. Only a fixed window of a peer's error text is scrubbed, in one
+  streaming pass. A successful response that does not parse (`/health`,
+  `/namespaces`, `/cluster`, `/config/export`, GitHub PR and events) is
+  reported by error category and position, never with `serde_json`'s quote
+  of the offending value.
 - Finish bounding error bodies and validator I/O (follow-up to #553). The
   gateway's structured `error` message is now one bounded line like every
   other displayed error body, and a failed PR-comment POST reads GitHub's

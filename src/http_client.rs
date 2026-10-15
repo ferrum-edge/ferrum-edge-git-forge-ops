@@ -38,6 +38,28 @@ const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 
+/// How much of a peer's error text is scrubbed. Only the first
+/// [`MAX_ERROR_MESSAGE_CHARS`] are ever displayed, so the window only needs
+/// room for a secret that starts inside the displayed part to end inside it
+/// too; the rest of a body (up to [`MAX_RESPONSE_BODY_BYTES`]) is never
+/// processed, which bounds scrubbing time and memory.
+const MAX_SCRUBBED_ERROR_CHARS: usize = 16 * 1024;
+
+/// A diagnostic for a successful response whose body did not parse.
+///
+/// `serde_json`'s own message quotes the offending value ("invalid type:
+/// string \"…\""), and a peer can make that value anything the request
+/// carried, the bearer token included. Only the error's category and
+/// position are kept.
+pub(crate) fn malformed_response(context: &str, error: &serde_json::Error) -> crate::error::Error {
+    crate::error::Error::HttpClient(format!(
+        "{context}: malformed response body ({:?} error at line {}, column {}); its contents are withheld",
+        error.classify(),
+        error.line(),
+        error.column()
+    ))
+}
+
 /// Collapse an API error body to one bounded line for display.
 ///
 /// Error bodies are peer-controlled: they can echo request material (which,
@@ -48,7 +70,11 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 512;
 pub(crate) fn bounded_error_message(body: &str) -> String {
     // Scrub before truncating: a cut through a secret would leave a prefix
     // no needle matches.
-    let body = crate::secrets::scrub_peer_text(body);
+    let window = body
+        .char_indices()
+        .nth(MAX_SCRUBBED_ERROR_CHARS)
+        .map_or(body, |(end, _)| &body[..end]);
+    let body = crate::secrets::scrub_peer_text(window);
     let mut out = String::with_capacity(body.len().min(MAX_ERROR_MESSAGE_CHARS + 16));
     for (index, ch) in body.chars().enumerate() {
         if index >= MAX_ERROR_MESSAGE_CHARS {
@@ -585,7 +611,7 @@ impl AdminClient {
             .await?;
         self.check(&resp, RequestKind::Read)?;
         serde_json::from_str::<HealthStatus>(&resp.body)
-            .map_err(|e| crate::error::Error::HttpClient(format!("GET /health: {e}")))
+            .map_err(|e| malformed_response("GET /health", &e))
     }
 
     /// Authenticated `GET /cluster`. CP/DP connection state, used for the
@@ -874,7 +900,7 @@ impl AdminClient {
             self.check(&resp, RequestKind::Read)?;
 
             let page: Page<String> = serde_json::from_str(&resp.body)
-                .map_err(|e| crate::error::Error::HttpClient(format!("GET /namespaces: {e}")))?;
+                .map_err(|e| malformed_response("GET /namespaces", &e))?;
             let total = page.pagination.as_ref().map(|p| p.total);
             let received = page.data.len();
             accumulated = accumulated.checked_add(received).ok_or_else(|| {
@@ -3402,8 +3428,7 @@ impl ClusterStatus {
 
 /// Parse a `GET /cluster` body.
 pub fn parse_cluster_status(body: &str) -> crate::error::Result<ClusterStatus> {
-    serde_json::from_str::<ClusterStatus>(body)
-        .map_err(|e| crate::error::Error::HttpClient(format!("GET /cluster: {e}")))
+    serde_json::from_str::<ClusterStatus>(body).map_err(|e| malformed_response("GET /cluster", &e))
 }
 
 /// One-line post-apply convergence report.
@@ -3802,17 +3827,76 @@ mod bounded_error_message_tests {
         )
         .unwrap();
         let token = client.authorized("/health").unwrap().token;
-        for echoed in [
-            format!("rejected token={token}"),
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
+        for (echoed, leaked) in [
+            (format!("rejected token={token}"), token.clone()),
             // Glued to another word, so only the registered value catches it.
-            format!("rejected ref:x{token}"),
+            (format!("rejected ref:x{token}"), token.clone()),
+            // Re-encoded: neither the raw token nor a JWT-shaped word.
+            (format!("rejected header {encoded}"), encoded.clone()),
         ] {
             let body = serde_json::json!({ "error": echoed });
             let rendered =
                 super::map_api_error(401, &body.to_string(), super::RequestKind::Read).to_string();
-            assert!(!rendered.contains(&token), "{rendered}");
+            assert!(!rendered.contains(&leaked), "{rendered}");
             assert!(rendered.contains("[REDACTED]"), "{rendered}");
         }
+        // A fragment of the signature: no needle matches, so the scan
+        // withholds the text.
+        let signature = token.rsplit('.').next().unwrap();
+        let fragment = &signature[2..signature.len() - 2];
+        let body = serde_json::json!({ "error": format!("rejected sig {fragment}") });
+        let rendered =
+            super::map_api_error(401, &body.to_string(), super::RequestKind::Read).to_string();
+        assert!(!rendered.contains(fragment), "{rendered}");
+        assert!(
+            rendered.contains(crate::secrets::DISPLAY_WITHHELD),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn malformed_successful_responses_never_quote_their_contents() {
+        const REFLECTED: &str = "eyJ-zq7-reflected-request-material";
+        let health =
+            serde_json::from_str::<super::HealthStatus>(&format!(r#"{{"ready":"{REFLECTED}"}}"#))
+                .unwrap_err();
+        let rendered = super::malformed_response("GET /health", &health).to_string();
+        assert!(!rendered.contains(REFLECTED), "{rendered}");
+        assert!(rendered.contains("GET /health"), "{rendered}");
+        let cluster =
+            super::parse_cluster_status(&format!(r#"{{"mode":"x","nodes":"{REFLECTED}"}}"#));
+        if let Err(error) = cluster {
+            assert!(!error.to_string().contains(REFLECTED), "{error}");
+        }
+    }
+
+    #[test]
+    fn scrubbing_memory_does_not_grow_with_the_number_of_words() {
+        // Alternating word and separator characters: the worst case for a
+        // tokenizer that keeps one entry per word.
+        let text = "a ".repeat(4 * 1024 * 1024);
+        let (redacted, peak) =
+            crate::alloc_meter::peak_bytes(|| crate::secrets::redact_credential_shapes(&text));
+        assert_eq!(redacted.len(), text.len());
+        // The output string itself, and nothing proportional to word count.
+        assert!(
+            peak <= text.len() + 64 * 1024,
+            "redacting {} bytes peaked at {peak} bytes",
+            text.len()
+        );
+
+        // A peer's error text is scrubbed in a fixed window, whatever its size.
+        let error = "a ".repeat(16 * 1024 * 1024);
+        let (message, peak) =
+            crate::alloc_meter::peak_bytes(|| super::bounded_error_message(&error));
+        assert!(message.ends_with("[truncated]"), "{message}");
+        assert!(
+            peak <= 1024 * 1024,
+            "a {}-byte error message peaked at {peak} bytes",
+            error.len()
+        );
     }
 
     #[test]
