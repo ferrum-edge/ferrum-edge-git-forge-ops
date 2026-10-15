@@ -2241,6 +2241,54 @@ def security_trigger_violations(text: str) -> list[str]:
     return violations
 
 
+# The exact trigger shape `agent-setup-policy.yml` may carry. Its job reports
+# the required `validate-trusted-policy` context, and the exemption in
+# `policy_check_impersonation_violations` trusts this file to be the context's
+# only home. `pull_request_target` loads the protected definition; any added
+# candidate-controlled trigger (above all `pull_request`) would run the
+# candidate's own copy and could post a result under the required name
+# without the trusted validator ever running.
+AGENT_SETUP_POLICY_SHAPE = {
+    "types": ["opened", "synchronize", "reopened", "edited"],
+}
+
+
+def agent_setup_policy_trigger_violations(text: str) -> list[str]:
+    """`agent-setup-policy.yml` may run only on its reviewed trigger shape."""
+    try:
+        document = parse_workflow(text)
+    except WorkflowSyntaxError as error:
+        return [
+            "agent-setup-policy.yml: the trigger list must be in the YAML "
+            f"subset the policy reads: {error}"
+        ]
+    candidates = [value for key, value in document.items() if key.casefold() == "on"]
+    if len(candidates) != 1 or not isinstance(candidates[0], dict):
+        return ["agent-setup-policy.yml: the workflow must declare exactly one `on:` mapping"]
+    triggers = candidates[0]
+    violations: list[str] = []
+    for found in triggers:
+        if found.casefold() != "pull_request_target":
+            violations.append(
+                f"agent-setup-policy.yml: the trigger {found!r} is not reviewed; "
+                "the only reviewed trigger is pull_request_target, because a "
+                "candidate-controlled trigger would let a pull request report "
+                "the required validate-trusted-policy check itself"
+            )
+    spelled = {found.casefold(): found for found in triggers}
+    target = triggers.get(spelled.get("pull_request_target", ""))
+    if "pull_request_target" not in spelled:
+        violations.append(
+            "agent-setup-policy.yml: the reviewed pull_request_target trigger is missing"
+        )
+    elif target != AGENT_SETUP_POLICY_SHAPE:
+        violations.append(
+            "agent-setup-policy.yml: pull_request_target must keep its reviewed "
+            f"types; expected {AGENT_SETUP_POLICY_SHAPE!r}, found {target!r}"
+        )
+    return violations
+
+
 def allowlisted_validator_digests(text: str) -> list[str]:
     """Return every approved validator digest, in file order."""
     digests: list[str] = []
@@ -4077,6 +4125,7 @@ REQUIRED_CHECK_WORKFLOWS = {
     SUPPLY_CHAIN_POLICY_JOB: SUPPLY_CHAIN_POLICY_PATH,
     "state-guard-reject-state-edits": ".github/workflows/state-guard.yml",
     "gitforgeops-required-static-validation": ".github/workflows/validate-pr.yml",
+    "validate-trusted-policy": ".github/workflows/agent-setup-policy.yml",
 }
 
 
@@ -4659,6 +4708,19 @@ RELEASE_GATE_REQUIRED_CHECKS = (
 )
 RELEASE_GATE_ACCEPTED_CHECKS = (
     "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
+    "Agent Setup Policy / validate-trusted-policy",
+)
+# TRANSITIONAL: the protected-branch checker pins the candidate's
+# `release_gate.py` to the pre-`validate-trusted-policy` tuple, so the helper
+# cannot change in the same PR as this pin. Until the follow-up PR updates
+# the helper, either tuple satisfies `release_gate_helper_violations`; the
+# follow-up removes the old spelling here in the same change.
+# A plain tuple, not a set: membership must compare by equality, because the
+# candidate's literal may be a list or contain unhashable values, and those
+# must reach the pin-violation diagnostic instead of raising TypeError.
+RELEASE_GATE_ACCEPTED_CHECKS_TRANSITIONAL = (
+    ("GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",),
+    RELEASE_GATE_ACCEPTED_CHECKS,
 )
 RELEASE_GATE_APP_ID = 15368
 RELEASE_GATE_BUDGET_SECONDS = 900
@@ -4888,7 +4950,9 @@ def release_gate_helper_violations(root: Path) -> list[str]:
     violations: list[str] = []
     for name, expected in RELEASE_GATE_PINS.items():
         value = _module_constant(tree, name)
-        if type(value) is not type(expected) or value != expected:
+        if name == "ACCEPTED_CHECKS" and value in RELEASE_GATE_ACCEPTED_CHECKS_TRANSITIONAL:
+            pass  # Transitional spellings; see RELEASE_GATE_ACCEPTED_CHECKS_TRANSITIONAL.
+        elif type(value) is not type(expected) or value != expected:
             violations.append(f"{label}: {name} must be assigned exactly {expected!r}")
         if _python_bindings(tree, name) != 1:
             violations.append(f"{label}: {name} must be bound once, at module level")
@@ -5535,6 +5599,11 @@ def main(argv: list[str] | None = None) -> int:
     violations.extend(cargo_audit_install_violations(security_workflow))
     violations.extend(security_push_trigger_violations(security_workflow))
     violations.extend(security_trigger_violations(security_workflow))
+    violations.extend(
+        agent_setup_policy_trigger_violations(
+            (workflows / "agent-setup-policy.yml").read_text(encoding="utf-8")
+        )
+    )
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     if 'result=$(python3 "$helper"' not in state_guard:
         violations.append(

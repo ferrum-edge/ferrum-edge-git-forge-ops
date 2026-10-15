@@ -37,6 +37,7 @@ REQUIRED_STATUS_CHECKS = (
     "trusted-supply-chain-policy",
     "state-guard-reject-state-edits",
     "gitforgeops-required-static-validation",
+    "validate-trusted-policy",
 )
 
 # TRANSITIONAL (GHSA-x5m2-4555-q4cr, expand step). `trusted-supply-chain-policy`
@@ -48,7 +49,7 @@ REQUIRED_STATUS_CHECKS = (
 # `security-supply-chain-policy` stays required: that job still runs the
 # workflow-script unit tests. The retire step makes the new context a hard
 # requirement and drops this tuple (docs/github-launch-controls.md, section 2).
-TRANSITIONAL_STATUS_CHECKS = ("trusted-supply-chain-policy",)
+TRANSITIONAL_STATUS_CHECKS = ("trusted-supply-chain-policy", "validate-trusted-policy")
 
 # Every required context is a GitHub Actions job, so the ruleset binds each to
 # the GitHub Actions app (its id on github.com). Unbound, a commit status or a
@@ -63,6 +64,7 @@ GITHUB_ACTIONS_APP_ID = 15368
 SOURCE_BOUND_STATUS_CHECKS = (
     "trusted-supply-chain-policy",
     "state-guard-reject-state-edits",
+    "validate-trusted-policy",
 )
 
 RELEASE_TAG_PATTERN = "refs/tags/v*"

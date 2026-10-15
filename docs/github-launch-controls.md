@@ -163,6 +163,9 @@ no other include or exclude patterns. It must:
     [Switching the supply-chain policy check](#switching-the-supply-chain-policy-check))
   - `state-guard-reject-state-edits`
   - `gitforgeops-required-static-validation`
+  - `validate-trusted-policy` (being added; until an operator adds it to the
+    ruleset the settings audit reports its absence as a `WARN`, like the
+    transitional supply-chain context above)
 - have exactly one bypass actor in any mode: the state-writer App, as an
   always-on bypass. Pull-request-only human or team bypasses are not allowed.
 
@@ -954,12 +957,14 @@ GH_TOKEN=<administration-read-token> python3 .github/scripts/audit_settings.py \
   --required-check 'security-supply-chain-policy' \
   --required-check 'trusted-supply-chain-policy' \
   --required-check 'state-guard-reject-state-edits' \
-  --required-check 'gitforgeops-required-static-validation'
+  --required-check 'gitforgeops-required-static-validation' \
+  --required-check 'validate-trusted-policy'
 ```
 
-`--required-check` may be omitted; those six contexts are the default. Until
+`--required-check` may be omitted; those seven contexts are the default. Until
 the [ruleset switch](#switching-the-supply-chain-policy-check), a ruleset
-without `trusted-supply-chain-policy` is reported as a `WARN`, not a failure.
+without `trusted-supply-chain-policy` or `validate-trusted-policy` is reported
+as a `WARN`, not a failure.
 On a template repository, pass `--template-repo` instead of
 `--state-writer-app-id` (one of the two is required).
 
