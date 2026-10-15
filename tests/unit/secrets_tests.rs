@@ -2302,6 +2302,111 @@ fn retired_partner_key_bundle() -> BTreeMap<String, String> {
     bundle
 }
 
+/// Every spelling the lookup still reads for a two-entry keyauth array:
+/// `(entry 0 slot, entry 1 slot)`.
+const KEYAUTH_SLOT_ENCODINGS: [(&str, &str); 4] = [
+    (
+        "ferrum/partner/keyauth/key",
+        "ferrum/partner/keyauth/[1]/key",
+    ),
+    (
+        "ferrum/partner/keyauth/[0]/key",
+        "ferrum/partner/keyauth/[1]/key",
+    ),
+    (
+        "ferrum/partner/keyauth.key",
+        "ferrum/partner/keyauth[1].key",
+    ),
+    (
+        "ferrum/partner/keyauth[0].key",
+        "ferrum/partner/keyauth[1].key",
+    ),
+];
+
+/// A legacy spelling names the same slot as the canonical one, so shrinking
+/// the array or dropping the type is refused for every encoding the lookup
+/// still accepts, and an unshrunk array resolves both entries from it.
+#[test]
+fn every_accepted_slot_encoding_is_covered_by_the_retirement_checks() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    for (first, second) in KEYAUTH_SLOT_ENCODINGS {
+        let mut bundle = BTreeMap::new();
+        bundle.insert(first.to_string(), "FIRST-STORED-KEY".to_string());
+        bundle.insert(second.to_string(), "SECOND-STORED-KEY".to_string());
+
+        // Both entries declared: the stored values resolve, nothing refused.
+        let mut grown = partner_cfg(serde_json::json!({
+            "keyauth": [{"key": REQUIRE}, {"key": REQUIRE}],
+        }));
+        let report = resolve_secrets(&mut grown, &bundle).unwrap();
+        assert_eq!(report.slot_remaps.len(), 0, "{first}");
+        assert_eq!(
+            grown.consumers[0].credentials["keyauth"],
+            serde_json::json!([{"key": "FIRST-STORED-KEY"}, {"key": "SECOND-STORED-KEY"}]),
+            "{first}"
+        );
+
+        for (case, declared) in [
+            (
+                "shrunk array",
+                serde_json::json!({"keyauth": [{"key": REQUIRE}]}),
+            ),
+            ("empty array", serde_json::json!({"keyauth": []})),
+            ("omitted type", serde_json::json!({})),
+        ] {
+            let err = report_secrets_with_mode_and_options(
+                &partner_cfg(declared),
+                &bundle,
+                GatewayMode::Api,
+                ResolveOptions::default(),
+            )
+            .expect_err("a retired slot in any accepted encoding must be refused");
+            assert!(
+                matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
+                "{first} {case}"
+            );
+            let err = err.to_string();
+            assert!(
+                err.contains(second) && err.contains("orphaned"),
+                "{first} {case}: {err}"
+            );
+            assert!(
+                !err.contains("STORED-KEY"),
+                "a refusal must never echo bundle values"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_slot_scan_ignores_similarly_named_types_and_canonical_children() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/partner/keyauth/key".to_string(), "LIVE".to_string());
+    // Not keyauth slots: another consumer and an unrelated key.
+    bundle.insert(
+        "ferrum/partner2/keyauth.key".to_string(),
+        "OTHER".to_string(),
+    );
+    bundle.insert(
+        "ferrum/partner/keyauthx.key".to_string(),
+        "OTHER".to_string(),
+    );
+    let cfg = partner_cfg(serde_json::json!({"keyauth": [{"key": REQUIRE}]}));
+    let report = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(report.slot_remaps.len(), 0);
+}
+
 /// Omitting `keyauth` entirely must reach the same verdict as `keyauth: []`:
 /// the stored slots would otherwise be resurrected by a later re-add, even
 /// with `alloc=generate`.
@@ -2549,6 +2654,91 @@ fn deleted_consumer_recorded_by_the_ledger_is_refused_in_an_unfiltered_run() {
         resolved.consumers[0].credentials["keyauth"][0]["key"],
         REQUIRE
     );
+}
+
+/// A nested credential array keeps its explicit-`[0]` slash alias: shrinking
+/// it is refused for a value stored under that spelling too.
+#[test]
+fn nested_array_shrink_covers_the_explicit_zero_slash_alias() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/partner/keyauth/key".to_string(), "KEY".to_string());
+    bundle.insert(
+        "ferrum/partner/keyauth/[0]/extra/[0]/token".to_string(),
+        "STORED-A".to_string(),
+    );
+    bundle.insert(
+        "ferrum/partner/keyauth/[0]/extra/[1]/token".to_string(),
+        "STORED-B".to_string(),
+    );
+    let grown = partner_cfg(serde_json::json!({
+        "keyauth": [{"key": REQUIRE, "extra": [{"token": REQUIRE}, {"token": REQUIRE}]}],
+    }));
+    let shrunk = partner_cfg(serde_json::json!({
+        "keyauth": [{"key": REQUIRE, "extra": [{"token": REQUIRE}]}],
+    }));
+    let report = report_secrets_with_mode_and_options(
+        &grown,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(report.slot_remaps.len(), 0);
+    let err = report_secrets_with_mode_and_options(
+        &shrunk,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("the retired nested entry must be refused")
+    .to_string();
+    assert!(
+        err.contains("ferrum/partner/keyauth/[0]/extra/[1]/token"),
+        "{err}"
+    );
+    assert!(!err.contains("STORED-"));
+}
+
+/// A deleted Consumer's values stored under legacy dotted spellings are the
+/// same retired slots as canonical ones.
+#[test]
+fn deleted_consumer_refusal_covers_legacy_dotted_slots() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/partner/keyauth.key".to_string(),
+        "OLD-RETIRED-A".to_string(),
+    );
+    bundle.insert(
+        "ferrum/partner/keyauth[1].key".to_string(),
+        "OLD-RETIRED-B".to_string(),
+    );
+    bundle.insert(
+        "ferrum/other/keyauth/key".to_string(),
+        "OTHER-LIVE-VALUE".to_string(),
+    );
+    let ledger = ledger_of(
+        &[("ferrum", "partner"), ("ferrum", "other")],
+        ConsumerCoverage::Complete,
+    );
+
+    let err = report_with_ledger(&partner_deleted_cfg(), &bundle, &ledger, false)
+        .expect_err("dotted slots of a deleted Consumer must be refused");
+    assert!(is_slot_remap(&err));
+    let err = err.to_string();
+    assert!(
+        err.contains("'ferrum/partner/keyauth.key'")
+            && err.contains("'ferrum/partner/keyauth[1].key'")
+            && !err.contains("OLD-RETIRED")
+            && !err.contains("OTHER-LIVE"),
+        "{err}"
+    );
+    let mut resolved = partner_deleted_cfg();
+    assert!(resolve_with_ledger(&mut resolved, &bundle, &ledger, false).is_err());
 }
 
 /// `--allow-credential-slot-remap` downgrades the deleted-Consumer refusal to
@@ -4195,6 +4385,70 @@ fn scrubber_covers_the_resolved_consul_token_but_not_the_address() {
         "{scrubbed}"
     );
     assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+}
+
+/// `validate` runs without the security audit, so URL credentials in the
+/// Consul address are scrubbed from validator output, while the host stays.
+#[test]
+fn scrubber_covers_consul_address_credentials_but_keeps_the_host() {
+    use gitforgeops::secrets::SecretScrubber;
+
+    let mut cfg = config_with_consul_token(None);
+    cfg.upstreams[0]
+        .service_discovery
+        .as_mut()
+        .and_then(|sd| sd.consul.as_mut())
+        .unwrap()
+        .address = "https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501".to_string();
+    let scrubber = SecretScrubber::from_gateway_config(&cfg);
+
+    assert!(!scrubber.is_empty());
+    for output in [
+        "error: https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501 unreachable",
+        "consul password SYNTHETIC-URL-PASSWORD rejected",
+    ] {
+        let scrubbed = scrubber.scrub(output);
+        assert!(!scrubbed.contains("SYNTHETIC-URL-PASSWORD"), "{scrubbed}");
+        assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+    }
+    assert!(scrubber
+        .scrub("error: https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501")
+        .contains("@consul.example.test:8501"));
+}
+
+/// A credential split by a tab or line break is detected in its normalized
+/// form, but a validator echoes the raw bytes: those streams are withheld.
+#[test]
+fn consul_address_credentials_with_embedded_breaks_withhold_validator_output() {
+    use gitforgeops::secrets::SecretScrubber;
+
+    for (separator, path) in [
+        ("\n", ""),
+        ("\r", ""),
+        ("\t", ""),
+        // The normalized userinfo repeated elsewhere must not hide the split
+        // credential in the authority.
+        ("\n", "/svc-user:ABCD1234EFGH5678"),
+    ] {
+        let address =
+            format!("https://svc-user:ABCD1234{separator}EFGH5678@consul.example.test:8501{path}");
+        let mut cfg = config_with_consul_token(None);
+        cfg.upstreams[0]
+            .service_discovery
+            .as_mut()
+            .and_then(|sd| sd.consul.as_mut())
+            .unwrap()
+            .address = address.clone();
+        let scrubber = SecretScrubber::from_gateway_config(&cfg);
+
+        let json_escaped = serde_json::to_string(&address).unwrap();
+        for echoed in [address.as_str(), json_escaped.as_str()] {
+            let output = scrubber.scrub_streams(&format!("error: {echoed}"), "");
+            assert!(output.suppressed.is_some(), "{separator:?}");
+            assert!(!output.stdout.contains("ABCD1234"), "{separator:?}");
+            assert!(!output.stderr.contains("ABCD1234"), "{separator:?}");
+        }
+    }
 }
 
 /// An unresolved placeholder is repository data: leaving it visible is what

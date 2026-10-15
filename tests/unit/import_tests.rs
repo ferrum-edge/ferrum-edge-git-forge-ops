@@ -2082,6 +2082,65 @@ fn file_import_brokers_a_consul_discovery_token() {
     assert!(!notice.contains(token), "{notice}");
 }
 
+/// URL credentials in the Consul address are not a brokered leaf: import
+/// refuses rather than writing them to the tree, and never prints them.
+#[test]
+fn file_import_refuses_url_credentials_in_a_consul_address() {
+    for address in [
+        "https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+        "https:///svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+        "https:svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+        "https:\\\\svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+    ] {
+        assert_import_refuses_address(address);
+    }
+}
+
+fn assert_import_refuses_address(address: &str) {
+    let password = "SYNTHETIC-URL-PASSWORD";
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    let mut upstream = consul_upstream("SYNTHETIC-AUDIT-TOKEN");
+    upstream
+        .service_discovery
+        .as_mut()
+        .and_then(|sd| sd.consul.as_mut())
+        .unwrap()
+        .address = address.to_string();
+    config.upstreams.push(upstream);
+    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .expect_err("credentials in the address must not be imported")
+    .to_string();
+
+    assert!(
+        error.contains("service_discovery.consul.address"),
+        "{error}"
+    );
+    assert!(!error.contains(password), "{error}");
+    assert!(!bundle_path.exists());
+    let written = if output.exists() {
+        walk_files(&output)
+    } else {
+        Vec::new()
+    };
+    for entry in written {
+        let body = std::fs::read_to_string(&entry).unwrap();
+        assert!(!body.contains(password), "{} leaked it", entry.display());
+    }
+}
+
 /// Whatever the source held, the imported tree resolves back to it from the
 /// migration bundle alone.
 #[test]

@@ -22,6 +22,9 @@
 //!   is the control-plane URL, `service_name`, `datacenter` and `tag` are
 //!   selectors: all four name *what* is discovered, are needed to review a
 //!   change, and are already covered by the `allowed_backend_domains` policy.
+//!   An `address` must therefore carry no URL userinfo: credentials there are
+//!   refused by import and by the security audit, and redacted from a diff
+//!   (see [`consul_address_has_userinfo`]). The ACL token belongs in `token`.
 //! * `dns_sd`, `kubernetes`, `mesh` — no secret-bearing field. Kubernetes
 //!   discovery authenticates with the pod's own service-account token from
 //!   the gateway's filesystem, never from this document; mesh discovery
@@ -88,6 +91,77 @@ pub(crate) fn secret_leaf_mut<'a>(
         ["consul", "token"] => discovery.consul.as_mut().map(|consul| &mut consul.token),
         _ => None,
     }
+}
+
+/// Whether this discovery block's Consul `address` carries URL userinfo
+/// (`scheme://user[:password]@host…`), a credential the address is never
+/// allowed to hold.
+pub(crate) fn consul_address_has_userinfo(discovery: &ServiceDiscoveryConfig) -> bool {
+    consul_address_userinfo(discovery).is_some()
+}
+
+/// The userinfo of this discovery block's Consul `address`, if it has one.
+pub(crate) fn consul_address_userinfo(discovery: &ServiceDiscoveryConfig) -> Option<String> {
+    let consul = discovery.consul.as_ref()?;
+    split_url_userinfo(&consul.address).map(|parts| parts.userinfo)
+}
+
+/// Whether detection had to normalize `address` (surrounding whitespace or
+/// control characters, or an embedded tab or line break), so the bytes as
+/// written may differ from the userinfo it reports.
+pub(crate) fn address_is_normalized(address: &str) -> bool {
+    address.trim_matches(|c: char| c <= ' ') != address || address.contains(['\t', '\n', '\r'])
+}
+
+/// `text` with the userinfo of a URL replaced by [`crate::secrets::REDACTION`],
+/// or `None` when it carries none.
+pub(crate) fn redact_url_userinfo(text: &str) -> Option<String> {
+    let parts = split_url_userinfo(text)?;
+    let redacted = format!("{}@{}", crate::secrets::REDACTION, parts.after);
+    Some(match parts.scheme {
+        Some(scheme) => format!("{scheme}://{redacted}"),
+        None => redacted,
+    })
+}
+
+struct UrlUserinfo {
+    scheme: Option<String>,
+    userinfo: String,
+    after: String,
+}
+
+/// Find a URL's userinfo the way a lenient (WHATWG-style) parser would, and
+/// err towards finding one: surrounding whitespace and control characters
+/// and embedded tabs and newlines are ignored, any number of `/` or `\`
+/// may follow the scheme (`https:///u:p@h`, `https:u:p@h`), and an `@`
+/// anywhere before the first `/`, `\`, `?` or `#` counts, with or without a
+/// scheme.
+fn split_url_userinfo(text: &str) -> Option<UrlUserinfo> {
+    let cleaned: String = text
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let (scheme, rest) = match cleaned.find(':') {
+        Some(colon) if is_url_scheme(&cleaned[..colon]) => {
+            (Some(cleaned[..colon].to_string()), &cleaned[colon + 1..])
+        }
+        _ => (None, cleaned.as_str()),
+    };
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let authority_end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
+    let at = rest[..authority_end].rfind('@')?;
+    Some(UrlUserinfo {
+        scheme,
+        userinfo: rest[..at].to_string(),
+        after: rest[at + 1..].to_string(),
+    })
+}
+
+fn is_url_scheme(candidate: &str) -> bool {
+    let mut characters = candidate.chars();
+    characters.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Every modeled secret leaf that this upstream actually carries a value for.
