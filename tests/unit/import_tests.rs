@@ -2086,6 +2086,17 @@ fn file_import_brokers_a_consul_discovery_token() {
 /// refuses rather than writing them to the tree, and never prints them.
 #[test]
 fn file_import_refuses_url_credentials_in_a_consul_address() {
+    for address in [
+        "https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+        "https:///svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+        "https:svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+        "https:\\\\svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+    ] {
+        assert_import_refuses_address(address);
+    }
+}
+
+fn assert_import_refuses_address(address: &str) {
     let password = "SYNTHETIC-URL-PASSWORD";
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
@@ -2096,7 +2107,7 @@ fn file_import_refuses_url_credentials_in_a_consul_address() {
         .as_mut()
         .and_then(|sd| sd.consul.as_mut())
         .unwrap()
-        .address = format!("https://svc-user:{password}@consul.example.test:8501");
+        .address = address.to_string();
     config.upstreams.push(upstream);
     std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
 

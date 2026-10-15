@@ -97,23 +97,64 @@ pub(crate) fn secret_leaf_mut<'a>(
 /// (`scheme://user[:password]@host…`), a credential the address is never
 /// allowed to hold.
 pub(crate) fn consul_address_has_userinfo(discovery: &ServiceDiscoveryConfig) -> bool {
-    discovery
-        .consul
-        .as_ref()
-        .is_some_and(|consul| redact_url_userinfo(&consul.address).is_some())
+    consul_address_userinfo(discovery).is_some()
 }
 
-/// `text` with the userinfo of a `scheme://userinfo@host…` URL replaced by
-/// [`crate::secrets::REDACTION`], or `None` when it carries none.
+/// The userinfo of this discovery block's Consul `address`, if it has one.
+pub(crate) fn consul_address_userinfo(discovery: &ServiceDiscoveryConfig) -> Option<String> {
+    let consul = discovery.consul.as_ref()?;
+    split_url_userinfo(&consul.address).map(|parts| parts.userinfo)
+}
+
+/// `text` with the userinfo of a URL replaced by [`crate::secrets::REDACTION`],
+/// or `None` when it carries none.
 pub(crate) fn redact_url_userinfo(text: &str) -> Option<String> {
-    let (scheme, rest) = text.split_once("://")?;
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let parts = split_url_userinfo(text)?;
+    let redacted = format!("{}@{}", crate::secrets::REDACTION, parts.after);
+    Some(match parts.scheme {
+        Some(scheme) => format!("{scheme}://{redacted}"),
+        None => redacted,
+    })
+}
+
+struct UrlUserinfo {
+    scheme: Option<String>,
+    userinfo: String,
+    after: String,
+}
+
+/// Find a URL's userinfo the way a lenient (WHATWG-style) parser would, and
+/// err towards finding one: surrounding whitespace and control characters
+/// and embedded tabs and newlines are ignored, any number of `/` or `\`
+/// may follow the scheme (`https:///u:p@h`, `https:u:p@h`), and an `@`
+/// anywhere before the first `/`, `\`, `?` or `#` counts, with or without a
+/// scheme.
+fn split_url_userinfo(text: &str) -> Option<UrlUserinfo> {
+    let cleaned: String = text
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let (scheme, rest) = match cleaned.find(':') {
+        Some(colon) if is_url_scheme(&cleaned[..colon]) => {
+            (Some(cleaned[..colon].to_string()), &cleaned[colon + 1..])
+        }
+        _ => (None, cleaned.as_str()),
+    };
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let authority_end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
     let at = rest[..authority_end].rfind('@')?;
-    Some(format!(
-        "{scheme}://{}@{}",
-        crate::secrets::REDACTION,
-        &rest[at + 1..]
-    ))
+    Some(UrlUserinfo {
+        scheme,
+        userinfo: rest[..at].to_string(),
+        after: rest[at + 1..].to_string(),
+    })
+}
+
+fn is_url_scheme(candidate: &str) -> bool {
+    let mut characters = candidate.chars();
+    characters.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Every modeled secret leaf that this upstream actually carries a value for.

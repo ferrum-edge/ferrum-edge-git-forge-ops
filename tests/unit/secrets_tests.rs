@@ -2341,7 +2341,7 @@ fn every_accepted_slot_encoding_is_covered_by_the_retirement_checks() {
             "keyauth": [{"key": REQUIRE}, {"key": REQUIRE}],
         }));
         let report = resolve_secrets(&mut grown, &bundle).unwrap();
-        assert!(report.slot_remaps.is_empty(), "{first}");
+        assert_eq!(report.slot_remaps.len(), 0, "{first}");
         assert_eq!(
             grown.consumers[0].credentials["keyauth"],
             serde_json::json!([{"key": "FIRST-STORED-KEY"}, {"key": "SECOND-STORED-KEY"}]),
@@ -2404,7 +2404,7 @@ fn legacy_slot_scan_ignores_similarly_named_types_and_canonical_children() {
         ResolveOptions::default(),
     )
     .unwrap();
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert_eq!(report.slot_remaps.len(), 0);
 }
 
 /// Omitting `keyauth` entirely must reach the same verdict as `keyauth: []`:
@@ -2654,6 +2654,45 @@ fn deleted_consumer_recorded_by_the_ledger_is_refused_in_an_unfiltered_run() {
         resolved.consumers[0].credentials["keyauth"][0]["key"],
         REQUIRE
     );
+}
+
+/// A deleted Consumer's values stored under legacy dotted spellings are the
+/// same retired slots as canonical ones.
+#[test]
+fn deleted_consumer_refusal_covers_legacy_dotted_slots() {
+    use gitforgeops::secrets::ConsumerCoverage;
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert(
+        "ferrum/partner/keyauth.key".to_string(),
+        "OLD-RETIRED-A".to_string(),
+    );
+    bundle.insert(
+        "ferrum/partner/keyauth[1].key".to_string(),
+        "OLD-RETIRED-B".to_string(),
+    );
+    bundle.insert(
+        "ferrum/other/keyauth/key".to_string(),
+        "OTHER-LIVE-VALUE".to_string(),
+    );
+    let ledger = ledger_of(
+        &[("ferrum", "partner"), ("ferrum", "other")],
+        ConsumerCoverage::Complete,
+    );
+
+    let err = report_with_ledger(&partner_deleted_cfg(), &bundle, &ledger, false)
+        .expect_err("dotted slots of a deleted Consumer must be refused");
+    assert!(is_slot_remap(&err));
+    let err = err.to_string();
+    assert!(
+        err.contains("'ferrum/partner/keyauth.key'")
+            && err.contains("'ferrum/partner/keyauth[1].key'")
+            && !err.contains("OLD-RETIRED")
+            && !err.contains("OTHER-LIVE"),
+        "{err}"
+    );
+    let mut resolved = partner_deleted_cfg();
+    assert!(resolve_with_ledger(&mut resolved, &bundle, &ledger, false).is_err());
 }
 
 /// `--allow-credential-slot-remap` downgrades the deleted-Consumer refusal to
@@ -4300,6 +4339,35 @@ fn scrubber_covers_the_resolved_consul_token_but_not_the_address() {
         "{scrubbed}"
     );
     assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+}
+
+/// `validate` runs without the security audit, so URL credentials in the
+/// Consul address are scrubbed from validator output, while the host stays.
+#[test]
+fn scrubber_covers_consul_address_credentials_but_keeps_the_host() {
+    use gitforgeops::secrets::SecretScrubber;
+
+    let mut cfg = config_with_consul_token(None);
+    cfg.upstreams[0]
+        .service_discovery
+        .as_mut()
+        .and_then(|sd| sd.consul.as_mut())
+        .unwrap()
+        .address = "https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501".to_string();
+    let scrubber = SecretScrubber::from_gateway_config(&cfg);
+
+    assert!(!scrubber.is_empty());
+    for output in [
+        "error: https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501 unreachable",
+        "consul password SYNTHETIC-URL-PASSWORD rejected",
+    ] {
+        let scrubbed = scrubber.scrub(output);
+        assert!(!scrubbed.contains("SYNTHETIC-URL-PASSWORD"), "{scrubbed}");
+        assert!(scrubbed.contains("[REDACTED]"), "{scrubbed}");
+    }
+    assert!(scrubber
+        .scrub("error: https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501")
+        .contains("@consul.example.test:8501"));
 }
 
 /// An unresolved placeholder is repository data: leaving it visible is what

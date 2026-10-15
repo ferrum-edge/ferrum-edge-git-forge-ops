@@ -158,8 +158,8 @@ token is otherwise treated like a consumer credential: `import` captures it,
 literal is a blocking finding. `consul.address` must not carry URL
 credentials (`https://user:password@host`): a committed one is a blocking
 finding, `import` refuses a gateway whose address has them rather than writing
-them to the tree, and `diff` shows such a live address as
-`https://[REDACTED]@host`. Put a Consul ACL token in `consul.token` instead.
+them to the tree, `diff` shows such a live address as
+`https://[REDACTED]@host`, and validator output is scrubbed of them. Put a Consul ACL token in `consul.token` instead.
 
 ## Entry position is the slot identity
 

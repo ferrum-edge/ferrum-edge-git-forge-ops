@@ -320,13 +320,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Credential-slot retirement checks (array shrink and dropped credential type)
-  now also find values stored under the legacy `[0]` and dotted bundle-key
-  spellings the resolver still reads, so a shrink cannot leave a retired value
-  that a later regrowth resolves again.
-- A Consul `service_discovery.consul.address` with URL credentials is a
-  blocking security finding, is refused by `import` instead of being written
-  to the resource tree, and has its userinfo redacted in `diff` output.
+- Credential-slot retirement checks (array shrink, dropped credential type and
+  deleted ledger Consumer) now also find values stored under the legacy `[0]`
+  and dotted bundle-key spellings the resolver still reads, so a retired value
+  cannot be resolved again by a later regrowth or a reused id.
+- A Consul `service_discovery.consul.address` with URL credentials (detected
+  as leniently as a URL parser reads them) is a blocking security finding, is
+  refused by `import` instead of being written to the resource tree, has its
+  userinfo redacted in `diff` output, and is scrubbed from validator output.
 - The template updater now treats the vendored `contracts/` tree as
   upstream-managed, so adopting a revision that introduces or re-pins
   `contracts/ferrum-contracts/` also adopts the PIN, schemas, vocabularies and

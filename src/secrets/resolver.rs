@@ -1922,7 +1922,14 @@ fn check_consumer_ledger(
         let [namespace, consumer_id, credential_type, ..] = components.as_slice() else {
             continue;
         };
-        let credential_type = unescape_slot_component(credential_type);
+        let mut credential_type = unescape_slot_component(credential_type);
+        // A legacy dotted spelling (`keyauth.key`, `keyauth[1].key`) names the
+        // same slot as the canonical one and resolves just the same.
+        if !is_known_credential_type(&credential_type) {
+            if let Some(end) = credential_type.find(['.', '[']) {
+                credential_type.truncate(end);
+            }
+        }
         if !is_known_credential_type(&credential_type) {
             continue;
         }

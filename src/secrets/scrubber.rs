@@ -594,6 +594,19 @@ fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut BTreeSet<
         for (_field, value) in super::service_discovery::present_secrets(upstream) {
             record_secret(value, out);
         }
+        // URL credentials in the Consul address are refused by the audit, but
+        // `validate` runs without it, so its validator output is scrubbed of
+        // them too: the whole userinfo and its password half.
+        if let Some(userinfo) = upstream
+            .service_discovery
+            .as_ref()
+            .and_then(super::service_discovery::consul_address_userinfo)
+        {
+            if let Some((_, password)) = userinfo.split_once(':') {
+                record_secret(password, out);
+            }
+            record_secret(&userinfo, out);
+        }
     }
 }
 
