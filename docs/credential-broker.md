@@ -169,11 +169,11 @@ base64, percent, JSON-escaped and single-quoted spellings, a `Bearer`
 credential, and a JWT or GitHub token by its shape. A line that still holds
 an 8-byte run of one (also after decoding escapes, percent-encoding or HTML
 references) is withheld, unless that run is also public text: the scrubbed
-configuration or the tool's own messages. A value shorter than 8 bytes is
-not looked for in the tool's own prose, where it would match ordinary words,
-but text a gateway or GitHub sends back is withheld when it contains one, and
-while any registered value is not safely scrubbable (the validator-output
-rule above). Decisions read responses as received; only the displayed copy
+configuration or the tool's own messages. A value (or encoding) shorter than
+8 bytes is replaced only where it stands as a whole token, so the `on` in
+`connection` stays; text a gateway or GitHub sends back is withheld when it
+contains one anywhere, and while any registered value is not safely
+scrubbable (the validator-output rule above). Decisions read responses as received; only the displayed copy
 is scrubbed.
 
 ## Entry position is the slot identity

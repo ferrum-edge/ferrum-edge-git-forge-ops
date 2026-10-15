@@ -3812,7 +3812,9 @@ mod bounded_error_message_tests {
                 let value = &"Zq7xQw9"[..length];
                 crate::display::enable_display_scrubbing_on_this_thread();
                 crate::display::register_values([value]);
-                let body = serde_json::json!({ "error": format!("bad password {value}") });
+                // Glued to another word: not a token the sink can replace, so
+                // peer text carrying it is withheld.
+                let body = serde_json::json!({ "error": format!("bad password x{value}") });
                 let rendered =
                     super::map_api_error(400, &body.to_string(), super::RequestKind::Read)
                         .to_string();

@@ -475,9 +475,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   registers every value it resolves, every rotated value it publishes, a
   window of the admin JWTs it sends, and the GitHub tokens and admin JWT
   secrets in its environment. The sink replaces those values and their
-  base64, percent, JSON-escaped and single-quoted spellings (including the
-  encodings of values under 8 bytes) and any `Bearer`, JWT- or
-  GitHub-token-shaped word with `[REDACTED]`. A line (or a JSON string value)
+  base64, percent, JSON-escaped and single-quoted spellings and any
+  `Bearer`, JWT- or GitHub-token-shaped word with `[REDACTED]`; a value or
+  encoding under 8 bytes is replaced where it stands as a whole token. A line (or a JSON string value)
   that still holds an 8-byte run of one, as written or after decoding
   escapes, percent-encoding or HTML references, is withheld; runs that are
   also in the scrubbed configuration or in the tool's own messages are
