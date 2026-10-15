@@ -370,6 +370,10 @@ class MonitoringConfigReaderTests(unittest.TestCase):
             "environments:\n  staging:\n    monitoring:\n      unattended: yes\n",
             "environments:\n  base: &base\n    overlay: x\n  staging:\n"
             "    <<: *base\n",
+            # An environment body written as a flow mapping.
+            "environments:\n  staging:\n    {monitoring: {unattended: true}}\n",
+            # A structural key spelled with an escape.
+            'environments:\n  staging:\n    "monitor\\x69ng":\n      unattended: true\n',
         ):
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):
@@ -499,6 +503,15 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
         ):
             self.assertIn(target, performed)
         self.assertNotIn("environment production-monitor", performed)
+
+    def test_a_flow_style_root_stops_the_plan(self):
+        for text in (
+            "{version: 1, environments: {staging: {}, production: {}}}\n",
+            '"environ\\x6dents":\n  staging: {}\n',
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    self._plan(text)
 
     def test_an_unreadable_monitoring_setting_stops_the_plan(self):
         with self.assertRaises(ValueError):

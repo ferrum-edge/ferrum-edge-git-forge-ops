@@ -292,6 +292,10 @@ def _mapping_entry(stripped: str) -> tuple[str, str] | None:
         return None
     key = match["key"].strip()
     if len(key) >= 2 and key[0] == key[-1] and key[0] in "'\"":
+        # An escape or doubled quote could spell a structural key some other
+        # way; treat it as unreadable rather than as an unrelated key.
+        if "\\" in key or (key[0] == "'" and "''" in key[1:-1]):
+            return None
         key = key[1:-1]
     return key, (match["value"] or "").strip()
 
@@ -328,7 +332,13 @@ def _environment_entries(
             )
         if indent == root:
             entry = _mapping_entry(stripped)
-            inside = entry is not None and entry[0] == "environments"
+            if entry is None:
+                raise ValueError(
+                    f"config line {number}: write the configuration as a block "
+                    "mapping (one `key:` per line); bootstrap cannot read this "
+                    "top-level syntax"
+                )
+            inside = entry[0] == "environments"
             depth = None
             if inside:
                 if seen_block:
@@ -431,13 +441,15 @@ def unattended_environments_from_config(text: str) -> list[str]:
                 monitoring_depth = None
                 setting_depth = None
                 entry = _mapping_entry(stripped)
-                if entry is not None and entry[0] == "<<":
+                if entry is None:
+                    raise unrepresentable(name, number)
+                if entry[0] == "<<":
                     raise ValueError(
                         f"config line {number}: environment {name!r} uses a YAML "
                         "merge key, which bootstrap cannot read; write its "
                         "settings out"
                     )
-                if entry is None or entry[0] != "monitoring":
+                if entry[0] != "monitoring":
                     continue
                 if entry[1] == "":
                     monitoring_depth = indent
