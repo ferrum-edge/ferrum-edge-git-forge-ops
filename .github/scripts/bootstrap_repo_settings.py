@@ -298,27 +298,35 @@ def _mapping_entry(stripped: str) -> tuple[str, str] | None:
 
 def _environment_entries(
     text: str,
-) -> list[tuple[str, str, list[tuple[int, str]]]]:
+) -> list[tuple[str, str, list[tuple[int, int, str]]]]:
     """Each key directly under `environments:`, its inline value and body.
 
     This is a deliberately small reader rather than a YAML parse: the script
     runs on a customer's laptop and PyYAML is not in the standard library. It
-    reads block-mapped and inline (`staging: {}`) entries and trailing
-    comments, and refuses, with the line number, anything it cannot read
-    rather than silently leaving an environment out of the plan. Pass
-    `--environment` to override discovery entirely.
+    reads block-mapped and inline (`staging: {}`) entries, quoted keys,
+    trailing comments and a root mapping at any indentation, and refuses, with
+    the line number, anything it cannot read rather than silently leaving an
+    environment out of the plan. Body lines are `(line, indent, text)`.
     """
-    entries: list[tuple[str, str, list[tuple[int, str]]]] = []
+    entries: list[tuple[str, str, list[tuple[int, int, str]]]] = []
     inside = False
     seen_block = False
+    root: int | None = None
     depth: int | None = None
     for number, raw in enumerate(text.splitlines(), start=1):
         line = _strip_comment(raw.rstrip())
-        if not line.strip():
+        if not line.strip() or line.strip() in ("---", "..."):
             continue
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
-        if indent == 0:
+        if root is None:
+            root = indent
+        if indent < root:
+            raise ValueError(
+                f"config line {number}: inconsistent indentation of the top-level "
+                "mapping; bootstrap cannot read this configuration"
+            )
+        if indent == root:
             entry = _mapping_entry(stripped)
             inside = entry is not None and entry[0] == "environments"
             depth = None
@@ -331,8 +339,8 @@ def _environment_entries(
                 if entry[1] not in ("", "{}"):
                     raise ValueError(
                         f"config line {number}: write `environments:` as a block "
-                        "mapping (one environment per line) or pass --environment; "
-                        "bootstrap cannot read an inline environment list"
+                        "mapping, one environment per line; bootstrap cannot read "
+                        "an inline environment list"
                     )
             continue
         if not inside:
@@ -342,23 +350,28 @@ def _environment_entries(
         if indent < depth:
             raise ValueError(
                 f"config line {number}: inconsistent indentation under "
-                "`environments:`; pass --environment or fix the indentation"
+                "`environments:`; bootstrap cannot read this configuration"
             )
         if indent > depth:
             if entries:
-                entries[-1][2].append((indent, stripped))
+                entries[-1][2].append((number, indent, stripped))
             continue
         entry = _mapping_entry(stripped)
         if entry is None:
             raise ValueError(
                 f"config line {number}: cannot read an environment entry under "
-                "`environments:`; write `name:` or `name: {}`, or pass --environment"
+                "`environments:`; write `name:` or `name: {}`"
             )
         name, value = entry
         if not ENVIRONMENT_NAME.match(name):
             raise ValueError(
                 f"config line {number}: environment name {name!r} must be 1-64 "
                 "ASCII letters, digits, '-' or '_', starting with a letter or digit"
+            )
+        if value.startswith(("*", "!")):
+            raise ValueError(
+                f"config line {number}: environment {name!r} uses a YAML alias or "
+                "tag, which bootstrap cannot read; write its settings out"
             )
         if any(existing == name for existing, _, _ in entries):
             raise ValueError(f"config line {number}: environment {name!r} is declared twice")
@@ -371,34 +384,59 @@ def environment_names_from_config(text: str) -> list[str]:
     return [name for name, _, _ in _environment_entries(text)]
 
 
+def _unattended_value(name: str, number: int, value: str) -> bool:
+    lowered = value.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    raise ValueError(
+        f"config line {number}: environment {name!r} sets `monitoring.unattended` "
+        f"to {value!r}; write `unattended: true` or `unattended: false` on one line"
+    )
+
+
 def unattended_environments_from_config(text: str) -> list[str]:
     """Which environments asked for an unattended drift check?
 
     An environment counts when its `monitoring:` block sets `unattended: true`
-    (block-mapped, or the inline `monitoring: {unattended: true}`). Absent,
-    `false`, or an `unattended:` key anywhere else reads as opted out, which
-    leaves that environment's monitoring approval-gated. A monitoring setting
-    the reader cannot represent is refused rather than read as opted out,
-    because the CLI would still route that environment's drift check to a
-    `-monitor` environment bootstrap never created.
+    (block-mapped, or the inline `monitoring: {unattended: true}`). An absent
+    setting, `false`, or an `unattended:` key outside `monitoring:` reads as
+    opted out, which leaves that environment's monitoring approval-gated. A
+    monitoring setting the reader cannot represent is refused rather than read
+    as opted out, because the CLI would still route that environment's drift
+    check to a `-monitor` environment bootstrap never created.
     """
     names: list[str] = []
+
+    def unrepresentable(name: str, number: int) -> ValueError:
+        return ValueError(
+            f"config line {number}: write environment {name!r}'s `monitoring:` "
+            "setting as a block mapping with `unattended: true|false` on one line "
+            "so bootstrap can read it"
+        )
+
     for name, value, body in _environment_entries(text):
         if value not in ("", "{}") and "monitoring" in value:
             raise ValueError(
                 f"environment {name!r}: write its `monitoring:` setting as a block "
-                "mapping so bootstrap can read it"
+                "mapping with `unattended: true|false` on one line so bootstrap "
+                "can read it"
             )
         child_depth: int | None = None
         monitoring_depth: int | None = None
         setting_depth: int | None = None
-        for indent, stripped in body:
+        for number, indent, stripped in body:
             if child_depth is None or indent < child_depth:
                 child_depth = indent
             if indent == child_depth:
                 monitoring_depth = None
                 setting_depth = None
                 entry = _mapping_entry(stripped)
+                if entry is not None and entry[0] == "<<":
+                    raise ValueError(
+                        f"config line {number}: environment {name!r} uses a YAML "
+                        "merge key, which bootstrap cannot read; write its "
+                        "settings out"
+                    )
                 if entry is None or entry[0] != "monitoring":
                     continue
                 if entry[1] == "":
@@ -408,22 +446,21 @@ def unattended_environments_from_config(text: str) -> list[str]:
                     continue
                 flow = _FLOW_UNATTENDED.match(entry[1])
                 if flow is None:
-                    raise ValueError(
-                        f"environment {name!r}: write its `monitoring:` setting as "
-                        "a block mapping so bootstrap can read it"
-                    )
-                if flow["value"].lower() == "true" and name not in names:
+                    raise unrepresentable(name, number)
+                if _unattended_value(name, number, flow["value"]) and name not in names:
                     names.append(name)
                 continue
             if monitoring_depth is None or indent <= monitoring_depth:
                 continue
+            # Inside `monitoring:`: every line must be one `key: scalar`
+            # setting at a single depth.
             if setting_depth is None:
                 setting_depth = indent
-            if indent != setting_depth:
-                continue
             entry = _mapping_entry(stripped)
-            if entry is not None and entry[0] == "unattended":
-                if entry[1].lower() == "true" and name not in names:
+            if indent != setting_depth or entry is None:
+                raise unrepresentable(name, number)
+            if entry[0] == "unattended":
+                if _unattended_value(name, number, entry[1]) and name not in names:
                     names.append(name)
     return names
 

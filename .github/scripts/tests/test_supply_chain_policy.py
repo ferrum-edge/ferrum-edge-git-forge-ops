@@ -1004,7 +1004,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 assign("jobs", "list-envs", "outputs", "promotions",
                        value="${{ steps.other.outputs.promotions }}"),
                 edit_run(
-                    "list-envs", "list", 'test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")', "true"
+                    "list-envs", "list", 'test("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")', "true"
                 ),
                 edit_run(
                     "list-envs", "list",

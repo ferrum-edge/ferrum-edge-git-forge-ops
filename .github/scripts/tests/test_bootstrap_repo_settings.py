@@ -289,6 +289,21 @@ class ConfigReaderTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     bootstrap.environment_names_from_config(text)
 
+    def test_an_indented_root_mapping_is_read(self):
+        self.assertEqual(
+            bootstrap.environment_names_from_config(
+                "---\n  version: 1\n  environments:\n    staging: {}\n"
+                "    production:\n      overlay: production\n"
+            ),
+            ["staging", "production"],
+        )
+        with self.assertRaises(ValueError):
+            bootstrap.environment_names_from_config(
+                "  version: 1\nenvironments:\n  staging: {}\n"
+            )
+        with self.assertRaises(ValueError):
+            bootstrap.environment_names_from_config("environments:\n  staging: *base\n")
+
     def test_explicit_environment_names_use_the_same_grammar(self):
         for name in ("prod.eu", "_staging", "a" * 65, "../x", ""):
             with self.subTest(name=name):
@@ -347,19 +362,25 @@ class MonitoringConfigReaderTests(unittest.TestCase):
         for text in (
             "environments:\n  staging: {monitoring: {unattended: true}}\n",
             "environments:\n  staging:\n    monitoring: {unattended: true, x: 1}\n",
+            # Valid YAML the CLI reads as `true`, which must not become an
+            # opt-out here.
+            "environments:\n  staging:\n    monitoring:\n      unattended:\n"
+            "        true\n",
+            "environments:\n  staging:\n    monitoring:\n      {unattended: true}\n",
+            "environments:\n  staging:\n    monitoring:\n      unattended: yes\n",
+            "environments:\n  base: &base\n    overlay: x\n  staging:\n"
+            "    <<: *base\n",
         ):
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):
                     bootstrap.unattended_environments_from_config(text)
 
-    def test_only_a_direct_unattended_child_of_monitoring_counts(self):
-        self.assertEqual(
+    def test_nested_monitoring_content_is_refused_not_read_as_opted_out(self):
+        with self.assertRaises(ValueError):
             bootstrap.unattended_environments_from_config(
                 "environments:\n  staging:\n    monitoring:\n      nested:\n"
                 "        unattended: true\n"
-            ),
-            [],
-        )
+            )
 
     def test_an_absent_monitoring_block_is_opted_out(self):
         self.assertEqual(
@@ -463,6 +484,28 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
         )
         self.assertEqual(step.action, bootstrap.UNCHANGED)
         self.assertEqual(step.writes, [])
+
+    def test_inline_and_commented_entries_reach_the_plan(self):
+        plan, _ = self._plan(
+            "version: 1\nenvironments:\n  staging:   # pre-production\n"
+            "    monitoring: {unattended: true}\n  production: {}\n",
+            existing=("production",),
+        )
+        performed = actions(plan)
+        for target in (
+            "environment staging",
+            "environment staging-monitor",
+            "environment production",
+        ):
+            self.assertIn(target, performed)
+        self.assertNotIn("environment production-monitor", performed)
+
+    def test_an_unreadable_monitoring_setting_stops_the_plan(self):
+        with self.assertRaises(ValueError):
+            self._plan(
+                "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+                "      unattended:\n        true\n"
+            )
 
     def test_opting_out_creates_nothing_and_says_monitoring_is_gated(self):
         plan, _ = self._plan(
