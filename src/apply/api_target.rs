@@ -92,10 +92,11 @@ pub struct ApplyResult {
     /// state from [`ApplyResult::applied_incremental`], then propagates this
     /// through its deferred-error path so the run still exits non-zero.
     pub fatal_error: Option<String>,
-    /// The first write, made inside a helper such as an ambiguous-batch
-    /// ownership assertion, that proved this namespace's plan stale
-    /// (`"<Kind> `<id>`"`). The namespace loop withholds every later write in
-    /// the namespace once this is set, exactly as for a stale direct write.
+    /// The first write that proved a namespace's plan stale (`"<Kind> `<id>`"`
+    /// within a namespace; `"[<namespace>] <Kind> `<id>`"` on the aggregate).
+    /// Every later write in that namespace is withheld, whether the refusal
+    /// came from a direct write or from a helper such as an ambiguous-batch
+    /// ownership assertion. Other namespaces continue.
     pub stale_plan: Option<String>,
     /// Per-resource operations that succeeded in `apply_incremental`.
     /// Empty for `apply_full_replace` runs — see `fully_replaced_namespaces`.
@@ -725,6 +726,11 @@ async fn apply_prepared(
                 .into_iter()
                 .map(|error| format!("[{namespace}] {error}")),
         );
+        if aggregate.stale_plan.is_none() {
+            aggregate.stale_plan = namespace_result
+                .stale_plan
+                .map(|first| format!("[{namespace}] {first}"));
+        }
 
         // A mid-namespace stop (a read-only plane refusing the Nth resource)
         // reaches us on the result rather than as an Err. Everything above has
@@ -1818,6 +1824,7 @@ async fn apply_incremental(
                     if plan_stale.is_none() {
                         plan_stale = batched.stale_plan;
                     }
+                    result.stale_plan.clone_from(&plan_stale);
                 }
                 Ok(None) => {
                     writes_failed = true;
@@ -2020,6 +2027,7 @@ async fn apply_incremental(
                         | crate::error::Error::UnplannedPluginReference(_)
                 ) {
                     plan_stale = Some(format!("{} `{}`", diff.kind, diff.id));
+                    result.stale_plan.clone_from(&plan_stale);
                 }
                 if matches!(diff.action, DiffAction::Add | DiffAction::Modify) {
                     writes_failed = true;
@@ -2208,9 +2216,9 @@ fn partition_cyclic_creates(
 ///
 /// That read is also the proxy's precondition (see [`Preconditions`]): a proxy
 /// an API spec claimed since the plan is refused, and so is one that changed in
-/// any other way. Only the associations to plugin configs this run created or
-/// retargeted are left out of the comparison, because the gateway rewrites
-/// those itself. An
+/// any other way. Only the associations to plugin configs this run wrote with a
+/// `proxy` scope or retargeted are left out of the comparison, because the
+/// gateway rewrites those itself. An
 /// association to any other plugin that appeared or vanished since the plan is
 /// a concurrent change, which the repository's association list must not
 /// revert. The update is sent with `If-Match` on that read.
@@ -2309,7 +2317,7 @@ struct Preconditions<'a> {
     /// Rows as the plan saw them, keyed by `namespace:Kind:id`.
     planned: HashMap<String, ObservedRow>,
     consumer_evidence: BTreeMap<String, ConsumerEvidence>,
-    /// PluginConfigs this run created or retargeted in the namespace. The
+    /// PluginConfigs this run wrote with a `proxy` scope or retargeted. The
     /// gateway rewrites proxy associations to them itself, so a proxy
     /// comparison leaves those associations, and only those, out. A write
     /// that cannot rewrite associations is not listed (see
@@ -2369,14 +2377,17 @@ impl<'a> Preconditions<'a> {
     }
 
     /// Record a PluginConfig this run created or updated, when that write
-    /// lets the gateway rewrite proxy associations to it (see
-    /// [`Self::retargets`]). A write that keeps the plan's `proxy_group`
-    /// scope, or an unchanged scope and target, rewrites no association, so
+    /// lets the gateway rewrite proxy associations to it: any `proxy`-scoped
+    /// write, and any retarget (see [`Self::retargets`]). A write that keeps
+    /// the plan's `proxy_group` or `global` scope rewrites no association, so
     /// every association to that plugin stays in the proxy comparison and an
     /// attachment made after the plan refuses the proxy update instead of
     /// being reverted by it.
     fn note_plugin_write(&mut self, plugin: &PluginConfig) {
-        if self.retargets(plugin) {
+        // A `proxy` config is attached to its target by the write itself,
+        // even with an unchanged target when the target lacked the
+        // association, and the gateway keeps it attached to no other proxy.
+        if plugin.scope == PluginScope::Proxy || self.retargets(plugin) {
             self.written_plugins.insert(plugin.id.clone());
         }
     }

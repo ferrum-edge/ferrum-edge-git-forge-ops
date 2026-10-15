@@ -1444,7 +1444,10 @@ async fn a_stale_ambiguous_batch_assertion_withholds_every_later_namespace_write
         run.result
     );
     assert!(run.result.fatal_error.is_none(), "{:?}", run.result);
-    assert_eq!(run.result.stale_plan.as_deref(), Some("Proxy `p1`"));
+    assert_eq!(
+        run.result.stale_plan.as_deref(),
+        Some("[team-alpha] Proxy `p1`")
+    );
     let errors = &run.result.errors;
     assert!(
         errors
@@ -1573,6 +1576,35 @@ fn with_group_authenticator(proxies: &[(&str, &[&str])], version: u16) -> Gatewa
         .plugin_configs
         .push(serde_json::from_value(plugin).unwrap());
     config
+}
+
+#[tokio::test]
+async fn a_proxy_scoped_update_that_attaches_its_unchanged_target_is_not_drift() {
+    // Live `pc` is scoped to `p`, but `p` does not list it (Edge permits
+    // this). The update keeps the scope and target; Edge still attaches `pc`
+    // to `p`, and that attachment is this run's own write, not a concurrent
+    // change, so `p`'s planned backend update goes through.
+    let planned = graph(&[("p", &[])], &[("pc", "p")]);
+    let mut desired = graph(&[("p", &["pc"])], &[("pc", "p")]);
+    desired.plugin_configs[0].config = serde_json::json!({"max_age": 5});
+    desired.proxies[0].backend_port = 2;
+    let attached = graph(&[("p", &["pc"])], &[("pc", "p")]);
+    let routes = vec![
+        health(),
+        tagged(Kind::PluginConfig, "pc", &planned, TAG),
+        tagged(Kind::Proxy, "p", &attached, "\"p-tag\""),
+        backup(&attached),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert!(run.result.errors.is_empty(), "{:?}", run.result);
+    assert_eq!(
+        run.mutations(),
+        ["PUT /plugins/config/pc HTTP/1.1", "PUT /proxies/p HTTP/1.1",]
+    );
+    let sent = run.request("PUT /proxies/p");
+    assert!(sent.contains("if-match: \"p-tag\"\r\n"), "{sent}");
 }
 
 #[tokio::test]
