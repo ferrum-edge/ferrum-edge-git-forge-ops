@@ -261,9 +261,9 @@ class ConfigReaderTests(unittest.TestCase):
         )
         self.assertEqual(
             bootstrap.environment_names_from_config(
-                "version: 1\nenvironments:  # deployments\n"
+                "\ufeffversion: 1\nenvironments:  # deployments\n"
                 "  staging:   # pre-production\n    overlay: staging\n"
-                "  'qa': {overlay: qa}\n  \"production\":\n"
+                "  'qa': {}\n  \"production\":\n"
                 "    overlay: production\n"
             ),
             ["staging", "qa", "production"],
@@ -361,6 +361,9 @@ class MonitoringConfigReaderTests(unittest.TestCase):
     def test_a_monitoring_setting_the_reader_cannot_represent_fails(self):
         for text in (
             "environments:\n  staging: {monitoring: {unattended: true}}\n",
+            'environments:\n  staging: {"monitor\\x69ng": {unattended: true}}\n',
+            "environments:\n  staging: {overlay: staging}\n",
+            "environments:\n  staging: &base {overlay: staging}\n",
             "environments:\n  staging:\n    monitoring: {unattended: true, x: 1}\n",
             # Valid YAML the CLI reads as `true`, which must not become an
             # opt-out here.
@@ -503,6 +506,17 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
         ):
             self.assertIn(target, performed)
         self.assertNotIn("environment production-monitor", performed)
+
+    def test_a_byte_order_mark_does_not_hide_the_environments(self):
+        plan, _ = self._plan(
+            "\ufeffenvironments:\n  staging:\n    monitoring:\n"
+            "      unattended: true\n"
+        )
+        self.assertIn("environment staging-monitor", actions(plan))
+
+    def test_an_inline_environment_mapping_stops_the_plan(self):
+        with self.assertRaises(ValueError):
+            self._plan('environments:\n  staging: {"monitor\\x69ng": {unattended: true}}\n')
 
     def test_a_flow_style_root_stops_the_plan(self):
         for text in (

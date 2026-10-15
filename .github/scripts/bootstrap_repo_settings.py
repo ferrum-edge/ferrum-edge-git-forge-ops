@@ -317,6 +317,8 @@ def _environment_entries(
     seen_block = False
     root: int | None = None
     depth: int | None = None
+    # A YAML parser accepts one leading byte-order mark; so does this reader.
+    text = text.removeprefix("\ufeff")
     for number, raw in enumerate(text.splitlines(), start=1):
         line = _strip_comment(raw.rstrip())
         if not line.strip() or line.strip() in ("---", "..."):
@@ -383,6 +385,14 @@ def _environment_entries(
                 f"config line {number}: environment {name!r} uses a YAML alias or "
                 "tag, which bootstrap cannot read; write its settings out"
             )
+        # Only an empty mapping (or none, or a bare anchor) can be read
+        # inline; anything else could hide a setting such as monitoring.
+        if value not in ("", "{}", "~", "null") and not re.fullmatch(r"&[^\s{}\[\],]+", value):
+            raise ValueError(
+                f"config line {number}: write environment {name!r}'s settings as a "
+                "block mapping (one `key:` per line); bootstrap reads only "
+                "`name:` or `name: {}` inline"
+            )
         if any(existing == name for existing, _, _ in entries):
             raise ValueError(f"config line {number}: environment {name!r} is declared twice")
         entries.append((name, value, []))
@@ -425,12 +435,6 @@ def unattended_environments_from_config(text: str) -> list[str]:
         )
 
     for name, value, body in _environment_entries(text):
-        if value not in ("", "{}") and "monitoring" in value:
-            raise ValueError(
-                f"environment {name!r}: write its `monitoring:` setting as a block "
-                "mapping with `unattended: true|false` on one line so bootstrap "
-                "can read it"
-            )
         child_depth: int | None = None
         monitoring_depth: int | None = None
         setting_depth: int | None = None
