@@ -320,6 +320,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The quickstart lists `FERRUM_ADMIN_JWT_VIEWER_SECRET` as a required secret
+  for the scheduled drift check and says where it goes (`<env>` or
+  `<env>-monitor`); it no longer says the monitor holds the admin key (#574).
+- The command reference no longer claims `validate` runs the security audit;
+  it points to `plan` for security and policy findings (#575).
+- The `deepseek-pro-agents` skill texts (Claude and canonical entrypoints,
+  briefs, agent metadata) now name the launcher's actual pin,
+  `alibaba-token-plan/deepseek-v4.1-flash`, and say the skill name is
+  historical (#576).
+- Claude agent entrypoints follow the bounded worker contract: no default
+  review trigger or CI babysitting unless assigned, and the controller owns
+  post-push monitoring. Implementer briefs describe the ledger's constant
+  `managed:v1` marker instead of state hashes. `check_agent_setup.py` now
+  refuses those stale instructions and any skill text naming a model other
+  than its launcher's pin (#577).
 - The template updater now treats the vendored `contracts/` tree as
   upstream-managed, so adopting a revision that introduces or re-pins
   `contracts/ferrum-contracts/` also adopts the PIN, schemas, vocabularies and

@@ -74,7 +74,10 @@ Use only those `.agents/skills/deepseek-flash-agents/references/` paths so Claud
 orchestrators share one source of truth.
 
 Every prompt must also PIN THE WORKER'S ROLE:
-"YOU are the implementer: write, commit, and push the changes yourself in this session.
+"YOU are the implementer: complete every assigned task and validation in this session.
+Perform commit, push, PR, review, and CI actions only when this prompt assigns them; after
+the final requested push and report, exit — the controller owns post-push CI and review
+monitoring.
 Do NOT invoke agent-dispatch skills (qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
 opencode-laguna-agents, grok-agents, muse-agents, sol-agents, opus-agents, fable-agents,
 composer-agents, .agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
@@ -84,21 +87,26 @@ Then append the mode block:
 **Implementer (fresh issue):** issue number, worktree dir `issue-<N>` under a sibling
 `<repo>-agents/` dir, branch name, acceptance criteria, repo-invariant callouts, scope
 boundaries vs neighboring in-flight PRs.
+State the exact stopping point; do not append review-trigger, CI-wait or shepherding work you
+did not intend to assign.
 
 **Fix round (existing PR):** PR number, existing worktree path, current head SHA, verified
 findings verbatim, CI-red diagnosis, per-finding guidance (fix vs acceptable-rebuttal).
 
-**Shepherd (drive to clean+green):** like fix round, plus loop until review-clean AND CI green.
-Only when the user wants agents babysitting CI.
+**Shepherd:** only when the user asks you to babysit or drive a PR to completion. Give each
+worker a bounded fix round with an exact implementation and validation stopping point. You, not
+the worker, monitor post-push review and CI state and dispatch another round only when new
+actionable work appears. Do not add a review trigger unless you explicitly assign one.
 
 **Cadence override (recommended default — full CI outlasts a worker round):** append:
-"CADENCE OVERRIDE: do NOT wait for in-progress CI. Loop: reconstruct state -> fix findings + RED
-checks -> fmt -> push -> ONE review trigger -> EXIT with report."
+"CADENCE OVERRIDE: do NOT wait for in-progress CI. Reconstruct state -> fix findings + RED
+checks -> fmt -> push -> EXIT with report. Post a review trigger only if this prompt explicitly
+assigns one."
 
 ## Orchestrator duties between agent rounds
 
 1. On each agent completion: verify from GitHub (never the agent's claims alone) — head pushed?
-   trigger posted to the correct bot? threads replied?
+   any explicitly assigned review trigger posted to the correct bot? threads replied?
 2. Independently review the diff in the agent's worktree before any merge
    (`git fetch origin main && git diff origin/main...HEAD` — three-dot).
 3. Triage CI reds yourself when agents are gone.

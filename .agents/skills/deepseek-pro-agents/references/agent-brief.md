@@ -1,4 +1,4 @@
-# Ferrum Edge Git Forge Ops DeepSeek V4 Pro implementer brief
+# Ferrum Edge Git Forge Ops deepseek-pro-agents implementer brief
 
 You are an opencode worker (model `alibaba-token-plan/deepseek-v4.1-flash`) dispatched by an
 orchestrator through the local opencode CLI harness. Implement or fix the scoped Ferrum Edge Git Forge Ops task
@@ -45,7 +45,8 @@ explicitly assigns that operation.
 
 - Follow all repository invariants, especially no `.unwrap()` in production paths, no `.expect()`
   unless failure is a genuine bug, path-component traversal rejection, namespace-scoped
-  `(namespace, kind, id)` identity, deterministic state hashes, a schema mirror that rejects unknown fields by default
+  `(namespace, kind, id)` identity, the constant non-secret `managed:v1` ownership
+  marker in `.state/` (never content hashes), a schema mirror that rejects unknown fields by default
   and leaves value validation to `ferrum-edge validate`, and fail-closed ownership and secret
   handling.
 - Add tests in the external test suites preferred by `AGENTS.md`; do not add inline source tests

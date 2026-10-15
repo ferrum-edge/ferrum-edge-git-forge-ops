@@ -37,6 +37,18 @@ BRIEF_INVARIANTS = (
     "`actionlint`",
     "`shellcheck`",
 )
+# Delivery and state rules the canonical briefs no longer carry. A Claude
+# entrypoint or brief that repeats one would widen a worker's assignment (an
+# unrequested review trigger or CI babysitting) or misstate the ledger, which
+# now stores the constant `managed:v1` marker rather than content hashes.
+STALE_CONTRACT_MARKERS = (
+    "deterministic state hashes",
+    "ONE review trigger",
+    "ONE @codex review",
+    "loop until review-clean",
+    "loop until codex clean",
+)
+PINNED_MODEL_LINE = re.compile(r"^readonly PINNED_MODEL='(?P<model>[^']+)'$", re.MULTILINE)
 STALE_MARKERS = (
     "-p ferrum-edge",
     "--bin ferrum-edge",
@@ -620,6 +632,38 @@ def collect_violations(root: Path) -> list[str]:
                     f"{launcher.relative_to(root)}: Cursor sandboxing blocks required network and tool state"
                 )
 
+    # A hard-pinned launcher and every text describing that skill must name the
+    # same model: the Claude mirror, the canonical skill, its briefs and its
+    # agent metadata. Any other model under the pin's provider is a mismatch.
+    for skill_dir in agent_skill_dirs:
+        launcher = skill_dir / "scripts" / "dispatch-agent.sh"
+        if launcher.is_symlink() or not launcher.is_file():
+            continue
+        pin = PINNED_MODEL_LINE.search(read_text(launcher))
+        if pin is None:
+            continue
+        model = pin.group("model")
+        provider = model.split("/", 1)[0]
+        named = re.compile(re.escape(provider) + r"/[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]")
+        described = [
+            skill_dir / "SKILL.md",
+            claude_skills / skill_dir.name / "SKILL.md",
+            skill_dir / "agents" / "openai.yaml",
+            *sorted((skill_dir / "references").glob("*.md")),
+        ]
+        for path in described:
+            if path.is_symlink() or not path.is_file():
+                continue
+            text = read_text(path)
+            if model not in text and path.name == "SKILL.md":
+                violations.append(
+                    f"{path.relative_to(root)}: does not name the launcher's pinned model {model}"
+                )
+            for other in sorted(set(named.findall(text)) - {model}):
+                violations.append(
+                    f"{path.relative_to(root)}: names {other} but the launcher pins {model}"
+                )
+
     # Main's trusted bootstrap validator predates the canonical references/
     # layout and requires these Claude-side paths. Keep them as exact mirrors,
     # not independent instructions that can silently drift.
@@ -685,6 +729,11 @@ def collect_violations(root: Path) -> list[str]:
             if marker in text:
                 violations.append(
                     f"{relative}: stale companion-repository marker {marker!r}"
+                )
+        for marker in STALE_CONTRACT_MARKERS:
+            if marker in text:
+                violations.append(
+                    f"{relative}: stale delivery or state instruction {marker!r}"
                 )
         if STALE_BRANDING.search(text):
             violations.append(f"{relative}: human-facing project branding is not adapted")
