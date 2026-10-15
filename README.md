@@ -390,7 +390,7 @@ default_environment: staging
 | `ownership.namespaces` | none | Required in exclusive mode. |
 | `ownership.drift_report` | `true` | Show unmanaged resources in PR review. |
 | `ownership.drift_alert_on` | modified and deleted on, unmanaged added off | What counts as drift. |
-| `ownership.large_prune_threshold_percent` | `25` | Exclusive-mode deletion guard. |
+| `ownership.large_prune_threshold_percent` | `25` | Deletion guard in both modes: refuse an apply deleting more than this share of the managed set (shared) or prunable live set (exclusive). |
 | `monitoring.unattended` | `false` | Run drift checks in `<env>-monitor`; see [below](#unattended-monitoring-and-when-it-is-approval-gated). |
 | `promotion.requires` | none | See [Staged promotion](#staged-promotion). |
 
@@ -412,7 +412,7 @@ credentials.
 | Removed from the repository after being applied | deleted | deleted |
 | Never applied by the repository (unmanaged) | **left alone**, shown in review | **deleted** in the listed namespaces |
 | `full_replace` | rejected | allowed |
-| Safety rail | deletes only what the ledger records | `large_prune_threshold_percent` guard (override with `--allow-large-prune`) |
+| Safety rail | deletes only what the ledger records, plus the `large_prune_threshold_percent` guard over that managed set | `large_prune_threshold_percent` guard over the prunable live set (override either with `--allow-large-prune`) |
 
 Choose `shared` when people still change the gateway by hand; choose
 `exclusive` when Git is the only source of truth. Resources created by the
@@ -953,8 +953,9 @@ points at a local credential bundle.
   ledger evidence.
 - **Prefer GitHub App installation tokens** for the provisioner token; they
   expire after an hour.
-- **The gateway URL must be `https://`**; insecure switches are refused in CI
-  except for loopback. See [Transport security](docs/reference.md#transport-security).
+- **The gateway URL must be `https://`**; the only plaintext exception is
+  `http://` to a literal loopback IP such as `127.0.0.1` (`localhost` does not
+  qualify). See [Transport security](docs/reference.md#transport-security).
 - **Dependencies are pinned.** Actions by commit SHA, Rust and tools by exact
   version, the validator by SHA-256 allowlist, Docker bases by digest.
   Releases carry provenance and SBOM attestations. `check_supply_chain.py`
