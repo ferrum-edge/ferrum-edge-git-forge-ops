@@ -95,6 +95,9 @@ UPSTREAM_MANAGED = (
     "src",
     "tests",
     "build.rs",
+    # Vendored ferrum-contracts release (PIN, schemas, vocabularies and
+    # fixtures) that the shipped conformance tests read and hash.
+    "contracts",
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",

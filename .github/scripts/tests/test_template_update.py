@@ -202,6 +202,36 @@ class TemplateUpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse((self.fixture.customer / "src/apply/api_target.rs").exists())
 
+    def test_vendored_contracts_are_introduced_and_their_pin_bumps_adopted(self):
+        # The shipped conformance tests read and hash `contracts/`, so a
+        # baseline must never advance past tests whose contract files were
+        # left behind: first introduction, then a later pin bump.
+        introduced = {
+            "contracts/ferrum-contracts/PIN": "tag=contracts-edge-0.9.15\n",
+            "contracts/ferrum-contracts/vocabularies/plugin-catalog.json": "[\"cors\"]\n",
+            "tests/unit/contracts_tests.rs": "// expects contracts-edge-0.9.15\n",
+        }
+        self.fixture.upstream_change(introduced, "vendor contracts")
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for relative, content in introduced.items():
+            with self.subTest(path=relative):
+                self.assertEqual(self.fixture.read(relative), content)
+
+        bumped = {
+            "contracts/ferrum-contracts/PIN": "tag=contracts-edge-0.9.16\n",
+            "contracts/ferrum-contracts/vocabularies/plugin-catalog.json": "[\"cors\",\"key_auth\"]\n",
+            "tests/unit/contracts_tests.rs": "// expects contracts-edge-0.9.16\n",
+        }
+        target = self.fixture.upstream_change(bumped, "bump contracts pin")
+        result = self.fixture.run("apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for relative, content in bumped.items():
+            with self.subTest(path=relative):
+                self.assertEqual(self.fixture.read(relative), content)
+        baseline = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
+        self.assertEqual(baseline["commit"], target)
+
     def test_upstream_mode_replaces_local_permission_and_special_bits(self):
         path = self.fixture.customer / "src/main.rs"
         upstream_path = self.fixture.upstream / "src/main.rs"
@@ -1431,6 +1461,21 @@ class RepositoryContractTests(unittest.TestCase):
             relative = f".gitforgeops/{example.name}"
             with self.subTest(example=relative):
                 self.assertIn(relative, template_update.UPSTREAM_MANAGED)
+
+    def test_every_tracked_contract_file_is_upstream_managed(self):
+        # The conformance tests read these, so an update that adopted the
+        # tests without them would leave a downstream repository failing.
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z", "contracts"],
+            cwd=str(ROOT),
+            check=True,
+            capture_output=True,
+        ).stdout.decode("utf-8").split("\0")
+        tracked = [path for path in tracked if path]
+        self.assertTrue(tracked)
+        for path in tracked:
+            with self.subTest(path=path):
+                self.assertTrue(template_update.is_upstream_managed(path))
 
     def test_no_path_is_both_upstream_managed_and_customer_owned(self):
         for owned in template_update.CUSTOMER_OWNED:

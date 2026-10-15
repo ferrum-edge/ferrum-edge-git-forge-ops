@@ -149,6 +149,14 @@ class ChangedFilesTests(unittest.TestCase):
             ".gitforgeops/policies.example.yaml",
             ".gitforgeops/smoke.example.yaml",
             ".github/scripts/audit_settings.py",
+            # The conformance tests read and hash the vendored contracts and
+            # the Edge checksum allowlist; the promotion tests read these two
+            # workflows.
+            "contracts/ferrum-contracts/PIN",
+            "contracts/ferrum-contracts/vocabularies/plugin-catalog.json",
+            ".github/ferrum-edge-checksums.txt",
+            ".github/workflows/apply-on-merge.yml",
+            ".github/workflows/trusted-pr-review.yml",
         ):
             with self.subTest(path=path):
                 result = changed_files.analyze([[{"filename": path}]], 1, "rust")
@@ -159,7 +167,10 @@ class ChangedFilesTests(unittest.TestCase):
             ".gitforgeops/policies.yaml",
             ".gitforgeops/nested/config.example.yaml",
             ".github/scripts/bootstrap_repo_settings.py",
+            ".github/workflows/drift-check.yml",
             "resources/ferrum/proxies/_example.yaml",
+            "docs/contracts.md",
+            "nested/contracts/PIN",
         ):
             with self.subTest(path=path):
                 result = changed_files.analyze([[{"filename": path}]], 1, "rust")
@@ -179,6 +190,10 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertIn("docs/quickstart.md", entries)
         self.assertIn(".gitforgeops/*.example.yaml", entries)
         self.assertIn(".github/scripts/audit_settings.py", entries)
+        self.assertIn("contracts/**", entries)
+        self.assertIn(".github/ferrum-edge-checksums.txt", entries)
+        self.assertIn(".github/workflows/apply-on-merge.yml", entries)
+        self.assertIn(".github/workflows/trusted-pr-review.yml", entries)
         for entry in entries:
             # Instantiate the glob with a representative concrete path.
             sample = (

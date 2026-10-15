@@ -19,7 +19,9 @@ PATTERNS = {
         r"\.github/workflows/rust-ci\.yml$|"
         # Non-Rust files the unit suite reads or the binary embeds.
         r"docs/quickstart\.md$|\.gitforgeops/[^/]+\.example\.yaml$|"
-        r"\.github/scripts/audit_settings\.py$)"
+        r"\.github/scripts/audit_settings\.py$|contracts/|"
+        r"\.github/ferrum-edge-checksums\.txt$|"
+        r"\.github/workflows/(?:apply-on-merge|trusted-pr-review)\.yml$)"
     ),
     "declarative": re.compile(r"^(?:resources/|overlays/|\.gitforgeops/|\.state(?:/|$))"),
     "state": re.compile(r"^\.state(?:/|$)"),
