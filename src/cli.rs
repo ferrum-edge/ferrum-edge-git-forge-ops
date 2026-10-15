@@ -10,12 +10,6 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    pub verbose: u8,
-
-    #[arg(long)]
-    pub no_color: bool,
-
     /// Select an environment declared in `.gitforgeops/config.yaml`.
     /// Overrides `FERRUM_ENV` if both are set.
     #[arg(long, global = true)]

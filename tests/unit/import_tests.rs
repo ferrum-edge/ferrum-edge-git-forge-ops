@@ -115,6 +115,39 @@ fn split_config_produces_loadable_files() {
 }
 
 #[test]
+fn file_import_refuses_documents_over_the_size_limit_without_publishing() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    // Sparse file one byte over the 64 MiB import limit: the bounded read
+    // must refuse it without allocating the whole document first.
+    let file = std::fs::File::create(&backup_path).unwrap();
+    file.set_len(64 * 1024 * 1024 + 1).unwrap();
+    drop(file);
+
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("exceeds the"), "{error}");
+    assert!(
+        error.contains("no tree or credential bundle was published"),
+        "{error}"
+    );
+    assert!(
+        !output.exists(),
+        "an oversized import must not publish a tree"
+    );
+}
+
+#[test]
 fn file_import_rejects_passthrough_fields_without_publishing_them() {
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");

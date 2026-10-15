@@ -626,6 +626,12 @@ fn build_github_api_client(
         .user_agent("gitforgeops/0.1")
         .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        // These calls carry a bearer token to api.github.com only. Never
+        // follow a redirect (a same-host 3xx keeps the Authorization header,
+        // and no endpoint used here legitimately redirects) and never let
+        // a downgraded http:// URL carry the token.
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
         .build()
         .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))
 }
@@ -1630,6 +1636,33 @@ async fn cmd_export(
     // export is exactly the artifact a file-mode gateway consumes.
     let yaml = apply::render_file_yaml(&gateway_config)?;
 
+    // Build the gateway payload before publishing anything: delivery can
+    // still fail here (no compatible SSH key for `--encrypt-to`), and a
+    // failed export must not leave a freshly reconciled mesh document
+    // behind as its only effect.
+    let plaintext_materialized = materialize && encrypt_to.is_none();
+    let payload: Vec<u8> = if let Some(login) = encrypt_to {
+        let client = build_github_api_client(&env_config)?;
+        match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
+            Some(delivery) => {
+                eprintln!(
+                    "Encrypted to @{} (ssh key {})",
+                    safe(&delivery.login),
+                    safe(&delivery.key_fingerprint)
+                );
+                delivery.encrypted_b64.into_bytes()
+            }
+            None => {
+                return Err(format!(
+                    "@{login} has no compatible SSH public keys on GitHub; cannot encrypt. Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys."
+                )
+                .into());
+            }
+        }
+    } else {
+        yaml.into_bytes()
+    };
+
     // The mesh document is a separate artifact with a separate destination —
     // it cannot ride inside the gateway document (the mesh loader is
     // deny_unknown_fields and would reject `proxies:`), and `--output` names
@@ -1663,29 +1696,6 @@ async fn cmd_export(
             }
         }
     }
-
-    let plaintext_materialized = materialize && encrypt_to.is_none();
-    let payload: Vec<u8> = if let Some(login) = encrypt_to {
-        let client = build_github_api_client(&env_config)?;
-        match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
-            Some(delivery) => {
-                eprintln!(
-                    "Encrypted to @{} (ssh key {})",
-                    safe(&delivery.login),
-                    safe(&delivery.key_fingerprint)
-                );
-                delivery.encrypted_b64.into_bytes()
-            }
-            None => {
-                return Err(format!(
-                    "@{login} has no compatible SSH public keys on GitHub; cannot encrypt. Ask them to add an Ed25519 or RSA key at https://github.com/settings/keys."
-                )
-                .into());
-            }
-        }
-    } else {
-        yaml.into_bytes()
-    };
 
     match output_path {
         Some(path) => {

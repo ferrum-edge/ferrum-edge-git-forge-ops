@@ -200,6 +200,11 @@ async fn check_override_context(
         .user_agent("gitforgeops/0.1")
         .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        // Bearer-token calls to api.github.com only: never follow a redirect
+        // with the token, never downgrade to http://. Pagination follows the
+        // `Link` header through fresh requests, not 3xx responses.
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
@@ -491,7 +496,7 @@ async fn fetch_json(
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
     let status = resp.status().as_u16();
-    if status >= 400 {
+    if !(200..300).contains(&status) {
         let body = resp.text().await.unwrap_or_default();
         return Err(crate::error::Error::ApiError {
             status,

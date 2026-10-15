@@ -69,7 +69,7 @@ pub async fn fetch_public_key_at(
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
     let status = resp.status().as_u16();
-    if status >= 400 {
+    if !(200..300).contains(&status) {
         let body = resp.text().await.unwrap_or_default();
         return Err(crate::error::Error::ApiError {
             status,
@@ -168,7 +168,7 @@ pub async fn put_environment_secret_at(
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
     let status = resp.status().as_u16();
-    if status >= 400 {
+    if !(200..300).contains(&status) {
         let body = resp.text().await.unwrap_or_default();
         return Err(crate::error::Error::ApiError {
             status,

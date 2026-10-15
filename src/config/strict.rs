@@ -192,6 +192,58 @@ pub(crate) fn resource_kind(resource: &Resource) -> &'static str {
     }
 }
 
+/// Largest YAML document accepted from a resource or overlay file, and the
+/// largest parsed shape accepted from one. A per-resource file is small by
+/// design; without bounds a crafted document (deep nesting, alias-expanded
+/// node floods) spends unbounded memory and stack in the recursive walks
+/// downstream of the parse. The shape walk is iterative, so checking the
+/// depth cannot itself overflow.
+pub(crate) const MAX_YAML_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_YAML_DEPTH: usize = 128;
+const MAX_YAML_NODES: usize = 1_000_000;
+
+pub(crate) fn check_yaml_input_bytes(contents: &str, path: &Path) -> crate::error::Result<()> {
+    if contents.len() > MAX_YAML_INPUT_BYTES {
+        return Err(crate::error::Error::Config(format!(
+            "YAML file {} is {} bytes, over the {MAX_YAML_INPUT_BYTES}-byte limit; \
+             split it into per-resource files",
+            path.display(),
+            contents.len()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn check_yaml_shape(value: &serde_yaml::Value, path: &Path) -> crate::error::Result<()> {
+    let mut nodes = 0usize;
+    let mut stack = vec![(value, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        nodes += 1;
+        if nodes > MAX_YAML_NODES || depth > MAX_YAML_DEPTH {
+            return Err(crate::error::Error::Config(format!(
+                "YAML file {} expands past the accepted shape (over {MAX_YAML_NODES} \
+                 nodes or {MAX_YAML_DEPTH} levels deep); refusing to walk it further",
+                path.display()
+            )));
+        }
+        match node {
+            serde_yaml::Value::Mapping(mapping) => {
+                stack.extend(
+                    mapping
+                        .iter()
+                        .flat_map(|(key, child)| [(key, depth + 1), (child, depth + 1)]),
+                );
+            }
+            serde_yaml::Value::Sequence(items) => {
+                stack.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            serde_yaml::Value::Tagged(tagged) => stack.push((&tagged.value, depth + 1)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Parse one YAML resource without letting Serde's internally-tagged enum
 /// buffering hide ignored fields.
 ///
@@ -205,11 +257,13 @@ pub(crate) fn resource_from_yaml(
     path: &Path,
     options: LoadOptions,
 ) -> crate::error::Result<Resource> {
+    check_yaml_input_bytes(contents, path)?;
     let yaml: serde_yaml::Value =
         serde_yaml::from_str(contents).map_err(|source| crate::error::Error::YamlParse {
             path: path.to_path_buf(),
             source,
         })?;
+    check_yaml_shape(&yaml, path)?;
     reject_non_string_keys(&yaml, path)?;
     let value = serde_json::to_value(yaml)?;
     resource_from_json_value(value, path, options)

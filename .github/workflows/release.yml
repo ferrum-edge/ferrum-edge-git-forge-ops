@@ -22,6 +22,11 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Every job states its own permissions; this default keeps a future job that
+# forgets to from inheriting the repository's permissive token defaults.
+permissions:
+  contents: read
+
 jobs:
   authorize-release:
     name: Require a checked, merged pull request

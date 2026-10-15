@@ -534,6 +534,26 @@ fn loader_still_rejects_config_shaped_files_next_to_os_artifacts() {
     assert!(error.contains("must contain a YAML object"), "{error}");
 }
 
+/// A node-flood document must be refused by the shape bound, with the file
+/// named, instead of spending unbounded memory in the walks that follow the
+/// parse. (Depth is bounded twice over: serde_yaml's own recursion limit
+/// fires during the parse, and the shape bound caps what survives it.)
+#[test]
+fn loader_rejects_yaml_past_the_node_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Anchor expansion: ~1,001,000 parsed nodes from a few KiB of input,
+    // far under the tree-read byte cap.
+    let base = "x,".repeat(1_000);
+    let copies = "*b,".repeat(1_001);
+    let body = format!(
+        "kind: PluginConfig\nspec:\n  id: p\n  plugin_name: key_auth\n  scope: global\n  config: {{base: &b [{base}], copies: [{copies}]}}\n"
+    );
+    write_resource(tmp.path(), "plugins", "flood.yaml", &body);
+    let error = load_resources(tmp.path()).unwrap_err().to_string();
+    assert!(error.contains("expands past the accepted shape"), "{error}");
+    assert!(error.contains("flood.yaml"), "{error}");
+}
+
 /// Non-string YAML keys would be silently stringified by the
 /// `serde_yaml::Value` → `serde_json::Value` hop every document takes, quietly
 /// rewriting exactly the sections gitforgeops promises to carry verbatim.
