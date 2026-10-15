@@ -1919,14 +1919,19 @@ pub fn map_api_error_with_redirect_base(
     // An unparsed body is peer-controlled bytes and is withheld entirely:
     // bounded or not, an excerpt can carry request material reflected from
     // a credential-bearing call. A parsed `error` field is the gateway's
-    // own structured diagnostic and is kept as parsed. Classification
-    // below may still inspect the raw body internally; it never displays it.
-    let message = parsed.error.clone().unwrap_or_else(|| {
-        format!(
+    // own structured diagnostic and is kept, reduced to one bounded line
+    // like every other displayed error body. Classification below may still
+    // inspect the raw body internally; it never displays it.
+    let message = parsed
+        .error
+        .as_deref()
+        .map(bounded_error_message)
+        .unwrap_or_else(|| {
+            format!(
             "the gateway returned an unstructured error body ({} bytes); its contents are withheld",
             body.len()
         )
-    });
+        });
 
     // The client is built with `redirect::Policy::none()` so a destructive
     // body is never replayed against a different authority, which means a 3xx
@@ -3502,6 +3507,76 @@ mod bounded_error_message_tests {
     #[test]
     fn short_error_body_survives() {
         assert_eq!(bounded_error_message("nope: bad thing"), "nope: bad thing");
+    }
+
+    #[test]
+    fn structured_gateway_errors_are_one_bounded_line() {
+        let body = serde_json::json!({
+            "error": format!("first line\nforged: ok\r\n{}", "x".repeat(5000)),
+        })
+        .to_string();
+        let rendered = super::map_api_error(400, &body, super::RequestKind::Read).to_string();
+        assert!(!rendered.contains('\n'), "{rendered}");
+        assert!(!rendered.contains('\r'), "{rendered}");
+        assert!(rendered.contains("first line forged: ok"), "{rendered}");
+        assert!(rendered.contains("[truncated]"), "{rendered}");
+        assert!(!rendered.contains(&"x".repeat(600)), "{rendered}");
+    }
+
+    /// Serve one HTTP 403 with `body`, and return what `read_error_body`
+    /// makes of it.
+    async fn read_error_body_of(body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            // The reader stops at its cap; the peer closing early is fine.
+            let _ = socket.write_all(&body).await;
+        });
+        let resp = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let message = super::read_error_body(resp).await;
+        server.abort();
+        message
+    }
+
+    #[tokio::test]
+    async fn github_error_bodies_are_bounded_and_unstructured_ones_withheld() {
+        // An oversized, unstructured body (which could reflect the bearer
+        // token) is neither buffered whole nor excerpted.
+        let mut huge = b"Authorization: Bearer synthetic-token ".to_vec();
+        huge.resize(4 * 1024 * 1024, b'x');
+        let withheld = read_error_body_of(huge).await;
+        assert!(!withheld.contains("synthetic-token"), "{withheld}");
+        assert!(withheld.contains("withheld"), "{withheld}");
+        assert!(
+            withheld.contains(&format!("{} bytes read", super::MAX_ERROR_BODY_BYTES)),
+            "{withheld}"
+        );
+
+        // GitHub's structured `message` survives as one bounded line.
+        let structured = serde_json::json!({
+            "message": format!("Bad credentials\nforged: ok {}", "y".repeat(2000)),
+        })
+        .to_string();
+        let message = read_error_body_of(structured.into_bytes()).await;
+        assert!(
+            message.starts_with("Bad credentials forged: ok"),
+            "{message}"
+        );
+        assert!(!message.contains('\n'), "{message}");
+        assert!(message.ends_with("[truncated]"), "{message}");
     }
 
     #[test]

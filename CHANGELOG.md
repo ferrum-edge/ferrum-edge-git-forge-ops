@@ -344,6 +344,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Finish bounding error bodies and validator I/O (follow-up to #553). The
+  gateway's structured `error` message is now one bounded line like every
+  other displayed error body, and a failed PR-comment POST reads GitHub's
+  error body through the same capped reader instead of buffering and
+  printing it whole. The validator's `--help` probe (used when `which` is
+  unavailable) runs under the same time and output limits as validation, and
+  timeout cleanup kills the validator's process group through `/bin/sh`'s
+  `kill` builtin rather than a `kill` found on `PATH`.
 - PR validation (`validate-pr.yml`) caches its PR-built cargo `target/` under
   its own `<os>-pr-cargo-` key family instead of the `<os>-cargo-` key the
   privileged apply, drift, materialize and rotate jobs restore.

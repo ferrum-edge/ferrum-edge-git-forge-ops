@@ -88,10 +88,9 @@ pub async fn post_pr_comment(
         if (200..=299).contains(&status) {
             return Ok(());
         }
-        let resp_body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("<no body>"));
+        // Bounded read, and only GitHub's structured `message` is shown: a
+        // raw error body can be large or reflect the bearer token.
+        let resp_body = crate::http_client::read_error_body(resp).await;
         if attempt < MAX_COMMENT_RETRIES && comment_status_is_retryable(status) {
             let delay = retry_after
                 .unwrap_or_else(|| Duration::from_millis(500_u64.saturating_mul(1_u64 << attempt)));
