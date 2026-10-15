@@ -349,6 +349,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Scrub resolved secrets from displayed errors. Every successful secret
+  resolution in a CLI run registers its values. The gateway's structured
+  `error`, GitHub's `message` and the final `Error:` line have them replaced
+  with `[REDACTED]`, and a diagnostic is withheld if a value or a fragment of
+  one survives. Follow-up to #553, which bounded these messages but still
+  displayed whatever a peer reflected from the request.
 - Finish bounding error bodies and validator I/O (follow-up to #553). The
   gateway's structured `error` message is now one bounded line like every
   other displayed error body, and a failed PR-comment POST reads GitHub's

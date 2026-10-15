@@ -42,6 +42,8 @@ macro_rules! reportln {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Every secret resolved in this run is removed from displayed errors.
+    secrets::enable_display_scrubbing();
     let cli = cli::Cli::parse();
     let explicit_env = cli.env.clone();
     // `--allow-credential-slot-remap` downgrades the credential-slot-remap
@@ -196,7 +198,12 @@ async fn main() {
         // Last line of defense for anything a printer below did not
         // already sanitize: an error Display can carry a resource id, a
         // YAML path or a gateway response body.
-        eprintln!("Error: {}", safe_block(&e));
+        // The run's resolved secrets are scrubbed from it first: a peer's
+        // error text can reflect them.
+        eprintln!(
+            "Error: {}",
+            safe_block(secrets::scrub_for_display(&e.to_string()))
+        );
         process::exit(1);
     }
 }

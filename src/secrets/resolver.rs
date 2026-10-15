@@ -1422,6 +1422,9 @@ pub fn resolve_secrets_with_mode_and_options(
     validate_identity_placeholders(cfg)?;
     let mut candidate = cfg.clone();
     let report = resolve_secrets_in_place(&mut candidate, bundle, mode, options)?;
+    // From here on these values travel in requests, so any error text a peer
+    // reflects them in must have them removed before it is displayed.
+    super::scrubber::register_resolved_for_display(&candidate, &report);
     *cfg = candidate;
     Ok(report)
 }
