@@ -2630,6 +2630,9 @@ impl BackupSnapshot {
             crate::error::Error::Config("invalid backup payload; details withheld".to_string())
         })?;
         crate::config::validate_unique_live_resource_keys(&config)?;
+        // Live credentials are this run's secrets too: a later response or a
+        // restore payload can carry them.
+        crate::display::register_gateway_config(&config);
         let unmodeled_nested_fields: Vec<UnmodeledNestedField> = ignored
             .into_iter()
             .map(|field| field.attribute(&config))

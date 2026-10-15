@@ -1262,6 +1262,9 @@ fn prepare_full_replace(
     // ownership tags cannot be stripped accidentally by treating a malformed
     // snapshot as legacy data.
     let config = preserve_spec_owned_graph(desired, actual, live_extras, namespace)?;
+    // The payload carries preserved live rows the repository never named;
+    // their secrets travel in this request.
+    crate::display::register_gateway_config(&config);
     Ok(PreparedFullReplace {
         config,
         extras: BackupExtras {

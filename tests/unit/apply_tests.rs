@@ -6213,3 +6213,49 @@ async fn apply_refuses_an_unresolved_service_discovery_secret_before_any_write()
     assert_eq!(result.created, 0);
     assert!(mutation_lines(&requests).is_empty());
 }
+
+/// A full replacement carries preserved live spec-owned rows the repository
+/// never named. Their secrets travel in the restore request, so they are
+/// registered before it is sent: a later response reflecting one (a
+/// `/cluster` message on the convergence line) is scrubbed.
+#[tokio::test]
+async fn full_replace_registers_the_secrets_of_preserved_live_rows() {
+    const PRESERVED: &str = "zq7-preserved-spec-plugin-secret-01";
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    let (desired, mut actual) = spec_owned_graph();
+    actual.plugin_configs[0].config = serde_json::json!({ "api_key": PRESERVED });
+    assert!(desired
+        .plugin_configs
+        .iter()
+        .all(|plugin| !plugin.config.to_string().contains(PRESERVED)));
+    let reflected = format!("convergence: mode=database (echo {PRESERVED})");
+    let extras = spec_extras(&["spec-a"]);
+    let (url, _requests) = spawn_recording_gateway(vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "POST /restore?confirm=true".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+    ]);
+    let client = stub_client(url);
+    apply_api(
+        &desired,
+        &client,
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), actual)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions {
+            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("restore succeeds");
+    assert_eq!(
+        gitforgeops::display::scrub_text(&reflected),
+        "convergence: mode=database (echo [REDACTED])"
+    );
+}

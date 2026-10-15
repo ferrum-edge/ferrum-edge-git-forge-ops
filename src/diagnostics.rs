@@ -94,6 +94,25 @@ fn neutralize_workflow_commands(line: &mut String) {
     }
 }
 
+/// What [`sanitize`] and its siblings make of `value`, without the length
+/// bound: unsafe characters as [`REPLACEMENT`] and workflow-command syntax
+/// broken. The display sink looks for this spelling of every secret, because
+/// a secret quoted through this module reaches it in this form.
+pub(crate) fn sanitized_spelling(value: &str) -> String {
+    let mut spelled: String = value
+        .chars()
+        .map(|character| {
+            if is_unsafe_log_char(character) {
+                REPLACEMENT
+            } else {
+                character
+            }
+        })
+        .collect();
+    spelled = spelled.replace("##[", "##\u{fffd}[");
+    spelled
+}
+
 /// Sanitize an untrusted scalar for interpolation into one line of output.
 ///
 /// The result contains no line break of any kind and does not begin a
