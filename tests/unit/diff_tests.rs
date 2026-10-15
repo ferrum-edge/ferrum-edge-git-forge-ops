@@ -2262,6 +2262,71 @@ fn upstream_with_consul(id: &str, address: &str, token: Option<&str>) -> Upstrea
     upstream
 }
 
+/// A live Consul address can carry URL credentials even though the repository
+/// cannot (the security audit refuses it). A diff that changes only a sibling
+/// field must still show the address host, never its userinfo.
+#[test]
+fn service_discovery_diff_redacts_address_userinfo_on_both_sides() {
+    let address = "https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501/v1";
+    let desired = GatewayConfig {
+        upstreams: vec![upstream_with_consul("orders", address, None)],
+        ..GatewayConfig::default()
+    };
+    let mut actual = desired.clone();
+    actual.upstreams[0]
+        .service_discovery
+        .as_mut()
+        .and_then(|sd| sd.consul.as_mut())
+        .unwrap()
+        .service_name = "payments".to_string();
+
+    let diffs = compute_diff(&desired, &actual).unwrap();
+    let change = diffs
+        .iter()
+        .flat_map(|diff| &diff.details)
+        .find(|change| change.field == "service_discovery")
+        .expect("the discovery block changed");
+    for side in [&change.old_value, &change.new_value] {
+        assert!(!side.contains("SYNTHETIC-URL-PASSWORD"), "{side}");
+        assert!(!side.contains("svc-user"), "{side}");
+        assert!(
+            side.contains("[REDACTED]@consul.example.test:8501/v1"),
+            "{side}"
+        );
+    }
+}
+
+#[test]
+fn audit_refuses_url_credentials_in_a_consul_address() {
+    let config = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "orders",
+            "https://svc-user:SYNTHETIC-URL-PASSWORD@consul.example.test:8501",
+            None,
+        )],
+        ..GatewayConfig::default()
+    };
+    let findings = audit_security(&config);
+    let finding = findings
+        .iter()
+        .find(|finding| finding.message.contains("service_discovery.consul.address"))
+        .expect("URL credentials in the address are a blocking finding");
+    assert_eq!(finding.severity, "error");
+    assert!(!finding.message.contains("SYNTHETIC-URL-PASSWORD"));
+
+    let clean = GatewayConfig {
+        upstreams: vec![upstream_with_consul(
+            "orders",
+            "https://consul.example.test:8501/path@v1",
+            None,
+        )],
+        ..GatewayConfig::default()
+    };
+    assert!(!audit_security(&clean)
+        .iter()
+        .any(|finding| finding.message.contains("service_discovery.consul.address")));
+}
+
 #[test]
 fn service_discovery_diff_redacts_the_token_but_shows_the_address() {
     let desired = GatewayConfig {

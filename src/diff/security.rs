@@ -740,6 +740,21 @@ fn check_literal_service_discovery_secrets(
     upstream: &crate::config::schema::Upstream,
     findings: &mut Vec<SecurityFinding>,
 ) {
+    if upstream
+        .service_discovery
+        .as_ref()
+        .is_some_and(crate::secrets::service_discovery::consul_address_has_userinfo)
+    {
+        findings.push(SecurityFinding::error(
+            "Upstream",
+            &upstream.id,
+            &upstream.namespace,
+            format!(
+                "URL credentials in 'service_discovery.consul.address' on upstream {} in namespace {} (remove the userinfo from the address; put a Consul ACL token in 'service_discovery.consul.token' as ${{gh-env-secret:alloc=require}})",
+                upstream.id, upstream.namespace
+            ),
+        ));
+    }
     for (field, value) in crate::secrets::service_discovery::present_secrets(upstream) {
         if is_broker_placeholder(value) {
             continue;

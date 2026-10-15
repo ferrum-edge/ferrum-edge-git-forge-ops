@@ -997,7 +997,9 @@ pub fn capture_and_redact_import_plugin_config_secrets(
 ///
 /// Only leaves named by [`SD_SECRET_FIELDS`] are touched: `consul.address`,
 /// `service_name`, `datacenter` and `tag` identify *what* is discovered and
-/// stay readable, so the imported file still says what the upstream does.
+/// stay readable, so the imported file still says what the upstream does. An
+/// address carrying URL userinfo is refused instead, because writing it would
+/// commit that credential.
 pub fn capture_and_redact_import_service_discovery_secrets(
     cfg: &mut GatewayConfig,
 ) -> crate::error::Result<CredentialBundle> {
@@ -1012,6 +1014,13 @@ pub fn capture_and_redact_import_service_discovery_secrets(
         let Some(discovery) = upstream.service_discovery.as_mut() else {
             continue;
         };
+        // The address is reviewable configuration, not a brokered leaf, so a
+        // credential in its userinfo can be neither captured nor written.
+        if service_discovery::consul_address_has_userinfo(discovery) {
+            return Err(crate::error::Error::Config(format!(
+                "upstream `{namespace}/{upstream_id}` has URL credentials in service_discovery.consul.address; import never writes them to a resource file. Remove the userinfo from the address on the gateway (use consul.token for a Consul ACL token), then re-run import"
+            )));
+        }
         for field in SD_SECRET_FIELDS {
             let slot = service_discovery::slot(&namespace, &upstream_id, field.path);
             let Some(leaf) = service_discovery::secret_leaf_mut(discovery, field.path) else {
@@ -1743,11 +1752,21 @@ fn check_array_slot_identity(
     }
 
     let scan_prefix = format!("{prefix}/");
+    let legacy_prefixes = legacy_array_prefixes(components);
     for slot in bundle.keys() {
-        let Some(rest) = slot.strip_prefix(&scan_prefix) else {
-            continue;
+        // Every spelling the lookup still reads names the same slot, so the
+        // retirement check scans all of them: a value stored under a legacy
+        // dotted key resolves again on regrowth exactly like a canonical one.
+        let index = match slot.strip_prefix(&scan_prefix) {
+            Some(rest) => entry_index_of_suffix(rest),
+            None => match legacy_prefixes
+                .iter()
+                .find_map(|legacy| legacy_entry_index(slot, legacy))
+            {
+                Some(index) => index,
+                None => continue,
+            },
         };
-        let index = entry_index_of_suffix(rest);
         if index >= items.len() {
             push_slot_remap(
                 report,
@@ -1796,13 +1815,18 @@ fn check_omitted_credential_types(
             SlotComponent::Literal(&consumer.id),
             SlotComponent::Literal(credential_type),
         ]);
+        // The canonical `<type>/…` and every legacy `<type>.…` / `<type>[N]…`
+        // spelling the lookup still reads.
         let orphans = bundle
             .range(prefix.clone()..)
             .map(|(slot, _)| slot)
             .take_while(|slot| slot.starts_with(&prefix))
             .filter(|slot| {
-                slot.strip_prefix(&prefix)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                slot.strip_prefix(&prefix).is_some_and(|rest| {
+                    rest.is_empty()
+                        || rest.starts_with('/')
+                        || legacy_entry_index(slot, &prefix).is_some()
+                })
             });
         for slot in orphans {
             push_slot_remap(
@@ -2030,6 +2054,49 @@ fn enforce_slot_remap_policy(
 
 /// Entry index a bundle-slot suffix belongs to: `"[2]/key"` → 2, and anything
 /// else → 0, since index 0 renders without its bracket (see [`is_elided`]).
+/// The legacy dotted spellings of a Consumer credential array's own slot
+/// prefix, as [`legacy_slot_from_components`] spells its entries.
+///
+/// Reserved `@` segments (plugin and service-discovery secrets) never had a
+/// dotted spelling, so they have none.
+fn legacy_array_prefixes(components: &[SlotComponent<'_>]) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    match components {
+        [SlotComponent::Literal(_), SlotComponent::Literal(_), SlotComponent::Literal(top), ..]
+            if !top.starts_with('@') => {}
+        _ => return prefixes,
+    }
+    if let [SlotComponent::Literal(namespace), SlotComponent::Literal(consumer_id), SlotComponent::Literal(top)] =
+        components
+    {
+        if !top.contains(['.', '[', ']']) {
+            prefixes.push(format!("{namespace}/{consumer_id}/{top}"));
+        }
+        return prefixes;
+    }
+    for keep_index_zero in [false, true] {
+        if let Some(prefix) = legacy_slot_from_components(components, keep_index_zero) {
+            if !prefixes.contains(&prefix) {
+                prefixes.push(prefix);
+            }
+        }
+    }
+    prefixes
+}
+
+/// The array entry index of a legacy dotted `slot` under `prefix`:
+/// `<prefix>.<leaf>` is entry 0, `<prefix>[N]` or `<prefix>[N].<leaf>` entry N.
+fn legacy_entry_index(slot: &str, prefix: &str) -> Option<usize> {
+    let rest = slot.strip_prefix(prefix)?;
+    if let Some(leaf) = rest.strip_prefix('.') {
+        return (!leaf.is_empty()).then_some(0);
+    }
+    let close = rest.find(']')?;
+    let index = parse_index_segment(&rest[..=close])?;
+    let after = &rest[close + 1..];
+    (after.is_empty() || after.starts_with('.') || after.starts_with('[')).then_some(index)
+}
+
 fn entry_index_of_suffix(rest: &str) -> usize {
     rest.split('/')
         .next()

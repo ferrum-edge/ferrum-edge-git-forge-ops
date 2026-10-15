@@ -22,6 +22,9 @@
 //!   is the control-plane URL, `service_name`, `datacenter` and `tag` are
 //!   selectors: all four name *what* is discovered, are needed to review a
 //!   change, and are already covered by the `allowed_backend_domains` policy.
+//!   An `address` must therefore carry no URL userinfo: credentials there are
+//!   refused by import and by the security audit, and redacted from a diff
+//!   (see [`consul_address_has_userinfo`]). The ACL token belongs in `token`.
 //! * `dns_sd`, `kubernetes`, `mesh` — no secret-bearing field. Kubernetes
 //!   discovery authenticates with the pod's own service-account token from
 //!   the gateway's filesystem, never from this document; mesh discovery
@@ -88,6 +91,29 @@ pub(crate) fn secret_leaf_mut<'a>(
         ["consul", "token"] => discovery.consul.as_mut().map(|consul| &mut consul.token),
         _ => None,
     }
+}
+
+/// Whether this discovery block's Consul `address` carries URL userinfo
+/// (`scheme://user[:password]@host…`), a credential the address is never
+/// allowed to hold.
+pub(crate) fn consul_address_has_userinfo(discovery: &ServiceDiscoveryConfig) -> bool {
+    discovery
+        .consul
+        .as_ref()
+        .is_some_and(|consul| redact_url_userinfo(&consul.address).is_some())
+}
+
+/// `text` with the userinfo of a `scheme://userinfo@host…` URL replaced by
+/// [`crate::secrets::REDACTION`], or `None` when it carries none.
+pub(crate) fn redact_url_userinfo(text: &str) -> Option<String> {
+    let (scheme, rest) = text.split_once("://")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let at = rest[..authority_end].rfind('@')?;
+    Some(format!(
+        "{scheme}://{}@{}",
+        crate::secrets::REDACTION,
+        &rest[at + 1..]
+    ))
 }
 
 /// Every modeled secret leaf that this upstream actually carries a value for.

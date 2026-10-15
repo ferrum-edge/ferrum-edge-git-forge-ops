@@ -2302,6 +2302,111 @@ fn retired_partner_key_bundle() -> BTreeMap<String, String> {
     bundle
 }
 
+/// Every spelling the lookup still reads for a two-entry keyauth array:
+/// `(entry 0 slot, entry 1 slot)`.
+const KEYAUTH_SLOT_ENCODINGS: [(&str, &str); 4] = [
+    (
+        "ferrum/partner/keyauth/key",
+        "ferrum/partner/keyauth/[1]/key",
+    ),
+    (
+        "ferrum/partner/keyauth/[0]/key",
+        "ferrum/partner/keyauth/[1]/key",
+    ),
+    (
+        "ferrum/partner/keyauth.key",
+        "ferrum/partner/keyauth[1].key",
+    ),
+    (
+        "ferrum/partner/keyauth[0].key",
+        "ferrum/partner/keyauth[1].key",
+    ),
+];
+
+/// A legacy spelling names the same slot as the canonical one, so shrinking
+/// the array or dropping the type is refused for every encoding the lookup
+/// still accepts, and an unshrunk array resolves both entries from it.
+#[test]
+fn every_accepted_slot_encoding_is_covered_by_the_retirement_checks() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    for (first, second) in KEYAUTH_SLOT_ENCODINGS {
+        let mut bundle = BTreeMap::new();
+        bundle.insert(first.to_string(), "FIRST-STORED-KEY".to_string());
+        bundle.insert(second.to_string(), "SECOND-STORED-KEY".to_string());
+
+        // Both entries declared: the stored values resolve, nothing refused.
+        let mut grown = partner_cfg(serde_json::json!({
+            "keyauth": [{"key": REQUIRE}, {"key": REQUIRE}],
+        }));
+        let report = resolve_secrets(&mut grown, &bundle).unwrap();
+        assert!(report.slot_remaps.is_empty(), "{first}");
+        assert_eq!(
+            grown.consumers[0].credentials["keyauth"],
+            serde_json::json!([{"key": "FIRST-STORED-KEY"}, {"key": "SECOND-STORED-KEY"}]),
+            "{first}"
+        );
+
+        for (case, declared) in [
+            (
+                "shrunk array",
+                serde_json::json!({"keyauth": [{"key": REQUIRE}]}),
+            ),
+            ("empty array", serde_json::json!({"keyauth": []})),
+            ("omitted type", serde_json::json!({})),
+        ] {
+            let err = report_secrets_with_mode_and_options(
+                &partner_cfg(declared),
+                &bundle,
+                GatewayMode::Api,
+                ResolveOptions::default(),
+            )
+            .expect_err("a retired slot in any accepted encoding must be refused");
+            assert!(
+                matches!(err, gitforgeops::error::Error::CredentialSlotRemap(_)),
+                "{first} {case}"
+            );
+            let err = err.to_string();
+            assert!(
+                err.contains(second) && err.contains("orphaned"),
+                "{first} {case}: {err}"
+            );
+            assert!(
+                !err.contains("STORED-KEY"),
+                "a refusal must never echo bundle values"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_slot_scan_ignores_similarly_named_types_and_canonical_children() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/partner/keyauth/key".to_string(), "LIVE".to_string());
+    // Not keyauth slots: another consumer and an unrelated key.
+    bundle.insert(
+        "ferrum/partner2/keyauth.key".to_string(),
+        "OTHER".to_string(),
+    );
+    bundle.insert(
+        "ferrum/partner/keyauthx.key".to_string(),
+        "OTHER".to_string(),
+    );
+    let cfg = partner_cfg(serde_json::json!({"keyauth": [{"key": REQUIRE}]}));
+    let report = report_secrets_with_mode_and_options(
+        &cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .unwrap();
+    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+}
+
 /// Omitting `keyauth` entirely must reach the same verdict as `keyauth: []`:
 /// the stored slots would otherwise be resurrected by a later re-add, even
 /// with `alloc=generate`.

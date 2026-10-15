@@ -118,7 +118,9 @@ jwt:     [{secret: S}]           ->  ferrum/app-mobile/jwt/secret
 ```
 
 Older spellings (an explicit `[0]`, and a dotted form) are still read, but only
-the form above is written. `gitforgeops rotate --credential` takes the same
+the form above is written. They name the same slot, so the shrink and
+dropped-type checks below also count a retired value stored under an older
+spelling. `gitforgeops rotate --credential` takes the same
 path: `keyauth/key`, `jwt/secret`, `hmac_auth/secret`, `basicauth/password`, or
 `keyauth/[1]/key`. Renaming a consumer gives it new slots.
 
@@ -153,7 +155,11 @@ stay readable for review and are checked by the `allowed_backend_domains`
 policy. `dns_sd`, `kubernetes` and `mesh` discovery hold no secrets. The Consul
 token is otherwise treated like a consumer credential: `import` captures it,
 `diff` prints `[REDACTED]`, validator output is scrubbed, and a committed
-literal is a blocking finding.
+literal is a blocking finding. `consul.address` must not carry URL
+credentials (`https://user:password@host`): a committed one is a blocking
+finding, `import` refuses a gateway whose address has them rather than writing
+them to the tree, and `diff` shows such a live address as
+`https://[REDACTED]@host`. Put a Consul ACL token in `consul.token` instead.
 
 ## Entry position is the slot identity
 

@@ -221,6 +221,16 @@ fn redact_service_discovery_json(serialized: &str) -> Option<String> {
         *leaf = crate::secrets::REDACTION.to_string();
         redacted = true;
     }
+    // The address stays reviewable; only a credential in its userinfo is
+    // replaced (a live row can hold one even though the repository cannot).
+    if let Some(serde_json::Value::String(address)) =
+        json_leaf_mut(&mut value, &["consul", "address"])
+    {
+        if let Some(safe) = crate::secrets::service_discovery::redact_url_userinfo(address) {
+            *address = safe;
+            redacted = true;
+        }
+    }
     if !redacted {
         return None;
     }
