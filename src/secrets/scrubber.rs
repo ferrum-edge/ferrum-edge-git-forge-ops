@@ -613,12 +613,13 @@ fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut BTreeSet<
                 record_secret(password, out);
             }
             record_secret(&userinfo, out);
-            // Detection ignores embedded tabs and line breaks, so the
-            // normalized userinfo may not occur in the address as written.
-            // Record the address itself then: its raw bytes are what a
-            // validator echoes, and their control characters make
-            // `scrub_streams` withhold the output rather than miss them.
-            if !consul.address.contains(userinfo.as_str()) {
+            // Detection ignores surrounding whitespace and embedded tabs and
+            // line breaks, so the credential as written may differ from the
+            // normalized userinfo. Record the address itself then: its raw
+            // bytes are what a validator echoes, and its whitespace or control
+            // characters make `scrub_streams` withhold the output rather than
+            // miss them.
+            if super::service_discovery::address_is_normalized(&consul.address) {
                 record_secret(&consul.address, out);
             }
         }

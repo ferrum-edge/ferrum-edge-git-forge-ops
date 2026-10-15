@@ -2656,6 +2656,52 @@ fn deleted_consumer_recorded_by_the_ledger_is_refused_in_an_unfiltered_run() {
     );
 }
 
+/// A nested credential array keeps its explicit-`[0]` slash alias: shrinking
+/// it is refused for a value stored under that spelling too.
+#[test]
+fn nested_array_shrink_covers_the_explicit_zero_slash_alias() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
+
+    let mut bundle = BTreeMap::new();
+    bundle.insert("ferrum/partner/keyauth/key".to_string(), "KEY".to_string());
+    bundle.insert(
+        "ferrum/partner/keyauth/[0]/extra/[0]/token".to_string(),
+        "STORED-A".to_string(),
+    );
+    bundle.insert(
+        "ferrum/partner/keyauth/[0]/extra/[1]/token".to_string(),
+        "STORED-B".to_string(),
+    );
+    let grown = partner_cfg(serde_json::json!({
+        "keyauth": [{"key": REQUIRE, "extra": [{"token": REQUIRE}, {"token": REQUIRE}]}],
+    }));
+    let shrunk = partner_cfg(serde_json::json!({
+        "keyauth": [{"key": REQUIRE, "extra": [{"token": REQUIRE}]}],
+    }));
+    let report = report_secrets_with_mode_and_options(
+        &grown,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(report.slot_remaps.len(), 0);
+    let err = report_secrets_with_mode_and_options(
+        &shrunk,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .expect_err("the retired nested entry must be refused")
+    .to_string();
+    assert!(
+        err.contains("ferrum/partner/keyauth/[0]/extra/[1]/token"),
+        "{err}"
+    );
+    assert!(!err.contains("STORED-"));
+}
+
 /// A deleted Consumer's values stored under legacy dotted spellings are the
 /// same retired slots as canonical ones.
 #[test]
@@ -4376,9 +4422,16 @@ fn scrubber_covers_consul_address_credentials_but_keeps_the_host() {
 fn consul_address_credentials_with_embedded_breaks_withhold_validator_output() {
     use gitforgeops::secrets::SecretScrubber;
 
-    for separator in ["\n", "\r", "\t"] {
+    for (separator, path) in [
+        ("\n", ""),
+        ("\r", ""),
+        ("\t", ""),
+        // The normalized userinfo repeated elsewhere must not hide the split
+        // credential in the authority.
+        ("\n", "/svc-user:ABCD1234EFGH5678"),
+    ] {
         let address =
-            format!("https://svc-user:ABCD1234{separator}EFGH5678@consul.example.test:8501");
+            format!("https://svc-user:ABCD1234{separator}EFGH5678@consul.example.test:8501{path}");
         let mut cfg = config_with_consul_token(None);
         cfg.upstreams[0]
             .service_discovery

@@ -106,6 +106,13 @@ pub(crate) fn consul_address_userinfo(discovery: &ServiceDiscoveryConfig) -> Opt
     split_url_userinfo(&consul.address).map(|parts| parts.userinfo)
 }
 
+/// Whether detection had to normalize `address` (surrounding whitespace or
+/// control characters, or an embedded tab or line break), so the bytes as
+/// written may differ from the userinfo it reports.
+pub(crate) fn address_is_normalized(address: &str) -> bool {
+    address.trim_matches(|c: char| c <= ' ') != address || address.contains(['\t', '\n', '\r'])
+}
+
 /// `text` with the userinfo of a URL replaced by [`crate::secrets::REDACTION`],
 /// or `None` when it carries none.
 pub(crate) fn redact_url_userinfo(text: &str) -> Option<String> {

@@ -1752,12 +1752,18 @@ fn check_array_slot_identity(
     }
 
     let scan_prefix = format!("{prefix}/");
+    // The explicit-`[0]` slash spelling of this array's own prefix differs
+    // from the canonical one when an enclosing array index is 0.
+    let verbatim_prefix = format!("{}/", join_slot_components_verbatim(components));
     let legacy_prefixes = legacy_array_prefixes(components);
     for slot in bundle.keys() {
         // Every spelling the lookup still reads names the same slot, so the
-        // retirement check scans all of them: a value stored under a legacy
-        // dotted key resolves again on regrowth exactly like a canonical one.
-        let index = match slot.strip_prefix(&scan_prefix) {
+        // retirement check scans all of them: a value stored under an older
+        // spelling resolves again on regrowth exactly like a canonical one.
+        let index = match slot
+            .strip_prefix(&scan_prefix)
+            .or_else(|| slot.strip_prefix(&verbatim_prefix))
+        {
             Some(rest) => entry_index_of_suffix(rest),
             None => match legacy_prefixes
                 .iter()
