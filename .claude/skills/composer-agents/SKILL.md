@@ -110,8 +110,9 @@ assigns one."
 3. Triage CI reds yourself when agents are gone.
 4. Salvage protocol for dead agents: check worktree status + unpushed commits, then relaunch a
    continuation agent with a state snapshot.
-5. Merge only when the user explicitly authorizes that exact PR, the review bot is clean on the
-   current head, CI is green, and your own review is done.
+5. Merge only when the user explicitly authorizes that exact PR, your own review is done, CI is
+   green, and every completion gate the user assigned is satisfied (a clean review-bot verdict on
+   the current head when review handling was assigned).
 
 ## Known failure modes
 

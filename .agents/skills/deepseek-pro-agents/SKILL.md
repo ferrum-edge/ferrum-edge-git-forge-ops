@@ -1,6 +1,6 @@
 ---
 name: deepseek-pro-agents
-description: Dispatch and orchestrate local opencode agents pinned to alibaba-token-plan/deepseek-v4.1-flash (DeepSeek V4.1 Flash; the skill keeps its historical deepseek-pro-agents name and does not run a Pro model) via the opencode CLI harness for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to deepseek-pro-agents or deepseek-v4.1-flash workers, run multiple DeepSeek Pro agents, resume interrupted runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local opencode agents pinned to alibaba-token-plan/deepseek-v4.1-flash (DeepSeek V4.1 Flash; the skill keeps its historical deepseek-pro-agents name and does not run a Pro model) via the opencode CLI harness for Ferrum Edge Git Forge Ops issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT, Codex, or Claude to delegate to deepseek-pro-agents or deepseek-v4.1-flash workers, run multiple deepseek-pro-agents (DeepSeek V4.1 Flash) workers, resume interrupted runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
 # deepseek-pro-agents (pinned to DeepSeek V4.1 Flash)

@@ -138,8 +138,9 @@ assigns one."
 4. Salvage protocol for dead agents: check worktree `git status --porcelain` +
    `git log @{u}..HEAD`, commit/push stranded WIP, relaunch a continuation agent
    with a state snapshot (or a handoff file for large context).
-5. Merge only when the user explicitly authorizes that exact PR, the review bot is clean on the
-   current head, CI is green, and your own review is done. Never infer landing permission from a
+5. Merge only when the user explicitly authorizes that exact PR, your own review is done, CI is
+   green, and every completion gate the user assigned is satisfied (a clean review-bot verdict on
+   the current head when review handling was assigned). Never infer landing permission from a
    request to implement, review, or shepherd the PR.
 
 ## Known failure modes

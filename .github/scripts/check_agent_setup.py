@@ -49,6 +49,8 @@ STALE_CONTRACT_MARKERS = (
     "loop until codex clean",
 )
 PINNED_MODEL_LINE = re.compile(r"^readonly PINNED_MODEL='(?P<model>[^']+)'$", re.MULTILINE)
+# A documented `--model provider/name` argument, whatever the provider.
+MODEL_ARGUMENT = re.compile(r"--model[ =]+`?(?P<model>[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]*[A-Za-z0-9])")
 STALE_MARKERS = (
     "-p ferrum-edge",
     "--bin ferrum-edge",
@@ -659,7 +661,10 @@ def collect_violations(root: Path) -> list[str]:
                 violations.append(
                     f"{path.relative_to(root)}: does not name the launcher's pinned model {model}"
                 )
-            for other in sorted(set(named.findall(text)) - {model}):
+            documented = set(named.findall(text)) | {
+                match.group("model") for match in MODEL_ARGUMENT.finditer(text)
+            }
+            for other in sorted(documented - {model}):
                 violations.append(
                     f"{path.relative_to(root)}: names {other} but the launcher pins {model}"
                 )

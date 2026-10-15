@@ -447,6 +447,27 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("does not name the launcher's pinned model", joined)
         self.assertIn("names provider-x/model-pro-0813 but the launcher pins", joined)
 
+    def test_a_documented_model_argument_from_another_provider_is_refused(self):
+        pinned = "provider-x/model-1.1-flash"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text(
+                launcher.read_text(encoding="utf-8")
+                + f"readonly PINNED_MODEL='{pinned}'\n",
+                encoding="utf-8",
+            )
+            for skill in (agent / "SKILL.md", root / ".claude" / "skills" / "sample" / "SKILL.md"):
+                skill.write_text(
+                    skill.read_text(encoding="utf-8")
+                    + f"\nPinned to `{pinned}`. Pass `--model provider-y/model-pro`.\n",
+                    encoding="utf-8",
+                )
+            violations = check_agent_setup.collect_violations(root)
+        joined = "\n".join(violations)
+        self.assertIn("names provider-y/model-pro but the launcher pins", joined)
+
     def test_sol_compatibility_briefs_must_match_canonical_references(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
