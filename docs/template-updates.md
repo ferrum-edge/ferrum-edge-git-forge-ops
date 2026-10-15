@@ -41,7 +41,7 @@ prevent.
 **Upstream-managed**: the engine and the machinery around it.
 
 ```
-src/  tests/  build.rs  Cargo.toml  Cargo.lock  rust-toolchain.toml
+src/  tests/  contracts/  build.rs  Cargo.toml  Cargo.lock  rust-toolchain.toml
 Dockerfile  .dockerignore
 .github/workflows/  .github/scripts/
 .github/ferrum-edge-checksums.txt  .github/cargo-audit-policy.json

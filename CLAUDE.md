@@ -135,7 +135,9 @@ cargo fmt --all && cargo fmt --all -- --check
   benches/examples, `build.rs`, `.cargo`, Cargo manifests/lockfiles,
   toolchain/lint config, `Dockerfile`) or a non-Rust file the unit suite reads
   or the binary embeds (`docs/quickstart.md`, `.gitforgeops/*.example.yaml`,
-  `.github/scripts/audit_settings.py`).
+  `.github/scripts/audit_settings.py`, `contracts/`,
+  `.github/ferrum-edge-checksums.txt`, `apply-on-merge.yml`,
+  `trusted-pr-review.yml`).
 - Unit tests never read the customer-owned `resources/` tree. Shipped-example
   checks use `tests/fixtures/shipped-examples/`.
 - Resource-only PRs skip the Rust steps and run secretless `validate-pr.yml`.

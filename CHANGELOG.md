@@ -329,6 +329,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   quickstart. The CLI now refuses a leading `_` or `-`, which the workflows
   already refused; bootstrap and the workflows no longer accept dots or names
   over 64 characters, which the CLI already refused (#573).
+- The template updater now treats the vendored `contracts/` tree as
+  upstream-managed, so adopting a revision that introduces or re-pins
+  `contracts/ferrum-contracts/` also adopts the PIN, schemas, vocabularies and
+  fixtures its conformance tests read (#570).
+- Rust CI now runs for pull requests and main pushes that change only the
+  vendored contracts, the Edge checksum allowlist, or the `apply-on-merge.yml`
+  and `trusted-pr-review.yml` workflows, all of which the unit suite reads
+  (#571).
 - Audit batch (#531). Proxy overlays canonicalize `backend_protocol` to
   `backend_scheme` before merging, and refuse conflicting values (#513).
   Additive array merges apply only to Proxy `spec.plugins` and Upstream
