@@ -1405,6 +1405,70 @@ async fn a_post_plugin_proxy_update_does_not_detach_a_concurrently_attached_plug
 }
 
 #[tokio::test]
+async fn a_stale_ambiguous_batch_assertion_withholds_every_later_namespace_write() {
+    // The cyclic `p1`/`pc1` group goes through `POST /batch`, which answers
+    // ambiguously. The verification backup shows the exact group, `pc1`'s
+    // assertion lands, but `p1`'s tagged read no longer matches: the plan is
+    // stale. The separately planned `q` update and `old` delete must not be
+    // sent, even though each would carry its own precondition.
+    let planned = graph(&[("q", &[]), ("old", &[])], &[]);
+    let mut desired = graph(&[("p1", &["pc1"]), ("q", &[])], &[("pc1", "p1")]);
+    desired
+        .proxies
+        .iter_mut()
+        .find(|proxy| proxy.id == "q")
+        .unwrap()
+        .backend_port = 2;
+    let verified = graph(
+        &[("p1", &["pc1"]), ("q", &[]), ("old", &[])],
+        &[("pc1", "p1")],
+    );
+    let mut drifted = verified.clone();
+    drifted.proxies[0].backend_port = 9;
+    let routes = vec![
+        health(),
+        ("POST /batch".into(), 503, "{}".into(), vec![]),
+        backup(&verified),
+        tagged(Kind::PluginConfig, "pc1", &verified, TAG),
+        tagged(Kind::Proxy, "p1", &drifted, TAG),
+        tagged(Kind::Proxy, "q", &planned, TAG),
+        tagged(Kind::Proxy, "old", &planned, TAG),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert_eq!(
+        run.mutations(),
+        ["POST /batch HTTP/1.1", "PUT /plugins/config/pc1 HTTP/1.1"],
+        "{:?}",
+        run.result
+    );
+    assert!(run.result.fatal_error.is_none(), "{:?}", run.result);
+    assert_eq!(run.result.stale_plan.as_deref(), Some("Proxy `p1`"));
+    let errors = &run.result.errors;
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Proxy p1") && error.contains("did not show the exact row")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("Proxy q update: not sent") && error.contains(WITHHELD)),
+        "{errors:?}"
+    );
+    assert_eq!(run.result.deletes_deferred, 1, "{:?}", run.result);
+    assert_eq!(run.result.updated, 0);
+    assert_eq!(run.result.deleted, 0);
+    assert!(run
+        .result
+        .applied_incremental
+        .iter()
+        .all(|op| op.id != "q" && op.id != "old"));
+}
+
+#[tokio::test]
 async fn moving_a_scoped_plugin_off_a_proxy_and_deleting_that_proxy_is_one_apply() {
     // `move` goes from `old` to `new`, and `old` is deleted, in one commit. The
     // gateway detaches `move` from `old` when the plugin is retargeted, so the
@@ -1492,6 +1556,71 @@ fn with_shared_plugin(
         .plugin_configs
         .push(serde_json::from_value(plugin).unwrap());
     config
+}
+
+/// Proxies as [`graph`] builds them plus a `proxy_group` `key_auth` plugin
+/// `auth` whose config carries `version`.
+fn with_group_authenticator(proxies: &[(&str, &[&str])], version: u16) -> GatewayConfig {
+    let mut config = graph(proxies, &[]);
+    let plugin = serde_json::json!({
+        "id": "auth",
+        "namespace": NS,
+        "plugin_name": "key_auth",
+        "config": {"key_names": [format!("x-key-{version}")]},
+        "scope": "proxy_group",
+    });
+    config
+        .plugin_configs
+        .push(serde_json::from_value(plugin).unwrap());
+    config
+}
+
+#[tokio::test]
+async fn a_proxy_group_plugin_update_keeps_a_concurrent_attachment_in_the_proxy_check() {
+    // `auth` keeps its `proxy_group` scope, so its update rewrites no proxy
+    // association. Someone attaches it to `q` after the plan; the planned `q`
+    // update (which lists no association) must be refused rather than
+    // silently detaching that authenticator.
+    let planned = with_group_authenticator(&[("q", &[])], 1);
+    let mut desired = with_group_authenticator(&[("q", &[])], 2);
+    desired.proxies[0].backend_port = 2;
+    for attached in [true, false] {
+        let context = format!("attached={attached}");
+        let q_plugins: &[&str] = if attached { &["auth"] } else { &[] };
+        let live = with_group_authenticator(&[("q", q_plugins)], 2);
+        let routes = vec![
+            health(),
+            tagged(Kind::PluginConfig, "auth", &planned, TAG),
+            tagged(Kind::Proxy, "q", &live, "\"q-tag\""),
+            backup(&live),
+        ];
+
+        let run = apply_exclusive(&desired, planned.clone(), routes).await;
+
+        if attached {
+            assert_eq!(
+                run.mutations(),
+                ["PUT /plugins/config/auth HTTP/1.1"],
+                "{context}"
+            );
+            let errors = &run.result.errors;
+            assert_eq!(errors.len(), 1, "{context}: {errors:?}");
+            assert_starts(errors, 0, "Proxy q update");
+            assert!(errors[0].contains(CHANGED), "{context}: {errors:?}");
+        } else {
+            assert!(run.result.errors.is_empty(), "{context}: {:?}", run.result);
+            assert_eq!(
+                run.mutations(),
+                [
+                    "PUT /plugins/config/auth HTTP/1.1",
+                    "PUT /proxies/q HTTP/1.1",
+                ],
+                "{context}"
+            );
+            let sent = run.request("PUT /proxies/q");
+            assert!(sent.contains("if-match: \"q-tag\"\r\n"), "{sent}");
+        }
+    }
 }
 
 #[tokio::test]
