@@ -35,6 +35,10 @@ on:
       - 'docs/quickstart.md'
       - '.gitforgeops/*.example.yaml'
       - '.github/scripts/audit_settings.py'
+      - 'contracts/**'
+      - '.github/ferrum-edge-checksums.txt'
+      - '.github/workflows/apply-on-merge.yml'
+      - '.github/workflows/trusted-pr-review.yml'
 
 permissions:
   contents: read
