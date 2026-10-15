@@ -514,6 +514,14 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
         )
         self.assertIn("environment staging-monitor", actions(plan))
 
+    def test_a_flow_key_without_a_separating_space_stops_the_plan(self):
+        # YAML reads `{unattended:true}` as one key with a null value, which
+        # the CLI refuses; it is never an opt-in.
+        with self.assertRaises(ValueError):
+            self._plan(
+                "environments:\n  staging:\n    monitoring: {unattended:true}\n"
+            )
+
     def test_an_inline_environment_mapping_stops_the_plan(self):
         with self.assertRaises(ValueError):
             self._plan('environments:\n  staging: {"monitor\\x69ng": {unattended: true}}\n')

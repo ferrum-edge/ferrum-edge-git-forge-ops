@@ -277,7 +277,8 @@ _MAPPING_KEY = re.compile(
     r"""(?:\s+(?P<value>.*))?\Z"""
 )
 _FLOW_UNATTENDED = re.compile(
-    r"\A\{\s*unattended\s*:\s*(?P<value>[A-Za-z]+)\s*\}\Z"
+    # YAML needs whitespace after the colon: `{unattended:true}` is one key.
+    r"\A\{\s*unattended\s*:\s+(?P<value>[A-Za-z]+)\s*\}\Z"
 )
 
 
