@@ -406,9 +406,11 @@ def environment_names_from_config(text: str) -> list[str]:
 
 
 def _unattended_value(name: str, number: int, value: str) -> bool:
-    lowered = value.lower()
-    if lowered in ("true", "false"):
-        return lowered == "true"
+    # YAML's boolean spellings only; the CLI refuses anything else.
+    if value in ("true", "True", "TRUE"):
+        return True
+    if value in ("false", "False", "FALSE"):
+        return False
     raise ValueError(
         f"config line {number}: environment {name!r} sets `monitoring.unattended` "
         f"to {value!r}; write `unattended: true` or `unattended: false` on one line"

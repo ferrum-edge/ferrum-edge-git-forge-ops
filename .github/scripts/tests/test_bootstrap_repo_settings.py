@@ -371,6 +371,8 @@ class MonitoringConfigReaderTests(unittest.TestCase):
             "        true\n",
             "environments:\n  staging:\n    monitoring:\n      {unattended: true}\n",
             "environments:\n  staging:\n    monitoring:\n      unattended: yes\n",
+            "environments:\n  staging:\n    monitoring:\n      unattended: tRuE\n",
+            "environments:\n  staging:\n    monitoring: {unattended: tRuE}\n",
             "environments:\n  base: &base\n    overlay: x\n  staging:\n"
             "    <<: *base\n",
             # An environment body written as a flow mapping.
