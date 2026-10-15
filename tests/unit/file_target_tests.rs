@@ -189,6 +189,42 @@ fn republish_preserves_destination_permissions() {
 
 #[cfg(unix)]
 #[test]
+fn regular_publication_is_never_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("resources.yaml");
+
+    apply_file(&fixture(), path.to_str().expect("utf-8 path")).expect("first write");
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(&path), 0o640, "new gateway file defaults to 0640");
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+        .expect("make destination world-readable");
+    let gid_before = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&path).expect("metadata").gid()
+    };
+    apply_file(&fixture(), path.to_str().expect("utf-8 path")).expect("second write");
+    assert_eq!(mode(&path), 0o660, "other bits are stripped on republish");
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").gid(),
+            gid_before,
+            "the destination group survives the rename, so group read access is real"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn private_export_forces_owner_only_permissions_on_create_and_replace() {
     use std::os::unix::fs::PermissionsExt;
 

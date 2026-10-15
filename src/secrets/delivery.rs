@@ -194,7 +194,7 @@ pub async fn fetch_ssh_recipient(
             .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
         let status = resp.status().as_u16();
-        if status >= 400 {
+        if !(200..300).contains(&status) {
             let body = crate::http_client::read_error_body(resp).await;
             return Err(crate::error::Error::ApiError {
                 status,

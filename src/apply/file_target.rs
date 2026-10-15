@@ -494,23 +494,45 @@ fn sync_parent_directory(
 /// `tempfile` creates its files 0600, which would silently tighten the mode of
 /// an output file the gateway (often a different user) has to read. Inherit
 /// the destination's current mode when it already exists, otherwise fall back
-/// to 0644 — what the previous `std::fs::write` produced under a default
-/// umask.
+/// to 0640. A file-mode document carries resolved credentials, so it is never
+/// world-readable: the `other` bits are stripped even from an inherited mode,
+/// while owner/group bits — the channel a different-user gateway reads
+/// through — are preserved exactly. The group id is preserved too: the
+/// rename installs the temp file's inode, so without it the inherited mode
+/// would describe the publisher's group, not the destination's, and a
+/// gateway reading through the destination's group would be locked out by
+/// the very group bits meant to let it in.
+#[cfg(unix)]
+fn regular_publication_mode(existing: Option<u32>) -> u32 {
+    existing.map_or(0o640, |mode| mode & 0o770)
+}
+
 #[cfg(unix)]
 fn apply_destination_permissions(
     dest: &Path,
     temp: &Path,
     policy: PublicationPermissions,
 ) -> crate::error::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    let existing = std::fs::metadata(dest).ok();
     let mode = match policy {
         PublicationPermissions::Private => 0o600,
-        PublicationPermissions::Regular => match std::fs::metadata(dest) {
-            Ok(meta) => meta.permissions().mode() & 0o777,
-            Err(_) => 0o644,
-        },
+        PublicationPermissions::Regular => regular_publication_mode(
+            existing
+                .as_ref()
+                .map(|meta| meta.permissions().mode() & 0o777),
+        ),
     };
+    if let (PublicationPermissions::Regular, Some(meta)) = (policy, existing.as_ref()) {
+        std::os::unix::fs::chown(temp, None, Some(meta.gid())).map_err(|source| {
+            crate::error::Error::Config(format!(
+                "cannot preserve the group of {} on its replacement ({source}); \
+                 refusing to publish a document the gateway's group may not be able to read",
+                dest.display()
+            ))
+        })?;
+    }
     std::fs::set_permissions(temp, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
