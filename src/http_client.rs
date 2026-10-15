@@ -611,6 +611,7 @@ impl AdminClient {
             .await?;
         self.check(&resp, RequestKind::Read)?;
         serde_json::from_str::<HealthStatus>(&resp.body)
+            .map(HealthStatus::scrubbed)
             .map_err(|e| malformed_response("GET /health", &e))
     }
 
@@ -3426,9 +3427,65 @@ impl ClusterStatus {
     }
 }
 
-/// Parse a `GET /cluster` body.
+/// Parse a `GET /cluster` body. Its free-text fields are peer text and are
+/// scrubbed like an error body ([`scrub_peer_field`]): they reach apply's
+/// convergence line and doctor's report.
 pub fn parse_cluster_status(body: &str) -> crate::error::Result<ClusterStatus> {
-    serde_json::from_str::<ClusterStatus>(body).map_err(|e| malformed_response("GET /cluster", &e))
+    serde_json::from_str::<ClusterStatus>(body)
+        .map(ClusterStatus::scrubbed)
+        .map_err(|e| malformed_response("GET /cluster", &e))
+}
+
+/// Scrub one peer-supplied string field for display, exactly like an error
+/// body ([`bounded_error_message`]). An ordinary value (`database`, a
+/// timestamp, a node id) comes back unchanged.
+fn scrub_peer_field(field: &mut Option<String>) {
+    if let Some(value) = field.as_mut() {
+        *value = bounded_error_message(value);
+    }
+}
+
+impl HealthStatus {
+    fn scrubbed(mut self) -> Self {
+        scrub_peer_field(&mut self.status);
+        scrub_peer_field(&mut self.mode);
+        self
+    }
+}
+
+impl ClusterStatus {
+    fn scrubbed(mut self) -> Self {
+        scrub_peer_field(&mut self.mode);
+        scrub_peer_field(&mut self.message);
+        for node in self
+            .data_planes
+            .iter_mut()
+            .chain(self.mesh_nodes.iter_mut())
+        {
+            for field in [
+                &mut node.node_id,
+                &mut node.version,
+                &mut node.namespace,
+                &mut node.status,
+                &mut node.connected_at,
+                &mut node.last_sync_at,
+            ] {
+                scrub_peer_field(field);
+            }
+        }
+        if let Some(control_plane) = self.control_plane.as_mut() {
+            for field in [
+                &mut control_plane.url,
+                &mut control_plane.status,
+                &mut control_plane.connected_since,
+                &mut control_plane.last_config_received_at,
+                &mut control_plane.config_diverged_since,
+            ] {
+                scrub_peer_field(field);
+            }
+        }
+        self
+    }
 }
 
 /// One-line post-apply convergence report.
@@ -3865,11 +3922,32 @@ mod bounded_error_message_tests {
         let rendered = super::malformed_response("GET /health", &health).to_string();
         assert!(!rendered.contains(REFLECTED), "{rendered}");
         assert!(rendered.contains("GET /health"), "{rendered}");
-        let cluster =
-            super::parse_cluster_status(&format!(r#"{{"mode":"x","nodes":"{REFLECTED}"}}"#));
-        if let Err(error) = cluster {
-            assert!(!error.to_string().contains(REFLECTED), "{error}");
-        }
+        let cluster = super::parse_cluster_status(&format!(
+            r#"{{"mode":"x","connected_data_planes":"{REFLECTED}"}}"#
+        ))
+        .unwrap_err();
+        assert!(!cluster.to_string().contains(REFLECTED), "{cluster}");
+        let namespaces =
+            serde_json::from_str::<super::Page<String>>(&format!(r#"{{"data":"{REFLECTED}"}}"#))
+                .unwrap_err();
+        let rendered = super::malformed_response("GET /namespaces", &namespaces).to_string();
+        assert!(!rendered.contains(REFLECTED), "{rendered}");
+    }
+
+    #[test]
+    fn accepted_cluster_fields_are_scrubbed_before_display() {
+        crate::secrets::enable_display_scrubbing_on_this_thread();
+        const TOKEN: &str = "zq7-cluster-field-canary-31b9";
+        crate::secrets::register_sent_token(TOKEN);
+        let status = super::parse_cluster_status(&format!(
+            r#"{{"mode":"database","message":"echo {TOKEN}",
+                "control_plane":{{"url":"https://cp/{TOKEN}","status":"connected"}},
+                "data_planes":[{{"node_id":"{TOKEN}","status":"online"}}]}}"#
+        ))
+        .unwrap();
+        let rendered = format!("{} {status:?}", super::convergence_summary(&status));
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+        assert_eq!(status.mode.as_deref(), Some("database"));
     }
 
     #[test]

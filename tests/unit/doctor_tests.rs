@@ -669,30 +669,138 @@ fn team_alpha() -> Vec<String> {
     vec!["team-alpha".to_string()]
 }
 
-/// A successful response whose body does not parse can quote anything the
-/// request carried. `serde_json`'s message quotes the offending value, so the
-/// doctor must report the failure without it.
-#[tokio::test]
-async fn malformed_successful_responses_are_reported_without_their_contents() {
-    const REFLECTED: &str = "zq7-reflected-request-material";
+/// The bearer token a request carried, read back from the recorded head.
+fn bearer_of(request: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().trim_start_matches("Bearer ").to_string())
+    })
+}
+
+/// Run doctor's gateway scope against a stub where `reflect(request, token)`
+/// answers each request with that request's own bearer token in it, and
+/// return the rendered checks and every request head.
+async fn doctor_reflecting(
+    reflect: impl Fn(&str, &str) -> EdgeReply + Send + Sync + 'static,
+) -> (String, Vec<String>) {
+    gitforgeops::secrets::enable_display_scrubbing_on_this_thread();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let url = spawn_edge_stub(
-        |request| {
-            if request.starts_with("GET /health") {
-                (200, r#"{"ready":"zq7-reflected-request-material"}"#)
-            } else if request.starts_with("GET /cluster") {
-                (200, r#"{"mode":["zq7-reflected-request-material"]}"#)
-            } else if request.starts_with("GET /namespaces") {
-                (200, r#"{"data":"zq7-reflected-request-material"}"#)
-            } else {
-                (404, r#"{"error":"not found"}"#)
-            }
-        },
+        move |request| reflect(request, &bearer_of(request).unwrap_or_default()),
         Arc::clone(&requests),
     );
     let checks = doctor::gateway::run("production", &scoped_env(url), &team_alpha()).await;
-    let rendered = format!("{checks:?}");
-    assert!(!rendered.contains(REFLECTED), "{rendered}");
+    let seen = requests.lock().unwrap().clone();
+    (format!("{checks:?}"), seen)
+}
+
+/// No token any request carried appears in `rendered`.
+fn assert_no_reflected_token(rendered: &str, seen: &[String]) {
+    assert!(!seen.is_empty(), "doctor made no request");
+    for token in seen.iter().filter_map(|request| bearer_of(request)) {
+        assert!(token.len() > 20, "{token}");
+        assert_no_reflected_token(&rendered, &seen);
+    }
+}
+
+fn leak(body: String) -> &'static str {
+    Box::leak(body.into_boxed_str())
+}
+
+/// A peer can put the request's own token in an accepted `/health` field.
+#[tokio::test]
+async fn a_token_reflected_in_an_accepted_health_field_is_not_reported() {
+    let (rendered, seen) = doctor_reflecting(|request, token| {
+        if request.starts_with("GET /health") {
+            (
+                200,
+                leak(format!(
+                    r#"{{"status":"ok","ready":true,"mode":"{token}","admin_writes_enabled":true}}"#
+                )),
+            )
+        } else {
+            (404, r#"{"error":"not found"}"#)
+        }
+    })
+    .await;
+    assert_no_reflected_token(&rendered, &seen);
+}
+
+/// ... or in `/cluster`'s informational message, which doctor reports.
+#[tokio::test]
+async fn a_token_reflected_in_an_accepted_cluster_field_is_not_reported() {
+    let (rendered, seen) = doctor_reflecting(|request, token| {
+        if request.starts_with("GET /health") {
+            (200, TENANT_HEALTH)
+        } else if request.starts_with("GET /cluster") {
+            (
+                200,
+                leak(format!(r#"{{"mode":"database","message":"{token}"}}"#)),
+            )
+        } else if request.starts_with("GET /namespaces") {
+            (200, r#"{"data":["team-alpha"],"pagination":{"total":1}}"#)
+        } else {
+            (404, r#"{"error":"not found"}"#)
+        }
+    })
+    .await;
+    assert!(seen.iter().any(|line| line.starts_with("GET /cluster")));
+    assert_no_reflected_token(&rendered, &seen);
+}
+
+/// A successful response whose body does not parse: `serde_json`'s message
+/// would quote the offending value. Each endpoint is reached with valid
+/// prerequisites, so its own parser is the one exercised.
+#[tokio::test]
+async fn malformed_successful_responses_are_reported_without_their_contents() {
+    // /health itself malformed.
+    let (rendered, seen) = doctor_reflecting(|request, token| {
+        if request.starts_with("GET /health") {
+            (200, leak(format!(r#"{{"ready":"{token}"}}"#)))
+        } else {
+            (404, r#"{"error":"not found"}"#)
+        }
+    })
+    .await;
+    assert!(seen[0].starts_with("GET /health"));
+    assert_no_reflected_token(&rendered, &seen);
+
+    // /cluster malformed, after a valid /health.
+    let (rendered, seen) = doctor_reflecting(|request, token| {
+        if request.starts_with("GET /health") {
+            (200, TENANT_HEALTH)
+        } else if request.starts_with("GET /cluster") {
+            (
+                200,
+                leak(format!(r#"{{"connected_data_planes":"{token}"}}"#)),
+            )
+        } else if request.starts_with("GET /namespaces") {
+            (200, r#"{"data":["team-alpha"],"pagination":{"total":1}}"#)
+        } else {
+            (404, r#"{"error":"not found"}"#)
+        }
+    })
+    .await;
+    assert!(seen.iter().any(|line| line.starts_with("GET /cluster")));
+    assert_no_reflected_token(&rendered, &seen);
+
+    // /namespaces malformed, after /cluster refuses the scoped token.
+    let (rendered, seen) = doctor_reflecting(|request, token| {
+        if request.starts_with("GET /health") {
+            (200, TENANT_HEALTH)
+        } else if request.starts_with("GET /cluster") {
+            (403, FLEET_GLOBAL_REFUSAL)
+        } else if request.starts_with("GET /namespaces") {
+            (200, leak(format!(r#"{{"data":"{token}"}}"#)))
+        } else {
+            (404, r#"{"error":"not found"}"#)
+        }
+    })
+    .await;
+    assert!(seen.iter().any(|line| line.starts_with("GET /namespaces")));
+    assert_no_reflected_token(&rendered, &seen);
 }
 
 #[tokio::test]
