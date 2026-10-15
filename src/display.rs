@@ -138,15 +138,17 @@ fn spellings(value: &str) -> Vec<String> {
         ascii_json_escaped(value),
     ];
     all.extend(json_escaped(value));
+    // As `crate::diagnostics` renders it (unsafe characters, including
+    // U+2028/U+2029, as U+FFFD; `##[` broken up), and with control
+    // characters as spaces (`bounded_error_message`).
+    all.push(crate::diagnostics::sanitized_spelling(value));
     if value.chars().any(char::is_control) {
-        let replaced = |with: char| {
+        all.push(
             value
                 .chars()
-                .map(|c| if c.is_control() { with } else { c })
-                .collect::<String>()
-        };
-        all.push(replaced(crate::diagnostics::REPLACEMENT));
-        all.push(replaced(' '));
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        );
     }
     all.retain(|spelling| !spelling.is_empty());
     all.sort();
@@ -455,6 +457,15 @@ pub fn register_scrubber(scrubber: &SecretScrubber) {
     with_registry_mut(|registry| {
         registry.insert(entry);
     });
+}
+
+/// Register the secret leaves of a live or outgoing document (a `/backup`
+/// snapshot, a restore payload carrying preserved live rows): they are
+/// secrets this run holds even when the repository never named them.
+pub fn register_gateway_config(config: &GatewayConfig) {
+    if registering() {
+        register_scrubber(&SecretScrubber::from_gateway_config(config));
+    }
 }
 
 /// Register one resolved snapshot. The resolver calls this on every
@@ -782,6 +793,12 @@ pub fn redact_credential_shapes(text: &str) -> String {
 /// Re-encode every string literal of a JSON document through `scrub`,
 /// leaving structure, key order and formatting alone. A literal `scrub`
 /// returns unchanged is kept byte for byte.
+///
+/// A property name in this crate's snake_case schema form (`namespace`,
+/// `diff_count`) is the report contract and is never rewritten, even when
+/// it happens to equal a registered value. Any other property name (a label
+/// key, a header name, a resource id used as a map key) is data and is
+/// scrubbed like a value.
 fn rewrite_json_strings(text: &str, scrub: impl Fn(&str) -> String) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -800,6 +817,15 @@ fn rewrite_json_strings(text: &str, scrub: impl Fn(&str) -> String) -> String {
         let end = (at + 1).min(bytes.len());
         let literal = &text[start..end];
         out.push_str(&text[copied..start]);
+        let is_key = text[end..].trim_start().starts_with(':');
+        let schema_key =
+            is_key && is_schema_key(&literal[1..literal.len().saturating_sub(1).max(1)]);
+        if schema_key {
+            out.push_str(literal);
+            copied = end;
+            at = end;
+            continue;
+        }
         match serde_json::from_str::<String>(literal) {
             Ok(value) => {
                 let scrubbed = scrub(&value);
@@ -819,6 +845,15 @@ fn rewrite_json_strings(text: &str, scrub: impl Fn(&str) -> String) -> String {
     }
     out.push_str(&text[copied..]);
     out
+}
+
+/// A property name in the crate's own schema form: lowercase ASCII, digits
+/// and underscores, starting with a letter.
+fn is_schema_key(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Run `check` over each spelling of `bytes` a peer's re-encoding would
@@ -850,10 +885,19 @@ type Decoder = fn(&[u8]) -> Option<Vec<u8>>;
 
 /// The decoders [`any_decoded_view`] applies; each returns `None` when the
 /// input has nothing for it to decode.
-const DECODERS: [Decoder; 4] = [
+const DECODERS: [Decoder; 5] = [
     |bytes| bytes.contains(&b'\\').then(|| unescape_backslashes(bytes)),
     |bytes| bytes.contains(&b'%').then(|| percent_decode(bytes)),
     |bytes| bytes.contains(&b'&').then(|| html_unescape(bytes)),
+    // A sanitizer's U+FFFD, inserted or substituted, dropped: what is left
+    // around it must not spell a secret either.
+    |bytes| {
+        contains_bytes(bytes, "\u{fffd}".as_bytes()).then(|| {
+            String::from_utf8_lossy(bytes)
+                .replace('\u{fffd}', "")
+                .into_bytes()
+        })
+    },
     |bytes| {
         bytes.windows(2).any(|pair| pair == b"''").then(|| {
             String::from_utf8_lossy(bytes)
@@ -1221,6 +1265,37 @@ mod tests {
         register_values("test", [SECRET]).unwrap();
         let markdown = SECRET.replace('_', "\\_").replace('.', "&#46;");
         assert_eq!(scrub_text(&format!("- {markdown}")), DISPLAY_WITHHELD);
+    }
+
+    /// Schema keys are the report contract; data keys are scrubbed.
+    #[test]
+    fn json_schema_keys_survive_matching_a_secret() {
+        enable();
+        register_values("test", ["namespace", "Zq7-Label-Key-Value"]).unwrap();
+        let document = r#"{"namespace":"namespace","labels":{"Zq7-Label-Key-Value":"x"}}"#;
+        let parsed: serde_json::Value = serde_json::from_str(&scrub_output(document)).unwrap();
+        assert_eq!(parsed["namespace"], "[REDACTED]");
+        assert!(
+            parsed["labels"].get("Zq7-Label-Key-Value").is_none(),
+            "{parsed}"
+        );
+        assert_eq!(parsed["labels"]["[REDACTED]"], "x");
+    }
+
+    /// The forms `crate::diagnostics` gives a value are found too.
+    #[test]
+    fn sanitized_spellings_are_found() {
+        enable();
+        register_values("test", ["Q7##[x9!-key", "zq7\u{2028}line-sep-key"]).unwrap();
+        for value in ["Q7##[x9!-key", "zq7\u{2028}line-sep-key"] {
+            let sanitized = crate::diagnostics::sanitize(value);
+            assert_eq!(scrub_text(&format!("id {sanitized}")), "id [REDACTED]");
+        }
+        // Broken up any other way around a U+FFFD, the run is still caught.
+        assert_eq!(
+            scrub_text("id Q7##\u{fffd}[x9!-\u{fffd}key"),
+            DISPLAY_WITHHELD
+        );
     }
 
     #[test]

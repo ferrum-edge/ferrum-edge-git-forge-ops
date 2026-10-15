@@ -157,7 +157,8 @@ literal is a blocking finding.
 
 Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,
 the final `Error:` line and the review comment. Every value a run resolves
-or rotates in, every admin JWT it sends, and the GitHub tokens and admin JWT
+or rotates in, the secrets of every live snapshot it reads or restore it
+sends, every admin JWT it sends, and the GitHub tokens and admin JWT
 secrets it reads from the environment become `[REDACTED]`, as do their
 base64, percent, JSON-escaped and single-quoted spellings, a `Bearer`
 credential, and a JWT or GitHub token by its shape. A line that still holds
