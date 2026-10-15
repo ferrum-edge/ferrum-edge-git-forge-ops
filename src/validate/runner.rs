@@ -497,7 +497,10 @@ fn run_validate_command(
     annotate_namespace: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
-    let which_result = Command::new("which").arg("--").arg(binary_path).output();
+    // Bounded like every other subprocess here: a PATH-resolved `which`
+    // wrapper must not stall or flood validation either. A limit failure is
+    // an `Err`, which falls through to the (also bounded) direct probe.
+    let which_result = output_bounded(Command::new("which").arg("--").arg(binary_path));
     // Reuse the existing lookup for diagnostics; no version subprocess or
     // version-number assumption can establish resource-label capability.
     let binary_in_use = which_result
