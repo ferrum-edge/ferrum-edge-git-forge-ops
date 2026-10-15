@@ -91,6 +91,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The release gate also accepts the Agent Setup Policy's
+  `validate-trusted-policy` check (#565): absent is tolerated until the `main`
+  ruleset requires it, but a reported result must pass and a required one is
+  waited for. The transitional checker pin that let the helper keep the old
+  single-check list is gone.
 - Align #266's pending first-release pairing with the reviewed Edge v0.9.17
   validator allowed by #529 and its signed standard multi-platform image.
   The release record, explicit baseline check, bundled gateway and current

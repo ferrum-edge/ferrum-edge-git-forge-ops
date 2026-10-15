@@ -523,12 +523,21 @@ class ReleaseGateBehavior:
         self.assert_gate(checks, True)
 
     def test_a_reported_trusted_policy_check_must_pass(self) -> None:
-        for bucket in ("fail", "pending", "skipping", "cancel"):
-            with self.subTest(bucket=bucket):
-                reported = dict(TRUSTED_POLICY_CHECK, bucket=bucket)
-                # The stub excludes this optional record from --required.
-                # Only the actual second gh invocation can reveal it.
-                self.assert_gate(PASSING_CHECKS + [reported], False)
+        for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
+            for bucket in ("fail", "pending", "skipping", "cancel"):
+                with self.subTest(check=policy["name"], bucket=bucket):
+                    reported = dict(policy, bucket=bucket)
+                    # The stub excludes this optional record from --required,
+                    # and the ruleset does not list it yet. Only the actual
+                    # second gh invocation can reveal it.
+                    self.assert_gate(
+                        PASSING_CHECKS + [reported], False, settings=rules(*REQUIRED)
+                    )
+
+    def test_a_passing_agent_policy_check_is_accepted_before_the_ruleset_switch(self) -> None:
+        self.assert_gate(
+            PASSING_CHECKS + [AGENT_POLICY_CHECK], True, settings=rules(*REQUIRED)
+        )
 
     def test_the_trusted_policy_check_is_verified_after_the_ruleset_switch(self) -> None:
         for bucket in ("pass", "fail", "pending"):
@@ -764,18 +773,26 @@ class ReleaseGateBehavior:
         self.assertEqual(self.sleeps, [["sleep", "15"]])
 
     def test_pending_transitional_checks_wait_then_pass(self) -> None:
-        pending = PASSING_CHECKS + [dict(TRUSTED_POLICY_CHECK, bucket="pending")]
-        passing = PASSING_CHECKS + [TRUSTED_POLICY_CHECK]
-        result = self.run_gate(PASSING_CHECKS, samples=[pending, passing])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
+            with self.subTest(check=policy["name"]):
+                pending = PASSING_CHECKS + [dict(policy, bucket="pending")]
+                passing = PASSING_CHECKS + [policy]
+                result = self.run_gate(
+                    PASSING_CHECKS, samples=[pending, passing], settings=rules(*REQUIRED)
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
 
     def test_pending_transitional_checks_wait_then_fail(self) -> None:
-        pending = PASSING_CHECKS + [dict(TRUSTED_POLICY_CHECK, bucket="pending")]
-        failed = PASSING_CHECKS + [dict(TRUSTED_POLICY_CHECK, bucket="cancel")]
-        result = self.run_gate(PASSING_CHECKS, samples=[pending, failed])
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.sleeps, [["sleep", "15"]])
+        for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
+            with self.subTest(check=policy["name"]):
+                pending = PASSING_CHECKS + [dict(policy, bucket="pending")]
+                failed = PASSING_CHECKS + [dict(policy, bucket="cancel")]
+                result = self.run_gate(
+                    PASSING_CHECKS, samples=[pending, failed], settings=rules(*REQUIRED)
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.sleeps, [["sleep", "15"]])
 
     def test_pending_and_missing_checks_time_out(self) -> None:
         pending = [dict(check) for check in PASSING_CHECKS]
