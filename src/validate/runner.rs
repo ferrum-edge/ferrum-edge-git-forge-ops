@@ -1,7 +1,8 @@
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::{collect_namespaces, GatewayConfig};
 use crate::secrets::SecretScrubber;
@@ -155,6 +156,131 @@ pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
     }
 }
 
+/// How long one validator invocation may run, and how much it may print on
+/// one stream. `Command::output` bounds neither: a wedged or hostile
+/// validator binary could park CI forever or exhaust memory.
+const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(300);
+const VALIDATOR_STREAM_CAP: usize = 16 * 1024 * 1024;
+
+fn output_bounded(command: &mut Command) -> std::io::Result<std::process::Output> {
+    output_bounded_with(command, VALIDATOR_TIMEOUT, VALIDATOR_STREAM_CAP)
+}
+
+/// Kill the validator and, on unix, its whole process group: killing only
+/// the direct child leaves descendants holding the output pipes (and
+/// running) after a refusal.
+fn kill_validator_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The child was spawned as a process-group leader, so its pid is
+        // the group id. `kill` is a base-system utility on Linux and macOS;
+        // if it is unavailable the direct kill below still runs.
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn output_bounded_with(
+    command: &mut Command,
+    timeout: Duration,
+    stream_cap: usize,
+) -> std::io::Result<std::process::Output> {
+    // Readers report over a channel instead of being joined: a descendant
+    // that inherits a pipe can delay EOF arbitrarily past the child's exit,
+    // and the deadline must cover drain completion, not just exit.
+    fn drain<R: Read + Send + 'static>(
+        pipe: R,
+        cap: usize,
+        is_stdout: bool,
+        done: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+    ) {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            // Read one byte past the cap so overflow is detectable.
+            let _ = pipe.take(cap as u64 + 1).read_to_end(&mut bytes);
+            let _ = done.send((is_stdout, bytes));
+        });
+    }
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    drain(
+        child.stdout.take().expect("stdout is piped"),
+        stream_cap,
+        true,
+        sender.clone(),
+    );
+    drain(
+        child.stderr.take().expect("stderr is piped"),
+        stream_cap,
+        false,
+        sender,
+    );
+
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    let mut stdout: Option<Vec<u8>> = None;
+    let mut stderr: Option<Vec<u8>> = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if let (Some(status), Some(stdout), Some(stderr)) = (status, &stdout, &stderr) {
+            return Ok(std::process::Output {
+                status,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            });
+        }
+        if Instant::now() >= deadline {
+            kill_validator_tree(&mut child);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("validator exceeded the {}s time limit", timeout.as_secs()),
+            ));
+        }
+        match receiver.recv_timeout(Duration::from_millis(10)) {
+            Ok((is_stdout, bytes)) => {
+                if bytes.len() > stream_cap {
+                    kill_validator_tree(&mut child);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("validator output exceeded the {stream_cap}-byte limit"),
+                    ));
+                }
+                if is_stdout {
+                    stdout = Some(bytes);
+                } else {
+                    stderr = Some(bytes);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Both readers ended without reporting (thread panic): fill
+                // whatever is missing so the child-status path can finish
+                // instead of waiting for reports that will never arrive.
+                stdout.get_or_insert_with(Vec::new);
+                stderr.get_or_insert_with(Vec::new);
+            }
+        }
+    }
+}
+
 /// Run `command`, retrying a spawn that failed with `ETXTBSY`.
 ///
 /// Linux refuses to execute a file while any process holds it open for
@@ -167,7 +293,7 @@ fn output_retrying_busy_executable(command: &mut Command) -> std::io::Result<std
     const ATTEMPTS: u32 = 6;
     let mut attempt = 0;
     loop {
-        match command.output() {
+        match output_bounded(command) {
             Err(error)
                 if error.kind() == std::io::ErrorKind::ExecutableFileBusy
                     && attempt + 1 < ATTEMPTS =>
@@ -500,5 +626,53 @@ fn bounded_process_diagnostic(diagnostic: &str) -> String {
         format!("{bounded}\n[validator diagnostic truncated]")
     } else {
         bounded
+    }
+}
+
+#[cfg(test)]
+mod bounded_output_tests {
+    use super::*;
+
+    #[test]
+    fn validator_timeout_kills_a_wedged_child() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let error = output_bounded_with(&mut command, Duration::from_millis(100), 1024)
+            .expect_err("a wedged validator must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn validator_stream_cap_refuses_unbounded_output() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'x%.0s' $(seq 1 5000)"]);
+        let error = output_bounded_with(&mut command, Duration::from_secs(30), 1024)
+            .expect_err("output past the cap must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn validator_deadline_covers_descendants_holding_the_pipes() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & echo started; exit 0"]);
+        let started = Instant::now();
+        let error = output_bounded_with(&mut command, Duration::from_millis(200), 1024)
+            .expect_err("a descendant holding stdout open must not outlive the deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "deadline must bound drain completion, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn validator_output_within_bounds_is_returned() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf hello"]);
+        let output = output_bounded_with(&mut command, Duration::from_secs(30), 1024)
+            .expect("bounded output is returned");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello");
     }
 }
