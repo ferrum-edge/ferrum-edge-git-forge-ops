@@ -173,10 +173,14 @@ fn kill_validator_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         // The child was spawned as a process-group leader, so its pid is
-        // the group id. `kill` is a base-system utility on Linux and macOS;
-        // if it is unavailable the direct kill below still runs.
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{}", child.id())])
+        // the group id. `kill` here is the POSIX shell's builtin, run by
+        // absolute path with an empty environment, so neither `PATH` nor a
+        // missing `kill` executable can turn group cleanup into a no-op. If
+        // even `/bin/sh` cannot run, the direct kill below still does.
+        let _ = Command::new("/bin/sh")
+            .args(["-c", "kill -s KILL -- \"-$1\"", "sh"])
+            .arg(child.id().to_string())
+            .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -493,7 +497,10 @@ fn run_validate_command(
     annotate_namespace: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Check that the binary exists / is callable
-    let which_result = Command::new("which").arg("--").arg(binary_path).output();
+    // Bounded like every other subprocess here: a PATH-resolved `which`
+    // wrapper must not stall or flood validation either. A limit failure is
+    // an `Err`, which falls through to the (also bounded) direct probe.
+    let which_result = output_bounded(Command::new("which").arg("--").arg(binary_path));
     // Reuse the existing lookup for diagnostics; no version subprocess or
     // version-number assumption can establish resource-label capability.
     let binary_in_use = which_result
@@ -508,9 +515,9 @@ fn run_validate_command(
         Ok(output) => output.status.success(),
         Err(_) => {
             // "which" might not exist (Windows); try running the binary directly
-            Command::new(binary_path)
-                .arg("--help")
-                .output()
+            // Bounded like the validation run itself: a wedged or flooding
+            // binary must not stall or exhaust memory in this probe either.
+            output_bounded(Command::new(binary_path).arg("--help"))
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         }
@@ -653,8 +660,16 @@ mod bounded_output_tests {
 
     #[test]
     fn validator_deadline_covers_descendants_holding_the_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "sleep 30 & echo started; exit 0"]);
+        command
+            .args([
+                "-c",
+                "sleep 30 & echo $! > \"$1\"; echo started; exit 0",
+                "sh",
+            ])
+            .arg(&pid_file);
         let started = Instant::now();
         let error = output_bounded_with(&mut command, Duration::from_millis(200), 1024)
             .expect_err("a descendant holding stdout open must not outlive the deadline");
@@ -664,6 +679,30 @@ mod bounded_output_tests {
             "deadline must bound drain completion, took {:?}",
             started.elapsed()
         );
+
+        // The descendant itself must be gone, not just no longer waited on.
+        // It is reparented once its shell dies; a zombie awaiting that reap
+        // counts as dead.
+        let descendant = std::fs::read_to_string(&pid_file).unwrap();
+        let descendant = descendant.trim();
+        let alive = || {
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "kill -0 \"$1\" 2>/dev/null || exit 1; \
+                     case \"$(ps -o stat= -p \"$1\" 2>/dev/null)\" in Z*) exit 1;; esac",
+                    "sh",
+                    descendant,
+                ])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let reaped_by = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < reaped_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "descendant {descendant} survived the deadline");
     }
 
     #[test]

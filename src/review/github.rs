@@ -39,11 +39,31 @@ pub async fn post_pr_comment(
         .map_err(|_| crate::error::Error::Config("GITHUB_TOKEN not set".to_string()))?;
     let repo = env::var("GITHUB_REPOSITORY")
         .map_err(|_| crate::error::Error::Config("GITHUB_REPOSITORY not set".to_string()))?;
+    post_comment_to(
+        env_config,
+        GITHUB_API_ORIGIN,
+        &token,
+        &repo,
+        pr_number,
+        comment,
+    )
+    .await
+}
 
-    let url = format!(
-        "https://api.github.com/repos/{}/issues/{}/comments",
-        repo, pr_number
-    );
+/// The only origin production comments are posted to.
+const GITHUB_API_ORIGIN: &str = "https://api.github.com";
+
+/// [`post_pr_comment`] against `api_origin`, so tests can point it at a
+/// loopback server. Production always passes [`GITHUB_API_ORIGIN`].
+async fn post_comment_to(
+    env_config: &EnvConfig,
+    api_origin: &str,
+    token: &str,
+    repo: &str,
+    pr_number: u64,
+    comment: &str,
+) -> crate::error::Result<()> {
+    let url = format!("{api_origin}/repos/{repo}/issues/{pr_number}/comments");
 
     let body = serde_json::json!({ "body": comment });
 
@@ -67,7 +87,7 @@ pub async fn post_pr_comment(
             .post(&url)
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "gitforgeops")
-            .bearer_auth(&token)
+            .bearer_auth(token)
             .json(&body)
             .send()
             .await
@@ -88,10 +108,9 @@ pub async fn post_pr_comment(
         if (200..=299).contains(&status) {
             return Ok(());
         }
-        let resp_body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("<no body>"));
+        // Bounded read, and only GitHub's structured `message` is shown: a
+        // raw error body can be large or reflect the bearer token.
+        let resp_body = crate::http_client::read_error_body(resp).await;
         if attempt < MAX_COMMENT_RETRIES && comment_status_is_retryable(status) {
             let delay = retry_after
                 .unwrap_or_else(|| Duration::from_millis(500_u64.saturating_mul(1_u64 << attempt)));
@@ -106,4 +125,65 @@ pub async fn post_pr_comment(
     Err(crate::error::Error::HttpClient(
         "GitHub comment retry loop ended unexpectedly".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod comment_error_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answer one comment POST with HTTP 403 and `body`, and return the
+    /// rendered error `post_comment_to` produced.
+    async fn comment_error_for(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 403 Forbidden\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            // The client stops at its cap; the peer closing early is fine.
+            let _ = socket.write_all(&body).await;
+        });
+        let config = EnvConfig {
+            github_connect_timeout_secs: 5,
+            github_request_timeout_secs: 30,
+            ..Default::default()
+        };
+        let error = post_comment_to(&config, &origin, "synthetic-token", "acme/repo", 7, "hi")
+            .await
+            .expect_err("a 403 is not delivery");
+        server.abort();
+        error.to_string()
+    }
+
+    #[tokio::test]
+    async fn an_oversized_unstructured_failure_is_withheld() {
+        let mut body = b"echo: Authorization: Bearer synthetic-token ".to_vec();
+        body.resize(4 * 1024 * 1024, b'x');
+        let rendered = comment_error_for(body).await;
+        assert!(rendered.contains("403"), "{rendered}");
+        assert!(!rendered.contains("synthetic-token"), "{rendered}");
+        assert!(rendered.contains("withheld"), "{rendered}");
+        assert!(rendered.len() < 1024, "{} bytes rendered", rendered.len());
+    }
+
+    #[tokio::test]
+    async fn a_structured_failure_is_one_bounded_line() {
+        let body = serde_json::json!({
+            "message": format!("Resource not accessible\nforged: ok {}", "y".repeat(2000)),
+        })
+        .to_string();
+        let rendered = comment_error_for(body.into_bytes()).await;
+        assert!(
+            rendered.contains("Resource not accessible forged: ok"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\n'), "{rendered}");
+        assert!(rendered.contains("[truncated]"), "{rendered}");
+    }
 }
