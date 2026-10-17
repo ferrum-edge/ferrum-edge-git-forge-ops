@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
