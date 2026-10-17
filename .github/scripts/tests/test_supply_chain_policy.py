@@ -5696,6 +5696,153 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
+    def test_required_home_jobs_cannot_skip_their_gates(self):
+        # #566: required contexts whose home workflows a candidate controls
+        # must not keep the checked markers while skipping the checks.
+        static = (ROOT / ".github/workflows/validate-pr.yml").read_text(encoding="utf-8")
+        self.assertEqual(
+            check_supply_chain.required_static_validation_violations(static), []
+        )
+        weakened_aggregate = (
+            # Verdict script exits successfully before any result is judged.
+            static.replace(
+                "          set -euo pipefail\n          [ \"$PAIRING_RESULT\"",
+                "          set -euo pipefail\n          exit 0\n          [ \"$PAIRING_RESULT\"",
+                1,
+            ),
+            # A needed job drops out of the aggregate.
+            static.replace(
+                "needs: [validator-pairing, scope, list-envs, validate]",
+                "needs: [validator-pairing, scope, list-envs]",
+                1,
+            ),
+            # The aggregate no longer runs when a needed job fails.
+            static.replace(
+                "    if: always()\n    needs: [validator-pairing",
+                "    needs: [validator-pairing",
+                1,
+            ),
+        )
+        for weakened in weakened_aggregate:
+            self.assertNotEqual(weakened, static)
+            self.assertTrue(
+                check_supply_chain.required_static_validation_violations(weakened),
+                weakened,
+            )
+
+        rust_ci = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
+        weakened_rust = (
+            # Both cargo lines stay, but the step exits before running them.
+            rust_ci.replace(
+                "          set -euo pipefail\n          cargo test --test unit_tests",
+                "          set -euo pipefail\n          exit 0\n          cargo test --test unit_tests",
+                1,
+            ),
+            # A gate step gains a bypass.
+            rust_ci.replace(
+                "        run: cargo clippy --all-targets -- -D warnings",
+                "        continue-on-error: true\n        run: cargo clippy --all-targets -- -D warnings",
+                1,
+            ),
+            # The scope step is taught to always skip the Rust gates.
+            rust_ci.replace(
+                "rust)\n", "rust)\n            result=false\n", 1
+            ),
+            # The whole job is conditioned away.
+            rust_ci.replace(
+                "  rust-ci-check:\n    runs-on: ubuntu-26.04",
+                "  rust-ci-check:\n    if: false\n    runs-on: ubuntu-26.04",
+                1,
+            ),
+        )
+        for weakened in weakened_rust:
+            self.assertNotEqual(weakened, rust_ci)
+            self.assertTrue(
+                check_supply_chain.rust_ci_test_scope_violations(weakened),
+                weakened,
+            )
+
+        # The verdict job's dependencies are pinned too: hardcoding the
+        # scope output irrelevant, or giving a dependency job a bypass
+        # shell, must not leave the aggregate green.
+        scope_hardcoded = static.replace(
+            "relevant: ${{ steps.classify.outputs.relevant }}",
+            "relevant: 'false'",
+            1,
+        )
+        self.assertNotEqual(scope_hardcoded, static)
+        self.assertTrue(
+            check_supply_chain.required_static_validation_violations(scope_hardcoded),
+            scope_hardcoded,
+        )
+        job_shell = static.replace(
+            "  validate:\n", "  validate:\n    defaults:\n      run:\n        shell: /usr/bin/true {0}\n", 1
+        )
+        self.assertNotEqual(job_shell, static)
+        self.assertTrue(
+            check_supply_chain.required_static_validation_violations(job_shell),
+            job_shell,
+        )
+
+        # A two-space comment must not end the extracted job early: a
+        # job-level condition written after it is still applied by GitHub.
+        hidden_condition = rust_ci.replace(
+            "\n  coverage:\n",
+            "\n  # boundary\n    if: github.event_name != 'pull_request'\n\n  coverage:\n",
+            1,
+        )
+        self.assertNotEqual(hidden_condition, rust_ci)
+        self.assertTrue(
+            check_supply_chain.rust_ci_test_scope_violations(hidden_condition),
+            hidden_condition,
+        )
+
+        # An executable suffix glued after a quote must not vanish as a
+        # "comment" during comparison: the shell still runs it.
+        glued = static.replace(
+            'did not succeed."', 'did not succeed."#; exit 0', 1
+        )
+        self.assertNotEqual(glued, static)
+        self.assertTrue(
+            check_supply_chain.required_static_validation_violations(glued), glued
+        )
+
+        # Workflow-level defaults reach every run step without touching the
+        # pinned job text.
+        defaulted = static.replace(
+            "jobs:\n", "defaults:\n  run:\n    shell: /usr/bin/true {0}\njobs:\n", 1
+        )
+        self.assertNotEqual(defaulted, static)
+        self.assertTrue(
+            check_supply_chain.required_static_validation_violations(defaulted),
+            defaulted,
+        )
+        defaulted_rust = rust_ci.replace(
+            "jobs:\n", "defaults:\n  run:\n    shell: /usr/bin/true {0}\njobs:\n", 1
+        )
+        self.assertNotEqual(defaulted_rust, rust_ci)
+        self.assertTrue(
+            check_supply_chain.rust_ci_test_scope_violations(defaulted_rust),
+            defaulted_rust,
+        )
+
+        # Gates moved before the scope step that enables them see no output
+        # and skip; step order is part of the pin.
+        test_step_start = rust_ci.index("      - name: cargo test\n")
+        test_step_end = rust_ci.index("\n  coverage:", test_step_start)
+        test_step = rust_ci[test_step_start:test_step_end] + "\n"
+        scope_start = rust_ci.index("      - name: Check out trusted path classifier\n")
+        reordered = (
+            rust_ci[:scope_start]
+            + test_step
+            + rust_ci[scope_start:test_step_start]
+            + rust_ci[test_step_end:]
+        )
+        self.assertNotEqual(reordered, rust_ci)
+        self.assertTrue(
+            check_supply_chain.rust_ci_test_scope_violations(reordered), reordered
+        )
+
     def test_unconfigured_repository_skips_instead_of_failing_the_merge(self):
         secure = "\n".join(
             [
