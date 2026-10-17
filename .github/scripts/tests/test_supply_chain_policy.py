@@ -5784,6 +5784,19 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             job_shell,
         )
 
+        # A two-space comment must not end the extracted job early: a
+        # job-level condition written after it is still applied by GitHub.
+        hidden_condition = rust_ci.replace(
+            "\n  coverage:\n",
+            "\n  # boundary\n    if: github.event_name != 'pull_request'\n\n  coverage:\n",
+            1,
+        )
+        self.assertNotEqual(hidden_condition, rust_ci)
+        self.assertTrue(
+            check_supply_chain.rust_ci_test_scope_violations(hidden_condition),
+            hidden_condition,
+        )
+
         # An executable suffix glued after a quote must not vanish as a
         # "comment" during comparison: the shell still runs it.
         glued = static.replace(

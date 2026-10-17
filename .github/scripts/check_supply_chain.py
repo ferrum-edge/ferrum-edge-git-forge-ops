@@ -2470,12 +2470,19 @@ def untrusted_pr_installer_violations(text: str) -> list[str]:
 
 
 def workflow_job(text: str, job: str) -> str:
-    """Read one conventionally indented job; duplicate/missing jobs fail closed."""
+    """Read one conventionally indented job; duplicate/missing jobs fail closed.
+
+    The body ends at the next line indented two spaces or less that is not
+    a comment (as in `workflow_jobs`): a two-space comment must not end the
+    job early, or a job-level `if:`/`continue-on-error:` written after it
+    would be invisible to every check reading the job while GitHub still
+    applies it.
+    """
     matches = list(re.finditer(rf"^  {re.escape(job)}:\n", text, re.MULTILINE))
     if len(matches) != 1:
         return ""
     return re.split(
-        r"^  \S|^\S", text[matches[0].end():], maxsplit=1, flags=re.MULTILINE
+        r"^ {0,2}(?!#)\S", text[matches[0].end():], maxsplit=1, flags=re.MULTILINE
     )[0]
 
 
