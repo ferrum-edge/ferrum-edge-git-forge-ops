@@ -1845,13 +1845,38 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
     return violations
 
 
-def _active_lines(block: str) -> list[str]:
-    """A workflow block's executable lines: comments and blanks removed."""
+def _verbatim_job_lines(block: str) -> list[str]:
+    """A job's lines exactly as written, blanks dropped, action SHAs masked.
+
+    Nothing is comment-stripped: splitting on `#` would let executable
+    suffixes hide after a `#` inside (or glued to) a quoted string, where
+    the shell still runs them. Immutable action pins are masked to
+    `@<sha>` because other rules already judge the pins themselves; what
+    this compares is structure, order, conditions and script bytes.
+    """
     return [
-        line.split("#", 1)[0].rstrip()
+        re.sub(r"@[0-9a-f]{40}\b", "@<sha>", line.rstrip())
         for line in block.splitlines()
-        if line.split("#", 1)[0].strip()
+        if line.strip()
     ]
+
+
+def _workflow_level_gate_violations(label: str, text: str) -> list[str]:
+    """Workflow-level defaults/env must not reach the pinned gate jobs.
+
+    `defaults.run.shell` (or a workflow `env:` such as `BASH_ENV`) applies
+    to every `run:` step in the file, including the pinned ones, without
+    changing a byte of the pinned job text.
+    """
+    violations: list[str] = []
+    for key in ("defaults", "env"):
+        if re.search(rf"^{key}\s*:", text, re.MULTILINE):
+            violations.append(
+                f"{label}: workflow-level {key}: would reach the pinned "
+                "required gate jobs; keep defaults and environment inside "
+                "the reviewed jobs"
+            )
+    return violations
 
 
 REQUIRED_STATIC_VALIDATION_JOB = [
@@ -1887,18 +1912,20 @@ REQUIRED_STATIC_VALIDATION_JOB = [
     "          }",
 ]
 
-RUST_CI_TRUSTED_CHECKOUT_STEP = [
-    "name: Check out trusted path classifier",
+RUST_CI_CHECK_JOB = [
+    "    runs-on: ubuntu-26.04",
+    "    steps:",
+    "      - uses: actions/checkout@<sha> # v7",
+    "        with:",
+    "          persist-credentials: false",
+    "      - name: Check out trusted path classifier",
     "        if: github.event_name == 'pull_request'",
-    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "        uses: actions/checkout@<sha> # v7",
     "        with:",
     "          ref: ${{ github.event.repository.default_branch }}",
     "          path: trusted-scope",
     "          persist-credentials: false",
-]
-
-RUST_CI_SCOPE_STEP = [
-    "name: Detect Rust-impacting PR paths",
+    "      - name: Detect Rust-impacting PR paths",
     "        if: github.event_name == 'pull_request'",
     "        id: scope",
     "        env:",
@@ -1940,6 +1967,9 @@ RUST_CI_SCOPE_STEP = [
     "            result=$(python3 trusted-scope/.github/scripts/changed_files.py \\",
     "              \"$pages_file\" \"$current_changed\" rust)",
     "          else",
+    "            # The helper is absent only while the PR that first introduces it",
+    "            # is based on an older main. Never execute the candidate copy;",
+    "            # classify as incomplete so every Rust gate runs fail-safe.",
     "            echo \"::warning::Trusted path classifier is not present on the PR base; running Rust CI fail-safe.\"",
     "            result='{\"complete\":false,\"matches\":true}'",
     "          fi",
@@ -1949,26 +1979,38 @@ RUST_CI_SCOPE_STEP = [
     "            rust=true",
     "          fi",
     "          echo \"rust=$rust\" >> \"$GITHUB_OUTPUT\"",
-]
-
-RUST_CI_FMT_STEP = [
-    "name: cargo fmt --check",
+    "      - name: Install Rust toolchain",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust 1.99.0",
+    "        with:",
+    "          toolchain: 1.99.0",
+    "          components: rustfmt, clippy",
+    "      - name: Cache cargo registry + target",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: actions/cache@<sha> # v6",
+    "        with:",
+    "          path: |",
+    "            ~/.cargo/registry",
+    "            ~/.cargo/git",
+    "            target",
+    "          key: ${{ runner.os }}-rust-ci-${{ hashFiles('**/Cargo.lock') }}",
+    "          restore-keys: |",
+    "            ${{ runner.os }}-rust-ci-",
+    "      - name: cargo fmt --check",
     "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
     "        run: cargo fmt --all -- --check",
-]
-
-RUST_CI_CLIPPY_STEP = [
-    "name: cargo clippy",
+    "      - name: cargo clippy",
     "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
     "        run: cargo clippy --all-targets -- -D warnings",
-]
-
-RUST_CI_TEST_STEP = [
-    "name: cargo test",
+    "      - name: cargo test",
     "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
     "        run: |",
     "          set -euo pipefail",
     "          cargo test --test unit_tests",
+    "          # Inline `#[cfg(test)]` modules live in the library target, not the",
+    "          # aggregated binary. Run the whole target unfiltered, and refuse a",
+    "          # target that silently lists none of its known suites (a cfg,",
+    "          # feature or filter change would otherwise pass with zero tests).",
     "          cargo test --lib",
     "          lib_tests=$(cargo test --lib -- --list --format terse)",
     "          for suite in 'secrets::plugin_config::tests::' 'apply::api_target::prepared_apply_tests::'; do",
@@ -1990,15 +2032,16 @@ def required_static_validation_violations(text: str) -> list[str]:
     validation job ran and passed. Changing the job means changing this
     protected pin first.
     """
+    violations = _workflow_level_gate_violations("validate-pr.yml", text)
     job = workflow_job(text, "gitforgeops-required-static-validation")
-    if _active_lines(job) != REQUIRED_STATIC_VALIDATION_JOB:
-        return [
+    if _verbatim_job_lines(job) != REQUIRED_STATIC_VALIDATION_JOB:
+        violations.append(
             "validate-pr.yml: the gitforgeops-required-static-validation job "
             "must keep its reviewed needs, always() condition, result wiring "
             "and verdict script exactly; a green required context must entail "
             "that every applicable validation job ran and passed"
-        ]
-    return []
+        )
+    return violations
 
 
 def rust_ci_test_scope_violations(text: str) -> list[str]:
@@ -2007,35 +2050,19 @@ def rust_ci_test_scope_violations(text: str) -> list[str]:
     Inline `#[cfg(test)]` modules compile under clippy's `--all-targets` but
     only run under `cargo test --lib`. A name filter on that command once
     skipped every library test but one, and coverage measured only the
-    aggregated binary. `rust-ci-check` is a required home job, so its gate
-    steps — the trusted scope classifier that decides whether they run,
-    then fmt, clippy and test — are pinned exactly, conditions and scripts
-    included: keeping the two `cargo test` lines while adding an early
-    successful exit, a swallowed failure or a weaker condition must not
-    satisfy the gate.
+    aggregated binary. `rust-ci-check` is a required home job, so the whole
+    job is pinned exactly — header, step order, conditions and scripts:
+    moving the gates before the scope step that enables them, adding an
+    early successful exit, or swallowing a failure must not satisfy it.
     """
-    violations: list[str] = []
+    violations = _workflow_level_gate_violations("rust-ci.yml", text)
     job = workflow_job(text, "rust-ci-check")
-    header = [
-        line for line in _active_lines(job.split("    steps:", 1)[0])
-    ]
-    if header != ["    runs-on: ubuntu-26.04"]:
+    if _verbatim_job_lines(job) != RUST_CI_CHECK_JOB:
         violations.append(
-            "rust-ci.yml: rust-ci-check must keep its reviewed job header "
-            "(no job condition, needs or continue-on-error)"
+            "rust-ci.yml: rust-ci-check must keep its reviewed header, step "
+            "order, conditions and scripts exactly; a green required context "
+            "must entail that fmt, clippy and the tests ran"
         )
-    for step_name, exact in (
-        ("Check out trusted path classifier", RUST_CI_TRUSTED_CHECKOUT_STEP),
-        ("Detect Rust-impacting PR paths", RUST_CI_SCOPE_STEP),
-        ("cargo fmt --check", RUST_CI_FMT_STEP),
-        ("cargo clippy", RUST_CI_CLIPPY_STEP),
-        ("cargo test", RUST_CI_TEST_STEP),
-    ):
-        if policy_step(job, step_name) != exact:
-            violations.append(
-                f"rust-ci.yml: the {step_name!r} step must keep its reviewed "
-                "condition and script exactly"
-            )
     test_lines = [
         line.strip()
         for line in policy_step(job, "cargo test")

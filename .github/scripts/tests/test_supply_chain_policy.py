@@ -5762,6 +5762,52 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 weakened,
             )
 
+        # An executable suffix glued after a quote must not vanish as a
+        # "comment" during comparison: the shell still runs it.
+        glued = static.replace(
+            'did not succeed."', 'did not succeed."#; exit 0', 1
+        )
+        self.assertNotEqual(glued, static)
+        self.assertTrue(
+            check_supply_chain.required_static_validation_violations(glued), glued
+        )
+
+        # Workflow-level defaults reach every run step without touching the
+        # pinned job text.
+        defaulted = static.replace(
+            "jobs:\n", "defaults:\n  run:\n    shell: /usr/bin/true {0}\njobs:\n", 1
+        )
+        self.assertNotEqual(defaulted, static)
+        self.assertTrue(
+            check_supply_chain.required_static_validation_violations(defaulted),
+            defaulted,
+        )
+        defaulted_rust = rust_ci.replace(
+            "jobs:\n", "defaults:\n  run:\n    shell: /usr/bin/true {0}\njobs:\n", 1
+        )
+        self.assertNotEqual(defaulted_rust, rust_ci)
+        self.assertTrue(
+            check_supply_chain.rust_ci_test_scope_violations(defaulted_rust),
+            defaulted_rust,
+        )
+
+        # Gates moved before the scope step that enables them see no output
+        # and skip; step order is part of the pin.
+        test_step_start = rust_ci.index("      - name: cargo test\n")
+        test_step_end = rust_ci.index("\n  coverage:", test_step_start)
+        test_step = rust_ci[test_step_start:test_step_end] + "\n"
+        scope_start = rust_ci.index("      - name: Check out trusted path classifier\n")
+        reordered = (
+            rust_ci[:scope_start]
+            + test_step
+            + rust_ci[scope_start:test_step_start]
+            + rust_ci[test_step_end:]
+        )
+        self.assertNotEqual(reordered, rust_ci)
+        self.assertTrue(
+            check_supply_chain.rust_ci_test_scope_violations(reordered), reordered
+        )
+
     def test_unconfigured_repository_skips_instead_of_failing_the_merge(self):
         secure = "\n".join(
             [
