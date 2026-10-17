@@ -1862,54 +1862,274 @@ def _verbatim_job_lines(block: str) -> list[str]:
 
 
 def _workflow_level_gate_violations(label: str, text: str) -> list[str]:
-    """Workflow-level defaults/env must not reach the pinned gate jobs.
+    """Inherited defaults/env must not reach the pinned gate jobs.
 
     `defaults.run.shell` (or a workflow `env:` such as `BASH_ENV`) applies
     to every `run:` step in the file, including the pinned ones, without
     changing a byte of the pinned job text.
     """
     violations: list[str] = []
-    for key in ("defaults", "env"):
-        if re.search(rf"^{key}\s*:", text, re.MULTILINE):
-            violations.append(
-                f"{label}: workflow-level {key}: would reach the pinned "
-                "required gate jobs; keep defaults and environment inside "
-                "the reviewed jobs"
-            )
+    if re.search(r"^env\s*:", text, re.MULTILINE):
+        violations.append(
+            f"{label}: workflow-level env: would reach the pinned "
+            "required gate jobs; keep environment inside the reviewed jobs"
+        )
+    if re.search(r"^\s*defaults\s*:", text, re.MULTILINE):
+        violations.append(
+            f"{label}: defaults: at workflow or job level would reach the "
+            "pinned required gate jobs' run steps (a bypass shell skips "
+            "their scripts); keep shell and working-directory explicit"
+        )
     return violations
 
 
-REQUIRED_STATIC_VALIDATION_JOB = [
-    "    name: gitforgeops-required-static-validation",
-    "    if: always()",
-    "    needs: [validator-pairing, scope, list-envs, validate]",
-    "    runs-on: ubuntu-26.04",
-    "    env:",
-    "      PAIRING_RESULT: ${{ needs.validator-pairing.result }}",
-    "      SCOPE_RESULT: ${{ needs.scope.result }}",
-    "      RELEVANT: ${{ needs.scope.outputs.relevant }}",
-    "      LIST_RESULT: ${{ needs.list-envs.result }}",
-    "      VALIDATE_RESULT: ${{ needs.validate.result }}",
-    "    steps:",
-    "      - name: Require every applicable validation job",
-    "        run: |",
-    "          set -euo pipefail",
-    "          [ \"$PAIRING_RESULT\" = success ] || {",
-    "            echo \"::error::The pinned validator resource-label pairing check did not succeed.\"",
-    "            exit 1",
-    "          }",
-    "          [ \"$SCOPE_RESULT\" = success ] || {",
-    "            echo \"::error::Declarative change classification did not succeed.\"",
-    "            exit 1",
-    "          }",
-    "          if [ \"$RELEVANT\" != true ]; then",
-    "            echo \"No resource, overlay, or repository configuration changes require validation.\"",
-    "            exit 0",
-    "          fi",
-    "          [ \"$LIST_RESULT\" = success ] && [ \"$VALIDATE_RESULT\" = success ] || {",
-    "            echo \"::error::One or more required static-validation jobs failed or were skipped.\"",
-    "            exit 1",
-    "          }",
+VALIDATE_PR_JOBS = [
+    ("scope", [
+        "    runs-on: ubuntu-26.04",
+        "    outputs:",
+        "      relevant: ${{ steps.classify.outputs.relevant }}",
+        "    steps:",
+        "      - uses: actions/checkout@<sha> # v7",
+        "        with:",
+        "          persist-credentials: false",
+        "      - name: Check out trusted path classifier",
+        "        uses: actions/checkout@<sha> # v7",
+        "        with:",
+        "          ref: ${{ github.event.repository.default_branch }}",
+        "          path: trusted-scope",
+        "          persist-credentials: false",
+        "      - name: Classify declarative changes",
+        "        id: classify",
+        "        env:",
+        "          GH_TOKEN: ${{ github.token }}",
+        "          REPO: ${{ github.repository }}",
+        "          PR_NUMBER: ${{ github.event.pull_request.number }}",
+        "          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+        "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+        "        run: |",
+        "          set -euo pipefail",
+        "          pages_file=$(mktemp)",
+        "          trap 'rm -f \"$pages_file\"' EXIT",
+        "          stable=false",
+        "          for attempt in 1 2 3; do",
+        "            before=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
+        "            before_head=$(jq -r '.head.sha' <<< \"$before\")",
+        "            before_base=$(jq -r '.base.sha' <<< \"$before\")",
+        "            before_ref=$(jq -r '.base.ref' <<< \"$before\")",
+        "            before_count=$(jq -r '.changed_files' <<< \"$before\")",
+        "            [[ \"$before_head\" =~ ^[0-9a-f]{40}$ && \"$before_base\" =~ ^[0-9a-f]{40}$ && \"$before_count\" =~ ^[0-9]+$ ]] || exit 1",
+        "            [ \"$before_head\" = \"$EXPECTED_HEAD_SHA\" ] && [ \"$before_ref\" = \"$DEFAULT_BRANCH\" ] || exit 1",
+        "            gh api \"repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100\" --paginate --slurp > \"$pages_file\"",
+        "            after=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
+        "            after_head=$(jq -r '.head.sha' <<< \"$after\")",
+        "            after_base=$(jq -r '.base.sha' <<< \"$after\")",
+        "            after_ref=$(jq -r '.base.ref' <<< \"$after\")",
+        "            after_count=$(jq -r '.changed_files' <<< \"$after\")",
+        "            if [ \"$before_head\" = \"$after_head\" ] && [ \"$before_base\" = \"$after_base\" ] && \\",
+        "               [ \"$before_ref\" = \"$after_ref\" ] && [ \"$before_count\" = \"$after_count\" ]; then",
+        "              current_changed=$after_count",
+        "              stable=true",
+        "              break",
+        "            fi",
+        "            echo \"::warning::PR file metadata changed during attempt ${attempt}; retrying.\"",
+        "          done",
+        "          [ \"$stable\" = true ] || exit 1",
+        "          helper=trusted-scope/.github/scripts/changed_files.py",
+        "          if [ -f \"$helper\" ]; then",
+        "            result=$(python3 trusted-scope/.github/scripts/changed_files.py \\",
+        "              \"$pages_file\" \"$current_changed\" declarative)",
+        "          else",
+        "            # The helper does not exist on the base of its own bootstrap PR.",
+        "            # Run validation fail-safe rather than executing candidate code.",
+        "            echo \"::warning::Trusted path classifier is not present on the PR base; validating fail-safe.\"",
+        "            result='{\"complete\":false,\"matches\":true}'",
+        "          fi",
+        "          relevant=$(jq -r '.matches' <<< \"$result\")",
+        "          if [ \"$(jq -r '.complete' <<< \"$result\")\" != true ]; then",
+        "            echo \"::warning::Changed-file pagination was incomplete; validating fail-safe.\"",
+        "            relevant=true",
+        "          fi",
+        "          echo \"relevant=$relevant\" >> \"$GITHUB_OUTPUT\"",
+    ]),
+    ("list-envs", [
+        "    needs: scope",
+        "    if: needs.scope.outputs.relevant == 'true'",
+        "    runs-on: ubuntu-26.04",
+        "    outputs:",
+        "      envs: ${{ steps.list.outputs.envs }}",
+        "    steps:",
+        "      - uses: actions/checkout@<sha> # v7",
+        "        with:",
+        "          persist-credentials: false",
+        "      - name: Install Rust toolchain",
+        "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust 1.99.0",
+        "        with:",
+        "          toolchain: 1.99.0",
+        "      # PR-built `target/` (build scripts, proc macros) stays in its own key",
+        "      # family. The privileged workflows restore `<os>-cargo-<lock>` with no",
+        "      # restore-keys, so they can never select a `<os>-pr-cargo-` entry even if",
+        "      # cache scoping were wrong. `check_supply_chain.py` enforces the split.",
+        "      - name: Cache cargo registry",
+        "        uses: actions/cache@<sha> # v6",
+        "        with:",
+        "          path: |",
+        "            ~/.cargo/registry",
+        "            ~/.cargo/git",
+        "            target",
+        "          key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "      - name: Build gitforgeops",
+        "        run: cargo install --path . --locked",
+        "      - name: Enumerate environments",
+        "        id: list",
+        "        run: |",
+        "          set -euo pipefail",
+        "          envs=$(gitforgeops envs --format json | jq -c .)",
+        "          jq -e '",
+        "            type == \"array\" and",
+        "            all(.[]; type == \"string\" and test(\"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$\"))",
+        "          ' <<< \"$envs\" >/dev/null || {",
+        "            echo \"::error::Every environment must be a single safe path component.\"",
+        "            exit 1",
+        "          }",
+        "          echo \"envs=$envs\" >> \"$GITHUB_OUTPUT\"",
+    ]),
+    ("validate", [
+        "    needs: list-envs",
+        "    if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''",
+        "    runs-on: ubuntu-26.04",
+        "    strategy:",
+        "      fail-fast: false",
+        "      matrix:",
+        "        environment: ${{ fromJson(needs.list-envs.outputs.envs) }}",
+        "    steps:",
+        "      - uses: actions/checkout@<sha> # v7",
+        "        with:",
+        "          persist-credentials: false",
+        "      # The installer runs with GITHUB_TOKEN. This job also builds the pull",
+        "      # request's own Cargo tree, so the *script* must not be one the pull",
+        "      # request wrote: it comes from the protected default branch instead.",
+        "      - name: Check out trusted validator installer",
+        "        uses: actions/checkout@<sha> # v7",
+        "        with:",
+        "          ref: ${{ github.event.repository.default_branch }}",
+        "          path: trusted-validator",
+        "          persist-credentials: false",
+        "      - name: Download verified ferrum-edge binary",
+        "        env:",
+        "          # The installer resolves the upstream asset by name and refuses to",
+        "          # execute any build whose SHA-256 is absent from the reviewed",
+        "          # .github/ferrum-edge-checksums.txt allowlist.",
+        "          GITHUB_TOKEN: ${{ github.token }}",
+        "        # Trusted code, candidate allowlist. A pull request that refreshes the",
+        "        # validator pin has to be validated against the digests it is adding,",
+        "        # so the second argument is deliberately the candidate's allowlist. A",
+        "        # hostile allowlist can only approve a different *genuine upstream*",
+        "        # build \u2014 the installer still requires the publisher's own checksum to",
+        "        # match \u2014 and this job carries no secret beyond a read-only token.",
+        "        # Privileged consumers (trusted-pr-review.yml, apply-on-merge.yml) use",
+        "        # the trusted allowlist instead.",
+        "        run: |",
+        "          bash trusted-validator/.github/scripts/install-ferrum-edge.sh \\",
+        "            \"$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge\" \\",
+        "            .github/ferrum-edge-checksums.txt",
+        "      # The probe also selects its fixture relative to the trusted script.",
+        "      # Candidate code or fixtures cannot approve a candidate digest.",
+        "      - name: Require resource-label compatibility",
+        "        run: |",
+        "          bash trusted-validator/.github/scripts/check-validator-resource-labels.sh \\",
+        "            \"$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge\"",
+        "      - name: Install Rust toolchain",
+        "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust 1.99.0",
+        "        with:",
+        "          toolchain: 1.99.0",
+        "      # PR-built `target/` (build scripts, proc macros) stays in its own key",
+        "      # family. The privileged workflows restore `<os>-cargo-<lock>` with no",
+        "      # restore-keys, so they can never select a `<os>-pr-cargo-` entry even if",
+        "      # cache scoping were wrong. `check_supply_chain.py` enforces the split.",
+        "      - name: Cache cargo registry",
+        "        uses: actions/cache@<sha> # v6",
+        "        with:",
+        "          path: |",
+        "            ~/.cargo/registry",
+        "            ~/.cargo/git",
+        "            target",
+        "          key: ${{ runner.os }}-pr-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "      - name: Install gitforgeops",
+        "        run: cargo install --path . --locked",
+        "      - name: Validate",
+        "        env:",
+        "          FERRUM_ENV: ${{ matrix.environment }}",
+        "        run: gitforgeops validate --format github-annotations",
+        "      - name: Static review output",
+        "        if: always()",
+        "        env:",
+        "          FERRUM_ENV: ${{ matrix.environment }}",
+        "        run: gitforgeops review",
+        "  # Always run, including pin-only, workflow-only and Rust-only PRs, and when",
+        "  # the repository has no configured environments or desired resources. Keep",
+        "  # this job fast and self-contained: the Alloy consumer qualification lives in",
+        "  # the non-required alloy-consumer.yml workflow.",
+    ]),
+    ("validator-pairing", [
+        "    runs-on: ubuntu-26.04",
+        "    timeout-minutes: 10",
+        "    permissions:",
+        "      contents: read",
+        "    steps:",
+        "      - uses: actions/checkout@<sha> # v7",
+        "        with:",
+        "          persist-credentials: false",
+        "      - name: Check out trusted pairing installer",
+        "        uses: actions/checkout@<sha> # v7",
+        "        with:",
+        "          ref: ${{ github.event.repository.default_branch }}",
+        "          path: trusted-validator",
+        "          persist-credentials: false",
+        "      - name: Download pairing validator",
+        "        env:",
+        "          GITHUB_TOKEN: ${{ github.token }}",
+        "        run: |",
+        "          bash trusted-validator/.github/scripts/install-ferrum-edge.sh \\",
+        "            \"$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge\" \\",
+        "            .github/ferrum-edge-checksums.txt",
+        "      # Keep both the probe and its script-relative fixture on the trusted ref.",
+        "      - name: Require resource-label compatibility",
+        "        run: |",
+        "          bash trusted-validator/.github/scripts/check-validator-resource-labels.sh \\",
+        "            \"$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge\"",
+    ]),
+    ("gitforgeops-required-static-validation", [
+        "    name: gitforgeops-required-static-validation",
+        "    if: always()",
+        "    needs: [validator-pairing, scope, list-envs, validate]",
+        "    runs-on: ubuntu-26.04",
+        "    env:",
+        "      PAIRING_RESULT: ${{ needs.validator-pairing.result }}",
+        "      SCOPE_RESULT: ${{ needs.scope.result }}",
+        "      RELEVANT: ${{ needs.scope.outputs.relevant }}",
+        "      LIST_RESULT: ${{ needs.list-envs.result }}",
+        "      VALIDATE_RESULT: ${{ needs.validate.result }}",
+        "    steps:",
+        "      - name: Require every applicable validation job",
+        "        run: |",
+        "          set -euo pipefail",
+        "          [ \"$PAIRING_RESULT\" = success ] || {",
+        "            echo \"::error::The pinned validator resource-label pairing check did not succeed.\"",
+        "            exit 1",
+        "          }",
+        "          [ \"$SCOPE_RESULT\" = success ] || {",
+        "            echo \"::error::Declarative change classification did not succeed.\"",
+        "            exit 1",
+        "          }",
+        "          if [ \"$RELEVANT\" != true ]; then",
+        "            echo \"No resource, overlay, or repository configuration changes require validation.\"",
+        "            exit 0",
+        "          fi",
+        "          [ \"$LIST_RESULT\" = success ] && [ \"$VALIDATE_RESULT\" = success ] || {",
+        "            echo \"::error::One or more required static-validation jobs failed or were skipped.\"",
+        "            exit 1",
+        "          }",
+    ]),
 ]
 
 RUST_CI_CHECK_JOB = [
@@ -2026,20 +2246,26 @@ def required_static_validation_violations(text: str) -> list[str]:
 
     `gitforgeops-required-static-validation` is a required status context
     whose home workflow a candidate controls. Substring checks once let a
-    job keep the markers while skipping the checks they name, so the whole
-    job — needs, condition, environment wiring and the verdict script — is
-    pinned exactly: its green result must entail that every applicable
-    validation job ran and passed. Changing the job means changing this
-    protected pin first.
+    job keep the markers while skipping the checks they name, and pinning
+    only the verdict job still let its dependencies be weakened (a scope
+    output hardcoded irrelevant, a bypass shell on a dependency job), so
+    every job in the workflow is pinned exactly: the aggregate's green
+    result must entail that every applicable validation job ran and
+    passed. Changing any of these jobs means changing this protected pin
+    first.
     """
     violations = _workflow_level_gate_violations("validate-pr.yml", text)
-    job = workflow_job(text, "gitforgeops-required-static-validation")
-    if _verbatim_job_lines(job) != REQUIRED_STATIC_VALIDATION_JOB:
+    jobs = [
+        (name, _verbatim_job_lines(body)) for name, body in workflow_jobs(text)
+    ]
+    if jobs != VALIDATE_PR_JOBS:
         violations.append(
-            "validate-pr.yml: the gitforgeops-required-static-validation job "
-            "must keep its reviewed needs, always() condition, result wiring "
-            "and verdict script exactly; a green required context must entail "
-            "that every applicable validation job ran and passed"
+            "validate-pr.yml: every job the required "
+            "gitforgeops-required-static-validation context depends on — "
+            "scope classification, validator pairing, environment listing, "
+            "validation and the verdict job itself — must keep its reviewed "
+            "shape exactly; a green required context must entail that every "
+            "applicable validation job ran and passed"
         )
     return violations
 

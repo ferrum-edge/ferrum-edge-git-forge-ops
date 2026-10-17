@@ -5762,6 +5762,28 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 weakened,
             )
 
+        # The verdict job's dependencies are pinned too: hardcoding the
+        # scope output irrelevant, or giving a dependency job a bypass
+        # shell, must not leave the aggregate green.
+        scope_hardcoded = static.replace(
+            "relevant: ${{ steps.classify.outputs.relevant }}",
+            "relevant: 'false'",
+            1,
+        )
+        self.assertNotEqual(scope_hardcoded, static)
+        self.assertTrue(
+            check_supply_chain.required_static_validation_violations(scope_hardcoded),
+            scope_hardcoded,
+        )
+        job_shell = static.replace(
+            "  validate:\n", "  validate:\n    defaults:\n      run:\n        shell: /usr/bin/true {0}\n", 1
+        )
+        self.assertNotEqual(job_shell, static)
+        self.assertTrue(
+            check_supply_chain.required_static_validation_violations(job_shell),
+            job_shell,
+        )
+
         # An executable suffix glued after a quote must not vanish as a
         # "comment" during comparison: the shell still runs it.
         glued = static.replace(
