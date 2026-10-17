@@ -5696,6 +5696,72 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             violations,
         )
 
+    def test_required_home_jobs_cannot_skip_their_gates(self):
+        # #566: required contexts whose home workflows a candidate controls
+        # must not keep the checked markers while skipping the checks.
+        static = (ROOT / ".github/workflows/validate-pr.yml").read_text(encoding="utf-8")
+        self.assertEqual(
+            check_supply_chain.required_static_validation_violations(static), []
+        )
+        weakened_aggregate = (
+            # Verdict script exits successfully before any result is judged.
+            static.replace(
+                "          set -euo pipefail\n          [ \"$PAIRING_RESULT\"",
+                "          set -euo pipefail\n          exit 0\n          [ \"$PAIRING_RESULT\"",
+                1,
+            ),
+            # A needed job drops out of the aggregate.
+            static.replace(
+                "needs: [validator-pairing, scope, list-envs, validate]",
+                "needs: [validator-pairing, scope, list-envs]",
+                1,
+            ),
+            # The aggregate no longer runs when a needed job fails.
+            static.replace(
+                "    if: always()\n    needs: [validator-pairing",
+                "    needs: [validator-pairing",
+                1,
+            ),
+        )
+        for weakened in weakened_aggregate:
+            self.assertNotEqual(weakened, static)
+            self.assertTrue(
+                check_supply_chain.required_static_validation_violations(weakened),
+                weakened,
+            )
+
+        rust_ci = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
+        weakened_rust = (
+            # Both cargo lines stay, but the step exits before running them.
+            rust_ci.replace(
+                "          set -euo pipefail\n          cargo test --test unit_tests",
+                "          set -euo pipefail\n          exit 0\n          cargo test --test unit_tests",
+                1,
+            ),
+            # A gate step gains a bypass.
+            rust_ci.replace(
+                "        run: cargo clippy --all-targets -- -D warnings",
+                "        continue-on-error: true\n        run: cargo clippy --all-targets -- -D warnings",
+                1,
+            ),
+            # The scope step is taught to always skip the Rust gates.
+            rust_ci.replace(
+                "rust)\n", "rust)\n            result=false\n", 1
+            ),
+            # The whole job is conditioned away.
+            rust_ci.replace(
+                "  rust-ci-check:\n    runs-on: ubuntu-26.04",
+                "  rust-ci-check:\n    if: false\n    runs-on: ubuntu-26.04",
+                1,
+            ),
+        )
+        for weakened in weakened_rust:
+            self.assertNotEqual(weakened, rust_ci)
+            self.assertTrue(
+                check_supply_chain.rust_ci_test_scope_violations(weakened),
+                weakened,
+            )
+
     def test_unconfigured_repository_skips_instead_of_failing_the_merge(self):
         secure = "\n".join(
             [

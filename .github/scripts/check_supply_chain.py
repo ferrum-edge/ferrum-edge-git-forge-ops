@@ -1845,19 +1845,200 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
     return violations
 
 
+def _active_lines(block: str) -> list[str]:
+    """A workflow block's executable lines: comments and blanks removed."""
+    return [
+        line.split("#", 1)[0].rstrip()
+        for line in block.splitlines()
+        if line.split("#", 1)[0].strip()
+    ]
+
+
+REQUIRED_STATIC_VALIDATION_JOB = [
+    "    name: gitforgeops-required-static-validation",
+    "    if: always()",
+    "    needs: [validator-pairing, scope, list-envs, validate]",
+    "    runs-on: ubuntu-26.04",
+    "    env:",
+    "      PAIRING_RESULT: ${{ needs.validator-pairing.result }}",
+    "      SCOPE_RESULT: ${{ needs.scope.result }}",
+    "      RELEVANT: ${{ needs.scope.outputs.relevant }}",
+    "      LIST_RESULT: ${{ needs.list-envs.result }}",
+    "      VALIDATE_RESULT: ${{ needs.validate.result }}",
+    "    steps:",
+    "      - name: Require every applicable validation job",
+    "        run: |",
+    "          set -euo pipefail",
+    "          [ \"$PAIRING_RESULT\" = success ] || {",
+    "            echo \"::error::The pinned validator resource-label pairing check did not succeed.\"",
+    "            exit 1",
+    "          }",
+    "          [ \"$SCOPE_RESULT\" = success ] || {",
+    "            echo \"::error::Declarative change classification did not succeed.\"",
+    "            exit 1",
+    "          }",
+    "          if [ \"$RELEVANT\" != true ]; then",
+    "            echo \"No resource, overlay, or repository configuration changes require validation.\"",
+    "            exit 0",
+    "          fi",
+    "          [ \"$LIST_RESULT\" = success ] && [ \"$VALIDATE_RESULT\" = success ] || {",
+    "            echo \"::error::One or more required static-validation jobs failed or were skipped.\"",
+    "            exit 1",
+    "          }",
+]
+
+RUST_CI_TRUSTED_CHECKOUT_STEP = [
+    "name: Check out trusted path classifier",
+    "        if: github.event_name == 'pull_request'",
+    "        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "        with:",
+    "          ref: ${{ github.event.repository.default_branch }}",
+    "          path: trusted-scope",
+    "          persist-credentials: false",
+]
+
+RUST_CI_SCOPE_STEP = [
+    "name: Detect Rust-impacting PR paths",
+    "        if: github.event_name == 'pull_request'",
+    "        id: scope",
+    "        env:",
+    "          GH_TOKEN: ${{ github.token }}",
+    "          REPO: ${{ github.repository }}",
+    "          PR_NUMBER: ${{ github.event.pull_request.number }}",
+    "          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+    "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    "        run: |",
+    "          set -euo pipefail",
+    "          pages_file=$(mktemp)",
+    "          trap 'rm -f \"$pages_file\"' EXIT",
+    "          stable=false",
+    "          for attempt in 1 2 3; do",
+    "            before=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
+    "            before_head=$(jq -r '.head.sha' <<< \"$before\")",
+    "            before_base=$(jq -r '.base.sha' <<< \"$before\")",
+    "            before_ref=$(jq -r '.base.ref' <<< \"$before\")",
+    "            before_count=$(jq -r '.changed_files' <<< \"$before\")",
+    "            [[ \"$before_head\" =~ ^[0-9a-f]{40}$ && \"$before_base\" =~ ^[0-9a-f]{40}$ && \"$before_count\" =~ ^[0-9]+$ ]] || exit 1",
+    "            [ \"$before_head\" = \"$EXPECTED_HEAD_SHA\" ] && [ \"$before_ref\" = \"$DEFAULT_BRANCH\" ] || exit 1",
+    "            gh api \"repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100\" --paginate --slurp > \"$pages_file\"",
+    "            after=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
+    "            after_head=$(jq -r '.head.sha' <<< \"$after\")",
+    "            after_base=$(jq -r '.base.sha' <<< \"$after\")",
+    "            after_ref=$(jq -r '.base.ref' <<< \"$after\")",
+    "            after_count=$(jq -r '.changed_files' <<< \"$after\")",
+    "            if [ \"$before_head\" = \"$after_head\" ] && [ \"$before_base\" = \"$after_base\" ] && \\",
+    "               [ \"$before_ref\" = \"$after_ref\" ] && [ \"$before_count\" = \"$after_count\" ]; then",
+    "              current_changed=$after_count",
+    "              stable=true",
+    "              break",
+    "            fi",
+    "            echo \"::warning::PR file metadata changed during attempt ${attempt}; retrying.\"",
+    "          done",
+    "          [ \"$stable\" = true ] || exit 1",
+    "          helper=trusted-scope/.github/scripts/changed_files.py",
+    "          if [ -f \"$helper\" ]; then",
+    "            result=$(python3 trusted-scope/.github/scripts/changed_files.py \\",
+    "              \"$pages_file\" \"$current_changed\" rust)",
+    "          else",
+    "            echo \"::warning::Trusted path classifier is not present on the PR base; running Rust CI fail-safe.\"",
+    "            result='{\"complete\":false,\"matches\":true}'",
+    "          fi",
+    "          rust=$(jq -r '.matches' <<< \"$result\")",
+    "          if [ \"$(jq -r '.complete' <<< \"$result\")\" != true ]; then",
+    "            echo \"::warning::Changed-file pagination was incomplete; running Rust CI fail-safe.\"",
+    "            rust=true",
+    "          fi",
+    "          echo \"rust=$rust\" >> \"$GITHUB_OUTPUT\"",
+]
+
+RUST_CI_FMT_STEP = [
+    "name: cargo fmt --check",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        run: cargo fmt --all -- --check",
+]
+
+RUST_CI_CLIPPY_STEP = [
+    "name: cargo clippy",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        run: cargo clippy --all-targets -- -D warnings",
+]
+
+RUST_CI_TEST_STEP = [
+    "name: cargo test",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        run: |",
+    "          set -euo pipefail",
+    "          cargo test --test unit_tests",
+    "          cargo test --lib",
+    "          lib_tests=$(cargo test --lib -- --list --format terse)",
+    "          for suite in 'secrets::plugin_config::tests::' 'apply::api_target::prepared_apply_tests::'; do",
+    "            grep -q \"^${suite}.*: test\\$\" <<< \"$lib_tests\" || {",
+    "              echo \"::error::cargo test --lib no longer lists ${suite} tests\"",
+    "              exit 1",
+    "            }",
+    "          done",
+]
+
+def required_static_validation_violations(text: str) -> list[str]:
+    """The required static-validation context must keep its exact verdict job.
+
+    `gitforgeops-required-static-validation` is a required status context
+    whose home workflow a candidate controls. Substring checks once let a
+    job keep the markers while skipping the checks they name, so the whole
+    job — needs, condition, environment wiring and the verdict script — is
+    pinned exactly: its green result must entail that every applicable
+    validation job ran and passed. Changing the job means changing this
+    protected pin first.
+    """
+    job = workflow_job(text, "gitforgeops-required-static-validation")
+    if _active_lines(job) != REQUIRED_STATIC_VALIDATION_JOB:
+        return [
+            "validate-pr.yml: the gitforgeops-required-static-validation job "
+            "must keep its reviewed needs, always() condition, result wiring "
+            "and verdict script exactly; a green required context must entail "
+            "that every applicable validation job ran and passed"
+        ]
+    return []
+
+
 def rust_ci_test_scope_violations(text: str) -> list[str]:
     """Rust CI must execute the library target unfiltered, beside the suite.
 
     Inline `#[cfg(test)]` modules compile under clippy's `--all-targets` but
     only run under `cargo test --lib`. A name filter on that command once
     skipped every library test but one, and coverage measured only the
-    aggregated binary. Exact lines keep a filtered or dropped invocation
-    from satisfying the gate.
+    aggregated binary. `rust-ci-check` is a required home job, so its gate
+    steps — the trusted scope classifier that decides whether they run,
+    then fmt, clippy and test — are pinned exactly, conditions and scripts
+    included: keeping the two `cargo test` lines while adding an early
+    successful exit, a swallowed failure or a weaker condition must not
+    satisfy the gate.
     """
     violations: list[str] = []
+    job = workflow_job(text, "rust-ci-check")
+    header = [
+        line for line in _active_lines(job.split("    steps:", 1)[0])
+    ]
+    if header != ["    runs-on: ubuntu-26.04"]:
+        violations.append(
+            "rust-ci.yml: rust-ci-check must keep its reviewed job header "
+            "(no job condition, needs or continue-on-error)"
+        )
+    for step_name, exact in (
+        ("Check out trusted path classifier", RUST_CI_TRUSTED_CHECKOUT_STEP),
+        ("Detect Rust-impacting PR paths", RUST_CI_SCOPE_STEP),
+        ("cargo fmt --check", RUST_CI_FMT_STEP),
+        ("cargo clippy", RUST_CI_CLIPPY_STEP),
+        ("cargo test", RUST_CI_TEST_STEP),
+    ):
+        if policy_step(job, step_name) != exact:
+            violations.append(
+                f"rust-ci.yml: the {step_name!r} step must keep its reviewed "
+                "condition and script exactly"
+            )
     test_lines = [
         line.strip()
-        for line in policy_step(workflow_job(text, "rust-ci-check"), "cargo test")
+        for line in policy_step(job, "cargo test")
     ]
     for command in ("cargo test --test unit_tests", "cargo test --lib"):
         if command not in test_lines:
@@ -5678,11 +5859,10 @@ def main(argv: list[str] | None = None) -> int:
         violations.append(
             "validate-pr.yml: a path-filtered workflow cannot provide a stable required check"
         )
+    violations.extend(required_static_validation_violations(static_review))
     for required in (
         "trusted-scope/.github/scripts/changed_files.py",
         "ref: ${{ github.event.repository.default_branch }}",
-        "gitforgeops-required-static-validation:",
-        "if: always()",
     ):
         if required not in static_review:
             violations.append(

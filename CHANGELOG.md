@@ -402,6 +402,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Required home jobs are pinned exactly in the supply-chain checker
+  (#566). The `gitforgeops-required-static-validation` verdict job
+  (needs, `always()`, result wiring and script) and `rust-ci-check`'s
+  trusted scope, fmt, clippy and test steps were previously checked by
+  substrings/membership, so a candidate could keep the markers while
+  exiting successfully before the gates ran. Both now compare the
+  complete job/step shapes, so a green required context entails that the
+  checks ran. Changing either job means updating the protected pin first.
+
 - The supply-chain checker's cache scanner reads candidate-referenced
   local actions and reusable workflows through one fail-closed reader
   (#567): plain in-tree path components only, the resolved path must be
