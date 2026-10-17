@@ -397,6 +397,17 @@ fn write_atomically(
     bytes: &[u8],
     permissions: PublicationPermissions,
 ) -> crate::error::Result<()> {
+    // A private publication carries live credentials. Only Unix can
+    // establish the owner-only mode it promises; on any other platform
+    // refuse before a single secret byte is written rather than publish
+    // under whatever ACL the destination directory happens to inherit.
+    #[cfg(not(unix))]
+    if matches!(permissions, PublicationPermissions::Private) {
+        return Err(crate::error::Error::Config(format!(
+            "private export to {} requires owner-only file permissions this platform cannot enforce; refusing to write credential bytes",
+            path.display()
+        )));
+    }
     if destination_needs_direct_write(path) {
         return match permissions {
             PublicationPermissions::Regular => write_directly(path, bytes),
@@ -541,7 +552,15 @@ fn apply_destination_permissions(
 fn apply_destination_permissions(
     _dest: &Path,
     _temp: &Path,
-    _policy: PublicationPermissions,
+    policy: PublicationPermissions,
 ) -> crate::error::Result<()> {
-    Ok(())
+    // Defense in depth: `write_atomically` already refuses private
+    // publications off Unix before any bytes are written.
+    match policy {
+        PublicationPermissions::Regular => Ok(()),
+        PublicationPermissions::Private => Err(crate::error::Error::Config(
+            "private publication requires owner-only file permissions this platform cannot enforce"
+                .to_string(),
+        )),
+    }
 }

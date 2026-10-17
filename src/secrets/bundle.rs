@@ -384,6 +384,7 @@ pub fn remove_bundle_handoff(path: &Path) -> crate::error::Result<()> {
 /// place — never a partially written file, never a world-readable one. The
 /// destination must be a regular file or absent; a symlink, pipe or device is
 /// refused rather than written through.
+#[cfg(unix)]
 pub fn write_bundle_handoff(
     path: &Path,
     shards: &BTreeMap<u32, CredentialBundle>,
@@ -401,7 +402,6 @@ pub fn write_bundle_handoff(
     };
     let mut builder = tempfile::Builder::new();
     builder.prefix(".gitforgeops-creds-").suffix(".tmp");
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o600));
@@ -413,6 +413,19 @@ pub fn write_bundle_handoff(
     temp.persist(path)
         .map_err(|error| crate::error::Error::Io(error.error))?;
     Ok(())
+}
+
+/// Plaintext credential material: only Unix can establish the owner-only
+/// mode the handoff promises, so refuse off Unix before any byte is written.
+#[cfg(not(unix))]
+pub fn write_bundle_handoff(
+    path: &Path,
+    _shards: &BTreeMap<u32, CredentialBundle>,
+) -> crate::error::Result<()> {
+    Err(crate::error::Error::Config(format!(
+        "credential handoff to {} requires owner-only file permissions this platform cannot enforce; refusing to write credential bytes",
+        safe_line(path.display())
+    )))
 }
 
 /// Pick a shard for a new slot.
