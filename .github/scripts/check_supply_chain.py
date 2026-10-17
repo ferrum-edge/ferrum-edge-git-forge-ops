@@ -1285,13 +1285,16 @@ def _cache_key_documents(
             continue
         seen.add(reference)
         if reference.startswith("./.github/workflows/"):
-            path = root / reference[2:].split("@", 1)[0]
+            relative = reference[2:].split("@", 1)[0]
+            text, refusal = _read_contained_reference(root, tuple(relative.split("/")))
+            if text is None:
+                violations.append(f"{label}: cache keys in {reference} cannot be read: {refusal}")
+                continue
             try:
-                nested = parse_workflow(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, WorkflowSyntaxError) as error:
+                nested = parse_workflow(text)
+            except WorkflowSyntaxError as error:
                 violations.append(f"{label}: cache keys in {reference} cannot be read: {error}")
                 continue
-            relative = reference[2:]
         else:
             relative, nested, refusal = resolve_local_action(root, reference)
             if nested is None:
@@ -3946,6 +3949,51 @@ LOCAL_ACTION_FILES = ("action.yml", "action.yaml")
 _LOCAL_ACTION_COMPONENT = re.compile(r"[A-Za-z0-9_.-]+")
 
 
+# A candidate-referenced document is read by the trusted policy job, so its
+# size is bounded before it is opened: an unbounded read of a huge regular
+# file (or, before containment was enforced, a device) can exhaust the job.
+MAX_REFERENCED_DOCUMENT_BYTES = 1024 * 1024
+
+
+def _read_contained_reference(root: Path, parts: tuple[str, ...]) -> tuple[str | None, str | None]:
+    """Read one candidate-referenced file, fail-closed.
+
+    The reference comes from candidate YAML, so nothing about it is trusted:
+    every component must be a plain path component, the resolved path must
+    be exactly the in-tree path those components name (no symbolic link
+    anywhere along it), the target must be a regular file, and its size is
+    capped before and while it is read. Returns `(text, None)` or
+    `(None, refusal)`.
+    """
+    if not parts or any(
+        part in ("", ".", "..") or not _LOCAL_ACTION_COMPONENT.fullmatch(part) for part in parts
+    ):
+        return None, "must name a file inside the tree by a plain path"
+    path = root.joinpath(*parts)
+    expected = Path(os.path.realpath(root)).joinpath(*parts)
+    if Path(os.path.realpath(path)) != expected:
+        return None, "must be a regular file inside the tree reached through no symbolic link"
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        return None, f"cannot be read: {error}"
+    if not stat.S_ISREG(info.st_mode):
+        return None, "must be a regular file inside the tree reached through no symbolic link"
+    if info.st_size > MAX_REFERENCED_DOCUMENT_BYTES:
+        return None, f"exceeds the {MAX_REFERENCED_DOCUMENT_BYTES}-byte referenced-document limit"
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_REFERENCED_DOCUMENT_BYTES + 1)
+    except OSError as error:
+        return None, f"cannot be read: {error}"
+    if len(data) > MAX_REFERENCED_DOCUMENT_BYTES:
+        return None, f"exceeds the {MAX_REFERENCED_DOCUMENT_BYTES}-byte referenced-document limit"
+    try:
+        return data.decode("utf-8"), None
+    except UnicodeDecodeError as error:
+        return None, f"is not valid UTF-8: {error}"
+
+
 def resolve_local_action(root: Path, reference: str) -> tuple[str, dict | None, str | None]:
     """The action file a `./` reference runs and its parsed document, or a refusal."""
     parts = reference[2:].removesuffix("/").split("/")
@@ -3967,12 +4015,12 @@ def resolve_local_action(root: Path, reference: str) -> tuple[str, dict | None, 
         return reference, None, "must resolve to exactly one action.yml or action.yaml"
     path = found[0]
     relative = "/".join((*parts, path.name))
-    expected = Path(os.path.realpath(root)).joinpath(*parts, path.name)
-    if Path(os.path.realpath(path)) != expected or not path.is_file():
-        return relative, None, "must be a regular file reached through no symbolic link"
+    text, refusal = _read_contained_reference(root, (*parts, path.name))
+    if text is None:
+        return relative, None, refusal
     try:
-        document = parse_workflow(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, WorkflowSyntaxError) as error:
+        document = parse_workflow(text)
+    except WorkflowSyntaxError as error:
         return relative, None, f"is outside the YAML subset the policy reads: {error}"
     runs = document.get("runs")
     if (

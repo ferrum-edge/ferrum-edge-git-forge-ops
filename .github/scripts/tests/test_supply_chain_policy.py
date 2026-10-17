@@ -7089,6 +7089,45 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("trusted-pr-review-" in item for item in violations), violations
         )
 
+    def test_cache_reference_cannot_escape_the_tree(self):
+        # #567: a candidate `uses:` reaches the cache scanner as data. A
+        # reusable-workflow reference with parent components (or an oversized
+        # target) must be refused before anything outside — or unbounded
+        # inside — the checkout is read.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflows = root / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            (root / "outside.yml").write_text("name: outside\n", encoding="utf-8")
+            (workflows / "nested.yml").write_text("name: nested\n", encoding="utf-8")
+            (workflows / "huge.yml").write_bytes(
+                b"name: huge\n"
+                + b"# padding\n" * (check_supply_chain.MAX_REFERENCED_DOCUMENT_BYTES // 10)
+            )
+
+            def scan(reference):
+                violations = []
+                documents = check_supply_chain._cache_key_documents(
+                    root,
+                    "caller.yml",
+                    {"jobs": {"call": {"uses": reference}}},
+                    set(),
+                    violations,
+                )
+                return documents, violations
+
+            documents, violations = scan("./.github/workflows/../../outside.yml")
+            self.assertEqual(len(documents), 1)
+            self.assertTrue(any("plain path" in item for item in violations), violations)
+
+            documents, violations = scan("./.github/workflows/huge.yml")
+            self.assertEqual(len(documents), 1)
+            self.assertTrue(any("exceeds" in item for item in violations), violations)
+
+            documents, violations = scan("./.github/workflows/nested.yml@v1")
+            self.assertEqual(violations, [])
+            self.assertEqual(len(documents), 2)
+
     def test_pr_code_cache_cannot_share_a_privileged_key_family(self):
         # #547: validate-pr builds PR code into `target/`; the privileged
         # workflows restore `<os>-cargo-<lock>`. Reusing that family in any
