@@ -334,18 +334,30 @@ fn executable_bits_set(_meta: &std::fs::Metadata) -> bool {
 }
 
 /// Create a temp file with owner-only permissions on unix.
+#[cfg(unix)]
 fn private_temp_file(
     prefix: &str,
     suffix: &str,
 ) -> std::io::Result<tempfile::NamedTempFile<std::fs::File>> {
+    use std::os::unix::fs::PermissionsExt;
     let mut builder = tempfile::Builder::new();
     builder.prefix(prefix).suffix(suffix);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        builder.permissions(std::fs::Permissions::from_mode(0o600));
-    }
+    builder.permissions(std::fs::Permissions::from_mode(0o600));
     builder.tempfile()
+}
+
+/// The assembled spec can contain resolved live credentials. Off Unix
+/// there is no owner-only mode to establish before those bytes land, so
+/// fail closed instead of writing them under an inherited ACL.
+#[cfg(not(unix))]
+fn private_temp_file(
+    _prefix: &str,
+    _suffix: &str,
+) -> std::io::Result<tempfile::NamedTempFile<std::fs::File>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "validating a credential-bearing spec requires owner-only temp files this platform cannot enforce",
+    ))
 }
 
 /// Assemble a temporary YAML spec from `GatewayConfig`, shell out to
