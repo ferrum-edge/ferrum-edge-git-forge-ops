@@ -91,6 +91,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Secret-bearing file writes fail closed off Unix (#568). A private
+  (materialized-credential) export, an import credential bundle, the
+  credential bundle handoff, and validation's credential-bearing temp spec
+  previously reported success on non-Unix platforms without establishing a
+  restrictive ACL, leaving the bytes under whatever ACL the destination
+  inherited. They now refuse before any secret byte is written on a
+  platform that cannot enforce owner-only permissions. Unix behavior and
+  ordinary (non-private) publications are unchanged.
+
 - The release gate also accepts the Agent Setup Policy's
   `validate-trusted-policy` check (#565): absent is tolerated until the `main`
   ruleset requires it, but a reported result must pass and a required one is
