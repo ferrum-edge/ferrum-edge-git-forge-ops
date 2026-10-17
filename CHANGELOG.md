@@ -402,6 +402,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- The supply-chain checker's cache scanner reads candidate-referenced
+  local actions and reusable workflows through one fail-closed reader
+  (#567): plain in-tree path components only, the resolved path must be
+  exactly the named in-tree regular file with no symbolic link along it,
+  and reads are capped at 1 MiB before and while reading. A `uses:`
+  reference with parent components can no longer make the trusted policy
+  job open a file outside the candidate checkout.
+
 - Finish bounding error bodies and validator I/O (follow-up to #553). The
   gateway's structured `error` message is now one bounded line like every
   other displayed error body, and a failed PR-comment POST reads GitHub's
