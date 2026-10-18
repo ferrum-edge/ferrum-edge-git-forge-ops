@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process;
 
@@ -14,6 +13,7 @@ use gitforgeops::config::{
 use gitforgeops::config_export;
 use gitforgeops::diagnostics::{safe, safe_block, safe_line, safe_path};
 use gitforgeops::diff;
+use gitforgeops::display;
 use gitforgeops::http_client::conditional::PreparedConsumerRotation;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
@@ -25,6 +25,7 @@ use gitforgeops::secrets;
 use gitforgeops::state::{AllocationBinding, StateFile};
 use gitforgeops::validate;
 use gitforgeops::verdict::{self, ApplyGateInputs};
+use gitforgeops::{eout, eoutln, out, outln};
 
 // Keep human-readable reports on stderr when stdout carries a JSON document.
 macro_rules! reportln {
@@ -33,16 +34,46 @@ macro_rules! reportln {
     };
     ($json_mode:expr, $($args:tt)*) => {
         if $json_mode {
-            eprintln!($($args)*);
+            eoutln!($($args)*);
         } else {
-            println!($($args)*);
+            outln!($($args)*);
         }
     };
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let cli = cli::Cli::parse();
+    // Everything this process shows goes through `display`, which removes
+    // every secret the run resolves, generates or sends. Register from here
+    // on, and start with the tokens in the environment: a peer's text can
+    // echo them.
+    display::enable_display_scrubbing();
+    display::install_panic_hook();
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "FERRUM_GH_PROVISIONER_TOKEN",
+        "FERRUM_ADMIN_JWT_SECRET",
+        "FERRUM_ADMIN_JWT_VIEWER_SECRET",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            if let Err(error) = display::register_values(name, [value]) {
+                eoutln!("Error: {}", safe_block(&error));
+                process::exit(1);
+            }
+        }
+    }
+    // Help, version and usage errors go through the sink like everything
+    // else.
+    let cli = cli::Cli::try_parse().unwrap_or_else(|error| {
+        let rendered = error.render().to_string();
+        if error.use_stderr() {
+            eout!("{rendered}");
+        } else {
+            out!("{rendered}");
+        }
+        process::exit(error.exit_code());
+    });
     let explicit_env = cli.env.clone();
     // `--allow-credential-slot-remap` downgrades the credential-slot-remap
     // refusal to a report. The reporting commands (`diff`, `plan`, `review`)
@@ -192,11 +223,15 @@ async fn main() {
         }
     };
 
-    if let Err(e) = result {
+    if let Err(e) = display::registration_result()
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        .and(result)
+    {
         // Last line of defense for anything a printer below did not
         // already sanitize: an error Display can carry a resource id, a
-        // YAML path or a gateway response body.
-        eprintln!("Error: {}", safe_block(&e));
+        // YAML path or a gateway response body. The sink removes the run's
+        // secrets from it: a peer's error text can reflect them.
+        eoutln!("Error: {}", safe_block(&e));
         process::exit(1);
     }
 }
@@ -316,11 +351,11 @@ fn print_namespace_finding(finding: &config::NamespaceFilterFinding) {
     } else {
         "Warning"
     };
-    eprintln!("{stream}: {}", safe_block(&finding.message));
+    eoutln!("{stream}: {}", safe_block(&finding.message));
 }
 
 fn print_live_filter_warning(message: &str) {
-    eprintln!("Warning: {}", safe_block(message));
+    eoutln!("Warning: {}", safe_block(message));
 }
 
 fn attach_validate_scope(
@@ -370,7 +405,7 @@ fn print_or_collect_scope_json(
     extra: serde_json::Value,
 ) {
     if !json_mode {
-        println!("{}", scope.text_line());
+        outln!("{}", scope.text_line());
         return;
     }
     let mut document = scope.json_fields();
@@ -399,7 +434,7 @@ fn print_or_collect_scope_json(
             }
         }
     }
-    println!(
+    outln!(
         "{}",
         serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_string())
     );
@@ -645,6 +680,8 @@ fn write_review_to_step_summary(comment: &str) -> Result<(), Box<dyn std::error:
         Ok(p) if !p.trim().is_empty() => p,
         _ => return Ok(()),
     };
+    // Shown in the job summary: through the display sink like stdout.
+    let comment = &display::scrub_text(comment);
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -681,32 +718,35 @@ async fn surface_delivered_credentials(
         return Ok(());
     }
 
-    let mut body = String::from("## GitForgeOps — New Credentials Allocated\n\n");
-    body.push_str(
+    // The ciphertext is data for the recipient: written byte for byte, while
+    // the text around it goes through the display sink.
+    let mut body = display::Composed::new();
+    body.text("## GitForgeOps — New Credentials Allocated\n\n");
+    body.text(
         "The credentials below were generated during apply. Each blob is age-encrypted to the recipient's GitHub-published SSH key. Decrypt locally:\n\n",
     );
-    body.push_str("```\nage -d -i ~/.ssh/id_ed25519 < blob.age\n```\n\n");
+    body.text("```\nage -d -i ~/.ssh/id_ed25519 < blob.age\n```\n\n");
 
     let mut undelivered: Vec<&str> = Vec::new();
 
     for slot in &outcome.allocated {
-        body.push_str(&format!("### `{}`\n\n", slot.slot));
+        body.text(format!("### `{}`\n\n", slot.slot));
         match &slot.delivered {
             Some(d) => {
-                body.push_str(&format!(
+                body.text(format!(
                     "Encrypted to **@{}** (SSH fingerprint `{}`):\n\n",
                     d.login, d.key_fingerprint
                 ));
-                body.push_str("```\n");
-                body.push_str(&d.encrypted_b64);
+                body.text("```\n");
+                body.data(d.encrypted_b64.as_str());
                 if !d.encrypted_b64.ends_with('\n') {
-                    body.push('\n');
+                    body.text("\n");
                 }
-                body.push_str("```\n\n");
+                body.text("```\n\n");
             }
             None => {
                 undelivered.push(slot.slot.as_str());
-                body.push_str(
+                body.text(
                     "**NOT DELIVERED** — the recipient had no SSH key on file or was not provided. Run `gitforgeops rotate` after adding an SSH key to deliver the value.\n\n",
                 );
             }
@@ -721,9 +761,9 @@ async fn surface_delivered_credentials(
         && env_config.github_repository.is_some();
 
     if let (Some(pr), true) = (pr_number, can_post_pr) {
-        match review::post_pr_comment(env_config, pr, &body).await {
+        match review::post_composed_pr_comment(env_config, pr, &body).await {
             Ok(()) => {
-                eprintln!(
+                eoutln!(
                     "Posted encrypted credential delivery to PR #{pr} ({} slot(s)).",
                     outcome.allocated.len()
                 );
@@ -732,7 +772,7 @@ async fn surface_delivered_credentials(
             Err(e) => {
                 // Fall through to stdout — losing the blob is worse than
                 // double-printing it.
-                eprintln!(
+                eoutln!(
                     "Warning: failed to post credentials to PR #{pr}: {e}. Falling back to stdout."
                 );
             }
@@ -740,10 +780,11 @@ async fn surface_delivered_credentials(
     }
 
     // Stdout fallback. Also warn if any slots weren't delivered at all.
-    println!();
-    println!("{}", body);
+    outln!();
+    body.text("\n");
+    display::write_composed_stdout(&body);
     if !undelivered.is_empty() {
-        eprintln!(
+        eoutln!(
             "Warning: {} slot(s) could not be delivered (no recipient SSH key): {}",
             undelivered.len(),
             safe(undelivered.join(", "))
@@ -1146,10 +1187,10 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
     if findings.is_empty() {
         return;
     }
-    eprintln!("=== Security Findings ===");
+    eoutln!("=== Security Findings ===");
     let blockers = diff::security_blockers(findings);
     for finding in &blockers {
-        eprintln!(
+        eoutln!(
             "  [{}] {} {} ({}): {}",
             safe(&finding.severity),
             safe(&finding.kind),
@@ -1162,7 +1203,7 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
         .iter()
         .filter(|finding| finding.severity != diff::BLOCKING_SEVERITY)
     {
-        eprintln!(
+        eoutln!(
             "  [{}] {} {} ({}): {}",
             safe(&finding.severity),
             safe(&finding.kind),
@@ -1171,7 +1212,7 @@ fn print_security_findings(findings: &[diff::SecurityFinding]) {
             safe_line(&finding.message)
         );
     }
-    eprintln!();
+    eoutln!();
 }
 
 /// Best-effort post-apply convergence line. Never fails an apply — a gateway
@@ -1463,9 +1504,9 @@ fn report_plan_validation(
             } else {
                 reportln!(json_mode, "{label}: FAILED");
                 if json_mode {
-                    eprint!("{}", safe_block(&r.stderr));
+                    eout!("{}", safe_block(&r.stderr));
                 } else {
-                    print!("{}", safe_block(&r.stderr));
+                    out!("{}", safe_block(&r.stderr));
                 }
             }
             r.success
@@ -1527,7 +1568,7 @@ fn cmd_validate(
         desired_finding.as_ref(),
         None,
     );
-    print!("{}", formatted);
+    out!("{}", formatted);
 
     // A failure in either document is a failure overall: both get published,
     // and a node refusing either one is a broken deploy.
@@ -1565,10 +1606,7 @@ async fn cmd_export(
     if let Some(login) = encrypt_to {
         secrets::check_recipient_login(login)?;
     }
-    if materialize
-        && encrypt_to.is_none()
-        && output_path.is_none()
-        && std::io::stdout().is_terminal()
+    if materialize && encrypt_to.is_none() && output_path.is_none() && display::stdout_is_terminal()
     {
         return Err(
             "refusing to print materialized credentials to an interactive terminal; use --output PATH (written mode 0600) or --encrypt-to LOGIN"
@@ -1645,7 +1683,7 @@ async fn cmd_export(
         let client = build_github_api_client(&env_config)?;
         match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
             Some(delivery) => {
-                eprintln!(
+                eoutln!(
                     "Encrypted to @{} (ssh key {})",
                     safe(&delivery.login),
                     safe(&delivery.key_fingerprint)
@@ -1683,7 +1721,7 @@ async fn cmd_export(
         mesh_retraction_scope(&resolved, &mesh_state, &env_config.mesh_file_output_path),
     )?;
     match (&assembled.mesh, mesh_publication) {
-        (Some(mesh), apply::MeshPublication::Published) => eprintln!(
+        (Some(mesh), apply::MeshPublication::Published) => eoutln!(
             "Exported mesh document to {} ({})",
             env_config.mesh_file_output_path,
             safe_line(mesh_summary_line(mesh))
@@ -1692,7 +1730,7 @@ async fn cmd_export(
             if let Some(line) =
                 mesh_retraction_line(mesh_publication, &env_config.mesh_file_output_path, false)
             {
-                eprintln!("{line}");
+                eoutln!("{line}");
             }
         }
     }
@@ -1704,15 +1742,15 @@ async fn cmd_export(
             } else {
                 apply::publish_export(path, &payload)?;
             }
-            eprintln!("Exported to {}", path);
+            eoutln!("Exported to {}", path);
         }
         None => {
             if plaintext_materialized {
-                eprintln!(
+                eoutln!(
                     "WARNING: writing plaintext materialized credentials to non-interactive stdout; ensure the receiving process and destination are private. Prefer --output PATH (mode 0600) or --encrypt-to LOGIN."
                 );
             }
-            std::io::stdout().write_all(&payload)?;
+            display::write_data_stdout(&payload)?;
         }
     }
 
@@ -1767,7 +1805,7 @@ fn unverified_secrets_refusal() -> gitforgeops::error::Error {
 /// it as a warning rather than as a match (0) or a failed check (1). Drift
 /// found on the same read is real and keeps the drift exit code.
 fn exit_secrets_unverified() -> ! {
-    eprintln!(
+    eoutln!(
         "Note: --exit-on-drift found no drift in the alerted categories, but no fingerprint baseline was supplied and fingerprinted secret fields were not verified (see the notes above), so it does not return the in-sync (0) result; exiting {} (in sync, secrets unverified). Compare against a complete fingerprint baseline under the gateway's current key, or pass --accept-unverified-secrets to exit 0.",
         verdict::SECRETS_UNVERIFIED_EXIT_CODE
     );
@@ -1808,7 +1846,7 @@ async fn load_export_pairs_for(
         let unresolved_ns = config::filter_config_by_namespace(unresolved, namespace);
         let export = client.get_config_export(&endpoint, namespace).await?;
         if let Some(notice) = &export.count_seal_notice {
-            eprintln!(
+            eoutln!(
                 "Warning: GET /config/export for namespace '{}' returned counts that do not match the document ({}). Resource data is used as received.",
                 safe(namespace),
                 safe_line(notice)
@@ -1836,15 +1874,15 @@ fn print_fingerprint_notes(
     baseline_found: bool,
 ) {
     if baseline_requested && !baseline_found {
-        eprintln!(
+        eoutln!(
             "Note: the fingerprint baseline file does not exist yet; no secret could be checked for changes."
         );
     }
     for note in &summary.notes {
-        eprintln!("Note: {}.", safe_line(note));
+        eoutln!("Note: {}.", safe_line(note));
     }
     if summary.masked_ancestors > 0 {
-        eprintln!(
+        eoutln!(
             "Note: the gateway fingerprinted {} whole value(s) that contain a secret, so their non-secret contents were not compared either. No baseline or flag makes such a run authoritative.",
             summary.masked_ancestors
         );
@@ -1853,12 +1891,12 @@ fn print_fingerprint_notes(
         return;
     }
     if summary.baseline_complete {
-        eprintln!(
+        eoutln!(
             "Note: {} fingerprinted secret field(s) on declared resources were compared with the fingerprint baseline, not with the repository: the result says whether each changed since the baseline was recorded, not whether it matches the repository.",
             summary.uncompared
         );
     } else {
-        eprintln!(
+        eoutln!(
             "Note: {} fingerprinted secret field(s) on declared resources were not verified. GET /config/export fingerprints secrets with a key derived from the gateway's admin secret, so the viewer credential cannot compute the fingerprint of the repository's value. Pass --fingerprint-baseline with a baseline recorded by --write-fingerprint-baseline to detect changes between exports.",
             summary.uncompared
         );
@@ -1895,7 +1933,7 @@ async fn cmd_diff(
     baseline_files.extend(flags.read.iter().chain(&flags.write));
     for path in baseline_files {
         if let Some(root) = config_export::enclosing_git_worktree(path) {
-            eprintln!(
+            eoutln!(
                 "Warning: fingerprint baseline {} is inside the git worktree at {}. It holds keyed fingerprints only, but keep it outside the repository so it is never committed.",
                 safe_path(path),
                 safe_path(&root)
@@ -1997,13 +2035,13 @@ async fn cmd_diff(
         "backup (GET /backup)"
     };
     if read_export {
-        eprintln!(
+        eoutln!(
             "Note: live state was read from GET /config/export with the viewer credential (FERRUM_ADMIN_JWT_VIEWER_SECRET). The export strips api_spec_id, so API-spec-owned rows are compared like any other live row and spec ownership conflicts are not detected; plan and review read GET /backup and do detect them."
         );
     }
     let cached_namespaces = cached_namespace_names(&namespace_pairs);
     if !cached_namespaces.is_empty() {
-        eprintln!(
+        eoutln!(
             "Warning: diff is approximate because cached {live_source} data was served for namespace(s) {}. The cached snapshot may be older than the configuration database, and API-spec ownership metadata is unavailable, so no authoritative sync or drift decision is possible until the gateway serves a database read again.",
             safe(cached_namespaces.join(", "))
         );
@@ -2022,7 +2060,7 @@ async fn cmd_diff(
             diff::mask_indeterminate_secret_values(&desired, &mut pair.actual, &secret_report);
         }
         if let Some(note) = secret_report.unresolved_comparison_note() {
-            eprintln!("Note: {}", safe_block(note));
+            eoutln!("Note: {}", safe_block(note));
         }
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
@@ -2074,7 +2112,7 @@ async fn cmd_diff(
                 diffs.len(),
                 fingerprint_changes.len()
             );
-            eprintln!("Warning: {reason}.");
+            eoutln!("Warning: {reason}.");
             baseline_refusal = Some(gitforgeops::error::Error::Config(reason));
         }
     }
@@ -2086,7 +2124,7 @@ async fn cmd_diff(
             recorded.record(export);
         }
         recorded.write(path)?;
-        eprintln!(
+        eoutln!(
             "Recorded secret fingerprints for {} namespace(s) in {}.",
             comparison.exports.len(),
             safe_path(path)
@@ -2195,15 +2233,15 @@ async fn cmd_diff(
         // out-of-sync on their own.
         print_spec_owned(&spec_owned);
         if !cached_namespaces.is_empty() {
-            println!(
+            outln!(
                 "No differences found in the cached snapshot. Authoritative sync status is unavailable."
             );
         } else if !fingerprints_verified || !fields_authoritative {
-            println!(
+            outln!(
                 "No differences found in the compared fields. Fingerprinted secret fields were not verified (see the note above)."
             );
         } else {
-            println!("No differences found. Configuration is in sync.");
+            outln!("No differences found. Configuration is in sync.");
         }
         if let Some(error) = refusal {
             return Err(error.into());
@@ -2215,14 +2253,14 @@ async fn cmd_diff(
     }
 
     if !diffs.is_empty() {
-        println!("Found {} difference(s):\n", diffs.len());
+        outln!("Found {} difference(s):\n", diffs.len());
         for d in &diffs {
             let action = match d.action {
                 diff::DiffAction::Add => "ADD",
                 diff::DiffAction::Modify => "MODIFY",
                 diff::DiffAction::Delete => "DELETE",
             };
-            println!(
+            outln!(
                 "  {} {} {} ({})",
                 action,
                 safe(&d.kind),
@@ -2234,9 +2272,9 @@ async fn cmd_diff(
                     // Consumer credentials and plugin config can carry actual
                     // secret material. Printing them here would leak to CI
                     // logs, which are visible to anyone with run access.
-                    println!("    {}: [REDACTED] -> [REDACTED]", safe(&change.field));
+                    outln!("    {}: [REDACTED] -> [REDACTED]", safe(&change.field));
                 } else {
-                    println!(
+                    outln!(
                         "    {}: {} -> {}",
                         safe(&change.field),
                         safe_line(&change.old_value),
@@ -2248,12 +2286,12 @@ async fn cmd_diff(
     }
 
     if !fingerprint_changes.is_empty() {
-        println!(
+        outln!(
             "\nSecret fields changed since the fingerprint baseline ({}):",
             fingerprint_changes.len()
         );
         for change in fingerprint_changes {
-            println!(
+            outln!(
                 "  {} {} {} ({}) {}",
                 change.change.label(),
                 safe(&change.kind),
@@ -2262,23 +2300,23 @@ async fn cmd_diff(
                 safe(&change.pointer)
             );
         }
-        println!();
+        outln!();
     }
 
     if let Some(note) = apply::incremental_prune_notice(&resolved.apply_strategy, &diffs) {
-        println!("{}\n", safe_block(note));
+        outln!("{}\n", safe_block(note));
     }
     if let Some(note) = plugin_attach_notice {
-        println!("{}\n", safe_block(note));
+        outln!("{}\n", safe_block(note));
     }
 
     if !unmanaged.is_empty() && resolved.ownership.drift_report {
-        println!(
+        outln!(
             "\nUnmanaged resources (mode: {:?}, not touched by apply):",
             resolved.ownership.mode
         );
         for u in &unmanaged {
-            println!(
+            outln!(
                 "  {} {} ({})",
                 safe(&u.kind),
                 safe(&u.id),
@@ -2288,7 +2326,7 @@ async fn cmd_diff(
     }
 
     if !spec_owned.is_empty() {
-        println!();
+        outln!();
         print_spec_owned(&spec_owned);
     }
 
@@ -2296,7 +2334,7 @@ async fn cmd_diff(
         return Err(error.into());
     }
     if exit_on_drift && drift.has_drift() {
-        println!(
+        outln!(
             "Drift detected ({}); exiting {}.",
             safe(drift.reasons().join(", ")),
             verdict::DRIFT_EXIT_CODE
@@ -2509,12 +2547,12 @@ async fn cmd_plan(
             Err(e @ gitforgeops::error::Error::BackupNamespace(_))
             | Err(e @ gitforgeops::error::Error::DuplicateLiveResource(_)) => return Err(e.into()),
             Err(e) => {
-                eprintln!("Could not fetch live config: {}", safe_block(e));
+                eoutln!("Could not fetch live config: {}", safe_block(e));
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
             }
         },
         Err(e) => {
-            eprintln!("Could not create API client: {}", safe_block(e));
+            eoutln!("Could not create API client: {}", safe_block(e));
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false, None)
         }
     };
@@ -2956,14 +2994,14 @@ async fn cmd_apply(
         let blocker_count = gate.count;
         match &override_approver {
             Some(approver) => {
-                eprintln!(
+                eoutln!(
                     "{blocker_count} error-severity security finding(s) overridden by @{}; continuing.",
                     safe(approver)
                 );
                 overridden_for_audit.push((SECURITY_AUDIT_RULE_ID.to_string(), approver.clone()));
             }
             None => {
-                eprintln!(
+                eoutln!(
                     "Refusing to apply: {blocker_count} error-severity security finding(s) listed above. \
                      Consumer credentials belong in the broker as ${{gh-env-secret:...}} placeholders; a literal \
                      value in repository YAML is a committed secret and applying it publishes it to the gateway. \
@@ -2973,11 +3011,11 @@ async fn cmd_apply(
                 );
                 match &override_decision {
                     Some(decision) if !decision.active => {
-                        eprintln!("(override inactive: {})", safe_block(&decision.reason))
+                        eoutln!("(override inactive: {})", safe_block(&decision.reason))
                     }
                     Some(_) => {}
                     None => {
-                        eprintln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE)
+                        eoutln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE)
                     }
                 }
                 return Err("unresolved security findings".into());
@@ -3011,7 +3049,7 @@ async fn cmd_apply(
         if let Some(message) =
             refuse_policy_violations(&findings, "", override_decision.as_ref(), None)
         {
-            eprint!("{message}");
+            eout!("{message}");
             return Err("unresolved policy violations".into());
         }
     }
@@ -3076,7 +3114,7 @@ async fn cmd_apply(
                 override_decision.as_ref(),
                 Some(&scrubber),
             ) {
-                eprint!("{message}");
+                eout!("{message}");
                 return Err("unresolved policy violations".into());
             }
         }
@@ -3087,12 +3125,12 @@ async fn cmd_apply(
     // that plans clean cannot refuse here.
     if verdict::required_credentials_blocker(&secret_report).is_some() {
         let missing = secret_report.missing_required();
-        eprintln!(
+        eoutln!(
             "Refusing to apply: {} required credential slot(s) have no value:",
             missing.len()
         );
         for m in missing {
-            eprintln!("  {}", safe(&m.slot));
+            eoutln!("  {}", safe(&m.slot));
         }
         return Err("required credential slots are missing".into());
     }
@@ -3107,8 +3145,8 @@ async fn cmd_apply(
     }?;
     if verdict::validation_blocker(val_result.success).is_some() {
         let formatted = validate::format_result(&val_result, validate::OutputFormat::Text);
-        eprint!("{}", formatted);
-        eprintln!("Refusing to apply because validation failed.");
+        eout!("{}", formatted);
+        eoutln!("Refusing to apply because validation failed.");
         return Err("validation failed".into());
     }
 
@@ -3120,15 +3158,15 @@ async fn cmd_apply(
         let mesh_result = validate::run_mesh_validation(mesh, &env_config.edge_binary_path)?;
         if verdict::validation_blocker(mesh_result.success).is_some() {
             let formatted = validate::format_result(&mesh_result, validate::OutputFormat::Text);
-            eprint!("{}", formatted);
-            eprintln!("Refusing to apply because mesh validation failed.");
+            eout!("{}", formatted);
+            eoutln!("Refusing to apply because mesh validation failed.");
             return Err("mesh validation failed".into());
         }
         if matches!(env_config.gateway_mode, GatewayMode::Api) {
             // There is no mesh admin API — no push endpoint, no `mesh`
             // section on /backup or /restore. Say so rather than letting an
             // api-mode apply look like it delivered the mesh document.
-            eprintln!(
+            eoutln!(
                 "Notice: {} mesh fragment(s) assembled, but FERRUM_GATEWAY_MODE=api has no mesh push path (ferrum-edge exposes no mesh admin API). Run `gitforgeops export` or a file-mode apply to publish {} for mesh nodes.",
                 safe_line(mesh_summary_line(mesh)),
                 env_config.mesh_file_output_path
@@ -3138,7 +3176,7 @@ async fn cmd_apply(
 
     let is_first_apply = StateFile::is_first_apply(&resolved.name)?;
     if is_first_apply && matches!(resolved.ownership.mode, OwnershipMode::Shared) {
-        eprintln!(
+        eoutln!(
             "Notice: first apply for environment '{}' in shared mode. Resources on the gateway but not in this repo will be treated as unmanaged and left alone.",
             safe(&resolved.name)
         );
@@ -3279,17 +3317,17 @@ async fn cmd_apply(
                     // Informational spec-owned rows are reported but do not
                     // manufacture a change to approve.
                     print_spec_owned(&spec_owned);
-                    println!("No changes to apply.");
+                    outln!("No changes to apply.");
                     return Ok(());
                 }
-                println!("Will apply {} change(s):", diffs.len());
-                println!("{}", gitforgeops::verdict::CONDITIONAL_APPLY_NOTICE);
+                outln!("Will apply {} change(s):", diffs.len());
+                outln!("{}", gitforgeops::verdict::CONDITIONAL_APPLY_NOTICE);
                 if let Some(note) = apply::incremental_plugin_attach_notice(
                     &resolved.apply_strategy,
                     &diffs,
                     &desired,
                 ) {
-                    println!("{}", safe_block(note));
+                    outln!("{}", safe_block(note));
                 }
                 for d in &diffs {
                     let action = match d.action {
@@ -3297,60 +3335,60 @@ async fn cmd_apply(
                         diff::DiffAction::Modify => "MODIFY",
                         diff::DiffAction::Delete => "DELETE",
                     };
-                    println!("  {} {} {}", action, safe(&d.kind), safe(&d.id));
+                    outln!("  {} {} {}", action, safe(&d.kind), safe(&d.id));
                 }
                 if let Some(note) =
                     apply::incremental_prune_notice(&resolved.apply_strategy, &diffs)
                 {
-                    println!("{}", safe_block(note));
+                    outln!("{}", safe_block(note));
                 }
                 if !adoptions.is_empty() {
-                    println!(
+                    outln!(
                         "\n{} already-matching resource(s) would be adopted into the ownership ledger:",
                         adoptions.len()
                     );
-                    println!("{}", apply::ADOPTION_PREVIEW_NOTICE);
+                    outln!("{}", apply::ADOPTION_PREVIEW_NOTICE);
                     for candidate in &adoptions {
-                        println!("  ADOPT {} {}", safe(&candidate.kind), safe(&candidate.id));
+                        outln!("  ADOPT {} {}", safe(&candidate.kind), safe(&candidate.id));
                     }
                 }
                 if !unmanaged.is_empty() {
-                    println!(
+                    outln!(
                         "\n{} unmanaged resource(s) on gateway (not touched in shared mode).",
                         unmanaged.len()
                     );
                 }
                 if !spec_owned.is_empty() {
-                    println!();
+                    outln!();
                     print_spec_owned(&spec_owned);
                 }
                 if !blocked.is_empty() {
-                    println!(
+                    outln!(
                         "\n{} namespace(s) would be refused; nothing in them would be written and \
                          no credential would be allocated for them:",
                         blocked.len()
                     );
                     for (namespace, reason) in &blocked {
-                        println!("  REFUSE [{}] {}", safe(namespace), safe_line(reason));
+                        outln!("  REFUSE [{}] {}", safe(namespace), safe_line(reason));
                     }
                 }
                 if let Some(error) = &preparation_error {
-                    println!(
+                    outln!(
                         "\nApply would stop before any write: {}",
                         safe_line(error.to_string())
                     );
                 }
                 let pending_creds = allocatable.needs_allocation();
                 if !pending_creds.is_empty() {
-                    println!(
+                    outln!(
                         "\n{} credential slot(s) would be allocated on apply:",
                         pending_creds.len()
                     );
                     for r in pending_creds {
-                        println!("  [new] {}", safe(&r.slot));
+                        outln!("  [new] {}", safe(&r.slot));
                     }
                 }
-                println!("\nUse --auto-approve to skip this check.");
+                outln!("\nUse --auto-approve to skip this check.");
                 return Ok(());
             }
 
@@ -3493,7 +3531,7 @@ async fn cmd_apply(
             let reconciled_pending =
                 state.reconcile_pending_creates(&desired, &actual_by_namespace, pending_scope);
             for warning in &reconciled_pending.warnings {
-                eprintln!("Warning: {}", safe_block(warning));
+                eoutln!("Warning: {}", safe_block(warning));
             }
             let reconciled_absent =
                 state.reconcile_absent_managed_resources(&desired, &actual_by_namespace);
@@ -3601,7 +3639,7 @@ async fn cmd_apply(
                     .collect();
                 held_back.sort_unstable();
                 held_back.dedup();
-                eprintln!(
+                eoutln!(
                     "Not allocating {} credential slot(s) in namespace(s) this apply refuses: {}",
                     withheld,
                     safe(held_back.join(", "))
@@ -3621,16 +3659,16 @@ async fn cmd_apply(
             .await?;
 
             if let Some(outcome) = &allocation {
-                eprintln!("Allocated {} credential slot(s):", outcome.allocated.len());
+                eoutln!("Allocated {} credential slot(s):", outcome.allocated.len());
                 for slot in &outcome.allocated {
                     match &slot.delivered {
-                        Some(d) => eprintln!(
+                        Some(d) => eoutln!(
                             "  {} -> @{} (ssh {})",
                             safe(&slot.slot),
                             safe(&d.login),
                             safe(&d.key_fingerprint)
                         ),
-                        None => eprintln!(
+                        None => eoutln!(
                             "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
                             safe(&slot.slot)
                         ),
@@ -3702,7 +3740,7 @@ async fn cmd_apply(
 
             // Print counts up front so partial-success runs surface what
             // landed even when we're about to propagate an error.
-            println!(
+            outln!(
                 "Applied: {} created, {} updated, {} deleted, {} deletes deferred, {} unmanaged skipped, {} spec-owned skipped",
                 raw.created,
                 raw.updated,
@@ -3712,7 +3750,7 @@ async fn cmd_apply(
                 raw.spec_owned_skipped
             );
             if let Some(line) = apply::adoption_summary_line(raw.adopted.len()) {
-                println!("{}", safe_block(line));
+                outln!("{}", safe_block(line));
             }
 
             // Pull the per-op records out before `into_result()` consumes
@@ -3737,7 +3775,7 @@ async fn cmd_apply(
             // — after a partial failure the divergence question is moot until
             // the errors above are dealt with.
             if deferred_apply_error.is_none() {
-                println!("{}", convergence_line(&client).await);
+                outln!("{}", convergence_line(&client).await);
             }
         }
         GatewayMode::File => {
@@ -3747,15 +3785,15 @@ async fn cmd_apply(
             // can inspect pending allocations without writing to GitHub.
             let pending = secret_report.needs_allocation();
             if !auto_approve && !pending.is_empty() {
-                println!(
+                outln!(
                     "Would write placeholder file to {} and allocate {} credential slot(s):",
                     env_config.file_output_path,
                     pending.len()
                 );
                 for r in pending {
-                    println!("  [new] {}", safe(&r.slot));
+                    outln!("  [new] {}", safe(&r.slot));
                 }
-                println!("\nUse --auto-approve to proceed.");
+                outln!("\nUse --auto-approve to proceed.");
                 return Ok(());
             }
 
@@ -3777,7 +3815,7 @@ async fn cmd_apply(
             // run yet. This is the committed-to-repo form; the real values
             // come via the separate `materialize-file.yml` workflow.
             apply::apply_file(&desired, &env_config.file_output_path)?;
-            println!("Written to {}", env_config.file_output_path);
+            outln!("Written to {}", env_config.file_output_path);
 
             // The mesh document goes to its own path as its own
             // `{version, mesh}` document. It is never folded into the gateway
@@ -3798,7 +3836,7 @@ async fn cmd_apply(
                 mesh_retraction_scope(&resolved, &state, &env_config.mesh_file_output_path),
             )?);
             match (&desired_mesh, mesh_publication) {
-                (Some(mesh), _) => println!(
+                (Some(mesh), _) => outln!(
                     "Written mesh document to {} ({})",
                     env_config.mesh_file_output_path,
                     safe_line(mesh_summary_line(mesh))
@@ -3807,7 +3845,7 @@ async fn cmd_apply(
                     if let Some(line) =
                         mesh_retraction_line(publication, &env_config.mesh_file_output_path, false)
                     {
-                        println!("{line}");
+                        outln!("{line}");
                     }
                 }
                 (None, None) => {}
@@ -3971,37 +4009,40 @@ async fn cmd_import(
             allow_plaintext_plugin_config,
         )?
     } else {
-        eprintln!("Specify --from-api or --from-file <PATH>");
+        eoutln!("Specify --from-api or --from-file <PATH>");
         process::exit(1);
     };
 
-    println!(
+    outln!(
         "Imported: {} proxies, {} consumers, {} upstreams, {} plugin_configs",
-        result.proxies, result.consumers, result.upstreams, result.plugin_configs
+        result.proxies,
+        result.consumers,
+        result.upstreams,
+        result.plugin_configs
     );
-    println!(
+    outln!(
         "Import manifest: {}",
         output_path.join(import::IMPORT_MANIFEST_FILENAME).display()
     );
     if let Some(path) = credential_bundle_path {
-        println!(
+        outln!(
             "Secret migration bundle: {} (private mode 0600; seed the listed FERRUM_CREDS_BUNDLE* environment secrets, then securely delete the local file)",
             path.display()
         );
     }
     if let Some(notice) = result.source_metadata_notice() {
-        println!("{}", safe_block(notice));
+        outln!("{}", safe_block(notice));
     }
     if let Some(notice) = result.unmanaged_sections_notice() {
-        println!("{}", safe_block(notice));
+        outln!("{}", safe_block(notice));
     }
     // Loud and last, so it is the final thing on screen: these are the values
     // gitforgeops could not classify and a human has to.
     if let Some(notice) = result.acknowledged_passthrough_notice() {
-        eprintln!("{}", safe_block(notice));
+        eoutln!("{}", safe_block(notice));
     }
     if let Some(notice) = result.custom_plugin_review_notice() {
-        eprintln!("{}", safe_block(notice));
+        eoutln!("{}", safe_block(notice));
     }
 
     Ok(())
@@ -4031,7 +4072,7 @@ async fn cmd_review(
     let smoke_error = preflight_smoke_checks().err();
     let preflight_errors = [&publication_path_error, &smoke_error];
     for error in preflight_errors.into_iter().flatten() {
-        eprintln!("{}", safe_block(error));
+        eoutln!("{}", safe_block(error));
     }
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
     // The probe-credential binding, judged on the unresolved configuration
@@ -4052,7 +4093,7 @@ async fn cmd_review(
         }
     };
     for error in [&probe_error, &allowlist_error].into_iter().flatten() {
-        eprintln!("{}", safe_block(error));
+        eoutln!("{}", safe_block(error));
     }
     let smoke_invalid = smoke_error.is_some() || probe_error.is_some();
     let probe_allowlist_invalid = allowlist_error.is_some();
@@ -4123,7 +4164,7 @@ async fn cmd_review(
                                     safe(cached.join(", "))
                                 ));
                             }
-                            eprintln!("{}", safe_block(&reason));
+                            eoutln!("{}", safe_block(&reason));
                             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Some(reason))
                         }
                         None => {
@@ -4159,7 +4200,7 @@ async fn cmd_review(
                 // a transport error's Display carries the gateway URL —
                 // an environment secret. See `review::redact_comparison_error`.
                 Err(e) => {
-                    eprintln!("Live gateway comparison failed: {}", safe_block(&e));
+                    eoutln!("Live gateway comparison failed: {}", safe_block(&e));
                     (
                         Vec::new(),
                         Vec::new(),
@@ -4170,7 +4211,7 @@ async fn cmd_review(
                 }
             },
             Err(e) => {
-                eprintln!("Live gateway comparison failed: {}", safe_block(e));
+                eoutln!("Live gateway comparison failed: {}", safe_block(e));
                 (
                     Vec::new(),
                     Vec::new(),
@@ -4327,15 +4368,15 @@ async fn cmd_review(
             // the same fallback evidence.
             match review::post_pr_comment(&env_config, pr_number, &comment).await {
                 Ok(()) => {
-                    println!("Posted review comment to PR #{}", pr_number);
+                    outln!("Posted review comment to PR #{}", pr_number);
                 }
                 Err(e) => {
-                    eprintln!(
+                    eoutln!(
                         "Warning: could not post PR comment (typical on fork PRs where GITHUB_TOKEN is read-only): {}",
                         safe_block(&e)
                     );
                     write_review_to_step_summary(&comment)?;
-                    print!("{}", review::markdown_comment_for_terminal(&comment));
+                    out!("{}", review::markdown_comment_for_terminal(&comment));
                     // Recorded rather than raised here: when the live
                     // comparison also failed, that is the root cause and has
                     // to be the reported one, and its gate only runs below.
@@ -4346,7 +4387,7 @@ async fn cmd_review(
             }
         }
         None => {
-            print!("{}", review::markdown_comment_for_terminal(&comment));
+            out!("{}", review::markdown_comment_for_terminal(&comment));
         }
     }
 
@@ -4426,7 +4467,7 @@ async fn cmd_verify(
                     operator.list.as_ref(),
                 )?;
                 let (bundle, _) = load_credential_bundles(&env_config)?;
-                authorization.project(&bundle)
+                authorization.project(&bundle)?
             } else {
                 gitforgeops::verify::ProbeCredentials::none()
             };
@@ -4447,8 +4488,8 @@ async fn cmd_verify(
     };
 
     match format {
-        cli::ReportFormat::Text => print!("{}", report.render_text()),
-        cli::ReportFormat::Json => print!("{}", gitforgeops::json_output::pretty(&report)?),
+        cli::ReportFormat::Text => out!("{}", report.render_text()),
+        cli::ReportFormat::Json => out!("{}", gitforgeops::json_output::pretty(&report)?),
     }
     if report.exit_code() != 0 {
         process::exit(report.exit_code());
@@ -4613,8 +4654,8 @@ async fn cmd_doctor(
     }
 
     match format {
-        cli::ReportFormat::Text => print!("{}", report.render_text()),
-        cli::ReportFormat::Json => print!("{}", gitforgeops::json_output::pretty(&report)?),
+        cli::ReportFormat::Text => out!("{}", report.render_text()),
+        cli::ReportFormat::Json => out!("{}", gitforgeops::json_output::pretty(&report)?),
     }
     if !report.is_ready() {
         process::exit(report.exit_code());
@@ -4637,8 +4678,8 @@ fn doctor_token_namespaces(
 fn cmd_version(format: cli::ReportFormat) -> Result<(), Box<dyn std::error::Error>> {
     let info = gitforgeops::version::BuildInfo::current();
     match format {
-        cli::ReportFormat::Text => print!("{}", info.render_text()),
-        cli::ReportFormat::Json => print!("{}", info.render_json()?),
+        cli::ReportFormat::Text => out!("{}", info.render_text()),
+        cli::ReportFormat::Json => out!("{}", info.render_json()?),
     }
     Ok(())
 }
@@ -4670,7 +4711,7 @@ fn cmd_envs(
                 promotion_requires: None,
             }],
         };
-        print!("{}", gitforgeops::json_output::compact(&scopes)?);
+        out!("{}", gitforgeops::json_output::compact(&scopes)?);
         return Ok(());
     }
     let names = match repo {
@@ -4680,11 +4721,11 @@ fn cmd_envs(
     match format {
         cli::EnvsFormat::Text => {
             for n in names {
-                println!("{n}");
+                outln!("{n}");
             }
         }
         cli::EnvsFormat::Json => {
-            print!("{}", gitforgeops::json_output::compact(&names)?);
+            out!("{}", gitforgeops::json_output::compact(&names)?);
         }
     }
     Ok(())
@@ -4902,16 +4943,18 @@ async fn cmd_rotate(
     // first.
     match &outcome.delivered {
         Some(d) => {
-            println!(
+            outln!(
                 "Delivered age-encrypted blob to @{} (ssh key {}):\n",
                 safe(&d.login),
                 safe(&d.key_fingerprint)
             );
-            println!("{}", d.encrypted_b64);
+            let mut blob = display::Composed::new();
+            blob.data(d.encrypted_b64.as_str()).text("\n");
+            display::write_composed_stdout(&blob);
         }
         None => {
             if recipient.is_some() {
-                println!(
+                outln!(
                     "Warning: recipient had no compatible SSH keys; secret written but not delivered."
                 );
             }
@@ -4943,8 +4986,8 @@ async fn cmd_rotate(
                 std::env::var("GITHUB_RUN_ID").ok().as_deref(),
             );
             state.save()?;
-            println!("Rotated slot {} in shard {}", safe(&slot), outcome.shard);
-            println!(
+            outln!("Rotated slot {} in shard {}", safe(&slot), outcome.shard);
+            outln!(
                 "Gateway consumer '{}/{}' updated.",
                 safe(ns),
                 safe(consumer)

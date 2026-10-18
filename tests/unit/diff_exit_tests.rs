@@ -1058,7 +1058,7 @@ fn malformed_backup_namespaces_refuse_diff_plan_and_apply_without_mutations() {
                 assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
                 let error = stderr(&output);
                 assert!(error.contains("namespace-scoped backup"), "{error}");
-                assert!(error.contains("app"), "{error}");
+                assert!(error.contains("response identifiers withheld"), "{error}");
                 assert!(!stdout(&output).contains("DELETE Proxy"));
             }
             for request in repo.requests.lock().unwrap().iter() {
@@ -1066,6 +1066,53 @@ fn malformed_backup_namespaces_refuse_diff_plan_and_apply_without_mutations() {
             }
         }
     }
+}
+
+/// The first backup carries a previously unknown live credential and reflects
+/// it in a foreign row's id. Namespace validation runs before admission, so the
+/// error must withhold that id without relying on a prior registered snapshot.
+#[cfg(unix)]
+#[test]
+fn first_backup_namespace_refusal_withholds_reflected_live_credentials() {
+    const SECRET: &str = "Zq7-first-backup-canary-94b2";
+    let body = serde_json::json!({
+        "proxies": [live_proxy(SECRET, "foreign", 8080, None)],
+        "consumers": [{
+            "id": "live-consumer", "namespace": "ferrum", "username": "client",
+            "credentials": {"keyauth": [{"key": SECRET}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [],
+    })
+    .to_string();
+    let repo = Repo::new(
+        &[("resources/ferrum/proxies/app.yaml", FERRUM_PROXY)],
+        vec![("ferrum".to_string(), body)],
+    );
+    for args in [
+        &["diff"][..],
+        &["diff", "--format", "json"],
+        &["plan"],
+        &["plan", "--format", "json"],
+        &["apply", "--auto-approve"],
+    ] {
+        let output = repo.run(args);
+        let shown = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {shown}");
+        assert!(shown.contains("namespace-scoped backup"), "{shown}");
+        assert!(shown.contains("response identifiers withheld"), "{shown}");
+        assert!(!shown.contains(SECRET), "{args:?}: {shown}");
+    }
+    let requests = repo.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("GET /backup "))
+            .count(),
+        5,
+        "each CLI run must refuse its first backup"
+    );
+    assert!(requests.iter().all(|request| request.starts_with("GET ")));
 }
 
 #[cfg(unix)]
@@ -1356,6 +1403,29 @@ const VIEWER_ONLY: [(&str, &str); 2] = [
     ("FERRUM_ADMIN_JWT_VIEWER_SECRET", VIEWER_SECRET),
     ("FERRUM_ADMIN_JWT_SECRET", ""),
 ];
+
+#[test]
+fn first_export_namespace_refusal_withholds_response_identifiers() {
+    const SECRET: &str = "Zq7-first-export-canary-94b2";
+    let mut export: serde_json::Value =
+        serde_json::from_str(&config_export(EXPORT_KEY_ID, &['a'])).unwrap();
+    export["consumers"][0]["id"] = SECRET.into();
+    export["consumers"][0]["namespace"] = "foreign".into();
+    let repo = export_repo(export.to_string(), false);
+    for args in [&["diff"][..], &["diff", "--format", "json"]] {
+        let output = repo.run_with_env(args, &VIEWER_ONLY);
+        let shown = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{shown}");
+        assert!(shown.contains("configuration export"), "{shown}");
+        assert!(shown.contains("response identifiers withheld"), "{shown}");
+        assert!(!shown.contains(SECRET), "{shown}");
+    }
+    let requests = repo.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.starts_with("GET /config/export ")));
+}
 
 #[test]
 fn a_viewer_diff_reads_the_export_and_does_not_call_unverified_secrets_in_sync() {
@@ -1770,7 +1840,7 @@ fn a_bundle_resolved_placeholder_stays_uncompared() {
 #[test]
 fn a_whole_value_fingerprinted_around_a_secret_is_never_accepted() {
     let placeholder = "${gh-env-secret:alloc=require}";
-    let headers = serde_json::json!({ "x-api-key": placeholder, "x-trace": "on" });
+    let headers = serde_json::json!({ "x-api-key": placeholder, "x-trace": "trace-enabled" });
     let config = serde_json::json!({ "headers": headers });
     let live = serde_json::json!({ "headers": fingerprint('c') });
     let repo = Repo::new(
@@ -1796,4 +1866,128 @@ fn a_whole_value_fingerprinted_around_a_secret_is_never_accepted() {
     assert_eq!(report["in_sync"], false);
     assert_eq!(report["secret_fingerprints"]["masked_ancestor_fields"], 1);
     assert_eq!(report["secret_fingerprints"]["authoritative"], false);
+}
+
+/// Brokered secrets shorter than eight bytes are refused at resolution: the
+/// refusal names the slot and never the value.
+#[test]
+fn a_short_brokered_value_is_refused_by_slot() {
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let config = serde_json::json!({ "service_label": placeholder, "protocol": "grpc" });
+    let live = serde_json::json!({ "service_label": fingerprint('e'), "protocol": "grpc" });
+    let repo = Repo::new(
+        &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+        vec![("ferrum".to_string(), plugin_export(live))],
+    );
+    let slot = "ferrum/otel/@plugin/otel_tracing/config/service_label";
+    let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: "s3cr3t!" } }).to_string();
+    let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+    env.push(("FERRUM_CREDS_JSON", &bundle));
+
+    let output = repo.run_with_env(&["diff", "--accept-unverified-secrets"], &env);
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains(slot), "{shown}");
+    assert!(shown.contains("shorter than 8 bytes"), "{shown}");
+    assert!(!shown.contains("s3cr3t"), "{shown}");
+}
+
+/// A token in the environment shorter than eight bytes is refused by name
+/// before anything runs.
+#[test]
+fn a_short_environment_token_is_refused_by_name() {
+    let repo = export_repo(config_export(EXPORT_KEY_ID, &['a']), false);
+    let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+    env.push(("GITHUB_TOKEN", "abc"));
+    let output = repo.run_with_env(&["diff"], &env);
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains("GITHUB_TOKEN holds a secret shorter than 8 bytes"),
+        "{shown}"
+    );
+}
+
+/// A secret quoted through `safe()` reaches the sink in sanitized form
+/// (`##[` broken up, U+2028 replaced). The diff printer must still never
+/// show it.
+#[test]
+fn a_secret_sanitized_on_its_way_to_the_sink_is_still_removed() {
+    for secret in ["Q7##[x9!-key", "zq7\u{2028}line-sep-key"] {
+        let placeholder = "${gh-env-secret:alloc=require}";
+        let config = serde_json::json!({ "service_label": placeholder, "protocol": "grpc" });
+        let live = serde_json::json!({ "service_label": fingerprint('e'), "protocol": "grpc" });
+        let mut export: serde_json::Value = serde_json::from_str(&plugin_export(live)).unwrap();
+        export["proxies"] = serde_json::json!([{
+            "id": secret,
+            "namespace": "ferrum",
+            "listen_path": "/reflected",
+            "backend_protocol": "http",
+            "backend_host": "backend.internal",
+            "backend_port": 8080,
+        }]);
+        export["counts"]["proxies"] = serde_json::json!(1);
+        let repo = Repo::new(
+            &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+            vec![("ferrum".to_string(), export.to_string())],
+        );
+        let slot = "ferrum/otel/@plugin/otel_tracing/config/service_label";
+        let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: secret } }).to_string();
+        let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+        env.push(("FERRUM_CREDS_JSON", &bundle));
+
+        let output = repo.run_with_env(&["diff", "--accept-unverified-secrets"], &env);
+        let shown = format!("{}{}", stdout(&output), stderr(&output));
+        assert!(shown.contains("Proxy"), "{shown}");
+        for leaked in ["Q7##", "x9!-key", "line-sep-key"] {
+            assert!(!shown.contains(leaked), "{leaked}: {shown}");
+        }
+    }
+}
+
+/// A resolved value that equals a fixed report key must not rename that key
+/// in JSON output; the value itself is still scrubbed wherever it appears.
+#[test]
+fn a_secret_equal_to_a_report_key_keeps_the_json_contract() {
+    let placeholder = "${gh-env-secret:alloc=require}";
+    let config = serde_json::json!({ "service_label": placeholder, "protocol": "grpc" });
+    let live = serde_json::json!({ "service_label": fingerprint('e'), "protocol": "grpc" });
+    let repo = Repo::new(
+        &[("resources/ferrum/plugins/otel.yaml", &plugin_yaml(config))],
+        vec![("ferrum".to_string(), plugin_export(live))],
+    );
+    let slot = "ferrum/otel/@plugin/otel_tracing/config/service_label";
+    let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": { slot: "live_source" } }).to_string();
+    let mut env: Vec<(&str, &str)> = VIEWER_ONLY.to_vec();
+    env.push(("FERRUM_CREDS_JSON", &bundle));
+
+    let args = ["diff", "--format", "json", "--accept-unverified-secrets"];
+    let output = repo.run_with_env(&args, &env);
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    for key in ["live_source", "in_sync", "namespace", "diff_count"] {
+        assert!(report.get(key).is_some(), "{key} missing: {report}");
+    }
+    assert!(
+        !stdout(&output).contains("\"[REDACTED]\":"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn diff_refuses_short_live_credentials_without_displaying_them() {
+    let live = serde_json::json!({"proxies": [], "consumers": [{
+        "id": "live-consumer", "namespace": "ferrum", "username": "client",
+        "credentials": {"keyauth": [{"key": "Q7short"}]}
+    }], "upstreams": [], "plugin_configs": []})
+    .to_string();
+    let repo = Repo::new(
+        &[("resources/ferrum/proxies/app.yaml", FERRUM_PROXY)],
+        vec![("ferrum".to_string(), live)],
+    );
+    let output = repo.run(&["diff"]);
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("shorter than 8 bytes"), "{shown}");
+    assert!(!shown.contains("Q7short"), "{shown}");
 }

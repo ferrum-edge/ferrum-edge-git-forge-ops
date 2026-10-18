@@ -192,7 +192,7 @@ impl NamespaceScope {
             "live_namespaces": self
                 .live_namespaces
                 .iter()
-                .map(|ns| sanitize(ns))
+                .map(|ns| sanitize(&crate::display::peer_text(ns)))
                 .collect::<Vec<_>>(),
             "live_filter_matched_nothing": self.live_filter_matched_nothing(),
         })
@@ -214,7 +214,14 @@ impl NamespaceScope {
 
     fn live_mismatch_message(&self) -> String {
         let filter = sanitize(self.filter.as_deref().unwrap_or("<unset>"));
-        let namespaces = format_namespace_list(&self.live_namespaces);
+        // Live names come from `GET /namespaces`: peer text, scrubbed for
+        // display only (the comparisons above read the raw names).
+        let live_namespaces: Vec<String> = self
+            .live_namespaces
+            .iter()
+            .map(|namespace| crate::display::peer_text(namespace))
+            .collect();
+        let namespaces = format_namespace_list(&live_namespaces);
         let live = self.live_count.unwrap_or(0);
         sanitize_line(&format!(
             "namespace filter '{filter}' matched 0 live resources (live={live}), \

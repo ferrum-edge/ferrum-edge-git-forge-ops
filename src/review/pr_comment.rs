@@ -483,7 +483,7 @@ fn bounded_markdown_text(value: &str) -> String {
 /// Dynamic inline-code fence for untrusted identifiers. A pipe is escaped for
 /// GFM table parsing, and line breaks are flattened so an identifier cannot
 /// terminate its surrounding list or row.
-fn inline_code(value: &str) -> String {
+fn inline_code_text(value: &str) -> String {
     let value: String = value
         .replace("\r\n", " ")
         .trim()
@@ -503,12 +503,33 @@ fn inline_code(value: &str) -> String {
     } else {
         value
     };
-    let value = value
+    value
         // GFM's table parser processes backslash escapes before deciding
         // whether a pipe ends the cell. Escape caller-supplied backslashes
         // first so an input `\|` cannot consume the escape we add for `|`.
         .replace('\\', "\\\\")
-        .replace('|', "\\|");
+        .replace('|', "\\|")
+}
+
+/// Exactly the payload spellings used by the review's two inline formatters.
+/// Kept beside them so display admission follows any future escaping change.
+pub(crate) fn secret_spellings(value: &str) -> [String; 4] {
+    let (bounded, omitted) = truncate_utf8(value, MAX_INLINE_BYTES);
+    let bounded_code = if omitted > 0 {
+        inline_code_text(&format!("{bounded}…"))
+    } else {
+        inline_code_text(bounded)
+    };
+    [
+        escape_markdown_text(value),
+        bounded_markdown_text(value),
+        inline_code_text(value),
+        bounded_code,
+    ]
+}
+
+fn inline_code(value: &str) -> String {
+    let value = inline_code_text(value);
     let longest_run = value
         .split(|character| character != '`')
         .map(str::len)

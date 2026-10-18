@@ -288,7 +288,10 @@ fn identity_broker_cli_refuses_before_validator_network_or_file_side_effects() {
 
 #[cfg(unix)]
 #[test]
-fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value() {
+/// Every brokered value is a secret of at least eight bytes. A short one
+/// (here a policy-relevant `mode: dry_run`) is refused at resolution, naming
+/// the slot, before the validator or any gateway request.
+fn api_apply_refuses_a_short_brokered_value_before_any_request() {
     let repo = Repo::with_files(&[
         ("resources/ferrum/proxies/app.yaml", HTTPS_PROXY),
         (
@@ -341,14 +344,11 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
 
     let stderr = stderr(&output);
     assert!(!output.status.success(), "{}\n{stderr}", stdout(&output));
-    assert!(stderr.contains("after credential resolution"), "{stderr}");
-    assert!(stderr.contains("policy violation(s)"), "{stderr}");
-    assert!(stderr.contains("require_ai_guardrails"), "{stderr}");
-    assert!(stderr.contains(NO_PR_OVERRIDE_NOTE), "{stderr}");
     assert!(
-        stderr.contains("Policy finding details were withheld"),
+        stderr.contains("ferrum/shield/@plugin/ai_prompt_shield/config/mode"),
         "{stderr}"
     );
+    assert!(stderr.contains("shorter than 8 bytes"), "{stderr}");
     assert!(!stderr.contains("[REDACTED]"), "{stderr}");
     assert!(!stderr.contains("dry_run"), "{stderr}");
     assert!(!stderr.contains("Validator diagnostics"), "{stderr}");
@@ -356,6 +356,78 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
     assert!(!repo.dir.path().join(".state/default.json").exists());
     assert!(
         gateway_requests.lock().unwrap().is_empty(),
+        "the refusal must precede every gateway request"
+    );
+}
+
+/// The unresolved Redis policy is harmless to `rate_limit_completeness`;
+/// resolving it to `local_fallback` creates a blocking finding. A separate
+/// credential with a re-encoding hazard exercises withholding finding details
+/// without relying on the short-value admission refusal above.
+#[cfg(unix)]
+#[test]
+fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value() {
+    const RESOLVED_POLICY: &str = "local_fallback";
+    const CREDENTIAL: &str = "Zq7-policy-canary#key";
+    let repo = Repo::with_files(&[
+        ("resources/ferrum/consumers/app.yaml", BROKERED_CONSUMER),
+        (
+            "resources/ferrum/plugins/limiter.yaml",
+            "kind: PluginConfig\nspec:\n  id: limiter\n  plugin_name: rate_limiting\n  scope: global\n  config:\n    limits:\n      - scope: default\n        requests_per_second: 10\n    redis_failure_policy: '${gh-env-secret:alloc=require}'\n",
+        ),
+        (
+            ".gitforgeops/policies.yaml",
+            "version: 1\npolicies:\n  rate_limit_completeness:\n    enabled: true\n    severity: error\n",
+        ),
+    ]);
+    std::fs::write(&repo.validator, "#!/bin/sh\ntouch validator-ran\nexit 0\n").unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    // PluginWalk::report_leaf uses plugin_config_slot's type-bearing grammar:
+    // <namespace>/<plugin-id>/@plugin/<plugin_name>/config/<path>.
+    let bundle = serde_json::json!({"FERRUM_CREDS_BUNDLE": {
+        "ferrum/limiter/@plugin/rate_limiting/config/redis_failure_policy": RESOLVED_POLICY,
+        "ferrum/app/keyauth/key": CREDENTIAL,
+    }})
+    .to_string();
+    let output = repo.run(
+        &["apply", "--auto-approve"],
+        &[
+            ("FERRUM_GATEWAY_MODE", "api"),
+            ("FERRUM_GATEWAY_URL", &endpoint),
+            ("FERRUM_ALLOW_INSECURE_HTTP", "true"),
+            ("FERRUM_GATEWAY_MAX_RETRIES", "0"),
+            ("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "1"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "synthetic-admin-secret-at-least-32-bytes",
+            ),
+            ("FERRUM_CREDS_JSON", &bundle),
+        ],
+    );
+
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("after credential resolution"), "{shown}");
+    assert!(
+        shown.contains("Policy finding details were withheld"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("[rate_limit_completeness] PluginConfig/ferrum limiter"),
+        "{shown}"
+    );
+    assert!(!shown.contains(RESOLVED_POLICY), "{shown}");
+    assert!(!shown.contains(CREDENTIAL), "{shown}");
+    assert!(!shown.contains("has redis_failure_policy"), "{shown}");
+    assert!(!shown.contains("shorter than 8 bytes"), "{shown}");
+    assert!(!repo.dir.path().join("validator-ran").exists());
+    assert!(!repo.dir.path().join(".state/default.json").exists());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
         "policy refusal must precede every gateway request"
     );
 }

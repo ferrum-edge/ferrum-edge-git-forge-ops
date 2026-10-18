@@ -216,12 +216,7 @@ impl SecretScrubber {
     /// placeholder document paired with a read-only allocation report.
     /// No bundle values or unused slots are retained in the report.
     pub fn from_gateway_config_with_report(config: &GatewayConfig, report: &ResolveReport) -> Self {
-        let mut values = BTreeSet::new();
-        collect_consumer_secrets(config, &mut values);
-        collect_plugin_config_secrets(config, &mut values);
-        collect_service_discovery_secrets(config, &mut values);
-        collect_resolved_secrets(config, report, &mut values);
-        let mut scrubber = Self::from_values(values);
+        let mut scrubber = Self::from_values(gateway_secret_values(config, report, false));
         // The document with every secret removed. Serialization failure is not
         // worth failing validation over: an empty `public_text` only makes the
         // fragment scan stricter, never laxer.
@@ -280,6 +275,22 @@ impl SecretScrubber {
             public_text: String::new(),
             unsafe_to_scrub,
         }
+    }
+
+    /// A scrubber for exactly `values` (a generated rotation value, a token
+    /// this process sends) with no public document.
+    pub fn from_secret_values<I, S>(values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::from_values(
+            values
+                .into_iter()
+                .map(Into::into)
+                .filter(|value: &String| !value.is_empty())
+                .collect(),
+        )
     }
 
     /// True when the config carried no secret material at all.
@@ -388,6 +399,21 @@ impl SecretScrubber {
             suppressed: None,
         }
     }
+}
+
+/// Collect raw leaves without building encodings or fragment indexes. Live
+/// credentials have no repository-placeholder exemption, including empty leaves.
+pub(crate) fn gateway_secret_values(
+    config: &GatewayConfig,
+    report: &ResolveReport,
+    live: bool,
+) -> BTreeSet<String> {
+    let mut values = BTreeSet::new();
+    collect_consumer_secrets(config, &mut values, live);
+    collect_plugin_config_secrets(config, &mut values, live);
+    collect_service_discovery_secrets(config, &mut values, live);
+    collect_resolved_secrets(config, report, &mut values);
+    values
 }
 
 fn collect_resolved_secrets(
@@ -528,7 +554,7 @@ pub fn is_reencoding_hazard(value: &str) -> bool {
 /// `\r` spell the same way in both, so every other character JSON would write
 /// as `\u00NN` is refused by [`is_reencoding_hazard`], which withholds the
 /// stream rather than relying on this needle.
-fn json_escaped(value: &str) -> Option<String> {
+pub(crate) fn json_escaped(value: &str) -> Option<String> {
     let quoted = serde_json::to_string(value).ok()?;
     let inner = quoted
         .strip_prefix('"')
@@ -538,14 +564,14 @@ fn json_escaped(value: &str) -> Option<String> {
 
 /// The value as single-quoted YAML would write it, without the surrounding
 /// quotes: the only escape in that style is a doubled `'`.
-fn yaml_single_quoted(value: &str) -> String {
+pub(crate) fn yaml_single_quoted(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn collect_consumer_secrets(config: &GatewayConfig, out: &mut BTreeSet<String>) {
+fn collect_consumer_secrets(config: &GatewayConfig, out: &mut BTreeSet<String>, live: bool) {
     for consumer in &config.consumers {
         for (credential_type, value) in &consumer.credentials {
-            collect_credential_leaves(credential_type, value, None, out);
+            collect_credential_leaves(credential_type, value, None, out, live);
         }
     }
 }
@@ -555,44 +581,49 @@ fn collect_credential_leaves(
     value: &serde_json::Value,
     leaf_key: Option<&str>,
     out: &mut BTreeSet<String>,
+    live: bool,
 ) {
     match value {
         serde_json::Value::String(text) => {
             if is_identity_credential_leaf(credential_type, leaf_key) {
                 return;
             }
-            record_secret(text, out);
+            record_secret(text, out, live);
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map {
-                collect_credential_leaves(credential_type, child, Some(key.as_str()), out);
+                collect_credential_leaves(credential_type, child, Some(key.as_str()), out, live);
             }
         }
         serde_json::Value::Array(items) => {
             for child in items {
                 // An array index does not change which field a leaf is, so
                 // the enclosing key (`keyauth` → `key`) carries through.
-                collect_credential_leaves(credential_type, child, leaf_key, out);
+                collect_credential_leaves(credential_type, child, leaf_key, out, live);
             }
         }
         _ => {}
     }
 }
 
-fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut BTreeSet<String>) {
+fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut BTreeSet<String>, live: bool) {
     for plugin in &config.plugin_configs {
         for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
             if let Some(serde_json::Value::String(text)) = value_at(&plugin.config, &path) {
-                record_secret(text, out);
+                record_secret(text, out, live);
             }
         }
     }
 }
 
-fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut BTreeSet<String>) {
+fn collect_service_discovery_secrets(
+    config: &GatewayConfig,
+    out: &mut BTreeSet<String>,
+    live: bool,
+) {
     for upstream in &config.upstreams {
         for (_field, value) in super::service_discovery::present_secrets(upstream) {
-            record_secret(value, out);
+            record_secret(value, out, live);
         }
         // URL credentials in the Consul address are refused by the audit, but
         // `validate` runs without it, so its validator output is scrubbed of
@@ -610,9 +641,9 @@ fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut BTreeSet<
             .and_then(super::service_discovery::consul_address_userinfo)
         {
             if let Some((_, password)) = userinfo.split_once(':') {
-                record_secret(password, out);
+                record_secret(password, out, live);
             }
-            record_secret(&userinfo, out);
+            record_secret(&userinfo, out, live);
             // Detection ignores surrounding whitespace and embedded tabs and
             // line breaks, so the credential as written may differ from the
             // normalized userinfo. Record the address itself then: its raw
@@ -620,24 +651,24 @@ fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut BTreeSet<
             // characters make `scrub_streams` withhold the output rather than
             // miss them.
             if super::service_discovery::address_is_normalized(&consul.address) {
-                record_secret(&consul.address, out);
+                record_secret(&consul.address, out, live);
             }
         }
     }
 }
 
 /// Keep a leaf unless it is repository data rather than secret material: a
-/// well-formed placeholder (validators quote those back and operators need to
-/// read them) or an empty string (scrubbing `""` would redact everything).
-fn record_secret(text: &str, out: &mut BTreeSet<String>) {
-    if text.is_empty() || matches!(parse_placeholder(text), Some(Ok(_))) {
+/// well-formed placeholder or empty string. Live evidence has neither exemption;
+/// its raw leaves must all pass display admission, even placeholder-shaped ones.
+fn record_secret(text: &str, out: &mut BTreeSet<String>, live: bool) {
+    if !live && (text.is_empty() || matches!(parse_placeholder(text), Some(Ok(_)))) {
         return;
     }
     out.insert(text.to_string());
 }
 
 /// Percent-encode every byte outside RFC 3986's unreserved set.
-fn percent_encoded(value: &str) -> String {
+pub(crate) fn percent_encoded(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {

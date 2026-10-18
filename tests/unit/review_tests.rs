@@ -1654,3 +1654,63 @@ fn the_mesh_retraction_banner_names_the_destination_and_the_outcome() {
     let narrowed = narrowed.expect("a skipped publication is reported");
     assert!(narrowed.contains("Mesh publication skipped"), "{narrowed}");
 }
+
+/// A registered value carried by a live field reaches the PR comment only
+/// through the display sink, which removes it even under Markdown escaping.
+#[test]
+fn review_comment_bodies_lose_registered_values_at_the_sink() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    gitforgeops::display::register_values("test", ["zq7Secret-v1", "zq7_live.field_canary.v1"])
+        .unwrap();
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Modify,
+        kind: "PluginConfig".to_string(),
+        id: "zq7Secret-v1".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![FieldChange {
+            field: "protocol".to_string(),
+            old_value: "zq7_live.field_canary.v1".to_string(),
+            new_value: "zq7Secret-v1".to_string(),
+        }],
+    }];
+    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    let published = gitforgeops::display::scrub_text(&comment);
+    assert!(!published.contains("s3cr3t"), "{published}");
+    assert!(!published.contains("canary"), "{published}");
+    assert!(!published.contains("field\\_canary"), "{published}");
+}
+
+/// Both formatter paths must be protected by the final publication sink:
+/// inline code collapses CRLF to one space; prose escapes Markdown punctuation.
+#[test]
+fn review_formatter_spellings_of_live_credentials_are_redacted() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    for secret in ["Q7\r\nx9-secret", "Q7_[x]*.!@|credential"] {
+        let config = serde_json::from_value(serde_json::json!({
+            "consumers": [{"id": "probe", "namespace": "ferrum", "username": "client",
+                "credentials": {"keyauth": [{"key": secret}]}}]
+        }))
+        .unwrap();
+        gitforgeops::display::register_gateway_config(&config).unwrap();
+        let diffs = vec![ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "Consumer".to_string(),
+            id: secret.to_string(),
+            namespace: "ferrum".to_string(),
+            details: vec![FieldChange {
+                field: format!("changed {secret}"),
+                old_value: secret.to_string(),
+                new_value: "changed".to_string(),
+            }],
+        }];
+        let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+        assert!(
+            comment.contains("Q7"),
+            "the formatter must actually echo the live value"
+        );
+        let published = gitforgeops::display::scrub_text(&comment);
+        assert!(!published.contains("Q7"), "{published}");
+        assert!(published.contains("[REDACTED]"), "{published}");
+        assert!(published.contains("changed"), "{published}");
+    }
+}

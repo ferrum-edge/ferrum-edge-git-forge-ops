@@ -1071,15 +1071,20 @@ impl ProbeAuthorization {
     }
 
     /// Project `bundle` down to the authorized slots. An authorized slot the
-    /// bundle lacks is left out, so its check fails as unresolvable.
-    pub fn project(&self, bundle: &BTreeMap<String, String>) -> ProbeCredentials {
+    /// bundle lacks is left out, so its check fails as unresolvable. Every
+    /// present value must pass display admission before it can be sent.
+    pub fn project(
+        &self,
+        bundle: &BTreeMap<String, String>,
+    ) -> crate::error::Result<ProbeCredentials> {
         let mut values = BTreeMap::new();
         for slot in &self.slots {
             if let Some(secret) = bundle.get(slot) {
+                crate::display::register_probe_value(secret)?;
                 values.insert(slot.clone(), secret.clone());
             }
         }
-        ProbeCredentials { values }
+        Ok(ProbeCredentials { values })
     }
 }
 
@@ -1137,13 +1142,13 @@ pub fn authorize_probe_credentials(
     bundle: &BTreeMap<String, String>,
 ) -> crate::error::Result<ProbeCredentials> {
     let authorization = authorize_probe_slots(environment, checks, desired, allowlist)?;
-    Ok(authorization.project(bundle))
+    authorization.project(bundle)
 }
 
 /// Turn declared header values into the exact bytes to send.
 ///
-/// Returns the unresolvable slot names on failure — names only; a bundle value
-/// never appears in an error, and the caller reports the check as failed
+/// Returns unresolvable slot names or a secret-free admission refusal. A bundle
+/// value never appears in an error, and the caller reports the check as failed
 /// rather than sending the request without the credential.
 pub fn resolve_headers(
     headers: &BTreeMap<String, HeaderValue>,
@@ -1155,7 +1160,11 @@ pub fn resolve_headers(
         match (&value.literal, &value.slot) {
             (Some(literal), None) => resolved.push((name.clone(), literal.clone())),
             (None, Some(slot)) => match bundle.get(slot) {
-                Some(secret) => resolved.push((name.clone(), secret.clone())),
+                Some(secret) => {
+                    crate::display::register_probe_value(secret)
+                        .map_err(|error| vec![error.to_string()])?;
+                    resolved.push((name.clone(), secret.clone()));
+                }
                 None => missing.push(slot.clone()),
             },
             // Refused at load; treat as unresolvable rather than guessing.

@@ -482,7 +482,7 @@ fn sync_parent_directory(
         (Ok(()), _) => Ok(()),
         (Err(source), PublicationPermissions::Private) => Err(crate::error::Error::Io(source)),
         (Err(source), PublicationPermissions::Regular) => {
-            eprintln!(
+            crate::eoutln!(
                 "Warning: published {} but could not fsync its directory ({}); the file is written and renamed into place, but its directory entry may not survive a host crash.",
                 safe_path(parent),
                 safe_line(&source)
