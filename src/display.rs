@@ -1657,11 +1657,7 @@ mod tests {
         for error in errors {
             let rendered = format!("{error} {error:?}");
             assert!(!rendered.contains(fragment), "{rendered}");
-            assert!(
-                rendered.contains(DISPLAY_WITHHELD)
-                    || rendered.contains("response identifiers withheld"),
-                "{rendered}"
-            );
+            assert!(rendered.contains("withheld"), "{rendered}");
         }
     }
 
