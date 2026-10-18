@@ -2660,7 +2660,7 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
                 } else {
                     "PUT /proxies/p1 HTTP/1.1"
                 },
-                "DELETE /plugins/config/pc1 HTTP/1.1",
+                "DELETE /plugins/config/pc1?expected_proxy_ids=p1 HTTP/1.1",
             ]
         );
     }
@@ -2685,7 +2685,7 @@ async fn plugin_updates_precede_proxy_updates_and_deletions_reverse_the_dependen
     assert_eq!(
         mutation_lines(&requests),
         vec![
-            "PUT /plugins/config/pc1 HTTP/1.1",
+            "PUT /plugins/config/pc1?expected_proxy_ids=p1 HTTP/1.1",
             "PUT /proxies/p1 HTTP/1.1"
         ]
     );
@@ -2981,7 +2981,7 @@ async fn delete_404_acknowledgements_gate_plugin_pruning_ledger_and_completion()
             .unwrap();
             let mut expected = vec!["DELETE /proxies/p1?cleanup_orphaned_upstream=false HTTP/1.1"];
             if acknowledged {
-                expected.push("DELETE /plugins/config/pc1 HTTP/1.1");
+                expected.push("DELETE /plugins/config/pc1?expected_proxy_ids=p1 HTTP/1.1");
             }
             assert_eq!(mutation_lines(&requests), expected, "{context}");
             assert_eq!(
@@ -3369,7 +3369,7 @@ async fn exact_batch_readback_asserts_proxy_ownership_despite_plugin_put_failure
         mutation_lines(&requests),
         vec![
             "POST /batch HTTP/1.1",
-            "PUT /plugins/config/pc1 HTTP/1.1",
+            "PUT /plugins/config/pc1?expected_proxy_ids=p1 HTTP/1.1",
             "PUT /proxies/p1 HTTP/1.1",
         ]
     );
@@ -3464,7 +3464,7 @@ async fn existing_plugin_retarget_to_new_proxy_fails_closed_even_with_opt_in() {
         assert!(result.applied_incremental.is_empty());
         assert_eq!(
             mutation_lines(&requests),
-            vec!["PUT /plugins/config/pc1 HTTP/1.1"]
+            vec!["PUT /plugins/config/pc1?expected_proxy_ids=old,p1 HTTP/1.1"]
         );
     }
 }
