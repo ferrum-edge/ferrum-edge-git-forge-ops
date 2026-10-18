@@ -324,7 +324,7 @@ async fn plugin_delete_sends_expected_proxy_ids_and_maps_association_412() {
     // One id carries query separators: they must be percent-encoded so the
     // value cannot split into extra expected ids or reshape the query.
     let expected: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::from(["pa".to_string(), "x&y,z".to_string()]);
+        std::collections::BTreeSet::from(["pa".to_string(), "x&y+z".to_string()]);
     let err = client
         .delete_if_match(
             "PluginConfig",
@@ -343,8 +343,21 @@ async fn plugin_delete_sends_expected_proxy_ids_and_maps_association_412() {
 
     let request = rx.recv().unwrap();
     assert!(
-        request.contains("DELETE /plugins/config/pc1?expected_proxy_ids=pa,x%26y%2Cz "),
+        request.contains("DELETE /plugins/config/pc1?expected_proxy_ids=pa,x%26y%2Bz "),
         "request line carries the precondition: {request}"
+    );
+
+    // A comma cannot be represented: the gateway decodes before splitting,
+    // so the client refuses before anything is sent.
+    let comma: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::from(["a,b".to_string()]);
+    let err = client
+        .delete_if_match("PluginConfig", "pc1", "team-alpha", "\"tag\"", Some(&comma))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot represent truthfully"),
+        "comma id refused client-side: {err}"
     );
 }
 

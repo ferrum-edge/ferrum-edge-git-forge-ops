@@ -1533,6 +1533,15 @@ fn expected_proxy_ids_query(expected: &BTreeSet<String>) -> crate::error::Result
     }
     for id in expected {
         validate_resource_id_for_path(id)?;
+        // Encoding cannot save a comma: Ferrum Edge form-decodes the whole
+        // value before splitting on commas, so `a%2Cb` would arrive as two
+        // expected ids and silently widen the set. Refuse instead.
+        if id.contains(',') {
+            return Err(crate::error::Error::Config(format!(
+                "proxy id `{id}` contains a comma, which the expected_proxy_ids \
+                 precondition cannot represent truthfully; rename the proxy before applying"
+            )));
+        }
     }
     Ok(expected
         .iter()
