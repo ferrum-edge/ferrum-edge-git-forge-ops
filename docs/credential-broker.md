@@ -164,26 +164,52 @@ them to the tree, `diff` shows such a live address as
 Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,
 the final `Error:` line and the review comment. Every value a run resolves
 or rotates in, the secrets of every live snapshot it reads or restore it
-sends, every admin JWT it sends, and the GitHub tokens and admin JWT
-secrets it reads from the environment become `[REDACTED]`, as do their
-base64, percent, JSON-escaped and single-quoted spellings, a `Bearer`
-credential, and a JWT or GitHub token by its shape. A line that still holds
-an 8-byte run of one (also after decoding escapes, percent-encoding or HTML
-references) is withheld, unless that run is also public text: the scrubbed
+sends, complete consumer verification evidence (including preserved rotation
+siblings), authorized traffic-probe credentials, every admin JWT it sends, and
+the GitHub tokens and admin JWT secrets it reads from the environment become
+`[REDACTED]`, as do their base64, percent, JSON-escaped and single-quoted
+spellings, and the review
+formatter's CRLF-to-one-space and Markdown-escaped spellings. A `Bearer`
+credential or a JWT or GitHub token is also redacted by its shape. A line that
+still holds an 8-byte run of one (also after decoding escapes, percent-encoding
+or HTML references) is withheld, unless that run is also public text: the scrubbed
 configuration or the tool's own messages. Text a gateway or GitHub sends
 back is withheld while any registered value is not safely scrubbable (the
 validator-output rule above). Decisions read responses as received; only the
 displayed copy is scrubbed. Age-encrypted deliveries are written byte for
 byte.
 
-**Minimum length.** Brokered secrets must be at least 8 bytes. A shorter
-bundle value is refused when the slot is resolved, and a shorter non-empty
+**Fail-closed admission.** Live credentials and authorized traffic-probe
+credentials must be at least 8 bytes, just like brokered values. A short live
+leaf (including an empty one) refuses the run when its snapshot or complete
+consumer verification evidence is admitted, before it can authorize a write or
+rotation delivery. A short probe value refuses projection/header resolution,
+before any probe request. Admission also refuses a value whose review
+formatter spelling falls below 8 bytes after CRLF collapse or trimming, rather
+than admitting a short spelling that would suppress ordinary prose. A live
+leaf that equals `${gh-env-secret:...}` is a real credential and is registered without the repository-placeholder exemption.
+Credential identities (`basicauth.username`, `mtls_auth.identity`) remain
+non-secret. Unresolved placeholders and short non-secret settings declared in
+resource YAML retain their existing policy; reserved broker sentinels remain
+refused.
+
+A short bundle value is refused when its slot is resolved. A shorter non-empty
 `GH_TOKEN`, `GITHUB_TOKEN`, `FERRUM_GH_PROVISIONER_TOKEN`,
 `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_ADMIN_JWT_VIEWER_SECRET` stops the CLI
-at startup. The error names the slot or variable, never the value. A value
-that short could not be told apart from ordinary words in output. Generated
-values (`alloc=generate`, `len` 16 or more) always qualify; keep short
-non-secret settings such as `mode: dry_run` in the resource YAML.
+at startup. Errors identify the source (a live/probe credential, slot or
+variable), never the value. Generated values (`alloc=generate`, `len` 16 or
+more) always meet the minimum; keep short non-secret settings such as
+`mode: dry_run` in resource YAML.
+
+All sources share one cumulative registration budget for the entire run.
+Repeated values, including values seen in multiple snapshots or sent through
+different paths, are counted once; no registered value or token is evicted.
+The 64 MiB accounting budget charges `1024 * (UTF-8 byte length + 1)` per
+unique value to bound its spellings and fragment indexes before allocating
+them. Oversized values or a cumulative overflow refuse the run with a
+secret-free error instead of silently dropping protection. Subsequent
+admissions fail, and diagnostics are replaced by that refusal, even if a
+reporting command would otherwise continue after a failed live read.
 
 ## Entry position is the slot identity
 

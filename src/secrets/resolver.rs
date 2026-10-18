@@ -1456,7 +1456,7 @@ pub fn resolve_secrets_with_mode_and_options(
     let report = resolve_secrets_in_place(&mut candidate, bundle, mode, options)?;
     // From here on these values travel in requests, so any error text a peer
     // reflects them in must have them removed before it is displayed.
-    crate::display::register_resolved(&candidate, &report);
+    crate::display::register_resolved(&candidate, &report)?;
     *cfg = candidate;
     Ok(report)
 }

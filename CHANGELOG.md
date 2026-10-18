@@ -110,6 +110,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   platform that cannot enforce owner-only permissions. Unix behavior and
   ordinary (non-private) publications are unchanged.
 
+- **BREAKING:** the 8-byte credential minimum also applies to live secret
+  leaves (including empty leaves and preserved rotation siblings) and authorized
+  traffic-probe values. Short values refuse admission before writes, rotation
+  delivery or probe requests; errors never quote them. Live placeholder-shaped
+  values are registered as credentials. All sources, including complete consumer
+  verification evidence and sent admin JWTs, share one deduplicated whole-run
+  registration budget: 64 MiB of accounting at `1024 * (UTF-8 byte length + 1)`
+  per unique value. Admission checks the budget before creating encodings or
+  fragment indexes; oversized values and cumulative overflow refuse the run
+  instead of dropping registrations. Further diagnostics show the refusal.
+  The sink also registers the review formatter's CRLF-to-one-space and Markdown
+  spellings, refusing a value if that formatting reduces it below 8 bytes. Declared repository placeholders, credential identities and the
+  reserved broker-sentinel policy retain their existing treatment.
+
 - **BREAKING:** brokered secrets must be at least 8 bytes. A bundle value
   shorter than that is refused when it is resolved (every command that reads
   the slot, before any request), and a non-empty `GH_TOKEN`, `GITHUB_TOKEN`,
@@ -461,7 +475,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Scrub secrets from displayed errors (follow-up to #553, which bounded these
   messages but still displayed whatever a peer reflected from the request).
   Each CLI run registers every value it resolves, every rotated value it
-  publishes, every admin JWT it sends (a bounded recent window), and the
+  publishes, every admin JWT it sends (for the whole run), and the
   GitHub tokens and admin JWT secret in its environment. Every displayed
   gateway field (`error`, `reason`, `rollback`, `restore_errors`,
   `api_specs_at_risk`), GitHub's `message` and the final `Error:` line show

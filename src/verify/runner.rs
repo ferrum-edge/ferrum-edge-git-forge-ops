@@ -108,13 +108,13 @@ pub async fn run_check(
     // entirely the wrong reason.
     let headers = match resolve_headers(&check.headers, credentials.values()) {
         Ok(headers) => headers,
-        Err(missing) => {
+        Err(errors) => {
             return failed(
                 Outcome::Unreachable,
                 0,
                 format!(
-                    "credential slot(s) not in the bundle: {}",
-                    missing.join(", ")
+                    "credential slot(s) not in the bundle or refused by admission: {}",
+                    errors.join(", ")
                 ),
             )
         }

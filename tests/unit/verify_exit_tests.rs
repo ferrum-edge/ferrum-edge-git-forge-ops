@@ -522,3 +522,33 @@ fn an_over_budget_smoke_file_is_an_error_before_any_request() {
     assert!(stderr.contains("above the maximum"), "{stderr}");
     assert!(!connected(&listener), "verify reached the data plane");
 }
+
+#[test]
+fn verify_refuses_a_short_authorized_probe_credential_before_any_request() {
+    let dir = repo_with_consumers(STAGING_PROBE, true, false);
+    let (listener, url) = silent_data_plane();
+    let short_bundle = serde_json::json!({"FERRUM_CREDS_BUNDLE": {
+        "ferrum/orders-probe/keyauth/key": "Q7short"
+    }})
+    .to_string();
+    let output = verify_staging(
+        &dir,
+        &url,
+        &[
+            (VERIFY_PROBE_CONSUMERS_ENV, PROBE_ALLOWLIST),
+            ("FERRUM_CREDS_JSON", short_bundle.as_str()),
+        ],
+    );
+    let shown = format!(
+        "{}{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(
+        shown.contains("traffic probe credential holds a secret shorter than 8 bytes"),
+        "{shown}"
+    );
+    assert!(!shown.contains("Q7short"), "{shown}");
+    assert!(!connected(&listener), "verify reached the data plane");
+}

@@ -810,7 +810,7 @@ fn an_authorized_slot_missing_from_the_bundle_still_fails_its_check() {
     )
     .expect("authorized");
     assert_eq!(authorization.slots().collect::<Vec<_>>(), vec![PROBE_SLOT]);
-    assert_eq!(authorization.project(&partial).slots().count(), 0);
+    assert_eq!(authorization.project(&partial).unwrap().slots().count(), 0);
 }
 
 #[test]
@@ -1445,4 +1445,49 @@ fn the_shipped_config_example_still_loads_with_a_promotion_chain() {
             .requires,
         None
     );
+}
+
+#[test]
+fn probe_projection_refuses_short_values_and_registers_only_authorized_credentials() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    let checks = checks_sending("GET", PROBE_SLOT);
+    let authorization =
+        authorize_probe_slots("staging", &checks, &desired(), Some(&allowlist())).unwrap();
+    authorization.project(&bundle()).unwrap();
+    assert_eq!(gitforgeops::display::scrub_text(PROBE_VALUE), "[REDACTED]");
+    assert_eq!(
+        gitforgeops::display::scrub_text(CUSTOMER_VALUE),
+        CUSTOMER_VALUE
+    );
+    let mut short = bundle();
+    short.insert(PROBE_SLOT.to_string(), "Q7short".to_string());
+    let error = authorization.project(&short).unwrap_err().to_string();
+    assert!(
+        error.contains("traffic probe credential holds a secret shorter than 8 bytes"),
+        "{error}"
+    );
+    assert!(!error.contains("Q7short"));
+}
+
+#[test]
+fn probe_header_resolution_enforces_admission_without_touching_literals() {
+    let headers = BTreeMap::from([
+        ("X-API-Key".to_string(), HeaderValue::slot(PROBE_SLOT)),
+        ("X-Mode".to_string(), HeaderValue::literal("x")),
+    ]);
+    for length in 0..8 {
+        let mut values = bundle();
+        values.insert(PROBE_SLOT.to_string(), "Q7short"[..length].to_string());
+        let error = resolve_headers(&headers, &values).unwrap_err().join(" ");
+        assert!(error.contains("shorter than 8 bytes"), "{error}");
+        if length > 0 {
+            assert!(!error.contains(&"Q7short"[..length]));
+        }
+    }
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    let resolved = resolve_headers(&headers, &bundle()).unwrap();
+    assert!(resolved
+        .iter()
+        .any(|(name, value)| name == "X-Mode" && value == "x"));
+    assert_eq!(gitforgeops::display::scrub_text(PROBE_VALUE), "[REDACTED]");
 }

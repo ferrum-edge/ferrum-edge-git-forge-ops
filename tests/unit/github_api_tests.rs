@@ -830,14 +830,14 @@ async fn a_same_job_first_allocation_reaches_the_traffic_check_through_the_hando
 
     // The pre-apply snapshot is what verify used to read: the slot is
     // missing, and the check fails before sending anything.
-    let stale = authorization.project(&merge_bundles(&pre_apply));
+    let stale = authorization.project(&merge_bundles(&pre_apply)).unwrap();
     let result = run_check(&base_url, &check, &stale, None).await;
     assert_eq!(result.outcome, Outcome::Unreachable);
     assert_eq!(result.attempts, 0);
     assert!(result.detail.contains("not in the bundle"));
     assert!(seen.lock().expect("seen").is_empty());
 
-    let finalized = authorization.project(&finalized);
+    let finalized = authorization.project(&finalized).unwrap();
     let result = run_check(&base_url, &check, &finalized, None).await;
     assert_eq!(result.outcome, Outcome::Passed);
     assert_eq!(result.actual_status, Some(200));

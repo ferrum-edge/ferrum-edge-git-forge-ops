@@ -27,10 +27,13 @@
 //! ([`register_resolved`]), every rotated value it publishes and every token
 //! it reads from the environment ([`register_values`]), and every admin JWT
 //! it sends ([`register_sent_token`]), for the rest of the run. Every secret
-//! is at least [`MIN_SCRUB_LENGTH`] bytes: the resolver refuses a shorter
-//! brokered value and [`register_values`] a shorter token, naming where it
-//! came from, so no secret is too short to find. Library callers stay
-//! opted out; a test opts in its own thread only
+//! admitted from live evidence, a probe, a broker or a token must be at least
+//! [`MIN_SCRUB_LENGTH`] bytes. Admission refuses shorter values, and deduplicates
+//! all sources under one cumulative budget before building encodings/windows.
+//! A refusal withholds further diagnostics and makes the CLI fail even when a
+//! reporting command would ordinarily tolerate a live-read failure. Library
+//! callers opt in to retention; minimum-length admission still applies. A test
+//! opts in its own thread only
 //! ([`enable_display_scrubbing_on_this_thread`]), so parallel tests never see
 //! each other's canaries.
 //!
@@ -79,10 +82,11 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 use base64::Engine;
 
 use crate::config::GatewayConfig;
-use crate::secrets::scrubber::{json_escaped, percent_encoded, yaml_single_quoted};
+use crate::secrets::scrubber::{
+    gateway_secret_values, json_escaped, percent_encoded, yaml_single_quoted,
+};
 use crate::secrets::{
-    is_reencoding_hazard, ResolveReport, SecretScrubber, FRAGMENT_SCAN_LENGTH, MIN_SCRUB_LENGTH,
-    REDACTION,
+    is_reencoding_hazard, ResolveReport, FRAGMENT_SCAN_LENGTH, MIN_SCRUB_LENGTH, REDACTION,
 };
 
 /// Shown in place of a line (or a JSON string, or a peer's text) that could
@@ -96,6 +100,14 @@ static PUBLIC_PROSE: &str = include_str!(concat!(env!("OUT_DIR"), "/display_corp
 
 /// The longest excerpt of peer text [`peer_text`] processes and returns.
 const MAX_PEER_TEXT_CHARS: usize = 16 * 1024;
+
+/// Whole-run admission budget. Charge conservatively for spellings, windows,
+/// hash buckets and their duplicate indexes *before* allocating them. This is
+/// an accounting limit, not a claim about allocator-exact resident memory.
+const REGISTRATION_BUDGET: usize = 64 * 1024 * 1024;
+const REGISTRATION_BYTES_PER_INPUT_BYTE: usize = 1024;
+
+const BUDGET_REFUSAL: &str = "Secret registration budget exceeded; refusing the run because its credentials cannot all be protected in displayed output.";
 
 type Window = [u8; FRAGMENT_SCAN_LENGTH];
 
@@ -111,11 +123,8 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|candidate| candidate == needle)
 }
 
-/// One registration: the values of a resolved snapshot, a set of tokens, or
-/// one sent JWT, with everything the sink looks for precomputed.
+/// One unique admitted value, with its spellings and fragment windows.
 struct Entry {
-    /// Runs of this text are public (the scrubbed configuration).
-    public_text: String,
     windows: Vec<Window>,
     needles: Vec<String>,
     hazardous: bool,
@@ -150,6 +159,9 @@ fn spellings(value: &str) -> Vec<String> {
                 .collect(),
         );
     }
+    // Use the review formatter itself, so its CRLF collapse, trimming,
+    // unsafe-character handling and Markdown escapes cannot drift from us.
+    all.extend(crate::review::pr_comment::secret_spellings(value));
     all.retain(|spelling| !spelling.is_empty());
     all.sort();
     all.dedup();
@@ -180,35 +192,27 @@ fn ascii_json_escaped(value: &str) -> String {
 }
 
 impl Entry {
-    fn new(values: &[String], public_text: String) -> Self {
+    fn new(value: &str) -> Self {
         let mut windows = Vec::new();
         let mut needles = Vec::new();
-        let mut hazardous = false;
-        // Shorter values never reach here as secrets: the resolver and
-        // [`register_values`] refuse them, so a short value in a document is a
-        // committed literal, readable in the repository.
-        for value in values
-            .iter()
-            .filter(|value| value.len() >= MIN_SCRUB_LENGTH)
-        {
-            hazardous |= is_reencoding_hazard(value);
-            for spelling in spellings(value) {
-                if spelling.len() < MIN_SCRUB_LENGTH {
-                    continue;
-                }
-                windows.extend(
-                    (0..=spelling.len() - FRAGMENT_SCAN_LENGTH)
-                        .filter_map(|at| window_at(spelling.as_bytes(), at)),
-                );
-                needles.push(spelling);
+        let hazardous = is_reencoding_hazard(value);
+        for spelling in spellings(value) {
+            if spelling.len() < MIN_SCRUB_LENGTH {
+                continue;
             }
+            windows.extend(
+                spelling
+                    .as_bytes()
+                    .windows(FRAGMENT_SCAN_LENGTH)
+                    .filter_map(|w| w.try_into().ok()),
+            );
+            needles.push(spelling);
         }
         windows.sort_unstable();
         windows.dedup();
         needles.sort();
         needles.dedup();
         Self {
-            public_text,
             windows,
             needles,
             hazardous,
@@ -216,44 +220,105 @@ impl Entry {
     }
 }
 
-/// Every registration, merged for lookup by eight-byte window.
+/// Unique secrets for the whole run, regardless of their source. Repeated
+/// snapshots update public-run evidence without retaining duplicate documents.
 #[derive(Default)]
 struct Registry {
-    entries: HashMap<u64, Entry>,
-    next_id: u64,
-    /// Every admin JWT this run sent. Kept for the whole run: a response
-    /// can be held and rendered long after later requests.
-    tokens: HashSet<String>,
-    /// Windows of the sent tokens and their spellings. Tokens have no
-    /// public document, so a set is enough (no owners to consult).
-    token_windows: HashSet<Window>,
-    /// Window → the entries that own it.
-    windows: HashMap<Window, Vec<u64>>,
+    entries: HashMap<String, Entry>,
+    /// A window is private if any registration has no public explanation for it.
+    private_windows: HashSet<Window>,
     /// First window of a needle → the needles, longest first.
     needles: HashMap<Window, Vec<String>>,
-    hazardous: usize,
+    hazardous: bool,
+    used: usize,
+    refusal: Option<String>,
 }
 
 impl Registry {
-    fn insert(&mut self, entry: Entry) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        for window in &entry.windows {
-            self.windows.entry(*window).or_default().push(id);
+    /// The single admission path for resolutions, live evidence, probes and
+    /// tokens. Check the entire registration before building any indexes.
+    fn register(
+        &mut self,
+        source: &str,
+        values: &[String],
+        document: Option<&GatewayConfig>,
+    ) -> crate::error::Result<()> {
+        if let Some(reason) = &self.refusal {
+            return Err(crate::error::Error::Config(reason.clone()));
         }
-        self.add_needles(&entry.needles);
-        self.hazardous += usize::from(entry.hazardous);
-        self.entries.insert(id, entry);
-        id
-    }
-
-    fn add_token(&mut self, token: &str) {
-        if !self.tokens.insert(token.to_string()) {
-            return;
+        let mut additional = 0usize;
+        let mut new_values = HashSet::new();
+        for value in values {
+            if value.len() < MIN_SCRUB_LENGTH {
+                let reason = format!("{source} holds a secret shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.");
+                self.refusal = Some(reason.clone());
+                return Err(crate::error::Error::Config(reason));
+            }
+            if !self.entries.contains_key(value) && new_values.insert(value.as_str()) {
+                additional = value
+                    .len()
+                    .checked_add(1)
+                    .and_then(|bytes| bytes.checked_mul(REGISTRATION_BYTES_PER_INPUT_BYTE))
+                    .and_then(|bytes| additional.checked_add(bytes))
+                    .unwrap_or(usize::MAX);
+            }
         }
-        let entry = Entry::new(&[token.to_string()], String::new());
-        self.token_windows.extend(entry.windows.iter().copied());
-        self.add_needles(&entry.needles);
+        if additional > REGISTRATION_BUDGET.saturating_sub(self.used) {
+            self.refusal = Some(BUDGET_REFUSAL.to_string());
+            return Err(crate::error::Error::Config(BUDGET_REFUSAL.to_string()));
+        }
+        // CRLF collapse or trimming can make even an eight-byte raw value
+        // too short to protect. Refuse that case rather than registering a
+        // short needle that would withhold ordinary prose throughout the run.
+        for value in &new_values {
+            if crate::review::pr_comment::secret_spellings(value)
+                .iter()
+                .any(|spelling| spelling.len() < MIN_SCRUB_LENGTH)
+            {
+                let reason = format!("{source} has a review-formatted spelling shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.");
+                self.refusal = Some(reason.clone());
+                return Err(crate::error::Error::Config(reason));
+            }
+        }
+        self.used += additional;
+        for value in new_values {
+            let entry = Entry::new(value);
+            self.hazardous |= entry.hazardous;
+            self.add_needles(&entry.needles);
+            self.entries.insert(value.to_string(), entry);
+        }
+        // Do not retain documents: repeated live reads must not accumulate
+        // copies or owners. Only the secret windows' public/private evidence
+        // survives. A bare value/token has no public document.
+        let public_text =
+            document.map(|config| self.redact(&serde_json::to_string(config).unwrap_or_default()));
+        let relevant_windows: HashSet<Window> = values
+            .iter()
+            .filter_map(|value| self.entries.get(value))
+            .flat_map(|entry| entry.windows.iter().copied())
+            .collect();
+        let public_windows: HashSet<Window> = public_text
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes()
+            .windows(FRAGMENT_SCAN_LENGTH)
+            .filter_map(|window| {
+                let window: Window = window.try_into().ok()?;
+                relevant_windows.contains(&window).then_some(window)
+            })
+            .collect();
+        for value in values {
+            if let Some(entry) = self.entries.get(value) {
+                self.private_windows.extend(
+                    entry
+                        .windows
+                        .iter()
+                        .filter(|window| !public_windows.contains(*window))
+                        .copied(),
+                );
+            }
+        }
+        Ok(())
     }
 
     fn add_needles(&mut self, needles: &[String]) {
@@ -300,19 +365,12 @@ impl Registry {
     /// Is this surviving run evidence of a secret, rather than a run that is
     /// public anyway?
     fn is_leak(&self, window: &Window, cache: &mut HashMap<Window, bool>) -> bool {
-        let owners = self.windows.get(window);
-        if owners.is_none() && !self.token_windows.contains(window) {
+        if !self.private_windows.contains(window) {
             return false;
         }
-        *cache.entry(*window).or_insert_with(|| {
-            !contains_bytes(PUBLIC_PROSE.as_bytes(), window)
-                && (self.token_windows.contains(window)
-                    || owners.into_iter().flatten().any(|owner| {
-                        self.entries.get(owner).is_some_and(|entry| {
-                            !contains_bytes(entry.public_text.as_bytes(), window)
-                        })
-                    }))
-        })
+        *cache
+            .entry(*window)
+            .or_insert_with(|| !contains_bytes(PUBLIC_PROSE.as_bytes(), window))
     }
 
     /// Does `bytes` hold a surviving run?
@@ -334,7 +392,7 @@ impl Registry {
     }
 
     fn has_windows(&self) -> bool {
-        !self.windows.is_empty() || !self.token_windows.is_empty()
+        !self.private_windows.is_empty()
     }
 
     /// Does a decoded spelling of `text` carry a surviving run? It cannot be
@@ -345,6 +403,9 @@ impl Registry {
 
     /// The sink's policy for one block of text (see the module docs).
     fn scrub_text(&self, text: &str) -> String {
+        if let Some(reason) = &self.refusal {
+            return reason.clone();
+        }
         let redacted = self.redact(text);
         if !self.has_windows() {
             return redacted;
@@ -371,6 +432,9 @@ impl Registry {
 
     /// One JSON string value: redacted, or withheld whole.
     fn scrub_json_string(&self, value: &str) -> String {
+        if let Some(reason) = &self.refusal {
+            return reason.clone();
+        }
         let redacted = self.redact(value);
         let mut cache = HashMap::new();
         if self.has_leak(redacted.as_bytes(), &mut cache)
@@ -383,7 +447,10 @@ impl Registry {
 
     /// The stricter policy for text a peer sent (see [`peer_text`]).
     fn peer_text(&self, text: &str) -> String {
-        if self.hazardous > 0 {
+        if let Some(reason) = &self.refusal {
+            return reason.clone();
+        }
+        if self.hazardous {
             return DISPLAY_WITHHELD.to_string();
         }
         // Only a bounded excerpt is ever shown, so only that much is
@@ -439,80 +506,91 @@ fn with_registry<T>(f: impl FnOnce(&Registry) -> T) -> T {
     }
 }
 
-fn with_registry_mut(f: impl FnOnce(&mut Registry)) {
+fn with_registry_mut<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
     if ENABLED.load(Ordering::SeqCst) {
-        f(&mut GLOBAL.lock().unwrap_or_else(PoisonError::into_inner));
-    } else if THREAD_ENABLED.with(Cell::get) {
-        LOCAL.with(|local| f(&mut local.borrow_mut()));
+        f(&mut GLOBAL.lock().unwrap_or_else(PoisonError::into_inner))
+    } else {
+        LOCAL.with(|local| f(&mut local.borrow_mut()))
     }
 }
 
-/// Register the secrets of `scrubber`, with its scrubbed document as public
-/// text.
-pub fn register_scrubber(scrubber: &SecretScrubber) {
-    if scrubber.is_empty() || !registering() {
-        return;
-    }
-    let entry = Entry::new(scrubber.values(), scrubber.public_text().to_string());
-    with_registry_mut(|registry| {
-        registry.insert(entry);
-    });
+/// Admit a live or outgoing document. Placeholder-shaped leaves are real
+/// credentials here; unlike repository declarations they get no exemption.
+pub fn register_gateway_config(config: &GatewayConfig) -> crate::error::Result<()> {
+    let values = gateway_secret_values(config, &ResolveReport::default(), true);
+    register(
+        "a live gateway credential",
+        values.into_iter().collect(),
+        Some(config),
+    )
 }
 
-/// Register the secret leaves of a live or outgoing document (a `/backup`
-/// snapshot, a restore payload carrying preserved live rows): they are
-/// secrets this run holds even when the repository never named them.
-pub fn register_gateway_config(config: &GatewayConfig) {
-    if registering() {
-        register_scrubber(&SecretScrubber::from_gateway_config(config));
-    }
+/// Register a resolved snapshot, retaining the declared-manifest policy:
+/// unresolved placeholders and short committed literals remain repository data.
+pub fn register_resolved(
+    config: &GatewayConfig,
+    report: &ResolveReport,
+) -> crate::error::Result<()> {
+    let values = gateway_secret_values(config, report, false);
+    register(
+        "a resolved credential",
+        values
+            .into_iter()
+            .filter(|value| value.len() >= MIN_SCRUB_LENGTH)
+            .collect(),
+        Some(config),
+    )
 }
 
-/// Register one resolved snapshot. The resolver calls this on every
-/// successful resolution: from then on those values travel in requests.
-pub fn register_resolved(config: &GatewayConfig, report: &ResolveReport) {
-    if registering() {
-        register_scrubber(&SecretScrubber::from_gateway_config_with_report(
-            config, report,
-        ));
-    }
-}
-
-/// Register secrets that are in no gateway document: a generated rotation
-/// value, or a token this process sends (`GITHUB_TOKEN` and friends).
-///
-/// A non-empty value shorter than [`MIN_SCRUB_LENGTH`] is refused with an
-/// error naming `source` (never the value): it could not be found again in
-/// output without matching ordinary words.
+/// Admit bare secrets (rotation, probe credentials, environment and sent tokens).
+/// Empty environment tokens are absent; live and probe leaves must pass the
+/// minimum even when empty. Sources must be trusted descriptions, never values.
 pub fn register_values<I, S>(source: &str, values: I) -> crate::error::Result<()>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    let values: Vec<String> = values
-        .into_iter()
-        .map(Into::into)
-        .filter(|value| !value.is_empty())
-        .collect();
-    if values.iter().any(|value| value.len() < MIN_SCRUB_LENGTH) {
-        return Err(crate::error::Error::Config(format!(
-            "{source} holds a secret shorter than {MIN_SCRUB_LENGTH} bytes; secrets this tool \
-             handles must be at least {MIN_SCRUB_LENGTH} bytes so they can be removed from \
-             its output. Use a longer value."
-        )));
-    }
-    if registering() {
-        register_scrubber(&SecretScrubber::from_secret_values(values));
-    }
-    Ok(())
+    register(
+        source,
+        values
+            .into_iter()
+            .map(Into::into)
+            .filter(|value| !value.is_empty())
+            .collect(),
+        None,
+    )
 }
 
-/// Register an admin JWT this process is about to send, for the rest of the
-/// run.
-pub fn register_sent_token(token: &str) {
-    if !token.is_empty() && registering() {
-        with_registry_mut(|registry| registry.add_token(token));
+pub(crate) fn register_probe_value(value: &str) -> crate::error::Result<()> {
+    register("a traffic probe credential", vec![value.to_string()], None)
+}
+
+fn register(
+    source: &str,
+    values: Vec<String>,
+    document: Option<&GatewayConfig>,
+) -> crate::error::Result<()> {
+    if registering() {
+        with_registry_mut(|registry| registry.register(source, &values, document))
+    } else if values.iter().any(|value| value.len() < MIN_SCRUB_LENGTH) {
+        Err(crate::error::Error::Config(format!("{source} holds a secret shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.")))
+    } else {
+        Ok(())
     }
+}
+
+/// Register each sent JWT for the whole run, under the same cumulative budget.
+pub fn register_sent_token(token: &str) -> crate::error::Result<()> {
+    register_values("an admin JWT", [token])
+}
+
+/// A swallowed live-read error must never turn a refused registration into a
+/// successful CLI run (e.g. review's ordinary offline fallback).
+pub fn registration_result() -> crate::error::Result<()> {
+    with_registry(|registry| match &registry.refusal {
+        Some(reason) => Err(crate::error::Error::Config(reason.clone())),
+        None => Ok(()),
+    })
 }
 
 /// The sink's policy for text, without writing it: for output that leaves
@@ -1149,13 +1227,191 @@ mod tests {
     #[test]
     fn short_secrets_are_refused_by_source() {
         enable();
+        register_values("GITHUB_TOKEN", [""]).unwrap();
         let error = register_values("GITHUB_TOKEN", ["s3cr3t!"])
             .unwrap_err()
             .to_string();
         assert!(error.contains("GITHUB_TOKEN"), "{error}");
         assert!(error.contains("8 bytes"), "{error}");
         assert!(!error.contains("s3cr3t"), "{error}");
-        register_values("GITHUB_TOKEN", ["", "long-enough-value"]).unwrap();
+        assert!(register_values("GITHUB_TOKEN", ["long-enough-value"]).is_err());
+        assert!(registration_result().is_err());
+    }
+
+    fn live_config(secret: &str) -> GatewayConfig {
+        serde_json::from_value(serde_json::json!({
+            "consumers": [{"id": "consumer", "namespace": "ferrum", "username": "client",
+                "credentials": {"keyauth": [{"key": secret}],
+                    "basicauth": [{"username": "x", "password": secret}],
+                    "mtls_auth": [{"identity": "x"}]}}],
+            "plugin_configs": [{"id": "plugin", "namespace": "ferrum", "plugin_name": "otel_tracing", "scope": "global",
+                "config": {"headers": {"authorization": secret}}}],
+            "upstreams": [{"id": "upstream", "namespace": "ferrum", "targets": [],
+                "service_discovery": {"provider": "consul", "consul": {
+                    "address": "https://consul.example", "service_name": "service", "token": secret}}}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn live_admission_refuses_short_leaves_without_registering_them() {
+        enable();
+        for length in 0..MIN_SCRUB_LENGTH {
+            for kind in ["consumer", "plugin", "discovery"] {
+                LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+                let value = "Q7!x9z?"[..length].to_string();
+                let mut config = live_config(&value);
+                if kind != "consumer" {
+                    config.consumers.clear();
+                }
+                if kind != "plugin" {
+                    config.plugin_configs.clear();
+                }
+                if kind != "discovery" {
+                    config.upstreams.clear();
+                }
+                let error = crate::http_client::BackupSnapshot::from_body(
+                    &serde_json::to_string(&config).unwrap(),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    error.contains("live gateway credential holds a secret shorter than 8 bytes"),
+                    "{error}"
+                );
+                if !value.is_empty() {
+                    assert!(!error.contains(&value), "{error}");
+                }
+                LOCAL.with(|local| {
+                    let registry = local.borrow();
+                    assert!(registry.entries.is_empty());
+                    assert!(registry.needles.is_empty());
+                });
+                assert!(registration_result().is_err());
+                assert!(!scrub_text("failed peer response").contains("peer response"));
+            }
+        }
+    }
+
+    #[test]
+    fn live_admission_refuses_a_formatter_spelling_too_short_to_protect() {
+        enable();
+        let value = "Q7\r\nx9yz";
+        assert_eq!(value.len(), MIN_SCRUB_LENGTH);
+        let result = crate::http_client::BackupSnapshot::from_body(
+            &serde_json::to_string(&live_config(value)).unwrap(),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("review-formatted spelling shorter than 8 bytes"),
+            "{error}"
+        );
+        assert!(!error.contains("Q7"));
+        LOCAL.with(|local| assert!(local.borrow().entries.is_empty()));
+    }
+
+    #[test]
+    fn live_admission_registers_placeholder_shaped_leaves_and_keeps_identity_exemptions() {
+        enable();
+        const VALUE: &str = "${gh-env-secret:alloc=require}";
+        let config = live_config(VALUE);
+        // The manifest collector must retain its placeholder policy.
+        assert!(crate::secrets::SecretScrubber::from_gateway_config(&config).is_empty());
+        crate::http_client::BackupSnapshot::from_body(&serde_json::to_string(&config).unwrap())
+            .unwrap();
+        assert_eq!(scrub_text(VALUE), REDACTION);
+        assert_eq!(
+            scrub_text(&base64::engine::general_purpose::STANDARD.encode(VALUE)),
+            REDACTION
+        );
+        assert_eq!(scrub_text("x"), "x");
+    }
+
+    #[test]
+    fn repeated_live_reads_and_cross_source_registrations_share_one_budget() {
+        enable();
+        let config = live_config("Q7-live-deduplicated-key");
+        let body = serde_json::to_string(&config).unwrap();
+        crate::http_client::BackupSnapshot::from_body(&body).unwrap();
+        let used = LOCAL.with(|local| local.borrow().used);
+        for _ in 0..32 {
+            crate::http_client::BackupSnapshot::from_body(&body).unwrap();
+            register_sent_token("Q7-live-deduplicated-key").unwrap();
+            crate::secrets::resolve_secrets(&mut config.clone(), &Default::default()).unwrap();
+            let headers = std::collections::BTreeMap::from([(
+                "X-Key".to_string(),
+                crate::verify::HeaderValue::slot("slot"),
+            )]);
+            crate::verify::resolve_headers(
+                &headers,
+                &std::collections::BTreeMap::from([(
+                    "slot".to_string(),
+                    "Q7-live-deduplicated-key".to_string(),
+                )]),
+            )
+            .unwrap();
+        }
+        LOCAL.with(|local| {
+            let registry = local.borrow();
+            assert_eq!(registry.entries.len(), 1);
+            assert_eq!(registry.used, used);
+        });
+        assert_eq!(scrub_text("Q7-live-deduplicated-key"), REDACTION);
+    }
+
+    #[test]
+    fn cumulative_budget_refuses_the_next_source_instead_of_dropping_it() {
+        enable();
+        // Each unique 8191-byte value costs 8 MiB of the 64 MiB budget.
+        for n in 0..8 {
+            let value = format!("Q7-budget-{n}-{}", "x".repeat(8179));
+            assert_eq!(value.len(), 8191);
+            if n % 3 == 0 {
+                crate::http_client::BackupSnapshot::from_body(
+                    &serde_json::to_string(&live_config(&value)).unwrap(),
+                )
+                .unwrap();
+            } else if n % 3 == 1 {
+                crate::secrets::resolve_secrets(&mut live_config(&value), &Default::default())
+                    .unwrap();
+            } else {
+                let headers = std::collections::BTreeMap::from([(
+                    "X-Key".to_string(),
+                    crate::verify::HeaderValue::slot("slot"),
+                )]);
+                crate::verify::resolve_headers(
+                    &headers,
+                    &std::collections::BTreeMap::from([("slot".to_string(), value)]),
+                )
+                .unwrap();
+            }
+        }
+        let error = register_sent_token("Q7-overflow-token")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("registration budget exceeded"), "{error}");
+        assert!(!error.contains("overflow-token"));
+        assert!(registration_result().is_err());
+        assert!(register_values("another source", ["Q7-another-key"]).is_err());
+        assert_eq!(scrub_text("unregistered private peer data"), BUDGET_REFUSAL);
+        LOCAL.with(|local| {
+            let registry = local.borrow();
+            assert_eq!(registry.used, REGISTRATION_BUDGET);
+            assert_eq!(registry.entries.len(), 8);
+        });
+    }
+
+    #[test]
+    fn oversized_live_value_is_refused_before_encoding_or_window_allocation() {
+        enable();
+        let body = serde_json::to_string(&live_config(&"Q7-secret".repeat(128 * 1024))).unwrap();
+        let (result, peak) =
+            crate::alloc_meter::peak_bytes(|| crate::http_client::BackupSnapshot::from_body(&body));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("registration budget exceeded"));
+        assert!(peak < 32 * 1024 * 1024, "admission allocated {peak} bytes");
+        LOCAL.with(|local| assert!(local.borrow().entries.is_empty()));
     }
 
     /// Every sent token stays registered for the whole run, however many
@@ -1165,7 +1421,7 @@ mod tests {
         enable();
         let token = |n: usize| format!("zq7-sent-token-{n:04}-signature-part");
         for n in 0..1000 {
-            register_sent_token(&token(n));
+            register_sent_token(&token(n)).unwrap();
         }
         assert_eq!(scrub_text(&token(0)), REDACTION);
         // A fragment of the first token is still recognized.
@@ -1350,7 +1606,7 @@ mod tests {
     fn live_namespace_names_are_scrubbed_where_displayed() {
         enable();
         const TOKEN: &str = "zq7-namespace-token-canary-0b7f";
-        register_sent_token(TOKEN);
+        register_sent_token(TOKEN).unwrap();
         let partial = &TOKEN[2..TOKEN.len() - 2];
         let scope = crate::config::NamespaceScope {
             filter: Some("team-alpha".to_string()),
@@ -1375,7 +1631,7 @@ mod tests {
     fn export_and_backup_diagnostics_never_quote_a_reflected_fragment() {
         enable();
         const TOKEN: &str = "zq7-export-token-canary-4a9e";
-        register_sent_token(TOKEN);
+        register_sent_token(TOKEN).unwrap();
         let fragment = &TOKEN[3..TOKEN.len() - 3];
         let namespace = serde_json::json!({ "namespace": fragment }).to_string();
         let fingerprint = serde_json::json!({

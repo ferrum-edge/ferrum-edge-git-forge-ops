@@ -68,6 +68,13 @@ impl ConsumerEvidence {
         require_authoritative(source, cache_control)?;
         let row = parse_sensitive(body)?;
         validate_consumer(&row, namespace, id)?;
+        let consumer = serde_json::from_value(row.clone()).map_err(|_| invalid())?;
+        // Rotation and conditional writes retain this complete row, including
+        // sibling credentials absent from the ordinary archival projection.
+        crate::display::register_gateway_config(&crate::config::GatewayConfig {
+            consumers: vec![consumer],
+            ..Default::default()
+        })?;
         Ok(Self {
             row,
             token: RowToken::parse(etag)?,

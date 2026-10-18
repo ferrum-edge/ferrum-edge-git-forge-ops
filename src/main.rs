@@ -223,7 +223,7 @@ async fn main() {
         }
     };
 
-    if let Err(e) = result {
+    if let Err(e) = display::registration_result().and(result) {
         // Last line of defense for anything a printer below did not
         // already sanitize: an error Display can carry a resource id, a
         // YAML path or a gateway response body. The sink removes the run's
@@ -4464,7 +4464,7 @@ async fn cmd_verify(
                     operator.list.as_ref(),
                 )?;
                 let (bundle, _) = load_credential_bundles(&env_config)?;
-                authorization.project(&bundle)
+                authorization.project(&bundle)?
             } else {
                 gitforgeops::verify::ProbeCredentials::none()
             };

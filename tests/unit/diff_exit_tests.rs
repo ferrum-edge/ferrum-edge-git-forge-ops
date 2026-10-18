@@ -1903,3 +1903,21 @@ fn a_secret_equal_to_a_report_key_keeps_the_json_contract() {
         stdout(&output)
     );
 }
+
+#[test]
+fn diff_refuses_short_live_credentials_without_displaying_them() {
+    let live = serde_json::json!({"proxies": [], "consumers": [{
+        "id": "live-consumer", "namespace": "ferrum", "username": "client",
+        "credentials": {"keyauth": [{"key": "Q7short"}]}
+    }], "upstreams": [], "plugin_configs": []})
+    .to_string();
+    let repo = Repo::new(
+        &[("resources/ferrum/proxies/app.yaml", FERRUM_PROXY)],
+        vec![("ferrum".to_string(), live)],
+    );
+    let output = repo.run(&["diff"]);
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("shorter than 8 bytes"), "{shown}");
+    assert!(!shown.contains("Q7short"), "{shown}");
+}

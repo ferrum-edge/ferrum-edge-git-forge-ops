@@ -58,7 +58,7 @@ fn verification_keeps_complete_basic_custom_and_legacy_fields_without_debug_leak
     let mut row = serde_json::to_value(consumer()).unwrap();
     row["credentials"]["basicauth"] = basic();
     row["credentials"]["custom"] = json!([{"private": {"url": "https://secret.example/private"}}]);
-    row["credentials"]["jwt"] = json!({"secret": SECRET, "legacy": "opaque"});
+    row["credentials"]["jwt"] = json!({"secret": SECRET, "legacy": "opaque-value"});
     let exact = evidence(&row, ROW_TAG);
     assert_eq!(exact.row, row);
     let debug = format!("{exact:?} {:?}", exact.token);
@@ -86,7 +86,7 @@ fn preserving_opaque_known_credentials_refuses_server_canonicalization_even_when
     let desired = consumer();
     let mut raw = serde_json::to_value(&desired).unwrap();
     raw["credentials"]["basicauth"] = basic();
-    raw["credentials"]["custom"] = json!({"legacy": "opaque"});
+    raw["credentials"]["custom"] = json!({"legacy": "opaque-value"});
     assert!(require_preserved_credentials(&raw, &desired, false).is_ok());
     assert!(require_preserved_credentials(&raw, &desired, true).is_err());
 }
@@ -668,7 +668,7 @@ async fn preallocation_capture_checks_archival_projection_but_retains_exact_hidd
         .credentials
         .insert("jwt".to_string(), json!([{"secret": SECRET}]));
     let mut raw = serde_json::to_value(&archival.consumers[0]).unwrap();
-    raw["credentials"]["jwt"] = json!({"secret": SECRET, "legacy": "hidden"});
+    raw["credentials"]["jwt"] = json!({"secret": SECRET, "legacy": "hidden-value"});
     let complete = evidence(&raw, ROW_TAG);
     assert!(complete.matches_archival(&archival.consumers[0]).unwrap());
     let mut changed = archival.consumers[0].clone();
@@ -977,7 +977,7 @@ async fn rotation_establishes_health_and_exact_fields_before_delivery_and_fences
     for profile in ["audit", "target", "identity", "legacy", "invalid-basic"] {
         let mut served = raw.clone();
         match profile {
-            "target" => served["credentials"]["keyauth"][0]["key"] = json!("changed"),
+            "target" => served["credentials"]["keyauth"][0]["key"] = json!("changed-value"),
             "identity" => served["custom_id"] = json!("other-owner"),
             "legacy" => served["credentials"]["jwt"] = json!({"secret": SECRET}),
             "invalid-basic" => {
@@ -1641,4 +1641,80 @@ fn consumer_target_selection_does_not_add_endpoint_dependencies_to_nonconsumer_w
     )
     .unwrap();
     assert!(targets.is_empty());
+}
+
+#[tokio::test]
+async fn rotation_registers_preserved_verification_credentials_before_publication() {
+    const SIBLING: &str = "Q7-preserved-sibling-credential";
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    let current = consumer();
+    let mut served = serde_json::to_value(&current).unwrap();
+    served["credentials"]["keyauth"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"key": SIBLING}));
+    let (client, requests) = gateway(move |request, _| {
+        if request.starts_with("GET /health") {
+            healthy()
+        } else if request.starts_with("GET /consumers/c1/verification ") {
+            verified(&served, ROW_TAG)
+        } else if request.starts_with("PUT /consumers/c1 ") {
+            assert!(request.contains(SIBLING));
+            (
+                400,
+                json!({"error": format!("rejected sibling {SIBLING}")}).to_string(),
+                vec![],
+            )
+        } else {
+            panic!("unexpected request; body withheld")
+        }
+    });
+    let prepared =
+        PreparedConsumerRotation::prepare(&client, &current, "keyauth/key", Some(SECRET))
+            .await
+            .unwrap();
+    assert_eq!(gitforgeops::display::scrub_text(SIBLING), "[REDACTED]");
+    let error = prepared
+        .publish(&client, "Q7-new-rotation-value")
+        .await
+        .unwrap_err();
+    let shown = gitforgeops::display::scrub_text(&error.to_string());
+    assert!(!shown.contains(SIBLING), "{shown}");
+    assert!(shown.contains("[REDACTED]"), "{shown}");
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request.starts_with("PUT /consumers/c1 ")));
+}
+
+#[tokio::test]
+async fn rotation_refuses_a_short_preserved_sibling_before_delivery_or_put() {
+    let current = consumer();
+    let mut served = serde_json::to_value(&current).unwrap();
+    served["credentials"]["keyauth"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"key": "Q7short"}));
+    let (client, requests) = gateway(move |request, _| {
+        if request.starts_with("GET /health") {
+            healthy()
+        } else if request.starts_with("GET /consumers/c1/verification ") {
+            verified(&served, ROW_TAG)
+        } else {
+            panic!("short live credentials must refuse before publication")
+        }
+    });
+    let error = PreparedConsumerRotation::prepare(&client, &current, "keyauth/key", Some(SECRET))
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("shorter than 8 bytes"), "{error}");
+    assert!(!error.contains("Q7short"));
+    assert!(!requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request.starts_with("PUT ")));
 }

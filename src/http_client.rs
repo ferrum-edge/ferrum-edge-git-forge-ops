@@ -418,7 +418,7 @@ impl AdminClient {
         let token = self.token()?;
         // A peer's error text can reflect this request's Authorization
         // header; displayed errors must have the token removed.
-        crate::display::register_sent_token(&token);
+        crate::display::register_sent_token(&token)?;
         Ok(Authorized {
             client: &self.client,
             url: parsed,
@@ -2629,10 +2629,10 @@ impl BackupSnapshot {
         .map_err(|_| {
             crate::error::Error::Config("invalid backup payload; details withheld".to_string())
         })?;
-        crate::config::validate_unique_live_resource_keys(&config)?;
         // Live credentials are this run's secrets too: a later response or a
         // restore payload can carry them.
-        crate::display::register_gateway_config(&config);
+        crate::display::register_gateway_config(&config)?;
+        crate::config::validate_unique_live_resource_keys(&config)?;
         let unmodeled_nested_fields: Vec<UnmodeledNestedField> = ignored
             .into_iter()
             .map(|field| field.attribute(&config))
@@ -3873,7 +3873,7 @@ mod bounded_error_message_tests {
     fn accepted_cluster_fields_stay_raw_and_are_scrubbed_where_displayed() {
         crate::display::enable_display_scrubbing_on_this_thread();
         const TOKEN: &str = "zq7-cluster-field-canary-31b9";
-        crate::display::register_sent_token(TOKEN);
+        crate::display::register_sent_token(TOKEN).unwrap();
         let with_control_plane = super::parse_cluster_status(&format!(
             r#"{{"mode":"database","control_plane":{{"url":"https://cp/{TOKEN}","status":"{TOKEN}",
                 "last_config_received_at":"{TOKEN}"}}}}"#

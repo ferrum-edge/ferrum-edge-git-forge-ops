@@ -1264,7 +1264,7 @@ fn prepare_full_replace(
     let config = preserve_spec_owned_graph(desired, actual, live_extras, namespace)?;
     // The payload carries preserved live rows the repository never named;
     // their secrets travel in this request.
-    crate::display::register_gateway_config(&config);
+    crate::display::register_gateway_config(&config)?;
     Ok(PreparedFullReplace {
         config,
         extras: BackupExtras {
