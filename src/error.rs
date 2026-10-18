@@ -158,13 +158,13 @@ pub enum Error {
     #[error("{}", safe_block(.0))]
     StalePlan(String),
 
-    /// A PluginConfig delete, or an update that moves its scope or target,
-    /// would make the gateway detach the plugin from a proxy that neither the
-    /// plan's live view nor the repository showed referencing it: most likely
-    /// one that attached it after the plan. Association rows are outside the
-    /// plugin's `ETag`, so `If-Match` cannot refuse this. Nothing was written,
-    /// and the namespace's remaining writes are withheld, as for
-    /// [`Error::StalePlan`].
+    /// The gateway refused a PluginConfig delete or update because a proxy
+    /// outside the plan's expected referencing set references the plugin:
+    /// most likely one that attached it after the plan. Association rows are
+    /// outside the plugin's `ETag`, so Ferrum Edge checks the caller's
+    /// `expected_proxy_ids` set atomically with the write and answered
+    /// `412` (issue #569). Nothing was written, and the namespace's
+    /// remaining writes are withheld, as for [`Error::StalePlan`].
     #[error("{}", safe_block(.0))]
     UnplannedPluginReference(String),
 

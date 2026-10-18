@@ -110,11 +110,11 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
   the `If-Match` write. The row is not written and the namespace's remaining
   writes are withheld. See
   [Changes made during an apply](#changes-made-during-an-apply).
-- **`UnplannedPluginReference`.** A PluginConfig delete, or an update that
-  moves its scope or target, would make the gateway detach the plugin from a
-  proxy that neither the plan nor the repository showed referencing it. The
-  plugin is not written and the namespace's remaining writes are withheld, as
-  for `StalePlan`. See [Plugin associations](#plugin-associations).
+- **`UnplannedPluginReference`.** The gateway refused a PluginConfig update
+  or delete because a proxy outside the plan's expected referencing set
+  references the plugin, so the write would have detached it. The plugin is
+  not written and the namespace's remaining writes are withheld, as for
+  `StalePlan`. See [Plugin associations](#plugin-associations).
 - **`ConditionalWriteUnavailable`.** A required strong row tag, complete consumer
   verification or coherent conditional snapshot is unavailable or invalid. The
   operation refuses before allocation. Cached reads, audit-admission refusal and
@@ -338,36 +338,24 @@ matches.
 ### Plugin associations
 
 Deleting a plugin config makes Ferrum Edge remove every proxy association to
-it, and updating a plugin config to `scope: proxy` or `scope: global` removes
-every association except the `proxy` target. Association rows are not part of
-the plugin config's `ETag`, so `If-Match` on the plugin cannot see a proxy
-that attached the plugin after the plan, and the write would silently detach
-it.
+it, and updating a plugin config to `scope: proxy` or `scope: global`
+removes every association except the `proxy` target. Association rows are
+not part of the plugin config's `ETag`, so `If-Match` on the plugin cannot
+see a proxy that attached the plugin after the plan.
 
-Immediately before a plugin config delete, and before an update that changes
-the plan's `scope` or `proxy_id` to `proxy` or `global`, apply therefore reads
-the namespace's `/backup` again and lists the proxies that reference the
-plugin now. The write is refused as `UnplannedPluginReference` when any of
-them is neither a proxy the plan's live view showed referencing the plugin, a
-proxy the repository declares referencing it, nor the target the update keeps.
-As with `StalePlan`, the namespace's remaining writes are withheld. Declare the
-reference in the repository to keep it, or re-run apply to accept detaching it:
-the next plan's live view then shows the late proxy, so the write proceeds and
-detaches it. A `proxy_group` update leaves associations alone, and an update
-that keeps its scope and target detaches nothing another proxy could validly
-have attached, so neither takes this read.
-
-That narrowed update guard relies on Ferrum Edge rejecting a proxy write that
-references a `global` config or a `proxy` config aimed at another proxy, so only
-the target the update keeps can be validly attached; revisit it if Edge relaxes
-that association validation (for example, by allowing `global` references).
-
-This check narrows the race; it does not close it. A proxy that attaches the
-plugin between that read and the write is still detached, because the gateway
-offers no precondition on associations. The full fix is a Ferrum Edge guard
-that refuses to delete or retarget a plugin config while a proxy outside the
-caller's expectation references it, checked inside the same write
-transaction.
+Every PluginConfig update and delete therefore sends
+`expected_proxy_ids`: the proxies the plan accounts for referencing the
+plugin — those the plan's live view showed referencing it and those the
+repository declares referencing it. Ferrum Edge checks that set against
+the proxies referencing the config at write time, atomically with the
+write under its namespace admission lease, and refuses with `412` when a
+proxy outside the set (and outside the target an update keeps) references
+it. Apply surfaces that as `UnplannedPluginReference`, and the namespace's
+remaining writes are withheld, as with `StalePlan`. Declare the reference
+in the repository to keep it, or re-run apply to accept detaching it: the
+next plan's live view then shows the late proxy, so the write proceeds and
+detaches it. There is no client-side re-read: the gateway's check closes
+the interval a re-read could only narrow (issue #569).
 
 ## Ordering between runs
 

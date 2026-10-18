@@ -1175,6 +1175,12 @@ impl AdminClient {
     /// admission lease, so a 412 proves the row changed after it was read and
     /// this attempt wrote nothing. After a retried attempt, the change may be
     /// that earlier attempt's own commit; the caller decides.
+    /// `expected_proxy_ids` carries the plugin-association precondition
+    /// (issue #569) for `PluginConfig` writes: every proxy the caller
+    /// expects to reference the config and accepts this write detaching.
+    /// Ferrum Edge requires it unconditionally and refuses the write with
+    /// `412` when a proxy outside the set references the config, checked
+    /// atomically with the write under the namespace admission lease.
     pub async fn update_if_match<T: Serialize>(
         &self,
         kind: &str,
@@ -1182,8 +1188,15 @@ impl AdminClient {
         resource: &T,
         namespace: &str,
         etag: &str,
+        expected_proxy_ids: Option<&BTreeSet<String>>,
     ) -> crate::error::Result<ConditionalUpdate> {
-        let path = resource_path(kind, id)?;
+        let mut path = resource_path(kind, id)?;
+        if let Some(expected) = expected_proxy_ids {
+            path = format!(
+                "{path}?expected_proxy_ids={}",
+                expected_proxy_ids_query(expected)?
+            );
+        }
         let target = self.authorized(&path)?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, || {
@@ -1195,6 +1208,14 @@ impl AdminClient {
             })
             .await?;
         if resp.status == 412 {
+            if expected_proxy_ids.is_some() {
+                if let Some(detail) = association_precondition_refusal(&resp.body) {
+                    return Err(crate::error::Error::UnplannedPluginReference(format!(
+                        "not sent: {detail} Declare the reference in the repository to keep it, \
+                         or re-run apply to accept detaching it"
+                    )));
+                }
+            }
             return Ok(ConditionalUpdate::Refused(PreconditionRefusal {
                 after_retry: resp.retried,
                 message: precondition_failed_message("PUT", &path, resp.retried),
@@ -1273,10 +1294,21 @@ impl AdminClient {
         id: &str,
         namespace: &str,
         etag: &str,
+        expected_proxy_ids: Option<&BTreeSet<String>>,
     ) -> crate::error::Result<DeleteOutcome> {
         let mut path = resource_path(kind, id)?;
+        let mut query: Vec<String> = Vec::new();
         if kind == "Proxy" {
-            path.push_str("?cleanup_orphaned_upstream=false");
+            query.push("cleanup_orphaned_upstream=false".to_string());
+        }
+        if let Some(expected) = expected_proxy_ids {
+            query.push(format!(
+                "expected_proxy_ids={}",
+                expected_proxy_ids_query(expected)?
+            ));
+        }
+        if !query.is_empty() {
+            path = format!("{path}?{}", query.join("&"));
         }
         self.delete(kind, &path, namespace, Some(etag))
             .await
@@ -1315,6 +1347,12 @@ impl AdminClient {
             })
             .await?;
         if resp.status == 412 && if_match.is_some() {
+            if let Some(detail) = association_precondition_refusal(&resp.body) {
+                return Err(crate::error::Error::UnplannedPluginReference(format!(
+                    "not sent: {detail} Declare the reference in the repository to keep it, \
+                     or re-run apply to accept detaching it"
+                )));
+            }
             let message = precondition_failed_message("DELETE", path, resp.retried);
             return Err(crate::error::Error::StalePlan(message));
         }
@@ -1471,6 +1509,34 @@ pub struct PreconditionRefusal {
     /// retried, so it may itself have committed the write.
     pub after_retry: bool,
     pub message: String,
+}
+
+/// The comma-separated `expected_proxy_ids` value for a PluginConfig write
+/// (issue #569). Each id must already be safe as a path segment, which also
+/// makes it safe unencoded inside this comma-separated query value: the
+/// gateway's id grammar excludes every separator character.
+fn expected_proxy_ids_query(expected: &BTreeSet<String>) -> crate::error::Result<String> {
+    for id in expected {
+        validate_resource_id_for_path(id)?;
+    }
+    Ok(expected
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+/// Ferrum Edge's association-precondition refusal (issue #569), reduced
+/// like every displayed gateway error body: the parsed `error` field only,
+/// bounded to one line. `None` when the 412 is an ordinary `If-Match`
+/// refusal, which keeps its existing `StalePlan` handling.
+fn association_precondition_refusal(body: &str) -> Option<String> {
+    let parsed = ApiErrorBody::parse(body);
+    let error = parsed.error.as_deref()?;
+    if !error.contains("outside expected_proxy_ids") {
+        return None;
+    }
+    Some(bounded_error_message(error))
 }
 
 fn precondition_failed_message(method: &str, path: &str, retried: bool) -> String {

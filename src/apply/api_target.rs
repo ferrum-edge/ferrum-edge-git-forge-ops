@@ -2256,7 +2256,7 @@ async fn update_proxy_after_plugins(
         return Ok(OpOutcome::Unchanged);
     }
     CreateResource::Proxy(proxy)
-        .update_if_match(client, namespace, &tagged.etag)
+        .update_if_match(client, namespace, &tagged.etag, None)
         .await
         .map(applied)
 }
@@ -2305,8 +2305,10 @@ const STALE_PLAN_GONE: &str =
 ///
 /// A PluginConfig's `ETag` does not cover the proxy associations to it, which
 /// the gateway removes when it deletes or retargets the plugin. Those writes
-/// are also refused when a proxy outside the plan references the plugin (see
-/// [`Preconditions::refuse_unplanned_references`]).
+/// therefore also carry the plan's expected referencing-proxy set
+/// (`expected_proxy_ids`), which Ferrum Edge checks atomically with the
+/// write: a proxy outside the plan referencing the plugin refuses it with
+/// `412` instead of being silently detached (issue #569).
 ///
 /// Consumers compare complete verification with the raw evidence captured before
 /// allocation, including hidden fields and the original row token. Archival
@@ -2325,7 +2327,9 @@ struct Preconditions<'a> {
     written_plugins: BTreeSet<String>,
     /// For each PluginConfig id, the proxies the plan accounts for referencing
     /// it: those the plan's live view showed referencing it and those the
-    /// repository declares referencing it.
+    /// repository declares referencing it. Sent to the gateway as the
+    /// `expected_proxy_ids` association precondition on every PluginConfig
+    /// update and delete.
     planned_references: BTreeMap<String, BTreeSet<String>>,
     /// Each PluginConfig's `(scope, proxy_id)` in the plan's live view.
     planned_targets: HashMap<String, (PluginScope, Option<String>)>,
@@ -2406,17 +2410,21 @@ impl<'a> Preconditions<'a> {
         let Some(etag) = self.confirm(resource.kind(), resource.id(), true).await? else {
             return Err(crate::error::Error::StalePlan(STALE_PLAN_GONE.to_string()));
         };
-        if let CreateResource::PluginConfig(plugin) = resource {
-            if self.retargets(plugin) {
-                let kept = match plugin.scope {
-                    PluginScope::Proxy => plugin.proxy_id.as_deref(),
-                    _ => None,
-                };
-                self.refuse_unplanned_references(&plugin.id, kept).await?;
-            }
-        }
+        // The gateway fences the associations this write would detach
+        // against the proxies the plan accounts for (issue #569), atomically
+        // with the write; a proxy outside the set refuses it with 412.
+        let expected = if let CreateResource::PluginConfig(plugin) = resource {
+            Some(
+                self.planned_references
+                    .get(&plugin.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
         resource
-            .update_if_match(self.client, self.namespace, &etag)
+            .update_if_match(self.client, self.namespace, &etag, expected.as_ref())
             .await
             .map(applied)
     }
@@ -2426,11 +2434,13 @@ impl<'a> Preconditions<'a> {
         let Some(etag) = self.confirm(kind, id, false).await? else {
             return Ok(OpOutcome::AlreadyGone);
         };
-        if kind == "PluginConfig" {
-            self.refuse_unplanned_references(id, None).await?;
-        }
+        let expected = if kind == "PluginConfig" {
+            Some(self.planned_references.get(id).cloned().unwrap_or_default())
+        } else {
+            None
+        };
         self.client
-            .delete_if_match(kind, id, self.namespace, &etag)
+            .delete_if_match(kind, id, self.namespace, &etag, expected.as_ref())
             .await
             .map(OpOutcome::from)
     }
@@ -2449,60 +2459,6 @@ impl<'a> Preconditions<'a> {
                 .is_none_or(|(scope, proxy_id)| {
                     *scope != plugin.scope || *proxy_id != plugin.proxy_id
                 })
-    }
-
-    /// Refuse a write that makes the gateway detach PluginConfig `id` from a
-    /// proxy the plan does not account for, other than `kept`, the target the
-    /// write keeps.
-    ///
-    /// Ferrum Edge's plugin-config `DELETE` removes every proxy association to
-    /// the plugin, and a `proxy` or `global` update removes every association
-    /// but its target. Those association rows are not covered by the plugin's
-    /// `ETag`, so `If-Match` cannot see a proxy that attached the plugin after
-    /// the plan, and the write would silently undo that attachment. So a
-    /// fresh `/backup`, read immediately before the write, lists the proxies
-    /// that reference the plugin now; any one neither the plan's live view nor
-    /// the repository showed referencing it refuses the write as
-    /// [`crate::error::Error::UnplannedPluginReference`].
-    ///
-    /// This narrows the race to the time between that read and the write; it
-    /// does not close it. A proxy that attaches the plugin in between is still
-    /// detached, because Edge offers no precondition on associations. Only a
-    /// gateway-side guard that refuses to delete or retarget a referenced
-    /// plugin config closes it.
-    async fn refuse_unplanned_references(
-        &mut self,
-        id: &str,
-        kept: Option<&str>,
-    ) -> crate::error::Result<()> {
-        let live = self.read_backup().await?;
-        let expected = self.planned_references.get(id);
-        let unplanned: Vec<String> = live
-            .proxies
-            .iter()
-            .filter(|proxy| {
-                proxy
-                    .plugins
-                    .iter()
-                    .any(|association| association.plugin_config_id == id)
-            })
-            .map(|proxy| proxy.id.as_str())
-            .filter(|proxy| Some(*proxy) != kept)
-            .filter(|proxy| !expected.is_some_and(|expected| expected.contains(*proxy)))
-            .map(|proxy| format!("`{proxy}`"))
-            .collect();
-        if unplanned.is_empty() {
-            return Ok(());
-        }
-        let noun = if unplanned.len() == 1 {
-            "proxy"
-        } else {
-            "proxies"
-        };
-        Err(crate::error::Error::UnplannedPluginReference(format!(
-            "not sent: the gateway would detach PluginConfig `{id}` from {noun} {}, which this run's plan and the repository do not show referencing it (most likely attached after the plan). Declare the reference in the repository to keep it, or re-run apply to accept detaching it",
-            unplanned.join(", ")
-        )))
     }
 
     /// Read the namespace's `/backup` and keep its rows as the confirmation
@@ -3140,7 +3096,12 @@ async fn adopt_matching_rows(
                 continue;
             }
         };
-        match resource.update_if_match(client, namespace, &etag).await {
+        let expected =
+            (kind == "PluginConfig").then(|| confirmation.referencing_proxy_ids(namespace, id));
+        match resource
+            .update_if_match(client, namespace, &etag, expected.as_ref())
+            .await
+        {
             Ok(()) => {}
             Err(crate::error::Error::StalePlan(_)) => {
                 skip_adoption(result, namespace, &changed);
@@ -3295,6 +3256,23 @@ impl<'a> ResourceIndex<'a> {
         }
     }
 
+    /// Every proxy in `namespace` this document shows referencing
+    /// `plugin_id` — the expected set a PluginConfig ownership assertion
+    /// sends with its conditional write (issue #569).
+    fn referencing_proxy_ids(&self, namespace: &str, plugin_id: &str) -> BTreeSet<String> {
+        self.proxies
+            .values()
+            .filter(|proxy| {
+                proxy.namespace == namespace
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == plugin_id)
+            })
+            .map(|proxy| proxy.id.clone())
+            .collect()
+    }
+
     /// Does the `(namespace, kind, id)` row carry an `api_spec_id`? Consumers
     /// are never spec-provisioned, so they can never answer yes.
     fn is_spec_owned(&self, kind: &str, namespace: &str, id: &str) -> bool {
@@ -3368,18 +3346,45 @@ impl<'a> CreateResource<'a> {
     /// Every overwrite incremental apply sends goes through here: a planned
     /// update, and the idempotent ownership assertion of a row a pending or
     /// ambiguous create, or adoption, found already live.
+    /// `expected_proxy_ids` is the plugin-association precondition
+    /// (issue #569): required for `PluginConfig`, ignored for every other
+    /// kind. Every caller holds a plan or verification view that knows the
+    /// referencing proxies it accounts for.
     async fn update_if_match(
         self,
         client: &AdminClient,
         namespace: &str,
         etag: &str,
+        expected_proxy_ids: Option<&BTreeSet<String>>,
     ) -> crate::error::Result<()> {
         let (kind, id) = (self.kind(), self.id());
+        if kind == "PluginConfig" && expected_proxy_ids.is_none() {
+            return Err(crate::error::Error::Config(format!(
+                "PluginConfig `{id}` update reached the conditional write without its \
+                 expected referencing-proxy set; this is a gitforgeops bug, not gateway state"
+            )));
+        }
         let outcome = match self {
-            Self::Proxy(row) => client.update_if_match(kind, id, row, namespace, etag).await,
-            Self::Consumer(row) => client.update_if_match(kind, id, row, namespace, etag).await,
-            Self::Upstream(row) => client.update_if_match(kind, id, row, namespace, etag).await,
-            Self::PluginConfig(row) => client.update_if_match(kind, id, row, namespace, etag).await,
+            Self::Proxy(row) => {
+                client
+                    .update_if_match(kind, id, row, namespace, etag, None)
+                    .await
+            }
+            Self::Consumer(row) => {
+                client
+                    .update_if_match(kind, id, row, namespace, etag, None)
+                    .await
+            }
+            Self::Upstream(row) => {
+                client
+                    .update_if_match(kind, id, row, namespace, etag, None)
+                    .await
+            }
+            Self::PluginConfig(row) => {
+                client
+                    .update_if_match(kind, id, row, namespace, etag, expected_proxy_ids)
+                    .await
+            }
         };
         let refusal = match outcome? {
             ConditionalUpdate::Applied => return Ok(()),
@@ -3678,8 +3683,10 @@ async fn create_with_reconciliation(
                             )));
                         }
                     };
+                    let expected = (resource.kind() == "PluginConfig")
+                        .then(|| live.referencing_proxy_ids(namespace, resource.id()));
                     verified
-                        .update_if_match(client, namespace, &etag)
+                        .update_if_match(client, namespace, &etag, expected.as_ref())
                         .await
                         .map_err(|assertion| {
                             crate::error::Error::AmbiguousMutation(format!(
@@ -4337,8 +4344,10 @@ async fn assert_batch_ownership(
                 if verified.tagged_row_is(&tagged.body)
                     && complete_consumer_read_matches(resource, snapshot, &tagged) =>
             {
+                let expected =
+                    (kind == "PluginConfig").then(|| live.referencing_proxy_ids(namespace, id));
                 verified
-                    .update_if_match(client, namespace, &tagged.etag)
+                    .update_if_match(client, namespace, &tagged.etag, expected.as_ref())
                     .await
             }
             (Ok(_), _) => Err(crate::error::Error::StalePlan(
