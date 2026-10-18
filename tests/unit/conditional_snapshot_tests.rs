@@ -1678,9 +1678,14 @@ async fn rotation_registers_preserved_verification_credentials_before_publicatio
         .publish(&client, "Q7-new-rotation-value")
         .await
         .unwrap_err();
+    assert!(matches!(
+        &error,
+        gitforgeops::error::Error::ApiError { status: 400, .. }
+    ));
     let shown = gitforgeops::display::scrub_text(&error.to_string());
     assert!(!shown.contains(SIBLING), "{shown}");
-    assert!(shown.contains("[REDACTED]"), "{shown}");
+    // Conditional failures withhold the peer's entire response before display.
+    assert!(shown.contains("response details withheld"), "{shown}");
     assert!(requests
         .lock()
         .unwrap()

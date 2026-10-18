@@ -1840,7 +1840,7 @@ fn a_bundle_resolved_placeholder_stays_uncompared() {
 #[test]
 fn a_whole_value_fingerprinted_around_a_secret_is_never_accepted() {
     let placeholder = "${gh-env-secret:alloc=require}";
-    let headers = serde_json::json!({ "x-api-key": placeholder, "x-trace": "on" });
+    let headers = serde_json::json!({ "x-api-key": placeholder, "x-trace": "trace-enabled" });
     let config = serde_json::json!({ "headers": headers });
     let live = serde_json::json!({ "headers": fingerprint('c') });
     let repo = Repo::new(

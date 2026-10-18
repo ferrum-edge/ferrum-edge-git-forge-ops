@@ -437,7 +437,7 @@ fn a_whole_value_fingerprinted_around_a_secret_is_never_authoritative() {
             "namespace": "ferrum",
             "plugin_name": "otel_tracing",
             "scope": "global",
-            "config": { "headers": { "x-api-key": PLACEHOLDER, "x-trace": "on" } },
+            "config": { "headers": { "x-api-key": PLACEHOLDER, "x-trace": "trace-enabled" } },
         }],
     }))
     .unwrap();

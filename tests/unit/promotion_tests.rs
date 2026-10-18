@@ -1453,11 +1453,22 @@ fn probe_projection_refuses_short_values_and_registers_only_authorized_credentia
     let checks = checks_sending("GET", PROBE_SLOT);
     let authorization =
         authorize_probe_slots("staging", &checks, &desired(), Some(&allowlist())).unwrap();
-    authorization.project(&bundle()).unwrap();
+    let customer_value = "Q7-unrelated-customer-credential";
+    let mut values = bundle();
+    values.insert(CUSTOMER_SLOT.to_string(), customer_value.to_string());
+    let projected = authorization.project(&values).unwrap();
+    assert_eq!(projected.slots().collect::<Vec<_>>(), vec![PROBE_SLOT]);
     assert_eq!(gitforgeops::display::scrub_text(PROBE_VALUE), "[REDACTED]");
+    // The original customer fixture shares an eight-byte run with the probe:
+    // fragment protection must withhold it even though it was not registered.
     assert_eq!(
         gitforgeops::display::scrub_text(CUSTOMER_VALUE),
-        CUSTOMER_VALUE
+        gitforgeops::display::DISPLAY_WITHHELD
+    );
+    // A disjoint unauthorized value still proves projection did not register it.
+    assert_eq!(
+        gitforgeops::display::scrub_text(customer_value),
+        customer_value
     );
     let mut short = bundle();
     short.insert(PROBE_SLOT.to_string(), "Q7short".to_string());

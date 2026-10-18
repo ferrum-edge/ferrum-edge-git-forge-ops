@@ -2422,15 +2422,18 @@ fn legacy_slot_scan_ignores_similarly_named_types_and_canonical_children() {
     use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
 
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/partner/keyauth/key".to_string(), "LIVE".to_string());
+    bundle.insert(
+        "ferrum/partner/keyauth/key".to_string(),
+        "LIVE-KEY-VALUE".to_string(),
+    );
     // Not keyauth slots: another consumer and an unrelated key.
     bundle.insert(
         "ferrum/partner2/keyauth.key".to_string(),
-        "OTHER".to_string(),
+        "OTHER-KEY-VALUE".to_string(),
     );
     bundle.insert(
         "ferrum/partner/keyauthx.key".to_string(),
-        "OTHER".to_string(),
+        "OTHER-KEY-VALUE".to_string(),
     );
     let cfg = partner_cfg(serde_json::json!({"keyauth": [{"key": REQUIRE}]}));
     let report = report_secrets_with_mode_and_options(
@@ -2700,7 +2703,10 @@ fn nested_array_shrink_covers_the_explicit_zero_slash_alias() {
     use gitforgeops::secrets::{report_secrets_with_mode_and_options, ResolveOptions};
 
     let mut bundle = BTreeMap::new();
-    bundle.insert("ferrum/partner/keyauth/key".to_string(), "KEY".to_string());
+    bundle.insert(
+        "ferrum/partner/keyauth/key".to_string(),
+        "LIVE-KEY-VALUE".to_string(),
+    );
     bundle.insert(
         "ferrum/partner/keyauth/[0]/extra/[0]/token".to_string(),
         "STORED-A".to_string(),
