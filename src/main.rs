@@ -223,7 +223,10 @@ async fn main() {
         }
     };
 
-    if let Err(e) = display::registration_result().and(result) {
+    if let Err(e) = display::registration_result()
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        .and(result)
+    {
         // Last line of defense for anything a printer below did not
         // already sanitize: an error Display can carry a resource id, a
         // YAML path or a gateway response body. The sink removes the run's

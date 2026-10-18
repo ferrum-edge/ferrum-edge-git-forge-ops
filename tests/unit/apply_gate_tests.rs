@@ -397,6 +397,7 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
         &[
             ("FERRUM_GATEWAY_MODE", "api"),
             ("FERRUM_GATEWAY_URL", &endpoint),
+            ("FERRUM_ALLOW_INSECURE_HTTP", "true"),
             ("FERRUM_GATEWAY_MAX_RETRIES", "0"),
             ("FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS", "1"),
             (
