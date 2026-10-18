@@ -2509,15 +2509,13 @@ impl BackupSnapshot {
             if let Some(rows) = value.get(section).and_then(serde_json::Value::as_array) {
                 for row in rows {
                     if row.get("namespace").and_then(serde_json::Value::as_str) != Some(namespace) {
-                        // Peer text, only displayed.
-                        let id = crate::display::peer_text(
-                            row.get("id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("?"),
-                        );
+                        // This response's credentials have not been admitted
+                        // yet. Even its identifiers may reflect them, so no
+                        // response-derived value is safe to quote here.
                         return Err(crate::error::Error::BackupNamespace(format!(
-                            "namespace-scoped backup for {namespace:?} returned {section} {id:?} \
-                             with a missing or foreign namespace; refusing the snapshot"
+                            "namespace-scoped backup for {namespace:?} returned a {section} row \
+                             with a missing or foreign namespace; refusing the snapshot \
+                             (response identifiers withheld)"
                         )));
                     }
                 }

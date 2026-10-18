@@ -112,7 +112,7 @@ const BUDGET_REFUSAL: &str = "Secret registration budget exceeded; refusing the 
 type Window = [u8; FRAGMENT_SCAN_LENGTH];
 
 fn window_at(bytes: &[u8], at: usize) -> Option<Window> {
-    bytes.get(at..at + FRAGMENT_SCAN_LENGTH)?.try_into().ok()
+    Window::try_from(bytes.get(at..at + FRAGMENT_SCAN_LENGTH)?).ok()
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -204,7 +204,7 @@ impl Entry {
                 spelling
                     .as_bytes()
                     .windows(FRAGMENT_SCAN_LENGTH)
-                    .filter_map(|w| w.try_into().ok()),
+                    .filter_map(|w| Window::try_from(w).ok()),
             );
             needles.push(spelling);
         }
@@ -303,7 +303,7 @@ impl Registry {
             .as_bytes()
             .windows(FRAGMENT_SCAN_LENGTH)
             .filter_map(|window| {
-                let window: Window = window.try_into().ok()?;
+                let window = Window::try_from(window).ok()?;
                 relevant_windows.contains(&window).then_some(window)
             })
             .collect();
@@ -1520,7 +1520,7 @@ mod tests {
         const SECRET: &str = "zq7_md.ca_ny.va_ue.x9";
         register_values("test", [SECRET]).unwrap();
         let markdown = SECRET.replace('_', "\\_").replace('.', "&#46;");
-        assert_eq!(scrub_text(&format!("- {markdown}")), DISPLAY_WITHHELD);
+        assert_eq!(scrub_text(&format!("- {markdown}")), "- [REDACTED]");
     }
 
     /// Schema keys are the report contract; data keys are scrubbed.

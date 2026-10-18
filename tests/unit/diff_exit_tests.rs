@@ -1058,7 +1058,7 @@ fn malformed_backup_namespaces_refuse_diff_plan_and_apply_without_mutations() {
                 assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
                 let error = stderr(&output);
                 assert!(error.contains("namespace-scoped backup"), "{error}");
-                assert!(error.contains("app"), "{error}");
+                assert!(error.contains("response identifiers withheld"), "{error}");
                 assert!(!stdout(&output).contains("DELETE Proxy"));
             }
             for request in repo.requests.lock().unwrap().iter() {
@@ -1066,6 +1066,53 @@ fn malformed_backup_namespaces_refuse_diff_plan_and_apply_without_mutations() {
             }
         }
     }
+}
+
+/// The first backup carries a previously unknown live credential and reflects
+/// it in a foreign row's id. Namespace validation runs before admission, so the
+/// error must withhold that id without relying on a prior registered snapshot.
+#[cfg(unix)]
+#[test]
+fn first_backup_namespace_refusal_withholds_reflected_live_credentials() {
+    const SECRET: &str = "Zq7-first-backup-canary-94b2";
+    let body = serde_json::json!({
+        "proxies": [live_proxy(SECRET, "foreign", 8080, None)],
+        "consumers": [{
+            "id": "live-consumer", "namespace": "ferrum", "username": "client",
+            "credentials": {"keyauth": [{"key": SECRET}]},
+        }],
+        "upstreams": [],
+        "plugin_configs": [],
+    })
+    .to_string();
+    let repo = Repo::new(
+        &[("resources/ferrum/proxies/app.yaml", FERRUM_PROXY)],
+        vec![("ferrum".to_string(), body)],
+    );
+    for args in [
+        &["diff"][..],
+        &["diff", "--format", "json"],
+        &["plan"],
+        &["plan", "--format", "json"],
+        &["apply", "--auto-approve"],
+    ] {
+        let output = repo.run(args);
+        let shown = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {shown}");
+        assert!(shown.contains("namespace-scoped backup"), "{shown}");
+        assert!(shown.contains("response identifiers withheld"), "{shown}");
+        assert!(!shown.contains(SECRET), "{args:?}: {shown}");
+    }
+    let requests = repo.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("GET /backup "))
+            .count(),
+        5,
+        "each CLI run must refuse its first backup"
+    );
+    assert!(requests.iter().all(|request| request.starts_with("GET ")));
 }
 
 #[cfg(unix)]
@@ -1356,6 +1403,29 @@ const VIEWER_ONLY: [(&str, &str); 2] = [
     ("FERRUM_ADMIN_JWT_VIEWER_SECRET", VIEWER_SECRET),
     ("FERRUM_ADMIN_JWT_SECRET", ""),
 ];
+
+#[test]
+fn first_export_namespace_refusal_withholds_response_identifiers() {
+    const SECRET: &str = "Zq7-first-export-canary-94b2";
+    let mut export: serde_json::Value =
+        serde_json::from_str(&config_export(EXPORT_KEY_ID, &['a'])).unwrap();
+    export["consumers"][0]["id"] = SECRET.into();
+    export["consumers"][0]["namespace"] = "foreign".into();
+    let repo = export_repo(export.to_string(), false);
+    for args in [&["diff"][..], &["diff", "--format", "json"]] {
+        let output = repo.run_with_env(args, &VIEWER_ONLY);
+        let shown = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{shown}");
+        assert!(shown.contains("configuration export"), "{shown}");
+        assert!(shown.contains("response identifiers withheld"), "{shown}");
+        assert!(!shown.contains(SECRET), "{shown}");
+    }
+    let requests = repo.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.starts_with("GET /config/export ")));
+}
 
 #[test]
 fn a_viewer_diff_reads_the_export_and_does_not_call_unverified_secrets_in_sync() {

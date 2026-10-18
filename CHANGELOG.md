@@ -463,35 +463,6 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and reads are capped at 1 MiB before and while reading. A `uses:`
   reference with parent components can no longer make the trusted policy
   job open a file outside the candidate checkout.
-
-
-- Scrub resolved secrets from displayed errors. Every successful secret
-  resolution in a CLI run registers its values. The gateway's structured
-  `error`, GitHub's `message` and the final `Error:` line have them replaced
-  with `[REDACTED]`, and a diagnostic is withheld if a value or a fragment of
-  one survives. Follow-up to #553, which bounded these messages but still
-  displayed whatever a peer reflected from the request.
-
-- Scrub secrets from displayed errors (follow-up to #553, which bounded these
-  messages but still displayed whatever a peer reflected from the request).
-  Each CLI run registers every value it resolves, every rotated value it
-  publishes, every admin JWT it sends (for the whole run), and the
-  GitHub tokens and admin JWT secret in its environment. Every displayed
-  gateway field (`error`, `reason`, `rollback`, `restore_errors`,
-  `api_specs_at_risk`), GitHub's `message` and the final `Error:` line show
-  those values, and any `Bearer`, JWT- or GitHub-token-shaped word, as
-  `[REDACTED]`. Peer text is withheld whole when a resolved value is not
-  safely scrubbable, or when a value (including one too short to replace) or a
-  fragment of one survives. The final `Error:` line is never withheld.
-  Admin JWTs get the same re-encoding and fragment checks as resolved
-  secrets. Only a fixed window of a peer's error text is scrubbed, in one
-  streaming pass. A successful response that does not parse (`/health`,
-  `/namespaces`, `/cluster`, `/config/export`, GitHub PR and events) is
-  reported by error category and position, never with `serde_json`'s quote
-  of the offending value. Accepted free-text fields of `/health` and
-  `/cluster` (shown by doctor and apply's convergence line) and policy
-  override reasons are scrubbed the same way.
-
 - Scrub secrets from everything the CLI displays (follow-up to #553, which
   bounded peer error text but still displayed whatever a peer reflected from
   the request). All stdout and stderr, `--format json` documents, the final
@@ -501,12 +472,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   registers every value it resolves, the secret leaves of every live
   `/backup` snapshot and restore payload, every rotated value it publishes,
   every admin JWT it sends (for the whole run), and the GitHub tokens and
-  admin JWT secrets in its environment. The sink replaces those values and their
-  base64, percent, JSON-escaped and single-quoted spellings, the form the
-  log sanitizer gives them, and any `Bearer`, JWT- or GitHub-token-shaped
-  word with `[REDACTED]` (snake_case JSON property names, the report
-  contract, are left alone). A line (or a JSON string value) that still holds an 8-byte run of one, as written or
-  after decoding escapes, percent-encoding or HTML references, is withheld;
+  admin JWT secrets in its environment. Admission refuses credentials shorter
+  than eight bytes or with an unprotectable review spelling, and bounds the
+  cumulative registration cost. The sink replaces admitted values and their
+  base64, percent, JSON-escaped, single-quoted, sanitizer and review Markdown
+  spellings, and any `Bearer`, JWT- or GitHub-token-shaped word with
+  `[REDACTED]` (snake_case JSON property names, the report contract, are left
+  alone). A line (including the final `Error:` line, or a JSON string value)
+  that still holds an 8-byte run of one, as written or after decoding escapes,
+  percent-encoding or HTML references, is withheld;
   runs that are also in the scrubbed configuration or in the tool's own
   messages are public. Peer text (a gateway `error`, `reason` or `rollback`,
   GitHub's `message`, `/namespaces`, `/health`, `/cluster` and
@@ -516,7 +490,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   refusal never see a scrubbed copy. Age-encrypted credential deliveries are
   written byte for byte; only the text around them is scrubbed. A successful
   response that does not parse is reported by error category and position
-  only.
+  only. Backup and configuration-export namespace refusals withhold response
+  identifiers before live credentials can be admitted; export metadata
+  refusals likewise omit response-derived values.
 - Finish bounding error bodies and validator I/O (follow-up to #553). The
   gateway's structured `error` message is now one bounded line like every
   other displayed error body, and a failed PR-comment POST reads GitHub's

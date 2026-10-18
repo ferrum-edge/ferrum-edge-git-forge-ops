@@ -180,15 +180,14 @@ impl ConfigExport {
             )));
         };
 
-        // Response fields quoted in a diagnostic are peer text: the
-        // comparisons read them raw, the messages show
-        // `display::peer_text` copies.
+        // No credentials from this response have been admitted. Refusals must
+        // not quote response-derived values, including identifiers or metadata
+        // that could reflect a live secret before the sink knows its value.
         let exported_namespace = document.get("namespace").and_then(Value::as_str);
         if exported_namespace != Some(namespace) {
             return Err(Error::BackupNamespace(format!(
-                "configuration export for namespace {namespace:?} reported namespace {:?}; \
-                 refusing the snapshot",
-                crate::display::peer_text(exported_namespace.unwrap_or("<missing>"))
+                "configuration export for namespace {namespace:?} reported a missing or foreign \
+                 namespace; refusing the snapshot (response identifiers withheld)"
             )));
         }
 
@@ -205,11 +204,10 @@ impl ConfigExport {
             || prefix.as_deref() != Some(FINGERPRINT_PREFIX)
         {
             return Err(Error::Config(format!(
-                "GET {CONFIG_EXPORT_PATH} for namespace {namespace:?} uses fingerprint algorithm \
-                 {:?} with prefix {:?}; this build understands only {FINGERPRINT_ALGORITHM:?} \
-                 with prefix {FINGERPRINT_PREFIX:?}",
-                crate::display::peer_text(algorithm.as_deref().unwrap_or("<missing>")),
-                crate::display::peer_text(prefix.as_deref().unwrap_or("<missing>"))
+                "GET {CONFIG_EXPORT_PATH} for namespace {namespace:?} uses an unsupported or \
+                 missing fingerprint algorithm or prefix (response metadata withheld); \
+                 this build understands only {FINGERPRINT_ALGORITHM:?} with prefix \
+                 {FINGERPRINT_PREFIX:?}"
             )));
         }
         let fingerprint_key_id = redaction_field("fingerprint_key_id").unwrap_or_default();
@@ -254,11 +252,11 @@ impl ConfigExport {
                 let row_id = entry.get("id").and_then(Value::as_str);
                 let id = match (row_namespace, row_id) {
                     (Some(row_namespace), Some(id)) if row_namespace == namespace => id.to_string(),
-                    (_, id) => {
+                    _ => {
                         return Err(Error::BackupNamespace(format!(
-                            "configuration export for namespace {namespace:?} returned {section} \
-                             {:?} with a missing or foreign namespace or id; refusing the snapshot",
-                            crate::display::peer_text(id.unwrap_or("?"))
+                            "configuration export for namespace {namespace:?} returned a {section} \
+                             row with a missing or foreign namespace or id; refusing the snapshot \
+                             (response identifiers withheld)"
                         )));
                     }
                 };

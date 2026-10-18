@@ -165,11 +165,38 @@ fn an_export_for_another_namespace_or_with_a_foreign_row_is_refused() {
 }
 
 #[test]
+fn export_refusals_withhold_unadmitted_response_values() {
+    const SECRET: &str = "Zq7-unadmitted-export-canary-41b8";
+    for pointer in [
+        "/namespace",
+        "/redaction/fingerprint_algorithm",
+        "/redaction/fingerprint_prefix",
+        "/consumers/0/id",
+    ] {
+        let consumer = live_consumer(&[fp('a')], &fp('b'));
+        let mut body = document("ferrum", KEY_ID, json!([consumer]), json!([]));
+        *body.pointer_mut(pointer).unwrap() = json!(SECRET);
+        if pointer == "/consumers/0/id" {
+            body["consumers"][0]["namespace"] = json!("foreign");
+        }
+        let error = ConfigExport::from_response(&body.to_string(), "ferrum", false).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("withheld"), "{pointer}: {message}");
+        assert!(!message.contains(SECRET), "{pointer}: {message}");
+    }
+}
+
+#[test]
 fn an_unknown_fingerprint_scheme_or_key_id_is_refused() {
     let mut algorithm = document("ferrum", KEY_ID, json!([]), json!([]));
     algorithm["redaction"]["fingerprint_algorithm"] = json!("hmac-sha512");
     let error = ConfigExport::from_response(&algorithm.to_string(), "ferrum", false).unwrap_err();
-    assert!(error.to_string().contains("hmac-sha512"), "{error}");
+    assert!(
+        error.to_string().contains("fingerprint algorithm"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("hmac-sha256"), "{error}");
+    assert!(!error.to_string().contains("hmac-sha512"), "{error}");
 
     let key_id = document("ferrum", "not-hex", json!([]), json!([]));
     let error = ConfigExport::from_response(&key_id.to_string(), "ferrum", false).unwrap_err();
