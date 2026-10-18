@@ -5,6 +5,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- PluginConfig updates and deletes now send the gateway's
+  `expected_proxy_ids` association precondition (#569): the proxies the
+  plan accounts for referencing the plugin. Ferrum Edge checks the set
+  atomically with the write and refuses with `412` when an unplanned proxy
+  references the config, which apply still surfaces as
+  `UnplannedPluginReference`. The client-side fresh-backup re-read that
+  only narrowed the race is removed; older gateways ignore the parameter.
+
 ### Added
 
 - `.github/scripts/release_gate.py`, the release gate as a Python helper

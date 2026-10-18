@@ -198,6 +198,7 @@ async fn admin_client_rejects_unsafe_resource_ids_in_paths() {
             "../consumers/victim?confirm=true",
             "team-alpha",
             "\"tag\"",
+            None,
         )
         .await;
     assert!(err.is_err(), "expected unsafe id to be rejected");
@@ -232,7 +233,7 @@ async fn admin_client_accepts_safe_resource_id_in_paths() {
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let outcome = client
-        .delete_if_match("Proxy", "proxy-01._~A", "team-alpha", "\"tag\"")
+        .delete_if_match("Proxy", "proxy-01._~A", "team-alpha", "\"tag\"", None)
         .await
         .unwrap();
     assert_eq!(outcome, DeleteOutcome::Deleted);
@@ -296,13 +297,78 @@ fn resource_ids_that_escape_the_path_segment_are_rejected() {
 }
 
 #[tokio::test]
+async fn plugin_delete_sends_expected_proxy_ids_and_maps_association_412() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0_u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        tx.send(request).unwrap();
+        let body = r#"{"error":"plugin config 'pc1' is referenced by proxies outside expected_proxy_ids: late-proxy; re-read the namespace and retry with the current referencing set"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 412 Precondition Failed\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+
+    let mut env = base_env();
+    env.gateway_url = Some(format!("http://{addr}"));
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+    // One id carries query separators: they must be percent-encoded so the
+    // value cannot split into extra expected ids or reshape the query.
+    let expected: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::from(["pa".to_string(), "x&y+z".to_string()]);
+    let err = client
+        .delete_if_match(
+            "PluginConfig",
+            "pc1",
+            "team-alpha",
+            "\"tag\"",
+            Some(&expected),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::UnplannedPluginReference(_)),
+        "expected UnplannedPluginReference, got: {err:?}"
+    );
+    assert!(err.to_string().contains("late-proxy"), "names proxy: {err}");
+
+    let request = rx.recv().unwrap();
+    assert!(
+        request.contains("DELETE /plugins/config/pc1?expected_proxy_ids=pa,x%26y%2Bz "),
+        "request line carries the precondition: {request}"
+    );
+
+    // A comma cannot be represented: the gateway decodes before splitting,
+    // so the client refuses before anything is sent.
+    let comma: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::from(["a,b".to_string()]);
+    let err = client
+        .delete_if_match("PluginConfig", "pc1", "team-alpha", "\"tag\"", Some(&comma))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot represent truthfully"),
+        "comma id refused client-side: {err}"
+    );
+}
+
+#[tokio::test]
 async fn admin_client_rejects_ids_over_the_length_limit() {
     let env = base_env();
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
     let too_long = "a".repeat(255);
     let err = client
-        .delete_if_match("Proxy", &too_long, "team-alpha", "\"tag\"")
+        .delete_if_match("Proxy", &too_long, "team-alpha", "\"tag\"", None)
         .await;
     assert!(
         err.err().unwrap().to_string().contains("254"),
@@ -774,7 +840,7 @@ async fn unclassified_mutation_403_is_upgraded_via_health() {
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client
-        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"")
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"", None)
         .await
         .unwrap_err();
     assert!(
@@ -804,7 +870,7 @@ async fn a_403_on_a_writable_gateway_stays_a_plain_api_error() {
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client
-        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"")
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"", None)
         .await
         .unwrap_err();
     assert!(
@@ -824,7 +890,7 @@ async fn the_health_recheck_is_best_effort() {
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
 
     let err = client
-        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"")
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"", None)
         .await
         .unwrap_err();
     assert!(

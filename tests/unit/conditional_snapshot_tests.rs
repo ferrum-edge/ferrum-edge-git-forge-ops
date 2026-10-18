@@ -327,7 +327,7 @@ async fn malformed_create_and_conditional_put_acknowledgements_are_redacted_and_
                     client.create_consumer(&current, NS).await.unwrap_err()
                 } else {
                     client
-                        .update_if_match("Consumer", "c1", &current, NS, ROW_TAG)
+                        .update_if_match("Consumer", "c1", &current, NS, ROW_TAG, None)
                         .await
                         .unwrap_err()
                 };
@@ -363,7 +363,7 @@ async fn valid_resource_acknowledgements_and_empty_204_deletes_remain_accepted()
         client.create_consumer(&current, NS).await.unwrap();
         assert!(matches!(
             client
-                .update_if_match("Consumer", "c1", &current, NS, ROW_TAG)
+                .update_if_match("Consumer", "c1", &current, NS, ROW_TAG, None)
                 .await
                 .unwrap(),
             gitforgeops::http_client::ConditionalUpdate::Applied
@@ -384,7 +384,9 @@ async fn valid_resource_acknowledgements_and_empty_204_deletes_remain_accepted()
         ),
     ] {
         let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));
-        let result = client.delete_if_match("Consumer", "c1", NS, ROW_TAG).await;
+        let result = client
+            .delete_if_match("Consumer", "c1", NS, ROW_TAG, None)
+            .await;
         assert_eq!(result.is_ok(), accepted);
         if let Err(error) = result {
             assert!(!format!("{error:?} {error}").contains(SECRET));
@@ -458,7 +460,7 @@ async fn delete_404_acknowledgements_are_kind_specific_and_never_replayed() {
                 accepted && (kind != "Consumer" || body == r#"{"error":"Consumer not found"}"#);
             let response = body.clone();
             let (client, requests) = gateway(move |_, _| (404, response.clone(), vec![]));
-            let result = client.delete_if_match(kind, "c1", NS, ROW_TAG).await;
+            let result = client.delete_if_match(kind, "c1", NS, ROW_TAG, None).await;
             let context = format!("{kind} case={case}");
             if accepted {
                 assert_eq!(result.unwrap(), DeleteOutcome::NotFound, "{context}");

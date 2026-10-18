@@ -320,6 +320,7 @@ impl PreparedConsumerRotation {
                 &row,
                 &namespace,
                 self.evidence.token.as_str(),
+                None,
             )
             .await?
         {

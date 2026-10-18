@@ -283,6 +283,13 @@ compatibility. See
 [Changes made during an apply](apply.md#changes-made-during-an-apply) for the
 remaining checks and exact-build lifecycle qualification.
 
+PluginConfig updates and deletes additionally send `expected_proxy_ids`, the
+gateway's association precondition (issue #569). A gateway build that does
+not implement it ignores the parameter, so qualification of the exact
+released build — as for `If-Match` — is what establishes that the atomic
+check actually ran; the client does not detect a server that accepts the
+parameter but does not enforce it.
+
 Blank values count as unset. Present values are validated before anything else
 runs: unknown modes, bad booleans (accepted: `true`, `false`, `1`, `0`,
 case-insensitive), malformed or zero numbers, and bad URLs are errors. See
