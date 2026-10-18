@@ -2222,3 +2222,69 @@ async fn the_apply_preflight_refuses_a_gateway_without_entity_tags_before_any_wr
         .all(|request| request.starts_with("GET /health"));
     assert!(only_health);
 }
+
+#[tokio::test]
+async fn an_association_refused_batch_assertion_withholds_every_later_namespace_write() {
+    // Same ambiguous-batch shape as the stale assertion above, but the
+    // gateway refuses `pc1`'s ownership assertion with the association
+    // precondition (issue #569): a proxy outside the expected set attached
+    // it after the verification backup. That is a stale plan: `p1`'s
+    // assertion and the separately planned writes must not be sent.
+    let planned = graph(&[("q", &[]), ("old", &[])], &[]);
+    let mut desired = graph(&[("p1", &["pc1"]), ("q", &[])], &[("pc1", "p1")]);
+    desired
+        .proxies
+        .iter_mut()
+        .find(|proxy| proxy.id == "q")
+        .unwrap()
+        .backend_port = 2;
+    let verified = graph(
+        &[("p1", &["pc1"]), ("q", &[]), ("old", &[])],
+        &[("pc1", "p1")],
+    );
+    let routes = vec![
+        health(),
+        ("POST /batch".into(), 503, "{}".into(), vec![]),
+        backup(&verified),
+        tagged(Kind::PluginConfig, "pc1", &verified, TAG),
+        (
+            "PUT /plugins/config/pc1?".into(),
+            412,
+            r#"{"error":"plugin config 'pc1' is referenced by proxies outside expected_proxy_ids: q; re-read the namespace and retry with the current referencing set"}"#
+                .into(),
+            vec![],
+        ),
+        tagged(Kind::Proxy, "p1", &verified, TAG),
+        tagged(Kind::Proxy, "q", &planned, TAG),
+        tagged(Kind::Proxy, "old", &planned, TAG),
+    ];
+
+    let run = apply_exclusive(&desired, planned, routes).await;
+
+    assert_eq!(
+        run.mutations(),
+        [
+            "POST /batch HTTP/1.1",
+            "PUT /plugins/config/pc1?expected_proxy_ids=p1 HTTP/1.1"
+        ],
+        "{:?}",
+        run.result
+    );
+    assert!(run.result.fatal_error.is_none(), "{:?}", run.result);
+    assert_eq!(
+        run.result.stale_plan.as_deref(),
+        Some("[team-alpha] PluginConfig `pc1`")
+    );
+    assert!(
+        run.result.applied_incremental.is_empty(),
+        "{:?}",
+        run.result
+    );
+    let errors = &run.result.errors;
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("outside expected_proxy_ids: q")),
+        "{errors:?}"
+    );
+}

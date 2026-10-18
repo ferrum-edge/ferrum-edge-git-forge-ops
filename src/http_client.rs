@@ -1511,17 +1511,32 @@ pub struct PreconditionRefusal {
     pub message: String,
 }
 
-/// The comma-separated `expected_proxy_ids` value for a PluginConfig write
-/// (issue #569). Each id must already be safe as a path segment, which also
-/// makes it safe unencoded inside this comma-separated query value: the
-/// gateway's id grammar excludes every separator character.
+/// The comma-separated `expected_proxy_ids` value for a PluginConfig
+/// write (issue #569). Path validation alone does not make an id safe
+/// inside a query value — it admits `,`, `&` and `+`, which would let one
+/// id masquerade as two expected ids or reshape the query — so each id is
+/// also percent-encoded down to the unreserved set. Ferrum Edge decodes
+/// the value and then applies its own id grammar, refusing an id this
+/// contract cannot name with a `400` rather than acting on a split one.
 fn expected_proxy_ids_query(expected: &BTreeSet<String>) -> crate::error::Result<String> {
+    fn encode_id(id: &str) -> String {
+        let mut encoded = String::with_capacity(id.len());
+        for byte in id.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    encoded.push(byte as char)
+                }
+                _ => encoded.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        encoded
+    }
     for id in expected {
         validate_resource_id_for_path(id)?;
     }
     Ok(expected
         .iter()
-        .map(String::as_str)
+        .map(|id| encode_id(id))
         .collect::<Vec<_>>()
         .join(","))
 }

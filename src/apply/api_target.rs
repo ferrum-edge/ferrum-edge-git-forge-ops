@@ -3111,6 +3111,17 @@ async fn adopt_matching_rows(
                 }
                 continue;
             }
+            Err(error @ crate::error::Error::UnplannedPluginReference(_)) => {
+                // The gateway's association precondition refused the
+                // assertion: the namespace changed after the plan, exactly
+                // as a stale plan. Record it as such and stop adopting the
+                // namespace's remaining rows (issue #569).
+                fail_adoption(result, namespace, kind, id, &error);
+                if result.stale_plan.is_none() {
+                    result.stale_plan = Some(format!("{kind} `{id}`"));
+                }
+                return;
+            }
             Err(error) if is_fatal(&error) => {
                 result.fatal_error = Some(error.to_string());
                 return;
@@ -4355,7 +4366,11 @@ async fn assert_batch_ownership(
             )),
             (Err(error), _) => Err(error),
         };
-        let stale = matches!(outcome, Err(crate::error::Error::StalePlan(_)));
+        let stale = matches!(
+            outcome,
+            Err(crate::error::Error::StalePlan(_)
+                | crate::error::Error::UnplannedPluginReference(_))
+        );
         record_create(result, outcome, kind, id, namespace);
         if stale && result.stale_plan.is_none() {
             result.stale_plan = Some(format!("{kind} `{id}`"));
