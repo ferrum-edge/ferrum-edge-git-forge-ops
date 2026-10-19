@@ -1,4 +1,4 @@
 interface:
-  display_name: "DeepSeek (pro-agents skill, V4.1 Flash pin) Agents"
-  short_description: "Orchestrate DeepSeek V4.1 Flash coding agents via the opencode CLI"
-  default_prompt: "Use $deepseek-pro-agents to dispatch alibaba-token-plan/deepseek-v4.1-flash agents for this Ferrum Edge Git Forge Ops task."
+  display_name: "DeepSeek (pro-agents skill, V4.1 Flash 1017 pin) Agents"
+  short_description: "Orchestrate DeepSeek V4.1 Flash 1017 coding agents via the opencode CLI"
+  default_prompt: "Use $deepseek-pro-agents to dispatch alibaba-token-plan/deepseek-v4.1-flash-1017 agents for this Ferrum Edge Git Forge Ops task."
