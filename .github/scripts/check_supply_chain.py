@@ -386,6 +386,9 @@ CARGO_AUDIT_ACTIONS = frozenset(
     {
         # v2.87.27 retains v2.87.22's action source and cargo-audit manifest.
         "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",
+        # v2.87.29 changes other tool manifests; action source and the
+        # cargo-audit manifest are unchanged from v2.87.27.
+        "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",
     }
 )
 SECURITY_PUSH_POLICY_PATHS = (
@@ -1846,19 +1849,33 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
 
 
 def _verbatim_job_lines(block: str) -> list[str]:
-    """A job's lines exactly as written, blanks dropped, action SHAs masked.
+    """A job's lines exactly as written, blanks dropped, pins masked.
 
     Nothing is comment-stripped: splitting on `#` would let executable
     suffixes hide after a `#` inside (or glued to) a quoted string, where
     the shell still runs them. Immutable action pins are masked to
     `@<sha>` because other rules already judge the pins themselves; what
-    this compares is structure, order, conditions and script bytes.
+    this compares is structure, order, conditions and script bytes. The Rust
+    version in the install step is checked against rust-toolchain.toml by
+    rust_toolchain_violations, so a patch release does not change job shape.
     """
-    return [
-        re.sub(r"@[0-9a-f]{40}\b", "@<sha>", line.rstrip())
-        for line in block.splitlines()
-        if line.strip()
-    ]
+    lines = []
+    for raw_line in block.splitlines():
+        if not raw_line.strip():
+            continue
+        line = re.sub(r"@[0-9a-f]{40}\b", "@<sha>", raw_line.rstrip())
+        line = re.sub(
+            r"(# pinned action; Rust )\d+\.\d+\.\d+$",
+            r"\g<1><rust toolchain>",
+            line,
+        )
+        line = re.sub(
+            r"^(\s+toolchain: )\d+\.\d+\.\d+$",
+            r"\g<1><rust toolchain>",
+            line,
+        )
+        lines.append(line)
+    return lines
 
 
 def _workflow_level_gate_violations(label: str, text: str) -> list[str]:
@@ -1962,9 +1979,9 @@ VALIDATE_PR_JOBS = [
         "        with:",
         "          persist-credentials: false",
         "      - name: Install Rust toolchain",
-        "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust 1.99.0",
+        "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust <rust toolchain>",
         "        with:",
-        "          toolchain: 1.99.0",
+        "          toolchain: <rust toolchain>",
         "      # PR-built `target/` (build scripts, proc macros) stays in its own key",
         "      # family. The privileged workflows restore `<os>-cargo-<lock>` with no",
         "      # restore-keys, so they can never select a `<os>-pr-cargo-` entry even if",
@@ -2039,9 +2056,9 @@ VALIDATE_PR_JOBS = [
         "          bash trusted-validator/.github/scripts/check-validator-resource-labels.sh \\",
         "            \"$RUNNER_TEMP/gitforgeops-validator-bin/ferrum-edge\"",
         "      - name: Install Rust toolchain",
-        "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust 1.99.0",
+        "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust <rust toolchain>",
         "        with:",
-        "          toolchain: 1.99.0",
+        "          toolchain: <rust toolchain>",
         "      # PR-built `target/` (build scripts, proc macros) stays in its own key",
         "      # family. The privileged workflows restore `<os>-cargo-<lock>` with no",
         "      # restore-keys, so they can never select a `<os>-pr-cargo-` entry even if",
@@ -2201,9 +2218,9 @@ RUST_CI_CHECK_JOB = [
     "          echo \"rust=$rust\" >> \"$GITHUB_OUTPUT\"",
     "      - name: Install Rust toolchain",
     "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
-    "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust 1.99.0",
+    "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust <rust toolchain>",
     "        with:",
-    "          toolchain: 1.99.0",
+    "          toolchain: <rust toolchain>",
     "          components: rustfmt, clippy",
     "      - name: Cache cargo registry + target",
     "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",

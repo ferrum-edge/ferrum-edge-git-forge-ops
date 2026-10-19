@@ -22,6 +22,7 @@ SPEC.loader.exec_module(check_supply_chain)
 
 CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",  # v2.87.27
+    "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",  # v2.87.29
 )
 REJECTED_CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",  # retired v2.87.20
@@ -54,6 +55,32 @@ STDIN_CLASSIFIER = (
 
 
 class SupplyChainPolicyTests(unittest.TestCase):
+    def test_required_job_shapes_allow_pinned_rust_patch_release(self):
+        for workflow, shape_check in (
+            ("validate-pr.yml", check_supply_chain.required_static_validation_violations),
+            ("rust-ci.yml", check_supply_chain.rust_ci_test_scope_violations),
+        ):
+            with self.subTest(workflow=workflow):
+                original = (ROOT / ".github/workflows" / workflow).read_text(
+                    encoding="utf-8"
+                )
+                updated = original.replace("Rust 1.99.1", "Rust 1.99.2").replace(
+                    "toolchain: 1.99.1", "toolchain: 1.99.2"
+                )
+                self.assertNotEqual(updated, original)
+                self.assertEqual(shape_check(updated), [])
+                self.assertEqual(
+                    check_supply_chain.rust_toolchain_violations(
+                        workflow, updated, "1.99.2"
+                    ),
+                    [],
+                )
+                self.assertTrue(
+                    check_supply_chain.rust_toolchain_violations(
+                        workflow, updated, "1.99.1"
+                    )
+                )
+
     ENVIRONMENT_BOUND_WORKFLOWS = (
         ".github/workflows/apply-on-merge.yml",
         ".github/workflows/trusted-pr-review.yml",
@@ -2518,9 +2545,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
             encoding="utf-8"
         )
         job = check_supply_chain.workflow_job(workflow, "security-cargo-audit")
-        self.assertIn("toolchain: 1.99.0", job)
+        self.assertIn("toolchain: 1.99.1", job)
         bumped_job = re.sub(r"@[0-9a-f]{40}", "@" + "a" * 40, job).replace(
-            "toolchain: 1.99.0", "toolchain: 1.100.0"
+            "toolchain: 1.99.1", "toolchain: 1.100.0"
         )
         self.assertNotEqual(bumped_job, job)
         bumped = workflow.replace(job, bumped_job, 1)
@@ -2528,7 +2555,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # Each free part still answers to its own rule.
         self.assertTrue(check_supply_chain.cargo_audit_install_violations(bumped))
         self.assertTrue(
-            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.99.0")
+            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.99.1")
         )
 
     def test_cargo_audit_comment_bypass_is_refused_by_the_trusted_checker(self):
@@ -5560,7 +5587,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             root = self._mirror_repo(Path(temporary))
             dockerfile = root / "Dockerfile"
             text = dockerfile.read_text(encoding="utf-8")
-            changed = text.replace("rust:1.99.0-bookworm", "rust:1.98.0-bookworm", 1)
+            changed = text.replace("rust:1.99.1-bookworm", "rust:1.98.0-bookworm", 1)
             self.assertNotEqual(text, changed)
             dockerfile.write_text(changed, encoding="utf-8")
             violations = self._violations(root)
@@ -5647,7 +5674,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 manifest["rust_toolchain"],
-                "1.99.0",
+                "1.99.1",
             )
             self.assertTrue(
                 any(
