@@ -2518,9 +2518,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
             encoding="utf-8"
         )
         job = check_supply_chain.workflow_job(workflow, "security-cargo-audit")
-        self.assertIn("toolchain: 1.99.0", job)
+        self.assertIn("toolchain: 1.99.1", job)
         bumped_job = re.sub(r"@[0-9a-f]{40}", "@" + "a" * 40, job).replace(
-            "toolchain: 1.99.0", "toolchain: 1.100.0"
+            "toolchain: 1.99.1", "toolchain: 1.100.0"
         )
         self.assertNotEqual(bumped_job, job)
         bumped = workflow.replace(job, bumped_job, 1)
@@ -2528,7 +2528,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # Each free part still answers to its own rule.
         self.assertTrue(check_supply_chain.cargo_audit_install_violations(bumped))
         self.assertTrue(
-            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.99.0")
+            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.99.1")
         )
 
     def test_cargo_audit_comment_bypass_is_refused_by_the_trusted_checker(self):
