@@ -386,6 +386,9 @@ CARGO_AUDIT_ACTIONS = frozenset(
     {
         # v2.87.27 retains v2.87.22's action source and cargo-audit manifest.
         "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",
+        # v2.87.29 changes other tool manifests; action source and the
+        # cargo-audit manifest are unchanged from v2.87.27.
+        "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",
     }
 )
 SECURITY_PUSH_POLICY_PATHS = (
