@@ -54,6 +54,32 @@ STDIN_CLASSIFIER = (
 
 
 class SupplyChainPolicyTests(unittest.TestCase):
+    def test_required_job_shapes_allow_pinned_rust_patch_release(self):
+        for workflow, shape_check in (
+            ("validate-pr.yml", check_supply_chain.required_static_validation_violations),
+            ("rust-ci.yml", check_supply_chain.rust_ci_test_scope_violations),
+        ):
+            with self.subTest(workflow=workflow):
+                original = (ROOT / ".github/workflows" / workflow).read_text(
+                    encoding="utf-8"
+                )
+                updated = original.replace("Rust 1.99.0", "Rust 1.99.1").replace(
+                    "toolchain: 1.99.0", "toolchain: 1.99.1"
+                )
+                self.assertNotEqual(updated, original)
+                self.assertEqual(shape_check(updated), [])
+                self.assertEqual(
+                    check_supply_chain.rust_toolchain_violations(
+                        workflow, updated, "1.99.1"
+                    ),
+                    [],
+                )
+                self.assertTrue(
+                    check_supply_chain.rust_toolchain_violations(
+                        workflow, updated, "1.99.0"
+                    )
+                )
+
     ENVIRONMENT_BOUND_WORKFLOWS = (
         ".github/workflows/apply-on-merge.yml",
         ".github/workflows/trusted-pr-review.yml",
