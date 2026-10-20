@@ -319,6 +319,59 @@ impl Candidate {
     }
 }
 
+/// Shown in a refusal in place of a location that repeats a credential.
+const WITHHELD_LOCATION: &str =
+    "a resource whose id or field path repeats a credential (location withheld)";
+
+/// Does `location`, or a decoded view of it, repeat any value in `batch`:
+/// an eight-byte run of it or of any of its [`spellings`], or the whole of
+/// a value shorter than that?
+///
+/// Spellings are built only for values that could be admitted at all; a
+/// larger one is compared as written. A location is short (it is
+/// sanitized and bounded), so its runs are collected once and each value is
+/// scanned against them.
+fn repeats_a_candidate(location: &str, batch: &[Candidate]) -> bool {
+    let mut views = vec![location.as_bytes().to_vec()];
+    any_decoded_view(location.as_bytes(), |view| {
+        views.push(view.to_vec());
+        false
+    });
+    let runs: HashSet<Window> = views
+        .iter()
+        .flat_map(|view| view.windows(FRAGMENT_SCAN_LENGTH))
+        .filter_map(|run| Window::try_from(run).ok())
+        .collect();
+    let shares_a_run = |text: &str| {
+        text.as_bytes()
+            .windows(FRAGMENT_SCAN_LENGTH)
+            .any(|run| Window::try_from(run).is_ok_and(|run| runs.contains(&run)))
+    };
+    batch.iter().any(|candidate| {
+        let value = candidate.value.as_str();
+        if value.len() < FRAGMENT_SCAN_LENGTH {
+            return !value.is_empty()
+                && views
+                    .iter()
+                    .any(|view| contains_bytes(view, value.as_bytes()));
+        }
+        if worst_case_cost(value.len()) > REGISTRATION_BUDGET {
+            return shares_a_run(value);
+        }
+        spellings(value)
+            .iter()
+            .any(|spelling| shares_a_run(spelling.as_str()))
+    })
+}
+
+/// The most new values one registration can stage against `available`:
+/// each is charged at least [`ENTRY_OVERHEAD_BYTES`], so no more can fit.
+/// The staging list and its duplicate set never hold more than this, so
+/// their own memory is covered by the per-entry overhead they are charged.
+fn staging_limit(available: usize) -> usize {
+    available / ENTRY_OVERHEAD_BYTES
+}
+
 fn short_secret_refusal(described: &str) -> String {
     format!("{described} holds a secret shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.")
 }
@@ -367,25 +420,29 @@ impl Registry {
         }
         for candidate in candidates {
             if candidate.value.len() < MIN_SCRUB_LENGTH {
-                let described = self.described(source, candidate);
+                let described = self.described(source, candidate, candidates);
                 return Err(self.refuse(short_secret_refusal(&described)));
             }
         }
-        let mut seen = HashSet::new();
-        let new_candidates: Vec<&Candidate> = candidates
-            .iter()
-            .filter(|candidate| {
-                !self.entries.contains_key(&candidate.value)
-                    && seen.insert(candidate.value.as_str())
-            })
-            .collect();
         // Build each new entry only once its worst case fits what is left,
-        // and charge what it actually holds.
+        // and charge what it actually holds. The staging itself grows one
+        // admitted value at a time, never sized by the candidate count: a
+        // batch of millions of small values is refused once the budget is
+        // spent, before its bookkeeping outgrows what was admitted.
         let available = REGISTRATION_BUDGET.saturating_sub(self.used);
+        let max_staged = staging_limit(available);
         let mut charged = 0usize;
-        let mut pending = Vec::with_capacity(new_candidates.len());
-        for candidate in new_candidates {
-            if worst_case_cost(candidate.value.len()) > available.saturating_sub(charged) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut pending: Vec<(&str, Entry)> = Vec::new();
+        for candidate in candidates {
+            if self.entries.contains_key(&candidate.value)
+                || seen.contains(candidate.value.as_str())
+            {
+                continue;
+            }
+            if pending.len() >= max_staged
+                || worst_case_cost(candidate.value.len()) > available.saturating_sub(charged)
+            {
                 return Err(self.refuse(BUDGET_REFUSAL.to_string()));
             }
             // CRLF collapse or trimming can make even an eight-byte raw value
@@ -393,9 +450,10 @@ impl Registry {
             // a short needle that would withhold ordinary prose throughout
             // the run.
             if !protectable(&candidate.value) {
-                let described = self.described(source, candidate);
+                let described = self.described(source, candidate, candidates);
                 return Err(self.refuse(short_spelling_refusal(&described)));
             }
+            seen.insert(candidate.value.as_str());
             let entry = Entry::new(&candidate.value);
             charged = charged.saturating_add(entry.cost(&candidate.value));
             pending.push((candidate.value.as_str(), entry));
@@ -446,10 +504,17 @@ impl Registry {
     }
 
     /// `source`, with the candidate's location when it has one. The location
-    /// (a resource id and field path from the peer) is scrubbed here: once
-    /// the refusal is set, it is displayed in place of everything else.
-    fn described(&self, source: &str, candidate: &Candidate) -> String {
+    /// (a resource id and field path from the peer) is checked here: once
+    /// the refusal is set, it is displayed in place of everything else, and
+    /// never scrubbed again. It is scrubbed against what is registered, and
+    /// withheld whole when it repeats any value of the refused batch, which
+    /// is not registered yet (one Consumer's id can echo another's new
+    /// credential).
+    fn described(&self, source: &str, candidate: &Candidate, batch: &[Candidate]) -> String {
         match &candidate.location {
+            Some(location) if repeats_a_candidate(location, batch) => {
+                format!("{source} at {WITHHELD_LOCATION}")
+            }
             Some(location) => format!("{source} at {}", self.scrub_json_string(location)),
             None => source.to_string(),
         }
@@ -742,6 +807,9 @@ fn register(
         .find(|candidate| candidate.value.len() < MIN_SCRUB_LENGTH)
     {
         let described = match &short.location {
+            Some(location) if repeats_a_candidate(location, &candidates) => {
+                format!("{source} at {WITHHELD_LOCATION}")
+            }
             Some(location) => format!("{source} at {location}"),
             None => source.to_string(),
         };
@@ -1484,6 +1552,93 @@ mod tests {
                 assert!(!scrub_text("failed peer response").contains("peer response"));
             }
         }
+    }
+
+    /// Review of #608: a refusal's location comes from the peer and is never
+    /// scrubbed again once the refusal is set. When one Consumer's id
+    /// repeats another's credential from the same, not yet admitted, batch,
+    /// the location is withheld rather than shown.
+    #[test]
+    fn refusal_locations_never_repeat_a_credential_of_the_refused_batch() {
+        enable();
+        const CREDENTIAL: &str = "Q7-mirrored-secret-8f2d-zz41";
+        let fragment = &CREDENTIAL[3..15];
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(CREDENTIAL);
+        let snapshot = |id: &str| {
+            serde_json::json!({
+                "consumers": [
+                    {"id": id, "namespace": "ferrum", "username": "short-holder",
+                        "credentials": {"keyauth": [{"key": "Q7!x9"}]}},
+                    {"id": "holder", "namespace": "ferrum", "username": "long-holder",
+                        "credentials": {"keyauth": [{"key": CREDENTIAL}]}}
+                ]
+            })
+            .to_string()
+        };
+        for id in [
+            CREDENTIAL.to_string(),
+            format!("team-{fragment}"),
+            encoded.clone(),
+        ] {
+            LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+            let error = crate::http_client::BackupSnapshot::from_body(&snapshot(&id))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shorter than 8 bytes"), "{error}");
+            assert!(error.contains(WITHHELD_LOCATION), "{error}");
+            // The refusal replaces every later display, unscrubbed.
+            let shown = scrub_text("later diagnostic");
+            for leaked in [CREDENTIAL, fragment, encoded.as_str(), id.as_str()] {
+                assert!(!error.contains(leaked), "{leaked} shown: {error}");
+                assert!(!shown.contains(leaked), "{leaked} shown: {shown}");
+            }
+            LOCAL.with(|local| assert!(local.borrow().entries.is_empty()));
+        }
+        // A location that repeats nothing is still named.
+        LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+        let error = crate::http_client::BackupSnapshot::from_body(&snapshot("plain-consumer"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("at Consumer ferrum/plain-consumer credentials.keyauth[0].key"),
+            "{error}"
+        );
+    }
+
+    /// Review of #608: staging for a batch grows one admitted value at a
+    /// time, never sized by the candidate count, so a batch of a million
+    /// small values is refused on the budget without first allocating
+    /// bookkeeping for all of them.
+    #[test]
+    fn a_huge_batch_is_refused_before_its_staging_outgrows_the_budget() {
+        // What staging holds per value is covered by the overhead each
+        // value is charged, and every value is charged at least that.
+        assert!(
+            std::mem::size_of::<(&str, Entry)>() + 2 * std::mem::size_of::<&str>()
+                <= ENTRY_OVERHEAD_BYTES
+        );
+        assert!(worst_case_cost(MIN_SCRUB_LENGTH) >= ENTRY_OVERHEAD_BYTES);
+        assert_eq!(
+            staging_limit(REGISTRATION_BUDGET),
+            REGISTRATION_BUDGET / ENTRY_OVERHEAD_BYTES
+        );
+
+        let candidates: Vec<Candidate> = (0..1_000_000u32)
+            .map(|index| Candidate::bare(format!("Q7v{index:07}")))
+            .collect();
+        let mut registry = Registry {
+            used: REGISTRATION_BUDGET - 256 * 1024,
+            ..Registry::default()
+        };
+        let (result, peak) =
+            crate::alloc_meter::peak_bytes(|| registry.register("test", &candidates, None));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("registration budget exceeded"), "{error}");
+        // Sized by the candidate count, the staging alone would hold over
+        // 70 MiB here.
+        assert!(peak <= 2 * 1024 * 1024, "staging peaked at {peak} bytes");
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.used, REGISTRATION_BUDGET - 256 * 1024);
     }
 
     /// Leaves only the key-name heuristics flag (a builtin's `*key` field or

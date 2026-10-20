@@ -167,7 +167,8 @@ or rotates in, the secrets of every live snapshot it reads or restore it
 sends, complete consumer verification evidence (including preserved rotation
 siblings), authorized traffic-probe credentials, every admin JWT it sends (a
 client mints one and reuses it until it has less than five minutes, at most
-half its TTL, left), and
+half its TTL, left, by both the wall clock and a monotonic clock, rechecked
+before every retry), and
 the GitHub tokens and admin JWT secrets it reads from the environment become
 `[REDACTED]`, as do their base64, percent, JSON-escaped and single-quoted
 spellings, and the review
@@ -188,7 +189,8 @@ authorized traffic-probe credentials must be at least 8 bytes, just like
 brokered values. A short one refuses the run when its snapshot or complete
 consumer verification evidence is admitted, before it can authorize a write or
 rotation delivery; the refusal names the resource and field path (for example
-`Consumer ferrum/app credentials.keyauth[0].key`), never the value. An empty
+`Consumer ferrum/app credentials.keyauth[0].key`), never the value; a location
+that repeats any credential in the same snapshot is withheld. An empty
 live leaf has nothing to protect and is skipped. A short live value that only
 the key-name heuristics flag (a `*key` field such as a `request_transformer`
 header name, a header-map value, a Kafka producer property not named like a
@@ -227,7 +229,8 @@ after a failed live read.
 
 A credential bundle value must be a JSON string. Any other JSON value (an
 unquoted number, say) is refused with an error naming the shard, slot and JSON
-type, never the value.
+type, never the value. A repeated object member inside such a value is
+refused without naming the member.
 
 ## Entry position is the slot identity
 

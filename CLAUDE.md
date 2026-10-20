@@ -506,8 +506,9 @@ namespace payload is built before the first mutation.
   hosted qualification is still required, and the first-release record is pending.
 - **Credentials travel only over TLS or loopback.** Every admin request is
   built through `AdminClient::authorize` / `Authorized::request`, the only
-  place the bearer token is minted (once per client, reused until it nears
-  expiry) and attached; it refuses a target that is
+  place the bearer token is attached (`send_with_retry` takes it from the
+  client's cache before every attempt; one is minted per client and reused
+  until it nears expiry by wall and monotonic clock); it refuses a target that is
   not `https://` or `http://` to a literal loopback IP (`credential_target`),
   and client construction refuses such a gateway URL up front. Requests retain
   the parsed URL that passed the check. HTTPS clients also enforce HTTPS in

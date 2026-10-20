@@ -363,6 +363,54 @@ fn load_bundles_refuses_non_string_values_without_echoing_them() {
     assert!(!error.contains("1234567890123"), "{error}");
 }
 
+/// Review of #608: the duplicate-member check runs while parsing, before the
+/// type refusal above, so inside a non-string credential it must not name
+/// the repeated member either. Slot names and wrapper keys are still named.
+#[test]
+fn load_bundles_withholds_duplicate_members_inside_credential_values() {
+    use gitforgeops::secrets::bundle::parse_bundles_from_json;
+
+    const SLOT: &str = "ferrum/app/keyauth/key";
+    for value in [
+        r#"{"q7-secret-material":0,"q7-secret-material":1}"#,
+        r#"[{"q7-secret-material":"a","q7-secret-material":"b"}]"#,
+        r#"{"outer":{"q7-secret-material":0,"q7-secret-material":1}}"#,
+    ] {
+        let object = format!(r#"{{"FERRUM_CREDS_BUNDLE_2": {{"{SLOT}": {value}}}}}"#);
+        let stringified = serde_json::json!({
+            "FERRUM_CREDS_BUNDLE_2": format!(r#"{{"{SLOT}": {value}}}"#),
+        })
+        .to_string();
+        // A flat slot map at the top level, a common mistake: its values are
+        // credentials too.
+        let flat = format!(r#"{{"{SLOT}": {value}}}"#);
+        for raw in [object, stringified, flat] {
+            let error = parse_bundles_from_json(&raw).unwrap_err().to_string();
+            assert!(error.contains("duplicate JSON object member"), "{error}");
+            assert!(error.contains("member name withheld"), "{error}");
+            assert!(!error.contains("q7-secret"), "{raw}: {error}");
+            assert!(load_bundles_from_env(&raw).is_err());
+        }
+    }
+    for (raw, named) in [
+        (
+            r#"{"FERRUM_CREDS_BUNDLE": {"ferrum/app/key": "v1", "ferrum/app/key": "v2"}}"#,
+            "ferrum/app/key",
+        ),
+        (
+            r#"{"FERRUM_CREDS_BUNDLE": "{\"ferrum/app/key\":\"v1\",\"ferrum/app/key\":\"v2\"}"}"#,
+            "ferrum/app/key",
+        ),
+        (
+            r#"{"FERRUM_CREDS_BUNDLE": {}, "FERRUM_CREDS_BUNDLE": {}}"#,
+            "FERRUM_CREDS_BUNDLE",
+        ),
+    ] {
+        let error = parse_bundles_from_json(raw).unwrap_err().to_string();
+        assert!(error.contains(&format!("'{named}'")), "{error}");
+    }
+}
+
 /// Regression for #331: `u32::parse` accepted `_0`, `_00`, `_01` and `_+1`,
 /// so a second key aliased an existing shard, one shard's map overwrote the
 /// other's in `per_shard`, and the next PUT of that shard dropped slots.
