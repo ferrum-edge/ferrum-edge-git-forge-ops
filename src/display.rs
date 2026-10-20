@@ -324,8 +324,8 @@ const WITHHELD_LOCATION: &str =
     "a resource whose id or field path repeats a credential (location withheld)";
 
 /// Does `location`, or a decoded view of it, repeat any value in `batch`:
-/// an eight-byte run of any of its [`spellings`] (or its hex), or the whole
-/// of a spelling shorter than that? A short value is compared in every
+/// an eight-byte run of any of its [`spellings`] (or its hex, in any letter
+/// case), or the whole of a spelling shorter than that? A short value is compared in every
 /// spelling, so a location carrying `Q7!x9` as `UTcheDk=` is caught.
 ///
 /// Spellings are built only for values that could be admitted at all; a
@@ -339,6 +339,16 @@ fn repeats_a_candidate(location: &str, batch: &[Candidate]) -> bool {
         views.push(view.to_vec());
         false
     });
+    // Hex is case-insensitive to every decoder, so a mixed-case spelling
+    // (`6b3F7a`) must match too: compare ASCII-lowercased copies of each view
+    // against the lowercase hex spelling. Folding can only add matches, so it
+    // can only withhold more.
+    let folded: Vec<Vec<u8>> = views
+        .iter()
+        .filter(|view| view.iter().any(u8::is_ascii_uppercase))
+        .map(|view| view.to_ascii_lowercase())
+        .collect();
+    views.extend(folded);
     let runs: HashSet<Window> = views
         .iter()
         .flat_map(|view| view.windows(FRAGMENT_SCAN_LENGTH))
@@ -1640,6 +1650,8 @@ mod tests {
             (hex::encode(SHORT), SHORT, None),
             (hex::encode("k?z"), "k?z", None),
             (hex::encode_upper("k?z"), "k?z", None),
+            // Mixed-case hex decodes to the same bytes.
+            ("6b3F7a".to_string(), "k?z", None),
             (percent_encoded(SHORT), SHORT, None),
             (
                 fragment,
