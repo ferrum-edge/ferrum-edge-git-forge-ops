@@ -14,11 +14,11 @@ checks run again after a policy-only merge. Validator compatibility is checked
 on pull requests and by the canary, not here.
 
 CI installs cargo-audit **0.22.1** with
-`taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe` (v2.87.27), using
+`taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283` (v2.87.29), using
 `checksum: true` and `fallback: none`. The action pin fixes the installer code.
 The protected policy accepts only this reviewed revision after the workflow
-switch in #542 and retirement of v2.87.22; its action source and cargo-audit
-manifest are unchanged from v2.87.22. The byte-identical v2.87.20
+switch in #593 and retirement of v2.87.27; its action source and cargo-audit
+manifest are unchanged from v2.87.27. The byte-identical v2.87.20
 [committed cargo-audit manifest](https://github.com/taiki-e/install-action/blob/9983c65e42da123ff25d1f78505eb6de315aa172/manifests/cargo-audit.json)
 records the 0.22.1 Linux x86-64 archive SHA-256
 `c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab`, and the

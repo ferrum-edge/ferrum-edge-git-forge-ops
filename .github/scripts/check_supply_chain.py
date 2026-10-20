@@ -28,7 +28,9 @@ USES = re.compile(r"^\s*-?\s*uses\s*:\s*([^\s#]+)", re.MULTILINE)
 FROM = re.compile(r"^FROM\b[ \t]*([^\s]+)", re.MULTILINE | re.IGNORECASE)
 VALIDATOR_ASSET = "ferrum-edge-linux-x86_64"
 DIGEST_ENTRY = re.compile(r"([0-9a-f]{64})\s+" + re.escape(VALIDATOR_ASSET))
-MIN_RUST_TOOLCHAIN = (1, 99, 0)
+# Floor for rust-toolchain.toml; move it with each toolchain bump so a
+# candidate cannot silently downgrade the pinned stable channel.
+MIN_RUST_TOOLCHAIN = (1, 99, 1)
 RUST_TOOLCHAIN_CHANNEL = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII
 )
@@ -380,12 +382,12 @@ ALLOCATION_REVISION_BINDING = "GITFORGEOPS_ALLOCATION_REVISION: ${{ github.sha }
 APPLY_COMMAND = "run: gitforgeops apply"
 STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
-# Keep this as a set so each reviewed Dependabot bump can allow both pins before
-# switching the workflow, then retire the previous pin in a follow-up PR.
+# One reviewed pin per Dependabot bump: allow the new pin alongside the current
+# one before switching the workflow, then retire the previous pin in a
+# follow-up PR. v2.87.29 is the only reviewed pin left now that #593 moved
+# rust-ci.yml and security.yml to it and #604 retired v2.87.27.
 CARGO_AUDIT_ACTIONS = frozenset(
     {
-        # v2.87.27 retains v2.87.22's action source and cargo-audit manifest.
-        "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",
         # v2.87.29 changes other tool manifests; action source and the
         # cargo-audit manifest are unchanged from v2.87.27.
         "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",
