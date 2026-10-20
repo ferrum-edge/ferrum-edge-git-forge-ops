@@ -592,8 +592,17 @@ async fn every_overwrite_is_sent_with_the_etag_its_read_returned() {
             );
             assert_eq!(run.result.applied_incremental.len(), 1, "{context}");
             // A plugin delete carries its expected referencing set on the
-            // request (issue #569); no reference read is taken for it.
-            assert_eq!(run.backup_reads(), 0, "{context}");
+            // request (issue #569) and, because a gateway predating that
+            // precondition ignores it, also reads which proxies reference
+            // the plugin now (issue #603).
+            let plugin_delete = matches!(kind, Kind::PluginConfig) && action == "delete";
+            assert_eq!(run.backup_reads(), usize::from(plugin_delete), "{context}");
+            if plugin_delete {
+                assert!(
+                    mutations[0].contains("?expected_proxy_ids="),
+                    "{context}: {mutations:?}"
+                );
+            }
         }
     }
 }
@@ -1490,14 +1499,15 @@ async fn moving_a_scoped_plugin_off_a_proxy_and_deleting_that_proxy_is_one_apply
         tagged(Kind::PluginConfig, "move", &planned, "\"move-tag\""),
         tagged(Kind::Proxy, "new", &after, "\"new-tag\""),
         tagged(Kind::Proxy, "old", &after, "\"old-tag\""),
+        backup(&planned),
     ];
 
     let run = apply_exclusive(&desired, planned, routes).await;
 
     assert!(run.result.errors.is_empty(), "{:?}", run.result.errors);
     // The retarget carries the plan's referencing set (`new` from the
-    // repository, `old` from the live view): the gateway may detach `old`,
-    // and no reference re-read precedes the PUT (issue #569).
+    // repository, `old` from the live view): the gateway may detach `old`
+    // (issue #569).
     assert_eq!(
         run.mutations(),
         [
@@ -1507,7 +1517,11 @@ async fn moving_a_scoped_plugin_off_a_proxy_and_deleting_that_proxy_is_one_apply
     );
     let sent = run.request("DELETE /proxies/old");
     assert!(sent.contains("if-match: \"old-tag\"\r\n"), "{sent}");
-    assert_eq!(run.backup_reads(), 0);
+    // Retargeting also reads which proxies reference `move` before the PUT
+    // (issue #603): only `old`, which the plan saw, so it may be detached.
+    assert_eq!(run.backup_reads(), 1);
+    let references = run.position("GET /backup ");
+    assert!(references < run.position("PUT /plugins/config/move"));
 }
 
 #[tokio::test]
@@ -1662,6 +1676,62 @@ async fn a_proxy_group_plugin_update_keeps_a_concurrent_attachment_in_the_proxy_
     }
 }
 
+/// How the gateway treats a proxy that attaches a plugin after the plan, in
+/// the plugin-association tests below.
+#[derive(Clone, Copy, Debug)]
+enum LateAttach {
+    /// Nothing attaches it: the write proceeds.
+    Never,
+    /// It attaches before the client's reference re-read, on a gateway that
+    /// predates the `expected_proxy_ids` precondition (released Edge up to
+    /// v0.9.17) and would accept the write, detaching it. Only the client's
+    /// re-read refuses (issue #603).
+    BeforeReadNonEnforcing,
+    /// It attaches between the re-read and the write, on a gateway that
+    /// enforces `expected_proxy_ids`: its `412` refuses (issue #569).
+    AfterReadEnforcing,
+}
+
+const LATE_ATTACH: [LateAttach; 3] = [
+    LateAttach::Never,
+    LateAttach::BeforeReadNonEnforcing,
+    LateAttach::AfterReadEnforcing,
+];
+
+/// The gateway's association-precondition refusal naming `q`.
+const ASSOCIATION_412: &str = r#"{"error":"plugin config 'shared' is referenced by proxies outside expected_proxy_ids: q; re-read the namespace and retry with the current referencing set"}"#;
+
+/// Routes for one [`LateAttach`] case of a `method` write to PluginConfig
+/// `shared`, planned as `planned` with `p1` referencing it. The reference
+/// re-read shows `q` referencing it only when `q` attached before that read.
+fn late_attach_routes(
+    case: LateAttach,
+    method: &str,
+    planned: &GatewayConfig,
+) -> Vec<RecordingRoute> {
+    let q_attached: &[&str] = match case {
+        LateAttach::BeforeReadNonEnforcing => &["shared"],
+        LateAttach::Never | LateAttach::AfterReadEnforcing => &[],
+    };
+    let live = with_shared_plugin(
+        &[("p1", &["shared"]), ("q", q_attached)],
+        "proxy_group",
+        None,
+    );
+    let write = format!("{method} /plugins/config/shared?");
+    let (status, body) = match case {
+        // A gateway that ignores `expected_proxy_ids` accepts the write.
+        LateAttach::Never | LateAttach::BeforeReadNonEnforcing => (200, "{}"),
+        LateAttach::AfterReadEnforcing => (412, ASSOCIATION_412),
+    };
+    vec![
+        health(),
+        tagged(Kind::PluginConfig, "shared", planned, TAG),
+        backup(&live),
+        (write, status, body.into(), vec![]),
+    ]
+}
+
 #[tokio::test]
 async fn a_plugin_delete_never_detaches_a_proxy_outside_the_plan() {
     // Ferrum Edge removes every association to a deleted plugin config, and
@@ -1670,24 +1740,9 @@ async fn a_plugin_delete_never_detaches_a_proxy_outside_the_plan() {
     // and referenced `shared` in the plan, so detaching it is planned.
     let planned = with_shared_plugin(&[("p1", &["shared"]), ("q", &[])], "proxy_group", None);
     let desired = graph(&[("q", &[])], &[]);
-    for refused in [false, true] {
-        let context = format!("refused={refused}");
-        let mut routes = vec![
-            health(),
-            tagged(Kind::PluginConfig, "shared", &planned, TAG),
-        ];
-        if refused {
-            // The gateway's atomic association check (issue #569): `q`
-            // attached `shared` after the plan and is outside the expected
-            // set the delete carries (`p1` only).
-            routes.push((
-                "DELETE /plugins/config/shared?".into(),
-                412,
-                r#"{"error":"plugin config 'shared' is referenced by proxies outside expected_proxy_ids: q; re-read the namespace and retry with the current referencing set"}"#
-                    .into(),
-                vec![],
-            ));
-        }
+    for case in LATE_ATTACH {
+        let context = format!("{case:?}");
+        let routes = late_attach_routes(case, "DELETE", &planned);
         let mut options = ApplyOptions::default();
         for (kind, id) in [("PluginConfig", "shared"), ("Proxy", "q")] {
             options.managed_ledger.insert(state_key(NS, kind, id));
@@ -1695,16 +1750,29 @@ async fn a_plugin_delete_never_detaches_a_proxy_outside_the_plan() {
 
         let run = apply(&desired, planned.clone(), routes, true, options).await;
 
-        // No reference re-read: the expected set rides on the DELETE itself.
-        assert_eq!(run.backup_reads(), 0, "{context}");
+        // The references are re-read after the plugin's own conditional
+        // read, whatever the gateway enforces (issue #603).
+        assert_eq!(run.backup_reads(), 1, "{context}");
+        let read = run.position("GET /plugins/config/shared ");
+        assert!(read < run.position("GET /backup "), "{context}");
+        if matches!(case, LateAttach::BeforeReadNonEnforcing) {
+            // Nothing is sent: the gateway would have accepted it.
+            assert_refused(&run, "from proxy `q`,", &context);
+            assert_starts(&run.result.errors, 0, "PluginConfig shared delete");
+            assert!(!run.result.errors[0].contains("`p1`"), "{context}");
+            assert_eq!(run.result.deleted, 0, "{context}");
+            continue;
+        }
+        // The expected set still rides on the DELETE (issue #569).
         assert_eq!(
             run.mutations(),
             ["DELETE /plugins/config/shared?expected_proxy_ids=p1 HTTP/1.1"],
             "{context}"
         );
+        assert!(run.position("GET /backup ") < run.position("DELETE /plugins/config/shared"));
         let sent = run.request("DELETE /plugins/config/shared");
         assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
-        if refused {
+        if matches!(case, LateAttach::AfterReadEnforcing) {
             let errors = &run.result.errors;
             assert_eq!(errors.len(), 1, "{context}: {errors:?}");
             assert_starts(errors, 0, "PluginConfig shared delete");
@@ -1729,33 +1797,28 @@ async fn retargeting_a_plugin_never_detaches_a_proxy_outside_the_plan() {
     // kept; `q` attached it after the plan.
     let planned = with_shared_plugin(&[("p1", &["shared"]), ("q", &[])], "proxy_group", None);
     let desired = with_shared_plugin(&[("p1", &["shared"]), ("q", &[])], "proxy", Some("p1"));
-    for refused in [false, true] {
-        let context = format!("refused={refused}");
-        let mut routes = vec![
-            health(),
-            tagged(Kind::PluginConfig, "shared", &planned, TAG),
-        ];
-        if refused {
-            routes.push((
-                "PUT /plugins/config/shared?".into(),
-                412,
-                r#"{"error":"plugin config 'shared' is referenced by proxies outside expected_proxy_ids: q; re-read the namespace and retry with the current referencing set"}"#
-                    .into(),
-                vec![],
-            ));
-        }
+    for case in LATE_ATTACH {
+        let context = format!("{case:?}");
+        let routes = late_attach_routes(case, "PUT", &planned);
 
         let run = apply_exclusive(&desired, planned.clone(), routes).await;
 
-        assert_eq!(run.backup_reads(), 0, "{context}");
+        assert_eq!(run.backup_reads(), 1, "{context}");
+        if matches!(case, LateAttach::BeforeReadNonEnforcing) {
+            // Nothing is sent: the gateway would have accepted it.
+            assert_refused(&run, "from proxy `q`,", &context);
+            assert_starts(&run.result.errors, 0, "PluginConfig shared update");
+            continue;
+        }
         assert_eq!(
             run.mutations(),
             ["PUT /plugins/config/shared?expected_proxy_ids=p1 HTTP/1.1"],
             "{context}"
         );
+        assert!(run.position("GET /backup ") < run.position("PUT /plugins/config/shared"));
         let sent = run.request("PUT /plugins/config/shared");
         assert!(sent.contains(&format!("if-match: {TAG}\r\n")), "{sent}");
-        if refused {
+        if matches!(case, LateAttach::AfterReadEnforcing) {
             let errors = &run.result.errors;
             assert_eq!(errors.len(), 1, "{context}: {errors:?}");
             assert_starts(errors, 0, "PluginConfig shared update");
@@ -1776,9 +1839,11 @@ async fn a_plugin_delete_spares_a_proxy_the_repository_declares_referencing_it()
     // referencing `shared`, so the delete must not refuse.
     let planned = with_shared_plugin(&[], "proxy_group", None);
     let desired = graph(&[("q", &["shared"])], &[]);
+    let live = with_shared_plugin(&[("q", &["shared"])], "proxy_group", None);
     let routes = vec![
         health(),
         tagged(Kind::PluginConfig, "shared", &planned, TAG),
+        backup(&live),
     ];
 
     let run = apply_exclusive(&desired, planned, routes).await;
@@ -1791,19 +1856,22 @@ async fn a_plugin_delete_spares_a_proxy_the_repository_declares_referencing_it()
             "DELETE /plugins/config/shared?expected_proxy_ids=q HTTP/1.1",
         ]
     );
-    assert_eq!(run.backup_reads(), 0);
+    assert_eq!(run.backup_reads(), 1);
 }
 
 #[tokio::test]
 async fn retargeting_a_plugin_spares_the_kept_target_absent_from_the_plan() {
     // `shared` moves onto `new`, which the plan's live view never showed.
-    // The expected set is empty, but the update keeps `new` as its target,
-    // which the gateway exempts, so it must not refuse.
+    // The fresh backup lists `new` referencing `shared` and the expected set
+    // is empty, but the update keeps `new` as its target, which both the
+    // client check and the gateway exempt, so it must not refuse.
     let planned = with_shared_plugin(&[], "proxy_group", None);
     let desired = with_shared_plugin(&[], "proxy", Some("new"));
+    let live = with_shared_plugin(&[("new", &["shared"])], "proxy_group", None);
     let routes = vec![
         health(),
         tagged(Kind::PluginConfig, "shared", &planned, TAG),
+        backup(&live),
     ];
 
     let run = apply(&desired, planned, routes, true, Default::default()).await;
@@ -1813,7 +1881,7 @@ async fn retargeting_a_plugin_spares_the_kept_target_absent_from_the_plan() {
         ["PUT /plugins/config/shared?expected_proxy_ids= HTTP/1.1"]
     );
     assert!(run.result.errors.is_empty(), "{:?}", run.result);
-    assert_eq!(run.backup_reads(), 0);
+    assert_eq!(run.backup_reads(), 1);
 }
 
 #[tokio::test]
@@ -1922,9 +1990,9 @@ fn stamped_proxies(config: &GatewayConfig, stamp: &str) -> GatewayConfig {
 async fn a_proxy_read_after_this_runs_plugin_write_takes_a_fresh_backup() {
     // `shared` moves from `p1` onto `p2`, which makes the gateway bump both
     // proxies' `updated_at`. A concurrent edit to `p1` forces its proxy read
-    // down the confirmation path: the confirmation backup is taken after the
-    // plugin write, so it shows the concurrent edit and the stale plan is
-    // refused instead of overwriting it.
+    // down the confirmation path, and the guard's pre-write backup no longer
+    // matches the read, so the cache is not reused: a fresh backup is taken and
+    // the stale plan is refused instead of overwriting the concurrent edit.
     const PLANNED_AT: &str = "2026-10-06T00:00:00Z";
     const AFTER_AT: &str = "2026-10-06T00:00:01Z";
     let planned = stamped_proxies(
@@ -1942,13 +2010,14 @@ async fn a_proxy_read_after_this_runs_plugin_write_takes_a_fresh_backup() {
     let routes = vec![
         health(),
         tagged(Kind::PluginConfig, "shared", &planned, TAG),
+        once_backup(&planned),
         tagged(Kind::Proxy, "p1", &after, TAG),
         backup(&after),
     ];
 
     let run = apply_exclusive(&desired, planned, routes).await;
 
-    assert_eq!(run.backup_reads(), 1);
+    assert_eq!(run.backup_reads(), 2);
     let plugin_put = run.position("PUT /plugins/config/shared");
     let backups_after = run
         .requests
