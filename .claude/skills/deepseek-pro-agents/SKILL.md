@@ -56,6 +56,9 @@ Non-negotiables:
   `/opt/homebrew/bin/opencode` / `/usr/local/bin/opencode`, then `PATH`. Any candidate under
   `com.conductor.app` is refused — Conductor's bundled ACP-provider copy lags the standalone
   release. Confirm `<opencode> models` lists the model before dispatching.
+- The resolved opencode must support `opencode run --pure` (v1.3.4 or later in the 1.x line;
+  2.x removed the flag). The launcher exits 2 before spawning opencode otherwise — stop and
+  report; do not dispatch without it.
 - Run each dispatch as a **background / long-lived task**; prefer one task per agent.
 - **Parallel cap: 7** unless the user sets a lower limit.
 

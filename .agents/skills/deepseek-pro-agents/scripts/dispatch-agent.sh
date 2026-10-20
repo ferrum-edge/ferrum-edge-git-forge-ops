@@ -157,6 +157,10 @@ opencode_bin=$(resolve_agent_bin opencode OPENCODE_BIN \
   /opt/homebrew/bin/opencode \
   /usr/local/bin/opencode)
 
+# `run --pure` is required for config/plugin isolation; refuse before spawning
+# an opencode that does not support it.
+require_opencode_run_pure "$opencode_bin" || exit 2
+
 cd "$physical_worktree"
 
 printf '[deepseek-pro-agents] dispatch model=%s worktree=%s bin=%s\n' \

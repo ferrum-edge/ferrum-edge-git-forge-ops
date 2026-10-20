@@ -67,6 +67,7 @@ dispatch_lock_ready_dir=''
 dispatch_lock_release_file=''
 cursor_control_workspace=''
 dispatch_child=''
+opencode_probe_output=''
 
 release_worktree_dispatch_lock() {
   if [[ -n "$dispatch_child" ]] && kill -0 "$dispatch_child" 2>/dev/null; then
@@ -74,6 +75,7 @@ release_worktree_dispatch_lock() {
     wait "$dispatch_child" 2>/dev/null || true
   fi
   dispatch_child=''
+  remove_opencode_probe_output
   if [[ -n "$cursor_control_workspace" ]]; then
     case "$cursor_control_workspace" in
       "${TMPDIR:-/tmp}"/gitforgeops-cursor-control.*)
@@ -266,6 +268,94 @@ isolate_opencode_provider() {
   unset OPENCODE_API_KEY
   unset OPENCODE_AUTH_CONTENT
   export OPENCODE_DISABLE_PROJECT_CONFIG=1
+}
+
+# require_opencode_run_pure <opencode-bin>
+# The opencode launchers dispatch with `opencode run --pure`, which skips
+# external plugins; together with isolate_opencode_provider it is their config
+# and plugin isolation. opencode added the flag in v1.3.4 and removed it in
+# 2.x, which also moved `run` onto a shared background service the launcher's
+# environment cannot reach. There is no equivalent there, so refuse before
+# spawning opencode unless `run --help` declares --pure as an option. A probe
+# that fails or outlives its deadline counts as unsupported.
+require_opencode_run_pure() {
+  local opencode_bin=$1 run_help='' version=''
+  if run_opencode_probe "$opencode_bin" run --help \
+    && run_help=$(< "$opencode_probe_output") \
+    && opencode_help_declares_pure "$run_help"; then
+    remove_opencode_probe_output
+    return 0
+  fi
+  if run_opencode_probe "$opencode_bin" --version; then
+    version=$(< "$opencode_probe_output") || version=''
+  fi
+  remove_opencode_probe_output
+  version=${version%%$'\n'*}
+  version=${version#opencode }
+  printf 'opencode %s at %s does not support "opencode run --pure", which this launcher requires for config/plugin isolation.\n' \
+    "${version:-(unknown version)}" "$opencode_bin" >&2
+  printf 'Install an opencode release that supports it (v1.3.4 or later in the 1.x line; 2.x removed the flag) and point OPENCODE_BIN at it.\n' >&2
+  return 2
+}
+
+# Only an option declaration counts: a help line whose leading option list
+# (after indentation, with optional aliases) names --pure and is followed by
+# the description column or the end of the line. A description or migration
+# note that merely mentions --pure does not.
+opencode_help_declares_pure() {
+  local line alias='-{1,2}[[:alnum:]][[:alnum:]-]*'
+  local declaration="^[[:space:]]*(${alias},[[:space:]]*)*--pure(,[[:space:]]*${alias})*([[:space:]]{2,}|"$'\t'"|[[:space:]]*\$)"
+  while IFS= read -r line; do
+    [[ "$line" =~ $declaration ]] && return 0
+  done <<<"$1"
+  return 1
+}
+
+# Deadline for each opencode capability probe, in tenths of a second.
+OPENCODE_PROBE_TIMEOUT_TENTHS=100
+
+# run_opencode_probe <command> [args...]
+# Runs a short probe the way run_dispatch_child runs a worker (own process
+# group, no stdin, no lock descriptor), capturing its output in
+# opencode_probe_output. A probe still running at the deadline is killed with
+# its whole process group and reported as status 124.
+run_opencode_probe() {
+  local probe ticks=0 status
+  remove_opencode_probe_output
+  opencode_probe_output=$(mktemp "${TMPDIR:-/tmp}/gitforgeops-opencode-probe.XXXXXX") || return 2
+  set -m
+  "$@" > "$opencode_probe_output" 2>&1 < /dev/null 9>&- &
+  probe=$!
+  set +m
+  dispatch_child=$probe
+  while kill -0 "$probe" 2>/dev/null; do
+    if ((ticks >= OPENCODE_PROBE_TIMEOUT_TENTHS)); then
+      kill -KILL -- "-$probe" 2>/dev/null || true
+      wait "$probe" 2>/dev/null || true
+      dispatch_child=''
+      printf 'opencode probe "%s" did not finish within %s seconds; killed it.\n' \
+        "$*" "$((OPENCODE_PROBE_TIMEOUT_TENTHS / 10))" >&2
+      return 124
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  if wait "$probe"; then
+    status=0
+  else
+    status=$?
+  fi
+  dispatch_child=''
+  return "$status"
+}
+
+remove_opencode_probe_output() {
+  case "$opencode_probe_output" in
+    "${TMPDIR:-/tmp}"/gitforgeops-opencode-probe.*)
+      rm -f -- "$opencode_probe_output"
+      ;;
+  esac
+  opencode_probe_output=''
 }
 
 isolate_claude_provider() {

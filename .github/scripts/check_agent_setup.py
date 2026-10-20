@@ -617,7 +617,11 @@ def collect_violations(root: Path) -> list[str]:
                         f"{launcher.relative_to(root)}: missing Codex provider isolation {marker!r}"
                     )
         if "resolve_agent_bin opencode" in launcher_text:
-            for marker in ("isolate_opencode_provider", "--pure"):
+            for marker in (
+                "isolate_opencode_provider",
+                'require_opencode_run_pure "$opencode_bin"',
+                "--pure",
+            ):
                 if marker not in launcher_text:
                     violations.append(
                         f"{launcher.relative_to(root)}: missing opencode provider isolation {marker!r}"
@@ -713,6 +717,7 @@ def collect_violations(root: Path) -> list[str]:
                 "isolate_opencode_provider()",
                 "unset OPENCODE_API_KEY",
                 "unset OPENCODE_AUTH_CONTENT",
+                "require_opencode_run_pure()",
                 "isolate_claude_provider()",
                 "isolate_cursor_provider()",
                 "prepare_cursor_control_workspace()",
