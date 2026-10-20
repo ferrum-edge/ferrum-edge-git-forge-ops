@@ -544,6 +544,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`83ac0ad63c0167e6f06796fab0fce28db1bf3db0`) now that #542 moved
   `security.yml` to v2.87.27; the trusted checker accepts only the v2.87.27
   pin and tests reject the retired one.
+- Retire the v2.87.27 cargo-audit installer pin
+  (`ab6895351a88b908e96a4697860d4ffea5e57dbe`) now that #593 moved
+  `rust-ci.yml` and `security.yml` to v2.87.29 (#604); the trusted checker
+  accepts only the v2.87.29 pin and tests reject the retired one.
+  `docs/dependency-security.md` and the checker's rust-toolchain floor
+  (`1.99.1`, moving with each bump) follow the same revision.
 - Compare trusted-review SHA producer lines with case preserved, require the pinned `trusted_sha`
   assignment to precede its echo, and reject a `trusted_sha` or `head_sha` environment binding in
   every scope that reaches the metadata step (workflow, prepare job and step), so a differently
