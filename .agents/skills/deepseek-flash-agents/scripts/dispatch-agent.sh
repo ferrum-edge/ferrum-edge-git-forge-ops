@@ -157,20 +157,19 @@ opencode_bin=$(resolve_agent_bin opencode OPENCODE_BIN \
   /opt/homebrew/bin/opencode \
   /usr/local/bin/opencode)
 
-# opencode v1 isolates with `run --pure`; v2 dropped that flag and needs a private
-# `run --standalone` server for isolate_opencode_provider to apply. The shared
-# helper picks whichever the installed CLI supports and refuses otherwise.
-select_opencode_isolation_flags "$opencode_bin" || exit 2
+# `run --pure` is required for config/plugin isolation; refuse before spawning
+# an opencode that does not support it.
+require_opencode_run_pure "$opencode_bin" || exit 2
 
 cd "$physical_worktree"
 
-printf '[deepseek-flash-agents] dispatch model=%s worktree=%s bin=%s isolation=%s\n' \
-  "$model" "$physical_worktree" "$opencode_bin" "${opencode_isolation_flags[*]}" >&2
+printf '[deepseek-flash-agents] dispatch model=%s worktree=%s bin=%s\n' \
+  "$model" "$physical_worktree" "$opencode_bin" >&2
 
 # `run` reads the prompt from stdin; --auto bypasses permission prompts (worktree
 # isolation is the safety boundary); --agent build selects the write-enabled agent.
 run_dispatch_child "$prompt_file" "$opencode_bin" run \
-  "${opencode_isolation_flags[@]}" \
+  --pure \
   --model "$model" \
   --agent build \
   --auto

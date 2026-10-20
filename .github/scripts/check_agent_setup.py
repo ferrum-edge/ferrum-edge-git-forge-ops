@@ -619,8 +619,8 @@ def collect_violations(root: Path) -> list[str]:
         if "resolve_agent_bin opencode" in launcher_text:
             for marker in (
                 "isolate_opencode_provider",
-                'select_opencode_isolation_flags "$opencode_bin"',
-                '"${opencode_isolation_flags[@]}"',
+                'require_opencode_run_pure "$opencode_bin"',
+                "--pure",
             ):
                 if marker not in launcher_text:
                     violations.append(
@@ -717,9 +717,7 @@ def collect_violations(root: Path) -> list[str]:
                 "isolate_opencode_provider()",
                 "unset OPENCODE_API_KEY",
                 "unset OPENCODE_AUTH_CONTENT",
-                "export OPENCODE_CONFIG_PROJECT_DISABLE=1",
-                "select_opencode_isolation_flags()",
-                "refuse_opencode_global_plugins()",
+                "require_opencode_run_pure()",
                 "isolate_claude_provider()",
                 "isolate_cursor_provider()",
                 "prepare_cursor_control_workspace()",

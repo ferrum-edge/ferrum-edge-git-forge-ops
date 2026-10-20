@@ -35,6 +35,9 @@ worker. The orchestrator selected this session's model deliberately.
    - `OPENCODE_BIN` if it points at an executable absolute path,
    - `~/.opencode/bin/opencode`, `/opt/homebrew/bin/opencode`, `/usr/local/bin/opencode`,
    - `opencode` on `PATH`.
+   The resolved CLI must support `opencode run --pure` (v1.3.4 or later in the 1.x line;
+   2.x removed the flag), which the launcher needs for config/plugin isolation. It probes
+   `run --help` and exits 2 before spawning opencode otherwise; stop and report.
 3. Confirm the model resolves: `<opencode> models` must list
    `alibaba-token-plan/qwen3.8-max`.
    The model is served by the `alibaba-token-plan` provider block in the operator's
