@@ -209,9 +209,9 @@ pub fn parse_bundles_from_json(raw: &str) -> crate::error::Result<LoadedBundles>
                         "shard {secret_name}: malformed JSON value: {e}"
                     ))
                 })?;
-                serde_json::from_value(checked.0)?
+                slot_map(secret_name, &checked.0)?
             }
-            serde_json::Value::Object(_) => serde_json::from_value(secret_value.clone())?,
+            serde_json::Value::Object(_) => slot_map(secret_name, secret_value)?,
             _ => {
                 return Err(crate::error::Error::Config(format!(
                     "shard {secret_name}: unexpected value type (need object or JSON string)"
@@ -250,6 +250,49 @@ pub fn parse_bundles_from_json(raw: &str) -> crate::error::Result<LoadedBundles>
         per_shard,
         unrecognized_keys,
     })
+}
+
+/// One shard's `slot → value` map. Every value must be a JSON string.
+///
+/// Built by hand rather than with `serde_json::from_value`, whose type errors
+/// quote the offending value (``invalid type: integer `1234567890123`,
+/// expected a string``): a credential stored unquoted would be printed to
+/// the CI log, where GitHub masks only the whole secret string. The errors
+/// here name the shard and slot and the JSON type, never the value.
+fn slot_map(
+    secret_name: &str,
+    shard: &serde_json::Value,
+) -> crate::error::Result<CredentialBundle> {
+    let serde_json::Value::Object(slots) = shard else {
+        return Err(crate::error::Error::Config(format!(
+            "shard {secret_name}: expected a JSON object mapping each slot to a string value, \
+             found a JSON {} (value withheld)",
+            json_type_name(shard)
+        )));
+    };
+    let mut bundle = CredentialBundle::new();
+    for (slot, value) in slots {
+        let serde_json::Value::String(text) = value else {
+            return Err(crate::error::Error::Config(format!(
+                "shard {secret_name}: credential slot '{slot}' holds a JSON {} where a string is \
+                 required (value withheld); store the credential as a JSON string",
+                json_type_name(value)
+            )));
+        };
+        bundle.insert(slot.clone(), text.clone());
+    }
+    Ok(bundle)
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 /// Warning text when some shards loaded but other top-level keys were ignored.

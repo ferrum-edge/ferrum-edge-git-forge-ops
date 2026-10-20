@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use base64::Engine;
@@ -167,7 +168,17 @@ pub struct AdminClient {
     /// Sticky and conservative: once the client has seen a cached view, every
     /// later prune decision in the same run is treated as potentially stale.
     saw_cached_backup: AtomicBool,
+    /// The bearer token this client sends, reused until it nears expiry (see
+    /// [`AdminClient::token_at`]). One token per lifetime keeps the number
+    /// of unique secrets the display sink has to protect small, however many
+    /// requests a run makes.
+    token_cache: Mutex<Option<jwt::MintedJwt>>,
 }
+
+/// Mint a fresh admin token once the current one has less than this left
+/// to live (capped at half the configured TTL), so a request and its
+/// retries never carry a token that expires mid-flight.
+pub const JWT_REFRESH_MARGIN_SECS: i64 = 300;
 
 impl AdminClient {
     /// Build an Admin API client from resolved process/repo environment config.
@@ -201,6 +212,7 @@ impl AdminClient {
             jwt_options: JwtOptions::from_env(env),
             max_retries: env.gateway_max_retries,
             saw_cached_backup: AtomicBool::new(false),
+            token_cache: Mutex::new(None),
         })
     }
 
@@ -232,6 +244,7 @@ impl AdminClient {
             jwt_options: JwtOptions::from_env(env),
             max_retries: env.gateway_max_retries,
             saw_cached_backup: AtomicBool::new(false),
+            token_cache: Mutex::new(None),
         };
         client.jwt_options.role = crate::config_export::VIEWER_ROLE.to_string();
         client.set_namespace_scope(namespaces);
@@ -359,6 +372,11 @@ impl AdminClient {
         S: AsRef<str>,
     {
         self.jwt_options = self.jwt_options.clone().with_namespaces(namespaces);
+        // A token minted under the old scope must never be sent again.
+        *self
+            .token_cache
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// True when this client's tokens carry an `ns` claim.
@@ -392,7 +410,48 @@ impl AdminClient {
     }
 
     fn token(&self) -> crate::error::Result<String> {
-        jwt::mint_jwt(&self.jwt_secret, &self.jwt_options)
+        self.token_at(chrono::Utc::now().timestamp())
+    }
+
+    /// The bearer token for a request made at `now` (Unix seconds).
+    ///
+    /// One token is minted per client and reused until it has less than
+    /// [`JWT_REFRESH_MARGIN_SECS`] (at most half its configured TTL) left;
+    /// then, or when the clock reads earlier than its `iat`, a fresh one
+    /// replaces it. The gateway does not track `jti`, so reuse within the
+    /// lifetime is accepted. Minting per request instead registered a new
+    /// secret with the display sink for every call, which exhausted the
+    /// run's registration budget part-way through an ordinary apply.
+    ///
+    /// Every use, reused or fresh, is registered with the display sink: the
+    /// registration of a known value is cheap, and a refused registration
+    /// stops every later request rather than only the next fresh mint.
+    pub(crate) fn token_at(&self, now: i64) -> crate::error::Result<String> {
+        let mut cache = self
+            .token_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let reusable = cache
+            .as_ref()
+            .filter(|minted| {
+                let lifetime = minted.expires_at.saturating_sub(minted.issued_at);
+                let margin = JWT_REFRESH_MARGIN_SECS.min(lifetime / 2);
+                minted.issued_at <= now && now < minted.expires_at.saturating_sub(margin)
+            })
+            .map(|minted| minted.token.clone());
+        if let Some(token) = reusable {
+            drop(cache);
+            crate::display::register_sent_token(&token)?;
+            return Ok(token);
+        }
+        let minted = jwt::mint_jwt_at(&self.jwt_secret, &self.jwt_options, now)?;
+        // A peer's error text can reflect this request's Authorization
+        // header; displayed errors must have the token removed. Register
+        // before the token can be cached or sent.
+        crate::display::register_sent_token(&minted.token)?;
+        let token = minted.token.clone();
+        *cache = Some(minted);
+        Ok(token)
     }
 
     fn url(&self, path: &str) -> String {
@@ -415,10 +474,8 @@ impl AdminClient {
     /// remote host in cleartext, whatever was configured.
     fn authorize(&self, target: String) -> crate::error::Result<Authorized<'_>> {
         let parsed = credential_target(&target)?;
+        // Registered with the display sink by `token`.
         let token = self.token()?;
-        // A peer's error text can reflect this request's Authorization
-        // header; displayed errors must have the token removed.
-        crate::display::register_sent_token(&token)?;
         Ok(Authorized {
             client: &self.client,
             url: parsed,
@@ -3804,6 +3861,59 @@ mod bounded_error_message_tests {
         assert_eq!(message, crate::display::DISPLAY_WITHHELD);
     }
 
+    /// Issue #605: a client mints one admin token and reuses it for every
+    /// request until it nears expiry, so a long run registers a handful of
+    /// tokens with the display sink instead of one per request.
+    #[test]
+    fn one_admin_token_serves_every_request_until_it_nears_expiry() {
+        crate::display::enable_display_scrubbing_on_this_thread();
+        let env = crate::config::EnvConfig {
+            gateway_url: Some("http://127.0.0.1:9".into()),
+            admin_jwt_secret: Some("test-secret-must-be-32-chars-long".into()),
+            admin_jwt_ttl_secs: 3600,
+            ..Default::default()
+        };
+        let mut client = super::AdminClient::new_scoped(&env, ["ferrum"]).unwrap();
+        let first = client.authorized("/health").unwrap().token;
+        for path in ["/backup", "/consumers/c1", "/health"]
+            .iter()
+            .cycle()
+            .take(1500)
+        {
+            assert_eq!(client.authorized(path).unwrap().token, first);
+        }
+        crate::display::registration_result().unwrap();
+        assert_eq!(crate::display::scrub_text(&first), "[REDACTED]");
+
+        // Driven by an explicit clock: reused until less than the refresh
+        // margin is left, then replaced.
+        let now = 4_000_000_000;
+        let fresh = client.token_at(now).unwrap();
+        assert_ne!(fresh, first, "an expired token must be replaced");
+        assert_eq!(client.token_at(now + 1).unwrap(), fresh);
+        let refresh_at = now + 3600 - super::JWT_REFRESH_MARGIN_SECS;
+        assert_eq!(client.token_at(refresh_at - 1).unwrap(), fresh);
+        let renewed = client.token_at(refresh_at).unwrap();
+        assert_ne!(renewed, fresh);
+        // A clock that reads earlier than the token's `iat` never reuses it.
+        assert_ne!(client.token_at(refresh_at - 10).unwrap(), renewed);
+        // A short TTL refreshes at half its lifetime.
+        let short = crate::config::EnvConfig {
+            admin_jwt_ttl_secs: 60,
+            ..env.clone()
+        };
+        let short = super::AdminClient::new_scoped(&short, ["ferrum"]).unwrap();
+        let token = short.token_at(now).unwrap();
+        assert_eq!(short.token_at(now + 29).unwrap(), token);
+        assert_ne!(short.token_at(now + 30).unwrap(), token);
+
+        // A token minted for the old namespace scope is never sent again.
+        let scoped = client.token_at(now + 2).unwrap();
+        client.set_namespace_scope(["ferrum", "team-alpha"]);
+        assert_ne!(client.token_at(now + 2).unwrap(), scoped);
+        crate::display::registration_result().unwrap();
+    }
+
     #[test]
     fn a_minted_admin_token_is_scrubbed_however_it_is_reflected() {
         crate::display::enable_display_scrubbing_on_this_thread();
@@ -3979,7 +4089,7 @@ mod bounded_error_message_tests {
 
     #[test]
     fn reflected_bearer_credentials_are_redacted_without_registration() {
-        // Minted per request (the admin JWT) or read from the environment
+        // Minted by the client (the admin JWT) or read from the environment
         // (GitHub tokens): caught by shape, not by a registry entry.
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ6cTcifQ.c2lnbmF0dXJlLXpxNw";
         let github = "ghs_zq7AAAABBBBCCCCDDDDEEEE";

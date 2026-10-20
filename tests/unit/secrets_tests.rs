@@ -315,6 +315,54 @@ fn load_bundles_rejects_duplicate_json_members_before_collapse() {
     }
 }
 
+/// Issue #605: a bundle value that is not a JSON string (an unquoted numeric
+/// credential, say) is refused naming the shard and slot, never echoing the
+/// value. `serde_json`'s own type error quotes it, and GitHub masks only the
+/// whole secret string, not a number inside it.
+#[test]
+fn load_bundles_refuses_non_string_values_without_echoing_them() {
+    use gitforgeops::secrets::bundle::parse_bundles_from_json;
+
+    const SLOT: &str = "ferrum/app/keyauth/key";
+    for (value, kind) in [
+        ("1234567890123", "number"),
+        ("98765.4321", "number"),
+        ("true", "boolean"),
+        ("null", "null"),
+        ("[\"q7-array-secret\"]", "array"),
+        ("{\"q7\":\"q7-object-secret\"}", "object"),
+    ] {
+        let object = format!(r#"{{"FERRUM_CREDS_BUNDLE_2": {{"{SLOT}": {value}}}}}"#);
+        let stringified = serde_json::json!({
+            "FERRUM_CREDS_BUNDLE_2": format!(r#"{{"{SLOT}": {value}}}"#),
+        })
+        .to_string();
+        for raw in [object, stringified] {
+            let error = parse_bundles_from_json(&raw).unwrap_err().to_string();
+            assert!(error.contains("FERRUM_CREDS_BUNDLE_2"), "{error}");
+            assert!(error.contains(SLOT), "{error}");
+            assert!(error.contains(&format!("JSON {kind}")), "{error}");
+            for leaked in [
+                "1234567890123",
+                "98765",
+                "4321",
+                "q7-array-secret",
+                "q7-object-secret",
+                "true",
+            ] {
+                assert!(!error.contains(leaked), "{leaked} echoed: {error}");
+            }
+            assert!(load_bundles_from_env(&raw).is_err());
+        }
+    }
+    // A JSON-string shard that is itself a bare number is refused the same way.
+    let raw = serde_json::json!({ "FERRUM_CREDS_BUNDLE": "1234567890123" }).to_string();
+    let error = parse_bundles_from_json(&raw).unwrap_err().to_string();
+    assert!(error.contains("FERRUM_CREDS_BUNDLE"), "{error}");
+    assert!(error.contains("JSON number"), "{error}");
+    assert!(!error.contains("1234567890123"), "{error}");
+}
+
 /// Regression for #331: `u32::parse` accepted `_0`, `_00`, `_01` and `_+1`,
 /// so a second key aliased an existing shard, one shard's map overwrote the
 /// other's in `per_shard`, and the next PUT of that shard dropped slots.

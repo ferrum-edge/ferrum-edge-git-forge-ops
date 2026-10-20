@@ -1114,6 +1114,38 @@ async fn rotation_refuses_a_minimal_health_tier_before_any_other_request() {
     assert_eq!(requests.lock().unwrap().len(), 1);
 }
 
+/// Issue #605: every request of a long run carries the same admin token, so
+/// the display sink registers one token rather than one per request and the
+/// run never exhausts its registration budget part-way through.
+#[tokio::test]
+async fn a_long_run_sends_one_admin_token_with_every_request() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    let (client, requests) = gateway(|_, _| healthy());
+    for _ in 0..1100 {
+        client.get_health().await.unwrap();
+    }
+    gitforgeops::display::registration_result().unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1100);
+    let tokens: HashSet<String> = requests
+        .iter()
+        .filter_map(|request| {
+            request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_string())
+            })
+        })
+        .collect();
+    assert_eq!(tokens.len(), 1, "{} distinct admin tokens", tokens.len());
+    let token = tokens.iter().next().unwrap();
+    assert!(token.starts_with("Bearer eyJ"), "unexpected scheme");
+    assert_eq!(
+        gitforgeops::display::scrub_text(token.trim_start_matches("Bearer ")),
+        "[REDACTED]"
+    );
+}
+
 /// The rotated value never passed through secret resolution, so publication
 /// itself must register it: a peer's error text reflecting the new
 /// credential is scrubbed like any resolved secret.

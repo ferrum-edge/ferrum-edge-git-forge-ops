@@ -365,6 +365,30 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Secret-scrubbing follow-ups to the display sink (#605):
+  - An ordinary run no longer exhausts the secret registration budget
+    part-way through, leaving a partial apply. The admin client mints one
+    JWT and reuses it until it has less than five minutes (at most half its
+    TTL) left, instead of minting and registering a new token per request.
+    Each value is now charged what its spellings and fragment indexes
+    actually hold (a few KiB for a 43-byte API key, about 40 KiB for a
+    300-byte JWT), and its worst case must fit before they are built; the
+    whole-run budget is 128 MiB. Thousands of live credentials and over a
+    thousand distinct real-size JWTs fit. A cumulative overflow still refuses
+    the run.
+  - Short or empty live values no longer refuse runs where they are not
+    credentials. Empty live leaves are skipped. The 8-byte refusal applies to
+    Consumer credentials, plugin-config fields a schema rule declares
+    (secrets, endpoints, Kafka properties such as `sasl.password`) and
+    modeled service-discovery secrets; a short value that only the key-name
+    heuristics flag (a `request_transformer` header name under `key`, a
+    header-map value, a Kafka producer property not named like a credential,
+    a custom plugin's field) is not registered. The refusal names the
+    resource and field path, such as
+    `Consumer ferrum/app credentials.keyauth[0].key`, never the value.
+  - A credential bundle value that is not a JSON string (an unquoted number,
+    say) is refused naming the shard, slot and JSON type. It no longer prints
+    `serde_json`'s type error, which quoted the value.
 - The quickstart lists `FERRUM_ADMIN_JWT_VIEWER_SECRET` as a required secret
   for the scheduled drift check and says where it goes (`<env>` or
   `<env>-monitor`); it no longer says the monitor holds the admin key (#574).

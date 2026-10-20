@@ -322,6 +322,42 @@ pub(crate) fn endpoint_paths(
     found
 }
 
+/// The leaves a builtin plugin's schema rules name explicitly: its declared
+/// secrets and endpoints, and the Kafka producer properties named like a
+/// credential (`sasl.password`). The rest of the Kafka properties are left
+/// out (that rule keeps every property not on a safe list, such as
+/// `security.protocol: SSL`), as are the key/URL heuristics and every leaf of
+/// a custom plugin or of a config that is not an object.
+///
+/// Display admission refuses the run for a declared leaf too short to
+/// protect, while a short leaf only the heuristics flag (a header name under
+/// a `key` field, say) is not registered.
+pub(crate) fn rule_declared_paths(
+    plugin_name: &str,
+    config: &Value,
+) -> BTreeSet<Vec<ConfigPathComponent>> {
+    let mut found = BTreeSet::new();
+    if !config.is_object() || !is_builtin(plugin_name) {
+        return found;
+    }
+    for rule in rules_for(plugin_name) {
+        match rule.kind {
+            RuleKind::Secret | RuleKind::Endpoint => {
+                apply_rule(config, rule.path, rule.kind, &[], &mut found);
+            }
+            RuleKind::KafkaProperties => {
+                let mut properties = BTreeSet::new();
+                apply_rule(config, rule.path, rule.kind, &[], &mut properties);
+                found.extend(properties.into_iter().filter(|path| match path.last() {
+                    Some(ConfigPathComponent::Key(key)) => is_sensitive_key(key),
+                    _ => false,
+                }));
+            }
+        }
+    }
+    found
+}
+
 /// URL scheme a stand-in for this endpoint field must carry.
 ///
 /// ferrum-edge does not merely check that an endpoint parses; several plugins
