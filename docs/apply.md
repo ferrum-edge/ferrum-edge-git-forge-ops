@@ -110,10 +110,11 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
   the `If-Match` write. The row is not written and the namespace's remaining
   writes are withheld. See
   [Changes made during an apply](#changes-made-during-an-apply).
-- **`UnplannedPluginReference`.** The gateway refused a PluginConfig update
-  or delete because a proxy outside the plan's expected referencing set
-  references the plugin, so the write would have detached it. The plugin is
-  not written and the namespace's remaining writes are withheld, as for
+- **`UnplannedPluginReference`.** A PluginConfig update or delete would
+  have detached the plugin from a proxy outside the plan's expected
+  referencing set: apply's reference re-read found that proxy just before
+  the write, or the gateway refused the write with `412`. The plugin is not
+  written and the namespace's remaining writes are withheld, as for
   `StalePlan`. See [Plugin associations](#plugin-associations).
 - **`ConditionalWriteUnavailable`.** A required strong row tag, complete consumer
   verification or coherent conditional snapshot is unavailable or invalid. The
@@ -343,19 +344,45 @@ removes every association except the `proxy` target. Association rows are
 not part of the plugin config's `ETag`, so `If-Match` on the plugin cannot
 see a proxy that attached the plugin after the plan.
 
-Every PluginConfig update and delete therefore sends
-`expected_proxy_ids`: the proxies the plan accounts for referencing the
-plugin — those the plan's live view showed referencing it and those the
-repository declares referencing it. Ferrum Edge checks that set against
-the proxies referencing the config at write time, atomically with the
-write under its namespace admission lease, and refuses with `412` when a
-proxy outside the set (and outside the target an update keeps) references
-it. Apply surfaces that as `UnplannedPluginReference`, and the namespace's
+Apply guards these writes in two layers. In both, the expected set is the
+proxies the plan accounts for referencing the plugin: those the plan's
+live view showed referencing it and those the repository declares
+referencing it.
+
+1. **Client re-read.** Immediately before a plugin config delete, and
+   before an update that changes the plan's `scope` or `proxy_id` to
+   `proxy` or `global`, apply reads the namespace's `/backup` again and
+   lists the proxies that reference the plugin now. The write is not sent
+   when any of them is outside the expected set and is not the target the
+   update keeps. A `proxy_group` update leaves associations alone, and an
+   update that keeps its scope and target detaches nothing another proxy
+   could validly have attached, so neither takes this read. That narrowed
+   update guard relies on Ferrum Edge rejecting a proxy write that
+   references a `global` config or a `proxy` config aimed at another proxy;
+   revisit it if Edge relaxes that association validation.
+2. **Gateway precondition.** Every PluginConfig update and delete also
+   sends the expected set as `expected_proxy_ids`. A Ferrum Edge build that
+   implements this precondition
+   ([ferrum-edge#6744](https://github.com/ferrum-edge/ferrum-edge/pull/6744))
+   checks it against the proxies referencing the config at write time,
+   atomically with the write under its namespace admission lease. It
+   refuses with `412` when a proxy outside the set (and outside the target
+   an update keeps) references the config.
+
+Either refusal surfaces as `UnplannedPluginReference`, and the namespace's
 remaining writes are withheld, as with `StalePlan`. Declare the reference
 in the repository to keep it, or re-run apply to accept detaching it: the
 next plan's live view then shows the late proxy, so the write proceeds and
-detaches it. There is no client-side re-read: the gateway's check closes
-the interval a re-read could only narrow (issue #569).
+detaches it.
+
+The re-read alone only narrows the race: a proxy that attaches the plugin
+between that read and the write is detached unless the gateway enforces
+`expected_proxy_ids`, which closes the interval (issue #569). Released Ferrum
+Edge builds up to and including v0.9.17, the pinned release, do not include
+that precondition and ignore the parameter. The client cannot tell whether
+the target gateway enforces it, so the re-read runs on every such write
+(issue #603). It stays until the minimum supported Ferrum Edge release
+includes ferrum-edge#6744 and that exact build is qualified.
 
 ## Ordering between runs
 

@@ -457,13 +457,18 @@ namespace payload is built before the first mutation.
   A PluginConfig `ETag` does not cover proxy associations, which Edge removes
   on a plugin delete and on a `proxy`/`global` update (all but the target). So
   every PluginConfig update and delete also sends `expected_proxy_ids` — the
-  proxies the plan accounts for referencing the plugin — and Edge checks it
-  atomically with the write under the same lease (issue #569). A referencing
-  proxy outside that set (kept target aside) refuses the write with `412`,
-  surfaced as `Error::UnplannedPluginReference` (withholds like `StalePlan`)
-  instead of being silently detached. Gateways predating the precondition
-  ignore the parameter, so enforcement is established by qualifying the exact
-  gateway build, as for `If-Match` itself.
+  proxies the plan accounts for referencing the plugin — and an Edge build
+  with ferrum-edge#6744 checks it atomically with the write under the same
+  lease (issue #569), answering `412` for a referencing proxy outside that set
+  (kept target aside). Released Edge up to v0.9.17 ignores the parameter, so
+  `refuse_unplanned_references` also stays (issue #603): before a plugin
+  delete, and before an update changing the planned `scope`/`proxy_id` to
+  `proxy`/`global` (`Preconditions::retargets`), it re-reads `/backup` and
+  refuses when a referencing proxy is not in the plan's live view, not
+  declared, and not the kept target. Both surface as
+  `Error::UnplannedPluginReference` (withholds like `StalePlan`). Keep the
+  re-read until the minimum supported Edge release includes #6744; the
+  client cannot detect a gateway that ignores the parameter.
 
   A mismatch or `412` is `Error::StalePlan`: a per-resource error that also
   withholds **every later write in the namespace** (creates and updates

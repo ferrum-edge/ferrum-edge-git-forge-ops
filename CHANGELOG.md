@@ -12,8 +12,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   plan accounts for referencing the plugin. Ferrum Edge checks the set
   atomically with the write and refuses with `412` when an unplanned proxy
   references the config, which apply still surfaces as
-  `UnplannedPluginReference`. The client-side fresh-backup re-read that
-  only narrowed the race is removed; older gateways ignore the parameter.
+  `UnplannedPluginReference`. Older gateways ignore the parameter.
 
 ### Added
 
@@ -365,6 +364,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Restored the client-side reference re-read before PluginConfig deletes and
+  retargets (#603). The `expected_proxy_ids` change (#569) had removed it, but
+  no released Ferrum Edge up to and including the pinned v0.9.17 enforces
+  that parameter, so a proxy that attached a plugin after the plan could be
+  silently detached. Apply again reads `/backup` immediately before such a
+  write and refuses it as `UnplannedPluginReference` when an unplanned proxy
+  references the plugin. It still sends `expected_proxy_ids`, which closes
+  the remaining read-to-write window on a gateway that enforces it. The
+  re-read stays until the minimum supported Edge release includes
+  ferrum-edge#6744.
 - The quickstart lists `FERRUM_ADMIN_JWT_VIEWER_SECRET` as a required secret
   for the scheduled drift check and says where it goes (`<env>` or
   `<env>-monitor`); it no longer says the monitor holds the admin key (#574).
