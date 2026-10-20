@@ -264,8 +264,12 @@ isolate_opencode_provider() {
   unset OPENCODE_CONFIG
   unset OPENCODE_CONFIG_DIR
   unset OPENCODE_CONFIG_CONTENT
+  unset OPENCODE_CLI_CONFIG_CONTENT
   unset OPENCODE_API_KEY
   unset OPENCODE_AUTH_CONTENT
+  # opencode v2 reads OPENCODE_CONFIG_PROJECT_DISABLE first, so an inherited
+  # false there would override the older name.
+  export OPENCODE_CONFIG_PROJECT_DISABLE=1
   export OPENCODE_DISABLE_PROJECT_CONFIG=1
 }
 
@@ -276,15 +280,15 @@ isolate_opencode_provider() {
 #   already reaches the run process through the environment.
 # - opencode v2 dropped `--pure` and by default sends `run` to a shared
 #   background service whose environment the launcher cannot scrub, so
-#   isolate_opencode_provider (including OPENCODE_DISABLE_PROJECT_CONFIG, which
-#   keeps the worktree's own config and plugins out) only applies to a private
-#   `--standalone` server. v2 has no switch for global plugins, so the launcher
-#   refuses while the operator's global config enables any.
-# A CLI advertising neither flag predates `--pure`; refuse instead of running
-# with weaker isolation.
+#   isolate_opencode_provider (which keeps the worktree's own config and plugins
+#   out) only applies to a private `--standalone` server. v2 has no switch for
+#   the remaining plugin sources, so this fallback is limited to the audited
+#   OPENCODE_STANDALONE_AUDITED_SERIES and refuses while any of those sources
+#   names a plugin (refuse_opencode_global_plugins).
+# Anything else refuses instead of running with weaker isolation.
 # shellcheck disable=SC2034 # opencode_isolation_flags is read by the launcher.
 select_opencode_isolation_flags() {
-  local opencode_bin=$1 run_help
+  local opencode_bin=$1 run_help version
   opencode_isolation_flags=()
   if ! run_help=$("$opencode_bin" run --help 2>&1 < /dev/null); then
     printf 'Cannot read "%s run --help"; refusing to dispatch without opencode isolation.\n' \
@@ -296,6 +300,13 @@ select_opencode_isolation_flags() {
     return 0
   fi
   if opencode_help_has_flag "$run_help" --standalone; then
+    version=$("$opencode_bin" --version 2>&1 < /dev/null) || version=''
+    if [[ ! "$version" =~ ^(opencode[[:space:]]+)?v?${OPENCODE_STANDALONE_AUDITED_SERIES//./\\.}\.[0-9]+$ ]]; then
+      printf '%s has no "run --pure", and its plugin sources are audited only for opencode %s.x (found: %s).\n' \
+        "$opencode_bin" "$OPENCODE_STANDALONE_AUDITED_SERIES" "${version:-unknown}" >&2
+      printf 'Use an opencode CLI whose "run --help" lists --pure, or audit this version first.\n' >&2
+      return 2
+    fi
     refuse_opencode_global_plugins || return 2
     opencode_isolation_flags=(--standalone)
     return 0
@@ -306,37 +317,151 @@ select_opencode_isolation_flags() {
   return 2
 }
 
+# The opencode release series whose configuration discovery was checked for the
+# --standalone fallback (v2.0.32: system and user config directories, and macOS
+# managed preference profiles; project sources are disabled by
+# isolate_opencode_provider).
+OPENCODE_STANDALONE_AUDITED_SERIES=2.0
+
 opencode_help_has_flag() {
   local run_help=$1 flag=$2
   grep -Eq -- "(^|[[:space:],])${flag}([[:space:],=]|\$)" <<<"$run_help"
 }
 
-# opencode v2 loads plugins named by a global config's `plugin`/`plugins` key and
-# any entry under the global plugin/ or plugins/ directory. An empty list or map
-# is accepted; anything else (including a form this check cannot read) refuses.
+# Prints "dir<TAB>path" and "plist<TAB>path" lines for every non-project place
+# opencode 2.0.x reads plugins from. Both the XDG and the default user config
+# directory are listed so a stray XDG_CONFIG_HOME cannot hide either.
+opencode_global_plugin_sources() {
+  local user
+  printf 'dir\t%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/opencode" "$HOME/.config/opencode"
+  case "$(uname -s)" in
+    Darwin)
+      user=$(id -un) || return 2
+      printf 'dir\t%s\n' '/Library/Application Support/opencode'
+      printf 'plist\t%s\n' "/Library/Managed Preferences/$user/ai.opencode.managed.plist" \
+        '/Library/Managed Preferences/ai.opencode.managed.plist'
+      ;;
+    *)
+      printf 'dir\t%s\n' /etc/opencode
+      ;;
+  esac
+}
+
+# Refuses when any global plugin source names a plugin: a non-empty `plugin` or
+# `plugins` value in a directory's opencode.json, opencode.jsonc or config.json
+# or in a managed preference profile, or any entry under a directory's plugin/
+# or plugins/. Config is parsed structurally (JSONC comments and trailing
+# commas allowed); a file that cannot be read or parsed also refuses.
 refuse_opencode_global_plugins() {
-  local config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/opencode
-  local found=() file directory
-  for file in "$config_dir"/opencode.json "$config_dir"/opencode.jsonc \
-    "$config_dir"/config.json; do
-    [[ -e "$file" ]] || continue
-    if [[ ! -f "$file" || ! -r "$file" ]] \
-      || sed -E 's/"plugins?"[[:space:]]*:[[:space:]]*(\[[[:space:]]*\]|\{[[:space:]]*\})//g' \
-        "$file" | grep -Eq '"plugins?"[[:space:]]*:'; then
-      found+=("$file")
-    fi
-  done
-  for directory in "$config_dir"/plugin "$config_dir"/plugins; do
-    if [[ -e "$directory" && ( ! -d "$directory" || -n "$(ls -A "$directory" 2>&1)" ) ]]; then
-      found+=("$directory")
-    fi
-  done
-  if (( ${#found[@]} )); then
-    printf 'opencode v2 has no "run --pure", and global opencode plugins are configured:\n' >&2
-    printf '  %s\n' "${found[@]}" >&2
-    printf 'Remove them, or use an opencode CLI whose "run --help" lists --pure.\n' >&2
+  local sources
+  sources=$(opencode_global_plugin_sources) || return 2
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'python3 is required to inspect global opencode plugins; refusing to dispatch.\n' >&2
     return 2
   fi
+  python3 -I - "$sources" <<'PY' || return 2
+import json
+import os
+import plistlib
+import sys
+
+PLUGIN_KEYS = ("plugin", "plugins")
+
+
+def scan_jsonc(text, handle):
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text[i] == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i : j + 1])
+            i = j + 1
+        else:
+            i = handle(text, i, out)
+    return "".join(out)
+
+
+def drop_comment(text, i, out):
+    if text.startswith("//", i):
+        while i < len(text) and text[i] not in "\r\n":
+            i += 1
+        return i
+    if text.startswith("/*", i):
+        end = text.find("*/", i + 2)
+        if end < 0:
+            raise ValueError("unterminated comment")
+        out.append(" ")
+        return end + 2
+    out.append(text[i])
+    return i + 1
+
+
+def drop_trailing_comma(text, i, out):
+    if text[i] == ",":
+        rest = text[i + 1 :].lstrip(" \t\r\n")
+        if rest[:1] in ("]", "}"):
+            return i + 1
+    out.append(text[i])
+    return i + 1
+
+
+def strip_jsonc(text):
+    return scan_jsonc(scan_jsonc(text, drop_comment), drop_trailing_comma)
+
+
+def reject_duplicate_plugin_keys(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in PLUGIN_KEYS and key in seen:
+            raise ValueError(f"duplicate {key!r} key")
+        seen.add(key)
+    return dict(pairs)
+
+
+def names_plugins(document):
+    if not isinstance(document, dict):
+        raise ValueError("top level is not an object")
+    return any(document.get(key) not in (None, [], {}) for key in PLUGIN_KEYS)
+
+
+found = []
+for line in sys.argv[1].splitlines():
+    kind, _, path = line.partition("\t")
+    try:
+        if kind == "plist":
+            if os.path.lexists(path):
+                with open(path, "rb") as handle:
+                    if names_plugins(plistlib.load(handle)):
+                        found.append(path)
+            continue
+        for name in ("opencode.json", "opencode.jsonc", "config.json"):
+            file = os.path.join(path, name)
+            if not os.path.lexists(file):
+                continue
+            with open(file, encoding="utf-8") as handle:
+                document = json.loads(
+                    strip_jsonc(handle.read()),
+                    object_pairs_hook=reject_duplicate_plugin_keys,
+                )
+            if names_plugins(document):
+                found.append(file)
+        for name in ("plugin", "plugins"):
+            directory = os.path.join(path, name)
+            if os.path.lexists(directory) and (
+                not os.path.isdir(directory) or os.listdir(directory)
+            ):
+                found.append(directory)
+    except (OSError, ValueError, plistlib.InvalidFileException) as error:
+        found.append(f"{path} (cannot inspect: {error})")
+
+if found:
+    print('opencode 2.0 has no "run --pure", and global opencode plugins are configured:', file=sys.stderr)
+    for item in found:
+        print(f"  {item}", file=sys.stderr)
+    print('Remove them, or use an opencode CLI whose "run --help" lists --pure.', file=sys.stderr)
+    sys.exit(2)
+PY
 }
 
 isolate_claude_provider() {

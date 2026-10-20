@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import plistlib
 import shlex
 import shutil
 import signal
@@ -117,7 +118,8 @@ def write_valid_setup(
         "acquire_worktree_dispatch_lock() { :; }\n"
         "run_dispatch_child() { :; }\n"
         "isolate_codex_provider() { unset CODEX_HOME; }\n"
-        "isolate_opencode_provider() { unset OPENCODE_API_KEY; unset OPENCODE_AUTH_CONTENT; }\n"
+        "isolate_opencode_provider() { unset OPENCODE_API_KEY; unset OPENCODE_AUTH_CONTENT; "
+        "export OPENCODE_CONFIG_PROJECT_DISABLE=1; }\n"
         "select_opencode_isolation_flags() { :; }\n"
         "refuse_opencode_global_plugins() { :; }\n"
         "isolate_claude_provider() { :; }\n"
@@ -1111,8 +1113,13 @@ class AgentSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def run_opencode_isolation(
-        self, run_help: str, *, help_status: int = 0, plugin_config: str | None = None,
-        plugin_file: bool = False,
+        self,
+        run_help: str,
+        *,
+        help_status: int = 0,
+        version: str = "opencode v2.0.32",
+        files: dict[str, str | bytes] | None = None,
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         helper = str(
             check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
@@ -1123,59 +1130,105 @@ class AgentSetupTests(unittest.TestCase):
         fake = root / "opencode"
         fake.write_text(
             "#!/usr/bin/env bash\n"
+            f'[[ "$1" == "--version" ]] && {{ printf "%s\\n" {shlex.quote(version)}; exit 0; }}\n'
             '[[ "$1 $2" == "run --help" ]] || exit 9\n'
             f"printf '%s\\n' {shlex.quote(run_help)}\n"
             f"exit {help_status}\n",
             encoding="utf-8",
         )
         fake.chmod(0o755)
-        config = root / "xdg" / "opencode"
-        config.mkdir(parents=True)
-        if plugin_config is not None:
-            (config / "opencode.json").write_text(plugin_config, encoding="utf-8")
-        if plugin_file:
-            (config / "plugins").mkdir()
-            (config / "plugins" / "inject.js").write_text("", encoding="utf-8")
+        sources = root / "sources"
+        for name in ("user", "system"):
+            (sources / name).mkdir(parents=True)
+        for relative, content in (files or {}).items():
+            path = sources / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                path.write_bytes(content)
+            else:
+                path.write_text(content, encoding="utf-8")
+        # Same shell options as the launchers; the source list is pointed at the
+        # temporary tree so the operator's real configuration is never read.
         command = (
-            'source "$1"; select_opencode_isolation_flags "$2" || exit $?; '
+            "set -euo pipefail; "
+            'source "$1"; sources_root=$3; '
+            "opencode_global_plugin_sources() { "
+            "printf 'dir\\t%s\\n' \"$sources_root/user\" \"$sources_root/system\"; "
+            "printf 'plist\\t%s\\n' \"$sources_root/managed.plist\"; }; "
+            "isolate_opencode_provider; "
+            'select_opencode_isolation_flags "$2" || exit $?; '
             'printf "%s\\n" "${opencode_isolation_flags[*]}"'
         )
         return subprocess.run(
-            ["bash", "-c", command, "bash", helper, str(fake)],
+            ["bash", "-c", command, "bash", helper, str(fake), str(sources)],
             check=False,
             capture_output=True,
             text=True,
-            env={**os.environ, "XDG_CONFIG_HOME": str(root / "xdg")},
+            env={**os.environ, **(environment or {})},
         )
+
+    STANDALONE_HELP = "FLAGS\n  --standalone   Run with a private server"
 
     def test_opencode_isolation_prefers_pure_when_advertised(self):
         result = self.run_opencode_isolation(
             "Options:\n  --pure  run without external plugins [boolean]",
-            plugin_config='{"plugin": ["global-plugin"]}',
+            version="opencode v1.4.9",
+            files={"user/opencode.json": '{"plugin": ["global-plugin"]}'},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "--pure")
 
     def test_opencode_isolation_uses_private_server_without_pure(self):
         result = self.run_opencode_isolation(
-            "FLAGS\n  --standalone   Run with a private server",
-            plugin_config='{"plugin": [], "provider": {}}',
+            self.STANDALONE_HELP,
+            files={
+                "user/opencode.jsonc": (
+                    '{\n  // no plugins\n  "plugin": [],\n  "plugins": {},\n'
+                    '  "provider": {"x": {"options": {"baseURL": "http://a//b"}}}, // last\n}\n'
+                ),
+                "system/opencode.json": '{"model": "x/y"}',
+                "managed.plist": plistlib.dumps({"model": "x/y"}),
+            },
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "--standalone")
 
-    def test_opencode_isolation_refuses_global_plugins_without_pure(self):
-        for kwargs in (
-            {"plugin_config": '{"plugin": ["global-plugin"]}'},
-            {"plugin_config": '{\n  "plugins": {\n    "x": {}\n  }\n}'},
-            {"plugin_file": True},
+    def test_opencode_isolation_refuses_any_global_plugin_source(self):
+        for files in (
+            {"user/opencode.json": '{"plugin": ["global-plugin"]}'},
+            {"user/opencode.json": '{"plugins":["x"]}'},
+            {"user/opencode.jsonc": '{"plugins" /* note */ : ["x"]}'},
+            {"user/opencode.jsonc": '{\n  "plugins": {\n    "x": {},\n  },\n}'},
+            {"user/config.json": '{"plugin\\u0073": ["x"]}'},
+            {"user/opencode.json": '{"plugin": [], "plugin": ["x"]}'},
+            {"user/plugins/inject.js": ""},
+            {"system/opencode.json": '{"plugin": ["system-plugin"]}'},
+            {"system/plugin/inject.ts": ""},
+            {"managed.plist": plistlib.dumps({"plugin": ["managed-plugin"]})},
         ):
-            with self.subTest(**kwargs):
-                result = self.run_opencode_isolation(
-                    "FLAGS\n  --standalone   Run with a private server", **kwargs
-                )
-                self.assertEqual(result.returncode, 2)
+            with self.subTest(files=sorted(files)):
+                result = self.run_opencode_isolation(self.STANDALONE_HELP, files=files)
+                self.assertEqual(result.returncode, 2, result.stdout)
                 self.assertIn("global opencode plugins are configured", result.stderr)
+
+    def test_opencode_isolation_refuses_uninspectable_plugin_sources(self):
+        for files in (
+            {"user/opencode.json": '{"plugin": ['},
+            {"user/opencode.jsonc": "/* unterminated"},
+            {"user/opencode.json": '["plugin"]'},
+            {"managed.plist": b"not a plist"},
+        ):
+            with self.subTest(files=sorted(files)):
+                result = self.run_opencode_isolation(self.STANDALONE_HELP, files=files)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("cannot inspect", result.stderr)
+
+    def test_opencode_isolation_refuses_unaudited_standalone_versions(self):
+        for version in ("opencode v2.1.0", "opencode v3.0.0", "opencode v2.0.32-beta", ""):
+            with self.subTest(version=version):
+                result = self.run_opencode_isolation(self.STANDALONE_HELP, version=version)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("audited only for opencode 2.0.x", result.stderr)
 
     def test_opencode_isolation_refuses_unsupported_or_unreadable_cli(self):
         for run_help, status, message in (
@@ -1186,6 +1239,28 @@ class AgentSetupTests(unittest.TestCase):
                 result = self.run_opencode_isolation(run_help, help_status=status)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
+
+    def test_opencode_scrubber_overrides_conflicting_project_config_switches(self):
+        helper = str(
+            check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
+        )
+        command = (
+            "set -euo pipefail; "
+            'source "$1"; '
+            "export OPENCODE_CONFIG_PROJECT_DISABLE=0 OPENCODE_DISABLE_PROJECT_CONFIG=false "
+            "OPENCODE_CLI_CONFIG_CONTENT='{}'; "
+            "isolate_opencode_provider; "
+            '[[ "$OPENCODE_CONFIG_PROJECT_DISABLE" == 1 && '
+            '"$OPENCODE_DISABLE_PROJECT_CONFIG" == 1 && '
+            '-z "${OPENCODE_CLI_CONFIG_CONTENT-}" ]]'
+        )
+        result = subprocess.run(
+            ["bash", "-c", command, "bash", helper],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_expands_every_braced_rule_path(self):
         self.assertEqual(

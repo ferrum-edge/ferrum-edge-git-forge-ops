@@ -717,6 +717,7 @@ def collect_violations(root: Path) -> list[str]:
                 "isolate_opencode_provider()",
                 "unset OPENCODE_API_KEY",
                 "unset OPENCODE_AUTH_CONTENT",
+                "export OPENCODE_CONFIG_PROJECT_DISABLE=1",
                 "select_opencode_isolation_flags()",
                 "refuse_opencode_global_plugins()",
                 "isolate_claude_provider()",
