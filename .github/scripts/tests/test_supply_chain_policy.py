@@ -5603,26 +5603,26 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "nightly": ('[toolchain]\nchannel = "nightly"\n', None),
             "missing patch": ('[toolchain]\nchannel = "1.99"\n', None),
             "non-string channel": ('[toolchain]\nchannel = 198\n', None),
-            "leading zero": ('[toolchain]\nchannel = "01.99.0"\n', None),
+            "leading zero": ('[toolchain]\nchannel = "01.99.1"\n', None),
             "unicode digits": ('[toolchain]\nchannel = "١.99.0"\n', None),
             "duplicate table": (
-                '[toolchain]\nchannel = "1.99.0"\n'
-                '[toolchain]\nchannel = "1.99.0"\n',
+                '[toolchain]\nchannel = "1.99.1"\n'
+                '[toolchain]\nchannel = "1.99.1"\n',
                 None,
             ),
             "decoy table": (
-                '[toolchain]\nchannel = "1.99.0"\n'
+                '[toolchain]\nchannel = "1.99.1"\n'
                 '[decoy]\nchannel = "1.98.0"\n',
                 None,
             ),
             "path key": (
-                '[toolchain]\nchannel = "1.99.0"\npath = "../rust"\n', None
+                '[toolchain]\nchannel = "1.99.1"\npath = "../rust"\n', None
             ),
             "unknown key": (
-                '[toolchain]\nchannel = "1.99.0"\ncustom = "value"\n', None
+                '[toolchain]\nchannel = "1.99.1"\ncustom = "value"\n', None
             ),
             "below floor": ('[toolchain]\nchannel = "1.97.9"\n', None),
-            "legacy file": ('[toolchain]\nchannel = "1.99.0"\n', "legacy"),
+            "legacy file": ('[toolchain]\nchannel = "1.99.1"\n', "legacy"),
             "missing file": (None, None),
         }
         for label, (contents, legacy) in invalid_files.items():
@@ -5634,7 +5634,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 else:
                     toolchain.write_text(contents, encoding="utf-8")
                 if legacy is not None:
-                    (root / "rust-toolchain").write_text("1.99.0\n", encoding="utf-8")
+                    (root / "rust-toolchain").write_text("1.99.1\n", encoding="utf-8")
                 violations = self._violations(root)
                 self.assertTrue(
                     any(
