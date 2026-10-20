@@ -12,8 +12,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   plan accounts for referencing the plugin. Ferrum Edge checks the set
   atomically with the write and refuses with `412` when an unplanned proxy
   references the config, which apply still surfaces as
-  `UnplannedPluginReference`. The client-side fresh-backup re-read that
-  only narrowed the race is removed; older gateways ignore the parameter.
+  `UnplannedPluginReference`. Older gateways ignore the parameter.
 
 ### Added
 
@@ -397,6 +396,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     say) is refused naming the shard, slot and JSON type. It no longer prints
     `serde_json`'s type error, which quoted the value. A repeated member
     inside such a value is refused without naming the member.
+- Restored the client-side reference re-read before PluginConfig deletes and
+  retargets (#603). The `expected_proxy_ids` change (#569) had removed it, but
+  no released Ferrum Edge up to and including the pinned v0.9.17 enforces
+  that parameter, so a proxy that attached a plugin after the plan could be
+  silently detached. Apply again reads `/backup` immediately before such a
+  write and refuses it as `UnplannedPluginReference` when an unplanned proxy
+  references the plugin. It still sends `expected_proxy_ids`, which closes
+  the remaining read-to-write window on a gateway that enforces it. The
+  re-read stays until the minimum supported Edge release includes
+  ferrum-edge#6744.
 - The quickstart lists `FERRUM_ADMIN_JWT_VIEWER_SECRET` as a required secret
   for the scheduled drift check and says where it goes (`<env>` or
   `<env>-monitor`); it no longer says the monitor holds the admin key (#574).
@@ -567,6 +576,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`83ac0ad63c0167e6f06796fab0fce28db1bf3db0`) now that #542 moved
   `security.yml` to v2.87.27; the trusted checker accepts only the v2.87.27
   pin and tests reject the retired one.
+- Retire the v2.87.27 cargo-audit installer pin
+  (`ab6895351a88b908e96a4697860d4ffea5e57dbe`) now that #593 moved
+  `rust-ci.yml` and `security.yml` to v2.87.29 (#604); the trusted checker
+  accepts only the v2.87.29 pin and tests reject the retired one.
+  `docs/dependency-security.md` and the checker's rust-toolchain floor
+  (`1.99.1`, moving with each bump) follow the same revision.
 - Compare trusted-review SHA producer lines with case preserved, require the pinned `trusted_sha`
   assignment to precede its echo, and reject a `trusted_sha` or `head_sha` environment binding in
   every scope that reaches the metadata step (workflow, prepare job and step), so a differently

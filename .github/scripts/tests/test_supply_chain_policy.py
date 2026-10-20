@@ -21,10 +21,10 @@ sys.modules[SPEC.name] = check_supply_chain
 SPEC.loader.exec_module(check_supply_chain)
 
 CARGO_AUDIT_ACTION_PINS = (
-    "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",  # v2.87.27
     "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",  # v2.87.29
 )
 REJECTED_CARGO_AUDIT_ACTION_PINS = (
+    "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",  # retired v2.87.27
     "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",  # retired v2.87.20
     "taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0",  # retired v2.87.22
     "taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af",
@@ -5369,10 +5369,13 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
     def test_rust_toolchain_channel_requires_one_stable_pin(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "rust-toolchain.toml"
-            path.write_text('[toolchain]\nchannel = "1.99.0"\n', encoding="utf-8")
+            path.write_text('[toolchain]\nchannel = "1.99.1"\n', encoding="utf-8")
             self.assertEqual(
-                check_supply_chain.read_rust_toolchain_channel(path), "1.99.0"
+                check_supply_chain.read_rust_toolchain_channel(path), "1.99.1"
             )
+            # Below the configured floor is refused, not read as a channel.
+            path.write_text('[toolchain]\nchannel = "1.99.0"\n', encoding="utf-8")
+            self.assertIsNone(check_supply_chain.read_rust_toolchain_channel(path))
             path.write_text(
                 '[toolchain]\nchannel = "stable"\n', encoding="utf-8"
             )
@@ -5600,26 +5603,26 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "nightly": ('[toolchain]\nchannel = "nightly"\n', None),
             "missing patch": ('[toolchain]\nchannel = "1.99"\n', None),
             "non-string channel": ('[toolchain]\nchannel = 198\n', None),
-            "leading zero": ('[toolchain]\nchannel = "01.99.0"\n', None),
+            "leading zero": ('[toolchain]\nchannel = "01.99.1"\n', None),
             "unicode digits": ('[toolchain]\nchannel = "١.99.0"\n', None),
             "duplicate table": (
-                '[toolchain]\nchannel = "1.99.0"\n'
-                '[toolchain]\nchannel = "1.99.0"\n',
+                '[toolchain]\nchannel = "1.99.1"\n'
+                '[toolchain]\nchannel = "1.99.1"\n',
                 None,
             ),
             "decoy table": (
-                '[toolchain]\nchannel = "1.99.0"\n'
+                '[toolchain]\nchannel = "1.99.1"\n'
                 '[decoy]\nchannel = "1.98.0"\n',
                 None,
             ),
             "path key": (
-                '[toolchain]\nchannel = "1.99.0"\npath = "../rust"\n', None
+                '[toolchain]\nchannel = "1.99.1"\npath = "../rust"\n', None
             ),
             "unknown key": (
-                '[toolchain]\nchannel = "1.99.0"\ncustom = "value"\n', None
+                '[toolchain]\nchannel = "1.99.1"\ncustom = "value"\n', None
             ),
             "below floor": ('[toolchain]\nchannel = "1.97.9"\n', None),
-            "legacy file": ('[toolchain]\nchannel = "1.99.0"\n', "legacy"),
+            "legacy file": ('[toolchain]\nchannel = "1.99.1"\n', "legacy"),
             "missing file": (None, None),
         }
         for label, (contents, legacy) in invalid_files.items():
@@ -5631,7 +5634,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 else:
                     toolchain.write_text(contents, encoding="utf-8")
                 if legacy is not None:
-                    (root / "rust-toolchain").write_text("1.99.0\n", encoding="utf-8")
+                    (root / "rust-toolchain").write_text("1.99.1\n", encoding="utf-8")
                 violations = self._violations(root)
                 self.assertTrue(
                     any(
@@ -5649,7 +5652,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             )
             violations = self._violations(root)
             self.assertTrue(
-                any("channel at or above 1.99.0" in item for item in violations),
+                any("channel at or above 1.99.1" in item for item in violations),
                 violations,
             )
 

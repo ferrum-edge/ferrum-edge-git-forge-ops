@@ -2308,10 +2308,15 @@ const STALE_PLAN_GONE: &str =
 ///
 /// A PluginConfig's `ETag` does not cover the proxy associations to it, which
 /// the gateway removes when it deletes or retargets the plugin. Those writes
-/// therefore also carry the plan's expected referencing-proxy set
-/// (`expected_proxy_ids`), which Ferrum Edge checks atomically with the
-/// write: a proxy outside the plan referencing the plugin refuses it with
-/// `412` instead of being silently detached (issue #569).
+/// are therefore guarded twice. Immediately before the write, a fresh
+/// `/backup` refuses it when a proxy outside the plan references the plugin
+/// (see [`Preconditions::refuse_unplanned_references`]); and the write itself
+/// carries the plan's expected referencing-proxy set (`expected_proxy_ids`),
+/// which a Ferrum Edge build implementing that precondition checks atomically
+/// with the write, refusing with `412` instead of silently detaching a proxy
+/// outside the set (issue #569). Released Edge builds up to v0.9.17 ignore the
+/// parameter, so the client-side re-read stays until the minimum supported
+/// Edge enforces it (issue #603).
 ///
 /// Consumers compare complete verification with the raw evidence captured before
 /// allocation, including hidden fields and the original row token. Archival
@@ -2413,6 +2418,18 @@ impl<'a> Preconditions<'a> {
         let Some(etag) = self.confirm(resource.kind(), resource.id(), true).await? else {
             return Err(crate::error::Error::StalePlan(STALE_PLAN_GONE.to_string()));
         };
+        // Defense in depth (issue #603): a gateway that predates the
+        // association precondition ignores `expected_proxy_ids`, so the
+        // client re-reads the references before a retarget either way.
+        if let CreateResource::PluginConfig(plugin) = resource {
+            if self.retargets(plugin) {
+                let kept = match plugin.scope {
+                    PluginScope::Proxy => plugin.proxy_id.as_deref(),
+                    _ => None,
+                };
+                self.refuse_unplanned_references(&plugin.id, kept).await?;
+            }
+        }
         // The gateway fences the associations this write would detach
         // against the proxies the plan accounts for (issue #569), atomically
         // with the write; a proxy outside the set refuses it with 412.
@@ -2437,6 +2454,10 @@ impl<'a> Preconditions<'a> {
         let Some(etag) = self.confirm(kind, id, false).await? else {
             return Ok(OpOutcome::AlreadyGone);
         };
+        if kind == "PluginConfig" {
+            // Defense in depth alongside `expected_proxy_ids` (issue #603).
+            self.refuse_unplanned_references(id, None).await?;
+        }
         let expected = if kind == "PluginConfig" {
             Some(self.planned_references.get(id).cloned().unwrap_or_default())
         } else {
@@ -2462,6 +2483,61 @@ impl<'a> Preconditions<'a> {
                 .is_none_or(|(scope, proxy_id)| {
                     *scope != plugin.scope || *proxy_id != plugin.proxy_id
                 })
+    }
+
+    /// Refuse a write that makes the gateway detach PluginConfig `id` from a
+    /// proxy the plan does not account for, other than `kept`, the target the
+    /// write keeps.
+    ///
+    /// Ferrum Edge's plugin-config `DELETE` removes every proxy association to
+    /// the plugin, and a `proxy` or `global` update removes every association
+    /// but its target. Those association rows are not covered by the plugin's
+    /// `ETag`, so `If-Match` cannot see a proxy that attached the plugin after
+    /// the plan, and the write would silently undo that attachment. So a
+    /// fresh `/backup`, read immediately before the write, lists the proxies
+    /// that reference the plugin now; any one neither the plan's live view nor
+    /// the repository showed referencing it refuses the write as
+    /// [`crate::error::Error::UnplannedPluginReference`].
+    ///
+    /// On its own this narrows the race to the time between that read and the
+    /// write; the `expected_proxy_ids` precondition the write also carries
+    /// closes it on a gateway that enforces it (issue #569). Released Edge
+    /// builds up to v0.9.17 ignore that parameter and the client cannot tell
+    /// whether the target enforces it, so this check runs unconditionally
+    /// until the minimum supported Edge release does (issue #603).
+    async fn refuse_unplanned_references(
+        &mut self,
+        id: &str,
+        kept: Option<&str>,
+    ) -> crate::error::Result<()> {
+        let live = self.read_backup().await?;
+        let expected = self.planned_references.get(id);
+        let unplanned: Vec<String> = live
+            .proxies
+            .iter()
+            .filter(|proxy| {
+                proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == id)
+            })
+            .map(|proxy| proxy.id.as_str())
+            .filter(|proxy| Some(*proxy) != kept)
+            .filter(|proxy| !expected.is_some_and(|expected| expected.contains(*proxy)))
+            .map(|proxy| format!("`{proxy}`"))
+            .collect();
+        if unplanned.is_empty() {
+            return Ok(());
+        }
+        let noun = if unplanned.len() == 1 {
+            "proxy"
+        } else {
+            "proxies"
+        };
+        Err(crate::error::Error::UnplannedPluginReference(format!(
+            "not sent: the gateway would detach PluginConfig `{id}` from {noun} {}, which this run's plan and the repository do not show referencing it (most likely attached after the plan). Declare the reference in the repository to keep it, or re-run apply to accept detaching it",
+            unplanned.join(", ")
+        )))
     }
 
     /// Read the namespace's `/backup` and keep its rows as the confirmation
