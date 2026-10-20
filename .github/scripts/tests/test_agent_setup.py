@@ -1114,24 +1114,27 @@ class AgentSetupTests(unittest.TestCase):
         "qwen-agents",
         "opencode-laguna-agents",
     )
+    UNSUPPORTED_HELP = "FLAGS\n  --standalone  private server\n  --purely  no"
 
-    def run_opencode_launcher(
-        self, skill: str, probe: str
-    ) -> tuple[subprocess.CompletedProcess[str], str, Path]:
+    def opencode_launcher_fixture(self) -> Path:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         temp = Path(directory.name)
-        root = temp / "repo"
-        linked = temp / "linked"
-        init_repo_with_linked_worktree(root, linked)
+        init_repo_with_linked_worktree(temp / "repo", temp / "linked")
+        (temp / "tmp").mkdir()
         fake = temp / "opencode"
         fake.write_text(
             "#!/usr/bin/env bash\n"
-            'if [[ "$1" == "--version" ]]; then printf "opencode v9.9.9\\n"; exit 0; fi\n'
+            "hang() { sleep 300 & printf '%s\\n' \"$!\" \"$$\" >> \"$FAKE_PIDS\"; wait; }\n"
+            'if [[ "$1" == "--version" ]]; then\n'
+            '  [[ "$FAKE_PROBE" == hang-version ]] && hang\n'
+            '  printf "opencode v9.9.9\\n"; exit 0\n'
+            "fi\n"
             'if [[ "$1 $2" == "run --help" ]]; then\n'
             '  case "$FAKE_PROBE" in\n'
-            "    pure) printf 'Options:\\n  --pure  run without external plugins\\n' ;;\n"
-            "    unsupported) printf 'FLAGS\\n  --standalone  private server\\n  --purely  no\\n' ;;\n"
+            "    pure) printf 'Options:\\n      --pure  run without external plugins  [boolean]\\n' ;;\n"
+            '    unsupported|hang-version) printf "%s\\n" "$FAKE_HELP" ;;\n'
+            "    hang-help) hang ;;\n"
             "    *) exit 1 ;;\n"
             "  esac\n"
             "  exit 0\n"
@@ -1142,28 +1145,50 @@ class AgentSetupTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake.chmod(0o755)
-        prompt = temp / "prompt.md"
-        prompt.write_text("Review only.\n", encoding="utf-8")
+        (temp / "prompt.md").write_text("Review only.\n", encoding="utf-8")
+        return temp
+
+    def run_opencode_launcher(
+        self,
+        skill: str,
+        probe: str,
+        *,
+        temp: Path | None = None,
+        help_text: str = UNSUPPORTED_HELP,
+    ) -> tuple[subprocess.CompletedProcess[str], str, Path]:
+        temp = temp or self.opencode_launcher_fixture()
         capture = temp / "capture.txt"
+        capture.unlink(missing_ok=True)
         launcher = (
             check_agent_setup.ROOT / f".agents/skills/{skill}/scripts/dispatch-agent.sh"
         )
         result = subprocess.run(
-            ["bash", str(launcher), "--worktree", str(linked), "--prompt-file", str(prompt)],
+            [
+                "bash",
+                str(launcher),
+                "--worktree",
+                str(temp / "linked"),
+                "--prompt-file",
+                str(temp / "prompt.md"),
+            ],
             cwd=temp,
             env={
                 **os.environ,
-                "OPENCODE_BIN": str(fake),
+                "OPENCODE_BIN": str(temp / "opencode"),
                 "ALIBABA_TOKEN_PLAN_API_KEY": "not-printed",
                 "FAKE_PROBE": probe,
+                "FAKE_HELP": help_text,
                 "FAKE_CAPTURE": str(capture),
+                "FAKE_PIDS": str(temp / "pids.txt"),
+                "TMPDIR": str(temp / "tmp"),
             },
             check=False,
             capture_output=True,
             text=True,
+            timeout=60,
         )
         captured = capture.read_text(encoding="utf-8") if capture.exists() else ""
-        return result, captured, fake
+        return result, captured, temp / "opencode"
 
     def test_opencode_launchers_dispatch_with_pure_when_supported(self):
         for skill in self.OPENCODE_LAUNCHERS:
@@ -1192,6 +1217,52 @@ class AgentSetupTests(unittest.TestCase):
                 )
                 self.assertIn("v1.3.4 or later", result.stderr)
 
+    def test_opencode_launchers_ignore_pure_mentioned_outside_an_option_declaration(self):
+        for help_text in (
+            "FLAGS\n  --standalone  replaces --pure",
+            "Note: --pure was removed in 2.0; use --standalone",
+            "FLAGS\n  --standalone   Run with a private server (formerly --pure)",
+            "  --pure is no longer supported",
+            "  --pure-mode  something else",
+        ):
+            with self.subTest(help_text=help_text):
+                result, captured, _ = self.run_opencode_launcher(
+                    "deepseek-pro-agents", "unsupported", help_text=help_text
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(captured, "")
+                self.assertIn('does not support "opencode run --pure"', result.stderr)
+
+    def test_opencode_help_parser_accepts_option_declarations_only(self):
+        helper = str(
+            check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
+        )
+        for line, declared in (
+            ("      --pure                 run without external plugins  [boolean]", True),
+            ("  -p, --pure  run without external plugins", True),
+            ("  --pure, -P\trun without external plugins", True),
+            ("  --pure", True),
+            ("  --standalone  replaces --pure", False),
+            ("  --model, -m string  Model to use (not --pure)", False),
+            ("  --pure is no longer supported", False),
+            ("  --purely  no", False),
+        ):
+            with self.subTest(line=line):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        'set -euo pipefail; source "$1"; opencode_help_declares_pure "$2"',
+                        "bash",
+                        helper,
+                        f"Options:\n{line}\n",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0 if declared else 1, result.stderr)
+
     def test_opencode_launchers_treat_a_failed_probe_as_unsupported(self):
         for skill in self.OPENCODE_LAUNCHERS:
             with self.subTest(skill=skill):
@@ -1199,6 +1270,32 @@ class AgentSetupTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(captured, "")
                 self.assertIn('does not support "opencode run --pure"', result.stderr)
+
+    def test_opencode_launchers_kill_hanging_probes_and_release_the_lock(self):
+        for probe in ("hang-help", "hang-version"):
+            with self.subTest(probe=probe):
+                temp = self.opencode_launcher_fixture()
+                started = time.monotonic()
+                result, captured, _ = self.run_opencode_launcher(
+                    "deepseek-pro-agents", probe, temp=temp
+                )
+                self.assertLess(time.monotonic() - started, 30)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(captured, "")
+                self.assertIn("did not finish within", result.stderr)
+                self.assertIn('does not support "opencode run --pure"', result.stderr)
+                pids = (temp / "pids.txt").read_text(encoding="utf-8").split()
+                self.assertTrue(pids)
+                for pid in pids:
+                    with self.assertRaises(ProcessLookupError, msg=f"pid {pid} survived"):
+                        os.kill(int(pid), 0)
+                self.assertEqual(list((temp / "tmp").iterdir()), [])
+                # The refusal released the worktree lock: the next dispatch runs.
+                result, captured, _ = self.run_opencode_launcher(
+                    "deepseek-pro-agents", "pure", temp=temp
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("spawn", captured)
 
     def test_expands_every_braced_rule_path(self):
         self.assertEqual(
