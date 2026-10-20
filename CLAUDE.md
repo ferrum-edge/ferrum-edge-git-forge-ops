@@ -273,10 +273,13 @@ exception needs a `display-sink:` comment saying why). JSON documents, the
 `Error:` line, panics, the posted review comment and the step summary use it
 too. Data payloads (`export`, bundles, state) do not; ciphertext for a person
 goes through `display::Composed` (text scrubbed, ciphertext byte for byte).
-Brokered secrets and environment tokens must be at least 8 bytes (refused at
-resolve and registration, naming the source). The CLI registers every
-resolved snapshot, rotated value, sent admin JWT (whole run) and environment
-token; the
+Brokered secrets, environment tokens, live credentials and rule-declared
+plugin secrets must be at least 8 bytes (refused at resolve and registration,
+naming the source, or a live leaf's resource and field path); empty live
+leaves and short heuristic-only plugin leaves are not registered. The CLI
+registers every resolved snapshot, live document, rotated value, sent admin
+JWT (whole run; `AdminClient` reuses one until it nears expiry) and
+environment token under one 128 MiB budget charged by actual index size; the
 sink replaces them and their encodings and withholds a line still holding an
 8-byte run, unless the run is in the scrubbed configuration or the tool's
 own string literals (`build.rs` collects them). Quote peer-sent strings with
@@ -508,7 +511,9 @@ namespace payload is built before the first mutation.
   hosted qualification is still required, and the first-release record is pending.
 - **Credentials travel only over TLS or loopback.** Every admin request is
   built through `AdminClient::authorize` / `Authorized::request`, the only
-  place the bearer token is minted and attached; it refuses a target that is
+  place the bearer token is attached (`send_with_retry` takes it from the
+  client's cache before every attempt; one is minted per client and reused
+  until it nears expiry by wall and monotonic clock); it refuses a target that is
   not `https://` or `http://` to a literal loopback IP (`credential_target`),
   and client construction refuses such a gateway URL up front. Requests retain
   the parsed URL that passed the check. HTTPS clients also enforce HTTPS in

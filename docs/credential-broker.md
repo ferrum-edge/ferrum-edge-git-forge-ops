@@ -165,7 +165,10 @@ Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,
 the final `Error:` line and the review comment. Every value a run resolves
 or rotates in, the secrets of every live snapshot it reads or restore it
 sends, complete consumer verification evidence (including preserved rotation
-siblings), authorized traffic-probe credentials, every admin JWT it sends, and
+siblings), authorized traffic-probe credentials, every admin JWT it sends (a
+client mints one and reuses it until it has less than five minutes, at most
+half its TTL, left, by both the wall clock and a monotonic clock, rechecked
+before every retry), and
 the GitHub tokens and admin JWT secrets it reads from the environment become
 `[REDACTED]`, as do their base64, percent, JSON-escaped and single-quoted
 spellings, and the review
@@ -179,15 +182,25 @@ validator-output rule above). Decisions read responses as received; only the
 displayed copy is scrubbed. Age-encrypted deliveries are written byte for
 byte.
 
-**Fail-closed admission.** Live credentials and authorized traffic-probe
-credentials must be at least 8 bytes, just like brokered values. A short live
-leaf (including an empty one) refuses the run when its snapshot or complete
+**Fail-closed admission.** Live credentials, plugin-config fields a schema
+rule declares (secrets, endpoints, and Kafka producer properties named like a
+credential), modeled service-discovery secrets and
+authorized traffic-probe credentials must be at least 8 bytes, just like
+brokered values. A short one refuses the run when its snapshot or complete
 consumer verification evidence is admitted, before it can authorize a write or
-rotation delivery. A short probe value refuses projection/header resolution,
-before any probe request. Admission also refuses a value whose review
-formatter spelling falls below 8 bytes after CRLF collapse or trimming, rather
-than admitting a short spelling that would suppress ordinary prose. A live
-leaf that equals `${gh-env-secret:...}` is a real credential and is registered without the repository-placeholder exemption.
+rotation delivery; the refusal names the resource and field path (for example
+`Consumer ferrum/app credentials.keyauth[0].key`), never the value; a location
+that repeats any credential in the same snapshot is withheld. An empty
+live leaf has nothing to protect and is skipped. A short live value that only
+the key-name heuristics flag (a `*key` field such as a `request_transformer`
+header name, a header-map value, a Kafka producer property not named like a
+credential, a custom plugin's secret-looking field) may be an ordinary setting: it is not registered and
+does not refuse the run. A short probe value refuses projection/header
+resolution, before any probe request. Admission also refuses a value whose
+review formatter spelling falls below 8 bytes after CRLF collapse or trimming,
+rather than admitting a short spelling that would suppress ordinary prose. A
+live leaf that equals `${gh-env-secret:...}` is a real credential and is
+registered without the repository-placeholder exemption.
 Credential identities (`basicauth.username`, `mtls_auth.identity`) remain
 non-secret. Unresolved placeholders and short non-secret settings declared in
 resource YAML retain their existing policy; reserved broker sentinels remain
@@ -204,12 +217,20 @@ more) always meet the minimum; keep short non-secret settings such as
 All sources share one cumulative registration budget for the entire run.
 Repeated values, including values seen in multiple snapshots or sent through
 different paths, are counted once; no registered value or token is evicted.
-The 64 MiB accounting budget charges `1024 * (UTF-8 byte length + 1)` per
-unique value to bound its spellings and fragment indexes before allocating
-them. Oversized values or a cumulative overflow refuse the run with a
-secret-free error instead of silently dropping protection. Subsequent
-admissions fail, and diagnostics are replaced by that refusal, even if a
-reporting command would otherwise continue after a failed live read.
+The 128 MiB accounting budget charges each unique value what its spellings
+and fragment indexes actually hold (a few KiB for a 43-byte API key, about
+40 KiB for a 300-byte JWT), and a value's worst case must fit before they are
+built, so an oversized value is refused without allocating them. Thousands of
+live credentials and over a thousand distinct admin JWTs fit. Oversized values
+or a cumulative overflow refuse the run with a secret-free error instead of
+silently dropping protection. Subsequent admissions fail, and diagnostics are
+replaced by that refusal, even if a reporting command would otherwise continue
+after a failed live read.
+
+A credential bundle value must be a JSON string. Any other JSON value (an
+unquoted number, say) is refused with an error naming the shard, slot and JSON
+type, never the value. A repeated object member inside such a value is
+refused without naming the member.
 
 ## Entry position is the slot identity
 

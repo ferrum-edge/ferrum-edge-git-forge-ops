@@ -107,9 +107,37 @@ impl JwtOptions {
     }
 }
 
+/// A minted token and the lifetime it claims (`iat` and `exp`, in Unix
+/// seconds), so a client can reuse it until it nears expiry.
+#[derive(Clone)]
+pub struct MintedJwt {
+    pub token: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+}
+
+impl std::fmt::Debug for MintedJwt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MintedJwt")
+            .field("token", &"<withheld>")
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// Mint an HS256 token for the admin API.
 pub fn mint_jwt(secret: &str, options: &JwtOptions) -> crate::error::Result<String> {
-    let now = Utc::now().timestamp();
+    mint_jwt_at(secret, options, Utc::now().timestamp()).map(|minted| minted.token)
+}
+
+/// [`mint_jwt`] issued at `now` (Unix seconds), returning the claimed
+/// lifetime with the token.
+pub fn mint_jwt_at(
+    secret: &str,
+    options: &JwtOptions,
+    now: i64,
+) -> crate::error::Result<MintedJwt> {
     // Guard against a nonsensical TTL reaching the wire as `exp <= iat`, which
     // the gateway rejects outright.
     let ttl = if options.ttl_secs > 0 {
@@ -139,10 +167,15 @@ pub fn mint_jwt(secret: &str, options: &JwtOptions) -> crate::error::Result<Stri
         },
     };
 
-    encode(
+    let token = encode(
         &Header::default(),
         &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
-    .map_err(|e| crate::error::Error::JwtError(e.to_string()))
+    .map_err(|e| crate::error::Error::JwtError(e.to_string()))?;
+    Ok(MintedJwt {
+        token,
+        issued_at: now,
+        expires_at: exp,
+    })
 }

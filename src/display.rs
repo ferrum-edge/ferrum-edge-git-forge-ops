@@ -25,11 +25,17 @@
 //! The CLI calls [`enable_display_scrubbing`] at startup. From then on the
 //! process registers every snapshot the resolver resolves
 //! ([`register_resolved`]), every rotated value it publishes and every token
-//! it reads from the environment ([`register_values`]), and every admin JWT
-//! it sends ([`register_sent_token`]), for the rest of the run. Every secret
-//! admitted from live evidence, a probe, a broker or a token must be at least
-//! [`MIN_SCRUB_LENGTH`] bytes. Admission refuses shorter values, and deduplicates
-//! all sources under one cumulative budget before building encodings/windows.
+//! it reads from the environment ([`register_values`]), every admin JWT it
+//! sends ([`register_sent_token`]; a client mints one and reuses it until it
+//! nears expiry), and the secrets of every live document it reads or sends
+//! ([`register_gateway_config`]), for the rest of the run. Every secret
+//! admitted from a credential, a schema-declared plugin field, a probe, a
+//! broker or a token must be at least [`MIN_SCRUB_LENGTH`] bytes: admission
+//! refuses shorter values, naming the source (and a live leaf's resource and
+//! field path), never the value. Empty live leaves, and short ones only the
+//! key-name heuristics flag, are not registered. Admission deduplicates all
+//! sources under one cumulative budget, checks a value's worst case before
+//! building its encodings and windows, and charges what they actually hold.
 //! A refusal withholds further diagnostics and makes the CLI fail even when a
 //! reporting command would ordinarily tolerate a live-read failure. Library
 //! callers opt in to retention; minimum-length admission still applies. A test
@@ -83,7 +89,7 @@ use base64::Engine;
 
 use crate::config::GatewayConfig;
 use crate::secrets::scrubber::{
-    gateway_secret_values, json_escaped, percent_encoded, yaml_single_quoted,
+    gateway_secret_values, json_escaped, live_secret_leaves, percent_encoded, yaml_single_quoted,
 };
 use crate::secrets::{
     is_reencoding_hazard, ResolveReport, FRAGMENT_SCAN_LENGTH, MIN_SCRUB_LENGTH, REDACTION,
@@ -101,11 +107,41 @@ static PUBLIC_PROSE: &str = include_str!(concat!(env!("OUT_DIR"), "/display_corp
 /// The longest excerpt of peer text [`peer_text`] processes and returns.
 const MAX_PEER_TEXT_CHARS: usize = 16 * 1024;
 
-/// Whole-run admission budget. Charge conservatively for spellings, windows,
-/// hash buckets and their duplicate indexes *before* allocating them. This is
+/// Whole-run admission budget, in accounted bytes. Each unique value is
+/// charged what its [`Entry`] actually holds — spellings (kept twice: in the
+/// entry and the needle index), fragment windows (kept in the entry and the
+/// private-window set) and fixed per-entry and per-needle overheads — and,
+/// before anything is built, its worst case must fit ([`worst_case_cost`]),
+/// so an oversized value is refused without allocating its indexes. This is
 /// an accounting limit, not a claim about allocator-exact resident memory.
-const REGISTRATION_BUDGET: usize = 64 * 1024 * 1024;
-const REGISTRATION_BYTES_PER_INPUT_BYTE: usize = 1024;
+///
+/// A typical 43-byte API key is charged a few KiB and a 300-byte admin
+/// JWT about 40 KiB, so tens of thousands of live credentials fit, beside
+/// the handful of admin tokens a client mints (it reuses one per lifetime).
+const REGISTRATION_BUDGET: usize = 128 * 1024 * 1024;
+/// Fixed cost of one admitted value: its `entries` slot, `Entry` header and
+/// hash-table slack.
+const ENTRY_OVERHEAD_BYTES: usize = 256;
+/// Fixed cost of one needle, per copy: its `String` header, index-bucket
+/// slot and hash-table slack.
+const NEEDLE_OVERHEAD_BYTES: usize = 64;
+/// One window in the private-window set: the 8-byte key, its control byte,
+/// load-factor and growth slack, and the transient sets a registration
+/// builds over it.
+const INDEXED_WINDOW_BYTES: usize = 32;
+/// An upper bound on the bytes of all of a value's [`spellings`] per input
+/// byte. Summed per byte over every spelling at its worst: the value (1),
+/// four base64 alphabets (16/3), percent (3), single-quoted YAML (2), two
+/// JSON escapings (6 each, a control byte as `\u00XX`), the sanitizer's
+/// U+FFFD (3) and space (1) forms, and the review formatter's Markdown
+/// escapes (5 each, `@` as `&#64;`) and code spans (3 each, a control byte
+/// as U+FFFD). That is under 44; 48 leaves room.
+const SPELLING_BYTES_PER_INPUT_BYTE: usize = 48;
+/// Constant part of the spelling bound (base64 padding, `…`, `(none)`,
+/// `(unnamed)`).
+const SPELLING_CONSTANT_BYTES: usize = 256;
+/// An upper bound on the number of a value's [`spellings`].
+const MAX_SPELLINGS: usize = 16;
 
 const BUDGET_REFUSAL: &str = "Secret registration budget exceeded; refusing the run because its credentials cannot all be protected in displayed output.";
 
@@ -193,31 +229,182 @@ fn ascii_json_escaped(value: &str) -> String {
 
 impl Entry {
     fn new(value: &str) -> Self {
-        let mut windows = Vec::new();
-        let mut needles = Vec::new();
         let hazardous = is_reencoding_hazard(value);
-        for spelling in spellings(value) {
-            if spelling.len() < MIN_SCRUB_LENGTH {
-                continue;
-            }
+        let mut needles: Vec<String> = spellings(value)
+            .into_iter()
+            .filter(|spelling| spelling.len() >= MIN_SCRUB_LENGTH)
+            .collect();
+        needles.sort();
+        needles.dedup();
+        // Sized exactly, so the window list never over-allocates by growth.
+        let mut windows = Vec::with_capacity(
+            needles
+                .iter()
+                .map(|needle| (needle.len() + 1).saturating_sub(FRAGMENT_SCAN_LENGTH))
+                .sum(),
+        );
+        for needle in &needles {
             windows.extend(
-                spelling
+                needle
                     .as_bytes()
                     .windows(FRAGMENT_SCAN_LENGTH)
                     .filter_map(|w| Window::try_from(w).ok()),
             );
-            needles.push(spelling);
         }
         windows.sort_unstable();
         windows.dedup();
-        needles.sort();
-        needles.dedup();
+        windows.shrink_to_fit();
         Self {
             windows,
             needles,
             hazardous,
         }
     }
+
+    /// What this entry is charged against [`REGISTRATION_BUDGET`].
+    fn cost(&self, value: &str) -> usize {
+        let needles = self
+            .needles
+            .iter()
+            .map(|needle| needle.len().saturating_add(NEEDLE_OVERHEAD_BYTES))
+            .fold(0usize, usize::saturating_add);
+        ENTRY_OVERHEAD_BYTES
+            .saturating_add(value.len())
+            // Each needle is held by the entry and by the needle index.
+            .saturating_add(needles.saturating_mul(2))
+            .saturating_add(
+                self.windows.len().saturating_mul(
+                    std::mem::size_of::<Window>().saturating_add(INDEXED_WINDOW_BYTES),
+                ),
+            )
+    }
+}
+
+/// The most an [`Entry`] for a `length`-byte value can be charged, and the
+/// most building one can allocate: checked before building it, so an
+/// oversized value is refused without spelling or indexing it.
+fn worst_case_cost(length: usize) -> usize {
+    let spelling_bytes = length
+        .saturating_mul(SPELLING_BYTES_PER_INPUT_BYTE)
+        .saturating_add(SPELLING_CONSTANT_BYTES);
+    // Every spelling byte starts at most one window.
+    let windows = spelling_bytes;
+    ENTRY_OVERHEAD_BYTES
+        .saturating_add(length)
+        .saturating_add(
+            spelling_bytes
+                .saturating_add(MAX_SPELLINGS.saturating_mul(NEEDLE_OVERHEAD_BYTES))
+                .saturating_mul(2),
+        )
+        .saturating_add(
+            windows
+                .saturating_mul(std::mem::size_of::<Window>().saturating_add(INDEXED_WINDOW_BYTES)),
+        )
+}
+
+/// One value offered for admission, and where it came from when that is
+/// more specific than the registration's source (a live leaf's resource and
+/// field path). Never the value itself.
+struct Candidate {
+    value: String,
+    location: Option<String>,
+}
+
+impl Candidate {
+    fn bare(value: String) -> Self {
+        Self {
+            value,
+            location: None,
+        }
+    }
+}
+
+/// Shown in a refusal in place of a location that repeats a credential.
+const WITHHELD_LOCATION: &str =
+    "a resource whose id or field path repeats a credential (location withheld)";
+
+/// Does `location`, or a decoded view of it, repeat any value in `batch`:
+/// an eight-byte run of any of its [`spellings`] (or its hex, in any letter
+/// case), or the whole of a spelling shorter than that? A short value is compared in every
+/// spelling, so a location carrying `Q7!x9` as `UTcheDk=` is caught.
+///
+/// Spellings are built only for values that could be admitted at all; a
+/// location is withheld outright beside a larger one, whose encodings are
+/// never built and so cannot be ruled out. A location is short (it is
+/// sanitized and bounded), so its runs are collected once and each value is
+/// scanned against them.
+fn repeats_a_candidate(location: &str, batch: &[Candidate]) -> bool {
+    let mut views = vec![location.as_bytes().to_vec()];
+    any_decoded_view(location.as_bytes(), |view| {
+        views.push(view.to_vec());
+        false
+    });
+    // Hex is case-insensitive to every decoder, so a mixed-case spelling
+    // (`6b3F7a`) must match too: compare ASCII-lowercased copies of each view
+    // against the lowercase hex spelling. Folding can only add matches, so it
+    // can only withhold more.
+    let folded: Vec<Vec<u8>> = views
+        .iter()
+        .filter(|view| view.iter().any(u8::is_ascii_uppercase))
+        .map(|view| view.to_ascii_lowercase())
+        .collect();
+    views.extend(folded);
+    let runs: HashSet<Window> = views
+        .iter()
+        .flat_map(|view| view.windows(FRAGMENT_SCAN_LENGTH))
+        .filter_map(|run| Window::try_from(run).ok())
+        .collect();
+    let repeats = |spelling: &str| {
+        if spelling.len() < FRAGMENT_SCAN_LENGTH {
+            return views
+                .iter()
+                .any(|view| contains_bytes(view, spelling.as_bytes()));
+        }
+        spelling
+            .as_bytes()
+            .windows(FRAGMENT_SCAN_LENGTH)
+            .any(|run| Window::try_from(run).is_ok_and(|run| runs.contains(&run)))
+    };
+    batch.iter().any(|candidate| {
+        let value = candidate.value.as_str();
+        if worst_case_cost(value.len()) > REGISTRATION_BUDGET {
+            return true;
+        }
+        let hex = hex::encode(value);
+        let mut all = spellings(value);
+        all.push(hex.to_ascii_uppercase());
+        all.push(hex);
+        all.iter()
+            .filter(|spelling| !spelling.is_empty())
+            .any(|spelling| repeats(spelling))
+    })
+}
+
+/// The most new values one registration can stage against `available`:
+/// each is charged at least [`ENTRY_OVERHEAD_BYTES`], so no more can fit.
+/// The staging list and its duplicate set never hold more than this, so
+/// their own memory is covered by the per-entry overhead they are charged.
+fn staging_limit(available: usize) -> usize {
+    available / ENTRY_OVERHEAD_BYTES
+}
+
+fn short_secret_refusal(described: &str) -> String {
+    format!("{described} holds a secret shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.")
+}
+
+fn short_spelling_refusal(described: &str) -> String {
+    format!("{described} has a review-formatted spelling shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.")
+}
+
+/// Can `value` be protected in displayed output at all? Every needle the
+/// sink would look for, including the review formatter's (CRLF collapse or
+/// trimming can shorten an eight-byte value), must be at least
+/// [`MIN_SCRUB_LENGTH`] bytes.
+fn protectable(value: &str) -> bool {
+    value.len() >= MIN_SCRUB_LENGTH
+        && crate::review::pr_comment::secret_spellings(value)
+            .iter()
+            .all(|spelling| spelling.len() >= MIN_SCRUB_LENGTH)
 }
 
 /// Unique secrets for the whole run, regardless of their source. Repeated
@@ -236,53 +423,64 @@ struct Registry {
 
 impl Registry {
     /// The single admission path for resolutions, live evidence, probes and
-    /// tokens. Check the entire registration before building any indexes.
+    /// tokens. All or nothing: nothing is indexed unless every candidate is
+    /// admitted.
     fn register(
         &mut self,
         source: &str,
-        values: &[String],
+        candidates: &[Candidate],
         document: Option<&GatewayConfig>,
     ) -> crate::error::Result<()> {
         if let Some(reason) = &self.refusal {
             return Err(crate::error::Error::Config(reason.clone()));
         }
-        let mut additional = 0usize;
-        let mut new_values = HashSet::new();
-        for value in values {
-            if value.len() < MIN_SCRUB_LENGTH {
-                let reason = format!("{source} holds a secret shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.");
-                self.refusal = Some(reason.clone());
-                return Err(crate::error::Error::Config(reason));
-            }
-            if !self.entries.contains_key(value) && new_values.insert(value.as_str()) {
-                additional = value
-                    .len()
-                    .checked_add(1)
-                    .and_then(|bytes| bytes.checked_mul(REGISTRATION_BYTES_PER_INPUT_BYTE))
-                    .and_then(|bytes| additional.checked_add(bytes))
-                    .unwrap_or(usize::MAX);
+        for candidate in candidates {
+            if candidate.value.len() < MIN_SCRUB_LENGTH {
+                let described = self.described(source, candidate, candidates);
+                return Err(self.refuse(short_secret_refusal(&described)));
             }
         }
-        if additional > REGISTRATION_BUDGET.saturating_sub(self.used) {
-            self.refusal = Some(BUDGET_REFUSAL.to_string());
-            return Err(crate::error::Error::Config(BUDGET_REFUSAL.to_string()));
-        }
-        // CRLF collapse or trimming can make even an eight-byte raw value
-        // too short to protect. Refuse that case rather than registering a
-        // short needle that would withhold ordinary prose throughout the run.
-        for value in &new_values {
-            if crate::review::pr_comment::secret_spellings(value)
-                .iter()
-                .any(|spelling| spelling.len() < MIN_SCRUB_LENGTH)
+        // Build each new entry only once its worst case fits what is left,
+        // and charge what it actually holds. The staging itself grows one
+        // admitted value at a time, never sized by the candidate count: a
+        // batch of millions of small values is refused once the budget is
+        // spent, before its bookkeeping outgrows what was admitted.
+        let available = REGISTRATION_BUDGET.saturating_sub(self.used);
+        let max_staged = staging_limit(available);
+        let mut charged = 0usize;
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut pending: Vec<(&str, Entry)> = Vec::new();
+        for candidate in candidates {
+            if self.entries.contains_key(&candidate.value)
+                || seen.contains(candidate.value.as_str())
             {
-                let reason = format!("{source} has a review-formatted spelling shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.");
-                self.refusal = Some(reason.clone());
-                return Err(crate::error::Error::Config(reason));
+                continue;
             }
+            if pending.len() >= max_staged
+                || worst_case_cost(candidate.value.len()) > available.saturating_sub(charged)
+            {
+                return Err(self.refuse(BUDGET_REFUSAL.to_string()));
+            }
+            // CRLF collapse or trimming can make even an eight-byte raw value
+            // too short to protect. Refuse that case rather than registering
+            // a short needle that would withhold ordinary prose throughout
+            // the run.
+            if !protectable(&candidate.value) {
+                let described = self.described(source, candidate, candidates);
+                return Err(self.refuse(short_spelling_refusal(&described)));
+            }
+            seen.insert(candidate.value.as_str());
+            let entry = Entry::new(&candidate.value);
+            charged = charged.saturating_add(entry.cost(&candidate.value));
+            pending.push((candidate.value.as_str(), entry));
         }
-        self.used += additional;
-        for value in new_values {
-            let entry = Entry::new(value);
+        // The worst-case check above already bounds this; keep the budget a
+        // hard limit even if a spelling ever outgrows that bound.
+        if charged > available {
+            return Err(self.refuse(BUDGET_REFUSAL.to_string()));
+        }
+        self.used += charged;
+        for (value, entry) in pending {
             self.hazardous |= entry.hazardous;
             self.add_needles(&entry.needles);
             self.entries.insert(value.to_string(), entry);
@@ -292,9 +490,9 @@ impl Registry {
         // survives. A bare value/token has no public document.
         let public_text =
             document.map(|config| self.redact(&serde_json::to_string(config).unwrap_or_default()));
-        let relevant_windows: HashSet<Window> = values
+        let relevant_windows: HashSet<Window> = candidates
             .iter()
-            .filter_map(|value| self.entries.get(value))
+            .filter_map(|candidate| self.entries.get(&candidate.value))
             .flat_map(|entry| entry.windows.iter().copied())
             .collect();
         let public_windows: HashSet<Window> = public_text
@@ -307,8 +505,8 @@ impl Registry {
                 relevant_windows.contains(&window).then_some(window)
             })
             .collect();
-        for value in values {
-            if let Some(entry) = self.entries.get(value) {
+        for candidate in candidates {
+            if let Some(entry) = self.entries.get(&candidate.value) {
                 self.private_windows.extend(
                     entry
                         .windows
@@ -319,6 +517,30 @@ impl Registry {
             }
         }
         Ok(())
+    }
+
+    /// `source`, with the candidate's location when it has one. The location
+    /// (a resource id and field path from the peer) is checked here: once
+    /// the refusal is set, it is displayed in place of everything else, and
+    /// never scrubbed again. It is scrubbed against what is registered, and
+    /// withheld whole when it repeats any value of the refused batch, which
+    /// is not registered yet (one Consumer's id can echo another's new
+    /// credential).
+    fn described(&self, source: &str, candidate: &Candidate, batch: &[Candidate]) -> String {
+        match &candidate.location {
+            Some(location) if repeats_a_candidate(location, batch) => {
+                format!("{source} at {WITHHELD_LOCATION}")
+            }
+            Some(location) => format!("{source} at {}", self.scrub_json_string(location)),
+            None => source.to_string(),
+        }
+    }
+
+    /// Refuse every later registration and every later display, for the
+    /// rest of the run.
+    fn refuse(&mut self, reason: String) -> crate::error::Error {
+        self.refusal = Some(reason.clone());
+        crate::error::Error::Config(reason)
     }
 
     fn add_needles(&mut self, needles: &[String]) {
@@ -516,13 +738,31 @@ fn with_registry_mut<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
 
 /// Admit a live or outgoing document. Placeholder-shaped leaves are real
 /// credentials here; unlike repository declarations they get no exemption.
+///
+/// Empty leaves are skipped: there is nothing to protect. A credential,
+/// rule-declared plugin secret or endpoint, or modeled service-discovery
+/// secret shorter than [`MIN_SCRUB_LENGTH`] bytes refuses the run, naming the
+/// resource and field path (never the value). A leaf flagged only by the
+/// key-name heuristics (`*key`, a header map) that is too short to protect is
+/// not registered: it may be an ordinary setting such as a header name, and a
+/// short needle could not be meaningfully scrubbed anyway.
 pub fn register_gateway_config(config: &GatewayConfig) -> crate::error::Result<()> {
-    let values = gateway_secret_values(config, &ResolveReport::default(), true);
-    register(
-        "a live gateway credential",
-        values.into_iter().collect(),
-        Some(config),
-    )
+    let candidates = live_secret_leaves(config)
+        .into_iter()
+        .filter(|leaf| {
+            !leaf.value.is_empty()
+                && (leaf.required
+                    // Too large to index at all: admission refuses it on the
+                    // budget before spelling it.
+                    || worst_case_cost(leaf.value.len()) > REGISTRATION_BUDGET
+                    || protectable(&leaf.value))
+        })
+        .map(|leaf| Candidate {
+            value: leaf.value,
+            location: Some(leaf.location),
+        })
+        .collect();
+    register("a live gateway credential", candidates, Some(config))
 }
 
 /// Register a resolved snapshot, retaining the declared-manifest policy:
@@ -531,20 +771,21 @@ pub fn register_resolved(
     config: &GatewayConfig,
     report: &ResolveReport,
 ) -> crate::error::Result<()> {
-    let values = gateway_secret_values(config, report, false);
+    let values = gateway_secret_values(config, report);
     register(
         "a resolved credential",
         values
             .into_iter()
             .filter(|value| value.len() >= MIN_SCRUB_LENGTH)
+            .map(Candidate::bare)
             .collect(),
         Some(config),
     )
 }
 
 /// Admit bare secrets (rotation, probe credentials, environment and sent tokens).
-/// Empty environment tokens are absent; live and probe leaves must pass the
-/// minimum even when empty. Sources must be trusted descriptions, never values.
+/// Empty environment tokens are absent; probe values must pass the minimum.
+/// Sources must be trusted descriptions, never values.
 pub fn register_values<I, S>(source: &str, values: I) -> crate::error::Result<()>
 where
     I: IntoIterator<Item = S>,
@@ -556,24 +797,41 @@ where
             .into_iter()
             .map(Into::into)
             .filter(|value| !value.is_empty())
+            .map(Candidate::bare)
             .collect(),
         None,
     )
 }
 
 pub(crate) fn register_probe_value(value: &str) -> crate::error::Result<()> {
-    register("a traffic probe credential", vec![value.to_string()], None)
+    register(
+        "a traffic probe credential",
+        vec![Candidate::bare(value.to_string())],
+        None,
+    )
 }
 
 fn register(
     source: &str,
-    values: Vec<String>,
+    candidates: Vec<Candidate>,
     document: Option<&GatewayConfig>,
 ) -> crate::error::Result<()> {
     if registering() {
-        with_registry_mut(|registry| registry.register(source, &values, document))
-    } else if values.iter().any(|value| value.len() < MIN_SCRUB_LENGTH) {
-        Err(crate::error::Error::Config(format!("{source} holds a secret shorter than {MIN_SCRUB_LENGTH} bytes; refusing the run. Use a longer credential so it can be protected in displayed output.")))
+        with_registry_mut(|registry| registry.register(source, &candidates, document))
+    } else if let Some(short) = candidates
+        .iter()
+        .find(|candidate| candidate.value.len() < MIN_SCRUB_LENGTH)
+    {
+        let described = match &short.location {
+            Some(location) if repeats_a_candidate(location, &candidates) => {
+                format!("{source} at {WITHHELD_LOCATION}")
+            }
+            Some(location) => format!("{source} at {location}"),
+            None => source.to_string(),
+        };
+        Err(crate::error::Error::Config(short_secret_refusal(
+            &described,
+        )))
     } else {
         Ok(())
     }
@@ -1252,11 +1510,27 @@ mod tests {
         })).unwrap()
     }
 
+    /// A short credential, schema-declared plugin secret or discovery secret
+    /// refuses the run, naming the resource and field path but never the
+    /// value. An empty one has nothing to protect and is skipped.
     #[test]
     fn live_admission_refuses_short_leaves_without_registering_them() {
         enable();
         for length in 0..MIN_SCRUB_LENGTH {
-            for kind in ["consumer", "plugin", "discovery"] {
+            for (kind, location) in [
+                (
+                    "consumer",
+                    "Consumer ferrum/consumer credentials.basicauth[0].password",
+                ),
+                (
+                    "plugin",
+                    "PluginConfig ferrum/plugin config.headers.authorization",
+                ),
+                (
+                    "discovery",
+                    "Upstream ferrum/upstream service_discovery.consul.token",
+                ),
+            ] {
                 LOCAL.with(|local| *local.borrow_mut() = Registry::default());
                 let value = "Q7!x9z?"[..length].to_string();
                 let mut config = live_config(&value);
@@ -1269,27 +1543,239 @@ mod tests {
                 if kind != "discovery" {
                     config.upstreams.clear();
                 }
-                let error = crate::http_client::BackupSnapshot::from_body(
+                let result = crate::http_client::BackupSnapshot::from_body(
                     &serde_json::to_string(&config).unwrap(),
-                )
-                .unwrap_err()
-                .to_string();
-                assert!(
-                    error.contains("live gateway credential holds a secret shorter than 8 bytes"),
-                    "{error}"
                 );
-                if !value.is_empty() {
-                    assert!(!error.contains(&value), "{error}");
-                }
                 LOCAL.with(|local| {
                     let registry = local.borrow();
                     assert!(registry.entries.is_empty());
                     assert!(registry.needles.is_empty());
                 });
+                if value.is_empty() {
+                    result.unwrap();
+                    registration_result().unwrap();
+                    continue;
+                }
+                let error = result.unwrap_err().to_string();
+                assert!(
+                    error.contains(&format!(
+                        "a live gateway credential at {location} holds a secret shorter than 8 bytes"
+                    )),
+                    "{error}"
+                );
+                assert!(!error.contains(&value), "{error}");
                 assert!(registration_result().is_err());
                 assert!(!scrub_text("failed peer response").contains("peer response"));
             }
         }
+    }
+
+    /// Review of #608: a refusal's location comes from the peer and is never
+    /// scrubbed again once the refusal is set. When one Consumer's id
+    /// repeats another's credential from the same, not yet admitted, batch,
+    /// the location is withheld rather than shown.
+    #[test]
+    fn refusal_locations_never_repeat_a_credential_of_the_refused_batch() {
+        enable();
+        const CREDENTIAL: &str = "Q7-mirrored-secret-8f2d-zz41";
+        let fragment = &CREDENTIAL[3..15];
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(CREDENTIAL);
+        let snapshot = |id: &str| {
+            serde_json::json!({
+                "consumers": [
+                    {"id": id, "namespace": "ferrum", "username": "short-holder",
+                        "credentials": {"keyauth": [{"key": "Q7!x9"}]}},
+                    {"id": "holder", "namespace": "ferrum", "username": "long-holder",
+                        "credentials": {"keyauth": [{"key": CREDENTIAL}]}}
+                ]
+            })
+            .to_string()
+        };
+        for id in [
+            CREDENTIAL.to_string(),
+            format!("team-{fragment}"),
+            encoded.clone(),
+        ] {
+            LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+            let error = crate::http_client::BackupSnapshot::from_body(&snapshot(&id))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shorter than 8 bytes"), "{error}");
+            assert!(error.contains(WITHHELD_LOCATION), "{error}");
+            // The refusal replaces every later display, unscrubbed.
+            let shown = scrub_text("later diagnostic");
+            for leaked in [CREDENTIAL, fragment, encoded.as_str(), id.as_str()] {
+                assert!(!error.contains(leaked), "{leaked} shown: {error}");
+                assert!(!shown.contains(leaked), "{leaked} shown: {shown}");
+            }
+            LOCAL.with(|local| assert!(local.borrow().entries.is_empty()));
+        }
+        // A location that repeats nothing is still named.
+        LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+        let error = crate::http_client::BackupSnapshot::from_body(&snapshot("plain-consumer"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("at Consumer ferrum/plain-consumer credentials.keyauth[0].key"),
+            "{error}"
+        );
+    }
+
+    /// Review of #608, round 2: a credential shorter than eight bytes is
+    /// compared in every spelling, so an id carrying it encoded is withheld;
+    /// and beside a value too large to spell, every location is withheld.
+    #[test]
+    fn refusal_locations_never_repeat_an_encoded_short_or_oversized_credential() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        enable();
+        const SHORT: &str = "Q7!x9";
+        let oversized = "Q7-secret".repeat(128 * 1024);
+        assert!(worst_case_cost(oversized.len()) > REGISTRATION_BUDGET);
+        let fragment = STANDARD.encode(&oversized.as_bytes()[9..33]);
+        let consumer = |id: &str, key: &str| {
+            serde_json::json!({"id": id, "namespace": "ferrum", "username": id,
+                "credentials": {"keyauth": [{"key": key}]}})
+        };
+        let refuse = |consumers: Vec<serde_json::Value>| {
+            LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+            let body = serde_json::json!({ "consumers": consumers }).to_string();
+            crate::http_client::BackupSnapshot::from_body(&body)
+                .unwrap_err()
+                .to_string()
+        };
+        // (id, the short key it encodes, the batch's other consumer)
+        let cases = vec![
+            (STANDARD.encode(SHORT), SHORT, None),
+            (URL_SAFE_NO_PAD.encode(SHORT), SHORT, None),
+            (hex::encode(SHORT), SHORT, None),
+            (hex::encode("k?z"), "k?z", None),
+            (hex::encode_upper("k?z"), "k?z", None),
+            // Mixed-case hex decodes to the same bytes.
+            ("6b3F7a".to_string(), "k?z", None),
+            (percent_encoded(SHORT), SHORT, None),
+            (
+                fragment,
+                SHORT,
+                Some(consumer("holder", oversized.as_str())),
+            ),
+        ];
+        assert_eq!(cases[0].0, "UTcheDk=");
+        assert_eq!(cases[4].0, "6B3F7A");
+        for (id, key, other) in cases {
+            let error = refuse(
+                [Some(consumer(id.as_str(), key)), other]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            );
+            assert!(error.contains("shorter than 8 bytes"), "{error}");
+            assert!(error.contains(WITHHELD_LOCATION), "{error}");
+            // The sticky refusal, returned again and shown in place of
+            // every later display.
+            let sticky = registration_result().unwrap_err().to_string();
+            let shown = scrub_text("later diagnostic");
+            for text in [&error, &sticky, &shown] {
+                assert!(!text.contains(id.as_str()), "{id} shown: {text}");
+                assert!(!text.contains(key), "{text}");
+            }
+            LOCAL.with(|local| assert!(local.borrow().entries.is_empty()));
+        }
+        // A location that repeats nothing is still named.
+        let error = refuse(vec![consumer("plain-consumer", SHORT)]);
+        assert!(
+            error.contains("at Consumer ferrum/plain-consumer credentials.keyauth[0].key"),
+            "{error}"
+        );
+    }
+
+    /// Review of #608: staging for a batch grows one admitted value at a
+    /// time, never sized by the candidate count, so a batch of a million
+    /// small values is refused on the budget without first allocating
+    /// bookkeeping for all of them.
+    #[test]
+    fn a_huge_batch_is_refused_before_its_staging_outgrows_the_budget() {
+        // What staging holds per value is covered by the overhead each
+        // value is charged, and every value is charged at least that.
+        assert!(
+            std::mem::size_of::<(&str, Entry)>() + 2 * std::mem::size_of::<&str>()
+                <= ENTRY_OVERHEAD_BYTES
+        );
+        assert!(worst_case_cost(MIN_SCRUB_LENGTH) >= ENTRY_OVERHEAD_BYTES);
+        assert_eq!(
+            staging_limit(REGISTRATION_BUDGET),
+            REGISTRATION_BUDGET / ENTRY_OVERHEAD_BYTES
+        );
+
+        let candidates: Vec<Candidate> = (0..1_000_000u32)
+            .map(|index| Candidate::bare(format!("Q7v{index:07}")))
+            .collect();
+        let mut registry = Registry {
+            used: REGISTRATION_BUDGET - 256 * 1024,
+            ..Registry::default()
+        };
+        let (result, peak) =
+            crate::alloc_meter::peak_bytes(|| registry.register("test", &candidates, None));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("registration budget exceeded"), "{error}");
+        // Sized by the candidate count, the staging alone would hold over
+        // 70 MiB here.
+        assert!(peak <= 2 * 1024 * 1024, "staging peaked at {peak} bytes");
+        assert!(registry.entries.is_empty());
+        assert_eq!(registry.used, REGISTRATION_BUDGET - 256 * 1024);
+    }
+
+    /// Leaves only the key-name heuristics flag (a builtin's `*key` field or
+    /// header map, a custom plugin's secret-looking field) may be ordinary
+    /// settings, such as a header name: too short to protect, they are not
+    /// registered and never refuse the run. Long ones are still protected.
+    #[test]
+    fn short_heuristic_plugin_leaves_are_not_registered_and_do_not_refuse() {
+        enable();
+        const LONG: &str = "Q7-heuristic-long-value-31c5";
+        let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "plugin_configs": [
+                {"id": "transform", "namespace": "ferrum", "plugin_name": "request_transformer",
+                    "scope": "global",
+                    "config": {"key": "X-Env", "extra_headers": {"x-tier": "gold"},
+                        "api_key": LONG, "routing_key": ""}},
+                {"id": "custom", "namespace": "ferrum", "plugin_name": "zq7_custom_plugin",
+                    "scope": "global", "config": {"secret": "abc"}},
+                {"id": "kafka", "namespace": "ferrum", "plugin_name": "kafka_logging",
+                    "scope": "global",
+                    "config": {"producer_config": {"security.protocol": "SSL"}}}
+            ]
+        }))
+        .unwrap();
+        crate::http_client::BackupSnapshot::from_body(&serde_json::to_string(&config).unwrap())
+            .unwrap();
+        registration_result().unwrap();
+        for short in ["X-Env", "gold", "abc", "SSL"] {
+            assert_eq!(
+                scrub_text(&format!("header {short}")),
+                format!("header {short}")
+            );
+        }
+        assert_eq!(scrub_text(LONG), REDACTION);
+        LOCAL.with(|local| assert_eq!(local.borrow().entries.len(), 1));
+
+        // A Kafka producer property named like a credential is declared, and
+        // a short one still refuses, by resource and field path.
+        LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+        let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "plugin_configs": [{"id": "kafka", "namespace": "ferrum",
+                "plugin_name": "kafka_logging", "scope": "global",
+                "config": {"producer_config": {"sasl.password": "pw-q7"}}}]
+        }))
+        .unwrap();
+        let error =
+            crate::http_client::BackupSnapshot::from_body(&serde_json::to_string(&config).unwrap())
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("PluginConfig ferrum/kafka config.producer_config.sasl.password"),
+            "{error}"
+        );
+        assert!(!error.contains("pw-q7"), "{error}");
     }
 
     #[test]
@@ -1358,33 +1844,60 @@ mod tests {
         assert_eq!(scrub_text("Q7-live-deduplicated-key"), REDACTION);
     }
 
+    /// Deterministic, incompressible test text: `length` base62 characters.
+    fn noise(seed: u64, length: usize) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ALPHABET[(state % 62) as usize] as char
+            })
+            .collect()
+    }
+
     #[test]
     fn cumulative_budget_refuses_the_next_source_instead_of_dropping_it() {
         enable();
-        // Each unique 8191-byte value costs 8 MiB of the 64 MiB budget.
-        for n in 0..8 {
-            let value = format!("Q7-budget-{n}-{}", "x".repeat(8179));
-            assert_eq!(value.len(), 8191);
-            if n % 3 == 0 {
-                crate::http_client::BackupSnapshot::from_body(
+        // Unique 16 KiB values through every source, until one is refused.
+        let mut admitted = 0usize;
+        let error = loop {
+            assert!(admitted < 1000, "the budget never ran out");
+            let value = format!("Q7-budget-{admitted}-{}", noise(admitted as u64, 16 * 1024));
+            let result: Result<(), String> = match admitted % 3 {
+                0 => crate::http_client::BackupSnapshot::from_body(
                     &serde_json::to_string(&live_config(&value)).unwrap(),
                 )
-                .unwrap();
-            } else if n % 3 == 1 {
-                crate::secrets::resolve_secrets(&mut live_config(&value), &Default::default())
-                    .unwrap();
-            } else {
-                let headers = std::collections::BTreeMap::from([(
-                    "X-Key".to_string(),
-                    crate::verify::HeaderValue::slot("slot"),
-                )]);
-                crate::verify::resolve_headers(
-                    &headers,
-                    &std::collections::BTreeMap::from([("slot".to_string(), value)]),
-                )
-                .unwrap();
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+                1 => crate::secrets::resolve_secrets(&mut live_config(&value), &Default::default())
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                _ => {
+                    let headers = std::collections::BTreeMap::from([(
+                        "X-Key".to_string(),
+                        crate::verify::HeaderValue::slot("slot"),
+                    )]);
+                    crate::verify::resolve_headers(
+                        &headers,
+                        &std::collections::BTreeMap::from([("slot".to_string(), value)]),
+                    )
+                    .map(|_| ())
+                    .map_err(|errors| errors.join("; "))
+                }
+            };
+            match result {
+                Ok(()) => admitted += 1,
+                Err(error) => break error,
             }
-        }
+        };
+        assert!(error.contains("registration budget exceeded"), "{error}");
+        assert!(!error.contains("Q7-budget"), "{error}");
+        // Charged what their indexes hold, not a flat 1 KiB per input byte
+        // (which admitted three of these).
+        assert!(admitted >= 16, "only {admitted} values fit");
         let error = register_sent_token("Q7-overflow-token")
             .unwrap_err()
             .to_string();
@@ -1395,8 +1908,54 @@ mod tests {
         assert_eq!(scrub_text("unregistered private peer data"), BUDGET_REFUSAL);
         LOCAL.with(|local| {
             let registry = local.borrow();
-            assert_eq!(registry.used, REGISTRATION_BUDGET);
-            assert_eq!(registry.entries.len(), 8);
+            assert!(registry.used <= REGISTRATION_BUDGET, "{}", registry.used);
+            assert_eq!(registry.entries.len(), admitted);
+        });
+    }
+
+    /// Issue #605: an ordinary run registers thousands of live credentials
+    /// and, even if every request minted its own token, over a thousand
+    /// real-size admin JWTs. All of it fits, and all of it stays protected.
+    #[test]
+    fn real_size_tokens_and_thousands_of_live_credentials_fit_the_budget() {
+        enable();
+        let consumers: Vec<serde_json::Value> = (0..2500u64)
+            .map(|n| {
+                serde_json::json!({
+                    "id": format!("consumer-{n}"), "namespace": "ferrum",
+                    "username": format!("client-{n}"),
+                    "credentials": {"keyauth": [{"key": noise(n + 1, 43)}]}
+                })
+            })
+            .collect();
+        let config: GatewayConfig =
+            serde_json::from_value(serde_json::json!({ "consumers": consumers })).unwrap();
+        crate::http_client::BackupSnapshot::from_body(&serde_json::to_string(&config).unwrap())
+            .unwrap();
+        let options = crate::jwt::JwtOptions {
+            audience: Some("ferrum-admin-api".to_string()),
+            ..Default::default()
+        }
+        .with_namespaces(["ferrum", "team-alpha", "team-beta"]);
+        let mut tokens = Vec::new();
+        for _ in 0..1200 {
+            let token =
+                crate::jwt::mint_jwt("test-secret-must-be-32-chars-long", &options).unwrap();
+            assert!(token.len() >= 284, "{}", token.len());
+            register_sent_token(&token).unwrap();
+            tokens.push(token);
+        }
+        registration_result().unwrap();
+        for token in [&tokens[0], &tokens[1199]] {
+            assert_eq!(scrub_text(token), REDACTION);
+        }
+        for key in [noise(1, 43), noise(2500, 43)] {
+            assert_eq!(scrub_text(&format!("key {key}")), "key [REDACTED]");
+        }
+        LOCAL.with(|local| {
+            let registry = local.borrow();
+            assert_eq!(registry.entries.len(), 2500 + 1200);
+            assert!(registry.used <= REGISTRATION_BUDGET);
         });
     }
 

@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use reqwest::{Client, Method, RequestBuilder};
@@ -167,6 +168,59 @@ pub struct AdminClient {
     /// Sticky and conservative: once the client has seen a cached view, every
     /// later prune decision in the same run is treated as potentially stale.
     saw_cached_backup: AtomicBool,
+    /// The bearer token this client sends, reused until it nears expiry (see
+    /// [`AdminClient::token_at`]). One token per lifetime keeps the number
+    /// of unique secrets the display sink has to protect small, however many
+    /// requests a run makes.
+    token_cache: Mutex<Option<CachedJwt>>,
+    /// Where the cached token's age is read from. The system clocks outside
+    /// tests.
+    clock: Clock,
+}
+
+/// A source of [`ClockReading`]s.
+type Clock = Arc<dyn Fn() -> ClockReading + Send + Sync>;
+
+/// Both clocks a cached admin token is checked against: the wall clock its
+/// claims are written in, and a monotonic clock that a wall-clock change
+/// cannot move.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClockReading {
+    /// Unix seconds.
+    pub(crate) wall: i64,
+    pub(crate) monotonic: Instant,
+}
+
+impl ClockReading {
+    pub(crate) fn now() -> Self {
+        Self {
+            wall: chrono::Utc::now().timestamp(),
+            monotonic: Instant::now(),
+        }
+    }
+}
+
+/// A minted token and the monotonic instant after which it is not reused.
+///
+/// The wall-clock bound alone is not enough: a clock set back after minting,
+/// but not back past `iat`, would keep the token in use after the gateway's
+/// clock has passed its `exp`. The monotonic deadline counts the real time
+/// since minting, which no clock change can extend.
+struct CachedJwt {
+    minted: jwt::MintedJwt,
+    reuse_until: Instant,
+}
+
+/// Mint a fresh admin token once the current one has less than this left
+/// to live (capped at half the configured TTL), so a request and its
+/// retries never carry a token that expires mid-flight.
+pub const JWT_REFRESH_MARGIN_SECS: i64 = 300;
+
+/// How long before its `exp` `minted` stops being reused: at most
+/// [`JWT_REFRESH_MARGIN_SECS`], and at most half its lifetime.
+fn refresh_margin(minted: &jwt::MintedJwt) -> i64 {
+    let lifetime = minted.expires_at.saturating_sub(minted.issued_at);
+    JWT_REFRESH_MARGIN_SECS.min(lifetime / 2)
 }
 
 impl AdminClient {
@@ -201,6 +255,8 @@ impl AdminClient {
             jwt_options: JwtOptions::from_env(env),
             max_retries: env.gateway_max_retries,
             saw_cached_backup: AtomicBool::new(false),
+            token_cache: Mutex::new(None),
+            clock: Arc::new(ClockReading::now),
         })
     }
 
@@ -232,6 +288,8 @@ impl AdminClient {
             jwt_options: JwtOptions::from_env(env),
             max_retries: env.gateway_max_retries,
             saw_cached_backup: AtomicBool::new(false),
+            token_cache: Mutex::new(None),
+            clock: Arc::new(ClockReading::now),
         };
         client.jwt_options.role = crate::config_export::VIEWER_ROLE.to_string();
         client.set_namespace_scope(namespaces);
@@ -359,6 +417,11 @@ impl AdminClient {
         S: AsRef<str>,
     {
         self.jwt_options = self.jwt_options.clone().with_namespaces(namespaces);
+        // A token minted under the old scope must never be sent again.
+        *self
+            .token_cache
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// True when this client's tokens carry an `ns` claim.
@@ -391,8 +454,74 @@ impl AdminClient {
         self.saw_cached_backup.load(Ordering::Relaxed)
     }
 
+    /// Read this client's tokens' age from `clock` instead of the system
+    /// clocks.
+    #[cfg(test)]
+    pub(crate) fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
     fn token(&self) -> crate::error::Result<String> {
-        jwt::mint_jwt(&self.jwt_secret, &self.jwt_options)
+        self.token_at((self.clock)())
+    }
+
+    /// The bearer token for a request made at `now`.
+    ///
+    /// One token is minted per client and reused until it has less than
+    /// [`JWT_REFRESH_MARGIN_SECS`] (at most half its configured TTL) left;
+    /// then, or when the clock reads earlier than its `iat`, a fresh one
+    /// replaces it. "Left" is measured on both clocks: by the wall clock
+    /// against the token's `exp`, and by the monotonic clock against the
+    /// same span counted from the mint, so setting the wall clock back
+    /// cannot keep a token in use past its real expiry. The gateway does not
+    /// track `jti`, so reuse within the lifetime is accepted. Minting per
+    /// request instead registered a new secret with the display sink for
+    /// every call, which exhausted the run's registration budget part-way
+    /// through an ordinary apply.
+    ///
+    /// Every use, reused or fresh, is registered with the display sink: the
+    /// registration of a known value is cheap, and a refused registration
+    /// stops every later request rather than only the next fresh mint.
+    pub(crate) fn token_at(&self, now: ClockReading) -> crate::error::Result<String> {
+        let mut cache = self
+            .token_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let reusable = cache
+            .as_ref()
+            .filter(|cached| {
+                let minted = &cached.minted;
+                let margin = refresh_margin(minted);
+                minted.issued_at <= now.wall
+                    && now.wall < minted.expires_at.saturating_sub(margin)
+                    && now.monotonic < cached.reuse_until
+            })
+            .map(|cached| cached.minted.token.clone());
+        if let Some(token) = reusable {
+            drop(cache);
+            crate::display::register_sent_token(&token)?;
+            return Ok(token);
+        }
+        let minted = jwt::mint_jwt_at(&self.jwt_secret, &self.jwt_options, now.wall)?;
+        // A peer's error text can reflect this request's Authorization
+        // header; displayed errors must have the token removed. Register
+        // before the token can be cached or sent.
+        crate::display::register_sent_token(&minted.token)?;
+        let token = minted.token.clone();
+        let reusable_for = minted
+            .expires_at
+            .saturating_sub(minted.issued_at)
+            .saturating_sub(refresh_margin(&minted));
+        // A span the monotonic clock cannot represent is not reused at all.
+        let reuse_until = u64::try_from(reusable_for)
+            .ok()
+            .and_then(|secs| now.monotonic.checked_add(Duration::from_secs(secs)))
+            .unwrap_or(now.monotonic);
+        *cache = Some(CachedJwt {
+            minted,
+            reuse_until,
+        });
+        Ok(token)
     }
 
     fn url(&self, path: &str) -> String {
@@ -408,21 +537,17 @@ impl AdminClient {
 
     /// The only way to build a request that carries the admin bearer token.
     ///
-    /// The token is minted, and attached, only after `url` is shown to be
-    /// `https://`, or cleartext `http://` to a literal loopback IP
-    /// ([`credential_target`]). Every admin call builds its request
-    /// through the returned [`Authorized`], so no call can send the token to a
-    /// remote host in cleartext, whatever was configured.
+    /// The token is attached only after `url` is shown to be `https://`, or
+    /// cleartext `http://` to a literal loopback IP ([`credential_target`]).
+    /// Every admin call builds its request through the returned
+    /// [`Authorized`], so no call can send the token to a remote host in
+    /// cleartext, whatever was configured. [`AdminClient::send_with_retry`]
+    /// supplies the token for each attempt.
     fn authorize(&self, target: String) -> crate::error::Result<Authorized<'_>> {
         let parsed = credential_target(&target)?;
-        let token = self.token()?;
-        // A peer's error text can reflect this request's Authorization
-        // header; displayed errors must have the token removed.
-        crate::display::register_sent_token(&token)?;
         Ok(Authorized {
             client: &self.client,
             url: parsed,
-            token,
         })
     }
 
@@ -437,13 +562,18 @@ impl AdminClient {
     /// Request timeouts are still NOT retried — their state is ambiguous (the
     /// write may have applied). The higher-level workflow re-runs safely
     /// because `apply_incremental` re-diffs against live state.
+    ///
+    /// `build` is handed the bearer token for each attempt, taken from
+    /// [`AdminClient::token`] just before that attempt is sent: retry delays
+    /// can outlast the margin a token had left when the first attempt went
+    /// out, so a retry never reuses the first attempt's token unchecked.
     async fn send_with_retry<F>(
         &self,
         kind: RequestKind,
         build: F,
     ) -> crate::error::Result<RawResponse>
     where
-        F: Fn() -> RequestBuilder,
+        F: Fn(&str) -> RequestBuilder,
     {
         let max_attempts = self.max_retries.saturating_add(1);
         let mut last_error: Option<String> = None;
@@ -453,7 +583,9 @@ impl AdminClient {
         let mut answered_before = false;
 
         for attempt in 1..=max_attempts {
-            match build().send().await {
+            // Registered with the display sink by `token`.
+            let token = self.token()?;
+            match build(&token).send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let data_source = header_string(&resp, "x-data-source");
@@ -611,7 +743,9 @@ impl AdminClient {
     pub async fn get_health(&self) -> crate::error::Result<HealthStatus> {
         let target = self.authorized("/health")?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || target.request(Method::GET))
+            .send_with_retry(RequestKind::Read, |bearer| {
+                target.request(Method::GET, bearer)
+            })
             .await?;
         self.check(&resp, RequestKind::Read)?;
         serde_json::from_str::<HealthStatus>(&resp.body)
@@ -654,7 +788,9 @@ impl AdminClient {
     pub async fn get_cluster_body(&self) -> crate::error::Result<String> {
         let target = self.authorized("/cluster")?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || target.request(Method::GET))
+            .send_with_retry(RequestKind::Read, |bearer| {
+                target.request(Method::GET, bearer)
+            })
             .await?;
         self.check(&resp, RequestKind::Read)?;
         Ok(resp.body)
@@ -669,9 +805,9 @@ impl AdminClient {
     ) -> crate::error::Result<BackupSnapshot> {
         let target = self.authorized("/backup")?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || {
+            .send_with_retry(RequestKind::Read, |bearer| {
                 target
-                    .request(Method::GET)
+                    .request(Method::GET, bearer)
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
@@ -725,9 +861,9 @@ impl AdminClient {
     ) -> crate::error::Result<ConfigExport> {
         let target = self.authorize(endpoint.as_str().to_string())?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || {
+            .send_with_retry(RequestKind::Read, |bearer| {
                 target
-                    .request(Method::GET)
+                    .request(Method::GET, bearer)
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
@@ -767,9 +903,9 @@ impl AdminClient {
         let path = format!("/consumers/{id}/verification");
         let target = self.authorized(&path)?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || {
+            .send_with_retry(RequestKind::Read, |bearer| {
                 target
-                    .request(Method::GET)
+                    .request(Method::GET, bearer)
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
@@ -810,9 +946,9 @@ impl AdminClient {
     ) -> crate::error::Result<BackupSnapshot> {
         let target = self.authorized("/backup?conditional=true")?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || {
+            .send_with_retry(RequestKind::Read, |bearer| {
                 target
-                    .request(Method::GET)
+                    .request(Method::GET, bearer)
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
@@ -899,7 +1035,9 @@ impl AdminClient {
             let path = format!("/namespaces?offset={offset}&limit={LIST_PAGE_LIMIT}");
             let target = self.authorized(&path)?;
             let resp = self
-                .send_with_retry(RequestKind::Read, || target.request(Method::GET))
+                .send_with_retry(RequestKind::Read, |bearer| {
+                    target.request(Method::GET, bearer)
+                })
                 .await?;
             self.check(&resp, RequestKind::Read)?;
 
@@ -950,9 +1088,9 @@ impl AdminClient {
         };
         let target = self.authorized(path)?;
         let resp = self
-            .send_with_retry(RequestKind::Restore, || {
+            .send_with_retry(RequestKind::Restore, |bearer| {
                 target
-                    .request(Method::POST)
+                    .request(Method::POST, bearer)
                     .header("X-Ferrum-Namespace", namespace)
                     .header("If-Match", token.namespace_token.as_str())
                     .json(&body)
@@ -1002,9 +1140,9 @@ impl AdminClient {
     ) -> crate::error::Result<Option<BatchCreated>> {
         let target = self.authorized("/batch")?;
         let resp = self
-            .send_with_retry(RequestKind::NonIdempotentMutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, |bearer| {
                 target
-                    .request(Method::POST)
+                    .request(Method::POST, bearer)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(batch)
             })
@@ -1066,9 +1204,9 @@ impl AdminClient {
     pub async fn create_proxy(&self, proxy: &Proxy, namespace: &str) -> crate::error::Result<()> {
         let target = self.authorized("/proxies")?;
         let resp = self
-            .send_with_retry(RequestKind::NonIdempotentMutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, |bearer| {
                 target
-                    .request(Method::POST)
+                    .request(Method::POST, bearer)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(proxy)
             })
@@ -1084,9 +1222,9 @@ impl AdminClient {
     ) -> crate::error::Result<()> {
         let target = self.authorized("/consumers")?;
         let resp = self
-            .send_with_retry(RequestKind::NonIdempotentMutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, |bearer| {
                 target
-                    .request(Method::POST)
+                    .request(Method::POST, bearer)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(consumer)
             })
@@ -1103,9 +1241,9 @@ impl AdminClient {
     ) -> crate::error::Result<()> {
         let target = self.authorized("/upstreams")?;
         let resp = self
-            .send_with_retry(RequestKind::NonIdempotentMutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, |bearer| {
                 target
-                    .request(Method::POST)
+                    .request(Method::POST, bearer)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(upstream)
             })
@@ -1121,9 +1259,9 @@ impl AdminClient {
     ) -> crate::error::Result<()> {
         let target = self.authorized("/plugins/config")?;
         let resp = self
-            .send_with_retry(RequestKind::NonIdempotentMutation, || {
+            .send_with_retry(RequestKind::NonIdempotentMutation, |bearer| {
                 target
-                    .request(Method::POST)
+                    .request(Method::POST, bearer)
                     .header("X-Ferrum-Namespace", namespace)
                     .json(pc)
             })
@@ -1159,9 +1297,9 @@ impl AdminClient {
         let path = resource_path(kind, id)?;
         let target = self.authorized(&path)?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || {
+            .send_with_retry(RequestKind::Read, |bearer| {
                 target
-                    .request(Method::GET)
+                    .request(Method::GET, bearer)
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
@@ -1235,9 +1373,9 @@ impl AdminClient {
         }
         let target = self.authorized(&path)?;
         let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
+            .send_with_retry(RequestKind::Mutation, |bearer| {
                 target
-                    .request(Method::PUT)
+                    .request(Method::PUT, bearer)
                     .header("X-Ferrum-Namespace", namespace)
                     .header("If-Match", etag)
                     .json(resource)
@@ -1303,9 +1441,9 @@ impl AdminClient {
         let path = format!("{}?offset=0&limit=1", collection_path(kind)?);
         let target = self.authorized(&path)?;
         let resp = self
-            .send_with_retry(RequestKind::Read, || {
+            .send_with_retry(RequestKind::Read, |bearer| {
                 target
-                    .request(Method::GET)
+                    .request(Method::GET, bearer)
                     .header("X-Ferrum-Namespace", namespace)
             })
             .await?;
@@ -1372,9 +1510,9 @@ impl AdminClient {
     ) -> crate::error::Result<DeleteOutcome> {
         let target = self.authorized(path)?;
         let resp = self
-            .send_with_retry(RequestKind::Mutation, || {
+            .send_with_retry(RequestKind::Mutation, |bearer| {
                 let request = target
-                    .request(Method::DELETE)
+                    .request(Method::DELETE, bearer)
                     .header("X-Ferrum-Namespace", namespace);
                 match if_match {
                     Some(etag) => request.header("If-Match", etag),
@@ -1418,21 +1556,20 @@ impl AdminClient {
     }
 }
 
-/// A request target the admin bearer token may be sent to, with that token.
+/// A request target the admin bearer token may be sent to.
 ///
 /// Only [`AdminClient::authorize`] builds one, after checking the transport,
 /// so every request that carries the token went through that check.
 struct Authorized<'a> {
     client: &'a Client,
     url: url::Url,
-    token: String,
 }
 
 impl Authorized<'_> {
-    fn request(&self, method: Method) -> RequestBuilder {
+    fn request(&self, method: Method, token: &str) -> RequestBuilder {
         self.client
             .request(method, self.url.clone())
-            .bearer_auth(&self.token)
+            .bearer_auth(token)
     }
 }
 
@@ -3804,6 +3941,227 @@ mod bounded_error_message_tests {
         assert_eq!(message, crate::display::DISPLAY_WITHHELD);
     }
 
+    /// A reading of both clocks `secs` seconds after `(wall, monotonic)`.
+    fn clock_after(wall: i64, monotonic: std::time::Instant, secs: i64) -> super::ClockReading {
+        super::ClockReading {
+            wall: wall + secs,
+            monotonic: monotonic + std::time::Duration::from_secs(secs.unsigned_abs()),
+        }
+    }
+
+    /// The `exp` claim of an admin token.
+    fn token_expiry(token: &str) -> i64 {
+        use base64::Engine;
+        let payload = token.split('.').nth(1).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        claims["exp"].as_i64().unwrap()
+    }
+
+    /// Issue #605: a client mints one admin token and reuses it for every
+    /// request until it nears expiry, so a long run registers a handful of
+    /// tokens with the display sink instead of one per request.
+    #[test]
+    fn one_admin_token_serves_every_request_until_it_nears_expiry() {
+        crate::display::enable_display_scrubbing_on_this_thread();
+        let env = crate::config::EnvConfig {
+            gateway_url: Some("http://127.0.0.1:9".into()),
+            admin_jwt_secret: Some("test-secret-must-be-32-chars-long".into()),
+            admin_jwt_ttl_secs: 3600,
+            ..Default::default()
+        };
+        let mut client = super::AdminClient::new_scoped(&env, ["ferrum"]).unwrap();
+        let first = client.token().unwrap();
+        for path in ["/backup", "/consumers/c1", "/health"]
+            .iter()
+            .cycle()
+            .take(1500)
+        {
+            client.authorized(path).unwrap();
+            assert_eq!(client.token().unwrap(), first);
+        }
+        crate::display::registration_result().unwrap();
+        assert_eq!(crate::display::scrub_text(&first), "[REDACTED]");
+
+        // Driven by explicit clocks: reused until less than the refresh
+        // margin is left, then replaced.
+        let now = 4_000_000_000;
+        let t0 = std::time::Instant::now();
+        let at = |secs: i64| clock_after(now, t0, secs);
+        let fresh = client.token_at(at(0)).unwrap();
+        assert_ne!(fresh, first, "an expired token must be replaced");
+        assert_eq!(client.token_at(at(1)).unwrap(), fresh);
+        let refresh_after = 3600 - super::JWT_REFRESH_MARGIN_SECS;
+        assert_eq!(client.token_at(at(refresh_after - 1)).unwrap(), fresh);
+        let renewed = client.token_at(at(refresh_after)).unwrap();
+        assert_ne!(renewed, fresh);
+        // A wall clock that reads earlier than the token's `iat` never
+        // reuses it, though the monotonic clock moved on.
+        let mut back = at(refresh_after + 1);
+        back.wall = now + refresh_after - 10;
+        assert_ne!(client.token_at(back).unwrap(), renewed);
+        // A short TTL refreshes at half its lifetime.
+        let short = crate::config::EnvConfig {
+            admin_jwt_ttl_secs: 60,
+            ..env.clone()
+        };
+        let short = super::AdminClient::new_scoped(&short, ["ferrum"]).unwrap();
+        let token = short.token_at(at(0)).unwrap();
+        assert_eq!(short.token_at(at(29)).unwrap(), token);
+        assert_ne!(short.token_at(at(30)).unwrap(), token);
+
+        // A token minted for the old namespace scope is never sent again.
+        let later = at(refresh_after + 2);
+        let scoped = client.token_at(later).unwrap();
+        client.set_namespace_scope(["ferrum", "team-alpha"]);
+        assert_ne!(client.token_at(later).unwrap(), scoped);
+        crate::display::registration_result().unwrap();
+    }
+
+    /// Review of #608: a wall clock set back after minting, but not back
+    /// past `iat`, must not stretch a token's reuse past its real expiry.
+    /// The monotonic clock still counts the time since the mint.
+    #[test]
+    fn a_wall_clock_set_back_above_iat_cannot_extend_token_reuse() {
+        crate::display::enable_display_scrubbing_on_this_thread();
+        let env = crate::config::EnvConfig {
+            gateway_url: Some("http://127.0.0.1:9".into()),
+            admin_jwt_secret: Some("test-secret-must-be-32-chars-long".into()),
+            admin_jwt_ttl_secs: 3600,
+            ..Default::default()
+        };
+        let client = super::AdminClient::new_scoped(&env, ["ferrum"]).unwrap();
+        let issued = 4_000_000_000;
+        let t0 = std::time::Instant::now();
+        let token = client.token_at(clock_after(issued, t0, 0)).unwrap();
+        let reuse_for = 3600 - super::JWT_REFRESH_MARGIN_SECS;
+        // Both clocks agree the token is still inside its reuse window.
+        assert_eq!(
+            client
+                .token_at(clock_after(issued, t0, reuse_for - 1))
+                .unwrap(),
+            token
+        );
+        // 3,601 real seconds after the mint the gateway's clock is past
+        // `exp`, but the local wall clock was set back 600 s and reads only
+        // `iat + 3001`, inside the wall-clock window.
+        let mut rolled_back = clock_after(issued, t0, 3601);
+        rolled_back.wall = issued + 3001;
+        assert!(rolled_back.wall < token_expiry(&token) - super::JWT_REFRESH_MARGIN_SECS);
+        let renewed = client.token_at(rolled_back).unwrap();
+        assert_ne!(renewed, token, "a token past its real expiry was reused");
+        assert_eq!(token_expiry(&renewed), issued + 3001 + 3600);
+        // The fresh token is reused from its own mint.
+        let mut next = clock_after(issued, t0, 3602);
+        next.wall = issued + 3002;
+        assert_eq!(client.token_at(next).unwrap(), renewed);
+        crate::display::registration_result().unwrap();
+    }
+
+    /// Review of #608: retry delays can outlast what the first attempt's
+    /// token had left. Every attempt takes a token that is valid when it is
+    /// sent. TTL 120 (margin 60): a token reused at age 59 has 61 s left,
+    /// and three 30 s `Retry-After` delays would send it at age 149.
+    #[tokio::test]
+    async fn every_retry_attempt_carries_a_token_valid_when_it_is_sent() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        crate::display::enable_display_scrubbing_on_this_thread();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let env = crate::config::EnvConfig {
+            gateway_url: Some(format!("http://{address}")),
+            admin_jwt_secret: Some("test-secret-must-be-32-chars-long".into()),
+            admin_jwt_ttl_secs: 120,
+            gateway_max_retries: 3,
+            ..Default::default()
+        };
+        let issued = 4_000_000_000;
+        let t0 = std::time::Instant::now();
+        // Seconds since `issued` on both clocks. The stub advances it by the
+        // 30 s each `Retry-After` stands for, and answers `Retry-After: 0`
+        // so the test does not wait.
+        let elapsed = Arc::new(AtomicI64::new(0));
+        let mut client = super::AdminClient::new_scoped(&env, ["ferrum"]).unwrap();
+        let clock = Arc::clone(&elapsed);
+        client.set_clock(Arc::new(move || {
+            clock_after(issued, t0, clock.load(Ordering::SeqCst))
+        }));
+        let first = client.token().unwrap();
+        elapsed.store(59, Ordering::SeqCst);
+
+        let sent: Arc<Mutex<Vec<(String, i64)>>> = Arc::default();
+        let server = {
+            let elapsed = Arc::clone(&elapsed);
+            let sent = Arc::clone(&sent);
+            tokio::spawn(async move {
+                for attempt in 1..=4 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0, "request ended early");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let token = request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("authorization")
+                                .then(|| value.trim().strip_prefix("Bearer ").map(str::to_string))?
+                        })
+                        .unwrap();
+                    let now = issued + elapsed.fetch_add(30, Ordering::SeqCst);
+                    sent.lock().unwrap().push((token, now));
+                    let response = if attempt < 4 {
+                        let body = r#"{"error":"busy"}"#;
+                        format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nretry-after: 0\r\n\
+                             content-type: application/json\r\ncontent-length: {}\r\n\
+                             connection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}"
+                            .to_string()
+                    };
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    let _ = socket.shutdown().await;
+                }
+            })
+        };
+
+        client.get_cluster_body().await.unwrap();
+        server.await.unwrap();
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 4, "one request and three retries");
+        assert_eq!(
+            sent[0].0, first,
+            "the first attempt reuses the cached token"
+        );
+        for (token, now) in sent.iter() {
+            let left = token_expiry(token) - now;
+            assert!(
+                left > 60,
+                "a token with {left} s left was sent at {}",
+                now - issued
+            );
+        }
+        assert!(
+            sent.iter().skip(1).any(|(token, _)| *token != first),
+            "a retry reused the first attempt's token"
+        );
+        crate::display::registration_result().unwrap();
+    }
+
     #[test]
     fn a_minted_admin_token_is_scrubbed_however_it_is_reflected() {
         crate::display::enable_display_scrubbing_on_this_thread();
@@ -3816,7 +4174,7 @@ mod bounded_error_message_tests {
             ["ferrum"],
         )
         .unwrap();
-        let token = client.authorized("/health").unwrap().token;
+        let token = client.token().unwrap();
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
         for (echoed, leaked) in [
@@ -3979,7 +4337,7 @@ mod bounded_error_message_tests {
 
     #[test]
     fn reflected_bearer_credentials_are_redacted_without_registration() {
-        // Minted per request (the admin JWT) or read from the environment
+        // Minted by the client (the admin JWT) or read from the environment
         // (GitHub tokens): caught by shape, not by a registry entry.
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ6cTcifQ.c2lnbmF0dXJlLXpxNw";
         let github = "ghs_zq7AAAABBBBCCCCDDDDEEEE";

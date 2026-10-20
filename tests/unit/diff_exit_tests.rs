@@ -1989,5 +1989,35 @@ fn diff_refuses_short_live_credentials_without_displaying_them() {
     let shown = format!("{}{}", stdout(&output), stderr(&output));
     assert_eq!(output.status.code(), Some(1), "{shown}");
     assert!(shown.contains("shorter than 8 bytes"), "{shown}");
+    // The refusal names the resource and field path, never the value.
+    assert!(
+        shown.contains("Consumer ferrum/live-consumer credentials.keyauth[0].key"),
+        "{shown}"
+    );
     assert!(!shown.contains("Q7short"), "{shown}");
+}
+
+/// Issue #605: a short live value that only the key-name heuristics flag (a
+/// `request_transformer` header name under `key`) is an ordinary setting,
+/// not a credential. It does not refuse the run.
+#[test]
+fn diff_tolerates_short_live_settings_only_heuristics_flag() {
+    const KEY: &str = "Q7-live-consumer-key-0605";
+    let live = serde_json::json!({"proxies": [], "consumers": [{
+        "id": "live-consumer", "namespace": "ferrum", "username": "client",
+        "credentials": {"keyauth": [{"key": KEY}]}
+    }], "upstreams": [], "plugin_configs": [{
+        "id": "transform", "namespace": "ferrum", "plugin_name": "request_transformer",
+        "scope": "global", "config": {"key": "X-Env", "extra_headers": {"x-tier": "gold"}}
+    }]})
+    .to_string();
+    let repo = Repo::new(
+        &[("resources/ferrum/proxies/app.yaml", FERRUM_PROXY)],
+        vec![("ferrum".to_string(), live)],
+    );
+    let output = repo.run(&["diff"]);
+    let shown = format!("{}{}", stdout(&output), stderr(&output));
+    assert_eq!(output.status.code(), Some(0), "{shown}");
+    assert!(!shown.contains("shorter than 8 bytes"), "{shown}");
+    assert!(!shown.contains(KEY), "{shown}");
 }

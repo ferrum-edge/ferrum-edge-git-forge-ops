@@ -45,14 +45,16 @@
 //! diagnostics stay fully readable — which is the whole point of scrubbing
 //! rather than suppressing.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use base64::Engine;
 
 use crate::config::GatewayConfig;
 
 use super::placeholder::parse_placeholder;
-use super::plugin_config::{sensitive_string_paths, value_at, ConfigPathComponent};
+use super::plugin_config::{
+    render_config_path, rule_declared_paths, sensitive_string_paths, value_at, ConfigPathComponent,
+};
 use super::resolver::{
     consumer_credential_slot, is_identity_credential_leaf, plugin_config_slot, ResolveReport,
     SlotStatus,
@@ -216,7 +218,7 @@ impl SecretScrubber {
     /// placeholder document paired with a read-only allocation report.
     /// No bundle values or unused slots are retained in the report.
     pub fn from_gateway_config_with_report(config: &GatewayConfig, report: &ResolveReport) -> Self {
-        let mut scrubber = Self::from_values(gateway_secret_values(config, report, false));
+        let mut scrubber = Self::from_values(gateway_secret_values(config, report));
         // The document with every secret removed. Serialization failure is not
         // worth failing validation over: an empty `public_text` only makes the
         // fragment scan stricter, never laxer.
@@ -401,19 +403,108 @@ impl SecretScrubber {
     }
 }
 
-/// Collect raw leaves without building encodings or fragment indexes. Live
-/// credentials have no repository-placeholder exemption, including empty leaves.
+/// Collect raw leaves without building encodings or fragment indexes, under
+/// the declared-manifest policy: unresolved placeholders and empty leaves are
+/// repository data, not secrets.
 pub(crate) fn gateway_secret_values(
     config: &GatewayConfig,
     report: &ResolveReport,
-    live: bool,
 ) -> BTreeSet<String> {
-    let mut values = BTreeSet::new();
-    collect_consumer_secrets(config, &mut values, live);
-    collect_plugin_config_secrets(config, &mut values, live);
-    collect_service_discovery_secrets(config, &mut values, live);
+    let mut values = ManifestValues::default();
+    collect_consumer_secrets(config, &mut values);
+    collect_plugin_config_secrets(config, &mut values);
+    collect_service_discovery_secrets(config, &mut values);
+    let mut values = values.0;
     collect_resolved_secrets(config, report, &mut values);
     values
+}
+
+/// One secret leaf of a live (or outgoing) document, for display admission.
+pub(crate) struct LiveSecretLeaf {
+    pub value: String,
+    /// The leaf is a Consumer credential, a plugin-config field a schema rule
+    /// declares (a secret or an endpoint), or a modeled service-discovery
+    /// secret: it must be protectable, or the run is refused. `false` when
+    /// only the key-name heuristics flag it (`*key`, a header map, a Kafka
+    /// producer property not named like a credential, a custom plugin's
+    /// field): such a leaf may be an ordinary setting, such as a header name.
+    pub required: bool,
+    /// `<Kind> <namespace>/<id> <field path>`, sanitized for display; never
+    /// the value. For a value found at several leaves, a required one.
+    pub location: String,
+}
+
+/// Every secret leaf of a live document, one per distinct value. Live
+/// evidence has no repository-placeholder exemption: a leaf that looks like a
+/// placeholder is a real credential here. Empty leaves are returned too;
+/// callers decide what to admit.
+pub(crate) fn live_secret_leaves(config: &GatewayConfig) -> Vec<LiveSecretLeaf> {
+    let mut leaves = LiveLeaves::default();
+    collect_consumer_secrets(config, &mut leaves);
+    collect_plugin_config_secrets(config, &mut leaves);
+    collect_service_discovery_secrets(config, &mut leaves);
+    leaves
+        .0
+        .into_iter()
+        .map(|(value, (required, location))| LiveSecretLeaf {
+            value,
+            required,
+            location,
+        })
+        .collect()
+}
+
+/// Where the collectors deliver each secret leaf they find.
+trait LeafSink {
+    /// `required` as in [`LiveSecretLeaf::required`]. `location` renders the
+    /// leaf's resource and field path; it is called only when needed.
+    fn leaf(&mut self, text: &str, required: bool, location: &dyn Fn() -> String);
+}
+
+/// Repository and resolved documents: skip what is repository data rather
+/// than secret material, a well-formed placeholder or an empty string.
+#[derive(Default)]
+struct ManifestValues(BTreeSet<String>);
+
+impl LeafSink for ManifestValues {
+    fn leaf(&mut self, text: &str, _required: bool, _location: &dyn Fn() -> String) {
+        if text.is_empty() || matches!(parse_placeholder(text), Some(Ok(_))) {
+            return;
+        }
+        self.0.insert(text.to_string());
+    }
+}
+
+/// Live documents: every leaf, deduplicated by value, keeping a required
+/// location over a heuristic one.
+#[derive(Default)]
+struct LiveLeaves(BTreeMap<String, (bool, String)>);
+
+impl LeafSink for LiveLeaves {
+    fn leaf(&mut self, text: &str, required: bool, location: &dyn Fn() -> String) {
+        match self.0.get_mut(text) {
+            Some((known_required, known_location)) => {
+                if required && !*known_required {
+                    *known_required = true;
+                    *known_location = location();
+                }
+            }
+            None => {
+                self.0.insert(text.to_string(), (required, location()));
+            }
+        }
+    }
+}
+
+/// `<Kind> <namespace>/<id> <field path>`, with the gateway-supplied parts
+/// sanitized. Never includes a value.
+fn leaf_location(kind: &str, namespace: &str, id: &str, path: &str) -> String {
+    format!(
+        "{kind} {}/{} {}",
+        crate::diagnostics::sanitize(namespace),
+        crate::diagnostics::sanitize(id),
+        crate::diagnostics::sanitize(path)
+    )
 }
 
 fn collect_resolved_secrets(
@@ -568,62 +659,101 @@ pub(crate) fn yaml_single_quoted(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn collect_consumer_secrets(config: &GatewayConfig, out: &mut BTreeSet<String>, live: bool) {
+fn collect_consumer_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
     for consumer in &config.consumers {
         for (credential_type, value) in &consumer.credentials {
-            collect_credential_leaves(credential_type, value, None, out, live);
+            let mut path = format!("credentials.{credential_type}");
+            collect_credential_leaves(
+                &ConsumerLeaf {
+                    namespace: &consumer.namespace,
+                    id: &consumer.id,
+                    credential_type,
+                },
+                value,
+                None,
+                &mut path,
+                out,
+            );
         }
     }
 }
 
+struct ConsumerLeaf<'a> {
+    namespace: &'a str,
+    id: &'a str,
+    credential_type: &'a str,
+}
+
 fn collect_credential_leaves(
-    credential_type: &str,
+    consumer: &ConsumerLeaf<'_>,
     value: &serde_json::Value,
     leaf_key: Option<&str>,
-    out: &mut BTreeSet<String>,
-    live: bool,
+    path: &mut String,
+    out: &mut dyn LeafSink,
 ) {
     match value {
         serde_json::Value::String(text) => {
-            if is_identity_credential_leaf(credential_type, leaf_key) {
+            if is_identity_credential_leaf(consumer.credential_type, leaf_key) {
                 return;
             }
-            record_secret(text, out, live);
+            let rendered = path.as_str();
+            out.leaf(text, true, &|| {
+                leaf_location("Consumer", consumer.namespace, consumer.id, rendered)
+            });
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map {
-                collect_credential_leaves(credential_type, child, Some(key.as_str()), out, live);
+                let length = path.len();
+                path.push('.');
+                path.push_str(key);
+                collect_credential_leaves(consumer, child, Some(key.as_str()), path, out);
+                path.truncate(length);
             }
         }
         serde_json::Value::Array(items) => {
-            for child in items {
+            for (index, child) in items.iter().enumerate() {
+                let length = path.len();
+                path.push_str(&format!("[{index}]"));
                 // An array index does not change which field a leaf is, so
                 // the enclosing key (`keyauth` → `key`) carries through.
-                collect_credential_leaves(credential_type, child, leaf_key, out, live);
+                collect_credential_leaves(consumer, child, leaf_key, path, out);
+                path.truncate(length);
             }
         }
         _ => {}
     }
 }
 
-fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut BTreeSet<String>, live: bool) {
+fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
     for plugin in &config.plugin_configs {
+        let declared = rule_declared_paths(&plugin.plugin_name, &plugin.config);
         for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
             if let Some(serde_json::Value::String(text)) = value_at(&plugin.config, &path) {
-                record_secret(text, out, live);
+                out.leaf(text, declared.contains(&path), &|| {
+                    leaf_location(
+                        "PluginConfig",
+                        &plugin.namespace,
+                        &plugin.id,
+                        &format!("config.{}", render_config_path(&path)),
+                    )
+                });
             }
         }
     }
 }
 
-fn collect_service_discovery_secrets(
-    config: &GatewayConfig,
-    out: &mut BTreeSet<String>,
-    live: bool,
-) {
+fn collect_service_discovery_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
     for upstream in &config.upstreams {
-        for (_field, value) in super::service_discovery::present_secrets(upstream) {
-            record_secret(value, out, live);
+        let location = |path: &str| {
+            leaf_location(
+                "Upstream",
+                &upstream.namespace,
+                &upstream.id,
+                &format!("service_discovery.{path}"),
+            )
+        };
+        for (field, value) in super::service_discovery::present_secrets(upstream) {
+            out.leaf(value, true, &|| location(&field.path.join(".")));
         }
         // URL credentials in the Consul address are refused by the audit, but
         // `validate` runs without it, so its validator output is scrubbed of
@@ -640,10 +770,11 @@ fn collect_service_discovery_secrets(
             .as_ref()
             .and_then(super::service_discovery::consul_address_userinfo)
         {
+            let address = || location("consul.address");
             if let Some((_, password)) = userinfo.split_once(':') {
-                record_secret(password, out, live);
+                out.leaf(password, true, &address);
             }
-            record_secret(&userinfo, out, live);
+            out.leaf(&userinfo, true, &address);
             // Detection ignores surrounding whitespace and embedded tabs and
             // line breaks, so the credential as written may differ from the
             // normalized userinfo. Record the address itself then: its raw
@@ -651,20 +782,10 @@ fn collect_service_discovery_secrets(
             // characters make `scrub_streams` withhold the output rather than
             // miss them.
             if super::service_discovery::address_is_normalized(&consul.address) {
-                record_secret(&consul.address, out, live);
+                out.leaf(&consul.address, true, &address);
             }
         }
     }
-}
-
-/// Keep a leaf unless it is repository data rather than secret material: a
-/// well-formed placeholder or empty string. Live evidence has neither exemption;
-/// its raw leaves must all pass display admission, even placeholder-shaped ones.
-fn record_secret(text: &str, out: &mut BTreeSet<String>, live: bool) {
-    if !live && (text.is_empty() || matches!(parse_placeholder(text), Some(Ok(_)))) {
-        return;
-    }
-    out.insert(text.to_string());
 }
 
 /// Percent-encode every byte outside RFC 3986's unreserved set.
