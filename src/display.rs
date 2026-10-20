@@ -324,11 +324,13 @@ const WITHHELD_LOCATION: &str =
     "a resource whose id or field path repeats a credential (location withheld)";
 
 /// Does `location`, or a decoded view of it, repeat any value in `batch`:
-/// an eight-byte run of it or of any of its [`spellings`], or the whole of
-/// a value shorter than that?
+/// an eight-byte run of any of its [`spellings`] (or its hex), or the whole
+/// of a spelling shorter than that? A short value is compared in every
+/// spelling, so a location carrying `Q7!x9` as `UTcheDk=` is caught.
 ///
 /// Spellings are built only for values that could be admitted at all; a
-/// larger one is compared as written. A location is short (it is
+/// location is withheld outright beside a larger one, whose encodings are
+/// never built and so cannot be ruled out. A location is short (it is
 /// sanitized and bounded), so its runs are collected once and each value is
 /// scanned against them.
 fn repeats_a_candidate(location: &str, batch: &[Candidate]) -> bool {
@@ -342,25 +344,29 @@ fn repeats_a_candidate(location: &str, batch: &[Candidate]) -> bool {
         .flat_map(|view| view.windows(FRAGMENT_SCAN_LENGTH))
         .filter_map(|run| Window::try_from(run).ok())
         .collect();
-    let shares_a_run = |text: &str| {
-        text.as_bytes()
+    let repeats = |spelling: &str| {
+        if spelling.len() < FRAGMENT_SCAN_LENGTH {
+            return views
+                .iter()
+                .any(|view| contains_bytes(view, spelling.as_bytes()));
+        }
+        spelling
+            .as_bytes()
             .windows(FRAGMENT_SCAN_LENGTH)
             .any(|run| Window::try_from(run).is_ok_and(|run| runs.contains(&run)))
     };
     batch.iter().any(|candidate| {
         let value = candidate.value.as_str();
-        if value.len() < FRAGMENT_SCAN_LENGTH {
-            return !value.is_empty()
-                && views
-                    .iter()
-                    .any(|view| contains_bytes(view, value.as_bytes()));
-        }
         if worst_case_cost(value.len()) > REGISTRATION_BUDGET {
-            return shares_a_run(value);
+            return true;
         }
-        spellings(value)
-            .iter()
-            .any(|spelling| shares_a_run(spelling.as_str()))
+        let hex = hex::encode(value);
+        let mut all = spellings(value);
+        all.push(hex.to_ascii_uppercase());
+        all.push(hex);
+        all.iter()
+            .filter(|spelling| !spelling.is_empty())
+            .any(|spelling| repeats(spelling))
     })
 }
 
@@ -1599,6 +1605,71 @@ mod tests {
         let error = crate::http_client::BackupSnapshot::from_body(&snapshot("plain-consumer"))
             .unwrap_err()
             .to_string();
+        assert!(
+            error.contains("at Consumer ferrum/plain-consumer credentials.keyauth[0].key"),
+            "{error}"
+        );
+    }
+
+    /// Review of #608, round 2: a credential shorter than eight bytes is
+    /// compared in every spelling, so an id carrying it encoded is withheld;
+    /// and beside a value too large to spell, every location is withheld.
+    #[test]
+    fn refusal_locations_never_repeat_an_encoded_short_or_oversized_credential() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        enable();
+        const SHORT: &str = "Q7!x9";
+        let oversized = "Q7-secret".repeat(128 * 1024);
+        assert!(worst_case_cost(oversized.len()) > REGISTRATION_BUDGET);
+        let fragment = STANDARD.encode(&oversized.as_bytes()[9..33]);
+        let consumer = |id: &str, key: &str| {
+            serde_json::json!({"id": id, "namespace": "ferrum", "username": id,
+                "credentials": {"keyauth": [{"key": key}]}})
+        };
+        let refuse = |consumers: Vec<serde_json::Value>| {
+            LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+            let body = serde_json::json!({ "consumers": consumers }).to_string();
+            crate::http_client::BackupSnapshot::from_body(&body)
+                .unwrap_err()
+                .to_string()
+        };
+        // (id, the short key it encodes, the batch's other consumer)
+        let cases = vec![
+            (STANDARD.encode(SHORT), SHORT, None),
+            (URL_SAFE_NO_PAD.encode(SHORT), SHORT, None),
+            (hex::encode(SHORT), SHORT, None),
+            (hex::encode("k?z"), "k?z", None),
+            (hex::encode_upper("k?z"), "k?z", None),
+            (percent_encoded(SHORT), SHORT, None),
+            (
+                fragment,
+                SHORT,
+                Some(consumer("holder", oversized.as_str())),
+            ),
+        ];
+        assert_eq!(cases[0].0, "UTcheDk=");
+        assert_eq!(cases[4].0, "6B3F7A");
+        for (id, key, other) in cases {
+            let error = refuse(
+                [Some(consumer(id.as_str(), key)), other]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            );
+            assert!(error.contains("shorter than 8 bytes"), "{error}");
+            assert!(error.contains(WITHHELD_LOCATION), "{error}");
+            // The sticky refusal, returned again and shown in place of
+            // every later display.
+            let sticky = registration_result().unwrap_err().to_string();
+            let shown = scrub_text("later diagnostic");
+            for text in [&error, &sticky, &shown] {
+                assert!(!text.contains(id.as_str()), "{id} shown: {text}");
+                assert!(!text.contains(key), "{text}");
+            }
+            LOCAL.with(|local| assert!(local.borrow().entries.is_empty()));
+        }
+        // A location that repeats nothing is still named.
+        let error = refuse(vec![consumer("plain-consumer", SHORT)]);
         assert!(
             error.contains("at Consumer ferrum/plain-consumer credentials.keyauth[0].key"),
             "{error}"
