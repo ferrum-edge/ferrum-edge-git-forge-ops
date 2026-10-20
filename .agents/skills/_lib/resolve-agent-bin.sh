@@ -67,6 +67,7 @@ dispatch_lock_ready_dir=''
 dispatch_lock_release_file=''
 cursor_control_workspace=''
 dispatch_child=''
+opencode_isolation_flags=()
 
 release_worktree_dispatch_lock() {
   if [[ -n "$dispatch_child" ]] && kill -0 "$dispatch_child" 2>/dev/null; then
@@ -266,6 +267,76 @@ isolate_opencode_provider() {
   unset OPENCODE_API_KEY
   unset OPENCODE_AUTH_CONTENT
   export OPENCODE_DISABLE_PROJECT_CONFIG=1
+}
+
+# select_opencode_isolation_flags <opencode-bin>
+# Sets the opencode_isolation_flags array for `opencode run`, chosen from what
+# the installed CLI's `run --help` advertises:
+# - opencode v1 `--pure` skips external plugins; isolate_opencode_provider
+#   already reaches the run process through the environment.
+# - opencode v2 dropped `--pure` and by default sends `run` to a shared
+#   background service whose environment the launcher cannot scrub, so
+#   isolate_opencode_provider (including OPENCODE_DISABLE_PROJECT_CONFIG, which
+#   keeps the worktree's own config and plugins out) only applies to a private
+#   `--standalone` server. v2 has no switch for global plugins, so the launcher
+#   refuses while the operator's global config enables any.
+# A CLI advertising neither flag predates `--pure`; refuse instead of running
+# with weaker isolation.
+# shellcheck disable=SC2034 # opencode_isolation_flags is read by the launcher.
+select_opencode_isolation_flags() {
+  local opencode_bin=$1 run_help
+  opencode_isolation_flags=()
+  if ! run_help=$("$opencode_bin" run --help 2>&1 < /dev/null); then
+    printf 'Cannot read "%s run --help"; refusing to dispatch without opencode isolation.\n' \
+      "$opencode_bin" >&2
+    return 2
+  fi
+  if opencode_help_has_flag "$run_help" --pure; then
+    opencode_isolation_flags=(--pure)
+    return 0
+  fi
+  if opencode_help_has_flag "$run_help" --standalone; then
+    refuse_opencode_global_plugins || return 2
+    opencode_isolation_flags=(--standalone)
+    return 0
+  fi
+  printf '%s supports neither "run --pure" (opencode v1) nor "run --standalone" (opencode v2).\n' \
+    "$opencode_bin" >&2
+  printf 'Upgrade the standalone opencode CLI or point OPENCODE_BIN at one that does.\n' >&2
+  return 2
+}
+
+opencode_help_has_flag() {
+  local run_help=$1 flag=$2
+  grep -Eq -- "(^|[[:space:],])${flag}([[:space:],=]|\$)" <<<"$run_help"
+}
+
+# opencode v2 loads plugins named by a global config's `plugin`/`plugins` key and
+# any entry under the global plugin/ or plugins/ directory. An empty list or map
+# is accepted; anything else (including a form this check cannot read) refuses.
+refuse_opencode_global_plugins() {
+  local config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/opencode
+  local found=() file directory
+  for file in "$config_dir"/opencode.json "$config_dir"/opencode.jsonc \
+    "$config_dir"/config.json; do
+    [[ -e "$file" ]] || continue
+    if [[ ! -f "$file" || ! -r "$file" ]] \
+      || sed -E 's/"plugins?"[[:space:]]*:[[:space:]]*(\[[[:space:]]*\]|\{[[:space:]]*\})//g' \
+        "$file" | grep -Eq '"plugins?"[[:space:]]*:'; then
+      found+=("$file")
+    fi
+  done
+  for directory in "$config_dir"/plugin "$config_dir"/plugins; do
+    if [[ -e "$directory" && ( ! -d "$directory" || -n "$(ls -A "$directory" 2>&1)" ) ]]; then
+      found+=("$directory")
+    fi
+  done
+  if (( ${#found[@]} )); then
+    printf 'opencode v2 has no "run --pure", and global opencode plugins are configured:\n' >&2
+    printf '  %s\n' "${found[@]}" >&2
+    printf 'Remove them, or use an opencode CLI whose "run --help" lists --pure.\n' >&2
+    return 2
+  fi
 }
 
 isolate_claude_provider() {

@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -117,6 +118,8 @@ def write_valid_setup(
         "run_dispatch_child() { :; }\n"
         "isolate_codex_provider() { unset CODEX_HOME; }\n"
         "isolate_opencode_provider() { unset OPENCODE_API_KEY; unset OPENCODE_AUTH_CONTENT; }\n"
+        "select_opencode_isolation_flags() { :; }\n"
+        "refuse_opencode_global_plugins() { :; }\n"
         "isolate_claude_provider() { :; }\n"
         "isolate_cursor_provider() { :; }\n"
         "prepare_cursor_control_workspace() { :; }\n",
@@ -1106,6 +1109,83 @@ class AgentSetupTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def run_opencode_isolation(
+        self, run_help: str, *, help_status: int = 0, plugin_config: str | None = None,
+        plugin_file: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        helper = str(
+            check_agent_setup.ROOT / ".agents/skills/_lib/resolve-agent-bin.sh"
+        )
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        fake = root / "opencode"
+        fake.write_text(
+            "#!/usr/bin/env bash\n"
+            '[[ "$1 $2" == "run --help" ]] || exit 9\n'
+            f"printf '%s\\n' {shlex.quote(run_help)}\n"
+            f"exit {help_status}\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        config = root / "xdg" / "opencode"
+        config.mkdir(parents=True)
+        if plugin_config is not None:
+            (config / "opencode.json").write_text(plugin_config, encoding="utf-8")
+        if plugin_file:
+            (config / "plugins").mkdir()
+            (config / "plugins" / "inject.js").write_text("", encoding="utf-8")
+        command = (
+            'source "$1"; select_opencode_isolation_flags "$2" || exit $?; '
+            'printf "%s\\n" "${opencode_isolation_flags[*]}"'
+        )
+        return subprocess.run(
+            ["bash", "-c", command, "bash", helper, str(fake)],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "XDG_CONFIG_HOME": str(root / "xdg")},
+        )
+
+    def test_opencode_isolation_prefers_pure_when_advertised(self):
+        result = self.run_opencode_isolation(
+            "Options:\n  --pure  run without external plugins [boolean]",
+            plugin_config='{"plugin": ["global-plugin"]}',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "--pure")
+
+    def test_opencode_isolation_uses_private_server_without_pure(self):
+        result = self.run_opencode_isolation(
+            "FLAGS\n  --standalone   Run with a private server",
+            plugin_config='{"plugin": [], "provider": {}}',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "--standalone")
+
+    def test_opencode_isolation_refuses_global_plugins_without_pure(self):
+        for kwargs in (
+            {"plugin_config": '{"plugin": ["global-plugin"]}'},
+            {"plugin_config": '{\n  "plugins": {\n    "x": {}\n  }\n}'},
+            {"plugin_file": True},
+        ):
+            with self.subTest(**kwargs):
+                result = self.run_opencode_isolation(
+                    "FLAGS\n  --standalone   Run with a private server", **kwargs
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("global opencode plugins are configured", result.stderr)
+
+    def test_opencode_isolation_refuses_unsupported_or_unreadable_cli(self):
+        for run_help, status, message in (
+            ("FLAGS\n  --model  Model to use\n  --purely-fake  no", 0, "supports neither"),
+            ("FLAGS\n  --pure  run without external plugins", 1, "Cannot read"),
+        ):
+            with self.subTest(run_help=run_help):
+                result = self.run_opencode_isolation(run_help, help_status=status)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
 
     def test_expands_every_braced_rule_path(self):
         self.assertEqual(
