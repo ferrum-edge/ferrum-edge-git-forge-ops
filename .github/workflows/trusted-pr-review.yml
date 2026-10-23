@@ -85,13 +85,29 @@ jobs:
             exit 0
           fi
 
+          # A commit that no PR still needs reviewed ends the job green with
+          # the fork path's unprivileged outputs: no source download, no
+          # Environment, no comment. The notice carries only digits and SHAs
+          # this step validated.
+          no_review_needed() {
+            {
+              echo "head_sha=$EVENT_HEAD_SHA"
+              echo "trusted_sha=$trusted_sha"
+              echo "privileged=false"
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice title=Trusted live review not needed::$1"
+            exit 0
+          }
+
           # workflow_run.pull_requests is observably empty for some PR runs.
           # Resolve from the exact triggering commit and require one open,
           # matching-source PR whose current head is still that commit.
           matches='[]'
           match_count=0
+          associated_ok=false
           for attempt in 1 2 3 4 5; do
             if associated=$(gh api "repos/${REPO}/commits/${EVENT_HEAD_SHA}/pulls?per_page=100" --paginate --slurp); then
+              associated_ok=true
               matches=$(jq -c --arg sha "$EVENT_HEAD_SHA" --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" '
                 [.[][]
                   | select(.state == "open")
@@ -101,21 +117,71 @@ jobs:
               ' <<< "$associated")
               match_count=$(jq 'length' <<< "$matches")
               [ "$match_count" -eq 1 ] && break
+            else
+              associated_ok=false
             fi
             echo "PR association is not yet available and unambiguous; retrying ($attempt/5)." >&2
             if [ "$attempt" -lt 5 ]; then sleep $((attempt * 2)); fi
           done
+          if [ "$match_count" -eq 0 ] && [ "$associated_ok" = true ]; then
+            # Static validation takes minutes, so by now the PR may have been
+            # merged or closed, or pushed again (the newer commit gets its own
+            # static validation and live review). The association still lists
+            # the PRs that contain this commit. Skip only when each same-source
+            # PR into the default branch, re-read on its own, is closed or has
+            # a different head. An empty list or a PR still at this head is
+            # association lag and still fails below.
+            candidates=$(jq -r --arg head_repo "$EVENT_HEAD_REPO" --arg base "$DEFAULT_BRANCH" '
+              [.[][]
+                | select(.head.repo.full_name == $head_repo)
+                | select(.base.ref == $base)
+                | .number]
+              | unique | .[]
+            ' <<< "$associated")
+            mapfile -t numbers <<< "$candidates"
+            reasons=()
+            for number in "${numbers[@]}"; do
+              [ -n "$number" ] || continue
+              [[ "$number" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid associated PR number" >&2; exit 1; }
+              candidate=$(gh api "repos/${REPO}/pulls/${number}")
+              candidate_state=$(jq -r '.state' <<< "$candidate")
+              candidate_head=$(jq -r '.head.sha' <<< "$candidate")
+              if [ "$candidate_state" = closed ]; then
+                if [ "$(jq -r '.merged' <<< "$candidate")" = true ]; then
+                  reasons+=("PR #${number} was merged")
+                else
+                  reasons+=("PR #${number} was closed")
+                fi
+              elif [ "$candidate_state" = open ] && [[ "$candidate_head" =~ ^[0-9a-f]{40}$ ]] && \
+                [ "$candidate_head" != "$EVENT_HEAD_SHA" ]; then
+                reasons+=("PR #${number} moved on to ${candidate_head}")
+              else
+                reasons=()
+                break
+              fi
+            done
+            if [ "${#reasons[@]}" -gt 0 ]; then
+              summary=$(printf '%s; ' "${reasons[@]}")
+              no_review_needed "No open PR still has head ${EVENT_HEAD_SHA}: ${summary%; }. Nothing to review for this commit."
+            fi
+          fi
           [ "$match_count" -eq 1 ] || { echo "Expected one open PR for workflow head; found $match_count." >&2; exit 1; }
           event_pr=$(jq -r '.[0].number' <<< "$matches")
           [[ "$event_pr" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid resolved PR number" >&2; exit 1; }
 
           current=$(gh api "repos/${REPO}/pulls/${event_pr}")
+          current_state=$(jq -r '.state' <<< "$current")
           current_sha=$(jq -r '.head.sha' <<< "$current")
           current_repo=$(jq -r '.head.repo.full_name' <<< "$current")
           current_base=$(jq -r '.base.ref' <<< "$current")
           current_base_sha=$(jq -r '.base.sha' <<< "$current")
           declared_changed=$(jq -r '.changed_files' <<< "$current")
-          [ "$current_sha" = "$EVENT_HEAD_SHA" ] || { echo "PR head changed after static validation; wait for the new run." >&2; exit 1; }
+          [ "$current_state" != closed ] || \
+            no_review_needed "PR #${event_pr} was closed after static validation of ${EVENT_HEAD_SHA}. Nothing to review for this commit."
+          [ "$current_state" = open ] || { echo "Unexpected PR state" >&2; exit 1; }
+          [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid PR head SHA" >&2; exit 1; }
+          [ "$current_sha" = "$EVENT_HEAD_SHA" ] || \
+            no_review_needed "PR #${event_pr} moved on from ${EVENT_HEAD_SHA} to ${current_sha}; the new head gets its own live review."
           [ "$current_repo" = "$EVENT_HEAD_REPO" ] || { echo "PR source repository changed." >&2; exit 1; }
           [ "$current_base" = "$DEFAULT_BRANCH" ] || { echo "PR no longer targets the protected default branch." >&2; exit 1; }
 
