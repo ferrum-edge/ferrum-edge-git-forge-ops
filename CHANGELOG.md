@@ -373,7 +373,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   commit, or more than one match still fails after the existing retries.
   The resolved PR's re-read gets the same treatment: closed there, it now
   stops instead of continuing; pushed again there, it ends green instead of
-  failing.
+  failing; any state other than open or closed fails.
 - Secret-scrubbing follow-ups to the display sink (#605):
   - An ordinary run no longer exhausts the secret registration budget
     part-way through, leaving a partial apply. The admin client mints one

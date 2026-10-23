@@ -176,8 +176,9 @@ jobs:
           current_base=$(jq -r '.base.ref' <<< "$current")
           current_base_sha=$(jq -r '.base.sha' <<< "$current")
           declared_changed=$(jq -r '.changed_files' <<< "$current")
-          [ "$current_state" = open ] || \
+          [ "$current_state" != closed ] || \
             no_review_needed "PR #${event_pr} was closed after static validation of ${EVENT_HEAD_SHA}. Nothing to review for this commit."
+          [ "$current_state" = open ] || { echo "Unexpected PR state" >&2; exit 1; }
           [[ "$current_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid PR head SHA" >&2; exit 1; }
           [ "$current_sha" = "$EVENT_HEAD_SHA" ] || \
             no_review_needed "PR #${event_pr} moved on from ${EVENT_HEAD_SHA} to ${current_sha}; the new head gets its own live review."
