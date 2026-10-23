@@ -364,6 +364,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `GitForgeOps Trusted PR Live Review` no longer fails its `prepare` job when
+  the reviewed commit is no longer any open PR's head by the time it runs: the
+  PR was merged or closed, or pushed again, while static validation ran. Each
+  same-source PR that contains the commit is re-read on its own. When every
+  one is closed or has a different head, the job ends green with a notice,
+  unprivileged, like a fork PR. An empty association, a PR still at the
+  commit, or more than one match still fails after the existing retries.
+  The resolved PR's re-read gets the same treatment: closed there, it now
+  stops instead of continuing; pushed again there, it ends green instead of
+  failing.
 - Secret-scrubbing follow-ups to the display sink (#605):
   - An ordinary run no longer exhausts the secret registration budget
     part-way through, leaving a partial apply. The admin client mints one
