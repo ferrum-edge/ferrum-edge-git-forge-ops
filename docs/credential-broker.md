@@ -385,9 +385,13 @@ starts over. If a shard PUT fails partway through the batch:
   not prove GitHub did not store the shard. Its slots are neither journaled nor
   delivered, yet the bundle may already hold their new values. The next apply
   may then refuse a slot as a revived value, or, for a Consumer the state
-  ledger already manages, publish a value nobody received. Retire the slot from
-  the bundle, or rotate it if it is a rotatable Consumer slot, to issue a
-  fresh, delivered value.
+  ledger already manages, publish a value nobody received. To recover, retire
+  the suspect slot from the credential bundle, then re-run an apply with a
+  recipient configured so a fresh value is allocated and delivered. `rotate`
+  is not a general fix here: it needs a Consumer that is already applied (and
+  owned, in shared mode) with its live credential equal to the bundle value,
+  and an ambiguous PUT can leave the bundle ahead of the gateway, so rotation
+  refuses until that is reconciled.
 
 If journaling fails after every PUT succeeds, the ciphertext is still surfaced
 before the error is reported.
