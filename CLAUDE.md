@@ -1647,12 +1647,28 @@ First apply or rotation: generate a random value → libsodium sealed box
 
 #### Delivery
 
-After allocation or rotation, the value is age-encrypted to the PR author's (or
-dispatcher's) SSH public key from `GET /users/{login}/keys` and posted as a PR
-comment or workflow output. The allocator discovers the key once per batch
-(`discover_recipient_at`) and encrypts each slot locally with
-`DeliveryRecipient::encrypt`. Discovery is unauthenticated and rate-limited;
-never call it per slot. The author decrypts with `age -d -i ~/.ssh/id_ed25519`.
+Encryption is precomputed; surfacing comes after the write. When a recipient is
+configured (PR author for apply, dispatcher for rotate), the allocator finds
+their SSH public key from `GET /users/{login}/keys` and age-encrypts each new
+value **before** any `FERRUM_CREDS_BUNDLE[_N]` PUT. A missing or incompatible
+key, an incomplete search or an encryption error refuses with no secret
+written. Without a recipient, no ciphertext is created and slots surface as not
+delivered.
+
+- Allocation (`allocate_and_deliver_at`): generate and reserve shards →
+  discover the key once per batch (`discover_recipient_at`) and encrypt every
+  planned slot (`DeliveryRecipient::encrypt`) → fetch the environment public
+  key → seal and PUT each shard. `allocate_if_needed` journals committed
+  slots; `surface_delivered_credentials` then posts the ciphertext as a PR
+  comment (stdout fallback). A later shard failure still journals and
+  surfaces the committed shards (#352); a journal failure after success still
+  surfaces before erroring (#521).
+- Rotation (`rotate_and_deliver_at`): generate, reserve and serialize → fetch
+  the environment public key → discover and encrypt → PUT. `cmd_rotate`
+  prints the ciphertext after the PUT and before the gateway push.
+
+Discovery is unauthenticated and rate-limited; never call it per slot. The
+recipient decrypts with `age -d -i ~/.ssh/id_ed25519`.
 
 ### Downstream template updates
 
