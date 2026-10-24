@@ -375,10 +375,22 @@ value is allocated:
    locally.
 
 A failure in steps 1–3 writes nothing and delivers nothing; the next apply
-starts over. If a shard PUT fails, the shards already written are journaled and
-their ciphertext is still surfaced; the failed shard and any after it are
-dropped and reallocated by the next apply. If journaling fails after the PUTs succeed, the ciphertext
-is surfaced before the error is reported.
+starts over. If a shard PUT fails partway through the batch:
+
+- Shards whose PUT was confirmed are journaled and their ciphertext is still
+  surfaced.
+- Shards after the failed one were never attempted. They are not journaled or
+  delivered, and the next apply allocates them afresh.
+- The failed PUT itself is ambiguous: an error, such as a lost response, does
+  not prove GitHub did not store the shard. Its slots are neither journaled nor
+  delivered, yet the bundle may already hold their new values. The next apply
+  may then refuse a slot as a revived value, or, for a Consumer the state
+  ledger already manages, publish a value nobody received. Retire the slot from
+  the bundle, or rotate it if it is a rotatable Consumer slot, to issue a
+  fresh, delivered value.
+
+If journaling fails after every PUT succeeds, the ciphertext is still surfaced
+before the error is reported.
 
 The recipient is the merged PR's author (`GITFORGEOPS_ACTOR` in the bundled
 workflow). A recipient must be a valid GitHub login; a set but blank
