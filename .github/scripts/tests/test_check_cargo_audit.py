@@ -25,7 +25,7 @@ SPEC.loader.exec_module(check_cargo_audit)
 
 REVIEWED_MANIFEST = (
     '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
-    '[dependencies]\nage = { version = "0.12", features = ["ssh", "armor"] }\n'
+    '[dependencies]\nage = { version = "0.11.5", features = ["ssh", "armor"] }\n'
 )
 REVIEWED_SOURCE = (
     "use age::ssh::Recipient;\n"
@@ -98,7 +98,7 @@ def write_reviewed_tree(
     manifest=REVIEWED_MANIFEST,
     source=REVIEWED_SOURCE,
     rsa_version="0.9.10",
-    age_version="0.12.1",
+    age_version="0.11.5",
     tree=None,
     extra_sources=None,
 ):
@@ -211,12 +211,12 @@ sys.exit(output["exit"])
 
 REVIEWED_RSA_TREE = (
     "rsa v0.9.10\n"
-    "└── age v0.12.1\n"
+    "└── age v0.11.5\n"
     "    └── gitforgeops v0.1.0 (/candidate)\n"
 )
 SECOND_RSA_PATH_TREE = (
     "rsa v0.9.10\n"
-    "├── age v0.12.1\n"
+    "├── age v0.11.5\n"
     "│   └── gitforgeops v0.1.0 (/candidate)\n"
     "└── forged-free v1.0.0\n"
     "    └── gitforgeops v0.1.0 (/candidate)\n"
@@ -481,8 +481,8 @@ class CargoAuditPolicyTests(unittest.TestCase):
 
     def test_patch_bumps_of_age_and_rsa_are_accepted(self):
         for rsa_version, age_version in (
-            ("0.9.10", "0.12.2"),
-            ("0.9.12", "0.12.9"),
+            ("0.9.10", "0.11.6"),
+            ("0.9.12", "0.11.9"),
         ):
             with self.subTest(rsa=rsa_version, age=age_version):
                 with tempfile.TemporaryDirectory() as directory:
@@ -497,12 +497,12 @@ class CargoAuditPolicyTests(unittest.TestCase):
     def test_feature_order_and_disabled_defaults_are_accepted(self):
         manifests = {
             "reordered": '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
-            '[dependencies]\nage = { version = "0.12", features = ["armor", "ssh"] }\n',
+            '[dependencies]\nage = { version = "0.11", features = ["armor", "ssh"] }\n',
             "no-default-features": '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
-            '[dependencies]\nage = { version = "0.12", default-features = false, '
+            '[dependencies]\nage = { version = "0.11", default-features = false, '
             'features = ["ssh", "armor"] }\n',
             "patch-pinned": '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
-            '[dependencies]\nage = { version = "0.12.2", features = ["ssh", "armor"] }\n',
+            '[dependencies]\nage = { version = "0.11.6", features = ["ssh", "armor"] }\n',
         }
         for name, manifest in manifests.items():
             with self.subTest(name=name):
@@ -583,7 +583,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                 root,
                 tree=(
                     "rsa v0.9.10\n"
-                    "├── age v0.12.1\n"
+                    "├── age v0.11.5\n"
                     f"│   └── gitforgeops v0.1.0 ({root})\n"
                     "└── another-crate v1.0.0\n"
                 ),
@@ -620,7 +620,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
             write_reviewed_tree(root)
             tree = (
                 "rsa v0.9.10\n"
-                "└── age v0.12.1\n"
+                "└── age v0.11.5\n"
                 f"    └── gitforgeops v0.1.0 ({root})\n"
             )
             completed = subprocess.CompletedProcess([], 0, tree, "")
@@ -1122,7 +1122,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 write_reviewed_tree(root)
-                rsa, age = locked_package(), locked_package("age", "0.12.1")
+                rsa, age = locked_package(), locked_package("age", "0.11.5")
                 write_lockfile(root, [rsa, age])
                 manifest_text = (root / "Cargo.toml").read_text(encoding="utf-8")
                 lockfile_text = (root / "Cargo.lock").read_text(encoding="utf-8")
@@ -1284,7 +1284,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
             write_lockfile(root, [rsa])
 
             def replace_originals(_snapshot):
-                write_lockfile(root, [locked_package("age", "0.12.1")])
+                write_lockfile(root, [locked_package("age", "0.11.5")])
 
             status, stdout, stderr, calls, http = self.run_gate(
                 root,
@@ -1422,7 +1422,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
                 },
             )
             rsa = locked_package()
-            age = locked_package("age", "0.12.1", dependencies=["rsa"])
+            age = locked_package("age", "0.11.5", dependencies=["rsa"])
             write_lockfile(
                 root,
                 [
@@ -1516,7 +1516,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_reviewed_tree(root)
-            rsa, age = locked_package(), locked_package("age", "0.12.1")
+            rsa, age = locked_package(), locked_package("age", "0.11.5")
             write_lockfile(root, [rsa, age])
 
             lookup_order = []

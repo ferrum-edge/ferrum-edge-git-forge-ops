@@ -10,9 +10,9 @@
       "reachability": "age-encryption-only",
       "owner": "@jeremyjpj0916",
       "review_by": "2026-11-30",
-      "rationale": "age 0.12.1 requires rsa 0.9 for SSH-RSA recipient compatibility and no patched stable rsa release is available. gitforgeops only parses RSA public keys and encrypts locally; it never accepts an RSA private key or exposes RSA signing/decryption timing to a remote observer.",
+      "rationale": "age 0.11.5 requires rsa 0.9 for SSH-RSA recipient compatibility and no patched stable rsa release is available. gitforgeops only parses RSA public keys and encrypts locally; it never accepts an RSA private key or exposes RSA signing/decryption timing to a remote observer.",
       "affected_call_paths": [
-        "gitforgeops -> age 0.12.1 (ssh feature) -> rsa 0.9.10",
+        "gitforgeops -> age 0.11.5 (ssh feature) -> rsa 0.9.10",
         "src/secrets/delivery.rs: age::ssh::Recipient public-key encryption"
       ],
       "compensating_controls": [

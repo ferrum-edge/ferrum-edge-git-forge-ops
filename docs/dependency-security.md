@@ -247,7 +247,7 @@ RustCrypto has not published a stable patched release. The lockfile has one
 remaining dependency path:
 
 ```text
-gitforgeops -> age 0.12.1 (ssh feature) -> rsa 0.9.10
+gitforgeops -> age 0.11.5 (ssh feature) -> rsa 0.9.10
 ```
 
 The `jsonwebtoken` dependency uses its `aws_lc_rs` provider with default
@@ -265,9 +265,9 @@ keys smaller than 2048 bits.
 The `age-encryption-only` verifier checks that premise before accepting the
 exception. It requires:
 
-- an `age 0.12` requirement in `Cargo.toml` with exactly the `ssh` and `armor`
+- an `age 0.11` requirement in `Cargo.toml` with exactly the `ssh` and `armor`
   features (in any order);
-- a dependency graph containing only `gitforgeops -> age 0.12.x -> rsa 0.9.x`,
+- a dependency graph containing only `gitforgeops -> age 0.11.x -> rsa 0.9.x`,
   checked with `--all-features --target all` so optional and platform-specific
   direct RSA paths cannot escape the exception guard;
 - no `age::` references under `src/` outside the reviewed delivery module, and
@@ -286,7 +286,7 @@ re-exports or aliases and does not look at `tests/` or `build.rs`. Treat it as a
 tripwire on the reviewed module boundary, not a proof of unreachability; the
 reviewer signs off on the reachability argument above.
 
-Patch upgrades such as `age 0.12.2` or `rsa 0.9.11` pass the graph check
+Patch upgrades such as `age 0.11.6` or `rsa 0.9.11` pass the graph check
 unchanged, so a routine Dependabot bump needs no script edit. When the flagged
 `rsa` version changes, update the exception's `version`. When `rsa` leaves the
 graph entirely, the gate reports a stale exception.
@@ -295,6 +295,32 @@ The exception owner must re-review or remove the entry by 2026-11-30. The
 preferred resolution is an `age` release whose stable RSA dependency contains
 the upstream constant-time work. Dropping SSH-RSA recipient compatibility is a
 fallback only if a safe upstream route remains unavailable at review time.
+
+## Why age stays on 0.11
+
+`age` 0.12 adds native P-256 / hybrid post-quantum (`tag` / `tagpq`)
+recipients and depends unconditionally on `p256` 0.13 and `hpke` 0.12. That
+pulls in `elliptic-curve` 0.13 → `crypto-bigint` 0.5.5, which is affected by
+RUSTSEC-2026-0387 (timing variability in operations meant to be constant-time).
+The fix is only in `crypto-bigint` 0.7.6 and later, and there is no patched
+0.5.x. gitforgeops never uses those recipients: it encrypts only to
+`ssh-ed25519` / `ssh-rsa` recipients. So `Cargo.toml` pins `age 0.11.5`, the
+maintained 0.11 line, which has the July 2026 armor fixes and is patched for
+RUSTSEC-2024-0433. That keeps `p256`, `hpke` and `crypto-bigint` out of
+`Cargo.lock` entirely, with no exception.
+
+`ssh-key` is declared with `default-features = false` and only `alloc` +
+`ed25519`. Production code only parses GitHub public keys and computes their
+SHA-256 fingerprint; RSA and Ed25519 public-key parsing need only `alloc`.
+The tests build an Ed25519 key pair. The default `ecdsa` / `std` features kept
+optional `p256` / `p384` / `p521` edges in the lockfile even though they were
+never compiled, and cargo-audit reads the lockfile.
+
+`.github/dependabot.yml` ignores `age` >= 0.12 so the pin is not bumped back
+automatically. Move to a newer `age` once its P-256 dependencies are on
+`elliptic-curve` 0.14 (`crypto-bigint` >= 0.7.6), and retarget the
+`age-encryption-only` verifier (`AGE_VERSION_REQUIREMENT`,
+`EXPECTED_RSA_TREE`) in the same change.
 
 ## Maintenance
 

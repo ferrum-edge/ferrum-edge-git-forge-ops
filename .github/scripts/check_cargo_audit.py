@@ -57,10 +57,10 @@ VERIFIER_REQUIRED_PACKAGES = frozenset({"rsa"})
 
 EXPECTED_RSA_TREE = re.compile(
     r"^rsa v0\.9\.\d+\n"
-    r"└── age v0\.12\.\d+\n"
+    r"└── age v0\.11\.\d+\n"
     r"    └── gitforgeops v\d+\.\d+\.\d+ \([^\n]+\)\n?$"
 )
-AGE_VERSION_REQUIREMENT = re.compile(r"^0\.12(?:\.\d+)?$")
+AGE_VERSION_REQUIREMENT = re.compile(r"^0\.11(?:\.\d+)?$")
 REQUIRED_AGE_FEATURES = frozenset({"ssh", "armor"})
 REVIEWED_AGE_MODULE = Path("src/secrets/delivery.rs")
 ALLOWED_AGE_REFERENCES = {
@@ -735,7 +735,7 @@ def verify_age_encryption_only(
         or set(features) != REQUIRED_AGE_FEATURES
     ):
         raise PolicyError(
-            "RSA exception requires an age 0.12 requirement with exactly the "
+            "RSA exception requires an age 0.11 requirement with exactly the "
             "ssh and armor features"
         )
 
@@ -783,7 +783,7 @@ def verify_age_encryption_only(
     if not EXPECTED_RSA_TREE.fullmatch(dependency_tree):
         raise PolicyError(
             "RSA exception dependency path changed; expected only "
-            "gitforgeops -> age 0.12.x -> rsa 0.9.x"
+            "gitforgeops -> age 0.11.x -> rsa 0.9.x"
         )
 
 
