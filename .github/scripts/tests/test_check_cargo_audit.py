@@ -89,6 +89,34 @@ def exception(**overrides):
     return value
 
 
+def crypto_bigint_exception(**overrides):
+    value = exception(
+        advisory="RUSTSEC-2026-0387",
+        package="crypto-bigint",
+        version="0.5.5",
+        rationale="age's P-256 code is compiled but never called.",
+        affected_call_paths=["app -> age -> p256 -> elliptic-curve -> crypto-bigint"],
+    )
+    value.update(overrides)
+    return value
+
+
+def crypto_bigint_tree(root, crypto_bigint="0.5.5", p256="0.13.2", age="0.12.1"):
+    return (
+        f"crypto-bigint v{crypto_bigint}\n"
+        "└── elliptic-curve v0.13.8\n"
+        f"    ├── p256 v{p256}\n"
+        f"    │   ├── age v{age}\n"
+        f"    │   │   └── gitforgeops v0.1.0 ({root})\n"
+        "    │   └── hpke v0.12.0\n"
+        f"    │       ├── age v{age} (*)\n"
+        "    │       └── age-core v0.12.0\n"
+        f"    │           └── age v{age} (*)\n"
+        "    └── primeorder v0.13.6\n"
+        f"        └── p256 v{p256} (*)\n"
+    )
+
+
 def indexed(*exceptions):
     return {check_cargo_audit._finding_key(item): item for item in exceptions}
 
@@ -642,6 +670,89 @@ class CargoAuditPolicyTests(unittest.TestCase):
             self.assertEqual(command[command.index("--target") + 1], "all")
             workdir = Path(run.call_args.kwargs["cwd"]).resolve()
             self.assertNotIn(root.resolve(), (workdir, *workdir.parents))
+
+    def test_crypto_bigint_exception_accepts_the_reviewed_age_path(self):
+        for versions in (
+            {},
+            {"crypto_bigint": "0.5.6", "p256": "0.13.3", "age": "0.12.2"},
+        ):
+            with self.subTest(versions=versions):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    tree = write_reviewed_tree(
+                        root, tree=crypto_bigint_tree(root, **versions)
+                    )
+                    verify_candidate_reachability(
+                        indexed(
+                            crypto_bigint_exception(
+                                version=versions.get("crypto_bigint", "0.5.5")
+                            )
+                        ),
+                        root,
+                        tree,
+                    )
+
+    def test_crypto_bigint_exception_requires_its_verifier(self):
+        orphan = crypto_bigint_exception(advisory="RUSTSEC-2099-0011")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree = write_reviewed_tree(root, tree=crypto_bigint_tree(root))
+            with self.assertRaises(check_cargo_audit.PolicyError) as raised:
+                verify_candidate_reachability(indexed(orphan), root, tree)
+            self.assertIn("no reachability verifier", str(raised.exception))
+
+    def test_crypto_bigint_exception_rejects_a_second_dependency_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            second_path = crypto_bigint_tree(root).replace(
+                "    │   └── hpke v0.12.0\n",
+                "    │   ├── hpke v0.12.0\n",
+                1,
+            ).replace(
+                "    │           └── age v0.12.1 (*)\n",
+                "    │           └── age v0.12.1 (*)\n"
+                "    │   └── jsonwebtoken v11.1.0\n"
+                f"    │       └── gitforgeops v0.1.0 ({root})\n",
+                1,
+            )
+            self.assertNotEqual(second_path, crypto_bigint_tree(root))
+            tree = write_reviewed_tree(root, tree=second_path)
+            with self.assertRaises(check_cargo_audit.PolicyError) as raised:
+                verify_candidate_reachability(
+                    indexed(crypto_bigint_exception()), root, tree
+                )
+            self.assertIn("crypto-bigint exception dependency path changed", str(raised.exception))
+
+    def test_crypto_bigint_exception_rejects_age_identity_and_feature_drift(self):
+        cases = {
+            "decryptor": "age::Decryptor",
+            "ssh-identity": "age::ssh::Identity",
+            "x25519-identity": "age::x25519::Identity",
+            "extra-feature": 'features = ["ssh", "armor", "plugin"]',
+        }
+        for name, marker in cases.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    manifest = REVIEWED_MANIFEST
+                    source = REVIEWED_SOURCE
+                    if name == "extra-feature":
+                        manifest = manifest.replace(
+                            'features = ["ssh", "armor"]', marker
+                        )
+                    else:
+                        source += f"fn forbidden() {{ let _ = {marker}; }}\n"
+                    tree = write_reviewed_tree(
+                        root,
+                        manifest=manifest,
+                        source=source,
+                        tree=crypto_bigint_tree(root),
+                    )
+                    with self.assertRaises(check_cargo_audit.PolicyError) as raised:
+                        verify_candidate_reachability(
+                            indexed(crypto_bigint_exception()), root, tree
+                        )
+                    self.assertIn("crypto-bigint exception", str(raised.exception))
 
 
 class CandidateCargoIsolationTests(unittest.TestCase):

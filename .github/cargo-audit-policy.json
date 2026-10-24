@@ -22,6 +22,29 @@
         "The exact package, version, and advisory must match this policy and CI rejects stale or expired exceptions."
       ],
       "upstream": "https://github.com/RustCrypto/RSA/issues/19"
+    },
+    {
+      "kind": "vulnerability",
+      "advisory": "RUSTSEC-2026-0387",
+      "package": "crypto-bigint",
+      "version": "0.5.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "reachability": "age-ssh-recipient-only",
+      "owner": "@jeremyjpj0916",
+      "review_by": "2026-11-30",
+      "rationale": "Pending owner acceptance: time-boxed risk acceptance, not an owner-approved exception until the owner merges it. crypto-bigint 0.5.5 has timing variability in operations meant to be constant-time; it is fixed only in >= 0.7.6 and there is no patched 0.5.x. age 0.12.1 (latest) requires p256 ^0.13 and hpke 0.12 for its native P-256 tag recipients, so the crate cannot be upgraded away. gitforgeops only encrypts to SSH recipients (ssh-ed25519 / ssh-rsa) parsed from public keys. It never constructs an age P-256 tag recipient or any age identity, and age rejects ecdsa-sha2-nistp256 SSH keys, so no p256 or crypto-bigint arithmetic runs in gitforgeops, on secret or public values.",
+      "affected_call_paths": [
+        "gitforgeops -> age 0.12.1 -> p256 0.13.2 -> elliptic-curve 0.13.8 -> crypto-bigint 0.5.5",
+        "gitforgeops -> age 0.12.1 / age-core 0.12.0 -> hpke 0.12.0 (p256 feature) -> p256 0.13.2 -> elliptic-curve 0.13.8 -> crypto-bigint 0.5.5",
+        "src/secrets/delivery.rs: age::ssh::Recipient public-key encryption only (no P-256 recipient, no identity, no decryption)"
+      ],
+      "compensating_controls": [
+        "The age API boundary is limited to SSH-recipient encryption (age::ssh::Recipient, age::Encryptor, the age::Recipient trait and armor) in src/secrets/delivery.rs. That excludes the native P-256 tag/tagpq recipients and every identity or decryptor that would run P-256 ECDH or HPKE with a secret scalar.",
+        "CI pins the age 0.12 feature declaration (exactly ssh and armor) and the complete crypto-bigint 0.5 dependency graph to gitforgeops -> age 0.12 -> p256 0.13 / hpke 0.12. A direct p256 dependency or a RustCrypto JWT signing backend would therefore fail the gate. The age scan is a syntactic source check; it does not cover tests, build scripts, or re-exports.",
+        "jsonwebtoken uses its aws_lc_rs provider with default features disabled, so it does not pull in p256 0.13.",
+        "The exact package, version, and advisory must match this policy, and CI rejects stale or expired exceptions."
+      ],
+      "upstream": "https://github.com/RustCrypto/crypto-bigint/pull/1365"
     }
   ]
 }

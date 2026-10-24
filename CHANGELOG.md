@@ -7,6 +7,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `.github/cargo-audit-policy.json` records a time-boxed RUSTSEC-2026-0387
+  exception for `crypto-bigint` 0.5.5, pending owner acceptance and due for
+  review by 2026-11-30. It arrives only through age 0.12's P-256 code, and
+  there is no patched 0.5.x. A new `age-ssh-recipient-only` reachability
+  verifier in `check_cargo_audit.py` pins that dependency path and reuses
+  the age API boundary of the RSA exception, so the exception fails closed
+  if a P-256 recipient, an identity, or a second path appears.
 - PluginConfig updates and deletes now send the gateway's
   `expected_proxy_ids` association precondition (#569): the proxies the
   plan accounts for referencing the plugin. Ferrum Edge checks the set
