@@ -389,9 +389,10 @@ starts over. If a shard PUT fails partway through the batch:
   the suspect slot from the credential bundle, then re-run an apply with a
   recipient configured so a fresh value is allocated and delivered. `rotate`
   is not a general fix here: it needs a Consumer that is already applied (and
-  owned, in shared mode) with its live credential equal to the bundle value,
-  and an ambiguous PUT can leave the bundle ahead of the gateway, so rotation
-  refuses until that is reconciled.
+  owned, in shared mode), and its target must match the old bundle value when
+  directly comparable (see [Rotation](#rotation)). An ambiguous PUT can leave
+  the bundle ahead of the gateway, so for those credential types rotation can
+  refuse until that is reconciled.
 
 If journaling fails after every PUT succeeds, the ciphertext is still surfaced
 before the error is reported.
