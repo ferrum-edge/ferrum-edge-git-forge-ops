@@ -362,10 +362,11 @@ your own resources are in place.
 ### Upload your SSH public key first
 
 Credential delivery age-encrypts the generated key to an SSH public key on
-your GitHub account, fetched from `GET /users/<you>/keys`. With no key on the
-account there is nothing to encrypt to, and the slot is reported as
-`NOT DELIVERED`. Add a key before the first apply and keep the matching private
-key: you decrypt with `age -d -i ~/.ssh/id_ed25519`.
+your GitHub account, fetched from `GET /users/<you>/keys`. The bundled apply
+workflow always names the PR author as the recipient, so with no compatible
+key (Ed25519 or RSA) on the account the apply refuses to allocate, before it
+writes any credential secret. Add a key before the first apply and keep the
+matching private key: you decrypt with `age -d -i ~/.ssh/id_ed25519`.
 
 ---
 

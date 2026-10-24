@@ -356,16 +356,46 @@ On apply, each `alloc=generate` (or first-time `alloc=rotate`) slot with no
 value is allocated:
 
 1. Generate `len` random bytes (default 32) from the OS CSPRNG, encoded as
-   base64url without padding.
-2. Fetch the environment's public key
+   base64url without padding, and reserve each value's shard. No network
+   access yet.
+2. If a recipient is configured, find their first age-compatible SSH key
+   (Ed25519 or RSA) from `GET /users/{login}/keys`, 100 keys per page, at most
+   20 pages. This lookup runs once per apply. Encrypt each new value locally
+   with age to that key and hold the ciphertext; nothing is posted yet. An
+   incomplete search, a recipient with no compatible key or an encryption
+   error aborts here, before any secret is written. With no recipient, this
+   step is skipped and no delivery ciphertext is created.
+3. Fetch the environment's public key
    (`GET /repos/{repo}/environments/{env}/secrets/public-key`).
-3. Seal the updated bundle with libsodium `crypto_box_seal` and `PUT` it to
-   `FERRUM_CREDS_BUNDLE[_N]`.
-4. Find the recipient's first age-compatible SSH key (Ed25519 or RSA) from
-   `GET /users/{login}/keys`, 100 keys per page, at most 20 pages. An
-   incomplete search fails. This lookup runs once per apply.
-5. Encrypt each new value with age to that key and post it as a PR comment.
-   The recipient decrypts locally.
+4. Seal each updated shard with libsodium `crypto_box_seal` and `PUT` it to
+   `FERRUM_CREDS_BUNDLE[_N]`, one PUT per shard.
+5. Journal the committed slots, then surface the ciphertext computed in step 2
+   as a PR comment (stdout when there is no PR or the post fails). Slots
+   without a recipient are listed as not delivered. The recipient decrypts
+   locally.
+
+A failure in steps 1–3 writes nothing and delivers nothing; the next apply
+starts over. If a shard PUT fails partway through the batch:
+
+- Shards whose PUT was confirmed are journaled and their ciphertext is still
+  surfaced.
+- Shards after the failed one were never attempted. They are not journaled or
+  delivered, and the next apply allocates them afresh.
+- The failed PUT itself is ambiguous: an error, such as a lost response, does
+  not prove GitHub did not store the shard. Its slots are neither journaled nor
+  delivered, yet the bundle may already hold their new values. The next apply
+  may then refuse a slot as a revived value, or, for a Consumer the state
+  ledger already manages, publish a value nobody received. To recover, retire
+  the suspect slot from the credential bundle, then re-run an apply with a
+  recipient configured so a fresh value is allocated and delivered. `rotate`
+  is not a general fix here: it needs a Consumer that is already applied (and
+  owned, in shared mode), and its target must match the old bundle value when
+  directly comparable (see [Rotation](#rotation)). An ambiguous PUT can leave
+  the bundle ahead of the gateway, so for those credential types rotation can
+  refuse until that is reconciled.
+
+If journaling fails after every PUT succeeds, the ciphertext is still surfaced
+before the error is reported.
 
 The recipient is the merged PR's author (`GITFORGEOPS_ACTOR` in the bundled
 workflow). A recipient must be a valid GitHub login; a set but blank
@@ -384,6 +414,13 @@ environment, consumer, credential path and optional namespace (default
 the value age-encrypted to whoever started the workflow, and pushes the updated
 stored Consumer to the Admin API with its row `If-Match`. It shares the
 environment's apply concurrency group.
+
+The age ciphertext is computed before the environment secret is written: a
+recipient with no compatible SSH key, or a failed key search, refuses the
+rotation with the secret unchanged. The ciphertext is printed only after the
+write succeeds and before the gateway push, so a failed push leaves the
+recipient holding the new value. Without `--recipient`, no ciphertext is
+created.
 
 The CLI equivalent is
 `gitforgeops rotate --consumer ID --credential PATH [--namespace NS] [--recipient LOGIN]`.
