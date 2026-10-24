@@ -48,40 +48,19 @@ BLOCKING_KINDS = frozenset({"vulnerability", "unsound", "yanked"})
 # Version is deliberately NOT part of the selector: a patch bump of the
 # vulnerable crate must not silently switch the verifier off.
 AGE_ENCRYPTION_ONLY = "age-encryption-only"
-AGE_SSH_RECIPIENT_ONLY = "age-ssh-recipient-only"
 IMPLICIT_REACHABILITY: dict[tuple[str, str, str], str] = {
     ("vulnerability", "RUSTSEC-2023-0071", "rsa"): AGE_ENCRYPTION_ONLY,
-    ("vulnerability", "RUSTSEC-2026-0387", "crypto-bigint"): AGE_SSH_RECIPIENT_ONLY,
 }
-# Packages whose exceptions must always resolve to a verifier. An rsa or
-# crypto-bigint exception the gate cannot machine-check is a policy error,
-# never a pass.
-VERIFIER_REQUIRED_PACKAGES = frozenset({"rsa", "crypto-bigint"})
+# Packages whose exceptions must always resolve to a verifier. An rsa
+# exception the gate cannot machine-check is a policy error, never a pass.
+VERIFIER_REQUIRED_PACKAGES = frozenset({"rsa"})
 
 EXPECTED_RSA_TREE = re.compile(
     r"^rsa v0\.9\.\d+\n"
-    r"└── age v0\.12\.\d+\n"
+    r"└── age v0\.11\.\d+\n"
     r"    └── gitforgeops v\d+\.\d+\.\d+ \([^\n]+\)\n?$"
 )
-# crypto-bigint 0.5 (RUSTSEC-2026-0387) may arrive only through age 0.12's
-# P-256 code (its native tag recipients and HPKE). gitforgeops never builds
-# those recipients or any identity: the shared age API boundary below admits
-# only SSH-recipient encryption. A second path (for example a direct p256, or a
-# jsonwebtoken `rust_crypto` backend that signs) must change this graph.
-EXPECTED_CRYPTO_BIGINT_TREE = re.compile(
-    r"^crypto-bigint v0\.5\.\d+\n"
-    r"└── elliptic-curve v0\.13\.\d+\n"
-    r"    ├── p256 v0\.13\.\d+\n"
-    r"    │   ├── age v0\.12\.\d+\n"
-    r"    │   │   └── gitforgeops v\d+\.\d+\.\d+ \([^\n]+\)\n"
-    r"    │   └── hpke v0\.12\.\d+\n"
-    r"    │       ├── age v0\.12\.\d+ \(\*\)\n"
-    r"    │       └── age-core v0\.12\.\d+\n"
-    r"    │           └── age v0\.12\.\d+ \(\*\)\n"
-    r"    └── primeorder v0\.13\.\d+\n"
-    r"        └── p256 v0\.13\.\d+ \(\*\)\n?$"
-)
-AGE_VERSION_REQUIREMENT = re.compile(r"^0\.12(?:\.\d+)?$")
+AGE_VERSION_REQUIREMENT = re.compile(r"^0\.11(?:\.\d+)?$")
 REQUIRED_AGE_FEATURES = frozenset({"ssh", "armor"})
 REVIEWED_AGE_MODULE = Path("src/secrets/delivery.rs")
 ALLOWED_AGE_REFERENCES = {
@@ -739,12 +718,14 @@ def _read_dependency_tree(
     return result.stdout
 
 
-def _verify_age_api_boundary(snapshot: CandidateSnapshot, label: str) -> None:
-    """Fail closed unless age use is limited to reviewed SSH-recipient encryption."""
+def verify_age_encryption_only(
+    exception: dict[str, Any], snapshot: CandidateSnapshot, dependency_tree_path: Path | None
+) -> None:
+    """Fail closed if the RSA exception outlives its encryption-only premise."""
     manifest = snapshot.manifest
     age_dependency = manifest.get("dependencies", {}).get("age")
     if not isinstance(age_dependency, dict):
-        raise PolicyError(f"{label} requires age to use an explicit dependency table")
+        raise PolicyError("RSA exception requires age to use an explicit dependency table")
     version = age_dependency.get("version")
     features = age_dependency.get("features")
     if (
@@ -754,19 +735,19 @@ def _verify_age_api_boundary(snapshot: CandidateSnapshot, label: str) -> None:
         or set(features) != REQUIRED_AGE_FEATURES
     ):
         raise PolicyError(
-            f"{label} requires an age 0.12 requirement with exactly the "
+            "RSA exception requires an age 0.11 requirement with exactly the "
             "ssh and armor features"
         )
 
     if snapshot.sources is None:
-        raise PolicyError(f"{label} source directory is missing: src")
+        raise PolicyError("RSA exception source directory is missing: src")
     for relative, raw_text in sorted(snapshot.sources.items()):
         # Comments and string literals are prose, not reachable calls.
         text = strip_rust_comments_and_strings(raw_text)
         references = set(AGE_REFERENCE.findall(text))
         if references and relative != REVIEWED_AGE_MODULE:
             raise PolicyError(
-                f"{label} permits age calls only in {REVIEWED_AGE_MODULE}; "
+                f"RSA exception permits age calls only in {REVIEWED_AGE_MODULE}; "
                 f"found {relative}"
             )
         for reference in sorted(references):
@@ -776,7 +757,7 @@ def _verify_age_api_boundary(snapshot: CandidateSnapshot, label: str) -> None:
             )
             if not allowed:
                 raise PolicyError(
-                    f"{label} encountered an unreviewed age API reference: "
+                    f"RSA exception encountered an unreviewed age API reference: "
                     f"{reference}"
                 )
         age_use_statements = re.findall(
@@ -788,17 +769,11 @@ def _verify_age_api_boundary(snapshot: CandidateSnapshot, label: str) -> None:
             != ["use age::ssh::Recipient;"]
         ):
             raise PolicyError(
-                f"{label} permits only the reviewed age::ssh::Recipient import"
+                "RSA exception permits only the reviewed age::ssh::Recipient import"
             )
         if re.search(r"\bextern\s+crate\s+age\b|\bage\s*::\s*\{", text):
-            raise PolicyError(f"{label} forbids alternate age import forms")
+            raise PolicyError("RSA exception forbids alternate age import forms")
 
-
-def verify_age_encryption_only(
-    exception: dict[str, Any], snapshot: CandidateSnapshot, dependency_tree_path: Path | None
-) -> None:
-    """Fail closed if the RSA exception outlives its encryption-only premise."""
-    _verify_age_api_boundary(snapshot, "RSA exception")
     dependency_tree = _read_dependency_tree(
         str(exception["package"]),
         str(exception["version"]),
@@ -808,26 +783,7 @@ def verify_age_encryption_only(
     if not EXPECTED_RSA_TREE.fullmatch(dependency_tree):
         raise PolicyError(
             "RSA exception dependency path changed; expected only "
-            "gitforgeops -> age 0.12.x -> rsa 0.9.x"
-        )
-
-
-def verify_age_ssh_recipient_only(
-    exception: dict[str, Any], snapshot: CandidateSnapshot, dependency_tree_path: Path | None
-) -> None:
-    """Fail closed if crypto-bigint 0.5 gains a path past age's unused P-256 code."""
-    _verify_age_api_boundary(snapshot, "crypto-bigint exception")
-    dependency_tree = _read_dependency_tree(
-        str(exception["package"]),
-        str(exception["version"]),
-        snapshot,
-        dependency_tree_path,
-    )
-    if not EXPECTED_CRYPTO_BIGINT_TREE.fullmatch(dependency_tree):
-        raise PolicyError(
-            "crypto-bigint exception dependency path changed; expected only "
-            "gitforgeops -> age 0.12.x -> p256 0.13.x / hpke 0.12.x -> "
-            "elliptic-curve 0.13.x -> crypto-bigint 0.5.x"
+            "gitforgeops -> age 0.11.x -> rsa 0.9.x"
         )
 
 
@@ -835,7 +791,6 @@ REACHABILITY_VERIFIERS: dict[
     str, Callable[[dict[str, Any], CandidateSnapshot, Path | None], None]
 ] = {
     AGE_ENCRYPTION_ONLY: verify_age_encryption_only,
-    AGE_SSH_RECIPIENT_ONLY: verify_age_ssh_recipient_only,
 }
 
 

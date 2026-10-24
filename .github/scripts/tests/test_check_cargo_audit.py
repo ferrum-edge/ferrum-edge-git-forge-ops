@@ -25,7 +25,7 @@ SPEC.loader.exec_module(check_cargo_audit)
 
 REVIEWED_MANIFEST = (
     '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
-    '[dependencies]\nage = { version = "0.12", features = ["ssh", "armor"] }\n'
+    '[dependencies]\nage = { version = "0.11.5", features = ["ssh", "armor"] }\n'
 )
 REVIEWED_SOURCE = (
     "use age::ssh::Recipient;\n"
@@ -89,34 +89,6 @@ def exception(**overrides):
     return value
 
 
-def crypto_bigint_exception(**overrides):
-    value = exception(
-        advisory="RUSTSEC-2026-0387",
-        package="crypto-bigint",
-        version="0.5.5",
-        rationale="age's P-256 code is compiled but never called.",
-        affected_call_paths=["app -> age -> p256 -> elliptic-curve -> crypto-bigint"],
-    )
-    value.update(overrides)
-    return value
-
-
-def crypto_bigint_tree(root, crypto_bigint="0.5.5", p256="0.13.2", age="0.12.1"):
-    return (
-        f"crypto-bigint v{crypto_bigint}\n"
-        "└── elliptic-curve v0.13.8\n"
-        f"    ├── p256 v{p256}\n"
-        f"    │   ├── age v{age}\n"
-        f"    │   │   └── gitforgeops v0.1.0 ({root})\n"
-        "    │   └── hpke v0.12.0\n"
-        f"    │       ├── age v{age} (*)\n"
-        "    │       └── age-core v0.12.0\n"
-        f"    │           └── age v{age} (*)\n"
-        "    └── primeorder v0.13.6\n"
-        f"        └── p256 v{p256} (*)\n"
-    )
-
-
 def indexed(*exceptions):
     return {check_cargo_audit._finding_key(item): item for item in exceptions}
 
@@ -126,7 +98,7 @@ def write_reviewed_tree(
     manifest=REVIEWED_MANIFEST,
     source=REVIEWED_SOURCE,
     rsa_version="0.9.10",
-    age_version="0.12.1",
+    age_version="0.11.5",
     tree=None,
     extra_sources=None,
 ):
@@ -239,12 +211,12 @@ sys.exit(output["exit"])
 
 REVIEWED_RSA_TREE = (
     "rsa v0.9.10\n"
-    "└── age v0.12.1\n"
+    "└── age v0.11.5\n"
     "    └── gitforgeops v0.1.0 (/candidate)\n"
 )
 SECOND_RSA_PATH_TREE = (
     "rsa v0.9.10\n"
-    "├── age v0.12.1\n"
+    "├── age v0.11.5\n"
     "│   └── gitforgeops v0.1.0 (/candidate)\n"
     "└── forged-free v1.0.0\n"
     "    └── gitforgeops v0.1.0 (/candidate)\n"
@@ -509,8 +481,8 @@ class CargoAuditPolicyTests(unittest.TestCase):
 
     def test_patch_bumps_of_age_and_rsa_are_accepted(self):
         for rsa_version, age_version in (
-            ("0.9.10", "0.12.2"),
-            ("0.9.12", "0.12.9"),
+            ("0.9.10", "0.11.6"),
+            ("0.9.12", "0.11.9"),
         ):
             with self.subTest(rsa=rsa_version, age=age_version):
                 with tempfile.TemporaryDirectory() as directory:
@@ -525,12 +497,12 @@ class CargoAuditPolicyTests(unittest.TestCase):
     def test_feature_order_and_disabled_defaults_are_accepted(self):
         manifests = {
             "reordered": '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
-            '[dependencies]\nage = { version = "0.12", features = ["armor", "ssh"] }\n',
+            '[dependencies]\nage = { version = "0.11", features = ["armor", "ssh"] }\n',
             "no-default-features": '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
-            '[dependencies]\nage = { version = "0.12", default-features = false, '
+            '[dependencies]\nage = { version = "0.11", default-features = false, '
             'features = ["ssh", "armor"] }\n',
             "patch-pinned": '[package]\nname = "gitforgeops"\nversion = "0.1.0"\n'
-            '[dependencies]\nage = { version = "0.12.2", features = ["ssh", "armor"] }\n',
+            '[dependencies]\nage = { version = "0.11.6", features = ["ssh", "armor"] }\n',
         }
         for name, manifest in manifests.items():
             with self.subTest(name=name):
@@ -611,7 +583,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
                 root,
                 tree=(
                     "rsa v0.9.10\n"
-                    "├── age v0.12.1\n"
+                    "├── age v0.11.5\n"
                     f"│   └── gitforgeops v0.1.0 ({root})\n"
                     "└── another-crate v1.0.0\n"
                 ),
@@ -648,7 +620,7 @@ class CargoAuditPolicyTests(unittest.TestCase):
             write_reviewed_tree(root)
             tree = (
                 "rsa v0.9.10\n"
-                "└── age v0.12.1\n"
+                "└── age v0.11.5\n"
                 f"    └── gitforgeops v0.1.0 ({root})\n"
             )
             completed = subprocess.CompletedProcess([], 0, tree, "")
@@ -670,89 +642,6 @@ class CargoAuditPolicyTests(unittest.TestCase):
             self.assertEqual(command[command.index("--target") + 1], "all")
             workdir = Path(run.call_args.kwargs["cwd"]).resolve()
             self.assertNotIn(root.resolve(), (workdir, *workdir.parents))
-
-    def test_crypto_bigint_exception_accepts_the_reviewed_age_path(self):
-        for versions in (
-            {},
-            {"crypto_bigint": "0.5.6", "p256": "0.13.3", "age": "0.12.2"},
-        ):
-            with self.subTest(versions=versions):
-                with tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
-                    tree = write_reviewed_tree(
-                        root, tree=crypto_bigint_tree(root, **versions)
-                    )
-                    verify_candidate_reachability(
-                        indexed(
-                            crypto_bigint_exception(
-                                version=versions.get("crypto_bigint", "0.5.5")
-                            )
-                        ),
-                        root,
-                        tree,
-                    )
-
-    def test_crypto_bigint_exception_requires_its_verifier(self):
-        orphan = crypto_bigint_exception(advisory="RUSTSEC-2099-0011")
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            tree = write_reviewed_tree(root, tree=crypto_bigint_tree(root))
-            with self.assertRaises(check_cargo_audit.PolicyError) as raised:
-                verify_candidate_reachability(indexed(orphan), root, tree)
-            self.assertIn("no reachability verifier", str(raised.exception))
-
-    def test_crypto_bigint_exception_rejects_a_second_dependency_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            second_path = crypto_bigint_tree(root).replace(
-                "    │   └── hpke v0.12.0\n",
-                "    │   ├── hpke v0.12.0\n",
-                1,
-            ).replace(
-                "    │           └── age v0.12.1 (*)\n",
-                "    │           └── age v0.12.1 (*)\n"
-                "    │   └── jsonwebtoken v11.1.0\n"
-                f"    │       └── gitforgeops v0.1.0 ({root})\n",
-                1,
-            )
-            self.assertNotEqual(second_path, crypto_bigint_tree(root))
-            tree = write_reviewed_tree(root, tree=second_path)
-            with self.assertRaises(check_cargo_audit.PolicyError) as raised:
-                verify_candidate_reachability(
-                    indexed(crypto_bigint_exception()), root, tree
-                )
-            self.assertIn("crypto-bigint exception dependency path changed", str(raised.exception))
-
-    def test_crypto_bigint_exception_rejects_age_identity_and_feature_drift(self):
-        cases = {
-            "decryptor": "age::Decryptor",
-            "ssh-identity": "age::ssh::Identity",
-            "x25519-identity": "age::x25519::Identity",
-            "extra-feature": 'features = ["ssh", "armor", "plugin"]',
-        }
-        for name, marker in cases.items():
-            with self.subTest(name=name):
-                with tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
-                    manifest = REVIEWED_MANIFEST
-                    source = REVIEWED_SOURCE
-                    if name == "extra-feature":
-                        manifest = manifest.replace(
-                            'features = ["ssh", "armor"]', marker
-                        )
-                    else:
-                        source += f"fn forbidden() {{ let _ = {marker}; }}\n"
-                    tree = write_reviewed_tree(
-                        root,
-                        manifest=manifest,
-                        source=source,
-                        tree=crypto_bigint_tree(root),
-                    )
-                    with self.assertRaises(check_cargo_audit.PolicyError) as raised:
-                        verify_candidate_reachability(
-                            indexed(crypto_bigint_exception()), root, tree
-                        )
-                    self.assertIn("crypto-bigint exception", str(raised.exception))
 
 
 class CandidateCargoIsolationTests(unittest.TestCase):
@@ -1233,7 +1122,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 write_reviewed_tree(root)
-                rsa, age = locked_package(), locked_package("age", "0.12.1")
+                rsa, age = locked_package(), locked_package("age", "0.11.5")
                 write_lockfile(root, [rsa, age])
                 manifest_text = (root / "Cargo.toml").read_text(encoding="utf-8")
                 lockfile_text = (root / "Cargo.lock").read_text(encoding="utf-8")
@@ -1395,7 +1284,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
             write_lockfile(root, [rsa])
 
             def replace_originals(_snapshot):
-                write_lockfile(root, [locked_package("age", "0.12.1")])
+                write_lockfile(root, [locked_package("age", "0.11.5")])
 
             status, stdout, stderr, calls, http = self.run_gate(
                 root,
@@ -1533,7 +1422,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
                 },
             )
             rsa = locked_package()
-            age = locked_package("age", "0.12.1", dependencies=["rsa"])
+            age = locked_package("age", "0.11.5", dependencies=["rsa"])
             write_lockfile(
                 root,
                 [
@@ -1627,7 +1516,7 @@ class CompleteCargoAuditGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_reviewed_tree(root)
-            rsa, age = locked_package(), locked_package("age", "0.12.1")
+            rsa, age = locked_package(), locked_package("age", "0.11.5")
             write_lockfile(root, [rsa, age])
 
             lookup_order = []
