@@ -7,6 +7,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `age` is pinned to 0.11.5 (from 0.12.1), and `ssh-key` is reduced to its
+  `alloc` and `ed25519` features. `age` 0.12's unused P-256 recipients brought
+  in `p256` 0.13 → `crypto-bigint` 0.5.5 (RUSTSEC-2026-0387, no patched
+  0.5.x), and `ssh-key`'s default features kept optional P-256/P-384/P-521
+  edges in `Cargo.lock`. `crypto-bigint` is now absent from the lockfile, so
+  no audit exception is needed. Dependabot ignores `age` >= 0.12, and the
+  RSA exception's reachability verifier now expects `gitforgeops -> age 0.11.x
+  -> rsa 0.9.x`.
+
 - PluginConfig updates and deletes now send the gateway's
   `expected_proxy_ids` association precondition (#569): the proxies the
   plan accounts for referencing the plugin. Ferrum Edge checks the set

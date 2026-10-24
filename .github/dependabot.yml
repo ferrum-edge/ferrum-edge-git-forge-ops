@@ -10,6 +10,14 @@ updates:
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
+    ignore:
+      # age 0.12 depends unconditionally on p256 0.13 / hpke 0.12, which pull
+      # in crypto-bigint 0.5.5 (RUSTSEC-2026-0387, no patched 0.5.x). Stay on
+      # 0.11 until a release's P-256 stack is on elliptic-curve 0.14
+      # (crypto-bigint >= 0.7.6); see docs/dependency-security.md, "Why age
+      # stays on 0.11". Patch releases within 0.11 are still proposed.
+      - dependency-name: "age"
+        versions: [">= 0.12"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
