@@ -22,6 +22,7 @@ SPEC.loader.exec_module(check_supply_chain)
 
 CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",  # v2.87.29
+    "taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177",  # v2.87.30
 )
 REJECTED_CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",  # retired v2.87.27
