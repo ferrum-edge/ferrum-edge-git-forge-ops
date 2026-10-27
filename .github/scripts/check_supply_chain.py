@@ -384,13 +384,16 @@ STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 # One reviewed pin per Dependabot bump: allow the new pin alongside the current
 # one before switching the workflow, then retire the previous pin in a
-# follow-up PR. v2.87.29 is the only reviewed pin left now that #593 moved
-# rust-ci.yml and security.yml to it and #604 retired v2.87.27.
+# follow-up PR. v2.87.29 remains accepted while #622 moves the workflows to
+# v2.87.30; the older v2.87.27 pin was retired in #604.
 CARGO_AUDIT_ACTIONS = frozenset(
     {
         # v2.87.29 changes other tool manifests; action source and the
         # cargo-audit manifest are unchanged from v2.87.27.
         "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",
+        # v2.87.30 changes other tool manifests; action source and the
+        # cargo-audit manifest remain unchanged.
+        "taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177",
     }
 )
 SECURITY_PUSH_POLICY_PATHS = (

@@ -1,6 +1,6 @@
 FROM ferrumedge/ferrum-edge:v0.9.17@sha256:f8942bed8d3b77c257d7266c9227450dd3d8c139759a07c47d060521a5fd41d1 AS ferrum-edge
 
-FROM rust:1.99.1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS builder
+FROM rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS builder
 # Override verification needs only Git's built-in local inspection commands.
 # Reuse the reviewed builder's Git and its complete ELF dependency closure,
 # including its loader, so Bookworm libraries never mix with Trixie's libc.
@@ -70,7 +70,7 @@ RUN set -eu; \
 # the reviewed security fix is u2. Keep the exact-version, SHA-256-verified
 # package updates until the base's installed package metadata confirms it
 # already carries the fixes. Never `apt-get`.
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 # Install only bytes the builder already verified against the reviewed digests.
 COPY --from=builder /opt/runtime-security-updates /tmp/runtime-security-updates
 RUN dpkg --install /tmp/runtime-security-updates/*.deb \
