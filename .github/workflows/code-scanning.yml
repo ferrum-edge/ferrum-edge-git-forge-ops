@@ -8,7 +8,7 @@ name: Code Scanning
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
     branches: [main]
   push:
     branches: [main]
@@ -24,6 +24,8 @@ on:
       - 'rust-toolchain.toml'
       - 'rust-toolchain'
       - 'Dockerfile'
+      # The image embeds the settings auditor (`include_str!`).
+      - '.github/scripts/audit_settings.py'
       - '.github/workflows/code-scanning.yml'
   schedule:
     - cron: '17 9 * * 1'
@@ -52,6 +54,10 @@ jobs:
 
       - name: Analyze
         uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          # The category these results had in `security.yml`, so existing
+          # alerts and their dismissals carry over.
+          category: .github/workflows/security.yml:codeql
 
   trivy-image:
     runs-on: ubuntu-26.04
@@ -228,3 +234,4 @@ jobs:
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           sarif_file: trivy-results.sarif
+          category: .github/workflows/security.yml:trivy-image

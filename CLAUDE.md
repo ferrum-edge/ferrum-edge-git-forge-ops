@@ -1807,8 +1807,8 @@ Only what the sections above do not already say.
   keys at most `MAX_RENDERED_KEY_BYTES`). `parse_value` messages name keys and
   key paths but never scalar values. `serde_yaml` is a dev-dependency only,
   the gateway oracle in `tests/unit/yaml_compat_tests.rs` and the export
-  readback tests; `Dockerfile` fetches dev-dependencies so `security.yml`
-  can build tests offline. Never enable serde-saphyr's `properties` or
+  readback tests; `Dockerfile` fetches dev-dependencies so
+  `code-scanning.yml` can build tests offline. Never enable serde-saphyr's `properties` or
   `include` features.
 - `src/diagnostics.rs` — shared log sanitizer (`sanitize*` and `safe*`
   adapters). Every diagnostic routes untrusted ids, namespaces, plugin names,

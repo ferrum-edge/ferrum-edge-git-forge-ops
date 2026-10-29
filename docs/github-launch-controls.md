@@ -199,7 +199,8 @@ from removing that check before secrets are used.
 ### Switching the supply-chain policy check
 
 The supply-chain verdict is moving from `security-supply-chain-policy` (in
-`security.yml`, whose definition the pull request under review supplies) to
+`security.yml`, whose definition the pull request under review supplies
+unless the organization ruleset in section 2a lists it) to
 `trusted-supply-chain-policy` (in `supply-chain-policy.yml`, which
 `pull_request_target` always loads from the protected branch; see
 [section 4](#4-restrict-github-actions)). It lands in three steps:
@@ -327,7 +328,10 @@ workflows in `check_supply_chain.REQUIRED_CHECK_WORKFLOWS`:
   `security-supply-chain-policy`)
 - `.github/workflows/validate-pr.yml` (`gitforgeops-required-static-validation`)
 
-As an organization owner, after section 2:
+As an organization owner, after section 2, and only once `main` carries this
+layout (CodeQL in `code-scanning.yml`, not `security.yml`); a listed workflow
+runs `main`'s definition, so listing an older `security.yml` stops every pull
+request:
 
 1. Read this repository's id: `gh api repos/owner/repo --jq .id`.
 2. Decide the bypass actors first: they must equal the `main` ruleset's. On a
@@ -400,7 +404,10 @@ What changes for pull requests:
   `github/codeql-action/upload-sarif`, and the image scan's gate would turn
   each newly fixed CRITICAL/HIGH finding into a merge block. The supply-chain
   checker refuses a CodeQL action in any workflow in
-  `REQUIRED_CHECK_WORKFLOWS`. `rust-ci.yml`'s `coverage` job does run under
+  `REQUIRED_CHECK_WORKFLOWS`, and, since the ban reaches into called
+  workflows, a reusable-workflow call or local action there too.
+  `code-scanning.yml` uploads under the categories these results had in
+  `security.yml`, so existing alerts and dismissals carry over. `rust-ci.yml`'s `coverage` job does run under
   the rule, so it must pass too.
 - A label or review starts no run. The state override is therefore a review,
   not a label event

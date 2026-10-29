@@ -4838,11 +4838,31 @@ def ruleset_workflow_codeql_violations(workflow: str, document: dict) -> list[st
     GitHub refuses to start a ruleset workflow that uses any CodeQL action
     except `github/codeql-action/upload-sarif`. Such a run never starts, so
     every pull request would be blocked. CodeQL lives in `code-scanning.yml`.
+    The ban covers reusable workflows the file calls, so job-level `uses:`
+    and local actions are refused here too.
     """
     if workflow not in set(REQUIRED_CHECK_WORKFLOWS.values()):
         return []
     violations: list[str] = []
+    # The ban also covers CodeQL reached through a reusable workflow, and a
+    # local action can hide it from this scan. None of these workflows needs
+    # either, so both are refused outright.
+    for jobs in (value for key, value in document.items() if key.casefold() == "jobs"):
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in jobs.items():
+            if isinstance(job, dict) and any(key.casefold() == "uses" for key in job):
+                violations.append(
+                    f"{workflow}: job {job_id!r} calls a reusable workflow; a "
+                    "ruleset-required workflow must define its steps itself"
+                )
     for reference in workflow_action_references(document):
+        if reference.strip().startswith("./"):
+            violations.append(
+                f"{workflow}: a ruleset-required workflow may not use the local "
+                f"action {reference!r}"
+            )
+            continue
         action = reference.strip().split("@", 1)[0].casefold()
         if action.startswith("github/codeql-action/") and action != (
             "github/codeql-action/upload-sarif"

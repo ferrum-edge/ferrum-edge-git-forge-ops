@@ -3640,8 +3640,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
                   - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370
             """
         )
-        text = security + "\n" + codeql
+        text = security + "\n" + textwrap.indent(codeql, "  ")
         document = check_supply_chain.parse_workflow(text)
+        self.assertIn("codeql", document["jobs"])
         for workflow in sorted(set(check_supply_chain.REQUIRED_CHECK_WORKFLOWS.values())):
             with self.subTest(workflow=workflow):
                 violations = check_supply_chain.ruleset_workflow_codeql_violations(
@@ -3656,6 +3657,26 @@ class SupplyChainPolicyTests(unittest.TestCase):
             ),
             [],
         )
+        hidden = security + textwrap.indent(textwrap.dedent(
+            """\
+              reusable:
+                uses: ./.github/workflows/code-scanning.yml
+              remote:
+                uses: acme/scans/.github/workflows/codeql.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+              composite:
+                runs-on: ubuntu-26.04
+                steps:
+                  - uses: ./.github/actions/scan
+            """
+        ), "  ")
+        violations = check_supply_chain.ruleset_workflow_codeql_violations(
+            ".github/workflows/security.yml", check_supply_chain.parse_workflow(hidden)
+        )
+        self.assertEqual(len(violations), 4, violations)
+        self.assertIn("job 'reusable' calls a reusable workflow", violations[0])
+        self.assertIn("job 'remote' calls a reusable workflow", violations[1])
+        self.assertIn("local action", violations[2])
+        self.assertIn("local action", violations[3])
         for workflow in sorted(set(check_supply_chain.REQUIRED_CHECK_WORKFLOWS.values())):
             with self.subTest(shipped=workflow):
                 shipped = check_supply_chain.parse_workflow(
