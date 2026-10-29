@@ -4656,6 +4656,10 @@ KNOWN_WORKFLOWS = frozenset({
     "alloy-consumer.yml",
     "apply-on-merge.yml",
     "base-image-pin-canary.yml",
+    # CodeQL and the image scan, which #632 moves out of `security.yml`: a
+    # workflow an organization ruleset requires by path may not use CodeQL
+    # actions other than `upload-sarif`. It reports no required check.
+    "code-scanning.yml",
     "drift-check.yml",
     "lifecycle.yml",
     "materialize-file.yml",
