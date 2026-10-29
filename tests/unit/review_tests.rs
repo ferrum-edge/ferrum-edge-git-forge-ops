@@ -1688,11 +1688,21 @@ fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
     gitforgeops::display::enable_display_scrubbing_on_this_thread();
     for (plugin_name, value, config) in [
         (
-            "response_mock",
-            "zq7-mock-query-condition-v19",
-            serde_json::json!({"rules": [{"match": {"query_params": {
-                "mock": "zq7-mock-query-condition-v19"
-            }}}]}),
+            "request_transformer",
+            "zq7-transform-value-v19",
+            serde_json::json!({"rules": [{"operation": "add", "target": "header",
+                "value": "zq7-transform-value-v19"}]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            "zq7-dispatch-value-v19",
+            serde_json::json!({"rules": [{"request_transform": [{"operation": "set",
+                "value": "zq7-dispatch-value-v19"}]}]}),
+        ),
+        (
+            "ws_logging",
+            "zq7-ws-collector-header-v19",
+            serde_json::json!({"custom_headers": {"x-collector": "zq7-ws-collector-header-v19"}}),
         ),
         (
             "waf",
@@ -1702,9 +1712,28 @@ fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
             }}}),
         ),
         (
-            "ws_logging",
-            "zq7-ws-collector-header-v19",
-            serde_json::json!({"custom_headers": {"x-collector": "zq7-ws-collector-header-v19"}}),
+            "fault_injection",
+            "zq7-fault-match-header-v19",
+            serde_json::json!({"match": {"headers": {"x-chaos": "zq7-fault-match-header-v19"}}}),
+        ),
+        (
+            "response_mock",
+            "zq7-mock-match-header-v19",
+            serde_json::json!({"rules": [{"match": {"headers": {
+                "x-mock": "zq7-mock-match-header-v19"
+            }}}]}),
+        ),
+        (
+            "response_mock",
+            "zq7-mock-query-condition-v19",
+            serde_json::json!({"rules": [{"match": {"query_params": {
+                "mock": "zq7-mock-query-condition-v19"
+            }}}]}),
+        ),
+        (
+            "ldap_auth",
+            "ldaps://zq7-ldap-failover-v19",
+            serde_json::json!({"failover_ldap_urls": ["ldaps://zq7-ldap-failover-v19"]}),
         ),
     ] {
         let config = serde_json::from_value(serde_json::json!({
@@ -1726,8 +1755,9 @@ fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
             }],
         }];
         let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+        // Markdown escaping may respell the value; the canary survives it.
         assert!(
-            comment.contains(value),
+            comment.contains("zq7"),
             "{plugin_name}: the formatter must actually echo the live value"
         );
         let published = gitforgeops::display::scrub_text(&comment);

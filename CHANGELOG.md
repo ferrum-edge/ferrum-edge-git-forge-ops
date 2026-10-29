@@ -37,7 +37,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   longer read as permanent viewer-`diff` drift. Generation refuses `len=` below 24 for
   `load_testing` `key`, `ai_semantic_cache` `redis_integrity_key` and
   `oidc_relying_party` `session.encryption_secret[_previous]`, whose v0.9.19
-  minimum is 32 characters.
+  minimum is 32 characters or bytes (the same for generated ASCII values).
 - `age` is pinned to 0.11.5 (from 0.12.1), and `ssh-key` is reduced to its
   `alloc` and `ed25519` features. `age` 0.12's unused P-256 recipients brought
   in `p256` 0.13 → `crypto-bigint` 0.5.5 (RUSTSEC-2026-0387, no patched
