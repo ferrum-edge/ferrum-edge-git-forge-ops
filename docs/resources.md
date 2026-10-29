@@ -215,12 +215,13 @@ delete the declaration instead: in `exclusive` mode an undeclared live row is
   tags and `!!binary`), `.inf`/`.nan`, integers outside the 64-bit range,
   repeated keys, and more than one document per file.
 - **Refused because YAML readers disagree on them:** raw U+0085, U+2028,
-  U+2029 or U+FEFF characters anywhere but a single leading byte-order mark
-  (write `\N`, `\L`, `\P` or `\uFEFF` in a double-quoted string), anchor
+  U+2029 or U+FEFF characters, including a leading byte-order mark (save the
+  file without one; write the others as `\N`, `\L`, `\P` or `\uFEFF` in a
+  double-quoted string), anchor
   names other than letters, digits, `_` and `-`, a plain value starting with
   `?` inside `[…]` or `{…}` (quote it), and a `|`, `>` or `|+` block scalar
-  that runs to the end of a file without a final newline (add one; `|-` is
-  fine).
+  that runs to the end of a file without a final newline, even if the last
+  line is blank (add the newline; `|-` is fine).
 - **Anchors and aliases** work, but a file may not expand past 1,000,000
   nodes, 64 MiB of scalar text or 128 levels of nesting, counting every copy
   an anchor or alias makes.

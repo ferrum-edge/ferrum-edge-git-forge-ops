@@ -41,8 +41,8 @@
 //! - an integer outside the `i64`/`u64` range;
 //! - more than one document, and a repeated key;
 //! - input the two readers would read differently: a raw U+0085, U+2028 or
-//!   U+2029 (a line break to YAML 1.1 readers only), a U+FEFF other than one
-//!   leading byte-order mark, an anchor name outside `[A-Za-z0-9_-]`, a plain
+//!   U+2029 (a line break to YAML 1.1 readers only), any U+FEFF (including a
+//!   leading byte-order mark), an anchor name outside `[A-Za-z0-9_-]`, a plain
 //!   scalar starting with `?` inside a flow collection (an explicit-key
 //!   indicator to libyaml), and a clipped or kept block scalar (`|`, `>`,
 //!   `|+`; not `|-`) that runs to the end of a file without a line break.
@@ -300,8 +300,9 @@ fn parser_options(max_depth: usize) -> granit_parser::Options {
 ///   many editors and diff views) but content to a YAML 1.2 one, so the same
 ///   bytes would show a reviewer a different document than gitforgeops reads.
 ///   Inside a quoted string they can be written as `\N`, `\L` and `\P`.
-/// - U+FEFF is accepted once, as a leading byte-order mark. libyaml strips
-///   one and keeps a second as part of the first key; granit strips them all.
+/// - U+FEFF, including a leading byte-order mark. libyaml strips one leading
+///   BOM but counts it toward the first line's indentation and keeps a second
+///   as part of the first key; granit strips them all and ignores them.
 /// - Anchor and alias names are limited to libyaml's `[A-Za-z0-9_-]`. granit
 ///   also takes `:` and `?` into a name, where libyaml ends the name and
 ///   reads the rest as content (`&a:b x` is `":b x"` to the gateway).
@@ -309,15 +310,17 @@ fn parser_options(max_depth: usize) -> granit_parser::Options {
 ///   indicator even without a following space; granit reads `?x` as a string.
 /// - A clipped or kept block scalar (`|`, `>`, `|+`) that runs to the end of a
 ///   file without a final line break gains a trailing newline under granit but
-///   not under libyaml. A comment or `...` after it ends the scalar first.
+///   not under libyaml. A comment or `...` after it ends the scalar first. A
+///   trailing whitespace-only line is refused too: past the block's indent it
+///   is content the readers disagree on, and telling the two apart is not
+///   worth the risk when the remedy is a final newline.
 fn refuse_reader_disagreements(contents: &str, max_depth: usize) -> Result<(), YamlError> {
-    let body = contents.strip_prefix('\u{feff}').unwrap_or(contents);
-    for (index, line) in body.split('\n').enumerate() {
+    for (index, line) in contents.split('\n').enumerate() {
         if let Some(column) = line.find(['\u{85}', '\u{2028}', '\u{2029}', '\u{feff}']) {
             return Err(YamlError::new(format!(
                 "raw U+0085, U+2028, U+2029 or U+FEFF at line {} byte {}; YAML readers \
-                 disagree on how to read it — write it as \\N, \\L, \\P or \\uFEFF inside a \
-                 double-quoted string, and keep at most one leading byte-order mark",
+                 disagree on how to read it — remove a byte-order mark, and write the others \
+                 as \\N, \\L, \\P or \\uFEFF inside a double-quoted string",
                 index + 1,
                 column + 1
             )));
@@ -325,14 +328,15 @@ fn refuse_reader_disagreements(contents: &str, max_depth: usize) -> Result<(), Y
     }
     // Blank trailing lines are not safe either: whitespace past the block's
     // indentation is content, and the readers disagree on it too.
-    let unterminated = !body.is_empty() && !body.ends_with(['\n', '\r']);
-    let length = body.chars().count();
+    let unterminated = !contents.is_empty() && !contents.ends_with(['\n', '\r']);
+    let length = contents.chars().count();
     let mut flow_depth = 0usize;
-    // A scan error ends the scan: the real parse reports it.
-    for token in
-        Scanner::with_options(StrInput::new(body), parser_options(max_depth)).map_while(Result::ok)
-    {
-        let (span, token) = token.into_parts();
+    // A scan error is returned here, not left to the reader: serde-saphyr stops
+    // at the first `...` and would never see malformed text after it.
+    for token in Scanner::with_options(StrInput::new(contents), parser_options(max_depth)) {
+        let (span, token) = token
+            .map_err(|error| YamlError::new(error.to_string()))?
+            .into_parts();
         match token {
             TokenType::FlowSequenceStart | TokenType::FlowMappingStart => flow_depth += 1,
             TokenType::FlowSequenceEnd | TokenType::FlowMappingEnd => {
@@ -345,8 +349,8 @@ fn refuse_reader_disagreements(contents: &str, max_depth: usize) -> Result<(), Y
             {
                 return Err(YamlError::at(
                     "anchor or alias name outside letters, digits, `_` and `-`; the \
-                     gateway's YAML reader ends the name at other characters and reads the \
-                     rest as content — rename it",
+                     gateway's YAML reader ends the name early (reading the rest as content) or \
+                     refuses it — rename it",
                     &span,
                 ));
             }

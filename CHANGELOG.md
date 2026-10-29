@@ -552,7 +552,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Refused instead of silently rewritten: application and `%TAG` tags,
   `!!binary` and other non-core tags, `.inf`/`.nan` (formerly JSON `null`),
   and input the two parsers would read differently (raw U+0085/U+2028/U+2029,
-  U+FEFF other than one leading byte-order mark, anchor names outside
+  any U+FEFF including a leading byte-order mark, anchor names outside
   `[A-Za-z0-9_-]`, a `?`-leading plain scalar in a flow collection, and a
   `|`/`>` block scalar running to the end of a file without a final newline). Anchor
   copies count against the limits like alias copies. Rendering refuses a

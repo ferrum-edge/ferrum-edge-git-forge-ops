@@ -38,13 +38,16 @@ fn json_shaped(value: &serde_yaml::Value) -> bool {
 }
 
 /// Documents the gateway reads that gitforgeops refuses on purpose.
-const REFUSED_ON_PURPOSE: [&str; 4] = [
+const REFUSED_ON_PURPOSE: [&str; 5] = [
     // YAML 1.2 forbids a plain `-` before a flow indicator; libyaml allows it.
     "[-]\n",
     // Raw line separators (see `yaml::parse_value`).
     "k: \"\u{85}\u{2028}\"\n",
     // serde_yaml keeps the undecoded text; other readers decode it.
     "k: !!binary aGk=\n",
+    // A leading byte-order mark: libyaml counts it toward the first line's
+    // indentation, so some documents read differently (see below).
+    "\u{feff}k: bom\n",
     // serde_yaml reads a global tag as a bare string, turning `1` into "1".
     "%TAG !e! tag:example.com,2000:\n---\nk: !e!x 1\n",
 ];
@@ -414,15 +417,22 @@ fn reader_disagreements_are_refused() {
     ] {
         documents.push(anchor.to_string());
     }
-    // Repeated byte-order marks.
+    // Byte-order marks, leading or not.
     for bom in [
+        "\u{feff}k: v\n",
         "\u{feff}\u{feff}k: v\n",
         "\u{feff}\u{feff}\u{feff}k: v\n",
         "k: \u{feff}v\n",
+        "\u{feff}k: |1\n  abc\n# footer",
+        "\u{feff}- |1\n  abc\n...",
+        "\u{feff}k: |1\r\n  abc\r\n# footer",
+        "\u{feff}---\n[? x]\n",
     ] {
         documents.push(bom.to_string());
     }
-    // Block scalars ending the file without a final line break.
+    // Block scalars running to the end of a file without a final line break.
+    // Some of these (a whitespace-only last line within the indent) read the
+    // same under both readers; they are refused conservatively.
     for header in ["|", "|+", ">", ">+", "|2", ">2", "|+2", "|2+"] {
         for body in [
             "abc",
@@ -478,7 +488,6 @@ fn reader_disagreements_are_refused() {
         "[? x]\n",
         "- ?x\n",
         "k: ?x\n",
-        "\u{feff}k: v\n",
         "k: \"\\uFEFFv\"\n",
     ] {
         assert_agrees(document);
@@ -521,6 +530,32 @@ fn long_keys_render_readably_or_are_refused() {
         }
     }
     assert!(yaml::to_string(&json!({ "é".repeat(513): 1 })).is_err());
+}
+
+/// serde-saphyr stops at the first `...`; malformed text after it must still
+/// refuse the settings file rather than be ignored.
+#[test]
+fn settings_refuse_malformed_text_after_a_document_end() {
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Settings {
+        environments: std::collections::BTreeMap<String, Value>,
+    }
+    for document in [
+        "environments: {prod: {}}\n...\n[",
+        "environments: {prod: {}}\n...\n\"unclosed",
+        "environments: {prod: {}}\n...\nk: &a.b v\n",
+    ] {
+        assert!(
+            yaml::from_str::<Settings>(document).is_err(),
+            "{document:?}"
+        );
+        assert!(
+            yaml::parse_value(document, RESOURCE_LIMITS).is_err(),
+            "{document:?}"
+        );
+    }
+    assert!(yaml::from_str::<Settings>("environments: {prod: {}}\n...\n").is_ok());
 }
 
 /// Typed settings read plain scalars into string fields as the gateway's
