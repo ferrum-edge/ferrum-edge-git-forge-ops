@@ -1680,6 +1680,95 @@ fn review_comment_bodies_lose_registered_values_at_the_sink() {
     assert!(!published.contains("field\\_canary"), "{published}");
 }
 
+/// A live value on a plugin path Ferrum Edge v0.9.19 started redacting is
+/// registered from the live snapshot, so a diff that echoes it loses it at
+/// the PR comment's sink.
+#[test]
+fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    for (plugin_name, value, config) in [
+        (
+            "request_transformer",
+            "zq7-transform-value-v19",
+            serde_json::json!({"rules": [{"operation": "add", "target": "header",
+                "value": "zq7-transform-value-v19"}]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            "zq7-dispatch-value-v19",
+            serde_json::json!({"rules": [{"request_transform": [{"operation": "set",
+                "value": "zq7-dispatch-value-v19"}]}]}),
+        ),
+        (
+            "ws_logging",
+            "zq7-ws-collector-header-v19",
+            serde_json::json!({"custom_headers": {"x-collector": "zq7-ws-collector-header-v19"}}),
+        ),
+        (
+            "waf",
+            "zq7-waf-header-present-v19",
+            serde_json::json!({"global_exemptions": {"header_present": {
+                "x-trusted-hop": "zq7-waf-header-present-v19"
+            }}}),
+        ),
+        (
+            "fault_injection",
+            "zq7-fault-match-header-v19",
+            serde_json::json!({"match": {"headers": {"x-chaos": "zq7-fault-match-header-v19"}}}),
+        ),
+        (
+            "response_mock",
+            "zq7-mock-match-header-v19",
+            serde_json::json!({"rules": [{"match": {"headers": {
+                "x-mock": "zq7-mock-match-header-v19"
+            }}}]}),
+        ),
+        (
+            "response_mock",
+            "zq7-mock-query-condition-v19",
+            serde_json::json!({"rules": [{"match": {"query_params": {
+                "mock": "zq7-mock-query-condition-v19"
+            }}}]}),
+        ),
+        (
+            "ldap_auth",
+            "ldaps://zq7-ldap-failover-v19",
+            serde_json::json!({"failover_ldap_urls": ["ldaps://zq7-ldap-failover-v19"]}),
+        ),
+    ] {
+        let config = serde_json::from_value(serde_json::json!({
+            "plugin_configs": [{"id": "plugin", "namespace": "ferrum",
+                "plugin_name": plugin_name, "scope": "global", "config": config}]
+        }))
+        .unwrap();
+        gitforgeops::display::register_gateway_config(&config).unwrap();
+        let diffs = vec![ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "PluginConfig".to_string(),
+            id: "plugin".to_string(),
+            namespace: "ferrum".to_string(),
+            // The changes table renders the field, so the value travels there.
+            details: vec![FieldChange {
+                field: format!("config {value}"),
+                old_value: value.to_string(),
+                new_value: "changed".to_string(),
+            }],
+        }];
+        let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+        // Markdown escaping may respell the value; the canary survives it.
+        assert!(
+            comment.contains("zq7"),
+            "{plugin_name}: the formatter must actually echo the live value"
+        );
+        let published = gitforgeops::display::scrub_text(&comment);
+        assert!(!published.contains("zq7"), "{plugin_name}: {published}");
+        assert!(
+            published.contains("[REDACTED]"),
+            "{plugin_name}: {published}"
+        );
+    }
+}
+
 /// Both formatter paths must be protected by the final publication sink:
 /// inline code collapses CRLF to one space; prose escapes Markdown punctuation.
 #[test]

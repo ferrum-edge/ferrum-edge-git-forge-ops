@@ -70,7 +70,7 @@ use crate::config::schema::Consumer;
 use crate::config::GatewayConfig;
 use crate::error::Error;
 use crate::http_client::{BackupSnapshot, SealStrictness};
-use crate::secrets::plugin_config::{sensitive_string_paths, ConfigPathComponent};
+use crate::secrets::plugin_config::{export_redacted_paths, ConfigPathComponent};
 
 /// Admin API path of the read-only export.
 pub const CONFIG_EXPORT_PATH: &str = "/config/export";
@@ -568,7 +568,7 @@ fn desired_comparison_rows(
     for plugin in &desired.plugin_configs {
         let value = serde_json::to_value(plugin)?;
         let mut secrets = BTreeSet::new();
-        for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
+        for path in export_redacted_paths(&plugin.plugin_name, &plugin.config) {
             let mut pointer = String::from("/config");
             for component in &path {
                 let segment = match component {

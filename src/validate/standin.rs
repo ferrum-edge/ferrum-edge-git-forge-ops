@@ -187,6 +187,10 @@ pub(crate) fn with_validation_standins_for_report(
             plugin.plugin_name.as_str(),
             &plugin.config,
         );
+        let scheme = crate::secrets::plugin_config::declared_ldap_scheme(
+            plugin.plugin_name.as_str(),
+            &plugin.config,
+        );
         let namespace = plugin.namespace.clone();
         let plugin_id = plugin.id.clone();
         let plugin_name = plugin.plugin_name.clone();
@@ -197,6 +201,7 @@ pub(crate) fn with_validation_standins_for_report(
             &plugin_id,
             &plugin_name,
             &endpoints,
+            scheme,
             &mut path,
             &eligible,
         );
@@ -205,12 +210,14 @@ pub(crate) fn with_validation_standins_for_report(
     changed.then_some(patched)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn substitute_plugin_leaves(
     value: &mut serde_json::Value,
     namespace: &str,
     plugin_id: &str,
     plugin_name: &str,
     endpoints: &std::collections::BTreeSet<Vec<ConfigPathComponent>>,
+    scheme: Option<&'static str>,
     path: &mut Vec<ConfigPathComponent>,
     eligible: &impl Fn(&str) -> bool,
 ) -> bool {
@@ -234,7 +241,9 @@ fn substitute_plugin_leaves(
             *text = if endpoints.contains(path) {
                 validation_url_standin(
                     &slot,
-                    crate::secrets::plugin_config::endpoint_scheme(plugin_name, path),
+                    scheme.unwrap_or_else(|| {
+                        crate::secrets::plugin_config::endpoint_scheme(plugin_name, path)
+                    }),
                 )
             } else {
                 validation_standin(&slot, None)
@@ -250,6 +259,7 @@ fn substitute_plugin_leaves(
                     plugin_id,
                     plugin_name,
                     endpoints,
+                    scheme,
                     path,
                     eligible,
                 );
@@ -265,6 +275,7 @@ fn substitute_plugin_leaves(
                     plugin_id,
                     plugin_name,
                     endpoints,
+                    scheme,
                     path,
                     eligible,
                 );

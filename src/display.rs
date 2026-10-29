@@ -1778,6 +1778,53 @@ mod tests {
         assert!(!error.contains("pw-q7"), "{error}");
     }
 
+    /// Ferrum Edge v0.9.19 redacts operator-chosen plugin values (a
+    /// `request_transformer` rule value, a `response_mock` match condition).
+    /// They are protected when long enough, but a short one is an ordinary
+    /// setting and does not refuse the run. A declared shared secret such as
+    /// a `waf` `header_present` value still does.
+    #[test]
+    fn short_operator_plugin_values_do_not_refuse_but_declared_secrets_do() {
+        enable();
+        const LONG: &str = "Q7-transform-long-value-8e21";
+        let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "plugin_configs": [
+                {"id": "transform", "namespace": "ferrum", "plugin_name": "request_transformer",
+                    "scope": "global",
+                    "config": {"rules": [
+                        {"operation": "add", "target": "header", "value": "1"},
+                        {"operation": "add", "target": "header", "value": LONG}
+                    ]}},
+                {"id": "mock", "namespace": "ferrum", "plugin_name": "response_mock",
+                    "scope": "global",
+                    "config": {"rules": [{"match": {"query_params": {"page": "2"}}}]}}
+            ]
+        }))
+        .unwrap();
+        crate::http_client::BackupSnapshot::from_body(&serde_json::to_string(&config).unwrap())
+            .unwrap();
+        registration_result().unwrap();
+        assert_eq!(scrub_text("value 1 page 2"), "value 1 page 2");
+        assert_eq!(scrub_text(LONG), REDACTION);
+
+        LOCAL.with(|local| *local.borrow_mut() = Registry::default());
+        let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "plugin_configs": [{"id": "waf", "namespace": "ferrum", "plugin_name": "waf",
+                "scope": "global",
+                "config": {"global_exemptions": {"header_present": {"x-hop": "pw-q7"}}}}]
+        }))
+        .unwrap();
+        let error =
+            crate::http_client::BackupSnapshot::from_body(&serde_json::to_string(&config).unwrap())
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("PluginConfig ferrum/waf config.global_exemptions.header_present.x-hop"),
+            "{error}"
+        );
+        assert!(!error.contains("pw-q7"), "{error}");
+    }
+
     #[test]
     fn live_admission_refuses_a_formatter_spelling_too_short_to_protect() {
         enable();

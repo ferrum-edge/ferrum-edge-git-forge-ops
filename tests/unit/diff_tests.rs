@@ -418,6 +418,139 @@ fn plugin_config_placeholder_leaves_are_masked_without_hiding_siblings() {
     assert!(!is_sensitive_diff_field("PluginConfig", "plugin_name"));
 }
 
+/// A brokered value on a path Ferrum Edge v0.9.19 started redacting (here a
+/// `request_transformer` rule value) is masked per leaf; a sibling setting
+/// that changed stays visible.
+#[test]
+fn edge_0_9_19_brokered_plugin_values_are_masked_without_hiding_siblings() {
+    let mut desired_plugin = make_plugin_config(
+        "transform",
+        "ferrum",
+        "request_transformer",
+        PluginScope::Global,
+    );
+    desired_plugin.config = serde_json::json!({"rules": [{
+        "operation": "add",
+        "target": "header",
+        "value": "${gh-env-secret:alloc=require}"
+    }]});
+    let desired = GatewayConfig {
+        plugin_configs: vec![desired_plugin],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_plugin = make_plugin_config(
+        "transform",
+        "ferrum",
+        "request_transformer",
+        PluginScope::Global,
+    );
+    live_plugin.config = serde_json::json!({"rules": [{
+        "operation": "add",
+        "target": "header",
+        "value": "Bearer live-upstream-credential"
+    }]});
+    let mut actual = GatewayConfig {
+        plugin_configs: vec![live_plugin.clone()],
+        ..GatewayConfig::default()
+    };
+    mask_without_bundle(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+
+    live_plugin.config["rules"][0]["target"] = serde_json::json!("query");
+    let mut actual = GatewayConfig {
+        plugin_configs: vec![live_plugin],
+        ..GatewayConfig::default()
+    };
+    mask_without_bundle(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    let rendered = format!("{:?}", diffs[0].details);
+    assert!(!rendered.contains("live-upstream-credential"), "{rendered}");
+}
+
+/// Every path Ferrum Edge v0.9.19 added to its redaction schema: a brokered
+/// leaf is masked against any live value, and a changed sibling on the same
+/// plugin is still reported.
+#[test]
+fn edge_0_9_19_brokered_plugin_paths_are_all_masked_per_leaf() {
+    const PLACEHOLDER: &str = "${gh-env-secret:alloc=require}";
+    const LIVE: &str = "live-secret-material-v19";
+    for (plugin_name, pointer, config) in [
+        (
+            "request_transformer",
+            "/rules/0/value",
+            serde_json::json!({"rules": [{"operation": "add", "value": PLACEHOLDER}]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            "/rules/0/request_transform/0/value",
+            serde_json::json!({"rules": [{"request_transform": [{"value": PLACEHOLDER}]}]}),
+        ),
+        (
+            "ws_logging",
+            "/custom_headers/x-collector",
+            serde_json::json!({"custom_headers": {"x-collector": PLACEHOLDER}}),
+        ),
+        (
+            "waf",
+            "/global_exemptions/header_present/x-hop",
+            serde_json::json!({"global_exemptions": {"header_present": {"x-hop": PLACEHOLDER}}}),
+        ),
+        (
+            "fault_injection",
+            "/match/headers/x-chaos",
+            serde_json::json!({"match": {"headers": {"x-chaos": PLACEHOLDER}}}),
+        ),
+        (
+            "response_mock",
+            "/rules/0/match/headers/x-mock",
+            serde_json::json!({"rules": [{"match": {"headers": {"x-mock": PLACEHOLDER}}}]}),
+        ),
+        (
+            "response_mock",
+            "/rules/0/match/query_params/mock",
+            serde_json::json!({"rules": [{"match": {"query_params": {"mock": PLACEHOLDER}}}]}),
+        ),
+        (
+            "ldap_auth",
+            "/failover_ldap_urls/0",
+            serde_json::json!({"failover_ldap_urls": [PLACEHOLDER]}),
+        ),
+    ] {
+        let mut desired_plugin =
+            make_plugin_config("edge", "ferrum", plugin_name, PluginScope::Global);
+        desired_plugin.config = config;
+        desired_plugin.config["sibling"] = serde_json::json!("declared");
+        let desired = GatewayConfig {
+            plugin_configs: vec![desired_plugin.clone()],
+            ..GatewayConfig::default()
+        };
+
+        let mut live_plugin = desired_plugin;
+        *live_plugin.config.pointer_mut(pointer).unwrap() = serde_json::json!(LIVE);
+        let mut actual = GatewayConfig {
+            plugin_configs: vec![live_plugin.clone()],
+            ..GatewayConfig::default()
+        };
+        mask_without_bundle(&desired, &mut actual);
+        let diffs = compute_diff(&desired, &actual).unwrap();
+        assert!(diffs.is_empty(), "{plugin_name} {pointer}: {diffs:?}");
+
+        live_plugin.config["sibling"] = serde_json::json!("drifted");
+        let mut actual = GatewayConfig {
+            plugin_configs: vec![live_plugin],
+            ..GatewayConfig::default()
+        };
+        mask_without_bundle(&desired, &mut actual);
+        let diffs = compute_diff(&desired, &actual).unwrap();
+        assert_eq!(diffs.len(), 1, "{plugin_name} {pointer}: {diffs:?}");
+        let rendered = format!("{:?}", diffs[0].details);
+        assert!(!rendered.contains(LIVE), "{plugin_name}: {rendered}");
+    }
+}
+
 fn make_plugin_config(
     id: &str,
     namespace: &str,

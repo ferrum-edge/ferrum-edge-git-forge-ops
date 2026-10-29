@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
+use super::MIN_SCRUB_LENGTH;
 use crate::plugin_catalog::is_builtin;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -23,6 +24,16 @@ pub(crate) enum ConfigPathComponent {
 enum RuleKind {
     Secret,
     Endpoint,
+    /// A value the gateway writes or matches on a request (a rule's header
+    /// value, a match condition). Edge redacts it because an operator may put
+    /// a credential there, so a string of at least [`MIN_SCRUB_LENGTH`] bytes
+    /// is brokered, masked, scrubbed and gated like a secret. Such values are
+    /// just as often ordinary settings (`value: "1"`), so a shorter one, which
+    /// could neither be brokered nor scrubbed, stays literal, and none is
+    /// rule-declared for display admission. Whatever its length or JSON type,
+    /// the matched value is a site `/config/export` fingerprints
+    /// ([`export_redacted_paths`]).
+    Value,
     KafkaProperties,
 }
 
@@ -43,6 +54,13 @@ const fn endpoint(path: &'static [&'static str]) -> Rule {
     Rule {
         path,
         kind: RuleKind::Endpoint,
+    }
+}
+
+const fn operator_value(path: &'static [&'static str]) -> Rule {
+    Rule {
+        path,
+        kind: RuleKind::Value,
     }
 }
 
@@ -132,6 +150,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         ],
         "ldap_auth" => vec![
             endpoint(&["ldap_url"]),
+            endpoint(&["failover_ldap_urls"]),
             secret(&["service_account_password"]),
         ],
         "soap_ws_security" => vec![
@@ -184,7 +203,28 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             secret(&["authorization_header"]),
             secret(&["custom_headers", "*"]),
         ],
-        "ws_logging" => vec![endpoint(&["endpoint_url"])],
+        // Ferrum Edge v0.9.19 redacts these, so `/config/export` fingerprints
+        // them. `header_present` values are shared secrets (Edge requires at
+        // least 16 characters); the rest are operator-chosen values with no
+        // gateway minimum.
+        "ws_logging" => vec![
+            endpoint(&["endpoint_url"]),
+            operator_value(&["custom_headers", "*"]),
+        ],
+        "waf" => vec![secret(&["global_exemptions", "header_present", "*"])],
+        "request_transformer" => vec![operator_value(&["rules", "*", "value"])],
+        "mesh_route_dispatch" => vec![operator_value(&[
+            "rules",
+            "*",
+            "request_transform",
+            "*",
+            "value",
+        ])],
+        "fault_injection" => vec![operator_value(&["match", "headers", "*"])],
+        "response_mock" => vec![
+            operator_value(&["rules", "*", "match", "headers", "*"]),
+            operator_value(&["rules", "*", "match", "query_params", "*"]),
+        ],
         "proxy_alerts" => vec![
             endpoint(&["channels", "*", "webhook_url"]),
             endpoint(&["channels", "*", "url"]),
@@ -264,12 +304,33 @@ pub(crate) fn classify_plugin_config(
         };
     }
 
+    // Operator values too short to broker or scrub are ordinary settings: the
+    // schema rule, not the key-name heuristic, decides them.
+    let mut ordinary = BTreeSet::new();
     for rule in rules_for(plugin_name) {
-        apply_rule(config, rule.path, rule.kind, &root, &mut sensitive);
+        if matches!(rule.kind, RuleKind::Value) {
+            let mut values = BTreeSet::new();
+            apply_rule(config, rule.path, rule.kind, &root, &mut values);
+            for path in values {
+                match value_at(config, &path) {
+                    Some(Value::String(text)) if text.len() < MIN_SCRUB_LENGTH => {
+                        ordinary.insert(path);
+                    }
+                    _ => {
+                        sensitive.insert(path);
+                    }
+                }
+            }
+        } else {
+            apply_rule(config, rule.path, rule.kind, &root, &mut sensitive);
+        }
     }
     let mut heuristic = BTreeSet::new();
     collect_heuristic_paths(config, &root, &mut heuristic, true);
-    let unbrokered = heuristic.difference(&sensitive).cloned().collect();
+    let unbrokered = heuristic
+        .into_iter()
+        .filter(|path| !sensitive.contains(path) && !ordinary.contains(path))
+        .collect();
     PluginConfigClassification {
         sensitive: sensitive.into_iter().collect(),
         unbrokered,
@@ -288,6 +349,69 @@ pub(crate) fn sensitive_string_paths(
         sensitive.extend(classification.unbrokered);
     }
     sensitive.into_iter().collect()
+}
+
+/// Every location `/config/export` fingerprints that the repository can
+/// put its declared value back at: [`sensitive_string_paths`], plus the node
+/// each secret, endpoint or [`RuleKind::Value`] rule matches, as a whole.
+/// Edge fingerprints the whole non-null value at a secret site, and at an
+/// endpoint site that is not a string, whatever its length or JSON type (a
+/// `request_transformer` body rule's `value` may be `true`, a number or an
+/// object; `failover_ldap_urls` is an array). Matching the site itself keeps
+/// such a value comparable against a baseline instead of reading as drift
+/// or as a masked ancestor.
+pub(crate) fn export_redacted_paths(
+    plugin_name: &str,
+    config: &Value,
+) -> BTreeSet<Vec<ConfigPathComponent>> {
+    let mut found: BTreeSet<_> = sensitive_string_paths(plugin_name, config)
+        .into_iter()
+        .collect();
+    if !config.is_object() || !is_builtin(plugin_name) {
+        return found;
+    }
+    for rule in rules_for(plugin_name) {
+        if matches!(rule.kind, RuleKind::KafkaProperties) {
+            continue;
+        }
+        walk_rule(config, rule.path, &[], &mut |node, path, complete| {
+            if complete && !node.is_null() {
+                found.insert(path.to_vec());
+            }
+        });
+    }
+    found
+}
+
+/// The LDAP scheme an `ldap_auth` config already commits to, if any.
+///
+/// Edge refuses an `ldap_url` and `failover_ldap_urls` that mix `ldap` and
+/// `ldaps`, so a validator stand-in for an unresolved endpoint must use the
+/// scheme of a literal or resolved one (the primary first) rather than the
+/// `ldaps` default of [`endpoint_scheme`].
+pub(crate) fn declared_ldap_scheme(plugin_name: &str, config: &Value) -> Option<&'static str> {
+    if plugin_name != "ldap_auth" {
+        return None;
+    }
+    let endpoints = endpoint_paths(plugin_name, config);
+    let is_primary = |path: &[ConfigPathComponent]| matches!(path.first(), Some(ConfigPathComponent::Key(key)) if normalize_key(key) == "ldapurl");
+    endpoints
+        .iter()
+        .filter(|path| is_primary(path))
+        .chain(endpoints.iter().filter(|path| !is_primary(path)))
+        .find_map(|path| {
+            let text = value_at(config, path)?
+                .as_str()?
+                .trim()
+                .to_ascii_lowercase();
+            if text.starts_with("ldaps://") {
+                Some("ldaps")
+            } else if text.starts_with("ldap://") {
+                Some("ldap")
+            } else {
+                None
+            }
+        })
 }
 
 /// The leaves this plugin's schema rules classify as **endpoints** — a URL,
@@ -326,8 +450,9 @@ pub(crate) fn endpoint_paths(
 /// secrets and endpoints, and the Kafka producer properties named like a
 /// credential (`sasl.password`). The rest of the Kafka properties are left
 /// out (that rule keeps every property not on a safe list, such as
-/// `security.protocol: SSL`), as are the key/URL heuristics and every leaf of
-/// a custom plugin or of a config that is not an object.
+/// `security.protocol: SSL`), as are [`RuleKind::Value`] leaves, the key/URL
+/// heuristics and every leaf of a custom plugin or of a config that is not an
+/// object.
 ///
 /// Display admission refuses the run for a declared leaf too short to
 /// protect, while a short leaf only the heuristics flag (a header name under
@@ -345,6 +470,7 @@ pub(crate) fn rule_declared_paths(
             RuleKind::Secret | RuleKind::Endpoint => {
                 apply_rule(config, rule.path, rule.kind, &[], &mut found);
             }
+            RuleKind::Value => {}
             RuleKind::KafkaProperties => {
                 let mut properties = BTreeSet::new();
                 apply_rule(config, rule.path, rule.kind, &[], &mut properties);
@@ -432,11 +558,23 @@ fn apply_rule(
     current: &[ConfigPathComponent],
     found: &mut BTreeSet<Vec<ConfigPathComponent>>,
 ) {
+    walk_rule(value, path, current, &mut |node, at, complete| match kind {
+        RuleKind::KafkaProperties if complete => collect_kafka_properties(node, at, found),
+        _ => collect_string_paths(node, at, found),
+    });
+}
+
+/// Walk a rule path, calling `visit` with each node it reaches and whether
+/// the whole path matched (`false` for a scalar met part-way, which
+/// [`apply_rule`] still collects so a mis-shaped config fails closed).
+fn walk_rule(
+    value: &Value,
+    path: &[&str],
+    current: &[ConfigPathComponent],
+    visit: &mut dyn FnMut(&Value, &[ConfigPathComponent], bool),
+) {
     let Some((head, rest)) = path.split_first() else {
-        match kind {
-            RuleKind::Secret | RuleKind::Endpoint => collect_string_paths(value, current, found),
-            RuleKind::KafkaProperties => collect_kafka_properties(value, current, found),
-        }
+        visit(value, current, true);
         return;
     };
 
@@ -446,7 +584,7 @@ fn apply_rule(
                 for (key, child) in map {
                     let mut next = current.to_vec();
                     next.push(ConfigPathComponent::Key(key.clone()));
-                    apply_rule(child, rest, kind, &next, found);
+                    walk_rule(child, rest, &next, visit);
                 }
             } else {
                 let wanted = normalize_key(head);
@@ -454,7 +592,7 @@ fn apply_rule(
                     if normalize_key(key) == wanted {
                         let mut next = current.to_vec();
                         next.push(ConfigPathComponent::Key(key.clone()));
-                        apply_rule(child, rest, kind, &next, found);
+                        walk_rule(child, rest, &next, visit);
                     }
                 }
             }
@@ -463,16 +601,10 @@ fn apply_rule(
             for (index, child) in items.iter().enumerate() {
                 let mut next = current.to_vec();
                 next.push(ConfigPathComponent::Index(index));
-                apply_rule(
-                    child,
-                    if *head == "*" { rest } else { path },
-                    kind,
-                    &next,
-                    found,
-                );
+                walk_rule(child, if *head == "*" { rest } else { path }, &next, visit);
             }
         }
-        _ => collect_string_paths(value, current, found),
+        _ => visit(value, current, false),
     }
 }
 
@@ -727,6 +859,166 @@ mod tests {
         );
 
         assert!(classification.unbrokered.is_empty());
+    }
+
+    /// Operator-chosen values Edge v0.9.19 redacts are brokered when long
+    /// enough to protect and otherwise stay ordinary settings, but every one
+    /// is an export site, and none is rule-declared for display admission.
+    #[test]
+    fn operator_values_are_sensitive_when_protectable_and_always_export_sites() {
+        let transform = serde_json::json!({"rules": [
+            {"operation": "add", "target": "header", "value": "Bearer long-upstream-value"},
+            {"operation": "add", "target": "header", "value": "1"},
+            {"operation": "add", "target": "body", "value": true},
+            {"operation": "add", "target": "body", "value": {"enabled": "yes"}}
+        ]});
+        let classification = classify_plugin_config("request_transformer", &transform);
+        assert_eq!(dotted(classification.sensitive), vec!["rules.[0].value"]);
+        assert!(classification.unbrokered.is_empty());
+        assert_eq!(
+            dotted(sensitive_string_paths("request_transformer", &transform)),
+            vec!["rules.[0].value"]
+        );
+        assert_eq!(
+            dotted(
+                export_redacted_paths("request_transformer", &transform)
+                    .into_iter()
+                    .collect()
+            ),
+            vec![
+                "rules.[0].value",
+                "rules.[1].value",
+                "rules.[2].value",
+                "rules.[3].value"
+            ]
+        );
+        assert!(rule_declared_paths("request_transformer", &transform).is_empty());
+
+        // A short header-map condition the key-name heuristic would flag is
+        // decided by the schema rule: an ordinary setting, not a review item.
+        for (plugin, config, site) in [
+            (
+                "mesh_route_dispatch",
+                serde_json::json!({"rules": [{"request_transform": [{"value": "on"}]}]}),
+                "rules.[0].request_transform.[0].value",
+            ),
+            (
+                "fault_injection",
+                serde_json::json!({"match": {"headers": {"x-chaos": "on"}}}),
+                "match.headers.x-chaos",
+            ),
+            (
+                "response_mock",
+                serde_json::json!({"rules": [{"match": {"query_params": {"page": "2"}}}]}),
+                "rules.[0].match.query_params.page",
+            ),
+            (
+                "ws_logging",
+                serde_json::json!({"custom_headers": {"x-env": "prod"}}),
+                "custom_headers.x-env",
+            ),
+        ] {
+            let classification = classify_plugin_config(plugin, &config);
+            assert!(classification.sensitive.is_empty(), "{plugin}");
+            assert!(classification.unbrokered.is_empty(), "{plugin}");
+            assert!(
+                sensitive_string_paths(plugin, &config).is_empty(),
+                "{plugin}"
+            );
+            assert_eq!(
+                dotted(export_redacted_paths(plugin, &config).into_iter().collect()),
+                vec![site],
+                "{plugin}"
+            );
+            assert!(rule_declared_paths(plugin, &config).is_empty(), "{plugin}");
+        }
+
+        let ws =
+            serde_json::json!({"custom_headers": {"authorization": "Bearer long-token-value"}});
+        assert_eq!(
+            dotted(sensitive_string_paths("ws_logging", &ws)),
+            vec!["custom_headers.authorization"]
+        );
+        assert!(rule_declared_paths("ws_logging", &ws).is_empty());
+
+        let waf = serde_json::json!({"global_exemptions": {"header_present": {"x-hop": "s"}}});
+        assert_eq!(
+            dotted(rule_declared_paths("waf", &waf).into_iter().collect()),
+            vec!["global_exemptions.header_present.x-hop"]
+        );
+    }
+
+    #[test]
+    fn rule_matched_nodes_are_export_sites() {
+        let ldap = serde_json::json!({
+            "ldap_url": "ldaps://ldap1.example:636",
+            "failover_ldap_urls": ["ldaps://ldap2.example:636"]
+        });
+        assert_eq!(
+            dotted(
+                export_redacted_paths("ldap_auth", &ldap)
+                    .into_iter()
+                    .collect()
+            ),
+            vec!["failover_ldap_urls", "failover_ldap_urls.[0]", "ldap_url"]
+        );
+    }
+
+    #[test]
+    fn ldap_schemes_follow_the_committed_endpoints() {
+        assert_eq!(
+            declared_ldap_scheme(
+                "ldap_auth",
+                &serde_json::json!({
+                    "ldap_url": "${gh-env-secret:alloc=require}",
+                    "failover_ldap_urls": ["LDAP://failover.example:389"]
+                })
+            ),
+            Some("ldap")
+        );
+        assert_eq!(
+            declared_ldap_scheme(
+                "ldap_auth",
+                &serde_json::json!({
+                    "ldap_url": "ldaps://primary.example:636",
+                    "failover_ldap_urls": ["ldap://failover.example:389"]
+                })
+            ),
+            Some("ldaps")
+        );
+        assert_eq!(
+            declared_ldap_scheme(
+                "ldap_auth",
+                &serde_json::json!({"ldap_url": "${gh-env-secret:alloc=require}"})
+            ),
+            None
+        );
+        assert_eq!(
+            declared_ldap_scheme(
+                "otel_tracing",
+                &serde_json::json!({"endpoint": "ldap://x.example"})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ldap_failover_urls_are_endpoints() {
+        let config = serde_json::json!({
+            "ldap_url": "ldaps://ldap1.example:636",
+            "failover_ldap_urls": ["ldaps://ldap2.example:636", "ldap://ldap3.example:389"]
+        });
+        let endpoints: Vec<Vec<ConfigPathComponent>> =
+            endpoint_paths("ldap_auth", &config).into_iter().collect();
+        assert_eq!(
+            dotted(endpoints.clone()),
+            vec![
+                "failover_ldap_urls.[0]",
+                "failover_ldap_urls.[1]",
+                "ldap_url"
+            ]
+        );
+        assert_eq!(endpoint_scheme("ldap_auth", &endpoints[0]), "ldaps");
     }
 
     #[test]

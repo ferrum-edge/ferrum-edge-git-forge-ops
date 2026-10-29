@@ -429,6 +429,115 @@ fn a_placeholder_stays_secret_bearing_after_the_bundle_resolves_it() {
     assert!(diffs.is_empty(), "{diffs:?}");
 }
 
+/// Ferrum Edge v0.9.19 added these paths to its plugin-config redaction
+/// schema, so the export fingerprints even a literal repository value there.
+/// Each one must put the declared value back and count as uncompared, not
+/// read as a change on every viewer `diff`.
+#[test]
+fn edge_0_9_19_redacted_plugin_values_are_not_false_drift() {
+    let cases = [
+        (
+            "request_transformer",
+            json!({"rules": [{"operation": "add", "target": "header",
+                "value": "literal-transform-value"}]}),
+            vec!["/config/rules/0/value"],
+        ),
+        (
+            "mesh_route_dispatch",
+            json!({"rules": [{"request_transform": [{"operation": "set",
+                "value": "literal-dispatch-value"}]}]}),
+            vec!["/config/rules/0/request_transform/0/value"],
+        ),
+        (
+            "ws_logging",
+            json!({"custom_headers": {"x-collector": "literal-ws-header"}}),
+            vec!["/config/custom_headers/x-collector"],
+        ),
+        (
+            "waf",
+            json!({"global_exemptions": {"header_present": {"x-hop": "literal-waf-exemption"}}}),
+            vec!["/config/global_exemptions/header_present/x-hop"],
+        ),
+        (
+            "fault_injection",
+            json!({"match": {"headers": {"x-chaos": "literal-fault-match"}}}),
+            vec!["/config/match/headers/x-chaos"],
+        ),
+        (
+            "response_mock",
+            json!({"rules": [{"match": {
+                "headers": {"x-mock": "literal-mock-header"},
+                "query_params": {"mock": "literal-mock-query"}
+            }, "body": "{}"}]}),
+            vec![
+                "/config/rules/0/match/headers/x-mock",
+                "/config/rules/0/match/query_params/mock",
+            ],
+        ),
+        // A non-string endpoint is fingerprinted whole: the array, not each URL.
+        (
+            "ldap_auth",
+            json!({"failover_ldap_urls": ["ldaps://ldap2.example:636"]}),
+            vec!["/config/failover_ldap_urls"],
+        ),
+        // Short, non-string and container values: Edge fingerprints the whole
+        // value at the rule site, so each must be matched there, never read
+        // as drift or as a masked ancestor.
+        (
+            "request_transformer",
+            json!({"rules": [
+                {"operation": "add", "target": "header", "value": "1"},
+                {"operation": "add", "target": "body", "value": true},
+                {"operation": "add", "target": "body", "value": 42},
+                {"operation": "add", "target": "body", "value": {"enabled": "yes"}},
+                {"operation": "add", "target": "body", "value": ["a", "b"]}
+            ]}),
+            vec![
+                "/config/rules/0/value",
+                "/config/rules/1/value",
+                "/config/rules/2/value",
+                "/config/rules/3/value",
+                "/config/rules/4/value",
+            ],
+        ),
+        (
+            "ws_logging",
+            json!({"custom_headers": {"x-env": "prod"}}),
+            vec!["/config/custom_headers/x-env"],
+        ),
+    ];
+    for (plugin_name, config, pointers) in cases {
+        let desired: GatewayConfig = serde_json::from_value(json!({
+            "plugin_configs": [{
+                "id": "edge-redacted",
+                "namespace": "ferrum",
+                "plugin_name": plugin_name,
+                "scope": "global",
+                "config": config,
+            }],
+        }))
+        .unwrap();
+        let mut live = serde_json::to_value(&desired.plugin_configs[0]).unwrap();
+        for pointer in &pointers {
+            *live.pointer_mut(pointer).unwrap() = json!(fp('e'));
+        }
+        let body = document("ferrum", KEY_ID, json!([]), json!([live])).to_string();
+        let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+        let view = export.live_view(&desired).unwrap();
+
+        let mut uncompared: Vec<&str> = view
+            .uncompared
+            .iter()
+            .map(|site| site.pointer.as_str())
+            .collect();
+        uncompared.sort_unstable();
+        assert_eq!(uncompared, pointers, "{plugin_name}");
+        assert!(view.masked_ancestors.is_empty(), "{plugin_name}");
+        let diffs = compute_diff(&desired, &view.actual).unwrap();
+        assert!(diffs.is_empty(), "{plugin_name}: {diffs:?}");
+    }
+}
+
 #[test]
 fn a_whole_value_fingerprinted_around_a_secret_is_never_authoritative() {
     let desired: GatewayConfig = serde_json::from_value(json!({

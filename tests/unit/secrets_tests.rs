@@ -109,6 +109,230 @@ fn builtin_unbrokered_heuristic_matches_stay_sensitive_to_the_scrubber() {
         "[REDACTED] [REDACTED] visible-setting"
     );
 }
+/// One plugin per path Ferrum Edge v0.9.19's `plugin_config_projection` added
+/// to its redaction schema, each value long enough to be scrubbed, with the
+/// broker slot import must capture it under.
+fn edge_0_9_19_redacted_plugins() -> Vec<(&'static str, serde_json::Value, Vec<&'static str>)> {
+    vec![
+        (
+            "request_transformer",
+            serde_json::json!({"rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Upstream-Auth",
+                "value": "synthetic-transform-value"
+            }]}),
+            vec!["ferrum/builtin/@plugin/request_transformer/config/rules/[0]/value"],
+        ),
+        (
+            "mesh_route_dispatch",
+            serde_json::json!({"rules": [{"request_transform": [{
+                "operation": "set",
+                "name": "x-route-auth",
+                "value": "synthetic-dispatch-value"
+            }]}]}),
+            vec![
+                "ferrum/builtin/@plugin/mesh_route_dispatch/config/rules/[0]/request_transform/[0]/value",
+            ],
+        ),
+        (
+            "ws_logging",
+            serde_json::json!({
+                "endpoint_url": "wss://collector.example/logs",
+                "custom_headers": {"x-collector-auth": "synthetic-ws-header"}
+            }),
+            vec![
+                "ferrum/builtin/@plugin/ws_logging/config/custom_headers/x-collector-auth",
+                "ferrum/builtin/@plugin/ws_logging/config/endpoint_url",
+            ],
+        ),
+        (
+            "waf",
+            serde_json::json!({
+                "mode": "enforce",
+                "global_exemptions": {"header_present": {"x-trusted-hop": "synthetic-waf-exemption"}}
+            }),
+            vec!["ferrum/builtin/@plugin/waf/config/global_exemptions/header_present/x-trusted-hop"],
+        ),
+        (
+            "fault_injection",
+            serde_json::json!({"match": {"headers": {"x-chaos": "synthetic-fault-match"}}}),
+            vec!["ferrum/builtin/@plugin/fault_injection/config/match/headers/x-chaos"],
+        ),
+        (
+            "response_mock",
+            serde_json::json!({"rules": [{
+                "match": {
+                    "headers": {"x-mock": "synthetic-mock-header"},
+                    "query_params": {"mock": "synthetic-mock-query"}
+                },
+                "status_code": 200,
+                "body": "{}"
+            }]}),
+            vec![
+                "ferrum/builtin/@plugin/response_mock/config/rules/[0]/match/headers/x-mock",
+                "ferrum/builtin/@plugin/response_mock/config/rules/[0]/match/query_params/mock",
+            ],
+        ),
+        (
+            "ldap_auth",
+            serde_json::json!({
+                "ldap_url": "ldaps://ldap1.example:636",
+                "failover_ldap_urls": ["ldaps://synthetic-failover.example:636"]
+            }),
+            vec![
+                "ferrum/builtin/@plugin/ldap_auth/config/failover_ldap_urls/[0]",
+                "ferrum/builtin/@plugin/ldap_auth/config/ldap_url",
+            ],
+        ),
+    ]
+}
+
+fn single_plugin_gateway(plugin_name: &str, config: serde_json::Value) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "builtin",
+            "namespace": "ferrum",
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "config": config
+        }]
+    }))
+    .unwrap()
+}
+
+/// Edge v0.9.19 redacts these paths, so `/config/export` fingerprints them
+/// and import must broker them rather than write them into resource YAML.
+/// `fault_injection` and `response_mock` header values used to be caught only
+/// by the header-map heuristic, which made import demand a plaintext
+/// allowance; they are now brokered outright.
+#[test]
+fn edge_0_9_19_redacted_plugin_paths_are_brokered_on_import() {
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for (plugin_name, config, expected) in edge_0_9_19_redacted_plugins() {
+        let mut gateway = single_plugin_gateway(plugin_name, config);
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+        let slots: Vec<&str> = capture.captured.keys().map(String::as_str).collect();
+        assert_eq!(slots, expected, "{plugin_name}");
+        // `request_transformer`'s header name sits under `key`, which only the
+        // key-name heuristic flags; it stays a plaintext-allowance decision.
+        let unbrokered: Vec<&str> = capture
+            .unbrokered
+            .iter()
+            .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+            .collect();
+        if plugin_name == "request_transformer" {
+            assert_eq!(unbrokered, ["rules.[0].key"], "{plugin_name}");
+        } else {
+            assert!(unbrokered.is_empty(), "{plugin_name}: {unbrokered:?}");
+        }
+        let written = gateway.plugin_configs[0].config.to_string();
+        assert!(!written.contains("synthetic-"), "{plugin_name}: {written}");
+    }
+}
+
+#[test]
+fn edge_0_9_19_redacted_plugin_paths_are_scrubbed_and_gated_as_literals() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+
+    for (plugin_name, config, _) in edge_0_9_19_redacted_plugins() {
+        let gateway = single_plugin_gateway(plugin_name, config);
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+        let rendered = gateway.plugin_configs[0].config.to_string();
+        let scrubbed = scrubber.scrub(&rendered);
+        assert!(
+            !scrubbed.contains("synthetic-"),
+            "{plugin_name}: {scrubbed}"
+        );
+        assert!(scrubbed.contains("[REDACTED]"), "{plugin_name}: {scrubbed}");
+
+        let findings = audit_security(&gateway);
+        let blockers = security_blockers(&findings);
+        assert!(
+            blockers
+                .iter()
+                .any(|finding| finding.message.contains("Literal plugin-config secret")),
+            "{plugin_name}: {findings:?}"
+        );
+        for finding in &findings {
+            assert!(!finding.message.contains("synthetic-"), "{plugin_name}");
+        }
+    }
+
+    // Settings beside the redacted values stay readable.
+    let gateway = single_plugin_gateway(
+        "response_mock",
+        serde_json::json!({"rules": [{
+            "match": {"query_params": {"mock": "synthetic-mock-query"}},
+            "body": "visible-mock-body"
+        }]}),
+    );
+    let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+    assert_eq!(
+        scrubber.scrub("synthetic-mock-query visible-mock-body"),
+        "[REDACTED] visible-mock-body"
+    );
+}
+
+/// An operator value too short to broker (the bundle refuses values under 8
+/// bytes) or to scrub is an ordinary setting: import keeps it literal without
+/// a plaintext allowance, the scrubber does not withhold validator output over
+/// it, and the literal-secret gate lets it through. A long one is still a
+/// secret.
+#[test]
+fn short_operator_plugin_values_stay_ordinary_settings() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for (plugin_name, config) in [
+        (
+            "request_transformer",
+            serde_json::json!({"rules": [
+                {"operation": "add", "target": "header", "value": "1"},
+                {"operation": "add", "target": "body", "value": true}
+            ]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            serde_json::json!({"rules": [{"request_transform": [{"value": "on"}]}]}),
+        ),
+        (
+            "ws_logging",
+            serde_json::json!({"custom_headers": {"x-env": "prod"}}),
+        ),
+        (
+            "fault_injection",
+            serde_json::json!({"match": {"headers": {"x-chaos": "on"}}}),
+        ),
+        (
+            "response_mock",
+            serde_json::json!({"rules": [{"match": {
+                "headers": {"x-mock": "yes"},
+                "query_params": {"page": "2"}
+            }}]}),
+        ),
+    ] {
+        let original = single_plugin_gateway(plugin_name, config);
+        let mut gateway = original.clone();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+        assert!(capture.captured.is_empty(), "{plugin_name}");
+        assert!(capture.unbrokered.is_empty(), "{plugin_name}");
+        assert_eq!(
+            gateway.plugin_configs[0].config, original.plugin_configs[0].config,
+            "{plugin_name}"
+        );
+
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
+        assert!(!scrubber.is_unsafe_to_scrub(), "{plugin_name}");
+        assert!(
+            security_blockers(&audit_security(&original)).is_empty(),
+            "{plugin_name}"
+        );
+    }
+}
+
 const TEST_RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCeBwh5uUsN7IUDwwsg1tMZsRAknSr77S2N+DoEBkLvMTIB9ox8MIx1XeFyJpKLIaXR3WvRW49zKGPqgR8cIoWPzwdnKAFLwjYA+MDDsjDqFTU3DO1msuj0v5M74MXriVCEMZjRY7DiEnSnIpHyySyddkwm8TQDTDFxc3kRGRDMh0L5UjWb3Y18uQgmU08gF/2Liwg0Pl35D3AyKR6rxegxvolHu/g+h2+qvnwiy/lhwXyTfVhqRJ4k/lbRxAKZINJwUlRqmGiXnnppQ90UJS775L47I65bJ7LdI2FRI4iJVej2mRNE7dv+0G+ntPVeqKR8XuokO8FnZj7/Y0IYZ/zN";
 
 #[test]
@@ -1766,12 +1990,39 @@ fn generate_credential_value_enforces_plugin_config_minimums() {
         32
     );
 
-    // Other plugin-config leaves keep the general 16-byte floor.
+    // Ferrum Edge v0.9.19 enforces the same floor on these leaves.
+    for slot in [
+        "ferrum/loadtest/@plugin/load_testing/config/key",
+        "ferrum/cache/@plugin/ai_semantic_cache/config/redis_integrity_key",
+        "ferrum/oidc/@plugin/oidc_relying_party/config/session/encryption_secret",
+        "ferrum/oidc/@plugin/oidc_relying_party/config/session/encryption_secret_previous",
+    ] {
+        let err = generate_credential_value(slot, 23).unwrap_err().to_string();
+        assert!(
+            err.contains("this plugin-config secret must be at least 32 characters"),
+            "{slot}: {err}"
+        );
+        assert_eq!(
+            generate_credential_value(slot, 24).unwrap().chars().count(),
+            32,
+            "{slot}"
+        );
+    }
+
+    // Other plugin-config leaves keep the general 16-byte floor, including
+    // the same field name under another plugin or another parent.
     assert!(generate_credential_value(
         "ferrum/audit/@plugin/ai_transcript_audit/config/headers/x-api-key",
         16
     )
     .is_ok());
+    for slot in [
+        "ferrum/other/@plugin/rate_limiting/config/key",
+        "ferrum/loadtest/@plugin/load_testing/config/nested/key",
+        "ferrum/oidc/@plugin/oidc_relying_party/config/encryption_secret",
+    ] {
+        assert!(generate_credential_value(slot, 16).is_ok(), "{slot}");
+    }
     assert!(
         generate_credential_value("ferrum/other/@plugin/opa/config/redaction/hash_secret", 16)
             .is_ok()

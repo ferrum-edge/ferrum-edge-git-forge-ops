@@ -1290,7 +1290,17 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
 - Schema rules cover OAuth/OIDC client secrets and private keys, OIDC session
   encryption secrets, LDAP service-account passwords, and SOAP WS-Security Redis
   and UsernameToken credentials. Check additions against the gateway's OpenAPI
-  schemas.
+  schemas and its `plugin_config_projection` table, because `/config/export`
+  fingerprints whatever that projection redacts.
+- Operator-chosen values Edge redacts (`request_transformer` rule values,
+  `mesh_route_dispatch` request-transform values, `ws_logging` custom headers,
+  `fault_injection` and `response_mock` match conditions) use
+  `RuleKind::Value`. A string of at least 8 bytes is brokered, masked,
+  scrubbed and literal-gated like a secret; a shorter one (`value: "1"`)
+  stays an ordinary literal, since the bundle and scrubber refuse it. None is
+  rule-declared for display admission. `export_redacted_paths` adds every
+  matched site, whatever its length or JSON type, for `/config/export`
+  substitution.
 - `basicauth[].username` and `mtls_auth[].identity` are never brokered
   (`resolver::is_identity_credential_leaf`).
 
@@ -1461,8 +1471,10 @@ Shared by `resolver::check_generation_allowed` and the allocator, so `plan` and
 generation agree:
 
 - `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24 entropy bytes), as do
-  the plugin-config leaves in `MIN32_PLUGIN_CONFIG_SECRETS` (today
-  `ai_transcript_audit` `redaction.hash_secret`, raised to 32 in Edge v0.9.19).
+  the plugin-config leaves in `MIN32_PLUGIN_CONFIG_SECRETS` (Edge v0.9.19:
+  `ai_transcript_audit` `redaction.hash_secret`, `load_testing` `key`,
+  `ai_semantic_cache` `redis_integrity_key`, `oidc_relying_party`
+  `session.encryption_secret[_previous]`).
 - `basicauth` generation is refused in file mode; `basicauth/…/password_hash`
   in every mode (it is HMAC-SHA256 under the gateway's own secret).
 - A plugin-config endpoint leaf (`secrets::plugin_config::endpoint_paths`, e.g.

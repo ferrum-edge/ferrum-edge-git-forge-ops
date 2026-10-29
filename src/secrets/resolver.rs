@@ -38,11 +38,22 @@ const RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND: &str = "@plugin-config";
 /// (`jwt.secret`, `hmac_auth.secret`).
 pub const MIN32_CREDENTIAL_TYPES: [&str; 2] = ["jwt", "hmac_auth"];
 
-/// Plugin-config secret leaves whose gateway minimum is 32 characters, as
-/// `(plugin_name, path under config)`. Ferrum Edge v0.9.19 raised
-/// `ai_transcript_audit` `redaction.hash_secret` from 16 to 32 characters.
-const MIN32_PLUGIN_CONFIG_SECRETS: &[(&str, &[&str])] =
-    &[("ai_transcript_audit", &["redaction", "hash_secret"])];
+/// Plugin-config secret leaves whose gateway minimum is 32, as
+/// `(plugin_name, path under config)`, checked against Ferrum Edge v0.9.19's
+/// config admission. `ai_transcript_audit` `redaction.hash_secret` (raised
+/// from 16 in that release) and `load_testing` `key` count characters; the
+/// others count bytes. Generated values are ASCII, so both are 32 characters
+/// here.
+const MIN32_PLUGIN_CONFIG_SECRETS: &[(&str, &[&str])] = &[
+    ("ai_transcript_audit", &["redaction", "hash_secret"]),
+    ("load_testing", &["key"]),
+    ("ai_semantic_cache", &["redis_integrity_key"]),
+    ("oidc_relying_party", &["session", "encryption_secret"]),
+    (
+        "oidc_relying_party",
+        &["session", "encryption_secret_previous"],
+    ),
+];
 
 /// Minimum `len=` (entropy bytes) that still yields ≥32 characters once
 /// base64url-no-pad encoded: `ceil(24 * 4 / 3) == 32`.
@@ -733,7 +744,8 @@ fn check_min_secret_length(slot: &str, value: &str) -> crate::error::Result<()> 
         "secret slot '{slot}' holds a bundle value shorter than {min} bytes. Brokered \
          secrets must be at least {min} bytes so they can be removed from this tool's \
          output; re-seed the slot with a longer value or rotate it with \
-         'gitforgeops rotate'.",
+         'gitforgeops rotate'. If the value is an ordinary short setting (a plugin \
+         transform or match value), write it literally in place of the placeholder.",
         min = super::MIN_SCRUB_LENGTH
     )))
 }
