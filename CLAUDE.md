@@ -1450,7 +1450,9 @@ See `docs/credential-identities.md` for the command-boundary audit.
 Shared by `resolver::check_generation_allowed` and the allocator, so `plan` and
 generation agree:
 
-- `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24 entropy bytes).
+- `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24 entropy bytes), as do
+  the plugin-config leaves in `MIN32_PLUGIN_CONFIG_SECRETS` (today
+  `ai_transcript_audit` `redaction.hash_secret`, raised to 32 in Edge v0.9.19).
 - `basicauth` generation is refused in file mode; `basicauth/…/password_hash`
   in every mode (it is HMAC-SHA256 under the gateway's own secret).
 - A plugin-config endpoint leaf (`secrets::plugin_config::endpoint_paths`, e.g.

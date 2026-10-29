@@ -1749,6 +1749,36 @@ fn generate_credential_value_enforces_the_jwt_minimum() {
 }
 
 #[test]
+fn generate_credential_value_enforces_plugin_config_minimums() {
+    // Ferrum Edge v0.9.19 requires ai_transcript_audit's
+    // `redaction.hash_secret` to be at least 32 characters; `len=16` would
+    // commit a 22-character value the gateway then refuses on every apply.
+    use gitforgeops::secrets::generate_credential_value;
+
+    let slot = "ferrum/audit/@plugin/ai_transcript_audit/config/redaction/hash_secret";
+    let err = generate_credential_value(slot, 16).unwrap_err().to_string();
+    assert!(
+        err.contains("this plugin-config secret must be at least 32 characters"),
+        "got: {err}"
+    );
+    assert_eq!(
+        generate_credential_value(slot, 24).unwrap().chars().count(),
+        32
+    );
+
+    // Other plugin-config leaves keep the general 16-byte floor.
+    assert!(generate_credential_value(
+        "ferrum/audit/@plugin/ai_transcript_audit/config/headers/x-api-key",
+        16
+    )
+    .is_ok());
+    assert!(
+        generate_credential_value("ferrum/other/@plugin/opa/config/redaction/hash_secret", 16)
+            .is_ok()
+    );
+}
+
+#[test]
 fn generate_credential_value_respects_the_value_cap_and_sentinel() {
     use gitforgeops::secrets::{generate_credential_value, MAX_CREDENTIAL_VALUE_CHARS};
 
