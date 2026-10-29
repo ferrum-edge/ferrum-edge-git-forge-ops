@@ -38,10 +38,25 @@ def secure_responses():
             "verified_allowed": False,
             "patterns_allowed": sorted(audit_settings.ALLOWED_ACTION_PATTERNS),
         },
-        "repos/acme/repo/rulesets?per_page=100": [[{"id": 7}, {"id": 8}]],
+        "repos/acme/repo/rulesets?per_page=100": [[{"id": 7}, {"id": 8}, {"id": 9}]],
+        # The organization ruleset behind the `workflows` rule (#470). The
+        # repository listing includes it; its bypass mirrors ruleset 7's.
+        "repos/acme/repo/rulesets/9": {
+            "id": 9,
+            "name": "trusted required workflows",
+            "source_type": "Organization",
+            "target": "branch",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+            "bypass_actors": [
+                {"actor_type": "Integration", "actor_id": 99, "bypass_mode": "always"}
+            ],
+            "rules": [{"type": "workflows", "parameters": {"workflows": []}}],
+        },
         "repos/acme/repo/rulesets/7": {
             "id": 7,
             "name": "protect main",
+            "source_type": "Repository",
             "target": "branch",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
@@ -87,6 +102,7 @@ def secure_responses():
         "repos/acme/repo/rulesets/8": {
             "id": 8,
             "name": "protect releases",
+            "source_type": "Repository",
             "target": "tag",
             "enforcement": "active",
             "conditions": {
@@ -101,6 +117,28 @@ def secure_responses():
                 {"type": "deletion"},
             ],
         },
+        "repos/acme/repo": {"id": 1234, "owner": {"type": "Organization"}},
+        # Effective rules for `main`, organization rulesets included (#470).
+        "repos/acme/repo/rules/branches/main?per_page=100": [
+            [
+                {
+                    "type": "workflows",
+                    "ruleset_source_type": "Organization",
+                    "ruleset_id": 9,
+                    "parameters": {
+                        "do_not_enforce_on_create": False,
+                        "workflows": [
+                            {
+                                "repository_id": 1234,
+                                "path": path,
+                                "ref": "refs/heads/main",
+                            }
+                            for path in audit_settings.REQUIRED_RULESET_WORKFLOWS
+                        ],
+                    },
+                }
+            ]
+        ],
         "repos/acme/repo/environments?per_page=100": [
             {
                 "total_count": 2,
@@ -871,9 +909,10 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
         responses = secure_responses()
         # Solo-maintainer template: the admin role holds a pull-request-mode
         # bypass and there is no App to name.
-        responses["repos/acme/repo/rulesets/7"]["bypass_actors"] = [
-            {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "pull_request"}
-        ]
+        for ruleset in ("7", "9"):
+            responses[f"repos/acme/repo/rulesets/{ruleset}"]["bypass_actors"] = [
+                {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "pull_request"}
+            ]
         # A template has no deployment environment, but it still runs the
         # settings audit, so it still needs the audit-token environment.
         responses["repos/acme/repo/environments?per_page=100"] = [
@@ -1116,6 +1155,220 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
                 rendered = "\n".join(audit.violations)
                 self.assertIn("missing required status checks", rendered)
                 self.assertIn(context, rendered)
+
+
+class RequiredWorkflowRuleTests(unittest.TestCase):
+    """#470: the trusted policy must be required by workflow path, not name only."""
+
+    RULES = "repos/acme/repo/rules/branches/main?per_page=100"
+
+    def run_audit(self, responses):
+        with patch.object(
+            audit_settings,
+            "gh_json",
+            side_effect=lambda path, paginate=False: responses[path],
+        ):
+            return audit_settings.run(
+                "acme/repo", "main", REQUIRED_CHECKS, 99, "refs/tags/v*"
+            )
+
+    def entries(self, responses):
+        return responses[self.RULES][0][0]["parameters"]["workflows"]
+
+    def test_the_supply_chain_policy_is_the_required_workflow(self):
+        self.assertEqual(
+            audit_settings.REQUIRED_RULESET_WORKFLOWS,
+            (".github/workflows/supply-chain-policy.yml",),
+        )
+        workflow = Path(__file__).parents[2] / "workflows" / "supply-chain-policy.yml"
+        self.assertTrue(workflow.is_file())
+
+    def test_the_organization_rule_is_evidence(self):
+        audit = self.run_audit(secure_responses())
+        self.assertEqual(audit.violations, [])
+        self.assertIn(
+            "required workflow: .github/workflows/supply-chain-policy.yml "
+            "at refs/heads/main",
+            audit.evidence,
+        )
+
+    def test_an_organization_ruleset_does_not_count_as_a_second_main_ruleset(self):
+        # The repository listing includes parent rulesets by default; one that
+        # targets `main` or the release tags must not trip the exactly-one
+        # rules for the repository's own rulesets.
+        responses = secure_responses()
+        responses["repos/acme/repo/rulesets?per_page=100"] = [
+            [{"id": 7}, {"id": 8}, {"id": 9}, {"id": 10}, {"id": 11}]
+        ]
+        for identifier, source in ((10, 7), (11, 8)):
+            parent = dict(responses[f"repos/acme/repo/rulesets/{source}"])
+            parent.update(id=identifier, source_type="Organization")
+            responses[f"repos/acme/repo/rulesets/{identifier}"] = parent
+        self.assertEqual(self.run_audit(responses).violations, [])
+
+    def test_a_missing_rule_fails_an_organization_repository(self):
+        responses = secure_responses()
+        responses[self.RULES] = [[]]
+        audit = self.run_audit(responses)
+        self.assertEqual(len(audit.violations), 1)
+        self.assertIn("supply-chain-policy.yml", audit.violations[0])
+        self.assertIn("section 2a", audit.violations[0])
+
+    def test_a_user_owned_repository_gets_a_residual_risk_warning(self):
+        responses = secure_responses()
+        responses[self.RULES] = [[]]
+        responses["repos/acme/repo"]["owner"]["type"] = "User"
+        audit = self.run_audit(responses)
+        self.assertEqual(audit.violations, [])
+        self.assertTrue(
+            any("supply-chain-policy.yml" in warning for warning in audit.warnings)
+        )
+
+    def test_an_entry_must_name_this_repository_path_and_default_branch(self):
+        for field, value in (
+            ("repository_id", 4321),
+            ("ref", "refs/heads/release"),
+            ("path", ".github/workflows/security.yml"),
+        ):
+            with self.subTest(field=field):
+                responses = secure_responses()
+                self.entries(responses)[0][field] = value
+                self.assertEqual(len(self.run_audit(responses).violations), 1)
+
+    def bypass(self, responses, actors):
+        responses["repos/acme/repo/rulesets/9"]["bypass_actors"] = actors
+
+    def test_a_wider_bypass_on_the_organization_ruleset_does_not_count(self):
+        for actors in (
+            # The write role could skip the one rule a posted check cannot meet.
+            [
+                {"actor_type": "Integration", "actor_id": 99, "bypass_mode": "always"},
+                {"actor_type": "RepositoryRole", "actor_id": 4, "bypass_mode": "pull_request"},
+            ],
+            # No state-writer App: ledger commits to `main` would be refused.
+            [],
+            # The App, but in another mode.
+            [{"actor_type": "Integration", "actor_id": 99, "bypass_mode": "pull_request"}],
+        ):
+            with self.subTest(actors=actors):
+                responses = secure_responses()
+                self.bypass(responses, actors)
+                audit = self.run_audit(responses)
+                # The refused rule, then the requirement it no longer meets.
+                self.assertEqual(len(audit.violations), 2)
+                self.assertIn("bypass actors", audit.violations[0])
+                self.assertIn("must require", audit.violations[1])
+
+    def test_an_unreadable_defining_ruleset_does_not_count(self):
+        for change in ("missing", "no-bypass-field"):
+            with self.subTest(change=change):
+                responses = secure_responses()
+                if change == "missing":
+                    responses["repos/acme/repo/rulesets?per_page=100"] = [
+                        [{"id": 7}, {"id": 8}]
+                    ]
+                else:
+                    del responses["repos/acme/repo/rulesets/9"]["bypass_actors"]
+                audit = self.run_audit(responses)
+                self.assertEqual(len(audit.violations), 2)
+                self.assertIn("unreadable", audit.violations[0])
+                self.assertIn("must require", audit.violations[1])
+
+    def add_second_workflow_ruleset(self, responses, actors, paths):
+        responses["repos/acme/repo/rulesets/12"] = dict(
+            responses["repos/acme/repo/rulesets/9"], id=12, bypass_actors=actors
+        )
+        responses["repos/acme/repo/rulesets?per_page=100"][0].append({"id": 12})
+        rule = {
+            "type": "workflows",
+            "ruleset_id": 12,
+            "parameters": {
+                "workflows": [
+                    {"repository_id": 1234, "path": path, "ref": "refs/heads/main"}
+                    for path in paths
+                ]
+            },
+        }
+        responses[self.RULES] = [responses[self.RULES][0] + [rule]]
+
+    def test_every_effective_workflow_ruleset_must_mirror_the_main_bypass(self):
+        # Rulesets apply together: a second rule without the state-writer App
+        # bypass refuses ledger commits even though ruleset 9 admits the App,
+        # and a wider one exempts actors from it. Either is a violation,
+        # whatever workflow the second rule lists.
+        for actors, paths in (
+            ([], audit_settings.REQUIRED_RULESET_WORKFLOWS),
+            ([], (".github/workflows/other.yml",)),
+            (
+                [
+                    {"actor_type": "Integration", "actor_id": 99, "bypass_mode": "always"},
+                    {"actor_type": "RepositoryRole", "actor_id": 4, "bypass_mode": "always"},
+                ],
+                audit_settings.REQUIRED_RULESET_WORKFLOWS,
+            ),
+        ):
+            with self.subTest(actors=actors, paths=paths):
+                responses = secure_responses()
+                self.add_second_workflow_ruleset(responses, actors, paths)
+                audit = self.run_audit(responses)
+                self.assertEqual(len(audit.violations), 1)
+                self.assertIn("ruleset 12", audit.violations[0])
+
+    def test_a_second_mirrored_workflow_ruleset_passes(self):
+        responses = secure_responses()
+        self.add_second_workflow_ruleset(
+            responses,
+            [{"actor_type": "Integration", "actor_id": 99, "bypass_mode": "always"}],
+            (".github/workflows/other.yml",),
+        )
+        self.assertEqual(self.run_audit(responses).violations, [])
+
+    def test_the_rule_may_be_on_a_later_page(self):
+        responses = secure_responses()
+        responses[self.RULES] = [[{"type": "deletion"}], responses[self.RULES][0]]
+        calls = []
+
+        def answer(path, paginate=False):
+            calls.append((path, paginate))
+            return responses[path]
+
+        with patch.object(audit_settings, "gh_json", side_effect=answer):
+            audit = audit_settings.run(
+                "acme/repo", "main", REQUIRED_CHECKS, 99, "refs/tags/v*"
+            )
+        self.assertEqual(audit.violations, [])
+        self.assertIn((self.RULES, True), calls)
+
+    def test_malformed_rules_and_a_missing_repository_id_fail_closed(self):
+        responses = secure_responses()
+        responses[self.RULES] = [[{"type": "workflows", "ruleset_id": 9, "parameters": None}]]
+        self.assertEqual(len(self.run_audit(responses).violations), 1)
+        responses = secure_responses()
+        del responses["repos/acme/repo"]["id"]
+        for entry in self.entries(responses):
+            del entry["repository_id"]
+        audit = self.run_audit(responses)
+        self.assertEqual(len(audit.violations), 1)
+        self.assertIn("repository id", audit.violations[0])
+
+    def test_a_status_check_rule_naming_the_context_is_not_enough(self):
+        responses = secure_responses()
+        responses[self.RULES] = [
+            [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {
+                        "required_status_checks": [
+                            {
+                                "context": "trusted-supply-chain-policy",
+                                "integration_id": audit_settings.GITHUB_ACTIONS_APP_ID,
+                            }
+                        ]
+                    },
+                }
+            ]
+        ]
+        self.assertEqual(len(self.run_audit(responses).violations), 1)
 
 
 class SharedConstantTests(unittest.TestCase):

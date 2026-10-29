@@ -4779,8 +4779,11 @@ def policy_check_impersonation_violations(workflow: str, document: dict) -> list
     no job `name:` may be computed with `${{ }}`. A matrix suffix or a reusable
     workflow's `caller / callee` form can never equal a context.
 
-    This is defense in depth. How branch protection resolves two check runs
-    with one name is not established (docs/github-launch-controls.md).
+    This is defense in depth. In the #470 experiments a same-name success from
+    a separate workflow did not override a failing trusted run; a head no
+    trusted run judged is fenced by the organization ruleset that requires
+    `supply-chain-policy.yml` by path (docs/github-launch-controls.md, 2a),
+    and the other contexts are not yet (#632).
 
     `workflow` is the path relative to the repository root.
     """

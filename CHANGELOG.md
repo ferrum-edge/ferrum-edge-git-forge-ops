@@ -538,6 +538,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- A required status check is now also enforced by workflow path (#470). In
+  sandbox repositories a same-repository pull request's own job pushed a head
+  with `GITHUB_TOKEN`, which starts no workflow, and posted a successful
+  check run under each required name; the required-check rule alone let it
+  merge. An organization ruleset `workflows` rule now requires
+  `.github/workflows/supply-chain-policy.yml` at `main` (launch controls
+  §2a). The settings audit fails without it on an organization repository,
+  or when any ruleset with a `workflows` rule on `main` has bypass actors
+  other than the `main` ruleset's, and warns on a user-owned repository; it
+  now matches only repository-sourced rulesets for its `main` and tag
+  baselines. The bootstrap prints the organization step it cannot write.
+  With the rule in place a retargeted pull request needs a push or reopen.
+  The other required contexts, the state guard included, can still be
+  satisfied by a write collaborator who deletes the failing run and posts a
+  check from another branch (#632).
+
 - Replace the deprecated `serde_yaml` 0.9 (and its archived C-translated
   `unsafe-libyaml`, RUSTSEC-2024-0449) with safe-Rust parsing that bounds work
   while it parses (#561). Resource, overlay and import files are composed from
@@ -554,8 +570,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and input the two parsers would read differently (raw U+0085/U+2028/U+2029,
   any U+FEFF including a leading byte-order mark, anchor names outside
   `[A-Za-z0-9_-]`, a `?`-leading plain scalar in a flow collection, and a
-  `|`/`>` block scalar running to the end of a file without a final newline). Anchor
-  copies count against the limits like alias copies. Rendering refuses a
+  `|`/`>` block scalar running to the end of a file without a final
+  newline). Anchor copies count against the limits like alias copies. Rendering refuses a
   mapping key over 1,000 bytes, which the gateway's reader could not load.
   Multi-line strings are emitted double-quoted rather than as `|` blocks.
   Typed settings now read scalars through the field type: `'5'` or `1_000`

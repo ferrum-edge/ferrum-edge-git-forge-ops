@@ -40,6 +40,7 @@ from audit_settings import (  # noqa: E402  (the path bootstrap above must run f
     ALLOWED_ACTION_PATTERNS,
     GITHUB_ACTIONS_APP_ID,
     RELEASE_TAG_PATTERN,
+    REQUIRED_RULESET_WORKFLOWS,
     REQUIRED_STATUS_CHECKS,
     SETTINGS_AUDIT_ENVIRONMENT,
 )
@@ -1421,6 +1422,18 @@ def build_plan(api: GitHubApi, args) -> Plan:
             "one exists."
         )
 
+    # A repository token cannot write organization rulesets, so this step is
+    # printed, not planned; the settings audit fails until it is done (#470).
+    plan.notes.append("")
+    plan.notes.append(
+        "Organization ruleset (not written by this script; needs an organization "
+        "owner): require "
+        + ", ".join(REQUIRED_RULESET_WORKFLOWS)
+        + " at the default branch through a `workflows` rule, with the same "
+        "bypass actors as the main ruleset. See docs/github-launch-controls.md, "
+        "section 2a; the settings audit fails without it on an organization "
+        "repository."
+    )
     plan.notes.extend(
         secret_remainder(
             args.repo,
