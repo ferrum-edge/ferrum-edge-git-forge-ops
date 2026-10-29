@@ -23,6 +23,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   v0.9.19's 16-character `keyauth` minimum and per-namespace `jwt`
   uniqueness. Supported status, publication fields and all exact-revision
   lifecycle acceptance remain pending.
+- Plugin-config classification follows Ferrum Edge v0.9.19's
+  `plugin_config_projection`, which `/config/export` fingerprints: `ws_logging`
+  `custom_headers`, `waf` `global_exemptions.header_present` values and
+  `ldap_auth` `failover_ldap_urls` (an endpoint) are secrets, and
+  `request_transformer` rule values, `mesh_route_dispatch` request-transform
+  values and `fault_injection` / `response_mock` match conditions are brokered,
+  masked and scrubbed operator values whose short live spelling does not
+  refuse the run. Literal values on these paths no longer read as permanent
+  viewer-`diff` drift; they now block apply as literal plugin-config secrets
+  and import brokers them. Generation refuses `len=` below 24 for
+  `load_testing` `key`, `ai_semantic_cache` `redis_integrity_key` and
+  `oidc_relying_party` `session.encryption_secret[_previous]`, whose v0.9.19
+  minimum is 32 characters.
 - `age` is pinned to 0.11.5 (from 0.12.1), and `ssh-key` is reduced to its
   `alloc` and `ed25519` features. `age` 0.12's unused P-256 recipients brought
   in `p256` 0.13 → `crypto-bigint` 0.5.5 (RUSTSEC-2026-0387, no patched

@@ -195,7 +195,11 @@ live leaf has nothing to protect and is skipped. A short live value that only
 the key-name heuristics flag (a `*key` field such as a `request_transformer`
 header name, a header-map value, a Kafka producer property not named like a
 credential, a custom plugin's secret-looking field) may be an ordinary setting: it is not registered and
-does not refuse the run. A short probe value refuses projection/header
+does not refuse the run. The same holds for operator-chosen values Ferrum Edge
+redacts but does not require to be secret (a `request_transformer` rule
+value, a `mesh_route_dispatch` request-transform value, a `fault_injection` or
+`response_mock` match condition): import brokers them and a long one is
+protected, but a short one is not refused. A short probe value refuses projection/header
 resolution, before any probe request. Admission also refuses a value whose
 review formatter spelling falls below 8 bytes after CRLF collapse or trimming,
 rather than admitting a short spelling that would suppress ordinary prose. A

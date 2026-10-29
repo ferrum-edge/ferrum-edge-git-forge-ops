@@ -23,6 +23,13 @@ pub(crate) enum ConfigPathComponent {
 enum RuleKind {
     Secret,
     Endpoint,
+    /// A value the gateway writes or matches on a request (a rule's header
+    /// value, a match condition). Edge redacts it because an operator may put
+    /// a credential there, so it is brokered, masked and scrubbed like a
+    /// secret. Unlike [`RuleKind::Secret`] it is not rule-declared for display
+    /// admission: such values are just as often short ordinary settings
+    /// (`value: "1"`), and a short live one must not refuse the run.
+    Value,
     KafkaProperties,
 }
 
@@ -43,6 +50,13 @@ const fn endpoint(path: &'static [&'static str]) -> Rule {
     Rule {
         path,
         kind: RuleKind::Endpoint,
+    }
+}
+
+const fn operator_value(path: &'static [&'static str]) -> Rule {
+    Rule {
+        path,
+        kind: RuleKind::Value,
     }
 }
 
@@ -132,6 +146,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         ],
         "ldap_auth" => vec![
             endpoint(&["ldap_url"]),
+            endpoint(&["failover_ldap_urls"]),
             secret(&["service_account_password"]),
         ],
         "soap_ws_security" => vec![
@@ -184,7 +199,27 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             secret(&["authorization_header"]),
             secret(&["custom_headers", "*"]),
         ],
-        "ws_logging" => vec![endpoint(&["endpoint_url"])],
+        "ws_logging" => vec![
+            endpoint(&["endpoint_url"]),
+            secret(&["custom_headers", "*"]),
+        ],
+        // Ferrum Edge v0.9.19 redacts these, so `/config/export` fingerprints
+        // them. `header_present` values are shared secrets (Edge requires at
+        // least 16 characters); the rest are operator-chosen values.
+        "waf" => vec![secret(&["global_exemptions", "header_present", "*"])],
+        "request_transformer" => vec![operator_value(&["rules", "*", "value"])],
+        "mesh_route_dispatch" => vec![operator_value(&[
+            "rules",
+            "*",
+            "request_transform",
+            "*",
+            "value",
+        ])],
+        "fault_injection" => vec![operator_value(&["match", "headers", "*"])],
+        "response_mock" => vec![
+            operator_value(&["rules", "*", "match", "headers", "*"]),
+            operator_value(&["rules", "*", "match", "query_params", "*"]),
+        ],
         "proxy_alerts" => vec![
             endpoint(&["channels", "*", "webhook_url"]),
             endpoint(&["channels", "*", "url"]),
@@ -326,8 +361,9 @@ pub(crate) fn endpoint_paths(
 /// secrets and endpoints, and the Kafka producer properties named like a
 /// credential (`sasl.password`). The rest of the Kafka properties are left
 /// out (that rule keeps every property not on a safe list, such as
-/// `security.protocol: SSL`), as are the key/URL heuristics and every leaf of
-/// a custom plugin or of a config that is not an object.
+/// `security.protocol: SSL`), as are [`RuleKind::Value`] leaves, the key/URL
+/// heuristics and every leaf of a custom plugin or of a config that is not an
+/// object.
 ///
 /// Display admission refuses the run for a declared leaf too short to
 /// protect, while a short leaf only the heuristics flag (a header name under
@@ -345,6 +381,7 @@ pub(crate) fn rule_declared_paths(
             RuleKind::Secret | RuleKind::Endpoint => {
                 apply_rule(config, rule.path, rule.kind, &[], &mut found);
             }
+            RuleKind::Value => {}
             RuleKind::KafkaProperties => {
                 let mut properties = BTreeSet::new();
                 apply_rule(config, rule.path, rule.kind, &[], &mut properties);
@@ -434,7 +471,9 @@ fn apply_rule(
 ) {
     let Some((head, rest)) = path.split_first() else {
         match kind {
-            RuleKind::Secret | RuleKind::Endpoint => collect_string_paths(value, current, found),
+            RuleKind::Secret | RuleKind::Endpoint | RuleKind::Value => {
+                collect_string_paths(value, current, found)
+            }
             RuleKind::KafkaProperties => collect_kafka_properties(value, current, found),
         }
         return;
@@ -727,6 +766,72 @@ mod tests {
         );
 
         assert!(classification.unbrokered.is_empty());
+    }
+
+    /// Operator-chosen values Edge v0.9.19 redacts are sensitive everywhere,
+    /// but only declared secrets and endpoints are rule-declared for display
+    /// admission, so a short live `value: "1"` cannot refuse the run.
+    #[test]
+    fn operator_values_are_sensitive_but_not_rule_declared() {
+        let transform = serde_json::json!({"rules": [{
+            "operation": "add", "target": "header", "value": "1"
+        }]});
+        assert_eq!(
+            dotted(sensitive_string_paths("request_transformer", &transform)),
+            vec!["rules.[0].value"]
+        );
+        assert!(rule_declared_paths("request_transformer", &transform).is_empty());
+        for (plugin, config) in [
+            (
+                "mesh_route_dispatch",
+                serde_json::json!({"rules": [{"request_transform": [{"value": "on"}]}]}),
+            ),
+            (
+                "fault_injection",
+                serde_json::json!({"match": {"headers": {"x-chaos": "on"}}}),
+            ),
+            (
+                "response_mock",
+                serde_json::json!({"rules": [{"match": {"query_params": {"page": "2"}}}]}),
+            ),
+        ] {
+            assert_eq!(
+                classify_plugin_config(plugin, &config).sensitive.len(),
+                1,
+                "{plugin}"
+            );
+            assert!(rule_declared_paths(plugin, &config).is_empty(), "{plugin}");
+        }
+
+        let waf = serde_json::json!({"global_exemptions": {"header_present": {"x-hop": "s"}}});
+        assert_eq!(
+            dotted(rule_declared_paths("waf", &waf).into_iter().collect()),
+            vec!["global_exemptions.header_present.x-hop"]
+        );
+        let ws = serde_json::json!({"custom_headers": {"authorization": "Bearer t"}});
+        assert_eq!(
+            dotted(rule_declared_paths("ws_logging", &ws).into_iter().collect()),
+            vec!["custom_headers.authorization"]
+        );
+    }
+
+    #[test]
+    fn ldap_failover_urls_are_endpoints() {
+        let config = serde_json::json!({
+            "ldap_url": "ldaps://ldap1.example:636",
+            "failover_ldap_urls": ["ldaps://ldap2.example:636", "ldap://ldap3.example:389"]
+        });
+        let endpoints: Vec<Vec<ConfigPathComponent>> =
+            endpoint_paths("ldap_auth", &config).into_iter().collect();
+        assert_eq!(
+            dotted(endpoints.clone()),
+            vec![
+                "failover_ldap_urls.[0]",
+                "failover_ldap_urls.[1]",
+                "ldap_url"
+            ]
+        );
+        assert_eq!(endpoint_scheme("ldap_auth", &endpoints[0]), "ldaps");
     }
 
     #[test]

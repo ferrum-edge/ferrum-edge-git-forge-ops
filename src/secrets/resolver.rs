@@ -39,10 +39,19 @@ const RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND: &str = "@plugin-config";
 pub const MIN32_CREDENTIAL_TYPES: [&str; 2] = ["jwt", "hmac_auth"];
 
 /// Plugin-config secret leaves whose gateway minimum is 32 characters, as
-/// `(plugin_name, path under config)`. Ferrum Edge v0.9.19 raised
-/// `ai_transcript_audit` `redaction.hash_secret` from 16 to 32 characters.
-const MIN32_PLUGIN_CONFIG_SECRETS: &[(&str, &[&str])] =
-    &[("ai_transcript_audit", &["redaction", "hash_secret"])];
+/// `(plugin_name, path under config)`, checked against Ferrum Edge v0.9.19's
+/// config admission. That release raised `ai_transcript_audit`
+/// `redaction.hash_secret` from 16 to 32 characters.
+const MIN32_PLUGIN_CONFIG_SECRETS: &[(&str, &[&str])] = &[
+    ("ai_transcript_audit", &["redaction", "hash_secret"]),
+    ("load_testing", &["key"]),
+    ("ai_semantic_cache", &["redis_integrity_key"]),
+    ("oidc_relying_party", &["session", "encryption_secret"]),
+    (
+        "oidc_relying_party",
+        &["session", "encryption_secret_previous"],
+    ),
+];
 
 /// Minimum `len=` (entropy bytes) that still yields ≥32 characters once
 /// base64url-no-pad encoded: `ceil(24 * 4 / 3) == 32`.

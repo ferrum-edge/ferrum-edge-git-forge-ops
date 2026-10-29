@@ -1680,6 +1680,37 @@ fn review_comment_bodies_lose_registered_values_at_the_sink() {
     assert!(!published.contains("field\\_canary"), "{published}");
 }
 
+/// A live value on a plugin path Ferrum Edge v0.9.19 started redacting is
+/// registered from the live snapshot, so a diff that echoes it loses it at
+/// the PR comment's sink.
+#[test]
+fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    const VALUE: &str = "zq7-mock-query-condition-v19";
+    let config = serde_json::from_value(serde_json::json!({
+        "plugin_configs": [{"id": "mock", "namespace": "ferrum", "plugin_name": "response_mock",
+            "scope": "global",
+            "config": {"rules": [{"match": {"query_params": {"mock": VALUE}}}]}}]
+    }))
+    .unwrap();
+    gitforgeops::display::register_gateway_config(&config).unwrap();
+    let diffs = vec![ResourceDiff {
+        action: DiffAction::Modify,
+        kind: "PluginConfig".to_string(),
+        id: "mock".to_string(),
+        namespace: "ferrum".to_string(),
+        details: vec![FieldChange {
+            field: "config".to_string(),
+            old_value: VALUE.to_string(),
+            new_value: "changed".to_string(),
+        }],
+    }];
+    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    let published = gitforgeops::display::scrub_text(&comment);
+    assert!(!published.contains("zq7-mock"), "{published}");
+    assert!(published.contains("[REDACTED]"), "{published}");
+}
+
 /// Both formatter paths must be protected by the final publication sink:
 /// inline code collapses CRLF to one space; prose escapes Markdown punctuation.
 #[test]

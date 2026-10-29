@@ -418,6 +418,58 @@ fn plugin_config_placeholder_leaves_are_masked_without_hiding_siblings() {
     assert!(!is_sensitive_diff_field("PluginConfig", "plugin_name"));
 }
 
+/// A brokered value on a path Ferrum Edge v0.9.19 started redacting (here a
+/// `request_transformer` rule value) is masked per leaf; a sibling setting
+/// that changed stays visible.
+#[test]
+fn edge_0_9_19_brokered_plugin_values_are_masked_without_hiding_siblings() {
+    let mut desired_plugin = make_plugin_config(
+        "transform",
+        "ferrum",
+        "request_transformer",
+        PluginScope::Global,
+    );
+    desired_plugin.config = serde_json::json!({"rules": [{
+        "operation": "add",
+        "target": "header",
+        "value": "${gh-env-secret:alloc=require}"
+    }]});
+    let desired = GatewayConfig {
+        plugin_configs: vec![desired_plugin],
+        ..GatewayConfig::default()
+    };
+
+    let mut live_plugin = make_plugin_config(
+        "transform",
+        "ferrum",
+        "request_transformer",
+        PluginScope::Global,
+    );
+    live_plugin.config = serde_json::json!({"rules": [{
+        "operation": "add",
+        "target": "header",
+        "value": "Bearer live-upstream-credential"
+    }]});
+    let mut actual = GatewayConfig {
+        plugin_configs: vec![live_plugin.clone()],
+        ..GatewayConfig::default()
+    };
+    mask_without_bundle(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+
+    live_plugin.config["rules"][0]["target"] = serde_json::json!("query");
+    let mut actual = GatewayConfig {
+        plugin_configs: vec![live_plugin],
+        ..GatewayConfig::default()
+    };
+    mask_without_bundle(&desired, &mut actual);
+    let diffs = compute_diff(&desired, &actual).unwrap();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    let rendered = format!("{:?}", diffs[0].details);
+    assert!(!rendered.contains("live-upstream-credential"), "{rendered}");
+}
+
 fn make_plugin_config(
     id: &str,
     namespace: &str,
