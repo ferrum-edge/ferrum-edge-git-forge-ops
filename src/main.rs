@@ -2072,6 +2072,8 @@ async fn cmd_diff(
     let diffs = apply::order_incremental_diffs(diffs, &desired);
     let plugin_attach_notice =
         apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
+    let consumer_rename_notice =
+        apply::incremental_consumer_rename_notice(&resolved.apply_strategy, &diffs);
 
     let fingerprint_report = export_comparison.as_ref().map(|comparison| {
         config_export::SecretFingerprintSummary::evaluate(
@@ -2163,6 +2165,7 @@ async fn cmd_diff(
             "diff_count": diffs.len(),
             "live_filter_warning": live_warning,
             "plugin_attach_notice": plugin_attach_notice,
+            "consumer_rename_notice": consumer_rename_notice,
             "live_source": live_source_key,
             "secret_fingerprints": fingerprint_json,
         }),
@@ -2307,6 +2310,9 @@ async fn cmd_diff(
         outln!("{}\n", safe_block(note));
     }
     if let Some(note) = plugin_attach_notice {
+        outln!("{}\n", safe_block(note));
+    }
+    if let Some(note) = consumer_rename_notice {
         outln!("{}\n", safe_block(note));
     }
 
@@ -2560,6 +2566,8 @@ async fn cmd_plan(
     let diffs = apply::order_incremental_diffs(diffs, &desired);
     let plugin_attach_notice =
         apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired);
+    let consumer_rename_notice =
+        apply::incremental_consumer_rename_notice(&resolved.apply_strategy, &diffs);
 
     if let Some(note) = &provenance_note {
         reportln!(json_mode, "=== Live Data Provenance ===");
@@ -2629,6 +2637,9 @@ async fn cmd_plan(
         reportln!(json_mode, "{}\n", safe_block(note));
     }
     if let Some(note) = plugin_attach_notice {
+        reportln!(json_mode, "{}\n", safe_block(note));
+    }
+    if let Some(note) = consumer_rename_notice {
         reportln!(json_mode, "{}\n", safe_block(note));
     }
 
@@ -2827,6 +2838,7 @@ async fn cmd_plan(
             serde_json::json!({
                 "live_filter_warning": live_warning,
                 "plugin_attach_notice": plugin_attach_notice,
+                "consumer_rename_notice": consumer_rename_notice,
                 "conditional_apply_notice": verdict::CONDITIONAL_APPLY_NOTICE,
                 "apply_blocked": offline_summary.is_some()
                     || !conflict_namespaces.is_empty()
@@ -3327,6 +3339,11 @@ async fn cmd_apply(
                     &diffs,
                     &desired,
                 ) {
+                    outln!("{}", safe_block(note));
+                }
+                if let Some(note) =
+                    apply::incremental_consumer_rename_notice(&resolved.apply_strategy, &diffs)
+                {
                     outln!("{}", safe_block(note));
                 }
                 for d in &diffs {
@@ -4262,6 +4279,11 @@ async fn cmd_review(
     );
     if let Some(note) =
         apply::incremental_plugin_attach_notice(&resolved.apply_strategy, &diffs, &desired)
+    {
+        ownership_note.push_str(note);
+        ownership_note.push_str("\n\n");
+    }
+    if let Some(note) = apply::incremental_consumer_rename_notice(&resolved.apply_strategy, &diffs)
     {
         ownership_note.push_str(note);
         ownership_note.push_str("\n\n");
