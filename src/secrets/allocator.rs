@@ -461,7 +461,8 @@ fn random_value(length_bytes: usize) -> String {
 ///
 /// Enforced here:
 ///
-/// * `jwt` / `hmac_auth` secrets must be ≥32 characters, so `len=` must be at
+/// * `jwt` / `hmac_auth` secrets, and the plugin-config leaves the shared
+///   policy lists, must be ≥32 characters, so `len=` must be at
 ///   least [`super::resolver::MIN_ENTROPY_BYTES_FOR_32_CHARS`] (24). `len=16` is rejected with
 ///   an actionable error rather than silently clamped — silently growing a
 ///   credential the operator explicitly sized would be a surprise, and the

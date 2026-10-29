@@ -1549,7 +1549,8 @@ fn resolve_secrets_in_place(
 /// ([`SlotStatus::NeedsAllocation`]); an already-allocated slot keeps
 /// resolving from the bundle whatever its shape.
 ///
-/// Constraints, all from ferrum-edge's `Consumer::validate_fields()`:
+/// Constraints, all from ferrum-edge's field validation
+/// (`Consumer::validate_fields()` and the plugins' config admission):
 ///
 /// * `basicauth` + **file mode** — a file-mode gateway hard-rejects a
 ///   plaintext `password`, and only the admin API hashes one on write.
@@ -1557,8 +1558,9 @@ fn resolve_secrets_in_place(
 ///   `hmac_sha256:<64 lowercase hex>` computed under the gateway's
 ///   server-wide `FERRUM_BASIC_AUTH_HMAC_SECRET`, which gitforgeops does not
 ///   have. Random bytes can never be a valid hash, in either mode.
-/// * `jwt` / `hmac_auth` — secrets must be ≥32 characters, so `len=` must be
-///   at least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] entropy bytes.
+/// * `jwt` / `hmac_auth`, and the plugin-config leaves in
+///   [`MIN32_PLUGIN_CONFIG_SECRETS`] — secrets must be ≥32 characters, so
+///   `len=` must be at least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] entropy bytes.
 ///
 /// Identity fields cannot be generated either. Existing bundle values still
 /// resolve without generation, including externally issued credentials.
