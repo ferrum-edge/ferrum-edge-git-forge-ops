@@ -218,8 +218,9 @@ delete the declaration instead: in `exclusive` mode an undeclared live row is
   U+2029 or U+FEFF characters anywhere but a single leading byte-order mark
   (write `\N`, `\L`, `\P` or `\uFEFF` in a double-quoted string), anchor
   names other than letters, digits, `_` and `-`, a plain value starting with
-  `?` inside `[…]` or `{…}` (quote it), and a `|` or `>` block scalar that
-  runs to the end of a file without a final newline (add one).
+  `?` inside `[…]` or `{…}` (quote it), and a `|`, `>` or `|+` block scalar
+  that runs to the end of a file without a final newline (add one; `|-` is
+  fine).
 - **Anchors and aliases** work, but a file may not expand past 1,000,000
   nodes, 64 MiB of scalar text or 128 levels of nesting, counting every copy
   an anchor or alias makes.

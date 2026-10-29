@@ -44,8 +44,8 @@
 //!   U+2029 (a line break to YAML 1.1 readers only), a U+FEFF other than one
 //!   leading byte-order mark, an anchor name outside `[A-Za-z0-9_-]`, a plain
 //!   scalar starting with `?` inside a flow collection (an explicit-key
-//!   indicator to libyaml), and a block scalar whose last line ends the file
-//!   without a line break.
+//!   indicator to libyaml), and a clipped or kept block scalar (`|`, `>`,
+//!   `|+`; not `|-`) that runs to the end of a file without a line break.
 //!
 //! The merge key `<<` is an ordinary string key, as it is for the gateway, so
 //! in a typed section it surfaces as the unknown field `<<`.
@@ -210,7 +210,9 @@ pub fn from_str<T: DeserializeOwned>(contents: &str) -> Result<T, YamlError> {
         .map_err(|error| YamlError::new(error.to_string()))
 }
 
-/// Render `value` as one YAML document.
+/// Render `value` as one YAML document. `value` must be JSON-shaped (string
+/// keys, numbers within 64 bits, finite floats), as every gitforgeops document
+/// is: the key check below reads it through `serde_json::to_value`.
 ///
 /// Every string is a single plain or quoted line: no `|`/`>` block scalars,
 /// whose folding and chomping rules are where readers disagree, and which

@@ -51,8 +51,8 @@ ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed2
 tempfile = "3"
 
 [dev-dependencies]
-# Differential oracle only (tests/unit/yaml_compat_tests.rs): the gateway still
-# reads YAML with serde_yaml 0.9, so the tests check src/yaml.rs against it.
-# Never a runtime dependency.
+# Test-only gateway oracle: the gateway still reads YAML with serde_yaml 0.9, so
+# tests/unit/yaml_compat_tests.rs and the export readback tests check src/yaml.rs
+# against it. Never a runtime dependency.
 serde_yaml = "0.9"
 base64 = "0.23"
