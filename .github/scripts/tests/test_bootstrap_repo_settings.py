@@ -574,6 +574,17 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
             actions(plan)["environment staging-monitor"], bootstrap.UPDATE
         )
 
+    def test_the_plan_names_the_organization_ruleset_it_cannot_write(self):
+        plan, api = self._plan("version: 1\nenvironments:\n  staging: {}\n")
+        notes = "\n".join(plan.notes)
+        self.assertIn("Organization ruleset (not written by this script", notes)
+        self.assertIn(".github/workflows/supply-chain-policy.yml", notes)
+        self.assertIn("section 2a", notes)
+        self.assertFalse(
+            any("orgs/" in str(step.writes) for step in plan.steps),
+            "the bootstrap must not plan organization writes",
+        )
+
     def test_the_secret_remainder_lists_viewer_material_and_warns_off_the_rest(self):
         plan, _ = self._plan(
             "version: 1\nenvironments:\n  staging:\n    monitoring:\n"

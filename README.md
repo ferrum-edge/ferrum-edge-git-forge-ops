@@ -140,8 +140,13 @@ on September 16, 2026. Plans change, so confirm there.
 The setup below uses a **private** repository with a **required reviewer**,
 which needs GitHub Enterprise. On Free, Pro or Team, pick one of:
 
-- **Public repository.** Every control works. Your gateway configuration
-  (routes, hostnames, plugin settings) is public; credential values are not.
+- **Public repository in an organization on Team or Enterprise.** Every
+  control works. Your gateway configuration (routes, hostnames, plugin
+  settings) is public; credential values are not. A public repository in a
+  Free organization or a personal account gets every control except requiring
+  the trusted policy by workflow path, so a collaborator with write access can
+  merge a head the policy never judged; the settings audit fails (Free
+  organization) or warns (personal account) about it.
 - **Private repository on Pro or Team.** Environments, secrets and branch
   policy work, but there is no human approval before apply. The bootstrap
   script reports the environment step as `FAILED` and the weekly settings audit

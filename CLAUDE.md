@@ -161,8 +161,10 @@ cargo fmt --all && cargo fmt --all -- --check
   Keep new workflows inside that subset. An organization ruleset also
   requires `supply-chain-policy.yml` at `main` by path (#470,
   `docs/github-launch-controls.md` §2a): a required check name alone accepts
-  a check run a same-repository PR's own job posts on a head no trusted run
-  judged. `audit_settings.py` fails without it (warns on user-owned repos). `security.yml`'s
+  a check run any `checks: write` job posts on a head no trusted run judged.
+  `audit_settings.py` fails without it, or when its bypass actors differ from
+  the `main` ruleset's (warns on user-owned repos). Other required contexts,
+  the state guard included, are still name-only (#632). `security.yml`'s
   `security-supply-chain-policy` stays required until the ruleset switch and a
   later retire PR (`docs/github-launch-controls.md`, "Switching the
   supply-chain policy check").
