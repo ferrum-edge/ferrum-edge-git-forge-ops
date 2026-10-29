@@ -474,10 +474,11 @@ fn edge_0_9_19_redacted_plugin_values_are_not_false_drift() {
                 "/config/rules/0/match/query_params/mock",
             ],
         ),
+        // A non-string endpoint is fingerprinted whole: the array, not each URL.
         (
             "ldap_auth",
             json!({"failover_ldap_urls": ["ldaps://ldap2.example:636"]}),
-            vec!["/config/failover_ldap_urls/0"],
+            vec!["/config/failover_ldap_urls"],
         ),
         // Short, non-string and container values: Edge fingerprints the whole
         // value at the rule site, so each must be matched there, never read

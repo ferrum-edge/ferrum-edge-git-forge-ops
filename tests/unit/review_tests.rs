@@ -1686,34 +1686,57 @@ fn review_comment_bodies_lose_registered_values_at_the_sink() {
 #[test]
 fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
     gitforgeops::display::enable_display_scrubbing_on_this_thread();
-    const VALUE: &str = "zq7-mock-query-condition-v19";
-    let config = serde_json::from_value(serde_json::json!({
-        "plugin_configs": [{"id": "mock", "namespace": "ferrum", "plugin_name": "response_mock",
-            "scope": "global",
-            "config": {"rules": [{"match": {"query_params": {"mock": VALUE}}}]}}]
-    }))
-    .unwrap();
-    gitforgeops::display::register_gateway_config(&config).unwrap();
-    let diffs = vec![ResourceDiff {
-        action: DiffAction::Modify,
-        kind: "PluginConfig".to_string(),
-        id: "mock".to_string(),
-        namespace: "ferrum".to_string(),
-        // The changes table renders the field, so the value travels there.
-        details: vec![FieldChange {
-            field: format!("config {VALUE}"),
-            old_value: VALUE.to_string(),
-            new_value: "changed".to_string(),
-        }],
-    }];
-    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
-    assert!(
-        comment.contains("zq7-mock"),
-        "the formatter must actually echo the live value"
-    );
-    let published = gitforgeops::display::scrub_text(&comment);
-    assert!(!published.contains("zq7-mock"), "{published}");
-    assert!(published.contains("[REDACTED]"), "{published}");
+    for (plugin_name, value, config) in [
+        (
+            "response_mock",
+            "zq7-mock-query-condition-v19",
+            serde_json::json!({"rules": [{"match": {"query_params": {
+                "mock": "zq7-mock-query-condition-v19"
+            }}}]}),
+        ),
+        (
+            "waf",
+            "zq7-waf-header-present-v19",
+            serde_json::json!({"global_exemptions": {"header_present": {
+                "x-trusted-hop": "zq7-waf-header-present-v19"
+            }}}),
+        ),
+        (
+            "ws_logging",
+            "zq7-ws-collector-header-v19",
+            serde_json::json!({"custom_headers": {"x-collector": "zq7-ws-collector-header-v19"}}),
+        ),
+    ] {
+        let config = serde_json::from_value(serde_json::json!({
+            "plugin_configs": [{"id": "plugin", "namespace": "ferrum",
+                "plugin_name": plugin_name, "scope": "global", "config": config}]
+        }))
+        .unwrap();
+        gitforgeops::display::register_gateway_config(&config).unwrap();
+        let diffs = vec![ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "PluginConfig".to_string(),
+            id: "plugin".to_string(),
+            namespace: "ferrum".to_string(),
+            // The changes table renders the field, so the value travels there.
+            details: vec![FieldChange {
+                field: format!("config {value}"),
+                old_value: value.to_string(),
+                new_value: "changed".to_string(),
+            }],
+        }];
+        let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+        assert!(
+            comment.contains(value),
+            "{plugin_name}: the formatter must actually echo the live value"
+        );
+        let published = gitforgeops::display::scrub_text(&comment);
+        assert!(!published.contains("zq7"), "{plugin_name}: {published}");
+        assert!(
+            published.contains("[REDACTED]"),
+            "{plugin_name}: {published}"
+        );
+    }
 }
 
 /// Both formatter paths must be protected by the final publication sink:

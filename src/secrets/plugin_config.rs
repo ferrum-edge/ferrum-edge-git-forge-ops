@@ -352,12 +352,14 @@ pub(crate) fn sensitive_string_paths(
 }
 
 /// Every location `/config/export` fingerprints that the repository can
-/// put its declared value back at: [`sensitive_string_paths`], plus each
-/// [`RuleKind::Value`] site as a whole. Edge fingerprints the whole non-null
-/// value there, whatever its length or JSON type (a `request_transformer`
-/// body rule's `value` may be `true`, a number or an object), so an
-/// ordinary short or non-string value must still be matched rather than
-/// read as drift.
+/// put its declared value back at: [`sensitive_string_paths`], plus the node
+/// each secret, endpoint or [`RuleKind::Value`] rule matches, as a whole.
+/// Edge fingerprints the whole non-null value at a secret site, and at an
+/// endpoint site that is not a string, whatever its length or JSON type (a
+/// `request_transformer` body rule's `value` may be `true`, a number or an
+/// object; `failover_ldap_urls` is an array). Matching the site itself keeps
+/// such a value comparable against a baseline instead of reading as drift
+/// or as a masked ancestor.
 pub(crate) fn export_redacted_paths(
     plugin_name: &str,
     config: &Value,
@@ -369,13 +371,14 @@ pub(crate) fn export_redacted_paths(
         return found;
     }
     for rule in rules_for(plugin_name) {
-        if matches!(rule.kind, RuleKind::Value) {
-            walk_rule(config, rule.path, &[], &mut |node, path, complete| {
-                if complete && !node.is_null() {
-                    found.insert(path.to_vec());
-                }
-            });
+        if matches!(rule.kind, RuleKind::KafkaProperties) {
+            continue;
         }
+        walk_rule(config, rule.path, &[], &mut |node, path, complete| {
+            if complete && !node.is_null() {
+                found.insert(path.to_vec());
+            }
+        });
     }
     found
 }
@@ -942,6 +945,22 @@ mod tests {
         assert_eq!(
             dotted(rule_declared_paths("waf", &waf).into_iter().collect()),
             vec!["global_exemptions.header_present.x-hop"]
+        );
+    }
+
+    #[test]
+    fn rule_matched_nodes_are_export_sites() {
+        let ldap = serde_json::json!({
+            "ldap_url": "ldaps://ldap1.example:636",
+            "failover_ldap_urls": ["ldaps://ldap2.example:636"]
+        });
+        assert_eq!(
+            dotted(
+                export_redacted_paths("ldap_auth", &ldap)
+                    .into_iter()
+                    .collect()
+            ),
+            vec!["failover_ldap_urls", "failover_ldap_urls.[0]", "ldap_url"]
         );
     }
 
