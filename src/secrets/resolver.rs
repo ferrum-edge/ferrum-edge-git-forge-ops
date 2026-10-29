@@ -744,7 +744,8 @@ fn check_min_secret_length(slot: &str, value: &str) -> crate::error::Result<()> 
         "secret slot '{slot}' holds a bundle value shorter than {min} bytes. Brokered \
          secrets must be at least {min} bytes so they can be removed from this tool's \
          output; re-seed the slot with a longer value or rotate it with \
-         'gitforgeops rotate'.",
+         'gitforgeops rotate'. If the value is an ordinary short setting (a plugin \
+         transform or match value), write it literally in place of the placeholder.",
         min = super::MIN_SCRUB_LENGTH
     )))
 }
