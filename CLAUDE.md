@@ -17,9 +17,9 @@ live operations.
 Shared contracts live in [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts); see
 [README.md's Contracts section](README.md#contracts) for the vendored pin and update rule.
 
-The 13 adopted files are pinned to published `contracts-edge-0.9.15` at
-`6fb64c5dc2e014204c17609fc717d976f3b4589e`, with Edge v0.9.15 provenance at
-`25b37395ff61bfea0f3ffd189d9011c4984fa755`. Adoption covers only the GitForgeOps
+The 13 adopted files are pinned to published `contracts-edge-0.9.19` at
+`d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`, with Edge v0.9.19 provenance at
+`510ce7121c3d9754110d330a30a3bd9b7a7b278e`. Adoption covers only the GitForgeOps
 resource-envelope schema, its ten fixtures, and the plugin-catalog and
 `provisioned-by` vocabularies. Retain upstream preparation prose verbatim; the
 [contracts guide](docs/contracts.md) distinguishes actual publication from metadata
@@ -463,15 +463,17 @@ namespace payload is built before the first mutation.
   proxies the plan accounts for referencing the plugin — and an Edge build
   with ferrum-edge#6744 checks it atomically with the write under the same
   lease (issue #569), answering `412` for a referencing proxy outside that set
-  (kept target aside). Released Edge up to v0.9.17 ignores the parameter, so
-  `refuse_unplanned_references` also stays (issue #603): before a plugin
+  (kept target aside). The pinned Edge v0.9.19 includes #6744 and refuses a
+  write without the parameter (`400`); released Edge up to v0.9.17 ignores it,
+  so `refuse_unplanned_references` also stays (issue #603): before a plugin
   delete, and before an update changing the planned `scope`/`proxy_id` to
   `proxy`/`global` (`Preconditions::retargets`), it re-reads `/backup` and
   refuses when a referencing proxy is not in the plan's live view, not
   declared, and not the kept target. Both surface as
   `Error::UnplannedPluginReference` (withholds like `StalePlan`). Keep the
-  re-read until the minimum supported Edge release includes #6744; the
-  client cannot detect a gateway that ignores the parameter.
+  re-read until hosted lifecycle qualification of the exact v0.9.19 build
+  (the intended minimum supported release) is recorded; the client cannot
+  detect a gateway that ignores the parameter.
 
   A mismatch or `412` is `Error::StalePlan`: a per-resource error that also
   withholds **every later write in the namespace** (creates and updates
@@ -1448,7 +1450,9 @@ See `docs/credential-identities.md` for the command-boundary audit.
 Shared by `resolver::check_generation_allowed` and the allocator, so `plan` and
 generation agree:
 
-- `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24 entropy bytes).
+- `jwt`/`hmac_auth` secrets need ≥32 chars (`len=` ≥ 24 entropy bytes), as do
+  the plugin-config leaves in `MIN32_PLUGIN_CONFIG_SECRETS` (today
+  `ai_transcript_audit` `redaction.hash_secret`, raised to 32 in Edge v0.9.19).
 - `basicauth` generation is refused in file mode; `basicauth/…/password_hash`
   in every mode (it is HMAC-SHA256 under the gateway's own secret).
 - A plugin-config endpoint leaf (`secrets::plugin_config::endpoint_paths`, e.g.

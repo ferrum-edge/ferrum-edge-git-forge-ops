@@ -1,4 +1,4 @@
-FROM ferrumedge/ferrum-edge:v0.9.17@sha256:f8942bed8d3b77c257d7266c9227450dd3d8c139759a07c47d060521a5fd41d1 AS ferrum-edge
+FROM ferrumedge/ferrum-edge:v0.9.19@sha256:0e2ed6d720cbc474e29cfa6bcd3945db010674d69988e2bd795a26399c3cb80e AS ferrum-edge
 
 FROM rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS builder
 # Override verification needs only Git's built-in local inspection commands.

@@ -38,6 +38,12 @@ const RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND: &str = "@plugin-config";
 /// (`jwt.secret`, `hmac_auth.secret`).
 pub const MIN32_CREDENTIAL_TYPES: [&str; 2] = ["jwt", "hmac_auth"];
 
+/// Plugin-config secret leaves whose gateway minimum is 32 characters, as
+/// `(plugin_name, path under config)`. Ferrum Edge v0.9.19 raised
+/// `ai_transcript_audit` `redaction.hash_secret` from 16 to 32 characters.
+const MIN32_PLUGIN_CONFIG_SECRETS: &[(&str, &[&str])] =
+    &[("ai_transcript_audit", &["redaction", "hash_secret"])];
+
 /// Minimum `len=` (entropy bytes) that still yields ≥32 characters once
 /// base64url-no-pad encoded: `ceil(24 * 4 / 3) == 32`.
 pub const MIN_ENTROPY_BYTES_FOR_32_CHARS: usize = 24;
@@ -1543,7 +1549,8 @@ fn resolve_secrets_in_place(
 /// ([`SlotStatus::NeedsAllocation`]); an already-allocated slot keeps
 /// resolving from the bundle whatever its shape.
 ///
-/// Constraints, all from ferrum-edge's `Consumer::validate_fields()`:
+/// Constraints, all from ferrum-edge's field validation
+/// (`Consumer::validate_fields()` and the plugins' config admission):
 ///
 /// * `basicauth` + **file mode** — a file-mode gateway hard-rejects a
 ///   plaintext `password`, and only the admin API hashes one on write.
@@ -1551,8 +1558,9 @@ fn resolve_secrets_in_place(
 ///   `hmac_sha256:<64 lowercase hex>` computed under the gateway's
 ///   server-wide `FERRUM_BASIC_AUTH_HMAC_SECRET`, which gitforgeops does not
 ///   have. Random bytes can never be a valid hash, in either mode.
-/// * `jwt` / `hmac_auth` — secrets must be ≥32 characters, so `len=` must be
-///   at least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] entropy bytes.
+/// * `jwt` / `hmac_auth`, and the plugin-config leaves in
+///   [`MIN32_PLUGIN_CONFIG_SECRETS`] — secrets must be ≥32 characters, so
+///   `len=` must be at least [`MIN_ENTROPY_BYTES_FOR_32_CHARS`] entropy bytes.
 ///
 /// Identity fields cannot be generated either. Existing bundle values still
 /// resolve without generation, including externally issued credentials.
@@ -1686,7 +1694,8 @@ pub(crate) fn check_endpoint_generation(slot: &str, endpoint: bool) -> crate::er
 }
 
 /// The one implementation of ferrum-edge's ≥32-character secret floor for
-/// `jwt` / `hmac_auth`.
+/// `jwt` / `hmac_auth` and the plugin-config leaves in
+/// [`MIN32_PLUGIN_CONFIG_SECRETS`].
 ///
 /// Both the plan-time resolver check ([`check_generation_constraints`]) and
 /// the generate-time allocator check
@@ -1699,10 +1708,16 @@ pub(crate) fn check_min_entropy(
     cred_type: &str,
     length_bytes: usize,
 ) -> crate::error::Result<()> {
-    if MIN32_CREDENTIAL_TYPES.contains(&cred_type) && length_bytes < MIN_ENTROPY_BYTES_FOR_32_CHARS
-    {
+    let subject = if MIN32_CREDENTIAL_TYPES.contains(&cred_type) {
+        format!("{cred_type} secrets")
+    } else if cred_type == PLUGIN_CONFIG_SLOT_KIND && is_min32_plugin_config_secret(slot) {
+        "this plugin-config secret".to_string()
+    } else {
+        return Ok(());
+    };
+    if length_bytes < MIN_ENTROPY_BYTES_FOR_32_CHARS {
         return Err(crate::error::Error::Config(format!(
-            "credential slot '{slot}': {cred_type} secrets must be at least 32 characters, but \
+            "credential slot '{slot}': {subject} must be at least 32 characters, but \
              'len={length_bytes}' generates only {} base64url characters. Use \
              'len={MIN_ENTROPY_BYTES_FOR_32_CHARS}' or higher (the default len=32 yields 43 \
              characters).",
@@ -1710,6 +1725,23 @@ pub(crate) fn check_min_entropy(
         )));
     }
     Ok(())
+}
+
+/// Whether a `<ns>/<id>/@plugin/<plugin_name>/config/<path>` slot names a
+/// leaf in [`MIN32_PLUGIN_CONFIG_SECRETS`].
+fn is_min32_plugin_config_secret(slot: &str) -> bool {
+    let parts: Vec<String> = slot
+        .split('/')
+        .skip(3)
+        .map(unescape_slot_component)
+        .collect();
+    let [plugin_name, config, field @ ..] = parts.as_slice() else {
+        return false;
+    };
+    config == "config"
+        && MIN32_PLUGIN_CONFIG_SECRETS.iter().any(|(name, path)| {
+            name == plugin_name && path.iter().copied().eq(field.iter().map(String::as_str))
+        })
 }
 
 /// Does this credential subtree contain at least one `${gh-env-secret:…}`

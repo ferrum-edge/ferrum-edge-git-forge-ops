@@ -2314,9 +2314,9 @@ const STALE_PLAN_GONE: &str =
 /// carries the plan's expected referencing-proxy set (`expected_proxy_ids`),
 /// which a Ferrum Edge build implementing that precondition checks atomically
 /// with the write, refusing with `412` instead of silently detaching a proxy
-/// outside the set (issue #569). Released Edge builds up to v0.9.17 ignore the
-/// parameter, so the client-side re-read stays until the minimum supported
-/// Edge enforces it (issue #603).
+/// outside the set (issue #569). The pinned Edge v0.9.19 enforces it; released
+/// builds up to v0.9.17 ignore the parameter, so the client-side re-read stays
+/// until the exact v0.9.19 build is qualified (issue #603).
 ///
 /// Consumers compare complete verification with the raw evidence captured before
 /// allocation, including hidden fields and the original row token. Archival
@@ -2501,10 +2501,11 @@ impl<'a> Preconditions<'a> {
     ///
     /// On its own this narrows the race to the time between that read and the
     /// write; the `expected_proxy_ids` precondition the write also carries
-    /// closes it on a gateway that enforces it (issue #569). Released Edge
-    /// builds up to v0.9.17 ignore that parameter and the client cannot tell
-    /// whether the target enforces it, so this check runs unconditionally
-    /// until the minimum supported Edge release does (issue #603).
+    /// closes it on a gateway that enforces it (issue #569). The pinned Edge
+    /// v0.9.19 enforces it, but released builds up to v0.9.17 ignore that
+    /// parameter and the client cannot tell whether the target enforces it,
+    /// so this check runs unconditionally until the exact v0.9.19 build is
+    /// qualified (issue #603).
     async fn refuse_unplanned_references(
         &mut self,
         id: &str,

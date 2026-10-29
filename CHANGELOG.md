@@ -7,6 +7,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Move #266's pending first-release pairing to published Ferrum Edge v0.9.19
+  (`510ce7121c3d9754110d330a30a3bd9b7a7b278e`; v0.9.18 was tagged but never
+  published), refreshing the stale-validator canary (#626) in the same change.
+  The verified x86_64 validator joins the allowlist, and the release record,
+  baseline check, Dockerfile gateway image index, quickstart and candidate
+  documentation now name it together. Vendored Contracts move to
+  `contracts-edge-0.9.19`, whose plugin catalog moves `ai_token_metrics` to
+  priority 4070; the local catalog follows. v0.9.19 includes ferrum-edge#6744
+  and requires `expected_proxy_ids` on PluginConfig updates and deletes,
+  which apply already sends; the client-side reference re-read (#603) stays
+  until this exact build is qualified. Generation refuses `len=` below 24 for
+  `ai_transcript_audit` `redaction.hash_secret`, whose v0.9.19 minimum is 32
+  characters, before any value is allocated. The consumer example notes
+  v0.9.19's 16-character `keyauth` minimum and per-namespace `jwt`
+  uniqueness. Supported status, publication fields and all exact-revision
+  lifecycle acceptance remain pending.
 - `age` is pinned to 0.11.5 (from 0.12.1), and `ssh-key` is reduced to its
   `alloc` and `ed25519` features. `age` 0.12's unused P-256 recipients brought
   in `p256` 0.13 → `crypto-bigint` 0.5.5 (RUSTSEC-2026-0387, no patched

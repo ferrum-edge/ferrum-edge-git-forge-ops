@@ -14,44 +14,46 @@ finalized record on upstream `main` when adopting the tag. The
 [release notes](notes-v0.1.0.md) are committed here so the pairing stays
 discoverable after Actions artifacts expire.
 
-The intended first pairing is GitForgeOps v0.1.0 with Ferrum Edge v0.9.17:
+The intended first pairing is GitForgeOps v0.1.0 with Ferrum Edge v0.9.19:
 
 | Artifact | Digest |
 | --- | --- |
-| v0.9.17 Linux x86_64 binary: the approved validator and the lifecycle suite's gateway | `0540ba760639bea61b93d0ffb34055fb0df8e4cd6db4550064d12cda87782b9e` (SHA-256) |
-| v0.9.17 Linux aarch64 standalone gateway asset | `8a8d898b21366fe0b820599f174e9af382a0a9af2b54d9d78c665ffc3bb81a9c` (SHA-256) |
-| Docker Hub v0.9.17 linux/amd64 image manifest | `sha256:64f958ef6c594b7da44345182035318611f2741463cbd1d5e7a77b3e109d22d2` |
-| Docker Hub v0.9.17 linux/arm64 image manifest | `sha256:2f80952c2aaaf450980c7d2fad9f28977416ac6ebb1e07dbe8c890c6e05e8ec0` |
-| Docker Hub v0.9.17 multi-platform index, used by the Dockerfile's gateway stage | `sha256:f8942bed8d3b77c257d7266c9227450dd3d8c139759a07c47d060521a5fd41d1` |
+| v0.9.19 Linux x86_64 binary: the approved validator and the lifecycle suite's gateway | `446e5aa4a85f03bc33a4cd2d618904a676ecf06f657954dca5b67a9563dec818` (SHA-256) |
+| v0.9.19 Linux aarch64 standalone gateway asset | `6b82a48ea56a59a2ce86c48d423b0d77de42d1b4e4d8b1f67da99b5b80e20b08` (SHA-256) |
+| Docker Hub v0.9.19 linux/amd64 image manifest | `sha256:a6383110354ad04905ed4be2036a36c26bee5c9439e40ae52502ef4d7604f03d` |
+| Docker Hub v0.9.19 linux/arm64 image manifest | `sha256:0ab3341d8204fa5696f57c2ffc07e3d82914bac22c58b0ddc741077968262019` |
+| Docker Hub v0.9.19 multi-platform index, used by the Dockerfile's gateway stage | `sha256:0e2ed6d720cbc474e29cfa6bcd3945db010674d69988e2bd795a26399c3cb80e` |
 
 Standalone binaries and OCI manifests are separate artifacts; the container
 copies its gateway from the pinned platform image, not the standalone asset. See the
-[upstream release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.17)
-and the [Docker Hub version tag](https://hub.docker.com/r/ferrumedge/ferrum-edge/tags?name=v0.9.17).
+[upstream release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.19)
+and the [Docker Hub version tag](https://hub.docker.com/r/ferrumedge/ferrum-edge/tags?name=v0.9.19).
 Because the Dockerfile pins the index digest, the GitForgeOps image bundles
-this verified gateway candidate. Edge v0.9.17 was published on 2026-10-10 at
-tag commit `669c574c1d1e88e84dccb26a8159939e6694644d`. Its
-[release run](https://github.com/ferrum-edge/ferrum-edge/actions/runs/38073021290)
+this verified gateway candidate. Edge v0.9.19 was published on 2026-10-27 at
+tag commit `510ce7121c3d9754110d330a30a3bd9b7a7b278e`. Its
+[release run](https://github.com/ferrum-edge/ferrum-edge/actions/runs/40457120201)
 completed successfully. These upstream release
 facts do not replace GitForgeOps hosted validation or exact-revision lifecycle
 acceptance against these bytes; both remain required.
 
 The standard image's signed SLSA provenance binds the index and both platform
-manifests above to that source commit, release workflow and `refs/tags/v0.9.17`.
-Review the [v0.9.17 operator changes](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917)
-before rollout, including namespace-bounded admin tokens, stricter plugin and
-route admission, and cached admin misses. The unpublished v0.9.16 tag is not a
-distribution candidate. The scoped vendored Contracts pin remains
-`contracts-edge-0.9.15`; this gateway refresh does not adopt another contract
-release or claim conformance or acceptance against the new gateway.
+manifests above to that source commit, release workflow and `refs/tags/v0.9.19`.
+Review the [v0.9.19 operator changes](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919)
+before rollout. v0.9.19 carries the changes prepared for the unpublished v0.9.18
+tag, whose ARM64 build failed; many plugin configurations v0.9.17 accepted are now
+refused, and PluginConfig updates and deletes require `expected_proxy_ids`, which
+GitForgeOps already sends. The unpublished v0.9.16 and v0.9.18 tags are not
+distribution candidates. The scoped vendored Contracts pin moves to
+`contracts-edge-0.9.19`; that adoption does not claim conformance or acceptance
+against the new gateway.
 
 ## Support and compatibility
 
 | Combination or profile | Initial support boundary |
 | --- | --- |
-| GitForgeOps v0.1.0 source/template with Ferrum Edge v0.9.17 | Intended first pairing; supported only after the record is finalized against passing exact-revision lifecycle evidence. The validator is the checked-in v0.9.17 x86_64 asset. |
-| GitForgeOps container | Linux AMD64 and ARM64 image at the recorded immutable GitForgeOps digest. The bundled gateway comes from the v0.9.17 OCI index above. The x86_64 standalone validator pin describes GitHub's Linux x86_64 runners, not an ARM64 binary checksum. |
-| Earlier or later Ferrum Edge versions | Not a supported pair. v0.9.4 and earlier cannot accept the resource labels GitForgeOps emits. A newer validator added to the checksum allowlist is not automatically a new supported pairing. Upstream v0.9.6 was tagged but never published. Older allowlist entries, including v0.9.5, v0.9.7, v0.9.8, v0.9.9, v0.9.10, v0.9.11, v0.9.12, v0.9.13, v0.9.14 and v0.9.15, are kept only so in-flight pull requests keep validating; they are not part of this pairing. |
+| GitForgeOps v0.1.0 source/template with Ferrum Edge v0.9.19 | Intended first pairing; supported only after the record is finalized against passing exact-revision lifecycle evidence. The validator is the checked-in v0.9.19 x86_64 asset. |
+| GitForgeOps container | Linux AMD64 and ARM64 image at the recorded immutable GitForgeOps digest. The bundled gateway comes from the v0.9.19 OCI index above. The x86_64 standalone validator pin describes GitHub's Linux x86_64 runners, not an ARM64 binary checksum. |
+| Earlier or later Ferrum Edge versions | Not a supported pair. v0.9.4 and earlier cannot accept the resource labels GitForgeOps emits. A newer validator added to the checksum allowlist is not automatically a new supported pairing. Upstream v0.9.6, v0.9.16 and v0.9.18 were tagged but never published. Older allowlist entries, including v0.9.5, v0.9.7, v0.9.8, v0.9.9, v0.9.10, v0.9.11, v0.9.12, v0.9.13, v0.9.14, v0.9.15 and v0.9.17, are kept only so in-flight pull requests keep validating; they are not part of this pairing. |
 | API mode, one namespace, shared ownership, incremental apply | The first customer deployment profile. It includes PR validation/review, human-approved apply, credential delivery, traffic verification, and ownership ledger publication. See the [quickstart](../docs/quickstart.md). |
 | File mode and mesh | Supported as assembly, validation, placeholder-preserving publication, and separate encrypted materialization. File output and mesh documents are **not** delivered to nodes by the bundled workflows; mesh has no admin API. Live fleet rollout and file-mode drift monitoring need an external delivery/observation system. Set `live_review: false` for file-only environments. |
 | Multiple environments | Independent matrix jobs can run in parallel, each with its own GitHub Environment approval, concurrency group, and ledger. For ordering, set `promotion.requires: staging` and declare traffic checks in `.gitforgeops/smoke.yaml`; promotion waits for successful staging apply and verify for the same eligible revision. Parallel jobs alone provide no promotion gate. |
@@ -150,12 +152,12 @@ formats from before the first release.
 
 ## Conditional API adoption qualification (#462)
 
-The candidate pairing pins published Edge v0.9.17 to owner commit
-`669c574c1d1e88e84dccb26a8159939e6694644d`, with content-pinned (SHA-256)
+The candidate pairing pins published Edge v0.9.19 to owner commit
+`510ce7121c3d9754110d330a30a3bd9b7a7b278e`, with content-pinned (SHA-256)
 release artifacts, the verified x86_64 asset and default multi-platform image
 index listed above. The existing conditional API implementation is unchanged.
 Vendored Contracts are pinned to published
-`contracts-edge-0.9.15`, commit `6fb64c5dc2e014204c17609fc717d976f3b4589e`;
+`contracts-edge-0.9.19`, commit `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`;
 all scoped canonical copies and PIN hashes match that tag. The contract
 adoption does not change the conditional API implementation or extend the
 vendored scope. See the [contracts guide](../docs/contracts.md) for the
