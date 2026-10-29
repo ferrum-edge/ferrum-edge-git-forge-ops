@@ -201,6 +201,9 @@ pub fn all_deletes_missing_warning(
 /// New proxies and their new scoped configs form a cycle: neither can be
 /// created individually first. `apply_incremental` batches those together at
 /// rank 2, after independent plugin writes, without stripping associations.
+/// An `access_control` Modify that drops a username a Consumer rename gives
+/// up moves the other way, to the front of rank 0; see
+/// [`order_incremental_diffs`].
 pub fn operation_rank(action: &DiffAction, kind: &str) -> u8 {
     match action {
         DiffAction::Add | DiffAction::Modify => match kind {
@@ -229,8 +232,12 @@ pub fn order_diffs(mut diffs: Vec<ResourceDiff>) -> Vec<ResourceDiff> {
     diffs
 }
 
-/// Execution and previews share namespace order and the rank-2 create batch.
-/// Cycles precede ordinary proxy writes, after all independent plugin writes.
+/// Execution and previews share namespace order, the rank-2 create batch and
+/// the rename-unblocking `access_control` writes. Cycles precede ordinary
+/// proxy writes, after all independent plugin writes. An `access_control`
+/// Modify that removes a username a Consumer rename in the same namespace
+/// gives up precedes every rank-0 write there (see
+/// [`rename_unblocking_keys`]).
 pub fn order_incremental_diffs(
     diffs: Vec<ResourceDiff>,
     desired: &GatewayConfig,
@@ -242,19 +249,130 @@ pub fn order_incremental_diffs(
         .iter()
         .map(|d| state_key(&d.namespace, &d.kind, &d.id))
         .collect();
+    let unblocking = rename_unblocking_keys(&diffs, &index);
     diffs.sort_by_key(|d| {
-        let cyclic = keys.contains(&state_key(&d.namespace, &d.kind, &d.id));
+        let key = state_key(&d.namespace, &d.kind, &d.id);
+        let cyclic = keys.contains(&key);
+        let unblocks = unblocking.contains(&key);
         (
             d.namespace.clone(),
             if cyclic {
                 2
+            } else if unblocks {
+                0
             } else {
                 operation_rank(&d.action, &d.kind)
             },
-            !cyclic,
+            !(cyclic || unblocks),
         )
     });
     diffs
+}
+
+const ACCESS_CONTROL_PLUGIN: &str = "access_control";
+
+/// Whether an `access_control` config names `username` in
+/// `allowed_consumers` or `disallowed_consumers`, byte for byte. Mirrors
+/// Edge's `access_control::config_names_consumer_username`, the predicate its
+/// stores use to refuse a Consumer rename.
+fn access_control_names(config: &serde_json::Value, username: &str) -> bool {
+    ["allowed_consumers", "disallowed_consumers"]
+        .iter()
+        .any(|key| {
+            config
+                .get(*key)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| entries.iter().any(|entry| entry.as_str() == Some(username)))
+        })
+}
+
+/// The live value of a top-level field a Modify changes, read back from the
+/// diff entry, which records it as JSON.
+fn live_field<T: serde::de::DeserializeOwned>(diff: &ResourceDiff, field: &str) -> Option<T> {
+    diff.details
+        .iter()
+        .find(|change| change.field == field)
+        .and_then(|change| serde_json::from_str(&change.old_value).ok())
+}
+
+/// `(namespace, previous username)` for every Consumer Modify that changes
+/// `username`.
+fn consumer_renames(diffs: &[ResourceDiff]) -> BTreeSet<(&str, String)> {
+    diffs
+        .iter()
+        .filter(|d| d.action == DiffAction::Modify && d.kind == "Consumer")
+        .filter_map(|d| live_field::<String>(d, "username").map(|old| (d.namespace.as_str(), old)))
+        .collect()
+}
+
+/// `access_control` PluginConfig modifies a Consumer rename in the same run
+/// waits on.
+///
+/// Edge v0.9.19 refuses (`409`) a `PUT /consumers/{id}` that changes
+/// `username` while any `access_control` config in the namespace still names
+/// the previous username, and a PluginConfig write does not check the
+/// usernames it lists. A Modify qualifies when its live config names a
+/// renamed Consumer's previous username and its desired config does not; it
+/// then has to land before the Consumer, ahead of its usual rank.
+///
+/// Edge refuses the rename while the previous username is listed anywhere, so
+/// no intermediate config can name both usernames, and the Consumer keeps its
+/// previous username until the config no longer lists it. Against Edge
+/// v0.9.19 moving the write earlier adds no intermediate state: under rank
+/// order the rename is refused, the plugin write still lands, and that same
+/// pairing (previous username, updated lists) lasts until a later run.
+/// Hoisting only lets the rename follow it in this run. Edge v0.9.17 and
+/// earlier accept either order; there the pairing becomes (new username,
+/// previous lists) for the same brief window.
+///
+/// Only Modifies that stay `access_control` qualify: those configs reference
+/// no upstream or Consumer row, so leaving rank 1 breaks no dependency. A
+/// delete is never moved, because deletes must follow every Add/Modify (a
+/// failed write defers them). Every other PluginConfig write keeps its rank.
+fn rename_unblocking_keys(diffs: &[ResourceDiff], index: &DesiredIndex<'_>) -> BTreeSet<String> {
+    let renames = consumer_renames(diffs);
+    if renames.is_empty() {
+        return BTreeSet::new();
+    }
+    diffs
+        .iter()
+        .filter(|d| d.action == DiffAction::Modify && d.kind == "PluginConfig")
+        .filter(|d| !d.details.iter().any(|change| change.field == "plugin_name"))
+        .filter(|d| {
+            let Some(plugin) = index
+                .plugin_configs
+                .get(&(d.namespace.as_str(), d.id.as_str()))
+                .filter(|plugin| plugin.plugin_name == ACCESS_CONTROL_PLUGIN)
+            else {
+                return false;
+            };
+            // No `config` change means live equals desired, which the
+            // desired-side check below would reject anyway.
+            let Some(live) = live_field::<serde_json::Value>(d, "config") else {
+                return false;
+            };
+            renames.iter().any(|(namespace, previous)| {
+                *namespace == d.namespace
+                    && access_control_names(&live, previous)
+                    && !access_control_names(&plugin.config, previous)
+            })
+        })
+        .map(|d| state_key(&d.namespace, &d.kind, &d.id))
+        .collect()
+}
+
+/// What a Consumer `username` change needs from `access_control`, for every
+/// incremental preview that contains one.
+pub fn incremental_consumer_rename_notice(
+    strategy: &ApplyStrategy,
+    diffs: &[ResourceDiff],
+) -> Option<&'static str> {
+    if !matches!(strategy, ApplyStrategy::Incremental) || consumer_renames(diffs).is_empty() {
+        return None;
+    }
+    Some(
+        "Consumer username renames: the gateway refuses a rename (409) while any access_control plugin config in the namespace still names the previous username, so incremental apply writes each declared access_control update that removes it before the Consumer. No config may name both usernames during the change: until the rename lands, the Consumer still carries its previous username, so an allow-list naming only the new username briefly refuses it and a deny-list naming only the new username briefly stops denying it. The rename still fails while the desired configuration or a config this repository does not declare names the previous username. A config deleted in the same run never releases it, because the refused rename defers that delete on every retry: remove the config, or the previous username from it, in an earlier apply. full_replace makes the change atomically per namespace.",
+    )
 }
 
 /// The safe default and its explicit availability exception belong in every
@@ -1686,6 +1804,17 @@ async fn apply_incremental(
         .iter()
         .map(|d| state_key(&d.namespace, &d.kind, &d.id))
         .collect();
+    let unblocking = rename_unblocking_keys(&diffs, &index);
+    for diff in diffs
+        .iter()
+        .filter(|d| unblocking.contains(&state_key(&d.namespace, &d.kind, &d.id)))
+    {
+        crate::eoutln!(
+            "[{}] writing access_control PluginConfig `{}` before Consumer writes: it removes the previous username of a Consumer this run renames",
+            safe(namespace),
+            safe(&diff.id)
+        );
+    }
 
     // Pure-Add namespaces take the transactional bulk path. `POST /batch` is
     // create-only and all-or-nothing (never 207), so any Modify or Delete in

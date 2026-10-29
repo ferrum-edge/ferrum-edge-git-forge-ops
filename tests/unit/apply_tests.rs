@@ -3601,6 +3601,218 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
     );
 }
 
+fn access_control(
+    id: &str,
+    allowed: &[&str],
+    denied: &[&str],
+) -> gitforgeops::config::schema::PluginConfig {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "namespace": "team-alpha",
+        "plugin_name": "access_control",
+        "config": {"allowed_consumers": allowed, "disallowed_consumers": denied},
+        "scope": "global",
+    }))
+    .expect("access_control fixture")
+}
+
+fn renamed(id: &str, username: &str) -> Consumer {
+    let mut row = consumer(id, "team-alpha");
+    row.username = username.to_string();
+    row
+}
+
+fn ordered_writes(diffs: &[ResourceDiff]) -> Vec<String> {
+    diffs
+        .iter()
+        .map(|d| format!("{:?} {} {}", d.action, d.kind, d.id))
+        .collect()
+}
+
+#[test]
+fn access_control_writes_that_release_a_renamed_username_precede_consumer_writes() {
+    use gitforgeops::apply::order_incremental_diffs;
+
+    // Edge v0.9.19 refuses a username change while any access_control config
+    // still names the previous username, in either list. `allow` and `deny`
+    // name it and drop it; `kept` still names it (the rename cannot land, so
+    // moving it would gain nothing); `other` never named it; `cors` is not an
+    // access_control config; `gone` is deleted and keeps its delete rank.
+    let mut cors = plugin_config("cors", "team-alpha", "p1", None);
+    cors.scope = gitforgeops::config::schema::PluginScope::Global;
+    cors.proxy_id = None;
+    let actual = GatewayConfig {
+        consumers: vec![renamed("c1", "alice"), renamed("c2", "bob")],
+        upstreams: vec![upstream("u1", "team-alpha")],
+        plugin_configs: vec![
+            access_control("allow", &["alice", "carol"], &[]),
+            access_control("deny", &[], &["alice"]),
+            access_control("kept", &["alice"], &[]),
+            access_control("other", &["carol"], &[]),
+            access_control("gone", &["alice"], &[]),
+            cors.clone(),
+        ],
+        ..Default::default()
+    };
+    let mut changed_cors = cors;
+    changed_cors.enabled = !changed_cors.enabled;
+    let mut changed_upstream = upstream("u1", "team-alpha");
+    changed_upstream.targets[0].port = 9090;
+    let desired = GatewayConfig {
+        consumers: vec![renamed("c1", "alice2"), renamed("c2", "bob")],
+        upstreams: vec![changed_upstream],
+        plugin_configs: vec![
+            access_control("allow", &["alice2", "carol"], &[]),
+            access_control("deny", &[], &["alice2"]),
+            access_control("kept", &["alice", "dave"], &[]),
+            access_control("other", &["carol", "dave"], &[]),
+            changed_cors,
+        ],
+        ..Default::default()
+    };
+    let diffs = order_incremental_diffs(
+        gitforgeops::diff::compute_diff(&desired, &actual).unwrap(),
+        &desired,
+    );
+    assert_eq!(
+        ordered_writes(&diffs),
+        vec![
+            "Modify PluginConfig allow",
+            "Modify PluginConfig deny",
+            "Modify Consumer c1",
+            "Modify Upstream u1",
+            "Modify PluginConfig cors",
+            "Modify PluginConfig kept",
+            "Modify PluginConfig other",
+            "Delete PluginConfig gone",
+        ]
+    );
+
+    // Without a rename nothing moves: the same access_control edit stays at
+    // its dependency rank, after Consumer and Upstream writes.
+    let mut no_rename = desired.clone();
+    no_rename.consumers[0].username = "alice".to_string();
+    no_rename.consumers.push(renamed("c3", "carol"));
+    let diffs = order_incremental_diffs(
+        gitforgeops::diff::compute_diff(&no_rename, &actual).unwrap(),
+        &no_rename,
+    );
+    assert_eq!(
+        ordered_writes(&diffs)[..3].to_vec(),
+        vec![
+            "Add Consumer c3",
+            "Modify Upstream u1",
+            "Modify PluginConfig allow"
+        ]
+    );
+}
+
+#[test]
+fn access_control_hoisting_is_per_namespace_and_ignores_retyped_configs() {
+    use gitforgeops::apply::order_incremental_diffs;
+
+    // A rename in one namespace never moves another namespace's config, and a
+    // config whose plugin type changes keeps its rank.
+    let mut elsewhere = access_control("acl", &["alice"], &[]);
+    elsewhere.namespace = "team-b".to_string();
+    let mut retyped = access_control("retyped", &["alice"], &[]);
+    let actual = GatewayConfig {
+        consumers: vec![renamed("c1", "alice")],
+        plugin_configs: vec![elsewhere.clone(), retyped.clone()],
+        ..Default::default()
+    };
+    let mut elsewhere_desired = elsewhere;
+    elsewhere_desired.config = serde_json::json!({"allowed_consumers": ["alice2"]});
+    retyped.plugin_name = "cors".to_string();
+    retyped.config = serde_json::json!({});
+    let desired = GatewayConfig {
+        consumers: vec![renamed("c1", "alice2")],
+        plugin_configs: vec![elsewhere_desired, retyped],
+        ..Default::default()
+    };
+    let diffs = order_incremental_diffs(
+        gitforgeops::diff::compute_diff(&desired, &actual).unwrap(),
+        &desired,
+    );
+    assert_eq!(
+        ordered_writes(&diffs),
+        vec![
+            "Modify Consumer c1",
+            "Modify PluginConfig retyped",
+            "Modify PluginConfig acl",
+        ]
+    );
+}
+
+#[test]
+fn consumer_rename_notice_is_incremental_only_and_explains_the_transition() {
+    use gitforgeops::apply::incremental_consumer_rename_notice;
+
+    let actual = GatewayConfig {
+        consumers: vec![renamed("c1", "alice")],
+        ..Default::default()
+    };
+    let desired = GatewayConfig {
+        consumers: vec![renamed("c1", "alice2")],
+        ..Default::default()
+    };
+    let diffs = gitforgeops::diff::compute_diff(&desired, &actual).unwrap();
+    let note = incremental_consumer_rename_notice(&ApplyStrategy::Incremental, &diffs).unwrap();
+    assert!(note.contains("refuses a rename (409)"));
+    assert!(note.contains("deny-list naming only the new username briefly stops denying it"));
+    assert!(note.contains("full_replace"));
+    assert!(incremental_consumer_rename_notice(&ApplyStrategy::FullReplace, &diffs).is_none());
+
+    // A Consumer change that keeps its username needs no notice.
+    let mut relabelled = actual.clone();
+    relabelled.consumers[0].custom_id = Some("crm-1".to_string());
+    let diffs = gitforgeops::diff::compute_diff(&relabelled, &actual).unwrap();
+    assert!(!diffs.is_empty());
+    assert!(incremental_consumer_rename_notice(&ApplyStrategy::Incremental, &diffs).is_none());
+}
+
+#[tokio::test]
+async fn consumer_rename_applies_after_its_access_control_update_in_one_run() {
+    let actual = GatewayConfig {
+        consumers: vec![renamed("c1", "alice")],
+        plugin_configs: vec![access_control("acl", &["alice"], &["mallory"])],
+        ..Default::default()
+    };
+    let desired = GatewayConfig {
+        consumers: vec![renamed("c1", "alice2")],
+        plugin_configs: vec![access_control("acl", &["alice2"], &["mallory"])],
+        ..Default::default()
+    };
+    let mut routes = vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("GET /backup".into(), 200, backup_body(&actual), vec![]),
+    ];
+    routes.extend(tagged_rows(&actual));
+    let (url, requests) = spawn_recording_gateway(routes);
+    let planned_actuals = BTreeMap::from([("team-alpha".into(), actual)]);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".into()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    assert_eq!(result.updated, 2);
+    let mutations = mutation_lines(&requests);
+    assert_eq!(mutations.len(), 2, "{mutations:?}");
+    assert!(
+        mutations[0].starts_with("PUT /plugins/config/acl"),
+        "{mutations:?}"
+    );
+    assert_eq!(mutations[1], "PUT /consumers/c1 HTTP/1.1");
+}
+
 fn ledger_of(ops: &[gitforgeops::apply::AppliedOp], desired: &GatewayConfig) -> StateFile {
     let mut state = StateFile::default();
     let desired = gitforgeops::state::ResourceKeys::from_config(desired);

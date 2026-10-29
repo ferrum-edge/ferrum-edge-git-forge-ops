@@ -367,6 +367,16 @@ deletes in reverse).
 - A failed proxy delete defers deletion of the plugins it references. Edge
   detaches references when deleting a plugin instead of rejecting the delete,
   so this order keeps a surviving proxy protected.
+- **Consumer renames.** Edge v0.9.19 refuses (409) a Consumer `username`
+  change while any `access_control` config in the namespace names the old
+  username (allow or deny list). `order_incremental_diffs`
+  (`rename_unblocking_keys`) moves an `access_control` Modify whose live
+  config (from the diff entry) names a renamed Consumer's old username and
+  whose desired config does not to the front of rank 0. Deletes, retypes and
+  other plugins keep their rank. No config can name both usernames, so the
+  window between the writes refuses an allow-listed Consumer and un-denies a
+  deny-listed one; v0.9.19's rank order already left that pairing until the
+  next run. `incremental_consumer_rename_notice` says so in every preview.
 
 **`--allow-nontransactional-plugin-attach`** (or strictly parsed
 `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH=true`, default false) permits

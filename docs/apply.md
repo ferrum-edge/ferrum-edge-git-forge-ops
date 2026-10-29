@@ -163,6 +163,24 @@ so the proxy change must land first.
   `listen_path`) to a new proxy id conflicts with the incumbent on every retry.
   Modify the existing id, or stage the replacement on a different routing key
   first.
+- **Consumer username renames wait on `access_control`.** The gateway refuses
+  (409) a Consumer `username` change while any `access_control` plugin config
+  in the namespace still names the previous username in `allowed_consumers` or
+  `disallowed_consumers`. So an `access_control` modify that removes the
+  previous username of a Consumer renamed in the same run is written at the
+  front of rank 0, and the rename follows in the same run. Only declared
+  modifies that stay `access_control` move; deletes and every other plugin
+  write keep their rank. A config cannot name both usernames during the
+  change, so until the rename lands the Consumer still carries its previous
+  username: an allow-list naming only the new username briefly refuses it, and
+  a deny-list naming only the new username briefly stops denying it. The rename
+  still fails while the desired configuration or an undeclared config names
+  the previous username. A config deleted in the same run never releases it:
+  the refused rename defers that delete on every retry, so remove the config,
+  or the previous username from it, in an earlier apply. `diff`, `plan`, the
+  apply preview and the PR review print this notice whenever an incremental
+  diff renames a Consumer. `full_replace` makes the change atomically per
+  namespace.
 - **Proxy deletes send `cleanup_orphaned_upstream=false`**, so the gateway
   never deletes an upstream behind the repository's back.
 - **Plugin retention.** Proxies are deleted before plugins, and plugins
