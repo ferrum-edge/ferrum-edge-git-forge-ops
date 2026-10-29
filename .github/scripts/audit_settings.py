@@ -67,6 +67,18 @@ SOURCE_BOUND_STATUS_CHECKS = (
     "validate-trusted-policy",
 )
 
+# The required-check binding above names a check, not the workflow that ran it,
+# and every job that holds `checks: write` reports through the same app. A
+# same-repository pull request can push a head with GITHUB_TOKEN (no workflow
+# starts) and post a successful check run under every required name, which
+# merges (#470). An organization ruleset `workflows` rule closes that for the
+# files it lists: only a run of the file at the default branch satisfies it, so
+# neither a head without one nor a deleted run can merge. Only the supply-chain
+# policy is listed. A listed workflow starts no run on `labeled`, which would
+# strand the state guard's override flow, so the state guard and the other
+# required contexts stay name-only until #632
+# (docs/github-launch-controls.md, section 2a).
+REQUIRED_RULESET_WORKFLOWS = (".github/workflows/supply-chain-policy.yml",)
 RELEASE_TAG_PATTERN = "refs/tags/v*"
 
 # `settings-audit.yml` binds this environment so its administration-read token
@@ -212,6 +224,11 @@ def audit_action_permissions(
 
 
 def ruleset_targets_branch(ruleset: dict, branch: str) -> bool:
+    # The listing includes organization rulesets. Their shape is not this
+    # audit's baseline (`audit_required_workflows` checks the one rule taken
+    # from them), so only the repository's own rulesets are matched here.
+    if ruleset.get("source_type") != "Repository":
+        return False
     if ruleset.get("target") != "branch" or ruleset.get("enforcement") != "active":
         return False
     ref_name = ruleset.get("conditions", {}).get("ref_name", {})
@@ -349,7 +366,99 @@ def audit_main_ruleset(
     )
 
 
+def bypass_set(actors) -> frozenset | None:
+    """A ruleset's bypass actors as comparable tuples; None when unreadable."""
+    if not isinstance(actors, list) or not all(isinstance(a, dict) for a in actors):
+        return None
+    return frozenset(
+        (a.get("actor_type"), str(a.get("actor_id")), a.get("bypass_mode"))
+        for a in actors
+    )
+
+
+def audit_required_workflows(
+    audit: Audit,
+    repository: dict,
+    branch_rules: list,
+    branch: str,
+    rulesets_by_id: dict,
+    expected_bypass: frozenset | None,
+) -> None:
+    """The default branch must require each trusted workflow by path (#470).
+
+    Read from the branch's effective rules, which include organization
+    rulesets. A `workflows` entry counts only when it names this repository,
+    the exact path and the default branch's ref. Every effective `workflows`
+    rule, whatever it lists, must come from a ruleset (`ruleset_id`, resolved
+    from the repository's ruleset listing) whose bypass actors equal the
+    audited `main` ruleset's (`expected_bypass`): rulesets apply together, so
+    a wider bypass on any of them exempts actors from a rule a posted check
+    run cannot satisfy, and a narrower one refuses the state-writer App's
+    ledger commits even when another rule admits it. An unreadable defining
+    ruleset or bypass list is a violation and its entries do not count.
+    GitHub offers the rule only through organization or enterprise rulesets,
+    so a user-owned repository gets a warning naming the residual risk
+    instead of a violation it could never clear.
+    """
+    repository_id = repository.get("id")
+    expected_ref = f"refs/heads/{branch}"
+    if repository_id is None:
+        audit.violations.append("repository id is unreadable; cannot match workflows rules")
+        return
+    required: set[str] = set()
+    for rule in branch_rules:
+        if not isinstance(rule, dict) or rule.get("type") != "workflows":
+            continue
+        defining = rulesets_by_id.get(rule.get("ruleset_id"))
+        bypass = bypass_set(defining.get("bypass_actors")) if defining else None
+        if defining is None or bypass is None:
+            reason = f"ruleset {rule.get('ruleset_id')} or its bypass actors are unreadable"
+        elif expected_bypass is None:
+            reason = "the main ruleset's bypass actors could not be established"
+        elif bypass != expected_bypass:
+            reason = (
+                f"its bypass actors {sorted(bypass)} differ from the main "
+                f"ruleset's {sorted(expected_bypass)}"
+            )
+        else:
+            workflows = (rule.get("parameters") or {}).get("workflows") or []
+            required |= {
+                entry.get("path")
+                for entry in workflows
+                if isinstance(entry, dict)
+                and entry.get("repository_id") == repository_id
+                and entry.get("ref") == expected_ref
+            }
+            continue
+        audit.violations.append(
+            f"the workflows rule from ruleset {rule.get('ruleset_id')} on "
+            f"{branch!r} does not count: {reason} "
+            "(docs/github-launch-controls.md, section 2a)"
+        )
+    user_owned = (repository.get("owner") or {}).get("type") == "User"
+    for path in REQUIRED_RULESET_WORKFLOWS:
+        if path in required:
+            audit.evidence.append(f"required workflow: {path} at {expected_ref}")
+        elif user_owned:
+            audit.warnings.append(
+                f"{branch!r} cannot require {path} by path: GitHub offers the "
+                "workflows rule only in organization rulesets. Until the "
+                "repository moves to an organization, a collaborator with write "
+                "access can merge a head no trusted policy run judged "
+                "(docs/github-launch-controls.md, section 2a)"
+            )
+        else:
+            audit.violations.append(
+                f"{branch!r} must require {path} at {expected_ref} through an "
+                "organization ruleset workflows rule; the required check name "
+                "alone accepts a check run the pull request's own job posts "
+                "(docs/github-launch-controls.md, section 2a)"
+            )
+
+
 def ruleset_targets_release_tags(ruleset: dict, pattern: str) -> bool:
+    if ruleset.get("source_type") != "Repository":
+        return False
     if ruleset.get("target") != "tag" or ruleset.get("enforcement") != "active":
         return False
     ref_name = ruleset.get("conditions", {}).get("ref_name", {})
@@ -633,6 +742,20 @@ def run(
         audit_main_ruleset(
             audit, matching[0], required_checks, state_writer_app_id, template_repo
         )
+    branch_rules = flatten_pages(
+        gh_json(
+            f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+            paginate=True,
+        )
+    )
+    audit_required_workflows(
+        audit,
+        gh_json(f"repos/{repo}"),
+        branch_rules,
+        branch,
+        {item.get("id"): item for item in rulesets},
+        bypass_set(matching[0].get("bypass_actors")) if len(matching) == 1 else None,
+    )
 
     tag_matching = [
         item

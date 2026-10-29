@@ -122,8 +122,8 @@ keep its schema in one initial baseline; see the
 
 ## GitHub plan requirements
 
-Three GitHub features the setup relies on depend on repository visibility and
-plan. Checked against GitHub's documentation on
+Four GitHub features the setup relies on depend on repository visibility,
+owner and plan. Checked against GitHub's documentation on
 [managing environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments),
 [deployment protection rules](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
 and [Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions)
@@ -135,12 +135,18 @@ on September 16, 2026. Plans change, so confirm there.
 | Deployment branch policy (apply only from protected branches) | All plans | Pro, Team or Enterprise |
 | Required reviewers on environments (the human gate before apply, live review and rotate) | All plans | **Enterprise only** |
 | Actions minutes | Free on standard hosted runners | Plan allowance, then billed |
+| Requiring the trusted policy workflow by path (organization ruleset `workflows` rule; see [launch controls §2a](docs/github-launch-controls.md#2a-require-the-trusted-policy-by-workflow-path)) | Organization on Team or Enterprise; **not a user-owned repository** | Organization on Team or Enterprise |
 
 The setup below uses a **private** repository with a **required reviewer**,
 which needs GitHub Enterprise. On Free, Pro or Team, pick one of:
 
-- **Public repository.** Every control works. Your gateway configuration
-  (routes, hostnames, plugin settings) is public; credential values are not.
+- **Public repository in an organization on Team or Enterprise.** Every
+  control works. Your gateway configuration (routes, hostnames, plugin
+  settings) is public; credential values are not. A public repository in a
+  Free organization or a personal account gets every control except requiring
+  the trusted policy by workflow path, so a collaborator with write access can
+  merge a head the policy never judged; the settings audit fails (Free
+  organization) or warns (personal account) about it.
 - **Private repository on Pro or Team.** Environments, secrets and branch
   policy work, but there is no human approval before apply. The bootstrap
   script reports the environment step as `FAILED` and the weekly settings audit

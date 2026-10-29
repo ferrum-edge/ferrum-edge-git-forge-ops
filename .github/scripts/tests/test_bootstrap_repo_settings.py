@@ -574,6 +574,17 @@ class MonitoringEnvironmentPlanTests(unittest.TestCase):
             actions(plan)["environment staging-monitor"], bootstrap.UPDATE
         )
 
+    def test_the_plan_names_the_organization_ruleset_it_cannot_write(self):
+        plan, api = self._plan("version: 1\nenvironments:\n  staging: {}\n")
+        notes = "\n".join(plan.notes)
+        self.assertIn("Organization ruleset (not written by this script", notes)
+        self.assertIn(".github/workflows/supply-chain-policy.yml", notes)
+        self.assertIn("section 2a", notes)
+        self.assertFalse(
+            any("orgs/" in str(step.writes) for step in plan.steps),
+            "the bootstrap must not plan organization writes",
+        )
+
     def test_the_secret_remainder_lists_viewer_material_and_warns_off_the_rest(self):
         plan, _ = self._plan(
             "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
@@ -1278,7 +1289,13 @@ class SharedConstantTests(unittest.TestCase):
         # Including the transitional context: running the bootstrap is the
         # documented way to add it, so what it writes draws no warning.
         self.assertEqual(audit.warnings, [])
-        self.assertTrue(audit_settings.ruleset_targets_branch(ruleset, "main"))
+        # The audit reads GitHub's copy, which adds `source_type` to the body
+        # the bootstrap writes; it matches only repository-sourced rulesets.
+        self.assertTrue(
+            audit_settings.ruleset_targets_branch(
+                {**ruleset, "source_type": "Repository"}, "main"
+            )
+        )
 
         tag = bootstrap.release_tag_ruleset_body(
             [{"actor_type": "Integration", "actor_id": 1234, "bypass_mode": "always"}]
@@ -1288,7 +1305,7 @@ class SharedConstantTests(unittest.TestCase):
         self.assertEqual(audit.violations, [])
         self.assertTrue(
             audit_settings.ruleset_targets_release_tags(
-                tag, audit_settings.RELEASE_TAG_PATTERN
+                {**tag, "source_type": "Repository"}, audit_settings.RELEASE_TAG_PATTERN
             )
         )
 

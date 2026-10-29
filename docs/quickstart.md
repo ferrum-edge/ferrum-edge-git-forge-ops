@@ -176,6 +176,13 @@ has to approve. `--environment production` is needed because the script
 normally discovers environments from `.gitforgeops/config.yaml`, which you
 commit in step 4.
 
+On an organization repository, an organization owner must also create the
+ruleset that requires the trusted supply-chain policy by workflow path, with
+the same bypass actors as the `main` ruleset
+([launch controls §2a](github-launch-controls.md#2a-require-the-trusted-policy-by-workflow-path)).
+The script prints this step but cannot write it, and the settings audit fails
+until it exists.
+
 The release-tag ruleset's bypass defaults to the Repository Admin role, which
 the settings audit rejects. Once you have an App, user or team that publishes
 releases, re-run with `--release-tag-bypass app:<id>`, `user:<login>` or
