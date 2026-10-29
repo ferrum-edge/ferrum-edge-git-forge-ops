@@ -1254,8 +1254,10 @@ class RequiredWorkflowRuleTests(unittest.TestCase):
                 responses = secure_responses()
                 self.bypass(responses, actors)
                 audit = self.run_audit(responses)
-                self.assertEqual(len(audit.violations), 1)
+                # The refused rule, then the requirement it no longer meets.
+                self.assertEqual(len(audit.violations), 2)
                 self.assertIn("bypass actors", audit.violations[0])
+                self.assertIn("must require", audit.violations[1])
 
     def test_an_unreadable_defining_ruleset_does_not_count(self):
         for change in ("missing", "no-bypass-field"):
@@ -1268,19 +1270,57 @@ class RequiredWorkflowRuleTests(unittest.TestCase):
                 else:
                     del responses["repos/acme/repo/rulesets/9"]["bypass_actors"]
                 audit = self.run_audit(responses)
-                self.assertEqual(len(audit.violations), 1)
+                self.assertEqual(len(audit.violations), 2)
                 self.assertIn("unreadable", audit.violations[0])
+                self.assertIn("must require", audit.violations[1])
 
-    def test_any_one_acceptable_defining_ruleset_is_enough(self):
-        # Rules from several rulesets apply together; a bypass of one does
-        # not bypass another.
-        responses = secure_responses()
-        wide = dict(responses["repos/acme/repo/rulesets/9"], id=12)
-        wide["bypass_actors"] = []
-        responses["repos/acme/repo/rulesets/12"] = wide
+    def add_second_workflow_ruleset(self, responses, actors, paths):
+        responses["repos/acme/repo/rulesets/12"] = dict(
+            responses["repos/acme/repo/rulesets/9"], id=12, bypass_actors=actors
+        )
         responses["repos/acme/repo/rulesets?per_page=100"][0].append({"id": 12})
-        rule = dict(responses[self.RULES][0][0], ruleset_id=12)
-        responses[self.RULES] = [[rule], [responses[self.RULES][0][0]]]
+        rule = {
+            "type": "workflows",
+            "ruleset_id": 12,
+            "parameters": {
+                "workflows": [
+                    {"repository_id": 1234, "path": path, "ref": "refs/heads/main"}
+                    for path in paths
+                ]
+            },
+        }
+        responses[self.RULES] = [responses[self.RULES][0] + [rule]]
+
+    def test_every_effective_workflow_ruleset_must_mirror_the_main_bypass(self):
+        # Rulesets apply together: a second rule without the state-writer App
+        # bypass refuses ledger commits even though ruleset 9 admits the App,
+        # and a wider one exempts actors from it. Either is a violation,
+        # whatever workflow the second rule lists.
+        for actors, paths in (
+            ([], audit_settings.REQUIRED_RULESET_WORKFLOWS),
+            ([], (".github/workflows/other.yml",)),
+            (
+                [
+                    {"actor_type": "Integration", "actor_id": 99, "bypass_mode": "always"},
+                    {"actor_type": "RepositoryRole", "actor_id": 4, "bypass_mode": "always"},
+                ],
+                audit_settings.REQUIRED_RULESET_WORKFLOWS,
+            ),
+        ):
+            with self.subTest(actors=actors, paths=paths):
+                responses = secure_responses()
+                self.add_second_workflow_ruleset(responses, actors, paths)
+                audit = self.run_audit(responses)
+                self.assertEqual(len(audit.violations), 1)
+                self.assertIn("ruleset 12", audit.violations[0])
+
+    def test_a_second_mirrored_workflow_ruleset_passes(self):
+        responses = secure_responses()
+        self.add_second_workflow_ruleset(
+            responses,
+            [{"actor_type": "Integration", "actor_id": 99, "bypass_mode": "always"}],
+            (".github/workflows/other.yml",),
+        )
         self.assertEqual(self.run_audit(responses).violations, [])
 
     def test_the_rule_may_be_on_a_later_page(self):
@@ -1301,7 +1341,7 @@ class RequiredWorkflowRuleTests(unittest.TestCase):
 
     def test_malformed_rules_and_a_missing_repository_id_fail_closed(self):
         responses = secure_responses()
-        responses[self.RULES] = [[{"type": "workflows", "parameters": None}]]
+        responses[self.RULES] = [[{"type": "workflows", "ruleset_id": 9, "parameters": None}]]
         self.assertEqual(len(self.run_audit(responses).violations), 1)
         responses = secure_responses()
         del responses["repos/acme/repo"]["id"]

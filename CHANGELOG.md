@@ -538,6 +538,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- A required status check is now also enforced by workflow path (#470). In
+  sandbox repositories a same-repository pull request's own job pushed a head
+  with `GITHUB_TOKEN`, which starts no workflow, and posted a successful
+  check run under each required name; the required-check rule alone let it
+  merge. An organization ruleset `workflows` rule now requires
+  `.github/workflows/supply-chain-policy.yml` at `main` (launch controls
+  §2a). The settings audit fails without it on an organization repository,
+  or when any ruleset with a `workflows` rule on `main` has bypass actors
+  other than the `main` ruleset's, and warns on a user-owned repository; it
+  now matches only repository-sourced rulesets for its `main` and tag
+  baselines. The bootstrap prints the organization step it cannot write.
+  With the rule in place a retargeted pull request needs a push or reopen.
+  The other required contexts, the state guard included, can still be
+  satisfied by a write collaborator who deletes the failing run and posts a
+  check from another branch (#632).
+
 - Required home jobs are pinned exactly in the supply-chain checker
   (#566). The `gitforgeops-required-static-validation` verdict job
   (needs, `always()`, result wiring and script) and `rust-ci-check`'s

@@ -388,15 +388,17 @@ def audit_required_workflows(
 
     Read from the branch's effective rules, which include organization
     rulesets. A `workflows` entry counts only when it names this repository,
-    the exact path and the default branch's ref, and when the ruleset that
-    defines it (`ruleset_id`, resolved from the repository's ruleset listing)
-    grants exactly the bypass actors of the audited `main` ruleset
-    (`expected_bypass`). A wider bypass would exempt actors from the one rule
-    a posted check run cannot satisfy; a missing state-writer App bypass
-    would refuse ledger commits. An unreadable defining ruleset or bypass
-    list does not count. GitHub offers the rule only through organization or
-    enterprise rulesets, so a user-owned repository gets a warning naming the
-    residual risk instead of a violation it could never clear.
+    the exact path and the default branch's ref. Every effective `workflows`
+    rule, whatever it lists, must come from a ruleset (`ruleset_id`, resolved
+    from the repository's ruleset listing) whose bypass actors equal the
+    audited `main` ruleset's (`expected_bypass`): rulesets apply together, so
+    a wider bypass on any of them exempts actors from a rule a posted check
+    run cannot satisfy, and a narrower one refuses the state-writer App's
+    ledger commits even when another rule admits it. An unreadable defining
+    ruleset or bypass list is a violation and its entries do not count.
+    GitHub offers the rule only through organization or enterprise rulesets,
+    so a user-owned repository gets a warning naming the residual risk
+    instead of a violation it could never clear.
     """
     repository_id = repository.get("id")
     expected_ref = f"refs/heads/{branch}"
@@ -404,45 +406,39 @@ def audit_required_workflows(
         audit.violations.append("repository id is unreadable; cannot match workflows rules")
         return
     required: set[str] = set()
-    refused: dict[str, list[str]] = {}
     for rule in branch_rules:
         if not isinstance(rule, dict) or rule.get("type") != "workflows":
             continue
-        workflows = (rule.get("parameters") or {}).get("workflows") or []
-        paths = {
-            entry.get("path")
-            for entry in workflows
-            if isinstance(entry, dict)
-            and entry.get("repository_id") == repository_id
-            and entry.get("ref") == expected_ref
-        }
-        if not paths:
-            continue
         defining = rulesets_by_id.get(rule.get("ruleset_id"))
         bypass = bypass_set(defining.get("bypass_actors")) if defining else None
-        if bypass is not None and expected_bypass is not None and bypass == expected_bypass:
-            required |= paths
-            continue
         if defining is None or bypass is None:
             reason = f"ruleset {rule.get('ruleset_id')} or its bypass actors are unreadable"
         elif expected_bypass is None:
             reason = "the main ruleset's bypass actors could not be established"
-        else:
+        elif bypass != expected_bypass:
             reason = (
-                f"ruleset {rule.get('ruleset_id')} bypass actors {sorted(bypass)} "
-                f"differ from the main ruleset's {sorted(expected_bypass)}"
+                f"its bypass actors {sorted(bypass)} differ from the main "
+                f"ruleset's {sorted(expected_bypass)}"
             )
-        for path in paths:
-            refused.setdefault(path, []).append(reason)
+        else:
+            workflows = (rule.get("parameters") or {}).get("workflows") or []
+            required |= {
+                entry.get("path")
+                for entry in workflows
+                if isinstance(entry, dict)
+                and entry.get("repository_id") == repository_id
+                and entry.get("ref") == expected_ref
+            }
+            continue
+        audit.violations.append(
+            f"the workflows rule from ruleset {rule.get('ruleset_id')} on "
+            f"{branch!r} does not count: {reason} "
+            "(docs/github-launch-controls.md, section 2a)"
+        )
     user_owned = (repository.get("owner") or {}).get("type") == "User"
     for path in REQUIRED_RULESET_WORKFLOWS:
         if path in required:
             audit.evidence.append(f"required workflow: {path} at {expected_ref}")
-        elif path in refused:
-            audit.violations.append(
-                f"the workflows rule requiring {path} does not count: "
-                f"{'; '.join(refused[path])} (docs/github-launch-controls.md, section 2a)"
-            )
         elif user_owned:
             audit.warnings.append(
                 f"{branch!r} cannot require {path} by path: GitHub offers the "

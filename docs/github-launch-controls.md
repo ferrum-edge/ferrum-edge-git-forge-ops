@@ -264,7 +264,8 @@ Take step 2 after step 1 has merged, as an administrator:
    `supply-chain-policy.yml`, so the new check **fails** on them ("must remain
    a regular file"). Re-running it does not help: update the branch from
    `main`. Pull requests branched after the merge report the check on their
-   next `opened`, `synchronize`, `reopened` or `edited` event.
+   next `opened`, `synchronize`, `reopened` or `edited` event (after §2a,
+   `edited` no longer starts a run: push or reopen instead).
 
 ## 2a. Require the trusted policy by workflow path
 
@@ -306,8 +307,9 @@ access who deletes its failing run and posts a success from a branch the policy
 never judges (last row above). The state guard cannot simply be listed: a
 listed workflow starts no run on `labeled` or `edited`, which would make the
 `gitforgeops/state-override` flow impossible. Until #632 lands, exact-head
-review of what merges, and of workflow-run deletions in the audit log, carries
-that part of the guarantee.
+review of what merges carries that part of the guarantee: a deleted run is
+visible only as a missing run on the head, and the organization audit-log API
+that would record the deletion needs GitHub Enterprise Cloud.
 
 As an organization owner, after section 2:
 
@@ -355,8 +357,10 @@ As an organization owner, after section 2:
 4. Dispatch `GitHub Settings Audit`. It reads the branch's effective rules
    (`GET /repos/{repo}/rules/branches/main`) and fails until a `workflows`
    rule names this repository, `.github/workflows/supply-chain-policy.yml` and
-   `refs/heads/main`, from a ruleset whose bypass actors equal the `main`
-   ruleset's. On a user-owned repository, where the rule does not exist, it
+   `refs/heads/main`. Every `workflows` rule on `main`, whatever it lists, must
+   come from a ruleset whose bypass actors equal the `main` ruleset's:
+   rulesets apply together, so one rule without the App's bypass refuses
+   ledger commits even if another admits it. On a user-owned repository, where the rule does not exist, it
    warns instead and the risk above remains. The bootstrap cannot write
    organization rulesets; it prints this step as a reminder.
 
@@ -1017,8 +1021,9 @@ included.
 - the active `main` and release-tag rulesets, including required checks and
   the exact state-writer App bypass;
 - the organization `workflows` rule that requires `supply-chain-policy.yml`
-  at `main`, and that its ruleset's bypass actors equal the `main` ruleset's
-  (§2a; a warning on a user-owned repository);
+  at `main`, and that every ruleset with a `workflows` rule on `main` has
+  the `main` ruleset's bypass actors (§2a; a warning on a user-owned
+  repository);
 - that the `settings-audit` environment exists;
 - every environment's reviewer, self-review and branch policy;
 - gateway monitoring coverage, once any environment opts into unattended drift
