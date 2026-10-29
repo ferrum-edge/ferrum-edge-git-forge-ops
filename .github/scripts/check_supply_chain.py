@@ -1517,10 +1517,11 @@ def state_guard_trigger_violations(text: str) -> list[str]:
         violations.append(
             "state-guard.yml: exactly one checkout is permitted, and it must name the default branch"
         )
-    # Deliveries for one head (opened plus one `labeled` per label) start out
-    # of order, so any shared concurrency group — per PR or per head,
-    # cancelling in progress or not — can cancel the newest check suite and
-    # leave the required check cancelled beside an older success (#407).
+    # Deliveries for one head started out of order on #407, so a shared
+    # concurrency group — per PR or per head, cancelling in progress or not —
+    # cancelled the newest check suite and left the required check cancelled
+    # beside an older success. Under the workflows rule a cancelled run also
+    # leaves the rule unsatisfied until someone re-runs it.
     if declares_concurrency(text):
         violations.append(
             "state-guard.yml: the guard must not declare a concurrency group; "
@@ -2650,8 +2651,10 @@ def security_push_trigger_violations(text: str) -> list[str]:
 
 
 # The exact triggers `security.yml` may carry. `security-cargo-audit` and
-# `security-supply-chain-policy` are required contexts defined by the pull
-# request's own copy of this workflow, and every pinned job switches on
+# `security-supply-chain-policy` are required contexts defined by this
+# workflow: the organization ruleset runs `main`'s copy on pull requests, but
+# a merged edit becomes `main`'s copy, and without the ruleset the pull
+# request's own copy runs. Every pinned job switches on
 # `github.event_name`. An added trigger — `workflow_dispatch:` above all —
 # would run that candidate copy outside `pull_request`, take the `else` branch
 # and post a second result under a required check name from a run no rule
@@ -4785,9 +4788,10 @@ def policy_check_impersonation_violations(workflow: str, document: dict) -> list
 
     This is defense in depth. In the #470 experiments a same-name success from
     a separate workflow did not override a failing trusted run; a head no
-    trusted run judged is fenced by the organization ruleset that requires
-    `supply-chain-policy.yml` by path (docs/github-launch-controls.md, 2a),
-    and the other contexts are not yet (#632).
+    trusted run judged, or a deleted run replaced by a posted check, is fenced
+    by the organization ruleset that requires every workflow in
+    `REQUIRED_CHECK_WORKFLOWS` by path (docs/github-launch-controls.md, 2a;
+    #632).
 
     `workflow` is the path relative to the repository root.
     """
@@ -4823,6 +4827,51 @@ def policy_check_impersonation_violations(workflow: str, document: dict) -> list
                     f"{label}: only job {context!r} of {home} may define the "
                     f"{context!r} check"
                 )
+    return violations
+
+
+def ruleset_workflow_codeql_violations(workflow: str, document: dict) -> list[str]:
+    """A workflow the organization ruleset requires may not run CodeQL.
+
+    The workflows in `REQUIRED_CHECK_WORKFLOWS` are required by path through
+    an organization ruleset (docs/github-launch-controls.md, 2a; #632), and
+    GitHub refuses to start a ruleset workflow that uses any CodeQL action
+    except `github/codeql-action/upload-sarif`. Such a run never starts, so
+    every pull request would be blocked. CodeQL lives in `code-scanning.yml`.
+    The ban covers reusable workflows the file calls, so job-level `uses:`
+    and local actions are refused here too.
+    """
+    if workflow not in set(REQUIRED_CHECK_WORKFLOWS.values()):
+        return []
+    violations: list[str] = []
+    # The ban also covers CodeQL reached through a reusable workflow, and a
+    # local action can hide it from this scan. None of these workflows needs
+    # either, so both are refused outright.
+    for jobs in (value for key, value in document.items() if key.casefold() == "jobs"):
+        if not isinstance(jobs, dict):
+            continue
+        for job_id, job in jobs.items():
+            if isinstance(job, dict) and any(key.casefold() == "uses" for key in job):
+                violations.append(
+                    f"{workflow}: job {job_id!r} calls a reusable workflow; a "
+                    "ruleset-required workflow must define its steps itself"
+                )
+    for reference in workflow_action_references(document):
+        if reference.strip().startswith("./"):
+            violations.append(
+                f"{workflow}: a ruleset-required workflow may not use the local "
+                f"action {reference!r}"
+            )
+            continue
+        action = reference.strip().split("@", 1)[0].casefold()
+        if action.startswith("github/codeql-action/") and action != (
+            "github/codeql-action/upload-sarif"
+        ):
+            violations.append(
+                f"{workflow}: a ruleset-required workflow may not use {reference!r}; "
+                "GitHub refuses to start it (only upload-sarif is allowed). Run "
+                "CodeQL from code-scanning.yml"
+            )
     return violations
 
 
@@ -5793,6 +5842,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 status_write_permission_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
+                ruleset_workflow_codeql_violations(
                     workflow.relative_to(root).as_posix(), document
                 )
             )

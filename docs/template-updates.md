@@ -316,8 +316,8 @@ It records what this repository has applied to a live gateway, and reverting
 code does not un-apply anything. An older snapshot tells shared mode that rows
 it manages were never managed, so it quietly stops reconciling them; in
 exclusive mode the next apply can look like a large prune. If the ledger itself
-is wrong, repair it deliberately with the `gitforgeops/state-override` label
-and a qualified maintainer, never as a side effect of a rollback.
+is wrong, repair it deliberately with a state override (the
+`gitforgeops/state-override` label and a qualified maintainer's review), never as a side effect of a rollback.
 
 **Do not roll back unrelated live configuration.** The adoption commit only
 touches upstream-managed files. Your resources and overlays are not in it, and

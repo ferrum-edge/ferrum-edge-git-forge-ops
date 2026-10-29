@@ -36,10 +36,12 @@ On pull requests, the workflow runs the checker, its tests and the exception
 policy from a separate checkout of the protected default branch, and
 `--source-root` points the audit and reachability checks at the candidate tree.
 A pull request therefore cannot approve its own dependency finding by weakening
-the checker or adding an exception. Because `security.yml` itself comes from
-the pull request head, `check_supply_chain.py` checks that this arrangement is
-still in place; otherwise one commit could add an exception and remove the
-trusted checkout in the same change.
+the checker or adding an exception. The organization ruleset runs `main`'s copy
+of `security.yml` on pull requests, but a merged change becomes `main`'s copy,
+and without the ruleset the pull request's own copy runs. So
+`check_supply_chain.py` checks that this arrangement is still in place;
+otherwise one commit could add an exception and remove the trusted checkout in
+the same change.
 
 Push and schedule runs use the tree's own checker and policy. Those events have
 no untrusted author, and pinning them to the default branch would stop a merged

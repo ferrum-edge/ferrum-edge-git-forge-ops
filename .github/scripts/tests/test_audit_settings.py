@@ -1175,13 +1175,41 @@ class RequiredWorkflowRuleTests(unittest.TestCase):
     def entries(self, responses):
         return responses[self.RULES][0][0]["parameters"]["workflows"]
 
-    def test_the_supply_chain_policy_is_the_required_workflow(self):
-        self.assertEqual(
-            audit_settings.REQUIRED_RULESET_WORKFLOWS,
-            (".github/workflows/supply-chain-policy.yml",),
+    def test_every_required_check_workflow_is_a_required_workflow(self):
+        # #632: a name-only context can be met by deleting its failing run and
+        # posting a check, so every workflow that reports one is listed.
+        spec = importlib.util.spec_from_file_location(
+            "check_supply_chain_for_audit", SCRIPT.parent / "check_supply_chain.py"
         )
-        workflow = Path(__file__).parents[2] / "workflows" / "supply-chain-policy.yml"
-        self.assertTrue(workflow.is_file())
+        assert spec and spec.loader
+        check_supply_chain = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(check_supply_chain)
+
+        self.assertEqual(
+            sorted(audit_settings.REQUIRED_RULESET_WORKFLOWS),
+            sorted(set(check_supply_chain.REQUIRED_CHECK_WORKFLOWS.values())),
+        )
+        self.assertEqual(
+            len(set(audit_settings.REQUIRED_RULESET_WORKFLOWS)),
+            len(audit_settings.REQUIRED_RULESET_WORKFLOWS),
+        )
+        for path in audit_settings.REQUIRED_RULESET_WORKFLOWS:
+            self.assertTrue((Path(__file__).parents[3] / path).is_file(), path)
+
+    def test_a_partial_rule_names_every_missing_workflow(self):
+        responses = secure_responses()
+        entries = self.entries(responses)
+        del entries[1:3]
+        audit = self.run_audit(responses)
+        self.assertEqual(len(audit.violations), 1)
+        self.assertIn("state-guard.yml", audit.violations[0])
+        self.assertIn("agent-setup-policy.yml", audit.violations[0])
+        self.assertNotIn("supply-chain-policy.yml", audit.violations[0])
+        self.assertIn(
+            "required workflow: .github/workflows/supply-chain-policy.yml "
+            "at refs/heads/main",
+            audit.evidence,
+        )
 
     def test_the_organization_rule_is_evidence(self):
         audit = self.run_audit(secure_responses())
