@@ -40,7 +40,7 @@ struct Repo {
 impl Repo {
     fn new(diagnostic: &str, exit_code: i32, use_stdout: bool) -> Self {
         let dir = TempDir::new().unwrap();
-        let document: serde_json::Value = serde_yaml::from_str(FIXTURE).unwrap();
+        let document: serde_json::Value = gitforgeops::yaml::from_str(FIXTURE).unwrap();
         for (section, folder, kind) in [
             ("proxies", "proxies", "Proxy"),
             ("consumers", "consumers", "Consumer"),
@@ -55,7 +55,7 @@ impl Repo {
             let resource = serde_json::json!({"kind": kind, "spec": spec});
             std::fs::write(
                 folder.join("labeled.yaml"),
-                serde_yaml::to_string(&resource).unwrap(),
+                gitforgeops::yaml::to_string(&resource).unwrap(),
             )
             .unwrap();
         }
@@ -294,7 +294,7 @@ fn compatibility_mapping_preserves_secret_scrubbing_and_withholding() {
     let diagnostic = edge_error(RESOURCE_FIELDS[1]);
     for secret in ["synthetic-secret-for-scrubbing", "tiny"] {
         let repo = Repo::new(&format!("{diagnostic}\ncredential: {secret}"), 1, false);
-        let mut config: GatewayConfig = serde_yaml::from_str(FIXTURE).unwrap();
+        let mut config: GatewayConfig = gitforgeops::yaml::from_str(FIXTURE).unwrap();
         config.consumers[0]
             .credentials
             .insert("keyauth".to_string(), serde_json::json!([{"key": secret}]));
@@ -322,7 +322,7 @@ fn accepting_validator_receives_labels_for_all_four_resource_kinds() {
     assert!(!stdout(&output).contains(MARKER));
     let captured = std::fs::read_to_string(repo.dir.path().join("captured.yaml")).unwrap();
     for document in [FIXTURE, captured.as_str()] {
-        let value: serde_json::Value = serde_yaml::from_str(document).unwrap();
+        let value: serde_json::Value = gitforgeops::yaml::from_str(document).unwrap();
         for section in ["proxies", "consumers", "upstreams", "plugin_configs"] {
             assert_eq!(value[section].as_array().unwrap().len(), 1);
             assert_eq!(value[section][0]["namespace"], "ferrum");

@@ -61,7 +61,7 @@ fn assemble_preserves_resource_ids() {
 fn assemble_serializes_to_valid_yaml() {
     let resources = load_resources(&fixtures_dir()).unwrap();
     let config = assemble_gateway(resources);
-    let yaml = serde_yaml::to_string(&config).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&config).unwrap();
 
     assert!(yaml.contains("proxy-httpbin"));
     assert!(yaml.contains("consumer-alice"));
@@ -786,7 +786,10 @@ fn consumer_config_with_credentials(
 /// Parse one `kind: Proxy` document into a loaded resource, so these tests
 /// exercise exactly what the loader hands the assembler.
 fn proxy_resource_from_yaml(yaml: &str) -> (String, Resource) {
-    ("ferrum".to_string(), serde_yaml::from_str(yaml).unwrap())
+    (
+        "ferrum".to_string(),
+        gitforgeops::yaml::from_str(yaml).unwrap(),
+    )
 }
 
 /// The gateway canonicalizes a non-stream proxy's scheme on write, so the
@@ -806,7 +809,7 @@ fn assembly_resolves_a_schemeless_http_proxy_to_https() {
         "a proxy with no scheme and no listen_port is HTTP-family and defaults to https"
     );
 
-    let yaml = serde_yaml::to_string(&config.proxies[0]).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&config.proxies[0]).unwrap();
     assert!(
         yaml.contains("backend_scheme: https") && !yaml.contains("null"),
         "the assembled proxy must serialize the resolved scheme:\n{yaml}"
@@ -984,9 +987,10 @@ fn normalization_preserves_credential_slot_names() {
 /// keep them separated in both directions.
 #[test]
 fn assemble_separates_mesh_fragments_from_gateway_resources() {
-    let mesh: Resource =
-        serde_yaml::from_str("kind: MeshConfig\nid: core\nspec:\n  sidecars:\n    - name: s\n")
-            .unwrap();
+    let mesh: Resource = gitforgeops::yaml::from_str(
+        "kind: MeshConfig\nid: core\nspec:\n  sidecars:\n    - name: s\n",
+    )
+    .unwrap();
     let output = assemble(vec![
         ("ferrum".to_string(), make_proxy("proxy-a")),
         ("ferrum".to_string(), mesh),
@@ -1051,8 +1055,8 @@ fn provisioner_labels_round_trip_and_do_not_overwrite_imported_origins() {
     )];
     let assembled = assemble_gateway(resources);
     assert_eq!(assembled.proxies[0].labels, config.proxies[0].labels);
-    let exported = serde_yaml::to_string(&assembled).unwrap();
-    let reloaded: GatewayConfig = serde_yaml::from_str(&exported).unwrap();
+    let exported = gitforgeops::yaml::to_string(&assembled).unwrap();
+    let reloaded: GatewayConfig = gitforgeops::yaml::from_str(&exported).unwrap();
     assert_eq!(reloaded.proxies[0].labels, config.proxies[0].labels);
     assert_eq!(
         serde_json::to_value(&assembled).unwrap(),

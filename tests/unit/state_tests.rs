@@ -970,7 +970,7 @@ fn public_state_is_identical_when_only_a_consumer_secret_changes() {
     use gitforgeops::config::schema::GatewayConfig;
 
     fn config(secret: &str) -> GatewayConfig {
-        serde_yaml::from_str(&format!(
+        gitforgeops::yaml::from_str(&format!(
             r#"
 consumers:
   - id: app

@@ -1204,7 +1204,7 @@ fn brokered_plugin_urls_reach_the_validator_as_parseable_stand_ins() {
         config.plugin_configs[0].config["ldap_url"],
         serde_json::json!("${gh-env-secret:alloc=require}")
     );
-    let exported = serde_yaml::to_string(&config).unwrap();
+    let exported = gitforgeops::yaml::to_string(&config).unwrap();
     assert!(
         exported.contains("${gh-env-secret:alloc=require}"),
         "{exported}"
@@ -1252,7 +1252,10 @@ fn capturing_validator(dir: &Path, checks: &str) -> std::path::PathBuf {
 
 #[cfg(unix)]
 fn captured_validator_input(dir: &Path) -> gitforgeops::config::GatewayConfig {
-    serde_yaml::from_slice(&std::fs::read(dir.join("input.yaml")).unwrap()).unwrap()
+    gitforgeops::yaml::from_str(
+        std::str::from_utf8(&std::fs::read(dir.join("input.yaml")).unwrap()).unwrap(),
+    )
+    .unwrap()
 }
 
 #[cfg(unix)]
@@ -1302,13 +1305,13 @@ exit 0
                 .collect();
             if !plugin && seed == Some(placeholder) {
                 // A Consumer secret may not be placeholder text (#379).
-                let untouched = serde_yaml::to_string(&config).unwrap();
+                let untouched = gitforgeops::yaml::to_string(&config).unwrap();
                 assert!(resolve_secrets(&mut config, &bundle).is_err());
-                assert_eq!(serde_yaml::to_string(&config).unwrap(), untouched);
+                assert_eq!(gitforgeops::yaml::to_string(&config).unwrap(), untouched);
                 continue;
             }
             let report = resolve_secrets(&mut config, &bundle).unwrap();
-            let before = serde_yaml::to_string(&config).unwrap();
+            let before = gitforgeops::yaml::to_string(&config).unwrap();
             let dir = tempfile::tempdir().unwrap();
             let validator = capturing_validator(
                 dir.path(),
@@ -1339,7 +1342,7 @@ exit 0
             } else {
                 assert!(actual.contains("gitforgeops-validation-standin"));
             }
-            assert_eq!(serde_yaml::to_string(&config).unwrap(), before);
+            assert_eq!(gitforgeops::yaml::to_string(&config).unwrap(), before);
         }
     }
 }
@@ -1403,7 +1406,7 @@ fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
         for slot in resolved_slots {
             assert!(report.results.iter().any(|result| result.slot == slot));
         }
-        let before = serde_yaml::to_string(&snapshot).unwrap();
+        let before = gitforgeops::yaml::to_string(&snapshot).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let validator = capturing_validator(dir.path(), "exit 0\n");
         let result =
@@ -1444,10 +1447,10 @@ fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
         // Discovery has no stand-in contract: both resolved and unresolved
         // modeled fields must survive the validator hand-off verbatim.
         assert_eq!(
-            serde_yaml::to_string(&captured.upstreams).unwrap(),
-            serde_yaml::to_string(&snapshot.upstreams).unwrap()
+            gitforgeops::yaml::to_string(&captured.upstreams).unwrap(),
+            gitforgeops::yaml::to_string(&snapshot.upstreams).unwrap()
         );
-        assert_eq!(serde_yaml::to_string(&snapshot).unwrap(), before);
+        assert_eq!(gitforgeops::yaml::to_string(&snapshot).unwrap(), before);
     }
 }
 
@@ -1504,7 +1507,7 @@ fn unresolved_reports_and_report_free_documents_keep_standins_for_every_alloc_mo
         ] {
             let mut config = consumer_config(serde_json::json!({"jwt": credential}));
             let report = resolve_secrets(&mut config, &Default::default()).unwrap();
-            let before = serde_yaml::to_string(&config).unwrap();
+            let before = gitforgeops::yaml::to_string(&config).unwrap();
             let dir = tempfile::tempdir().unwrap();
             let validator = capturing_validator(dir.path(), "exit 0\n");
             for with_report in [false, true] {
@@ -1523,7 +1526,7 @@ fn unresolved_reports_and_report_free_documents_keep_standins_for_every_alloc_mo
                     entry["secret"],
                     validation_standin("ferrum/app/jwt/secret", Some("secret"))
                 );
-                assert_eq!(serde_yaml::to_string(&config).unwrap(), before);
+                assert_eq!(gitforgeops::yaml::to_string(&config).unwrap(), before);
             }
         }
     }

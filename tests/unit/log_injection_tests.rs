@@ -268,7 +268,7 @@ fn untrusted_error_variants_cannot_emit_a_workflow_command() {
 fn hostile_proxy() -> Proxy {
     let id = quoted_hostile();
     let yaml = format!("id: {id}\nnamespace: {id}\nbackend_host: h.internal\nbackend_port: 8080\n");
-    serde_yaml::from_str(&yaml).expect("hostile proxy")
+    gitforgeops::yaml::from_str(&yaml).expect("hostile proxy")
 }
 
 fn hostile_upstream() -> Upstream {
@@ -276,19 +276,19 @@ fn hostile_upstream() -> Upstream {
     let yaml = format!(
         "id: {id}\nnamespace: ferrum\ntargets: []\nbackend_tls_verify_server_cert: false\n"
     );
-    serde_yaml::from_str(&yaml).expect("hostile upstream")
+    gitforgeops::yaml::from_str(&yaml).expect("hostile upstream")
 }
 
 fn hostile_plugin() -> PluginConfig {
     let id = quoted_hostile();
     let yaml = format!("id: {id}\nnamespace: ferrum\nplugin_name: {id}\nscope: global\n");
-    serde_yaml::from_str(&yaml).expect("hostile plugin")
+    gitforgeops::yaml::from_str(&yaml).expect("hostile plugin")
 }
 
 fn hostile_consumer() -> Consumer {
     let id = quoted_hostile();
     let yaml = format!("id: {id}\nnamespace: ferrum\nusername: app\n");
-    let mut consumer: Consumer = serde_yaml::from_str(&yaml).expect("consumer");
+    let mut consumer: Consumer = gitforgeops::yaml::from_str(&yaml).expect("consumer");
     consumer.credentials.insert(
         "keyauth".to_string(),
         serde_json::json!([{"key": "literal-committed-secret"}]),
@@ -346,9 +346,9 @@ fn policy_findings_cannot_emit_a_workflow_command() {
     let yaml = format!(
         "id: {id}\nnamespace: ferrum\nbackend_scheme: tcp\nbackend_host: h.internal\nbackend_port: 9000\nlisten_port: 19001\nfrontend_tls: true\n"
     );
-    let proxy: Proxy = serde_yaml::from_str(&yaml).expect("stream proxy");
+    let proxy: Proxy = gitforgeops::yaml::from_str(&yaml).expect("stream proxy");
     let yaml = format!("id: {id}\nnamespace: ferrum\nplugin_name: key_auth\nscope: global\n");
-    let plugin: PluginConfig = serde_yaml::from_str(&yaml).expect("key_auth plugin");
+    let plugin: PluginConfig = gitforgeops::yaml::from_str(&yaml).expect("key_auth plugin");
     let config = GatewayConfig {
         proxies: vec![proxy],
         plugin_configs: vec![plugin],

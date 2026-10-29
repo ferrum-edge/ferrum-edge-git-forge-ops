@@ -1200,7 +1200,10 @@ Corollaries of the no-silent-rewrites rule:
 - YAML merge keys (`<<:`) are unsupported and surface as unknown field
   `.spec.<<`.
 - Opaque islands are **JSON-shaped**: a non-string YAML mapping key is rejected
-  (`strict::reject_non_string_keys`), not stringified.
+  (`yaml::parse_value`), not stringified, as are non-core tags, `.inf`/`.nan`
+  and integers outside 64 bits. Input granit-parser and the gateway's libyaml
+  would read differently is refused too (`refuse_reader_disagreements`); a
+  new disagreement class belongs there and in `yaml_compat_tests.rs`.
 - Every map serialized into an exported document or API body is a `BTreeMap`.
   `HashMap` re-seeds `RandomState` per instance, so output would change every
   run.
@@ -1750,8 +1753,7 @@ Only what the sections above do not already say.
   `gateway.rs`.
 - `src/config/` — `schema.rs` (typed Edge mirror, incl. `BackendScheme` legacy
   value folding and opaque `MeshConfigSpec` items); `strict.rs` (`LoadOptions`,
-  unknown-field detection with YAML paths, non-string key rejection,
-  lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list kept
+  unknown-field detection with YAML paths, lowercase-extension enforcement, the silent `OS_ARTIFACT_FILES` skip list kept
   in step with `.github/scripts/pr_input.py` by a Python test); `loader.rs`
   (sorted, error-propagating, symlink-rejecting walk); `assembler.rs`;
   `env.rs`; `repo_config.rs`; `resolved.rs` (repo config + env → one
@@ -1785,6 +1787,19 @@ Only what the sections above do not already say.
   `DriftVerdict`.
 - `src/config_export.rs` — `GET /config/export` parsing, fingerprint
   substitution, Consumer projection, `FingerprintBaseline`.
+- `src/yaml.rs` — the one YAML boundary. `parse_value` composes resource,
+  overlay and import files from `granit-parser` events under `Limits` (depth,
+  nodes, scalar bytes; alias and anchor copies are charged before copying) and
+  resolves plain scalars exactly as the gateway's `serde_yaml` 0.9 does.
+  `from_str` reads typed settings structs through `serde-saphyr` (budgeted,
+  `SETTINGS_MAX_DEPTH`; never for `serde_json::Value`, whose inference is
+  serde-saphyr's own); `to_string` renders every document (no block scalars,
+  keys at most `MAX_RENDERED_KEY_BYTES`). `parse_value` messages name keys and
+  key paths but never scalar values. `serde_yaml` is a dev-dependency only,
+  the gateway oracle in `tests/unit/yaml_compat_tests.rs` and the export
+  readback tests; `Dockerfile` fetches dev-dependencies so `security.yml`
+  can build tests offline. Never enable serde-saphyr's `properties` or
+  `include` features.
 - `src/diagnostics.rs` — shared log sanitizer (`sanitize*` and `safe*`
   adapters). Every diagnostic routes untrusted ids, namespaces, plugin names,
   YAML paths and gateway text through it: control characters and line

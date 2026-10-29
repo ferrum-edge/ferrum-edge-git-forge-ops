@@ -323,7 +323,7 @@ impl SmokeConfig {
             return Ok(None);
         };
         let config: SmokeConfig =
-            serde_yaml::from_str(&contents).map_err(|source| crate::error::Error::YamlParse {
+            crate::yaml::from_str(&contents).map_err(|source| crate::error::Error::YamlParse {
                 path: path.to_path_buf(),
                 source,
             })?;

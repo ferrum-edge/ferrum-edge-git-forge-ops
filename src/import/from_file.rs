@@ -80,7 +80,7 @@ pub fn import_from_file_selected(
     // YAML is a superset of the JSON returned by GET /backup. Decode to a JSON
     // value, then use the same envelope parser as API import so opaque sections
     // are inventoried consistently instead of being discarded by GatewayConfig.
-    let value: serde_json::Value = serde_yaml::from_str(&contents).map_err(|_| {
+    let value = crate::yaml::parse_value(&contents, crate::yaml::IMPORT_LIMITS).map_err(|_| {
         crate::error::Error::Config(
             "invalid import document; credential-bearing details withheld".to_string(),
         )

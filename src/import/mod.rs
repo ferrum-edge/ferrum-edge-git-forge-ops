@@ -887,7 +887,7 @@ fn serialize_resource_yaml(resource: &Resource) -> crate::error::Result<String> 
     // iteration order. serde_json::Value uses a sorted map in this build, so
     // this intermediate representation makes byte output deterministic.
     let canonical = serde_json::to_value(resource)?;
-    serde_yaml::to_string(&canonical).map_err(crate::error::Error::SerdeYaml)
+    Ok(crate::yaml::to_string(&canonical)?)
 }
 
 #[derive(Serialize)]

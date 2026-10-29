@@ -821,7 +821,7 @@ fn schemeless_desired_proxy_is_not_a_breaking_change_against_a_resolved_live_sch
 fn assembled_schemeless_proxy_diffs_clean_against_a_resolved_live_gateway() {
     use gitforgeops::config::assemble;
 
-    let resource: Resource = serde_yaml::from_str(
+    let resource: Resource = gitforgeops::yaml::from_str(
         "kind: Proxy\nspec:\n  id: p1\n  listen_path: /api\n  backend_host: localhost\n  backend_port: 8080\n",
     )
     .unwrap();
@@ -1176,7 +1176,7 @@ fn auth_coverage_config(orders_plugins: &str, plugin_configs: &str) -> GatewayCo
 plugin_configs:
 {plugin_configs}"
     );
-    let mut config: GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
+    let mut config: GatewayConfig = gitforgeops::yaml::from_str(&yaml).unwrap();
     gitforgeops::config::assembler::normalize_proxy_plugin_associations(&mut config);
     config
 }

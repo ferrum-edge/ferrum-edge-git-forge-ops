@@ -4882,7 +4882,7 @@ fn enabled_allowlists_reject_empty_configuration_even_at_warning_severity() {
                 if let Some(list) = list {
                     yaml.push_str(&format!("    {key}: {list}\n"));
                 }
-                let policies: PolicyConfig = serde_yaml::from_str(&yaml).unwrap();
+                let policies: PolicyConfig = gitforgeops::yaml::from_str(&yaml).unwrap();
                 let findings = evaluate_policies(&GatewayConfig::default(), &policies);
                 if !enabled || (defaulted && list.is_none()) {
                     assert!(findings.is_empty(), "{yaml}: {findings:?}");

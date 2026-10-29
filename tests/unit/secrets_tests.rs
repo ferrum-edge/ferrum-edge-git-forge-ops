@@ -940,7 +940,7 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
 
     // Intentionally don't call resolve_secrets — this is the export-without-
     // materialize path.
-    let yaml = serde_yaml::to_string(&cfg).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&cfg).unwrap();
     assert!(
         yaml.contains(placeholder),
         "placeholder must survive YAML serialization when not materialized; got:\n{yaml}"

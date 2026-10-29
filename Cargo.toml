@@ -15,7 +15,13 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# YAML in safe Rust with limits enforced while parsing (src/yaml.rs).
+# `serde-saphyr` reads typed settings and writes every document; the
+# JSON-shaped resource composer drives its parser, `granit-parser`, directly.
+# Neither enables `properties` (`${NAME}` interpolation would rewrite
+# credential placeholders) or `include`.
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["serialize", "deserialize"] }
+granit-parser = { version = "2.0.0", default-features = false, features = ["std", "error_messages"] }
 serde_ignored = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
@@ -45,4 +51,8 @@ ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed2
 tempfile = "3"
 
 [dev-dependencies]
+# Test-only gateway oracle: the gateway still reads YAML with serde_yaml 0.9, so
+# tests/unit/yaml_compat_tests.rs and the export readback tests check src/yaml.rs
+# against it. Never a runtime dependency.
+serde_yaml = "0.9"
 base64 = "0.23"

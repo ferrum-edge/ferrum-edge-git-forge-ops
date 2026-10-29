@@ -211,7 +211,7 @@ fn assert_command_contract(namespaces: &[&str], invalid: Option<&str>, binary: O
                 assert_eq!(repo.published().exists(), invalid.is_none(), "{text}");
                 if invalid.is_none() {
                     let yaml = std::fs::read_to_string(repo.published()).unwrap();
-                    let published: GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
+                    let published: GatewayConfig = gitforgeops::yaml::from_str(&yaml).unwrap();
                     assert_eq!(published.proxies.len(), namespaces.len());
                 }
             }
@@ -344,7 +344,8 @@ fn overlay_selection_rejects_paths_before_loading_and_preserves_logical_environm
     );
     let output = repo.run(&["export", "--env", "logical-prod"], &[]);
     assert!(output.status.success(), "{}", output_text(&output));
-    let config: GatewayConfig = serde_yaml::from_slice(&output.stdout).unwrap();
+    let config: GatewayConfig =
+        gitforgeops::yaml::from_str(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
     assert_eq!(config.proxies[0].backend_port, 9202);
 
     std::os::unix::fs::symlink(
@@ -589,10 +590,10 @@ fn path_traversing_ids_reach_the_validator_verbatim_and_block_publication() {
         assert!(text.contains("invalid proxy id"), "{args:?}: {text}");
         assert!(!repo.published().exists(), "{args:?}: {text}");
         let document = std::fs::read_to_string(&validated).unwrap();
-        let document: serde_yaml::Value = serde_yaml::from_str(&document).unwrap();
+        let document: serde_json::Value = gitforgeops::yaml::from_str(&document).unwrap();
         assert_eq!(
             document["proxies"][0]["id"],
-            serde_yaml::Value::from("../escaped"),
+            serde_json::Value::from("../escaped"),
             "{args:?}"
         );
         std::fs::remove_file(&validated).unwrap();

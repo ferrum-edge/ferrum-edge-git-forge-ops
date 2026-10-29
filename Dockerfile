@@ -23,6 +23,11 @@ COPY src/ src/
 # `gitforgeops doctor` compiles the settings auditor into the binary
 # (`include_str!`) so it never executes a checkout-controlled copy.
 COPY .github/scripts/audit_settings.py .github/scripts/audit_settings.py
+# Fetch every locked package, dev-dependencies included: security.yml compiles
+# the override regression tests from this stage with `--network none`. Fetch
+# downloads checksum-verified sources and runs no build scripts; only the
+# release binary reaches the runtime image.
+RUN cargo fetch --locked
 RUN cargo build --release --locked
 
 # Debian point-release security updates for CVE-2026-103111 (HIGH) and

@@ -87,10 +87,10 @@ fn unknown_top_level_spec_fields_pass_through_on_explicit_opt_in() {
     assert!(exported.contains("nested: value"), "{exported}");
 
     // Known fields still round-trip alongside the unknown ones.
-    let reparsed: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let reparsed: serde_json::Value = gitforgeops::yaml::from_str(&exported).unwrap();
     assert_eq!(
         reparsed["proxies"][0]["backend_host"],
-        serde_yaml::Value::from("example.test")
+        serde_json::Value::from("example.test")
     );
 }
 
@@ -447,7 +447,7 @@ fn the_passthrough_warning_goes_to_stderr_and_never_into_exported_yaml() {
         !stdout.contains("Warning"),
         "stdout must carry only the YAML document; got:\n{stdout}"
     );
-    serde_yaml::from_str::<serde_yaml::Value>(&stdout).expect("stdout must parse as YAML");
+    gitforgeops::yaml::from_str::<serde_json::Value>(&stdout).expect("stdout must parse as YAML");
     assert!(stdout.contains("turbo_mode: true"), "{stdout}");
     assert!(
         stderr.contains("Warning:")

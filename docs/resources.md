@@ -206,6 +206,27 @@ delete the declaration instead: in `exclusive` mode an undeclared live row is
 - **Opaque values take string keys only.** Plugin `config`, credential entries
   and mesh items round-trip through JSON, so a non-string key (`404:`,
   `true:`) is rejected rather than quietly stringified.
+- **Scalars resolve as the gateway reads them** (YAML 1.2 core schema):
+  `017`, `1_000`, `yes` and `on` are strings; `0x1F`, `0o17` and `0b1` are
+  integers; `~`, `null` and an empty value are null. Quote a value to keep it
+  a string.
+- **Refused rather than rewritten:** tags other than `!!str`, `!!int`,
+  `!!float`, `!!bool`, `!!null`, `!!map` and `!!seq` (including `!custom`
+  tags and `!!binary`), `.inf`/`.nan`, integers outside the 64-bit range,
+  repeated keys, and more than one document per file.
+- **Refused because YAML readers disagree on them:** raw U+0085, U+2028,
+  U+2029 or U+FEFF characters, including a leading byte-order mark (save the
+  file without one; write the others as `\N`, `\L`, `\P` or `\uFEFF` in a
+  double-quoted string), anchor
+  names other than letters, digits, `_` and `-`, a plain value starting with
+  `?` inside `[…]` or `{…}` (quote it), and a `|`, `>` or `|+` block scalar
+  that runs to the end of a file without a final newline, even if the last
+  line is blank (add the newline; `|-` is fine).
+- **Anchors and aliases** work, but a file may not expand past 1,000,000
+  nodes, 64 MiB of scalar text or 128 levels of nesting, counting every copy
+  an anchor or alias makes.
+- **Keys** are limited to 1,000 bytes as rendered, so the gateway can read
+  every exported document.
 
 ## Proxy backend scheme
 

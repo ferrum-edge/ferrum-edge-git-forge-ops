@@ -13,7 +13,7 @@ spec:
   backend_port: 443
   strip_listen_path: true
 "#;
-    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str(yaml).unwrap();
     match resource {
         Resource::Proxy { spec } => {
             assert_eq!(spec.id, "proxy-test");
@@ -42,7 +42,7 @@ spec:
     - "admin"
     - "ops"
 "#;
-    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str(yaml).unwrap();
     match resource {
         Resource::Consumer { spec } => {
             assert_eq!(spec.id, "consumer-bob");
@@ -69,7 +69,7 @@ spec:
     - host: "10.0.0.2"
       port: 8080
 "#;
-    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str(yaml).unwrap();
     match resource {
         Resource::Upstream { spec } => {
             assert_eq!(spec.id, "upstream-pool");
@@ -94,7 +94,7 @@ spec:
     window_seconds: 60
     max_requests: 100
 "#;
-    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str(yaml).unwrap();
     match resource {
         Resource::PluginConfig { spec } => {
             assert_eq!(spec.id, "plugin-rate");
@@ -108,7 +108,7 @@ spec:
 }
 
 fn proxy_from_yaml(yaml: &str) -> Proxy {
-    match serde_yaml::from_str::<Resource>(yaml)
+    match gitforgeops::yaml::from_str::<Resource>(yaml)
         .unwrap_or_else(|e| panic!("failed to parse proxy: {e}\n{yaml}"))
     {
         Resource::Proxy { spec } => spec,
@@ -208,7 +208,7 @@ spec:
 
 #[test]
 fn unknown_backend_scheme_is_rejected() {
-    let err = serde_yaml::from_str::<Resource>(
+    let err = gitforgeops::yaml::from_str::<Resource>(
         r#"
 kind: Proxy
 spec:
@@ -237,7 +237,7 @@ spec:
   backend_port: 443
 "#,
     );
-    let yaml = serde_yaml::to_string(&spec).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&spec).unwrap();
     assert!(
         yaml.contains("backend_scheme: https"),
         "expected canonical scheme in output:\n{yaml}"
@@ -265,8 +265,8 @@ spec:
   listen_port: 15432
 "#,
     );
-    let yaml = serde_yaml::to_string(&spec).unwrap();
-    let reparsed: Proxy = serde_yaml::from_str(&yaml).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&spec).unwrap();
+    let reparsed: Proxy = gitforgeops::yaml::from_str(&yaml).unwrap();
     assert_eq!(reparsed.backend_scheme, Some(BackendScheme::Tcps));
     assert_eq!(reparsed.backend_host, "db.internal");
     assert_eq!(reparsed.backend_port, 5432);
@@ -290,7 +290,7 @@ spec:
     );
     assert_eq!(spec.backend_scheme, None);
 
-    let yaml = serde_yaml::to_string(&spec).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&spec).unwrap();
     assert!(
         !yaml.contains("backend_scheme"),
         "an unset scheme must be omitted entirely, not emitted as null:\n{yaml}"
@@ -354,8 +354,8 @@ spec:
     assert_eq!(spec.pool_max_requests_per_connection, Some(1000));
     assert_eq!(spec.api_spec_id, Some("spec-7".to_string()));
 
-    let yaml = serde_yaml::to_string(&spec).unwrap();
-    let reparsed: Proxy = serde_yaml::from_str(&yaml).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&spec).unwrap();
+    let reparsed: Proxy = gitforgeops::yaml::from_str(&yaml).unwrap();
     let arms = reparsed.stream_match.expect("stream_match preserved").arms;
     assert_eq!(arms.len(), 1);
     assert_eq!(arms[0].source_namespace, Some("team-alpha".to_string()));
@@ -397,15 +397,15 @@ spec:
     - "spiffe://cluster.local/ns/prod/sa/api"
   api_spec_id: "spec-3"
 "#;
-    let spec = match serde_yaml::from_str::<Resource>(yaml).unwrap() {
+    let spec = match gitforgeops::yaml::from_str::<Resource>(yaml).unwrap() {
         Resource::Upstream { spec } => spec,
         _ => panic!("expected Upstream"),
     };
     assert_eq!(spec.algorithm, LoadBalancerAlgorithm::Passthrough);
     assert_eq!(spec.targets[0].locality, Some("us-east-1/az-1".to_string()));
 
-    let round = serde_yaml::to_string(&spec).unwrap();
-    let reparsed: Upstream = serde_yaml::from_str(&round).unwrap();
+    let round = gitforgeops::yaml::to_string(&spec).unwrap();
+    let reparsed: Upstream = gitforgeops::yaml::from_str(&round).unwrap();
     let subsets = reparsed.subsets.expect("subsets preserved");
     assert_eq!(subsets.len(), 1);
     assert_eq!(subsets[0].name, "canary");
@@ -442,12 +442,12 @@ spec:
     max_stale_seconds: 300
     stale_policy: fail_readiness
 "#;
-    let spec = match serde_yaml::from_str::<Resource>(yaml).unwrap() {
+    let spec = match gitforgeops::yaml::from_str::<Resource>(yaml).unwrap() {
         Resource::Upstream { spec } => spec,
         _ => panic!("expected Upstream"),
     };
-    let round = serde_yaml::to_string(&spec).unwrap();
-    let reparsed: Upstream = serde_yaml::from_str(&round).unwrap();
+    let round = gitforgeops::yaml::to_string(&spec).unwrap();
+    let reparsed: Upstream = gitforgeops::yaml::from_str(&round).unwrap();
     let sd = reparsed
         .service_discovery
         .expect("service_discovery preserved");
@@ -476,7 +476,7 @@ spec:
       namespace: "prod"
       address_type: IPv6
 "#;
-    let spec = match serde_yaml::from_str::<Resource>(with_type).unwrap() {
+    let spec = match gitforgeops::yaml::from_str::<Resource>(with_type).unwrap() {
         Resource::Upstream { spec } => spec,
         _ => panic!("expected Upstream"),
     };
@@ -487,8 +487,8 @@ spec:
     let k8s = sd.kubernetes.as_ref().expect("kubernetes block preserved");
     assert_eq!(k8s.address_type.as_deref(), Some("IPv6"));
 
-    let round = serde_yaml::to_string(&spec).unwrap();
-    let reparsed: Upstream = serde_yaml::from_str(&round).unwrap();
+    let round = gitforgeops::yaml::to_string(&spec).unwrap();
+    let reparsed: Upstream = gitforgeops::yaml::from_str(&round).unwrap();
     let reparsed_k8s = reparsed
         .service_discovery
         .expect("service_discovery preserved")
@@ -508,7 +508,7 @@ spec:
     kubernetes:
       service_name: "checkout"
 "#;
-    let spec = match serde_yaml::from_str::<Resource>(without_type).unwrap() {
+    let spec = match gitforgeops::yaml::from_str::<Resource>(without_type).unwrap() {
         Resource::Upstream { spec } => spec,
         _ => panic!("expected Upstream"),
     };
@@ -519,7 +519,7 @@ spec:
             .and_then(|k| k.address_type.as_deref()),
         None
     );
-    let round = serde_yaml::to_string(&spec).unwrap();
+    let round = gitforgeops::yaml::to_string(&spec).unwrap();
     assert!(!round.contains("address_type"), "{round}");
 }
 
@@ -539,12 +539,12 @@ spec:
       gateway_error_codes: [502, 504]
       split_external_local_origin_errors: true
 "#;
-    let spec = match serde_yaml::from_str::<Resource>(yaml).unwrap() {
+    let spec = match gitforgeops::yaml::from_str::<Resource>(yaml).unwrap() {
         Resource::Upstream { spec } => spec,
         _ => panic!("expected Upstream"),
     };
-    let round = serde_yaml::to_string(&spec).unwrap();
-    let reparsed: Upstream = serde_yaml::from_str(&round).unwrap();
+    let round = gitforgeops::yaml::to_string(&spec).unwrap();
+    let reparsed: Upstream = gitforgeops::yaml::from_str(&round).unwrap();
     let cookie = reparsed
         .hash_on_cookie_config
         .expect("cookie config preserved");
@@ -591,20 +591,20 @@ spec:
                   value:
                     exact: ["alice"]
 "#;
-    let spec = match serde_yaml::from_str::<Resource>(yaml).unwrap() {
+    let spec = match gitforgeops::yaml::from_str::<Resource>(yaml).unwrap() {
         Resource::PluginConfig { spec } => spec,
         _ => panic!("expected PluginConfig"),
     };
     assert_eq!(spec.api_spec_id, Some("spec-9".to_string()));
 
-    let round = serde_yaml::to_string(&spec).unwrap();
+    let round = gitforgeops::yaml::to_string(&spec).unwrap();
     // The `match_` field must serialize back out under the reserved `match` key.
     assert!(
         round.contains("match:") && !round.contains("match_:"),
         "trigger must use the `match` wire key:\n{round}"
     );
 
-    let reparsed: PluginConfig = serde_yaml::from_str(&round).unwrap();
+    let reparsed: PluginConfig = gitforgeops::yaml::from_str(&round).unwrap();
     let when = reparsed.trigger.expect("trigger preserved").when;
     let all = when.all.expect("all branch preserved");
     assert_eq!(all.len(), 3);
@@ -657,8 +657,8 @@ spec:
 #[test]
 fn gateway_config_roundtrip() {
     let config = GatewayConfig::default();
-    let yaml = serde_yaml::to_string(&config).unwrap();
-    let parsed: GatewayConfig = serde_yaml::from_str(&yaml).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&config).unwrap();
+    let parsed: GatewayConfig = gitforgeops::yaml::from_str(&yaml).unwrap();
     assert_eq!(parsed.version, "1");
     assert!(parsed.proxies.is_empty());
     assert!(parsed.consumers.is_empty());
@@ -682,7 +682,7 @@ spec:
     max_retries: 5
     retryable_status_codes: [502, 503]
 "#;
-    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str(yaml).unwrap();
     match resource {
         Resource::Proxy { spec } => {
             let cb = spec.circuit_breaker.unwrap();
@@ -707,7 +707,7 @@ spec:
   backend_port: 5432
   listen_port: 15432
 "#;
-    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str(yaml).unwrap();
     match resource {
         Resource::Proxy { spec } => {
             assert_eq!(spec.backend_scheme, Some(BackendScheme::Tcp));
@@ -733,9 +733,9 @@ spec:
     );
 
     assert!(spec.allow_path_parameters);
-    let emitted = serde_yaml::to_string(&spec).unwrap();
+    let emitted = gitforgeops::yaml::to_string(&spec).unwrap();
     assert!(emitted.contains("allow_path_parameters: true"), "{emitted}");
-    let reparsed: Proxy = serde_yaml::from_str(&emitted).unwrap();
+    let reparsed: Proxy = gitforgeops::yaml::from_str(&emitted).unwrap();
     assert!(reparsed.allow_path_parameters);
 }
 
@@ -763,7 +763,7 @@ spec:
   outbound_traffic_policy:
     mode: registry_only
 "#;
-    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str(yaml).unwrap();
     match resource {
         Resource::MeshConfig { id, spec } => {
             assert_eq!(id.as_deref(), Some("core"));
@@ -794,7 +794,7 @@ spec:
       some_future_istio_field:
         nested: [1, 2, 3]
 "#;
-    let resource: Resource = serde_yaml::from_str(yaml).unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str(yaml).unwrap();
     let Resource::MeshConfig { spec, .. } = resource else {
         panic!("expected MeshConfig");
     };
@@ -802,7 +802,7 @@ spec:
     assert_eq!(spec.workloads[0]["some_future_istio_field"]["nested"][2], 3);
 
     let reparsed: MeshConfigSpec =
-        serde_yaml::from_str(&serde_yaml::to_string(&spec).unwrap()).unwrap();
+        gitforgeops::yaml::from_str(&gitforgeops::yaml::to_string(&spec).unwrap()).unwrap();
     assert_eq!(reparsed, spec);
 }
 
@@ -812,12 +812,12 @@ spec:
 /// serialization.
 #[test]
 fn mesh_mirror_omits_runtime_derived_fields() {
-    let spec: MeshConfigSpec = serde_yaml::from_str(
+    let spec: MeshConfigSpec = gitforgeops::yaml::from_str(
         "local_inbound_services: []\nnode_waypoint_assertors: []\nsidecar_ingress_declared: true\n",
     )
     .expect("unknown keys are tolerated, not mirrored");
 
-    let emitted = serde_yaml::to_string(&spec).unwrap();
+    let emitted = gitforgeops::yaml::to_string(&spec).unwrap();
     for runtime_only in [
         "local_inbound_services",
         "node_waypoint_assertors",
@@ -843,13 +843,13 @@ fn mesh_config_id_is_absent_from_a_default_fragment() {
     // `id` is a gitforgeops-side handle for overlay matching, not part of the
     // mesh schema — it must never reach the published mesh document, which
     // serializes `spec` alone.
-    let resource: Resource = serde_yaml::from_str("kind: MeshConfig\nspec: {}\n").unwrap();
+    let resource: Resource = gitforgeops::yaml::from_str("kind: MeshConfig\nspec: {}\n").unwrap();
     let Resource::MeshConfig { id, spec } = resource else {
         panic!("expected MeshConfig");
     };
     assert!(id.is_none());
     assert!(spec.is_empty());
-    assert_eq!(serde_yaml::to_string(&spec).unwrap().trim(), "{}");
+    assert_eq!(gitforgeops::yaml::to_string(&spec).unwrap().trim(), "{}");
 }
 
 #[test]
