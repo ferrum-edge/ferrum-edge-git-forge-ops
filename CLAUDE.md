@@ -1283,10 +1283,14 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   schemas and its `plugin_config_projection` table, because `/config/export`
   fingerprints whatever that projection redacts.
 - Operator-chosen values Edge redacts (`request_transformer` rule values,
-  `mesh_route_dispatch` request-transform values, `fault_injection` and
-  `response_mock` match conditions) use `RuleKind::Value`: brokered, masked
-  and scrubbed like secrets, but not rule-declared for display admission, so a
-  short live `value: "1"` does not refuse the run.
+  `mesh_route_dispatch` request-transform values, `ws_logging` custom headers,
+  `fault_injection` and `response_mock` match conditions) use
+  `RuleKind::Value`. A string of at least 8 bytes is brokered, masked,
+  scrubbed and literal-gated like a secret; a shorter one (`value: "1"`)
+  stays an ordinary literal, since the bundle and scrubber refuse it. None is
+  rule-declared for display admission. `export_redacted_paths` adds every
+  matched site, whatever its length or JSON type, for `/config/export`
+  substitution.
 - `basicauth[].username` and `mtls_auth[].identity` are never brokered
   (`resolver::is_identity_credential_leaf`).
 

@@ -276,6 +276,63 @@ fn edge_0_9_19_redacted_plugin_paths_are_scrubbed_and_gated_as_literals() {
     );
 }
 
+/// An operator value too short to broker (the bundle refuses values under 8
+/// bytes) or to scrub is an ordinary setting: import keeps it literal without
+/// a plaintext allowance, the scrubber does not withhold validator output over
+/// it, and the literal-secret gate lets it through. A long one is still a
+/// secret.
+#[test]
+fn short_operator_plugin_values_stay_ordinary_settings() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for (plugin_name, config) in [
+        (
+            "request_transformer",
+            serde_json::json!({"rules": [
+                {"operation": "add", "target": "header", "value": "1"},
+                {"operation": "add", "target": "body", "value": true}
+            ]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            serde_json::json!({"rules": [{"request_transform": [{"value": "on"}]}]}),
+        ),
+        (
+            "ws_logging",
+            serde_json::json!({"custom_headers": {"x-env": "prod"}}),
+        ),
+        (
+            "fault_injection",
+            serde_json::json!({"match": {"headers": {"x-chaos": "on"}}}),
+        ),
+        (
+            "response_mock",
+            serde_json::json!({"rules": [{"match": {
+                "headers": {"x-mock": "yes"},
+                "query_params": {"page": "2"}
+            }}]}),
+        ),
+    ] {
+        let original = single_plugin_gateway(plugin_name, config);
+        let mut gateway = original.clone();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+        assert!(capture.captured.is_empty(), "{plugin_name}");
+        assert!(capture.unbrokered.is_empty(), "{plugin_name}");
+        assert_eq!(
+            gateway.plugin_configs[0].config, original.plugin_configs[0].config,
+            "{plugin_name}"
+        );
+
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
+        assert!(!scrubber.is_unsafe_to_scrub(), "{plugin_name}");
+        assert!(
+            security_blockers(&audit_security(&original)).is_empty(),
+            "{plugin_name}"
+        );
+    }
+}
+
 const TEST_RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCeBwh5uUsN7IUDwwsg1tMZsRAknSr77S2N+DoEBkLvMTIB9ox8MIx1XeFyJpKLIaXR3WvRW49zKGPqgR8cIoWPzwdnKAFLwjYA+MDDsjDqFTU3DO1msuj0v5M74MXriVCEMZjRY7DiEnSnIpHyySyddkwm8TQDTDFxc3kRGRDMh0L5UjWb3Y18uQgmU08gF/2Liwg0Pl35D3AyKR6rxegxvolHu/g+h2+qvnwiy/lhwXyTfVhqRJ4k/lbRxAKZINJwUlRqmGiXnnppQ90UJS775L47I65bJ7LdI2FRI4iJVej2mRNE7dv+0G+ntPVeqKR8XuokO8FnZj7/Y0IYZ/zN";
 
 #[test]

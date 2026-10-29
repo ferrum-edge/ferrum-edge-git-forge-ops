@@ -527,6 +527,61 @@ exit 0
     );
 }
 
+/// Edge refuses `ldap_url` and `failover_ldap_urls` with mixed schemes, so an
+/// unresolved LDAP endpoint's stand-in takes the scheme of a literal or
+/// resolved one (the primary first), and `ldaps` only when none is known.
+#[test]
+fn ldap_endpoint_standins_keep_the_committed_scheme() {
+    use gitforgeops::config::schema::GatewayConfig;
+    use gitforgeops::validate::{with_validation_standins, VALIDATION_STANDIN_HOST};
+
+    const PLACEHOLDER: &str = "${gh-env-secret:alloc=require}";
+    let ldap = |config: serde_json::Value| -> serde_json::Value {
+        let gateway: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "plugin_configs": [{"id": "ldap", "namespace": "ferrum", "plugin_name": "ldap_auth",
+                "scope": "global", "config": config}]
+        }))
+        .unwrap();
+        with_validation_standins(&gateway)
+            .expect("substitution")
+            .plugin_configs[0]
+            .config
+            .clone()
+    };
+
+    let patched = ldap(serde_json::json!({
+        "ldap_url": "ldap://primary.example:389",
+        "failover_ldap_urls": [PLACEHOLDER]
+    }));
+    let failover = patched["failover_ldap_urls"][0].as_str().unwrap();
+    assert!(
+        failover.starts_with(&format!("ldap://{VALIDATION_STANDIN_HOST}/")),
+        "{failover}"
+    );
+
+    let patched = ldap(serde_json::json!({
+        "ldap_url": PLACEHOLDER,
+        "failover_ldap_urls": ["ldap://failover.example:389"]
+    }));
+    let primary = patched["ldap_url"].as_str().unwrap();
+    assert!(
+        primary.starts_with(&format!("ldap://{VALIDATION_STANDIN_HOST}/")),
+        "{primary}"
+    );
+
+    let patched = ldap(serde_json::json!({
+        "ldap_url": PLACEHOLDER,
+        "failover_ldap_urls": [PLACEHOLDER]
+    }));
+    for standin in [&patched["ldap_url"], &patched["failover_ldap_urls"][0]] {
+        let standin = standin.as_str().unwrap();
+        assert!(
+            standin.starts_with(&format!("ldaps://{VALIDATION_STANDIN_HOST}/")),
+            "{standin}"
+        );
+    }
+}
+
 /// Stand-ins live only in the validator's temp spec: nothing else in the
 /// process ever sees one, and they are stable between runs.
 #[test]

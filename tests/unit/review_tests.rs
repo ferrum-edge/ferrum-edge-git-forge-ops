@@ -1699,13 +1699,18 @@ fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
         kind: "PluginConfig".to_string(),
         id: "mock".to_string(),
         namespace: "ferrum".to_string(),
+        // The changes table renders the field, so the value travels there.
         details: vec![FieldChange {
-            field: "config".to_string(),
+            field: format!("config {VALUE}"),
             old_value: VALUE.to_string(),
             new_value: "changed".to_string(),
         }],
     }];
     let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    assert!(
+        comment.contains("zq7-mock"),
+        "the formatter must actually echo the live value"
+    );
     let published = gitforgeops::display::scrub_text(&comment);
     assert!(!published.contains("zq7-mock"), "{published}");
     assert!(published.contains("[REDACTED]"), "{published}");

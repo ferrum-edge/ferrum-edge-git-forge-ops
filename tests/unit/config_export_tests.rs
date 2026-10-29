@@ -479,6 +479,31 @@ fn edge_0_9_19_redacted_plugin_values_are_not_false_drift() {
             json!({"failover_ldap_urls": ["ldaps://ldap2.example:636"]}),
             vec!["/config/failover_ldap_urls/0"],
         ),
+        // Short, non-string and container values: Edge fingerprints the whole
+        // value at the rule site, so each must be matched there, never read
+        // as drift or as a masked ancestor.
+        (
+            "request_transformer",
+            json!({"rules": [
+                {"operation": "add", "target": "header", "value": "1"},
+                {"operation": "add", "target": "body", "value": true},
+                {"operation": "add", "target": "body", "value": 42},
+                {"operation": "add", "target": "body", "value": {"enabled": "yes"}},
+                {"operation": "add", "target": "body", "value": ["a", "b"]}
+            ]}),
+            vec![
+                "/config/rules/0/value",
+                "/config/rules/1/value",
+                "/config/rules/2/value",
+                "/config/rules/3/value",
+                "/config/rules/4/value",
+            ],
+        ),
+        (
+            "ws_logging",
+            json!({"custom_headers": {"x-env": "prod"}}),
+            vec!["/config/custom_headers/x-env"],
+        ),
     ];
     for (plugin_name, config, pointers) in cases {
         let desired: GatewayConfig = serde_json::from_value(json!({
