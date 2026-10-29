@@ -371,7 +371,7 @@ pub fn incremental_consumer_rename_notice(
         return None;
     }
     Some(
-        "Consumer username renames: the gateway refuses a rename (409) while any access_control plugin config in the namespace still names the previous username, so incremental apply writes each declared access_control update that removes it before the Consumer. No config may name both usernames during the change: until the rename lands, the Consumer still carries its previous username, so an allow-list naming only the new username briefly refuses it and a deny-list naming only the new username briefly stops denying it. The rename still fails while the desired configuration, a config this repository does not declare, or a config deleted in the same run names the previous username. full_replace makes the change atomically per namespace.",
+        "Consumer username renames: the gateway refuses a rename (409) while any access_control plugin config in the namespace still names the previous username, so incremental apply writes each declared access_control update that removes it before the Consumer. No config may name both usernames during the change: until the rename lands, the Consumer still carries its previous username, so an allow-list naming only the new username briefly refuses it and a deny-list naming only the new username briefly stops denying it. The rename still fails while the desired configuration or a config this repository does not declare names the previous username. A config deleted in the same run never releases it, because the refused rename defers that delete on every retry: remove the config, or the previous username from it, in an earlier apply. full_replace makes the change atomically per namespace.",
     )
 }
 
