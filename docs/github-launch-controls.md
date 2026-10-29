@@ -64,7 +64,7 @@ stay red on `main` until the settings behind them exist:
 | Workflow | Red until | Section |
 | --- | --- | --- |
 | `Release` | the `main` ruleset declares required checks. Until then `gh pr checks --required` exits non-zero with "no required checks reported", so every push to `main` fails the publication gate. | [§2](#2-protect-main-with-an-active-ruleset) |
-| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template), the `main` ruleset binds `state-guard-reject-state-edits` (and, once required, `trusted-supply-chain-policy`) to the GitHub Actions app, and an organization ruleset requires `supply-chain-policy.yml` by path with the `main` ruleset's bypass actors | [§1](#1-create-the-state-writer-github-app), [§2](#switching-the-supply-chain-policy-check), [§2a](#2a-require-the-trusted-policy-by-workflow-path), [§5](#5-enable-settings-drift-monitoring) |
+| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template), the `main` ruleset binds `state-guard-reject-state-edits` (and, once required, `trusted-supply-chain-policy`) to the GitHub Actions app, and an organization ruleset requires every workflow that reports a required check by path, with the `main` ruleset's bypass actors | [§1](#1-create-the-state-writer-github-app), [§2](#switching-the-supply-chain-policy-check), [§2a](#2a-require-the-trusted-workflows-by-path), [§5](#5-enable-settings-drift-monitoring) |
 
 Neither workflow may assume a control it cannot verify. Configure §1-§5 first
 and neither goes red.
@@ -129,10 +129,16 @@ rejects it.
 
 The required `state-guard-reject-state-edits` check protects the path `.state`
 and everything under it, including old and new rename paths, whatever the file
-type. A PR may change it only after a fresh `gitforgeops/state-override`
-`labeled` event for the current head, by an actor with current write, maintain
-or admin permission. The same authorization is required when the file list
-cannot be fully enumerated. Keep both `/.state` and `/.state/` in CODEOWNERS;
+type. A PR may change it only with the `gitforgeops/state-override` label
+applied and a review whose body is exactly `gitforgeops-state-override`, on the
+current head, from a user with current write, maintain or admin permission.
+That user's latest submitted review must be the authorizing one, so a later
+review of theirs revokes it, and a push needs a fresh review. A label or review
+starts no run of the required workflow
+([section 2a](#2a-require-the-trusted-workflows-by-path)): re-run the failed
+job, or close and reopen the PR. Revoking after a run has passed takes effect
+at the next run. The same authorization is required when the file list cannot
+be fully enumerated. Keep both `/.state` and `/.state/` in CODEOWNERS;
 the trusted static-validation classifier must cover both as well.
 
 At runtime, `.state` must be a real directory and state and lock entries must
@@ -267,7 +273,7 @@ Take step 2 after step 1 has merged, as an administrator:
    next `opened`, `synchronize`, `reopened` or `edited` event (after §2a,
    `edited` no longer starts a run: push or reopen instead).
 
-## 2a. Require the trusted policy by workflow path
+## 2a. Require the trusted workflows by path
 
 A required status check names a check, not the workflow that ran it. Binding
 it to the GitHub Actions app does not narrow that, because a pull request's own
@@ -278,9 +284,12 @@ requests `contents: write` and `checks: write`, pushes a commit with
 `GITHUB_TOKEN` (GitHub starts no workflow for that push) and posts a successful
 check run under every required name. The ruleset accepts it and the pull
 request merges. Fork pull requests cannot do this: their token is read-only.
+A collaborator with write access can also delete a failing run, which removes
+its check run, and post a success in its place from a branch no pull request
+judges.
 
-Recorded in disposable repositories for #470 (2026-10-29). These are the
-outcomes of the listed attempts, not a general model of how GitHub chooses
+Recorded in disposable repositories for #470 and #632 (2026-10-29). These are
+the outcomes of the listed attempts, not a general model of how GitHub chooses
 among several runs of one workflow:
 
 | Attempt | Result |
@@ -293,23 +302,26 @@ among several runs of one workflow:
 | The same, with an organization ruleset `workflows` rule requiring the policy file at `main` | Blocked: "Required workflow … is not satisfied". |
 | Under that rule, delete the failed policy run and post a same-name success | Blocked: the rule is still not satisfied. |
 | Under that rule, delete the failed run of a trusted workflow the rule does **not** list, and post its success from a `push` workflow on another branch | **Merged.** |
+| A listed workflow and a `labeled` event | No run starts. |
+| A listed `pull_request` workflow that the pull request edits to fail | One run, of `main`'s definition; it passed. The pull request's copy did not run. |
+| A listed workflow fails; an authorizing review is posted and the failed job re-run | The re-run attempt satisfies the rule. A later push blocks again until the new head gets its own run. |
+| A listed `pull_request` workflow completes | A `workflow_run` listener on its display name still starts; the run reports its usual file path and its artifacts can be read. |
 
-So the required checks stay, and an organization ruleset also requires the
-trusted policy by workflow path: a posted check run does not satisfy a
-`workflows` rule, and neither a head with no run of the file nor a deleted run
-can merge. GitHub offers this rule only in organization (or enterprise)
-rulesets, which need GitHub Team or Enterprise.
+So the required checks stay, and an organization ruleset also requires, by
+workflow path, every workflow that reports one of them: a posted check run does
+not satisfy a `workflows` rule, and neither a head with no run of the file nor
+a deleted run can merge. GitHub offers this rule only in organization (or
+enterprise) rulesets, which need GitHub Team or Enterprise. The listed files are
+`audit_settings.REQUIRED_RULESET_WORKFLOWS`; a test keeps them equal to the
+workflows in `check_supply_chain.REQUIRED_CHECK_WORKFLOWS`:
 
-**What remains open (#632).** Only the listed file is protected this way.
-Every other required context, including `state-guard-reject-state-edits` and
-`validate-trusted-policy`, can still be satisfied by a collaborator with write
-access who deletes its failing run and posts a success from a branch the policy
-never judges (last row above). The state guard cannot simply be listed: a
-listed workflow starts no run on `labeled` or `edited`, which would make the
-`gitforgeops/state-override` flow impossible. Until #632 lands, exact-head
-review of what merges carries that part of the guarantee: a deleted run is
-visible only as a missing run on the head, and the organization audit-log API
-that would record the deletion needs GitHub Enterprise Cloud.
+- `.github/workflows/supply-chain-policy.yml` (`trusted-supply-chain-policy`)
+- `.github/workflows/state-guard.yml` (`state-guard-reject-state-edits`)
+- `.github/workflows/agent-setup-policy.yml` (`validate-trusted-policy`)
+- `.github/workflows/rust-ci.yml` (`rust-ci-check`)
+- `.github/workflows/security.yml` (`security-cargo-audit`,
+  `security-supply-chain-policy`)
+- `.github/workflows/validate-pr.yml` (`gitforgeops-required-static-validation`)
 
 As an organization owner, after section 2:
 
@@ -339,11 +351,12 @@ As an organization owner, after section 2:
          "parameters": {
            "do_not_enforce_on_create": false,
            "workflows": [
-             {
-               "path": ".github/workflows/supply-chain-policy.yml",
-               "ref": "refs/heads/main",
-               "repository_id": 123456789
-             }
+             {"path": ".github/workflows/supply-chain-policy.yml", "ref": "refs/heads/main", "repository_id": 123456789},
+             {"path": ".github/workflows/state-guard.yml", "ref": "refs/heads/main", "repository_id": 123456789},
+             {"path": ".github/workflows/agent-setup-policy.yml", "ref": "refs/heads/main", "repository_id": 123456789},
+             {"path": ".github/workflows/rust-ci.yml", "ref": "refs/heads/main", "repository_id": 123456789},
+             {"path": ".github/workflows/security.yml", "ref": "refs/heads/main", "repository_id": 123456789},
+             {"path": ".github/workflows/validate-pr.yml", "ref": "refs/heads/main", "repository_id": 123456789}
            ]
          }
        }
@@ -355,26 +368,37 @@ As an organization owner, after section 2:
    ```
 
 4. Dispatch `GitHub Settings Audit`. It reads the branch's effective rules
-   (`GET /repos/{repo}/rules/branches/main`) and fails until a `workflows`
-   rule names this repository, `.github/workflows/supply-chain-policy.yml` and
-   `refs/heads/main`. Every `workflows` rule on `main`, whatever it lists, must
-   come from a ruleset whose bypass actors equal the `main` ruleset's:
-   rulesets apply together, so one rule without the App's bypass refuses
-   ledger commits even if another admits it. On a user-owned repository, where the rule does not exist, it
-   warns instead and the risk above remains. The bootstrap cannot write
+   (`GET /repos/{repo}/rules/branches/main`) and fails until `workflows` rules
+   name this repository, every listed file and `refs/heads/main`. Every
+   `workflows` rule on `main`, whatever it lists, must come from a ruleset
+   whose bypass actors equal the `main` ruleset's: rulesets apply together, so
+   one rule without the App's bypass refuses ledger commits even if another
+   admits it. On a user-owned repository, where the rule does not exist, it
+   warns instead and the risks above remain. The bootstrap cannot write
    organization rulesets; it prints this step as a reminder.
 
 What changes for pull requests:
 
 - Ruleset workflows run only on `opened`, `synchronize` and `reopened`; the
-  file's own `types` are ignored. With the rule in place the policy no longer
-  runs on `edited`, so a pull request retargeted to `main` shows "Required
-  workflow is not satisfied" until it is closed and reopened or gets a new
-  push. That fails closed.
-- Each head got one run of the policy in the sandbox and on #631, not two.
-  The policy keeps its per-PR `cancel-in-progress` group, which GitHub's
-  ruleset troubleshooting advises against. A run cancelled that way leaves the
-  rule unsatisfied for that head; push or reopen to start a fresh one.
+  file's own `types` are ignored. A pull request retargeted to `main` shows
+  "Required workflow is not satisfied" until it is closed and reopened or gets
+  a new push. That fails closed.
+- A listed workflow runs `main`'s definition against the pull request's code,
+  and its `paths` filters are ignored. The pull request's own copy of
+  `rust-ci.yml`, `security.yml` or `validate-pr.yml` does not run, so an edit
+  to one of them takes effect, and is first exercised, after merge. Review
+  such an edit like any other change to a trusted workflow, and watch its
+  first run on `main`.
+- A label or review starts no run. The state override is therefore a review,
+  not a label event
+  ([Protecting the ledger path](#protecting-the-ledger-path)): after the review,
+  re-run the failed `state-guard-reject-state-edits` job or close and reopen
+  the pull request.
+- Each head got one run of each listed workflow in the sandbox, and one run
+  of the policy on #631, not two. `supply-chain-policy.yml` and `agent-setup-policy.yml` keep their
+  per-PR `cancel-in-progress` groups, which GitHub's ruleset troubleshooting
+  advises against. A run cancelled that way leaves the rule unsatisfied for
+  that head; re-run it, push, or reopen.
 
 ## 3. Protect every deployment environment
 
@@ -799,10 +823,12 @@ by that trusted checker. New checker logic requires fresh exact-head review;
 a green verdict from the previous protected checker does not validate it.
 
 That is not a complete boundary on its own. The check runs under
-`pull_request`, so GitHub executes the pull request's own copy of
-`security.yml`. The trusted checker inspects that copy with substring rules,
-and it is the job that copy defines which runs those rules. A pull request that
-changes workflow definitions can therefore still influence what this check
+`pull_request`. With the organization ruleset
+([section 2a](#2a-require-the-trusted-workflows-by-path)), GitHub runs `main`'s
+copy of `security.yml`, so a pull request cannot change how this check runs on
+itself. Without the ruleset, GitHub executes the pull request's own copy, and
+it is the job that copy defines which runs the checker's rules, so a pull
+request that changes workflow definitions can influence what this check
 reports.
 
 `trusted-supply-chain-policy` (`supply-chain-policy.yml`) is the check whose
@@ -874,13 +900,15 @@ What the checker enforces for this check:
   This rule is defense in depth, not the boundary. In the #470 experiments a
   same-name success from a separate `pull_request` workflow did not override
   a failing trusted run, so such a duplicate mainly adds a failure. The
-  boundary against a head no trusted run judged is the organization ruleset
-  that requires `supply-chain-policy.yml` by path
-  ([section 2a](#2a-require-the-trusted-policy-by-workflow-path)); the other
-  required contexts are not yet covered by it (#632).
-- **The cargo-audit gate.** `security-cargo-audit` is required but defined by
-  the pull request's own `security.yml`, so substrings anywhere in that file
-  prove nothing: the trusted command can sit in a comment under a `true`, or
+  boundary against a head no trusted run judged, and against a deleted run
+  replaced by a posted check, is the organization ruleset that requires every
+  workflow in `REQUIRED_CHECK_WORKFLOWS` by path
+  ([section 2a](#2a-require-the-trusted-workflows-by-path)).
+- **The cargo-audit gate.** `security-cargo-audit` is defined in
+  `security.yml`. The organization ruleset runs `main`'s copy on pull
+  requests, but a merged edit becomes `main`'s copy, and without the ruleset
+  the pull request's own copy runs. Substrings anywhere in that file prove
+  nothing: the trusted command can sit in a comment under a `true`, or
   behind `exit 0` or `|| true`. The parsed job is pinned instead: its keys,
   every step in order, and the exact `run:` scripts that run the protected
   branch's cargo-audit checker, its tests and its exception list. Only the
@@ -901,11 +929,12 @@ What the checker enforces for this check:
   can see. The allow-list (`STATUS_WRITE_ALLOWED`) is empty.
 - **Ruleset source.** The bootstrap binds every required context to the GitHub
   Actions app (`integration_id` 15368). The audit fails when
-  `trusted-supply-chain-policy` or `state-guard-reject-state-edits` lacks
-  that binding: both come from `pull_request_target` workflows a pull request
-  cannot edit, so an own-token commit status is the remaining way to forge
-  them. It warns for the other contexts, whose job definitions the pull
-  request supplies anyway.
+  `trusted-supply-chain-policy`, `state-guard-reject-state-edits` or
+  `validate-trusted-policy` lacks that binding: an unbound context accepts a
+  commit status from a collaborator's own token. It warns for the other
+  contexts. The binding does not stop a `checks: write` job from posting under
+  the name through the same app; the `workflows` rule in
+  [section 2a](#2a-require-the-trusted-workflows-by-path) does.
 
 Until the `main` ruleset requires `trusted-supply-chain-policy`
 ([Switching the supply-chain policy check](#switching-the-supply-chain-policy-check)),
@@ -1020,8 +1049,8 @@ included.
 - Actions permissions;
 - the active `main` and release-tag rulesets, including required checks and
   the exact state-writer App bypass;
-- the organization `workflows` rule that requires `supply-chain-policy.yml`
-  at `main`, and that every ruleset with a `workflows` rule on `main` has
+- the organization `workflows` rule that requires every workflow reporting a
+  required check at `main`, and that every ruleset with a `workflows` rule on `main` has
   the `main` ruleset's bypass actors (§2a; a warning on a user-owned
   repository);
 - that the `settings-audit` environment exists;

@@ -56,10 +56,10 @@ TRANSITIONAL_STATUS_CHECKS = ("trusted-supply-chain-policy", "validate-trusted-p
 # check run from any other source with the same name satisfies the rule: a
 # collaborator's own token can post one. The bootstrap writes the binding for
 # every context. The audit requires it for the contexts in
-# `SOURCE_BOUND_STATUS_CHECKS` and warns for the rest. Those two come from
+# `SOURCE_BOUND_STATUS_CHECKS` and warns for the rest. Those come from
 # `pull_request_target` workflows, whose definitions a pull request cannot
-# edit, so the binding is what keeps their verdict from being forged; the
-# others are defined by the pull request itself.
+# edit. The binding alone does not stop a job that holds `checks: write` from
+# posting under the name; the workflows rule below does, for every context.
 GITHUB_ACTIONS_APP_ID = 15368
 SOURCE_BOUND_STATUS_CHECKS = (
     "trusted-supply-chain-policy",
@@ -70,15 +70,23 @@ SOURCE_BOUND_STATUS_CHECKS = (
 # The required-check binding above names a check, not the workflow that ran it,
 # and every job that holds `checks: write` reports through the same app. A
 # same-repository pull request can push a head with GITHUB_TOKEN (no workflow
-# starts) and post a successful check run under every required name, which
-# merges (#470). An organization ruleset `workflows` rule closes that for the
-# files it lists: only a run of the file at the default branch satisfies it, so
-# neither a head without one nor a deleted run can merge. Only the supply-chain
-# policy is listed. A listed workflow starts no run on `labeled`, which would
-# strand the state guard's override flow, so the state guard and the other
-# required contexts stay name-only until #632
-# (docs/github-launch-controls.md, section 2a).
-REQUIRED_RULESET_WORKFLOWS = (".github/workflows/supply-chain-policy.yml",)
+# starts) and post a successful check run under every required name, and a
+# writer can delete a failing run and post one in its place; both merge (#470,
+# #632). An organization ruleset `workflows` rule closes that for the files it
+# lists: only a run of the file at the default branch satisfies it, so neither a
+# head without one nor a deleted run can merge. Every workflow that reports a
+# required check is listed. A listed workflow runs `main`'s definition, starts
+# runs only on opened, synchronize and reopened, and ignores path filters
+# (docs/github-launch-controls.md, section 2a). A test keeps this tuple equal to
+# the workflows in `check_supply_chain.REQUIRED_CHECK_WORKFLOWS`.
+REQUIRED_RULESET_WORKFLOWS = (
+    ".github/workflows/supply-chain-policy.yml",
+    ".github/workflows/state-guard.yml",
+    ".github/workflows/agent-setup-policy.yml",
+    ".github/workflows/rust-ci.yml",
+    ".github/workflows/security.yml",
+    ".github/workflows/validate-pr.yml",
+)
 RELEASE_TAG_PATTERN = "refs/tags/v*"
 
 # `settings-audit.yml` binds this environment so its administration-read token
@@ -436,24 +444,28 @@ def audit_required_workflows(
             "(docs/github-launch-controls.md, section 2a)"
         )
     user_owned = (repository.get("owner") or {}).get("type") == "User"
+    missing = [path for path in REQUIRED_RULESET_WORKFLOWS if path not in required]
     for path in REQUIRED_RULESET_WORKFLOWS:
         if path in required:
             audit.evidence.append(f"required workflow: {path} at {expected_ref}")
-        elif user_owned:
-            audit.warnings.append(
-                f"{branch!r} cannot require {path} by path: GitHub offers the "
-                "workflows rule only in organization rulesets. Until the "
-                "repository moves to an organization, a collaborator with write "
-                "access can merge a head no trusted policy run judged "
-                "(docs/github-launch-controls.md, section 2a)"
-            )
-        else:
-            audit.violations.append(
-                f"{branch!r} must require {path} at {expected_ref} through an "
-                "organization ruleset workflows rule; the required check name "
-                "alone accepts a check run the pull request's own job posts "
-                "(docs/github-launch-controls.md, section 2a)"
-            )
+    if not missing:
+        return
+    named = ", ".join(missing)
+    if user_owned:
+        audit.warnings.append(
+            f"{branch!r} cannot require {named} by path: GitHub offers the "
+            "workflows rule only in organization rulesets. Until the "
+            "repository moves to an organization, a collaborator with write "
+            "access can merge a head no trusted run judged "
+            "(docs/github-launch-controls.md, section 2a)"
+        )
+    else:
+        audit.violations.append(
+            f"{branch!r} must require {named} at {expected_ref} through an "
+            "organization ruleset workflows rule; the required check name "
+            "alone accepts a check run the pull request's own job posts "
+            "(docs/github-launch-controls.md, section 2a)"
+        )
 
 
 def ruleset_targets_release_tags(ruleset: dict, pattern: str) -> bool:

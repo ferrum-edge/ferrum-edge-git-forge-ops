@@ -122,11 +122,12 @@ The ledger is only safe because CI writes it. `apply-on-merge.yml` and
   guard that runs is always the one on `main`, and it never checks out the PR:
   file lists, labels and permissions come from the GitHub API. A PR with 3,000
   or more changed files is treated as incomplete. The escape hatch is the exact
-  `gitforgeops/state-override` label; it authorizes only the `labeled` event
-  for the current head, and only when the labeling account currently has
-  `write`, `maintain` or `admin`. Any later push or reopen fails until a
-  qualified maintainer removes and re-adds the label. The job summary records
-  the actor, permission, head and run.
+  `gitforgeops/state-override` label plus a review whose body is exactly
+  `gitforgeops-state-override` on the current head, from an account that
+  currently has `write`, `maintain` or `admin`. That account's latest review
+  must be the authorizing one, and any later push needs a fresh review. A label
+  or review starts no run: re-run the failed job, or close and reopen the PR.
+  The job summary records the reviewer, permission, review, head and run.
 - **Runtime path checks.** `.state` must be a real directory and its state and
   lock files regular files; symlinks and other file types are rejected. No
   label bypasses this. Environment names are single safe path components.

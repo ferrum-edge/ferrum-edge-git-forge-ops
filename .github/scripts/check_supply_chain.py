@@ -1517,10 +1517,11 @@ def state_guard_trigger_violations(text: str) -> list[str]:
         violations.append(
             "state-guard.yml: exactly one checkout is permitted, and it must name the default branch"
         )
-    # Deliveries for one head (opened plus one `labeled` per label) start out
-    # of order, so any shared concurrency group — per PR or per head,
-    # cancelling in progress or not — can cancel the newest check suite and
-    # leave the required check cancelled beside an older success (#407).
+    # Deliveries for one head started out of order on #407, so a shared
+    # concurrency group — per PR or per head, cancelling in progress or not —
+    # cancelled the newest check suite and left the required check cancelled
+    # beside an older success. Under the workflows rule a cancelled run also
+    # leaves the rule unsatisfied until someone re-runs it.
     if declares_concurrency(text):
         violations.append(
             "state-guard.yml: the guard must not declare a concurrency group; "
@@ -4781,9 +4782,10 @@ def policy_check_impersonation_violations(workflow: str, document: dict) -> list
 
     This is defense in depth. In the #470 experiments a same-name success from
     a separate workflow did not override a failing trusted run; a head no
-    trusted run judged is fenced by the organization ruleset that requires
-    `supply-chain-policy.yml` by path (docs/github-launch-controls.md, 2a),
-    and the other contexts are not yet (#632).
+    trusted run judged, or a deleted run replaced by a posted check, is fenced
+    by the organization ruleset that requires every workflow in
+    `REQUIRED_CHECK_WORKFLOWS` by path (docs/github-launch-controls.md, 2a;
+    #632).
 
     `workflow` is the path relative to the repository root.
     """

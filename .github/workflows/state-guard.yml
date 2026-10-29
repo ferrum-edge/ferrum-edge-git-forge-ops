@@ -18,11 +18,20 @@ name: GitForgeOps State Guard
 #
 # Escape hatch for genuine repairs (restoring a corrupted ledger, seeding an
 # environment adopted from an existing gateway): label the PR
-# `gitforgeops/state-override`. Triage users can apply labels, so label presence
-# is not authority: authorization succeeds only on the exact `labeled` webhook
-# for the current head and requires that event actor's current permission to be
-# write, maintain, or admin. Every push or other PR transition therefore fails
-# until a qualified maintainer removes and reapplies the label.
+# `gitforgeops/state-override`, and have a user with current write, maintain or
+# admin permission submit a review (approve or comment) whose body is exactly
+# `gitforgeops-state-override` on the current head. Triage users can apply
+# labels, so the label is only the request; the review is the authority. It
+# names its author and the exact commit, and the reviewer's latest submitted
+# review is their current word, so a later review revokes it and a push makes
+# it stale. Re-run this job (or close and reopen the PR) after the review.
+#
+# The organization ruleset requires this file by path
+# (docs/github-launch-controls.md, section 2a), so only a run of `main`'s
+# definition satisfies the check and a deleted run cannot be replaced by a
+# posted check. A listed workflow runs only on `opened`, `synchronize` and
+# `reopened`; a label or review starts no run, which is why authority is read
+# from the pull request at run time rather than from the triggering event.
 
 # Deliberately `pull_request_target`, not `pull_request`. Both give this job a
 # read-only token, but `pull_request` loads the *workflow definition from the
@@ -39,14 +48,12 @@ name: GitForgeOps State Guard
 # into a `run:` block.
 on:
   pull_request_target:
-    # `labeled`/`unlabeled` are not in the default activity type set
-    # (opened, synchronize, reopened). Without them, adding the override
-    # label does nothing until someone pushes another commit — the check
-    # stays red on a PR that has already been authorized, and the only way
-    # out is an empty commit. Re-evaluate on the label events themselves so
-    # the escape hatch takes effect when it is used, and so removing the
-    # label puts the fence straight back up.
-    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+    # The ruleset starts runs only for opened, synchronize and reopened (see
+    # above); a label or review is no trigger. `edited` (a base retarget)
+    # stays for the supply-chain policy's retarget rule and for the case where
+    # the workflow is ever unlisted; under the ruleset a retarget starts no run
+    # and needs a reopen or push.
+    types: [opened, synchronize, reopened, edited]
     # Deliberately NO `paths:` filter. This job is meant to be a required
     # status check for `main`, and a path-filtered workflow never reports a status on
     # matching-base PRs that don't match — GitHub then holds every such PR at "Expected —
@@ -57,27 +64,19 @@ on:
 
 # Deliberately NO `concurrency:` group, at workflow or job level; the
 # supply-chain policy refuses the word anywhere outside full-line comments, so
-# keep it out of run scripts and trailing comments too. Every delivery
-# gets its own check suite on the head commit. On #407, branch protection was
-# observed reading the required `state-guard-reject-state-edits` check from the
-# newest suite, not from the one that finished last. Opening a PR with labels
-# already applied sends several deliveries for one head about a second apart,
-# and their runs do not start in creation order, so any group they share can
-# cancel the newest suite and leave the required check cancelled beside an
-# older success. `cancel-in-progress: false` does not avoid this: GitHub keeps
-# one pending run per group and cancels the older pending one. Keying the group
-# on the head SHA only moves the race to same-head deliveries, which is exactly
-# where it occurs; nothing in Actions can cancel across heads without also
-# cancelling within one.
+# keep it out of run scripts and trailing comments too. On #407, deliveries for
+# one head started out of order, and a shared group cancelled the newest suite,
+# leaving the required check cancelled beside an older success. The ruleset now
+# starts runs only on opened, synchronize and reopened, but a cancelled run
+# still leaves the required workflow unsatisfied until someone re-runs it, and
+# nothing here needs cancellation.
 #
-# Nothing relies on cancellation, or on which suite branch protection selects,
-# for safety. Each run is bound to the head it was delivered for and fails
-# closed if the PR head moves while it runs, and a run for a superseded head
-# reports only on that commit. Removing the override label sends a newer
-# delivery whose run fails on its own, and an authorizing run re-reads the head,
-# base and labels right before it records success. Whether branch protection
-# reads the newest suite or requires every suite's latest run to pass, an older
-# authorizing run that finishes later cannot turn the check green.
+# Nothing relies on which run branch protection selects for safety. Each run is
+# bound to the head it was delivered for and fails closed if the PR head moves
+# while it runs, and an authorizing run re-reads the head, base and label right
+# before it records success. Revoking an override after a run has passed (a
+# later review, removing the label) changes nothing until the job runs again:
+# push, re-run it, or close and reopen the PR.
 
 permissions:
   contents: read
@@ -212,53 +211,74 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           OVERRIDE_LABEL: gitforgeops/state-override
-          EVENT_ACTION: ${{ github.event.action }}
-          EVENT_LABEL: ${{ github.event.label.name || '' }}
-          EVENT_ACTOR: ${{ github.event.sender.login }}
+          OVERRIDE_REVIEW: gitforgeops-state-override
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
-          [ "$EVENT_ACTION" = labeled ] && [ "$EVENT_LABEL" = "$OVERRIDE_LABEL" ] || {
-            echo "::error::State override must be freshly applied to this exact PR head. Remove and reapply the label after every push or PR transition."
-            exit 1
-          }
-          [[ "$EVENT_ACTOR" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,33}\[bot\])$ ]] || {
-            echo "::error::Override event actor is missing or malformed."
-            exit 1
-          }
-
-          # Query current state instead of trusting the triggering event's
-          # possibly stale label array. Exact string matching also makes a
-          # renamed/lookalike label fail closed.
-          labels=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.labels[].name')
-          if ! grep -Fxq "$OVERRIDE_LABEL" <<< "$labels"; then
-            echo "::error::State override label is not currently applied."
-            exit 1
-          fi
-
+          # Query current state, never the triggering event: a re-run replays
+          # the original payload, and a label or review starts no run of its
+          # own. Exact string matching makes a lookalike label fail closed.
           current=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
           [ "$(jq -r '.head.sha' <<< "$current")" = "$EXPECTED_HEAD_SHA" ] || {
             echo "::error::PR head changed after state-scope detection; wait for the new run."
             exit 1
           }
+          labels=$(jq -r '.labels[].name' <<< "$current")
+          if ! grep -Fxq "$OVERRIDE_LABEL" <<< "$labels"; then
+            echo "::error::State override label is not currently applied."
+            exit 1
+          fi
 
-          # This endpoint returns the actor's current permission and fails for
-          # deleted/suspended/non-collaborator identities. Triage is explicitly
-          # insufficient even though it can manage labels.
-          permission=$(gh api "repos/${REPO}/collaborators/${EVENT_ACTOR}/permission" --jq '.permission')
-          case "$permission" in
-            write|maintain|admin) ;;
-            *)
-              echo "::error::@${EVENT_ACTOR} has '${permission:-unknown}' permission; state override requires write, maintain, or admin."
-              exit 1
-              ;;
-          esac
+          # Each reviewer's latest submitted review is their current word: a
+          # later review of any kind, or a dismissal, revokes an earlier
+          # override, and pending drafts count for nothing. Reviews come back
+          # oldest first across pages.
+          reviews=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" --paginate --slurp)
+          candidates=$(jq -r --arg head "$EXPECTED_HEAD_SHA" --arg body "$OVERRIDE_REVIEW" '
+            if type != "array" or any(.[]; type != "array") then
+              error("invalid pagination shape")
+            else
+              [.[][]]
+              | if any(.[]; type != "object") then error("invalid review entry") else . end
+              | [to_entries[] | .value + {order: .key}
+                 | select(.state != "PENDING" and (.user.login | type) == "string")]
+              | group_by(.user.login)
+              | map(max_by(.order))
+              | map(select((.state == "APPROVED" or .state == "COMMENTED")
+                           and .commit_id == $head
+                           and ((.body // "") | gsub("^\\s+|\\s+$"; "")) == $body))
+              | .[] | "\(.user.login) \(.id)"
+            end
+          ' <<< "$reviews")
+
+          authorized=""
+          while read -r reviewer review_id; do
+            [ -n "$reviewer" ] || continue
+            [[ "$reviewer" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,33}\[bot\])$ ]] || continue
+            [[ "$review_id" =~ ^[0-9]+$ ]] || continue
+            # This endpoint returns the reviewer's current permission and
+            # fails for deleted/suspended/non-collaborator identities. Triage
+            # is explicitly insufficient even though it can manage labels.
+            permission=$(gh api "repos/${REPO}/collaborators/${reviewer}/permission" --jq '.permission')
+            case "$permission" in
+              write|maintain|admin)
+                authorized="$reviewer"
+                break
+                ;;
+            esac
+          done <<< "$candidates"
+
+          [ -n "$authorized" ] || {
+            echo "::error::No user with write, maintain, or admin permission has a latest review with body exactly '${OVERRIDE_REVIEW}' on head ${EXPECTED_HEAD_SHA}. Submit one, then re-run this job or close and reopen the pull request."
+            exit 1
+          }
 
           {
-            echo "actor=$EVENT_ACTOR"
+            echo "actor=$authorized"
             echo "permission=$permission"
+            echo "review_id=$review_id"
             echo "head_sha=$EXPECTED_HEAD_SHA"
             echo "run_id=$RUN_ID"
             echo "run_attempt=$RUN_ATTEMPT"
@@ -283,12 +303,14 @@ jobs:
           it as `gitforgeops[bot]` after a successful run. Drop changes to `.state`
           and its descendants from this PR and let the next apply write them.
 
-          If you are deliberately repairing or seeding the ledger, a user with
-          current `write`, `maintain`, or `admin` repository permission can add
-          the exact `gitforgeops/state-override` label. Authorization succeeds
-          only on that exact `labeled` webhook for the current head and rejects
-          triage permission. A later push or PR transition requires the label
-          to be removed and reapplied.
+          If you are deliberately repairing or seeding the ledger, add the
+          exact `gitforgeops/state-override` label, and have a user with
+          current `write`, `maintain`, or `admin` repository permission submit
+          a review (approve or comment) whose body is exactly
+          `gitforgeops-state-override` on the current head. Then re-run this
+          job, or close and reopen the pull request: a label or review starts
+          no run. Triage permission cannot authorize, a later review by the
+          same user revokes it, and a push needs a fresh review.
           MSG
           exit 1
 
@@ -303,6 +325,7 @@ jobs:
           OVERRIDE_LABEL: gitforgeops/state-override
           ACTOR: ${{ steps.authorize.outputs.actor }}
           PERMISSION: ${{ steps.authorize.outputs.permission }}
+          REVIEW_ID: ${{ steps.authorize.outputs.review_id }}
           AUTHORIZED_HEAD: ${{ steps.authorize.outputs.head_sha }}
           RUN_ID: ${{ steps.authorize.outputs.run_id }}
           RUN_ATTEMPT: ${{ steps.authorize.outputs.run_attempt }}
@@ -331,12 +354,13 @@ jobs:
             exit 1
           }
 
-          echo "::warning::Protected state scope authorized by @${ACTOR} (${PERMISSION}) for head ${AUTHORIZED_HEAD}."
+          echo "::warning::Protected state scope authorized by @${ACTOR} (${PERMISSION}) in review ${REVIEW_ID} for head ${AUTHORIZED_HEAD}."
           {
             echo "## Authorized protected-state override"
             echo
-            echo "- Actor: \`@${ACTOR}\`"
+            echo "- Reviewer: \`@${ACTOR}\`"
             echo "- Current permission: \`${PERMISSION}\`"
+            echo "- Review: \`${REVIEW_ID}\`"
             echo "- Authorized head: \`${AUTHORIZED_HEAD}\`"
             echo "- Workflow run: \`${RUN_ID}\` (attempt \`${RUN_ATTEMPT}\`)"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -550,9 +550,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   now matches only repository-sourced rulesets for its `main` and tag
   baselines. The bootstrap prints the organization step it cannot write.
   With the rule in place a retargeted pull request needs a push or reopen.
-  The other required contexts, the state guard included, can still be
-  satisfied by a write collaborator who deletes the failing run and posts a
-  check from another branch (#632).
+
+- Every workflow that reports a required check is now required by path, not
+  only the supply-chain policy (#632). In the sandbox a write collaborator
+  deleted the failing run of an unlisted trusted workflow and posted its
+  success from another branch, and the pull request merged. The
+  organization ruleset now also lists `state-guard.yml`,
+  `agent-setup-policy.yml`, `rust-ci.yml`, `security.yml` and
+  `validate-pr.yml`, and the settings audit requires all six. A listed
+  workflow runs `main`'s definition, so edits to `rust-ci.yml`,
+  `security.yml` and `validate-pr.yml` no longer run on their own pull
+  request. Because a listed workflow starts no run on a label, the state
+  override is now the `gitforgeops/state-override` label plus a review whose
+  body is exactly `gitforgeops-state-override` on the current head, from a
+  user with write, maintain or admin permission; re-run the failed guard job
+  or reopen the pull request after the review. The reviewer's latest review
+  must be the authorizing one, a push needs a fresh review, and revoking
+  after a passing run takes effect at the next run (removing the label no
+  longer re-runs the guard).
 
 - Replace the deprecated `serde_yaml` 0.9 (and its archived C-translated
   `unsafe-libyaml`, RUSTSEC-2024-0449) with safe-Rust parsing that bounds work

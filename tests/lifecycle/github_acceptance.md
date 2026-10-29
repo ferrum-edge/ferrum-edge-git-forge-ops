@@ -156,8 +156,10 @@ wholesale or by rolling back unrelated live configuration.
    pending-create journal's absence (cancellation does not persist it) simply
    leaves the rows for the ordinary diff to pick up.
 4. If a repair genuinely needs `.state/` edited, do it through the
-   `gitforgeops/state-override` label with a qualified maintainer, and confirm
-   `state-guard.yml` rejects the same edit without it.
+   `gitforgeops/state-override` label and a qualified maintainer's
+   `gitforgeops-state-override` review on the head, then re-run the failed
+   guard job, and confirm `state-guard.yml` rejects the same edit without the
+   review.
 
 ---
 

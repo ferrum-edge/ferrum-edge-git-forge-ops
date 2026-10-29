@@ -159,12 +159,15 @@ cargo fmt --all && cargo fmt --all -- --check
   `checks`/`statuses` write, and pins the parsed `security-cargo-audit` job
   and `security.yml`'s reviewed `on:` triggers.
   Keep new workflows inside that subset. An organization ruleset also
-  requires `supply-chain-policy.yml` at `main` by path (#470,
+  requires, by path at `main`, every workflow in `REQUIRED_CHECK_WORKFLOWS`
+  (`audit_settings.REQUIRED_RULESET_WORKFLOWS`; #470, #632,
   `docs/github-launch-controls.md` §2a): a required check name alone accepts
-  a check run any `checks: write` job posts on a head no trusted run judged.
-  `audit_settings.py` fails without it, or when its bypass actors differ from
-  the `main` ruleset's (warns on user-owned repos). Other required contexts,
-  the state guard included, are still name-only (#632). `security.yml`'s
+  a check run any `checks: write` job posts on a head no trusted run judged,
+  or after a writer deletes the failing run. `audit_settings.py` fails
+  without it, or when its bypass actors differ from the `main` ruleset's
+  (warns on user-owned repos). A listed workflow runs `main`'s definition
+  only on `opened`/`synchronize`/`reopened` and ignores `paths`, so edits to
+  `rust-ci.yml`, `security.yml` and `validate-pr.yml` first run after merge. `security.yml`'s
   `security-supply-chain-policy` stays required until the ruleset switch and a
   later retire PR (`docs/github-launch-controls.md`, "Switching the
   supply-chain policy check").
@@ -1048,14 +1051,17 @@ only locks and temp files.
 `state-guard.yml` fails any PR touching `.state/**` (including rename sources)
 unless:
 
-- the exact `gitforgeops/state-override` `labeled` webhook targets the current
-  head, and
-- its actor currently has `write`, `maintain` or `admin`.
+- the `gitforgeops/state-override` label is applied, and
+- a user with current `write`, `maintain` or `admin` permission has, as their
+  latest submitted review, an approve or comment whose body is exactly
+  `gitforgeops-state-override` and whose `commit_id` is the current head.
 
-It rejects every later push or PR transition until a qualified maintainer
-removes and reapplies the label, and records actor, permission, head, run ID
-and attempt. Label changes rerun the check so removed authorization cannot
-leave a stale success.
+Authority is read from the PR at run time, never from the triggering event:
+the workflow is required by path (launch controls §2a), so it runs only on
+`opened`/`synchronize`/`reopened`, and a label or review starts no run. After
+the review, re-run the failed job or reopen the PR. A push needs a fresh
+review; revoking after a passing run takes effect at the next run. The summary
+records reviewer, permission, review id, head, run ID and attempt.
 
 - It uses `pull_request_target`, never `pull_request` (which would load the guard
   from the PR head, letting one commit forge a ledger entry and delete the
@@ -1067,11 +1073,11 @@ leave a stale success.
   them.
 
 The guard runs on every PR through `pull_request_target`, without checking out
-PR content; the changed-file list, labels and permission come from `gh api`,
-and the only checkout is the default branch. It requires a fresh
-`gitforgeops/state-override` `labeled` event for the current head by an actor
-with current `write`, `maintain` or `admin` permission, and re-reads the PR's
-head, base and label immediately before reporting success. The workflow has no
+PR content; the changed-file list, labels, reviews and permission come from
+`gh api`, and the only checkout is the default branch. It requires the override
+label and a qualifying `gitforgeops-state-override` review of the current head
+(above), and re-reads the PR's head, base and label immediately before
+reporting success. The workflow has no
 concurrency group: every delivery runs to completion, though a manual cancel or
 runner failure can still interrupt one. On #407, branch protection read the
 newest check suite; the guard is safe under that selection and under a model

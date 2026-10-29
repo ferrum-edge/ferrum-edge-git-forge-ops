@@ -135,7 +135,7 @@ on September 16, 2026. Plans change, so confirm there.
 | Deployment branch policy (apply only from protected branches) | All plans | Pro, Team or Enterprise |
 | Required reviewers on environments (the human gate before apply, live review and rotate) | All plans | **Enterprise only** |
 | Actions minutes | Free on standard hosted runners | Plan allowance, then billed |
-| Requiring the trusted policy workflow by path (organization ruleset `workflows` rule; see [launch controls §2a](docs/github-launch-controls.md#2a-require-the-trusted-policy-by-workflow-path)) | Organization on Team or Enterprise; **not a user-owned repository** | Organization on Team or Enterprise |
+| Requiring the trusted workflows by path (organization ruleset `workflows` rule; see [launch controls §2a](docs/github-launch-controls.md#2a-require-the-trusted-workflows-by-path)) | Organization on Team or Enterprise; **not a user-owned repository** | Organization on Team or Enterprise |
 
 The setup below uses a **private** repository with a **required reviewer**,
 which needs GitHub Enterprise. On Free, Pro or Team, pick one of:
@@ -439,8 +439,10 @@ live resource, so only CI writes the ledger:
 - `apply-on-merge.yml` and `rotate.yml` commit it with the state-writer App.
 - `state-guard.yml` fails any PR that touches `.state/`, unless an actor with
   current `write`, `maintain` or `admin` permission authorizes the current head
-  through a fresh `gitforgeops/state-override` label event. Make it a required
-  status check.
+  with the `gitforgeops/state-override` label and a review whose body is
+  exactly `gitforgeops-state-override`. Make it a required status check, and
+  require the workflow by path
+  ([launch controls §2a](docs/github-launch-controls.md#2a-require-the-trusted-workflows-by-path)).
 - The binary rejects a `.state` that is not a real directory or holds
   symlinks, whatever the label says.
 - Keep `.state/*.json` tracked in Git. If it is ignored, the ledger never

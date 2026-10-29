@@ -177,9 +177,9 @@ normally discovers environments from `.gitforgeops/config.yaml`, which you
 commit in step 4.
 
 On an organization repository, an organization owner must also create the
-ruleset that requires the trusted supply-chain policy by workflow path, with
-the same bypass actors as the `main` ruleset
-([launch controls §2a](github-launch-controls.md#2a-require-the-trusted-policy-by-workflow-path)).
+ruleset that requires the trusted workflows by path, with the same bypass
+actors as the `main` ruleset
+([launch controls §2a](github-launch-controls.md#2a-require-the-trusted-workflows-by-path)).
 The script prints this step but cannot write it, and the settings audit fails
 until it exists.
 
