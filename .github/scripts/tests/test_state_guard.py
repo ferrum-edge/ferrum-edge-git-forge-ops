@@ -266,7 +266,11 @@ class StateGuardTests(unittest.TestCase):
                         log.write(route + '\\n')
                     if route.endswith('/permission'):
                         login = route.split('/')[-2]
-                        print(json.loads(os.environ['TEST_PERMISSIONS']).get(login, 'none'))
+                        permission = json.loads(os.environ['TEST_PERMISSIONS']).get(login, 'none')
+                        if permission == 'lookup-fails':
+                            # An App's bot account answers 404 here.
+                            sys.exit(1)
+                        print(permission)
                     elif '/reviews?' in route:
                         print(os.environ['TEST_REVIEWS'])
                     else:
@@ -299,7 +303,12 @@ class StateGuardTests(unittest.TestCase):
                 "TEST_HEAD": "a" * 40,
                 "TEST_LABELS": json.dumps(["gitforgeops/state-override"]),
                 "TEST_PERMISSIONS": json.dumps(
-                    {"maintainer": "write", "admin-user": "admin", "triager": "triage"}
+                    {
+                        "maintainer": "write",
+                        "admin-user": "admin",
+                        "triager": "triage",
+                        "app[bot]": "lookup-fails",
+                    }
                 ),
             }
 
@@ -329,6 +338,9 @@ class StateGuardTests(unittest.TestCase):
                 # Another reviewer's later review does not revoke this one.
                 ([[review("maintainer", 7), review("triager", 8, body="no")]],
                  "maintainer", "7"),
+                # A failed permission lookup skips that reviewer only;
+                # "app[bot]" sorts before "maintainer".
+                ([[review("app[bot]", 6), review("maintainer", 7)]], "maintainer", "7"),
             ]
             for pages, actor, review_id in authorized:
                 with self.subTest(pages=pages):
@@ -352,6 +364,11 @@ class StateGuardTests(unittest.TestCase):
                 [[review("triager", 7)]],
                 [[review("stranger", 7)]],
                 [[review("bad login", 7)]],
+                # A login cannot smuggle a second record onto another line.
+                [[review("x\nmaintainer", 7)]],
+                [[review("app[bot]", 7)]],
+                [[review("maintainer", 7.5)]],
+                [[review("maintainer", 0)]],
                 [[review("maintainer", "7; rm -rf /")]],
                 [[{**review("maintainer", 7), "user": None}]],
                 [["not a review"]],

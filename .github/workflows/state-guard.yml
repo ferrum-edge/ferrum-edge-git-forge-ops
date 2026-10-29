@@ -249,6 +249,10 @@ jobs:
               | map(select((.state == "APPROVED" or .state == "COMMENTED")
                            and .commit_id == $head
                            and ((.body // "") | gsub("^\\s+|\\s+$"; "")) == $body))
+              # Validate each record before it crosses into the shell, so a
+              # login cannot carry a second record on another line.
+              | map(select((.user.login | test("\\A[A-Za-z0-9]([A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,33}\\[bot\\])\\z"))
+                           and (.id | type) == "number" and .id == (.id | floor) and .id > 0))
               | .[] | "\(.user.login) \(.id)"
             end
           ' <<< "$reviews")
@@ -258,10 +262,14 @@ jobs:
             [ -n "$reviewer" ] || continue
             [[ "$reviewer" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,33}\[bot\])$ ]] || continue
             [[ "$review_id" =~ ^[0-9]+$ ]] || continue
-            # This endpoint returns the reviewer's current permission and
-            # fails for deleted/suspended/non-collaborator identities. Triage
-            # is explicitly insufficient even though it can manage labels.
-            permission=$(gh api "repos/${REPO}/collaborators/${reviewer}/permission" --jq '.permission')
+            # The reviewer's current permission. Triage is explicitly
+            # insufficient even though it can manage labels. The lookup fails
+            # for some identities (an App's bot account answers 404); that
+            # reviewer does not qualify, but a later one still may.
+            if ! permission=$(gh api "repos/${REPO}/collaborators/${reviewer}/permission" --jq '.permission'); then
+              echo "::warning::Could not read @${reviewer}'s permission; that review does not authorize the override."
+              continue
+            fi
             case "$permission" in
               write|maintain|admin)
                 authorized="$reviewer"

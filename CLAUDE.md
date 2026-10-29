@@ -1070,8 +1070,8 @@ records reviewer, permission, review id, head, run ID and attempt.
 - It uses `pull_request_target`, never `pull_request` (which would load the guard
   from the PR head, letting one commit forge a ledger entry and delete the
   check). That is safe only because the job never checks out the PR: files,
-  labels and permission come from `gh api`, and `changed_files.py` from an
-  explicit default-branch checkout.
+  labels, reviews and permission come from `gh api`, and `changed_files.py`
+  from an explicit default-branch checkout.
 - It runs on **every** PR with no `paths:` filter and decides internally. A
   path-filtered required check never reports on non-matching PRs and stalls
   them.

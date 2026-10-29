@@ -2651,8 +2651,10 @@ def security_push_trigger_violations(text: str) -> list[str]:
 
 
 # The exact triggers `security.yml` may carry. `security-cargo-audit` and
-# `security-supply-chain-policy` are required contexts defined by the pull
-# request's own copy of this workflow, and every pinned job switches on
+# `security-supply-chain-policy` are required contexts defined by this
+# workflow: the organization ruleset runs `main`'s copy on pull requests, but
+# a merged edit becomes `main`'s copy, and without the ruleset the pull
+# request's own copy runs. Every pinned job switches on
 # `github.event_name`. An added trigger — `workflow_dispatch:` above all —
 # would run that candidate copy outside `pull_request`, take the `else` branch
 # and post a second result under a required check name from a run no rule

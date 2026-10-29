@@ -120,7 +120,7 @@ The ledger is only safe because CI writes it. `apply-on-merge.yml` and
 - **`state-guard.yml`.** It fails any PR that touches `.state` or anything
   under it, including renames. It runs on `pull_request_target`, so the
   guard that runs is always the one on `main`, and it never checks out the PR:
-  file lists, labels and permissions come from the GitHub API. A PR with 3,000
+  file lists, labels, reviews and permissions come from the GitHub API. A PR with 3,000
   or more changed files is treated as incomplete. The escape hatch is the exact
   `gitforgeops/state-override` label plus a review whose body is exactly
   `gitforgeops-state-override` on the current head, from an account that

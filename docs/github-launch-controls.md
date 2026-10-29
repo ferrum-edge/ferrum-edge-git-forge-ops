@@ -136,8 +136,11 @@ That user's latest submitted review must be the authorizing one, so a later
 review of theirs revokes it, and a push needs a fresh review. A label or review
 starts no run of the required workflow
 ([section 2a](#2a-require-the-trusted-workflows-by-path)): re-run the failed
-job, or close and reopen the PR. Revoking after a run has passed takes effect
-at the next run. The same authorization is required when the file list cannot
+job, or close and reopen the PR. The review and the reviewer's permission are
+checked when the job runs; the last step re-reads only the head, base and
+label. Revoking after a run has passed takes effect at the next run. A failed
+permission lookup (an App's bot account answers 404) only disqualifies that
+reviewer. The same authorization is required when the file list cannot
 be fully enumerated. Keep both `/.state` and `/.state/` in CODEOWNERS;
 the trusted static-validation classifier must cover both as well.
 
@@ -305,7 +308,8 @@ among several runs of one workflow:
 | A listed workflow and a `labeled` event | No run starts. |
 | A listed `pull_request` workflow that the pull request edits to fail | One run, of `main`'s definition; it passed. The pull request's copy did not run. |
 | A listed workflow fails; an authorizing review is posted and the failed job re-run | The re-run attempt satisfies the rule. A later push blocks again until the new head gets its own run. |
-| A listed `pull_request` workflow completes | A `workflow_run` listener on its display name still starts; the run reports its usual file path and its artifacts can be read. |
+| A listed `pull_request` workflow completes | A `workflow_run` listener on its display name still starts; the run reports its usual file path, and its artifact was listed and downloaded. |
+| A listed workflow whose required-style job passes and whose second, unrequired job fails | Blocked: the whole run must pass. |
 
 So the required checks stay, and an organization ruleset also requires, by
 workflow path, every workflow that reports one of them: a posted check run does
@@ -390,7 +394,7 @@ What changes for pull requests:
   such an edit like any other change to a trusted workflow, and watch its
   first run on `main`.
 - The whole workflow run must succeed, not only the jobs that report required
-  checks. CodeQL and the container image scan, which report no required check,
+  checks (sandbox row above). CodeQL and the container image scan, which report no required check,
   therefore live in the unlisted `code-scanning.yml`: GitHub refuses to start
   a ruleset workflow that uses a CodeQL action other than
   `github/codeql-action/upload-sarif`, and the image scan's gate would turn
