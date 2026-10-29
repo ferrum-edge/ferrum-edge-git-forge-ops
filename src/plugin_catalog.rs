@@ -143,9 +143,9 @@ pub const BUILTIN_PLUGINS: &[BuiltinPlugin] = &[
     p("ai_prompt_compressor", 4055, Ai),
     p("ai_semantic_cache", 4057, Ai),
     p("ai_federation", 4060, Ai),
+    p("ai_token_metrics", 4070, Ai),
     p("ai_response_guard", 4075, Ai),
     p("security_headers", 4080, Security),
-    p("ai_token_metrics", 4100, Ai),
     p("ai_rate_limiter", 4200, Ai),
     // --- Logging band (9000-9999) ---
     p("stdout_logging", 9000, Observability),

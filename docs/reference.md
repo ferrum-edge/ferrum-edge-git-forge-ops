@@ -286,15 +286,16 @@ remaining checks and exact-build lifecycle qualification.
 PluginConfig updates and deletes additionally send `expected_proxy_ids`, the
 gateway's association precondition (issue #569). A gateway build that does
 not implement it ignores the parameter, and the client does not detect a
-server that accepts the parameter but does not enforce it. No released
-Ferrum Edge build up to and including v0.9.17 enforces it, so apply keeps
+server that accepts the parameter but does not enforce it. Released Ferrum
+Edge builds up to and including v0.9.17 ignore it. The pinned v0.9.19 is the
+first published release that includes ferrum-edge#6744, and it refuses a
+PluginConfig update or delete that omits the parameter. Apply still keeps
 its client-side `/backup` re-read of the plugin's referencing proxies before
 every PluginConfig delete and retarget, whatever the gateway build (issue
 #603). That re-read narrows the race but cannot close it; only a gateway
-that enforces the precondition does. The minimum Ferrum Edge version that
-enforces it is the first release that includes ferrum-edge#6744; the
-re-read stays until that release is the minimum supported version and its
-exact build is qualified, as for `If-Match`. See
+that enforces the precondition does. The re-read stays until hosted
+lifecycle qualification of the exact v0.9.19 build is recorded, as for
+`If-Match`. See
 [Plugin associations](apply.md#plugin-associations).
 
 Blank values count as unset. Present values are validated before anything else

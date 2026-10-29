@@ -2,13 +2,13 @@
   "$schema": "https://github.com/ferrum-edge/ferrum-contracts/schemas/vocabulary-plugin-catalog/v1.schema.json",
   "vocabulary": "plugin-catalog",
   "version": 1,
-  "edge_release": "v0.9.15",
-  "description": "Index of every built-in Ferrum Edge plugin at v0.9.15: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
+  "edge_release": "v0.9.19",
+  "description": "Index of every built-in Ferrum Edge plugin at v0.9.19: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
   "provenance": [
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.15",
-      "commit": "25b37395ff61bfea0f3ffd189d9011c4984fa755",
+      "ref": "v0.9.19",
+      "commit": "510ce7121c3d9754110d330a30a3bd9b7a7b278e",
       "path": "src/plugins/mod.rs",
       "symbols": [
         "BUILTIN_PLUGIN_REGISTRATIONS",
@@ -23,8 +23,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.15",
-      "commit": "25b37395ff61bfea0f3ffd189d9011c4984fa755",
+      "ref": "v0.9.19",
+      "commit": "510ce7121c3d9754110d330a30a3bd9b7a7b278e",
       "path": "src/plugins/builtin_parity.rs",
       "symbols": [
         "BUILTIN_PLUGIN_PARITY_META",
@@ -43,8 +43,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.15",
-      "commit": "25b37395ff61bfea0f3ffd189d9011c4984fa755",
+      "ref": "v0.9.19",
+      "commit": "510ce7121c3d9754110d330a30a3bd9b7a7b278e",
       "path": "openapi.yaml",
       "symbols": [
         "components.schemas.PluginConfigBase"
@@ -52,15 +52,15 @@
       "fields": [
         "config_schema"
       ],
-      "note": "PluginConfigBase and every config_schema pointer are unchanged from v0.9.14. Config schemas the pointers reach change at v0.9.15: LdapAuthConfig drops consumer_mapping and stays closed, so a config that still sets it is refused (ferrum-edge#6088); JwksAuthConfig and Oauth2IntrospectionConfig display claims select X-Authenticated-Identity (#6088); the plugin-config environment references (ApiChargebackSinkConfig clickhouse.password_ref, AiSemanticFirewallConfig provider.api_key_env, WorkloadMetricsConfig Lightstep access_token_env/accessTokenEnv, ProxyAlertsEnvName) take a FERRUM_PLUGIN_SECRET_<NAME> name pattern and maxLength 256, and AiStreamRouterConfig api_key and the ServerlessFunctionConfig Azure/GCP fallbacks are redescribed (#6089); RateLimitingConfig adds ipv6_prefix (1-128, default 64), McpGatewayConfig adds sessions.max_sessions_per_principal (minimum 1, default 128) and sessions.max_sessions now refuses new sessions when full instead of evicting the oldest and BodyValidatorConfig grpc_max_decompressed_size_bytes has minimum 1 (#6079); SoapWsSecurityConfig content_type.allow_mtom describes strict MTOM framing with the first part as root (#6077)."
+      "note": "v0.9.19 retains the 82 registered types, removed names and PluginConfigBase pointers. Configuration components include the production-launch plugin hardening, multi-location key_auth, SPIFFE forwarding, external-identity access rules, telemetry redaction, resource bounds and plugin association preconditions documented in the owner upgrade guide. Registration failure policy and parity metadata are transcribed from the same tag; referenced config schemas are not copied here."
     }
   ],
   "config_schema_document": {
     "repo": "ferrum-edge/ferrum-edge",
-    "ref": "v0.9.15",
-    "commit": "25b37395ff61bfea0f3ffd189d9011c4984fa755",
+    "ref": "v0.9.19",
+    "commit": "510ce7121c3d9754110d330a30a3bd9b7a7b278e",
     "path": "openapi.yaml",
-    "sha256": "f6c7d8b1d247060c4d0ae66e5c149ad3d76721addb8176eff45b6fc3d1b4d6b2",
+    "sha256": "610e2645961e7a5deca73468439be9c4a5b7070045099506c212a0a36b045e90",
     "openapi": "3.1.0",
     "note": "Each config_schema.pointer is a JSON Pointer into this exact file. The schemas are OpenAPI 3.1 (JSON Schema 2020-12 dialect) and may $ref other components in the same document. They apply to `config` only when the plugin config is enabled. They are referenced, not copied, in this release; see docs/adoption.md (follow-ups)."
   },
@@ -99,7 +99,7 @@
       "name": "stdout_logging",
       "classification": "public",
       "priority": 9000,
-      "failure_policy": "optional_fail_open",
+      "failure_policy": "keep_last_known_good",
       "active_phases": [
         "log",
         "on_stream_disconnect",
@@ -253,7 +253,8 @@
       "priority": 1000,
       "failure_policy": "fail_closed",
       "active_phases": [
-        "authenticate"
+        "authenticate",
+        "before_proxy"
       ],
       "protocols": [
         "http",
@@ -299,7 +300,8 @@
         "on_request_received",
         "authenticate",
         "before_proxy",
-        "after_proxy"
+        "after_proxy",
+        "apply_websocket_handshake_response_headers"
       ],
       "protocols": [
         "http",
@@ -320,7 +322,8 @@
       "priority": 1100,
       "failure_policy": "fail_closed",
       "active_phases": [
-        "authenticate"
+        "authenticate",
+        "before_proxy"
       ],
       "protocols": [
         "http",
@@ -453,6 +456,7 @@
       "failure_policy": "fail_closed",
       "active_phases": [
         "on_request_received",
+        "before_proxy",
         "on_stream_connect"
       ],
       "protocols": [
@@ -477,6 +481,9 @@
       "failure_policy": "fail_closed",
       "active_phases": [
         "authorize",
+        "before_proxy",
+        "after_proxy",
+        "apply_websocket_handshake_response_headers",
         "on_stream_connect"
       ],
       "protocols": [
@@ -745,13 +752,14 @@
       "failure_policy": "keep_last_known_good",
       "active_phases": [
         "before_proxy",
-        "transform_request_body"
+        "transform_request_body_with_context"
       ],
       "protocols": [
         "http",
-        "grpc"
+        "grpc",
+        "websocket"
       ],
-      "protocol_rationale": "Modifies HTTP headers/query/body",
+      "protocol_rationale": "Modifies HTTP headers/query/body; WebSocket handshake headers/query only",
       "response_body_producer": false,
       "config_schema": {
         "document": "openapi.yaml",
@@ -897,6 +905,7 @@
         "authorize (consumer mode)",
         "before_proxy",
         "after_proxy",
+        "apply_websocket_handshake_response_headers",
         "on_stream_connect"
       ],
       "protocols": [
@@ -1030,7 +1039,8 @@
       "config_schema": {
         "document": "openapi.yaml",
         "pointer": "#/components/schemas/OpenapiValidatorConfig",
-        "config_required_when_enabled": true
+        "config_required_when_enabled": true,
+        "scope_constraint": "proxy"
       }
     },
     {
@@ -1179,6 +1189,7 @@
         "on_stream_connect",
         "before_proxy",
         "after_proxy",
+        "apply_websocket_handshake_response_headers",
         "log",
         "on_stream_disconnect",
         "on_ws_disconnect"
@@ -1201,10 +1212,12 @@
     {
       "name": "ai_token_metrics",
       "classification": "public",
-      "priority": 4100,
+      "priority": 4070,
       "failure_policy": "optional_fail_open",
       "active_phases": [
-        "on_response_body"
+        "on_response_body",
+        "response_stream_inspector",
+        "on_response_stream_terminated"
       ],
       "protocols": [
         "http"
@@ -1246,6 +1259,7 @@
       "failure_policy": "fail_closed",
       "active_phases": [
         "before_proxy",
+        "on_final_request_body_with_context",
         "after_proxy",
         "on_response_body",
         "response_stream_inspector",
@@ -1384,7 +1398,8 @@
       "active_phases": [
         "on_final_request_body_with_context",
         "after_proxy",
-        "on_final_response_body"
+        "on_final_response_body",
+        "on_response_committed"
       ],
       "protocols": [
         "http"
@@ -1408,12 +1423,13 @@
         "enforce_final_backend_header_policy",
         "on_final_request_body",
         "normalize_response_body",
+        "after_proxy",
         "response_stream_inspector"
       ],
       "protocols": [
         "http"
       ],
-      "protocol_rationale": "Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE",
+      "protocol_rationale": "Claims enabled POST JSON with `stream: true`, nonempty model, matching provider; provider-specific translation validates required representation shapes; normalizes supported provider SSE to OpenAI SSE",
       "response_body_producer": true,
       "config_schema": {
         "document": "openapi.yaml",
@@ -1514,7 +1530,8 @@
         "on_response_body",
         "transform_response_body",
         "on_final_response_body",
-        "response_stream_inspector"
+        "response_stream_inspector",
+        "on_response_stream_terminated"
       ],
       "protocols": [
         "http",
@@ -1553,13 +1570,15 @@
       "priority": 9050,
       "failure_policy": "optional_fail_open",
       "active_phases": [
-        "on_ws_frame",
+        "on_ws_policy_close",
+        "prepare_ws_frame_delivery",
+        "emit_ws_frame_delivery",
         "on_ws_disconnect"
       ],
       "protocols": [
         "websocket"
       ],
-      "protocol_rationale": "Logs WebSocket frame metadata",
+      "protocol_rationale": "`on_ws_policy_close` records final policy Close decisions; delivery observations are emitted after successful destination sends",
       "response_body_producer": false,
       "config_schema": {
         "document": "openapi.yaml",
@@ -1574,7 +1593,8 @@
       "failure_policy": "fail_closed",
       "active_phases": [
         "on_ws_frame",
-        "on_ws_reassembly_frames"
+        "on_ws_reassembly_frames",
+        "on_ws_disconnect"
       ],
       "protocols": [
         "websocket"
@@ -1688,7 +1708,8 @@
         "on_request_received",
         "before_proxy",
         "after_proxy",
-        "transform_response_body"
+        "transform_response_body",
+        "response_stream_inspector"
       ],
       "protocols": [
         "http"

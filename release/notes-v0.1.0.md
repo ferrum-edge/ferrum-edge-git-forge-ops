@@ -8,10 +8,10 @@ after workflow artifacts expire.
 
 ## Candidate pairing
 
-The intended GitForgeOps v0.1.0 pairing uses published Ferrum Edge v0.9.17
+The intended GitForgeOps v0.1.0 pairing uses published Ferrum Edge v0.9.19
 and its verified validator asset and multi-platform image pins. Edge published
-the release on 2026-10-10 at tag commit
-`669c574c1d1e88e84dccb26a8159939e6694644d`; its release run completed successfully.
+the release on 2026-10-27 at tag commit
+`510ce7121c3d9754110d330a30a3bd9b7a7b278e`; its release run completed successfully.
 GitForgeOps hosted qualification against those bytes is
 still required. The record remains `pending`; a supported GitForgeOps release
 requires exact-revision lifecycle evidence and publication.
@@ -30,15 +30,20 @@ for later fixes.
 
 - First supported source/template and container pairing, conditional on the
   record's `supported` status and passing exact-revision release gate.
-- Edge v0.9.17 carries the changes prepared for the unpublished v0.9.16 tag,
-  including namespace-bounded admin tokens, stricter plugin and route admission,
-  and cached admin misses that report unavailable rather than deleted. Review
-  the [v0.9.17 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917)
-  before rollout. GitForgeOps includes the namespace-aware client updates;
-  exact-byte hosted qualification and the six external acceptance scenarios
-  remain required. This gateway refresh retains the existing scoped
-  `contracts-edge-0.9.15` adoption.
-- The candidate gateway is Ferrum Edge v0.9.17. It includes v0.9.9's request-path
+- Edge v0.9.19 carries the changes prepared for the unpublished v0.9.18 tag.
+  Many plugin configurations v0.9.17 accepted are now refused, and PluginConfig
+  updates and deletes require the `expected_proxy_ids` association precondition
+  (ferrum-edge#6744), which GitForgeOps already sends. Review the
+  [v0.9.19 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919)
+  before rollout. Exact-byte hosted qualification and the six external
+  acceptance scenarios remain required.
+- Edge v0.9.17, which v0.9.19 follows, carries the changes prepared for the
+  unpublished v0.9.16 tag, including namespace-bounded admin tokens, stricter
+  plugin and route admission, and cached admin misses that report unavailable
+  rather than deleted. Review the
+  [v0.9.17 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917).
+  GitForgeOps includes the namespace-aware client updates.
+- The candidate gateway is Ferrum Edge v0.9.19. It includes v0.9.9's request-path
   hardening, which refuses non-final empty path segments and requires
   `allow_path_parameters: true` on a proxy to accept semicolon path parameters;
   review the
@@ -47,7 +52,7 @@ for later fixes.
   `allow_path_parameters` opt-in and preserves the mesh service opt-in; semicolon
   path parameters remain refused when the applicable option is absent or false.
   Run validation on a pull request before adopting this pairing.
-- Edge v0.9.17 retains v0.9.10 hardening: it refuses non-UTF-8 charsets on MCP
+- Edge v0.9.19 retains v0.9.10 hardening: it refuses non-UTF-8 charsets on MCP
   `ai_prompt_shield` and `mcp_gateway` requests, and fails closed on uninspectable
   or over-nested JSON-RPC batches (GHSA-4f9m-cfqg-fhx9, GHSA-f2jp-59r9-fp64).
 - Edge v0.9.15 introduced security changes with 26 published advisories. Review its
@@ -66,10 +71,11 @@ for later fixes.
   conditional gateway write succeeds. Hosted enforcement qualification remains
   required on the exact released bytes (#462).
 - Pin the scoped resource schema, fixtures and vocabularies to published
-  `contracts-edge-0.9.15` at `6fb64c5dc2e014204c17609fc717d976f3b4589e`, retaining
+  `contracts-edge-0.9.19` at `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`, retaining
   strict conformance and upstream descriptions. Canonical metadata alone grants
-  no production apply or first-release acceptance. The v0.9.15 pin update does
-  not change the conditional API implementation.
+  no production apply or first-release acceptance. The pin update changes only
+  the local `ai_token_metrics` catalog priority (4070), not the conditional API
+  implementation.
 - API-mode shared ownership is the first deployment profile. File/mesh output
   is assembled and validated, with external fleet delivery required.
 - Scheduled monitoring needs approval unless `monitoring.unattended` binds its

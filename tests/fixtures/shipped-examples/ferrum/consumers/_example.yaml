@@ -6,8 +6,8 @@
 # drift in `gitforgeops diff`. (gitforgeops normalizes the object form during
 # assembly, but the array form is what the gateway means.)
 #
-#   keyauth    [{key: "<non-empty, <=4096 chars>"}]
-#   jwt        [{secret: "<>=32 chars>"}]           # `secret` is the only field
+#   keyauth    [{key: "<16..4096 chars>"}]         # >=16 non-whitespace
+#   jwt        [{secret: "<>=32 chars>"}]           # only field; unique per namespace
 #   hmac_auth  [{secret: "<>=32 chars>"}]           # unique per namespace
 #   mtls_auth  [{identity: "<cert CN/SAN/fingerprint>"}]
 #   basicauth  [{password: "..."}] XOR [{password_hash: "hmac_sha256:<64 hex>"}]
