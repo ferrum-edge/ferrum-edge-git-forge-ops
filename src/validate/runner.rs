@@ -420,7 +420,7 @@ fn run_gateway_validation(
 ) -> crate::error::Result<ValidationResult> {
     // Stand-ins are fabricated here and go no further than `spec_file` below.
     let standins = crate::validate::standin::with_validation_standins_for_report(config, report);
-    let yaml = serde_yaml::to_string(standins.as_ref().unwrap_or(config))?;
+    let yaml = crate::yaml::to_string(standins.as_ref().unwrap_or(config))?;
     let mut namespaces = collect_namespaces(config);
     if namespaces.is_empty() {
         // Empty documents still need schema/settings validation. This does

@@ -23,7 +23,7 @@ use gitforgeops::state::StateFile;
 /// Compare through `serde_json::Value` so the check needs no `PartialEq` on
 /// the config types and covers every field, including ones added later.
 fn parsed<T: DeserializeOwned + Serialize>(document: &str) -> serde_json::Value {
-    let value: T = serde_yaml::from_str(document).expect("document parses");
+    let value: T = gitforgeops::yaml::from_str(document).expect("document parses");
     serde_json::to_value(value).expect("value serializes")
 }
 

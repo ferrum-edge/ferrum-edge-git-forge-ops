@@ -1,12 +1,11 @@
 use std::io::Write;
 use std::path::Path;
 
+use serde::Serialize;
+
+use crate::config::schema::{Consumer, PluginConfig, Proxy, Upstream};
 use crate::config::{GatewayConfig, MeshConfigSpec};
 use crate::diagnostics::{safe_line, safe_path};
-
-/// Top-level key holding the anti-truncation seal understood by ferrum-edge's
-/// file-mode loader.
-const RESOURCE_COUNTS_KEY: &str = "resource_counts";
 
 /// The only `version` a mesh document may declare. ferrum-edge's mesh file
 /// loader treats `version` as optional but rejects anything other than the
@@ -29,49 +28,50 @@ pub const MESH_DOCUMENT_VERSION: &str = "1";
 /// field on `GatewayConfig`: the struct mirrors what the admin API accepts,
 /// and `resource_counts` is a file-mode-only artifact.
 pub fn render_file_yaml(config: &GatewayConfig) -> crate::error::Result<String> {
-    let value = serde_yaml::to_value(config)?;
-    let serde_yaml::Value::Mapping(fields) = value else {
-        // `GatewayConfig` always serializes as a mapping; if that ever stops
-        // being true, emit the document unchanged rather than corrupting it.
-        return Ok(serde_yaml::to_string(config)?);
-    };
-
-    let mut counts = serde_yaml::Mapping::new();
-    counts.insert(
-        serde_yaml::Value::from("proxies"),
-        serde_yaml::Value::from(config.proxies.len() as u64),
-    );
-    counts.insert(
-        serde_yaml::Value::from("consumers"),
-        serde_yaml::Value::from(config.consumers.len() as u64),
-    );
-    counts.insert(
-        serde_yaml::Value::from("plugin_configs"),
-        serde_yaml::Value::from(config.plugin_configs.len() as u64),
-    );
-    counts.insert(
-        serde_yaml::Value::from("upstreams"),
-        serde_yaml::Value::from(config.upstreams.len() as u64),
-    );
-
-    // Keep `version` first and place the seal directly after it, so a human
-    // (or a truncation-detecting eyeball) sees the document header before the
-    // resource arrays. Remaining keys keep their original order.
-    let version_key = serde_yaml::Value::from("version");
-    let counts_key = serde_yaml::Value::from(RESOURCE_COUNTS_KEY);
-    let mut sealed = serde_yaml::Mapping::with_capacity(fields.len() + 1);
-    if let Some(version) = fields.get(&version_key) {
-        sealed.insert(version_key.clone(), version.clone());
-    }
-    sealed.insert(counts_key.clone(), serde_yaml::Value::Mapping(counts));
-    for (key, value) in fields {
-        if key == version_key || key == counts_key {
-            continue;
-        }
-        sealed.insert(key, value);
+    // `version` comes first and the seal directly after it, so a human (or a
+    // truncation-detecting eyeball) sees the document header before the
+    // resource arrays. The remaining keys keep `GatewayConfig`'s order.
+    #[derive(Serialize)]
+    struct SealedDocument<'a> {
+        version: &'a str,
+        resource_counts: ResourceCounts,
+        proxies: &'a [Proxy],
+        consumers: &'a [Consumer],
+        plugin_configs: &'a [PluginConfig],
+        upstreams: &'a [Upstream],
     }
 
-    Ok(serde_yaml::to_string(&serde_yaml::Value::Mapping(sealed))?)
+    /// The anti-truncation seal ferrum-edge's file-mode loader understands.
+    #[derive(Serialize)]
+    struct ResourceCounts {
+        proxies: usize,
+        consumers: usize,
+        plugin_configs: usize,
+        upstreams: usize,
+    }
+
+    // Destructured so a new `GatewayConfig` field fails to compile here
+    // instead of silently vanishing from the published document.
+    let GatewayConfig {
+        version,
+        proxies,
+        consumers,
+        plugin_configs,
+        upstreams,
+    } = config;
+    Ok(crate::yaml::to_string(&SealedDocument {
+        version,
+        resource_counts: ResourceCounts {
+            proxies: proxies.len(),
+            consumers: consumers.len(),
+            plugin_configs: plugin_configs.len(),
+            upstreams: upstreams.len(),
+        },
+        proxies,
+        consumers,
+        plugin_configs,
+        upstreams,
+    })?)
 }
 
 /// Serialize `mesh` into the standalone mesh document a mesh-protocol node
@@ -80,23 +80,24 @@ pub fn render_file_yaml(config: &GatewayConfig) -> crate::error::Result<String> 
 /// The document carries **exactly two keys**, `version` and `mesh`, and
 /// nothing else. ferrum-edge's `MeshFileDocument` is `deny_unknown_fields`
 /// precisely so a document that also carries gateway resources fails loudly
-/// instead of silently dropping them — so the mesh document is built key by
-/// key here rather than by serializing a struct that might one day grow a
-/// third field.
+/// instead of silently dropping them — so the mesh document is its own
+/// two-field shape here rather than a struct shared with anything that might
+/// one day grow a third field.
 ///
 /// Conversely the gateway document never gains a `mesh:` key: gateway file
 /// mode ignores it entirely, so writing it there would produce a config that
 /// looks like it configures a mesh and does not.
 pub fn render_mesh_yaml(mesh: &MeshConfigSpec) -> crate::error::Result<String> {
-    let mut document = serde_yaml::Mapping::with_capacity(2);
-    document.insert(
-        serde_yaml::Value::from("version"),
-        serde_yaml::Value::from(MESH_DOCUMENT_VERSION),
-    );
-    document.insert(serde_yaml::Value::from("mesh"), serde_yaml::to_value(mesh)?);
-    Ok(serde_yaml::to_string(&serde_yaml::Value::Mapping(
-        document,
-    ))?)
+    #[derive(Serialize)]
+    struct MeshDocument<'a> {
+        version: &'static str,
+        mesh: &'a MeshConfigSpec,
+    }
+
+    Ok(crate::yaml::to_string(&MeshDocument {
+        version: MESH_DOCUMENT_VERSION,
+        mesh,
+    })?)
 }
 
 pub fn apply_file(config: &GatewayConfig, output_path: &str) -> crate::error::Result<()> {

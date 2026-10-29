@@ -25,7 +25,7 @@ pub enum Error {
     #[error("failed to parse YAML in {}: {}", safe_path(path), safe_block(source))]
     YamlParse {
         path: PathBuf,
-        source: serde_yaml::Error,
+        source: crate::yaml::YamlError,
     },
 
     #[error(
@@ -199,8 +199,8 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error(transparent)]
-    SerdeYaml(#[from] serde_yaml::Error),
+    #[error("failed to render YAML: {}", safe_block(.0))]
+    YamlRender(#[from] crate::yaml::YamlError),
 
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),

@@ -4029,7 +4029,8 @@ fn failed_rename_cli_preserves_incumbent_and_journal_on_unchanged_retries() {
         let desired = routed_proxy("api-v2", "ferrum", "/orders");
         std::fs::write(
             root.join("resources/ferrum/proxies/api-v2.yaml"),
-            serde_yaml::to_string(&serde_json::json!({"kind": "Proxy", "spec": desired})).unwrap(),
+            gitforgeops::yaml::to_string(&serde_json::json!({"kind": "Proxy", "spec": desired}))
+                .unwrap(),
         )
         .unwrap();
         let mut state = proxy_ledger(&live);

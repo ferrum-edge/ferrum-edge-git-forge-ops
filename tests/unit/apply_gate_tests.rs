@@ -2118,7 +2118,7 @@ fn materialize_classifies_slots_by_resolution_not_by_value_shape() {
     let output = repo.run(&args, &[("FERRUM_CREDS_JSON", &bundle)]);
     assert!(output.status.success(), "{}", stderr(&output));
     let exported = std::fs::read_to_string(repo.dir.path().join("export.yaml")).unwrap();
-    let document: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let document: serde_json::Value = gitforgeops::yaml::from_str(&exported).unwrap();
     let published = &document["consumers"][0]["credentials"]["keyauth"][0]["key"];
     assert!(
         published.as_str() == Some(SEEDED),

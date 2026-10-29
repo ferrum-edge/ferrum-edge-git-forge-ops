@@ -103,13 +103,13 @@ fn authored_spec_keys(matcher: &str) -> BTreeSet<String> {
     let path = fixture_dir().join(format!("ferrum/{subdir}/every-field.yaml"));
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    let document: serde_yaml::Value = serde_yaml::from_str(&text).expect("fixture YAML parses");
+    let document: serde_json::Value =
+        gitforgeops::yaml::from_str(&text).expect("fixture YAML parses");
     document["spec"]
-        .as_mapping()
+        .as_object()
         .expect("authored spec is a mapping")
         .keys()
-        .filter_map(|key| key.as_str())
-        .map(|key| match key {
+        .map(|key| match key.as_str() {
             // The one declared alias: authoring it exercises the field.
             "backend_protocol" => "backend_scheme".to_string(),
             other => other.to_string(),
@@ -231,8 +231,8 @@ fn companion_schema_fixture_survives_an_export_round_trip() {
 
     // Every mirrored field is still there after serialization, and the
     // document re-parses into the same configuration.
-    let document: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
-    let reparsed: gitforgeops::config::GatewayConfig = serde_yaml::from_value(document).unwrap();
+    let document: serde_json::Value = gitforgeops::yaml::from_str(&exported).unwrap();
+    let reparsed: gitforgeops::config::GatewayConfig = serde_json::from_value(document).unwrap();
     assert_eq!(
         serde_json::to_value(&reparsed).unwrap(),
         serde_json::to_value(&assembled.gateway).unwrap(),
@@ -241,9 +241,9 @@ fn companion_schema_fixture_survives_an_export_round_trip() {
 
     let mesh = assembled.mesh.expect("mesh fragment");
     let mesh_document = gitforgeops::apply::render_mesh_yaml(&mesh).unwrap();
-    let mesh_value: serde_yaml::Value = serde_yaml::from_str(&mesh_document).unwrap();
+    let mesh_value: serde_json::Value = gitforgeops::yaml::from_str(&mesh_document).unwrap();
     let mesh_reparsed: gitforgeops::config::MeshConfigSpec =
-        serde_yaml::from_value(mesh_value["mesh"].clone()).unwrap();
+        serde_json::from_value(mesh_value["mesh"].clone()).unwrap();
     assert_eq!(mesh_reparsed, mesh);
 }
 
@@ -388,9 +388,10 @@ fn alloy_mutated_tree(
     }
     let path = copy.path().join(relative);
     let mut document: serde_json::Value =
-        serde_yaml::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        gitforgeops::yaml::from_str(std::str::from_utf8(&std::fs::read(&path).unwrap()).unwrap())
+            .unwrap();
     mutate(&mut document);
-    std::fs::write(path, serde_yaml::to_string(&document).unwrap()).unwrap();
+    std::fs::write(path, gitforgeops::yaml::to_string(&document).unwrap()).unwrap();
     copy
 }
 

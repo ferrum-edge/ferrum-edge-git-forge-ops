@@ -47,7 +47,8 @@ fn mesh_minimal_fixture_loads_and_assembles_under_strict_mode() {
 fn mesh_minimal_fixture_renders_the_document_ferrum_edge_validates() {
     let mesh = load_fixture().mesh.expect("mesh fragment");
     let document = render_mesh_yaml(&mesh).expect("render mesh document");
-    let value: serde_yaml::Value = serde_yaml::from_str(&document).expect("parse rendered YAML");
+    let value: serde_json::Value =
+        gitforgeops::yaml::from_str(&document).expect("parse rendered YAML");
 
     assert_eq!(value["version"].as_str(), Some("1"));
     let rendered = &value["mesh"];
@@ -71,7 +72,7 @@ fn mesh_minimal_fixture_renders_the_document_ferrum_edge_validates() {
     );
 
     let reparsed: gitforgeops::config::MeshConfigSpec =
-        serde_yaml::from_value(rendered.clone()).expect("reparse mesh");
+        serde_json::from_value(rendered.clone()).expect("reparse mesh");
     assert_eq!(reparsed, mesh);
 }
 

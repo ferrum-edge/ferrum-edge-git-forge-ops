@@ -45,20 +45,20 @@ upstreams:
 "#;
 
 fn fixture() -> GatewayConfig {
-    serde_yaml::from_str(FIXTURE).expect("fixture parses")
+    gitforgeops::yaml::from_str(FIXTURE).expect("fixture parses")
 }
 
-fn counts_of(yaml: &str) -> serde_yaml::Mapping {
-    let doc: serde_yaml::Value = serde_yaml::from_str(yaml).expect("written yaml parses");
+fn counts_of(yaml: &str) -> serde_json::Map<String, serde_json::Value> {
+    let doc: serde_json::Value = gitforgeops::yaml::from_str(yaml).expect("written yaml parses");
     doc.get("resource_counts")
-        .and_then(|v| v.as_mapping())
+        .and_then(|v| v.as_object())
         .cloned()
         .expect("resource_counts present")
 }
 
-fn count_of(counts: &serde_yaml::Mapping, key: &str) -> u64 {
+fn count_of(counts: &serde_json::Map<String, serde_json::Value>, key: &str) -> u64 {
     counts
-        .get(serde_yaml::Value::from(key))
+        .get(key)
         .and_then(|v| v.as_u64())
         .unwrap_or_else(|| panic!("resource_counts.{key} is an integer"))
 }
@@ -134,7 +134,8 @@ fn written_file_parses_back_into_gateway_config() {
     apply_file(&config, path.to_str().expect("utf-8 path")).expect("apply_file");
 
     let written = std::fs::read_to_string(&path).expect("read back");
-    let parsed: GatewayConfig = serde_yaml::from_str(&written).expect("parses as GatewayConfig");
+    let parsed: GatewayConfig =
+        gitforgeops::yaml::from_str(&written).expect("parses as GatewayConfig");
 
     assert_eq!(parsed.proxies.len(), config.proxies.len());
     assert_eq!(parsed.consumers.len(), config.consumers.len());

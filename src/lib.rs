@@ -21,6 +21,7 @@ pub mod validate;
 pub mod verdict;
 pub mod verify;
 pub mod version;
+pub mod yaml;
 
 /// Per-thread allocation accounting for tests that bound memory use.
 #[cfg(test)]

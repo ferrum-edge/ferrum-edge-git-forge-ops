@@ -206,6 +206,18 @@ delete the declaration instead: in `exclusive` mode an undeclared live row is
 - **Opaque values take string keys only.** Plugin `config`, credential entries
   and mesh items round-trip through JSON, so a non-string key (`404:`,
   `true:`) is rejected rather than quietly stringified.
+- **Scalars resolve as the gateway reads them** (YAML 1.2 core schema):
+  `017`, `1_000`, `yes` and `on` are strings; `0x1F`, `0o17` and `0b1` are
+  integers; `~`, `null` and an empty value are null. Quote a value to keep it
+  a string.
+- **Refused rather than rewritten:** tags other than `!!str`, `!!int`,
+  `!!float`, `!!bool`, `!!null`, `!!map` and `!!seq` (including `!custom`
+  tags and `!!binary`), `.inf`/`.nan`, integers outside the 64-bit range,
+  repeated keys, more than one document per file, and raw U+0085, U+2028 or
+  U+2029 characters (write `\N`, `\L` or `\P` in a double-quoted string).
+- **Anchors and aliases** work, but a file may not expand past 1,000,000
+  nodes, 64 MiB of scalar text or 128 levels of nesting, counting every copy
+  an alias makes.
 
 ## Proxy backend scheme
 

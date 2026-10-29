@@ -48,3 +48,4 @@ mod validator_namespace_tests;
 mod verdict_tests;
 mod verify_exit_tests;
 mod version_tests;
+mod yaml_compat_tests;

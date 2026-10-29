@@ -98,7 +98,7 @@ fn scoped_config_without_explicit_association_converges_to_live_backup() {
     let payload = serde_json::to_value(&desired.proxies[0]).unwrap();
     assert_eq!(payload["plugins"], json!([{"plugin_config_id": "auth"}]));
     let exported: GatewayConfig =
-        serde_yaml::from_str(&serde_yaml::to_string(&desired).unwrap()).unwrap();
+        gitforgeops::yaml::from_str(&gitforgeops::yaml::to_string(&desired).unwrap()).unwrap();
     assert!(compute_diff(&exported, &actual).unwrap().is_empty());
 
     let mut missing_live_association = actual;
@@ -145,7 +145,7 @@ fn association_comparison_is_a_set_without_changing_export_order() {
     assert!(shared.unmanaged.is_empty());
 
     let exported = gitforgeops::apply::render_file_yaml(&desired).unwrap();
-    let exported: GatewayConfig = serde_yaml::from_str(&exported).unwrap();
+    let exported: GatewayConfig = gitforgeops::yaml::from_str(&exported).unwrap();
     assert_eq!(association_ids(&exported.proxies[0]), vec!["b", "a"]);
     assert_eq!(association_ids(&desired.proxies[0]), vec!["b", "a"]);
     assert!(compute_diff(&exported, &live).unwrap().is_empty());

@@ -192,15 +192,11 @@ pub(crate) fn resource_kind(resource: &Resource) -> &'static str {
     }
 }
 
-/// Largest YAML document accepted from a resource or overlay file, and the
-/// largest parsed shape accepted from one. A per-resource file is small by
-/// design; without bounds a crafted document (deep nesting, alias-expanded
-/// node floods) spends unbounded memory and stack in the recursive walks
-/// downstream of the parse. The shape walk is iterative, so checking the
-/// depth cannot itself overflow.
+/// Largest YAML document accepted from a resource or overlay file. A
+/// per-resource file is small by design; the parsed shape (depth, nodes and
+/// scalar bytes, alias copies included) is bounded while composing, by
+/// [`crate::yaml::RESOURCE_LIMITS`].
 pub(crate) const MAX_YAML_INPUT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_YAML_DEPTH: usize = 128;
-const MAX_YAML_NODES: usize = 1_000_000;
 
 pub(crate) fn check_yaml_input_bytes(contents: &str, path: &Path) -> crate::error::Result<()> {
     if contents.len() > MAX_YAML_INPUT_BYTES {
@@ -214,34 +210,24 @@ pub(crate) fn check_yaml_input_bytes(contents: &str, path: &Path) -> crate::erro
     Ok(())
 }
 
-pub(crate) fn check_yaml_shape(value: &serde_yaml::Value, path: &Path) -> crate::error::Result<()> {
-    let mut nodes = 0usize;
-    let mut stack = vec![(value, 0usize)];
-    while let Some((node, depth)) = stack.pop() {
-        nodes += 1;
-        if nodes > MAX_YAML_NODES || depth > MAX_YAML_DEPTH {
-            return Err(crate::error::Error::Config(format!(
-                "YAML file {} expands past the accepted shape (over {MAX_YAML_NODES} \
-                 nodes or {MAX_YAML_DEPTH} levels deep); refusing to walk it further",
-                path.display()
-            )));
+/// Compose a resource or overlay file into its JSON-shaped value.
+///
+/// The composer refuses whatever would not survive as JSON unchanged —
+/// non-string keys, application tags, non-finite floats — instead of
+/// rewriting it: the opaque islands gitforgeops carries verbatim (a
+/// `PluginConfig.config`, a `Consumer.credentials` entry, a mesh workload)
+/// are JSON values on the far side of this call.
+pub(crate) fn yaml_file_value(
+    contents: &str,
+    path: &Path,
+) -> crate::error::Result<serde_json::Value> {
+    check_yaml_input_bytes(contents, path)?;
+    crate::yaml::parse_value(contents, crate::yaml::RESOURCE_LIMITS).map_err(|source| {
+        crate::error::Error::YamlParse {
+            path: path.to_path_buf(),
+            source,
         }
-        match node {
-            serde_yaml::Value::Mapping(mapping) => {
-                stack.extend(
-                    mapping
-                        .iter()
-                        .flat_map(|(key, child)| [(key, depth + 1), (child, depth + 1)]),
-                );
-            }
-            serde_yaml::Value::Sequence(items) => {
-                stack.extend(items.iter().map(|item| (item, depth + 1)));
-            }
-            serde_yaml::Value::Tagged(tagged) => stack.push((&tagged.value, depth + 1)),
-            _ => {}
-        }
-    }
-    Ok(())
+    })
 }
 
 /// Parse one YAML resource without letting Serde's internally-tagged enum
@@ -257,93 +243,8 @@ pub(crate) fn resource_from_yaml(
     path: &Path,
     options: LoadOptions,
 ) -> crate::error::Result<Resource> {
-    check_yaml_input_bytes(contents, path)?;
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str(contents).map_err(|source| crate::error::Error::YamlParse {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    check_yaml_shape(&yaml, path)?;
-    reject_non_string_keys(&yaml, path)?;
-    let value = serde_json::to_value(yaml)?;
+    let value = yaml_file_value(contents, path)?;
     resource_from_json_value(value, path, options)
-}
-
-/// Reject YAML mapping keys that are not strings, naming the mapping they
-/// appear in.
-///
-/// Every document takes a `serde_yaml::Value` → `serde_json::Value` hop before
-/// it is deserialized, and the opaque islands gitforgeops carries verbatim
-/// (a `PluginConfig.config`, a `Consumer.credentials` entry, a mesh workload)
-/// are *JSON* values on the far side of it. JSON has string keys only, so a
-/// YAML `2019: …` or `true: …` key is silently rewritten to `"2019"` / `"true"`
-/// on the way through — a quiet change of meaning in exactly the sections
-/// gitforgeops promises not to interpret. Rejecting them keeps "opaque" honest:
-/// what survives the hop is JSON-shaped, and anything that would not survive it
-/// is an error the author sees, not a rewrite they do not.
-pub(crate) fn reject_non_string_keys(
-    value: &serde_yaml::Value,
-    source_path: &Path,
-) -> crate::error::Result<()> {
-    let mut path = String::new();
-    walk_yaml_keys(value, &mut path, source_path)
-}
-
-fn walk_yaml_keys(
-    value: &serde_yaml::Value,
-    path: &mut String,
-    source_path: &Path,
-) -> crate::error::Result<()> {
-    match value {
-        serde_yaml::Value::Mapping(mapping) => {
-            for (key, child) in mapping {
-                let serde_yaml::Value::String(name) = key else {
-                    let location = if path.is_empty() {
-                        "the document root".to_string()
-                    } else {
-                        format!("`{path}`")
-                    };
-                    return Err(crate::error::Error::Config(format!(
-                        "resource file {} has a non-string mapping key ({}) in {location}; \
-                         configuration is JSON-shaped and only string keys survive parsing — \
-                         quote the key to keep it",
-                        source_path.display(),
-                        describe_yaml_key(key),
-                    )));
-                };
-                let restore = path.len();
-                path.push('.');
-                path.push_str(name);
-                walk_yaml_keys(child, path, source_path)?;
-                path.truncate(restore);
-            }
-        }
-        serde_yaml::Value::Sequence(items) => {
-            for (index, item) in items.iter().enumerate() {
-                let restore = path.len();
-                path.push('[');
-                path.push_str(&index.to_string());
-                path.push(']');
-                walk_yaml_keys(item, path, source_path)?;
-                path.truncate(restore);
-            }
-        }
-        serde_yaml::Value::Tagged(tagged) => walk_yaml_keys(&tagged.value, path, source_path)?,
-        _ => {}
-    }
-    Ok(())
-}
-
-fn describe_yaml_key(key: &serde_yaml::Value) -> String {
-    match key {
-        serde_yaml::Value::Null => "null".to_string(),
-        serde_yaml::Value::Bool(value) => format!("boolean `{value}`"),
-        serde_yaml::Value::Number(value) => format!("number `{value}`"),
-        serde_yaml::Value::Sequence(_) => "a sequence".to_string(),
-        serde_yaml::Value::Mapping(_) => "a mapping".to_string(),
-        serde_yaml::Value::Tagged(tagged) => format!("a `{}`-tagged value", tagged.tag),
-        serde_yaml::Value::String(value) => format!("string `{value}`"),
-    }
 }
 
 /// Strictly deserialize a complete resource wrapper, including a fully merged

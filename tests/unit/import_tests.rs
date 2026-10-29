@@ -158,7 +158,7 @@ fn file_import_rejects_passthrough_fields_without_publishing_them() {
         "future_access_token".to_string(),
         serde_json::json!("plaintext-secret-that-must-not-be-published"),
     );
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let error = gitforgeops::import::from_file::import_from_file(
         &backup_path,
@@ -193,7 +193,7 @@ fn file_import_rejects_unknown_credential_types_without_publishing_them() {
         "api_key": [{"key": "must-not-be-imported-either"}]
     }))
     .unwrap();
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let error = gitforgeops::import::from_file::import_from_file(
         &backup_path,
@@ -257,7 +257,7 @@ fn acknowledging_one_field_does_not_admit_another() {
         "future_access_token".to_string(),
         serde_json::json!("plaintext-secret-that-must-not-be-published"),
     );
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let policy = gitforgeops::import::ImportPassthroughPolicy {
         allow_unknown_fields: true,
@@ -289,7 +289,7 @@ fn acknowledged_fields_still_need_the_passthrough_load_policy() {
     config.consumers[0]
         .extra
         .insert("future_label".to_string(), serde_json::json!("team-a"));
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let policy = gitforgeops::import::ImportPassthroughPolicy {
         allow_unknown_fields: false,
@@ -317,7 +317,7 @@ fn acknowledged_passthrough_round_trips_and_is_reported_for_review() {
     config.consumers[0]
         .extra
         .insert("future_label".to_string(), serde_json::json!("team-a"));
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let policy = gitforgeops::import::ImportPassthroughPolicy {
         allow_unknown_fields: true,
@@ -357,7 +357,7 @@ fn a_source_without_unmodelled_fields_reports_no_passthrough_review() {
     let output = destination_parent.path().join("resources");
     std::fs::write(
         &backup_path,
-        serde_yaml::to_string(&make_test_config()).unwrap(),
+        gitforgeops::yaml::to_string(&make_test_config()).unwrap(),
     )
     .unwrap();
 
@@ -465,7 +465,7 @@ fn file_import_honors_the_namespace_selection() {
     let mut config = make_test_config();
     config.consumers[0].namespace = "team-b".to_string();
     let mixed = source.path().join("mixed.yaml");
-    std::fs::write(&mixed, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&mixed, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination = tempfile::tempdir().unwrap();
     let output = destination.path().join("resources");
@@ -503,7 +503,11 @@ fn file_import_honors_the_namespace_selection() {
 
     // A document wholly inside the selection imports unchanged.
     let single = source.path().join("single.yaml");
-    std::fs::write(&single, serde_yaml::to_string(&make_test_config()).unwrap()).unwrap();
+    std::fs::write(
+        &single,
+        gitforgeops::yaml::to_string(&make_test_config()).unwrap(),
+    )
+    .unwrap();
     let selected = tempfile::tempdir().unwrap();
     let result = gitforgeops::import::import_from_file_selected(
         &single,
@@ -526,7 +530,7 @@ fn import_from_file_roundtrip() {
     let tmp_export = tempfile::tempdir().unwrap();
     let config = make_test_config();
     let flat_file = tmp_export.path().join("resources.yaml");
-    let yaml = serde_yaml::to_string(&config).unwrap();
+    let yaml = gitforgeops::yaml::to_string(&config).unwrap();
     std::fs::write(&flat_file, yaml).unwrap();
 
     let tmp_import = tempfile::tempdir().unwrap();
@@ -564,7 +568,7 @@ fn file_import_preserves_declared_timestamps_and_omits_absent_ones() {
 
     let source_dir = tempfile::tempdir().unwrap();
     let backup_path = source_dir.path().join("backup.yaml");
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -617,7 +621,7 @@ fn file_import_requires_an_explicit_private_bundle_for_live_credentials() {
         "keyauth": [{"key": "live-production-key"}]
     }))
     .unwrap();
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -644,7 +648,7 @@ fn file_import_preserves_existing_placeholders_without_a_migration_bundle() {
         "keyauth": [{"key": "${gh-env-secret:alloc=require}"}]
     }))
     .unwrap();
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -714,7 +718,7 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
     }))
     .unwrap();
     let original_credentials = config.consumers[0].credentials.clone();
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -826,7 +830,7 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         created_at: Some(chrono::Utc::now()),
         updated_at: Some(chrono::Utc::now()),
     });
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -920,7 +924,7 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         created_at: Some(chrono::Utc::now()),
         updated_at: Some(chrono::Utc::now()),
     });
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let result = gitforgeops::import::from_file::import_from_file(
         &backup_path,
@@ -982,7 +986,7 @@ fn builtin_plugin_import_raises_no_review_notice() {
         created_at: Some(chrono::Utc::now()),
         updated_at: Some(chrono::Utc::now()),
     });
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let result = gitforgeops::import::from_file::import_from_file(
         &backup_path,
@@ -1018,7 +1022,7 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
         created_at: Some(chrono::Utc::now()),
         updated_at: Some(chrono::Utc::now()),
     });
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -1050,7 +1054,7 @@ fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
     config.consumers[0]
         .credentials
         .insert("hmac_auth".to_string(), serde_json::Value::Array(values));
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -1104,7 +1108,7 @@ fn credential_migration_bundle_refuses_unbound_shards_before_publication() {
         config.consumers[0]
             .credentials
             .insert("hmac_auth".to_string(), serde_json::Value::Array(values));
-        std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
         let destination = tempfile::tempdir().unwrap();
         let output = destination.path().join("resources");
         let bundle_path = destination.path().join("migration.json");
@@ -1143,7 +1147,7 @@ fn credential_migration_bundle_must_stay_outside_the_resource_tree() {
         "keyauth": [{"key": "live-production-key"}]
     }))
     .unwrap();
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -1174,7 +1178,7 @@ fn credential_migration_bundle_cannot_overwrite_its_source_backup() {
         "keyauth": [{"key": "live-production-key"}]
     }))
     .unwrap();
-    let original = serde_yaml::to_string(&config).unwrap();
+    let original = gitforgeops::yaml::to_string(&config).unwrap();
     std::fs::write(&backup_path, &original).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
@@ -1238,7 +1242,7 @@ fn credential_migration_bundle_is_rejected_inside_a_git_worktree() {
         "keyauth": [{"key": "live-production-key"}]
     }))
     .unwrap();
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -1273,7 +1277,7 @@ fn credential_migration_bundle_rejects_dotdot_after_symlink_into_worktree() {
         "keyauth": [{"key": "live-production-key"}]
     }))
     .unwrap();
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -1441,11 +1445,11 @@ fn split_config_skips_spec_provisioned_resources() {
 #[test]
 fn split_config_skips_spec_provisioned_upstreams_and_plugin_configs() {
     let tmp = tempfile::tempdir().unwrap();
-    let upstream: Upstream = serde_yaml::from_str(
+    let upstream: Upstream = gitforgeops::yaml::from_str(
         "id: pool-from-spec\nnamespace: ferrum\ntargets: []\napi_spec_id: spec-petstore\n",
     )
     .unwrap();
-    let plugin: PluginConfig = serde_yaml::from_str(
+    let plugin: PluginConfig = gitforgeops::yaml::from_str(
         "id: plugin-from-spec\nnamespace: ferrum\nplugin_name: cors\nscope: global\napi_spec_id: spec-petstore\n",
     )
     .unwrap();
@@ -1751,7 +1755,7 @@ fn file_import_parses_and_reports_the_full_backup_envelope() {
             "gateway_trust_bundles": 1
         }),
     );
-    std::fs::write(&backup_path, serde_yaml::to_string(&backup).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&backup).unwrap()).unwrap();
 
     let output = tempfile::tempdir().unwrap();
     let result = gitforgeops::import::from_file::import_from_file(
@@ -1945,7 +1949,7 @@ fn migration_bundle_paths_normalize_dotdot_under_a_missing_ancestor() {
         "keyauth": [{"key": "live-key"}]
     }))
     .unwrap();
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -2023,7 +2027,7 @@ fn file_import_brokers_a_consul_discovery_token() {
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
     config.upstreams.push(consul_upstream(token));
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -2109,7 +2113,7 @@ fn assert_import_refuses_address(address: &str) {
         .unwrap()
         .address = address.to_string();
     config.upstreams.push(upstream);
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -2150,7 +2154,7 @@ fn imported_consul_token_resolves_from_the_migration_bundle() {
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
     config.upstreams.push(consul_upstream(token));
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -2233,7 +2237,7 @@ fn unknown_plugin_backup(source_dir: &std::path::Path) -> PathBuf {
         created_at: Some(chrono::Utc::now()),
         updated_at: Some(chrono::Utc::now()),
     });
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
     backup_path
 }
 
@@ -2364,7 +2368,7 @@ fn builtin_plugins_without_secret_looking_leaves_import_silently() {
         created_at: Some(chrono::Utc::now()),
         updated_at: Some(chrono::Utc::now()),
     });
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
     let destination_parent = tempfile::tempdir().unwrap();
     let output = destination_parent.path().join("resources");
@@ -2413,7 +2417,7 @@ fn builtin_plugin_backup(source: &std::path::Path, plugin_name: &str) -> PathBuf
         config.plugin_configs[0].config["endpoint"] =
             serde_json::json!("https://collector.example/v1/traces?token=synthetic-endpoint");
     }
-    std::fs::write(&backup_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
     backup_path
 }
 
@@ -2591,7 +2595,7 @@ fn file_import_rejects_nested_unknown_fields_even_with_the_passthrough_opt_in() 
     let output = destination_parent.path().join("resources");
     std::fs::write(
         &backup_path,
-        serde_yaml::to_string(&nested_unknown_backup()).unwrap(),
+        gitforgeops::yaml::to_string(&nested_unknown_backup()).unwrap(),
     )
     .unwrap();
     let policy = gitforgeops::import::ImportPassthroughPolicy {

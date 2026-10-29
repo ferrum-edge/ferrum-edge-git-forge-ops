@@ -673,23 +673,22 @@ fn mesh_document_carries_only_version_and_mesh() {
     let mesh = mesh_from(tmp.path()).unwrap();
 
     let yaml = render_mesh_yaml(&mesh).unwrap();
-    let parsed: serde_yaml::Mapping = serde_yaml::from_str(&yaml).unwrap();
+    let parsed: serde_json::Map<String, serde_json::Value> =
+        gitforgeops::yaml::from_str(&yaml).unwrap();
 
-    let keys: Vec<String> = parsed
-        .keys()
-        .map(|k| k.as_str().unwrap_or_default().to_string())
-        .collect();
-    assert_eq!(keys, vec!["version".to_string(), "mesh".to_string()]);
+    let keys: Vec<&str> = parsed.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["mesh", "version"]);
+    assert!(yaml.starts_with("version:"), "version leads:\n{yaml}");
 
     // ferrum-edge's mesh file loader is deny_unknown_fields: any gateway key
     // here would fail the node's load outright.
     for forbidden in ["proxies", "consumers", "upstreams", "plugin_configs"] {
         assert!(
-            !parsed.contains_key(serde_yaml::Value::from(forbidden)),
+            !parsed.contains_key(forbidden),
             "mesh document must not carry `{forbidden}`"
         );
     }
-    assert_eq!(parsed["version"], serde_yaml::Value::from("1"));
+    assert_eq!(parsed["version"], serde_json::Value::from("1"));
 }
 
 #[test]
@@ -711,7 +710,7 @@ fn mesh_document_round_trips_back_into_the_mirror() {
         version: String,
         mesh: MeshConfigSpec,
     }
-    let parsed: Document = serde_yaml::from_str(&yaml).unwrap();
+    let parsed: Document = gitforgeops::yaml::from_str(&yaml).unwrap();
 
     assert_eq!(parsed.version, "1");
     assert_eq!(parsed.mesh, mesh);
@@ -720,10 +719,11 @@ fn mesh_document_round_trips_back_into_the_mirror() {
 #[test]
 fn empty_collections_are_omitted_from_the_document() {
     let yaml = render_mesh_yaml(&MeshConfigSpec::default()).unwrap();
-    let parsed: serde_yaml::Mapping = serde_yaml::from_str(&yaml).unwrap();
+    let parsed: serde_json::Map<String, serde_json::Value> =
+        gitforgeops::yaml::from_str(&yaml).unwrap();
 
     assert_eq!(parsed.len(), 2);
-    assert!(parsed["mesh"].as_mapping().is_some_and(|m| m.is_empty()));
+    assert!(parsed["mesh"].as_object().is_some_and(|m| m.is_empty()));
 }
 
 #[test]
@@ -904,10 +904,11 @@ fn removing_the_last_fragment_retracts_the_published_document() {
     // "no mesh policy": exactly `version` plus an empty `mesh` mapping.
     let written = read(&target);
     assert_eq!(written, empty_mesh_document());
-    let parsed: serde_yaml::Mapping = serde_yaml::from_str(&written).unwrap();
+    let parsed: serde_json::Map<String, serde_json::Value> =
+        gitforgeops::yaml::from_str(&written).unwrap();
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed["version"].as_str(), Some("1"));
-    assert!(parsed["mesh"].as_mapping().is_some_and(|m| m.is_empty()));
+    assert!(parsed["mesh"].as_object().is_some_and(|m| m.is_empty()));
 }
 
 #[test]
@@ -1478,7 +1479,7 @@ fn same_mesh_fragment_id_in_different_namespaces_is_allowed() {
 #[test]
 fn assemble_rejects_duplicate_mesh_fragment_ids() {
     let fragment = |policy: &str| {
-        serde_yaml::from_str::<Resource>(&format!(
+        gitforgeops::yaml::from_str::<Resource>(&format!(
             "kind: MeshConfig\nid: core\nspec:\n  mesh_policies: [{{name: {policy}}}]\n"
         ))
         .unwrap()

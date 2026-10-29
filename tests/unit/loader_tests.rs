@@ -535,9 +535,8 @@ fn loader_still_rejects_config_shaped_files_next_to_os_artifacts() {
 }
 
 /// A node-flood document must be refused by the shape bound, with the file
-/// named, instead of spending unbounded memory in the walks that follow the
-/// parse. (Depth is bounded twice over: serde_yaml's own recursion limit
-/// fires during the parse, and the shape bound caps what survives it.)
+/// named, while it is composed: each alias is charged for the nodes it would
+/// copy before the copy is made (issue #561).
 #[test]
 fn loader_rejects_yaml_past_the_node_bound() {
     let tmp = tempfile::tempdir().unwrap();
@@ -554,9 +553,9 @@ fn loader_rejects_yaml_past_the_node_bound() {
     assert!(error.contains("flood.yaml"), "{error}");
 }
 
-/// Non-string YAML keys would be silently stringified by the
-/// `serde_yaml::Value` → `serde_json::Value` hop every document takes, quietly
-/// rewriting exactly the sections gitforgeops promises to carry verbatim.
+/// Non-string YAML keys would be silently stringified on the way to the JSON
+/// value every document becomes, quietly rewriting exactly the sections
+/// gitforgeops promises to carry verbatim.
 #[test]
 fn loader_rejects_non_string_mapping_keys_and_names_the_mapping() {
     let cases = [
@@ -593,9 +592,9 @@ fn loader_rejects_non_string_mapping_keys_and_names_the_mapping() {
     }
 }
 
-/// YAML merge keys are not supported: `serde_yaml` leaves `<<` as an ordinary
-/// string key (merging is opt-in and gitforgeops does not opt in), so it
-/// surfaces as an unknown field rather than silently doing nothing.
+/// YAML merge keys are not supported: `<<` is an ordinary string key, as it is
+/// for the gateway's parser, so it surfaces as an unknown field rather than
+/// silently doing nothing.
 #[test]
 fn loader_rejects_yaml_merge_keys_as_an_unknown_field() {
     let tmp = tempfile::tempdir().unwrap();

@@ -538,6 +538,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Replace the deprecated `serde_yaml` 0.9 (and its archived C-translated
+  `unsafe-libyaml`, RUSTSEC-2024-0449) with safe-Rust parsing that bounds work
+  while it parses (#561). Resource, overlay and import files are composed from
+  `granit-parser` events: every alias is charged the nodes and scalar bytes it
+  would copy before copying, so an alias bomb is refused instead of expanded,
+  and depth is bounded during the parse. Repository settings deserialize
+  through `serde-saphyr` under the same budget, and every emitted document is
+  rendered by `serde-saphyr`. Plain scalars still resolve as the gateway's
+  YAML 1.2 parser reads them (`017`, `1_000`, `yes` stay strings), a
+  differential suite checks that against `serde_yaml` 0.9 (now a test-only
+  dependency), and rendered documents read back identically under it.
+  Refused instead of silently rewritten: application and `%TAG` tags,
+  `!!binary` and other non-core tags, `.inf`/`.nan` (formerly JSON `null`) and
+  raw U+0085/U+2028/U+2029. Multi-line strings are emitted double-quoted
+  rather than as `|` blocks.
+
 - Required home jobs are pinned exactly in the supply-chain checker
   (#566). The `gitforgeops-required-static-validation` verdict job
   (needs, `always()`, result wiring and script) and `rust-ci-check`'s

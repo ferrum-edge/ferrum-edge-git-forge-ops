@@ -865,19 +865,7 @@ fn load_overlay_fragments(overlay_dir: &Path) -> crate::error::Result<Vec<Overla
             for path in paths {
                 let contents = super::repo_file::read_tree_file(&path)?;
 
-                strict::check_yaml_input_bytes(&contents, &path)?;
-                // Parse as raw YAML then convert to JSON Value
-                let yaml_value: serde_yaml::Value =
-                    serde_yaml::from_str(&contents).map_err(|source| {
-                        crate::error::Error::YamlParse {
-                            path: path.clone(),
-                            source,
-                        }
-                    })?;
-                strict::check_yaml_shape(&yaml_value, &path)?;
-                strict::reject_non_string_keys(&yaml_value, &path)?;
-                let json_value: serde_json::Value =
-                    serde_json::to_value(yaml_value).map_err(crate::error::Error::SerdeJson)?;
+                let json_value = strict::yaml_file_value(&contents, &path)?;
                 let object = json_value.as_object().ok_or_else(|| {
                     crate::error::Error::Config(format!(
                         "overlay file {} must contain a YAML object",
