@@ -389,15 +389,26 @@ What changes for pull requests:
   to one of them takes effect, and is first exercised, after merge. Review
   such an edit like any other change to a trusted workflow, and watch its
   first run on `main`.
+- The whole workflow run must succeed, not only the jobs that report required
+  checks. CodeQL and the container image scan, which report no required check,
+  therefore live in the unlisted `code-scanning.yml`: GitHub refuses to start
+  a ruleset workflow that uses a CodeQL action other than
+  `github/codeql-action/upload-sarif`, and the image scan's gate would turn
+  each newly fixed CRITICAL/HIGH finding into a merge block. The supply-chain
+  checker refuses a CodeQL action in any workflow in
+  `REQUIRED_CHECK_WORKFLOWS`. `rust-ci.yml`'s `coverage` job does run under
+  the rule, so it must pass too.
 - A label or review starts no run. The state override is therefore a review,
   not a label event
   ([Protecting the ledger path](#protecting-the-ledger-path)): after the review,
   re-run the failed `state-guard-reject-state-edits` job or close and reopen
   the pull request.
 - Each head got one run of each listed workflow in the sandbox, and one run
-  of the policy on #631, not two. `supply-chain-policy.yml` and `agent-setup-policy.yml` keep their
-  per-PR `cancel-in-progress` groups, which GitHub's ruleset troubleshooting
-  advises against. A run cancelled that way leaves the rule unsatisfied for
+  of the policy on #631, not two. `supply-chain-policy.yml` and
+  `agent-setup-policy.yml` keep their per-PR `cancel-in-progress` groups,
+  which GitHub's ruleset troubleshooting says a ruleset workflow must not
+  use; the policy has run under the rule with its group since #631. A run
+  cancelled that way leaves the rule unsatisfied for
   that head; re-run it, push, or reopen.
 
 ## 3. Protect every deployment environment

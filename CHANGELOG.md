@@ -557,7 +557,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   success from another branch, and the pull request merged. The
   organization ruleset now also lists `state-guard.yml`,
   `agent-setup-policy.yml`, `rust-ci.yml`, `security.yml` and
-  `validate-pr.yml`, and the settings audit requires all six. A listed
+  `validate-pr.yml`, and the settings audit requires all six. CodeQL and the
+  image scan move from `security.yml` to the unlisted `code-scanning.yml`:
+  GitHub refuses to start a ruleset workflow that uses CodeQL actions other
+  than `upload-sarif`, and every job of a listed workflow must pass; the
+  supply-chain checker now refuses CodeQL actions in those workflows. A listed
   workflow runs `main`'s definition, so edits to `rust-ci.yml`,
   `security.yml` and `validate-pr.yml` no longer run on their own pull
   request. Because a listed workflow starts no run on a label, the state

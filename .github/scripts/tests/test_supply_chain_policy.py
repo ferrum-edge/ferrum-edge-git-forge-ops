@@ -2681,9 +2681,10 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 start = workflow.index("      - name: Install cargo-audit\n")
                 end = workflow.index("      - name: Test audit policy gate\n", start)
                 install = workflow[start:end]
-                changed = workflow.replace(install, "", 1).replace(
-                    "  codeql:\n", install + "  codeql:\n", 1
-                )
+                # The cargo-audit job is the last in the file: move the
+                # install step after enforcement, still inside the job.
+                self.assertTrue(workflow.endswith("          fi\n"))
+                changed = workflow.replace(install, "", 1) + install
                 job = check_supply_chain.workflow_job(changed, "security-cargo-audit")
                 self.assertEqual(
                     len(check_supply_chain.policy_step(job, "Install cargo-audit")), 6
@@ -3624,6 +3625,48 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "'state-guard-reject-state-edits' check",
             violations,
         )
+
+    def test_ruleset_required_workflows_may_not_run_codeql(self):
+        # GitHub refuses to start a ruleset workflow that uses a CodeQL
+        # action other than upload-sarif (#632).
+        security = (ROOT / ".github/workflows/security.yml").read_text(encoding="utf-8")
+        codeql = textwrap.dedent(
+            """\
+              codeql:
+                runs-on: ubuntu-26.04
+                steps:
+                  - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370
+                  - uses: GitHub/CodeQL-Action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370
+                  - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370
+            """
+        )
+        text = security + "\n" + codeql
+        document = check_supply_chain.parse_workflow(text)
+        for workflow in sorted(set(check_supply_chain.REQUIRED_CHECK_WORKFLOWS.values())):
+            with self.subTest(workflow=workflow):
+                violations = check_supply_chain.ruleset_workflow_codeql_violations(
+                    workflow, document
+                )
+                self.assertEqual(len(violations), 2, violations)
+                self.assertIn("codeql-action/init", violations[0])
+                self.assertIn("CodeQL-Action/analyze", violations[1])
+        self.assertEqual(
+            check_supply_chain.ruleset_workflow_codeql_violations(
+                ".github/workflows/code-scanning.yml", document
+            ),
+            [],
+        )
+        for workflow in sorted(set(check_supply_chain.REQUIRED_CHECK_WORKFLOWS.values())):
+            with self.subTest(shipped=workflow):
+                shipped = check_supply_chain.parse_workflow(
+                    (ROOT / workflow).read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    check_supply_chain.ruleset_workflow_codeql_violations(
+                        workflow, shipped
+                    ),
+                    [],
+                )
 
     def test_no_workflow_may_write_check_runs_or_commit_statuses(self):
         base = self.SUBSET_WORKFLOW

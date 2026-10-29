@@ -4657,6 +4657,10 @@ KNOWN_WORKFLOWS = frozenset({
     "alloy-consumer.yml",
     "apply-on-merge.yml",
     "base-image-pin-canary.yml",
+    # CodeQL and the image scan, which #632 moves out of `security.yml`: a
+    # workflow an organization ruleset requires by path may not use CodeQL
+    # actions other than `upload-sarif`. It reports no required check.
+    "code-scanning.yml",
     "drift-check.yml",
     "lifecycle.yml",
     "materialize-file.yml",
@@ -4821,6 +4825,31 @@ def policy_check_impersonation_violations(workflow: str, document: dict) -> list
                     f"{label}: only job {context!r} of {home} may define the "
                     f"{context!r} check"
                 )
+    return violations
+
+
+def ruleset_workflow_codeql_violations(workflow: str, document: dict) -> list[str]:
+    """A workflow the organization ruleset requires may not run CodeQL.
+
+    The workflows in `REQUIRED_CHECK_WORKFLOWS` are required by path through
+    an organization ruleset (docs/github-launch-controls.md, 2a; #632), and
+    GitHub refuses to start a ruleset workflow that uses any CodeQL action
+    except `github/codeql-action/upload-sarif`. Such a run never starts, so
+    every pull request would be blocked. CodeQL lives in `code-scanning.yml`.
+    """
+    if workflow not in set(REQUIRED_CHECK_WORKFLOWS.values()):
+        return []
+    violations: list[str] = []
+    for reference in workflow_action_references(document):
+        action = reference.strip().split("@", 1)[0].casefold()
+        if action.startswith("github/codeql-action/") and action != (
+            "github/codeql-action/upload-sarif"
+        ):
+            violations.append(
+                f"{workflow}: a ruleset-required workflow may not use {reference!r}; "
+                "GitHub refuses to start it (only upload-sarif is allowed). Run "
+                "CodeQL from code-scanning.yml"
+            )
     return violations
 
 
@@ -5791,6 +5820,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 status_write_permission_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
+                ruleset_workflow_codeql_violations(
                     workflow.relative_to(root).as_posix(), document
                 )
             )

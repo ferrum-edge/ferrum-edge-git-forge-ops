@@ -1,0 +1,230 @@
+name: Code Scanning
+# CodeQL and the container image scan. They report no required check, and they
+# live outside `security.yml` because the organization ruleset requires that
+# file by path: a ruleset workflow may not use CodeQL actions other than
+# `upload-sarif` (GitHub refuses to start it), and every job of a ruleset
+# workflow must pass, which would turn each newly fixed CRITICAL/HIGH image
+# finding into a merge block (docs/github-launch-controls.md, section 2a).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'benches/**'
+      - 'examples/**'
+      - '.cargo/**'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - 'rust-toolchain'
+      - 'Dockerfile'
+      - '.github/workflows/code-scanning.yml'
+  schedule:
+    - cron: '17 9 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          languages: rust
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+
+  trivy-image:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Build image for scan
+        run: docker build -t gitforgeops:scan .
+
+      - name: Smoke-test minimal runtime
+        run: |
+          docker run --rm gitforgeops:scan --help >/dev/null
+          docker run --rm --entrypoint ferrum-edge gitforgeops:scan --help >/dev/null
+          # dpkg keeps a "not-installed" stub record for a purged package that
+          # other installed packages still name in their dependencies, so a
+          # plain `dpkg-query -W` succeeds for it. Read the package's actual
+          # state instead: only an absent record or a not-installed stub is
+          # acceptable; installed, held, unpacked, half-configured,
+          # config-files and trigger states all mean the purge did not take.
+          for package in apt libapt-pkg7.0 libssl3t64 openssl-provider-legacy; do
+            state=$(docker run --rm --entrypoint dpkg-query gitforgeops:scan \
+              -W -f='${db:Status-Status}' "$package" 2>/dev/null || true)
+            case "$state" in
+              ""|not-installed) ;;
+              *)
+                echo "Purged runtime package remains present ($state): $package" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Exercise the published entrypoint as non-root
+        run: |
+          set -euo pipefail
+          image=gitforgeops:scan
+          owner_uid=$(id -u)
+          owner_gid=$(id -g)
+          fail() { echo "$*" >&2; exit 1; }
+          [ "$owner_uid" != 0 ] || fail "This check needs a non-root runner user."
+
+          # The image's own default identity: fixed, numeric and not root.
+          configured=$(docker image inspect --format '{{.Config.User}}' "$image")
+          [ "$configured" = 65532:65532 ] \
+            || fail "Image default user is '$configured', expected 65532:65532."
+          default_uid=$(docker run --rm --network none --entrypoint id "$image" -u)
+          [ "$default_uid" = 65532 ] || fail "Default container UID is $default_uid."
+          # No safe.directory bypass: Git keeps its ownership check everywhere.
+          if safe=$(docker run --rm --network none --entrypoint git "$image" \
+              config --system --get-all safe.directory 2>/dev/null); then
+            fail "Unexpected system safe.directory: $safe"
+          fi
+
+          # An arbitrary --user UID has no passwd entry; HOME must still be a
+          # writable location, including under --read-only with a /tmp tmpfs.
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 54321:54321 \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            --entrypoint sh "$image" -ec \
+            'test "$(id -u)" = 54321; test "$HOME" = /tmp; touch "$HOME/.probe"'
+
+          # A throwaway checkout owned by the runner user, never the workspace.
+          fixture="$RUNNER_TEMP/nonroot-fixture"
+          mkdir -p "$fixture"
+          git archive HEAD resources overlays | tar -x -C "$fixture"
+          git -C "$fixture" -c init.defaultBranch=main init -q
+          git -C "$fixture" add -A
+          git -C "$fixture" -c user.name=ci -c user.email=ci@example.invalid \
+            commit -q -m fixture
+          head=$(git -C "$fixture" rev-parse HEAD)
+
+          # Explicit owner UID, hardened like the documented invocation: the
+          # published entrypoint validates (exec ferrum-edge, 0600 temp spec)
+          # and writes into the bind mount; the results belong to the caller.
+          owner_run() {
+            docker run --rm --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges --user "$owner_uid:$owner_gid" \
+              --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+              -v "$fixture":/repo "$@"
+          }
+          [ "$(owner_run --entrypoint id "$image" -u)" = "$owner_uid" ] \
+            || fail "--user override did not take effect."
+          owner_run "$image" validate
+          owner_run "$image" export --output owner-export/gateway.yaml
+          for path in owner-export owner-export/gateway.yaml; do
+            [ "$(stat -c %u:%g "$fixture/$path")" = "$owner_uid:$owner_gid" ] \
+              || fail "$path is owned by $(stat -c %u:%g "$fixture/$path")."
+          done
+          [ "$(owner_run --entrypoint git "$image" rev-parse HEAD)" = "$head" ] \
+            || fail "Git could not inspect the owner's checkout."
+
+          # Default identity against a checkout owned by someone else: Git
+          # refuses it, so revision-bound overrides stay inactive (fail closed).
+          default_run() {
+            docker run --rm --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --tmpfs /tmp:rw,nosuid,nodev,mode=1777 "$@"
+          }
+          if refused=$(default_run -v "$fixture":/repo --entrypoint git "$image" \
+              rev-parse HEAD 2>&1); then
+            fail "Git trusted a checkout owned by another user."
+          fi
+          case "$refused" in
+            *"dubious ownership"*) ;;
+            *) fail "Git failed on the foreign-owned checkout for another reason: $refused" ;;
+          esac
+          # Writing needs a directory the default user may write to; what it
+          # writes belongs to 65532, never to root.
+          chmod 0777 "$fixture"
+          default_run -v "$fixture":/repo "$image" \
+            export --output default-export/gateway.yaml
+          for path in default-export default-export/gateway.yaml; do
+            [ "$(stat -c %u:%g "$fixture/$path")" = 65532:65532 ] \
+              || fail "$path is owned by $(stat -c %u:%g "$fixture/$path")."
+          done
+
+      - name: Build override regressions with the pinned builder
+        run: |
+          docker build --target builder -t gitforgeops:test-builder .
+          mkdir -p "$RUNNER_TEMP/override-tests"
+          docker run --rm --network none \
+            -v "$PWD/tests:/build/tests:ro" \
+            -v "$RUNNER_TEMP/override-tests:/checks" \
+            gitforgeops:test-builder sh -ec '
+              cargo test --release --locked --offline --test unit_tests --no-run
+              find /build/target/release/deps -maxdepth 1 -type f \
+                -name "unit_tests-*" -executable -exec cp "{}" /checks/unit_tests \;
+              test -x /checks/unit_tests
+            '
+
+      - name: Verify override inputs inside the shipped runtime
+        run: |
+          # Exercise actual authorization input checks, including dirty source,
+          # merged descendants and split trusted review. No network, credentials,
+          # root privilege or external checkout is needed by these fixtures.
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            -e GIT_CONFIG_GLOBAL=/dev/null -e GIT_CONFIG_SYSTEM=/dev/null \
+            -v "$RUNNER_TEMP/override-tests:/checks:ro" \
+            --entrypoint /checks/unit_tests gitforgeops:scan \
+            unit::override_tests:: --nocapture
+
+      # Two scans on purpose. The SARIF report keeps every severity visible
+      # under Code scanning, and the trivy action ignores `severity` for SARIF
+      # output unless it is told to limit the report, so an `exit-code` on that
+      # step would fail the job on a MEDIUM finding the documented gate does not
+      # cover. The gate below is the CRITICAL/HIGH fixed-vulnerability check.
+      - name: Scan image (report every severity)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: gitforgeops:scan
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: '0'
+          ignore-unfixed: true
+
+      - name: Gate on fixed CRITICAL and HIGH vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: gitforgeops:scan
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+          skip-setup-trivy: true
+
+      - name: Upload Trivy SARIF
+        if: ${{ always() && hashFiles('trivy-results.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
+        with:
+          sarif_file: trivy-results.sarif

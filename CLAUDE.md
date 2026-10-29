@@ -167,7 +167,11 @@ cargo fmt --all && cargo fmt --all -- --check
   without it, or when its bypass actors differ from the `main` ruleset's
   (warns on user-owned repos). A listed workflow runs `main`'s definition
   only on `opened`/`synchronize`/`reopened` and ignores `paths`, so edits to
-  `rust-ci.yml`, `security.yml` and `validate-pr.yml` first run after merge. `security.yml`'s
+  `rust-ci.yml`, `security.yml` and `validate-pr.yml` first run after merge.
+  Every job of a listed workflow must pass, and GitHub refuses to start one
+  that uses a CodeQL action other than `upload-sarif`, so CodeQL and the
+  image scan live in the unlisted `code-scanning.yml`
+  (`ruleset_workflow_codeql_violations`). `security.yml`'s
   `security-supply-chain-policy` stays required until the ruleset switch and a
   later retire PR (`docs/github-launch-controls.md`, "Switching the
   supply-chain policy check").
