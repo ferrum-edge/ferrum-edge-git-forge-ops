@@ -403,6 +403,17 @@ fn reader_disagreements_are_refused() {
     ] {
         documents.push(format!("{flow}\n"));
     }
+    // Anchor names libyaml ends early, reading the rest as content.
+    for anchor in [
+        "k: &a:prefix token-value\n",
+        "k: &a?prefix token-value\n",
+        "k: &a:prefix\n",
+        "k: &a:b value\nx: {*a:b}\n",
+        "- &é x\n- *é\n",
+        "k: &a.b v\nj: *a.b\n",
+    ] {
+        documents.push(anchor.to_string());
+    }
     // Repeated byte-order marks.
     for bom in [
         "\u{feff}\u{feff}k: v\n",
@@ -413,7 +424,14 @@ fn reader_disagreements_are_refused() {
     }
     // Block scalars ending the file without a final line break.
     for header in ["|", "|+", ">", ">+", "|2", ">2", "|+2", "|2+"] {
-        for body in ["abc", "abc\n  def", "abc\n\n  def", "abc\n  "] {
+        for body in [
+            "abc",
+            "abc\n  def",
+            "abc\n\n  def",
+            "abc\n  ",
+            "abc\n   ",
+            "abc\n\n  ",
+        ] {
             documents.push(format!("k: {header}\n  {body}"));
             documents.push(format!("- {header}\n  {body}"));
             documents.push(format!(
@@ -452,6 +470,10 @@ fn reader_disagreements_are_refused() {
         "k: |+\n  abc\n\n",
         "k: |-\n  abc",
         "k: |\n  abc\nj: x",
+        "k: |\n  abc\n# comment",
+        "k: |\n  abc\n...",
+        "k: |\n  abc\r",
+        "k: &a-1_B x\nj: *a-1_B\n",
         "['?x']\n",
         "[? x]\n",
         "- ?x\n",

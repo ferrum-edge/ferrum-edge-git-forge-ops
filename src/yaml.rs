@@ -42,9 +42,10 @@
 //! - more than one document, and a repeated key;
 //! - input the two readers would read differently: a raw U+0085, U+2028 or
 //!   U+2029 (a line break to YAML 1.1 readers only), a U+FEFF other than one
-//!   leading byte-order mark, a plain scalar starting with `?` inside a flow
-//!   collection (an explicit-key indicator to libyaml), and a block scalar
-//!   ending the file without a final line break.
+//!   leading byte-order mark, an anchor name outside `[A-Za-z0-9_-]`, a plain
+//!   scalar starting with `?` inside a flow collection (an explicit-key
+//!   indicator to libyaml), and a block scalar whose last line ends the file
+//!   without a line break.
 //!
 //! The merge key `<<` is an ordinary string key, as it is for the gateway, so
 //! in a typed section it surfaces as the unknown field `<<`.
@@ -58,7 +59,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use granit_parser::{Event, Parser, ScalarStyle, Span, StructureStyle, Tag};
+use granit_parser::{Event, Parser, ScalarStyle, Scanner, Span, StrInput, Tag, TokenType};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
@@ -132,9 +133,7 @@ impl std::error::Error for YamlError {}
 ///
 /// An empty stream (or one holding only comments) is `null`.
 pub fn parse_value(contents: &str, limits: Limits) -> Result<Value, YamlError> {
-    // The composer refuses flow-context `?` scalars itself, so the event scan
-    // is needed only where a final block scalar can be unterminated.
-    refuse_reader_disagreements(contents, limits.max_depth, false)?;
+    refuse_reader_disagreements(contents, limits.max_depth)?;
     let mut composer = Composer {
         limits,
         nodes: 0,
@@ -160,11 +159,11 @@ pub fn parse_value(contents: &str, limits: Limits) -> Result<Value, YamlError> {
             Event::Scalar(text, style, anchor, tag) => {
                 composer.scalar(&text, style, anchor, tag.as_deref(), &span)?;
             }
-            Event::SequenceStart(style, anchor, tag) => {
-                composer.open(Kind::Sequence, style, anchor, tag.as_deref(), &span)?;
+            Event::SequenceStart(_, anchor, tag) => {
+                composer.open(Kind::Sequence, anchor, tag.as_deref(), &span)?;
             }
-            Event::MappingStart(style, anchor, tag) => {
-                composer.open(Kind::Mapping, style, anchor, tag.as_deref(), &span)?;
+            Event::MappingStart(_, anchor, tag) => {
+                composer.open(Kind::Mapping, anchor, tag.as_deref(), &span)?;
             }
             Event::SequenceEnd | Event::MappingEnd => composer.close(&span)?,
             Event::Alias(anchor) => composer.alias(anchor, &span)?,
@@ -184,7 +183,7 @@ pub fn parse_value(contents: &str, limits: Limits) -> Result<Value, YamlError> {
 /// gets `serde-saphyr`'s own scalar inference, not the gateway's: JSON-shaped
 /// data goes through [`parse_value`].
 pub fn from_str<T: DeserializeOwned>(contents: &str) -> Result<T, YamlError> {
-    refuse_reader_disagreements(contents, SETTINGS_MAX_DEPTH, true)?;
+    refuse_reader_disagreements(contents, SETTINGS_MAX_DEPTH)?;
     let options = serde_saphyr::options! {
         budget: serde_saphyr::budget! {
             max_depth: SETTINGS_MAX_DEPTH,
@@ -301,20 +300,15 @@ fn parser_options(max_depth: usize) -> granit_parser::Options {
 ///   Inside a quoted string they can be written as `\N`, `\L` and `\P`.
 /// - U+FEFF is accepted once, as a leading byte-order mark. libyaml strips
 ///   one and keeps a second as part of the first key; granit strips them all.
-/// - A clipped or kept block scalar (`|`, `>`, `|+`) that ends the file
-///   without a final line break gains a trailing newline under granit but not
-///   under libyaml.
+/// - Anchor and alias names are limited to libyaml's `[A-Za-z0-9_-]`. granit
+///   also takes `:` and `?` into a name, where libyaml ends the name and
+///   reads the rest as content (`&a:b x` is `":b x"` to the gateway).
 /// - Inside a flow collection, libyaml takes a leading `?` as an explicit-key
 ///   indicator even without a following space; granit reads `?x` as a string.
-///
-/// The last two need parser events. `scan_flow` asks for the flow check on
-/// every input; otherwise the events are scanned only for a file that does
-/// not end in a line break.
-fn refuse_reader_disagreements(
-    contents: &str,
-    max_depth: usize,
-    scan_flow: bool,
-) -> Result<(), YamlError> {
+/// - A clipped or kept block scalar (`|`, `>`, `|+`) that runs to the end of a
+///   file without a final line break gains a trailing newline under granit but
+///   not under libyaml. A comment or `...` after it ends the scalar first.
+fn refuse_reader_disagreements(contents: &str, max_depth: usize) -> Result<(), YamlError> {
     let body = contents.strip_prefix('\u{feff}').unwrap_or(contents);
     for (index, line) in body.split('\n').enumerate() {
         if let Some(column) = line.find(['\u{85}', '\u{2028}', '\u{2029}', '\u{feff}']) {
@@ -327,52 +321,56 @@ fn refuse_reader_disagreements(
             )));
         }
     }
+    // Blank trailing lines are not safe either: whitespace past the block's
+    // indentation is content, and the readers disagree on it too.
     let unterminated = !body.is_empty() && !body.ends_with(['\n', '\r']);
-    if !scan_flow && !unterminated {
-        return Ok(());
-    }
-    // A parse error ends the scan: the real parse reports it.
-    let mut final_block_scalar = false;
+    let length = body.chars().count();
     let mut flow_depth = 0usize;
-    for (event, span) in
-        Parser::new_from_str_with_options(body, parser_options(max_depth)).map_while(Result::ok)
+    // A scan error ends the scan: the real parse reports it.
+    for token in
+        Scanner::with_options(StrInput::new(body), parser_options(max_depth)).map_while(Result::ok)
     {
-        match event {
-            Event::Scalar(text, style, ..) => {
-                if flow_depth > 0 && matches!(style, ScalarStyle::Plain) && text.starts_with('?') {
-                    return Err(flow_question_mark(&span));
-                }
-                // Strip chomping (`|-`) ends without a newline under both
-                // readers; clip and keep gain one under granit alone.
-                final_block_scalar = matches!(style, ScalarStyle::Literal | ScalarStyle::Folded)
-                    && text.ends_with('\n');
+        let (span, token) = token.into_parts();
+        match token {
+            TokenType::FlowSequenceStart | TokenType::FlowMappingStart => flow_depth += 1,
+            TokenType::FlowSequenceEnd | TokenType::FlowMappingEnd => {
+                flow_depth = flow_depth.saturating_sub(1);
             }
-            Event::SequenceStart(style, ..) | Event::MappingStart(style, ..) => {
-                if style == StructureStyle::Flow || flow_depth > 0 {
-                    flow_depth += 1;
-                }
-                final_block_scalar = false;
+            TokenType::Anchor(name) | TokenType::Alias(name)
+                if !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) =>
+            {
+                return Err(YamlError::at(
+                    "anchor or alias name outside letters, digits, `_` and `-`; the \
+                     gateway's YAML reader ends the name at other characters and reads the \
+                     rest as content — rename it",
+                    &span,
+                ));
             }
-            Event::SequenceEnd | Event::MappingEnd => flow_depth = flow_depth.saturating_sub(1),
-            Event::Alias(_) => final_block_scalar = false,
+            TokenType::Scalar(ScalarStyle::Plain, text)
+                if flow_depth > 0 && text.starts_with('?') =>
+            {
+                return Err(YamlError::at(
+                    "plain scalar starting with `?` inside a flow collection; the gateway's \
+                     YAML reader takes `?` there as an explicit-key indicator — quote the value",
+                    &span,
+                ));
+            }
+            TokenType::Scalar(ScalarStyle::Literal | ScalarStyle::Folded, text)
+                if unterminated && span.end.index() == length && text.ends_with('\n') =>
+            {
+                return Err(YamlError::at(
+                    "`|` or `>` block scalar ends the file without a final line break; YAML \
+                     readers disagree on whether its value ends in a newline — end the file \
+                     with one",
+                    &span,
+                ));
+            }
             _ => {}
         }
     }
-    if unterminated && final_block_scalar {
-        return Err(YamlError::new(
-            "the file ends inside a `|` or `>` block scalar without a final line break; YAML \
-             readers disagree on whether its value ends in a newline — end the file with one",
-        ));
-    }
     Ok(())
-}
-
-fn flow_question_mark(span: &Span) -> YamlError {
-    YamlError::at(
-        "plain scalar starting with `?` inside a flow collection; the gateway's YAML reader \
-         takes `?` there as an explicit-key indicator — quote the value",
-        span,
-    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,7 +409,6 @@ struct Frame {
     body: Body,
     anchor: usize,
     size: Size,
-    flow: bool,
 }
 
 struct Composer {
@@ -451,9 +448,6 @@ impl Composer {
         tag: Option<&Tag>,
         span: &Span,
     ) -> Result<(), YamlError> {
-        if matches!(style, ScalarStyle::Plain) && text.starts_with('?') && self.in_flow() {
-            return Err(flow_question_mark(span));
-        }
         let size = Size {
             nodes: 1,
             scalar_bytes: text.len(),
@@ -467,7 +461,6 @@ impl Composer {
     fn open(
         &mut self,
         kind: Kind,
-        style: StructureStyle,
         anchor: usize,
         tag: Option<&Tag>,
         span: &Span,
@@ -513,7 +506,6 @@ impl Composer {
                 scalar_bytes: 0,
                 height: 1,
             },
-            flow: style == StructureStyle::Flow,
         });
         Ok(())
     }
@@ -609,10 +601,6 @@ impl Composer {
             }
         }
         Ok(())
-    }
-
-    fn in_flow(&self) -> bool {
-        self.stack.last().is_some_and(|frame| frame.flow)
     }
 
     fn awaiting_key(&self) -> bool {
