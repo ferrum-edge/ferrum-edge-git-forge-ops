@@ -342,3 +342,4 @@ promise updates for a copy taken from an arbitrary pre-release revision. The
 baseline you record has to be a revision upstream still has, and the further
 behind you are, the more of the comparison lands in the conflict column. Adopt
 regularly and each update stays small.
+
