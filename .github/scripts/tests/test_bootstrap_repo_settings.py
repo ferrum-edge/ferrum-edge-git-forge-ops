@@ -1278,7 +1278,13 @@ class SharedConstantTests(unittest.TestCase):
         # Including the transitional context: running the bootstrap is the
         # documented way to add it, so what it writes draws no warning.
         self.assertEqual(audit.warnings, [])
-        self.assertTrue(audit_settings.ruleset_targets_branch(ruleset, "main"))
+        # The audit reads GitHub's copy, which adds `source_type` to the body
+        # the bootstrap writes; it matches only repository-sourced rulesets.
+        self.assertTrue(
+            audit_settings.ruleset_targets_branch(
+                {**ruleset, "source_type": "Repository"}, "main"
+            )
+        )
 
         tag = bootstrap.release_tag_ruleset_body(
             [{"actor_type": "Integration", "actor_id": 1234, "bypass_mode": "always"}]
@@ -1288,7 +1294,7 @@ class SharedConstantTests(unittest.TestCase):
         self.assertEqual(audit.violations, [])
         self.assertTrue(
             audit_settings.ruleset_targets_release_tags(
-                tag, audit_settings.RELEASE_TAG_PATTERN
+                {**tag, "source_type": "Repository"}, audit_settings.RELEASE_TAG_PATTERN
             )
         )
 

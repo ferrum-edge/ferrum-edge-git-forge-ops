@@ -158,7 +158,11 @@ cargo fmt --all && cargo fmt --all -- --check
   own job (`REQUIRED_CHECK_WORKFLOWS`), computed job names and
   `checks`/`statuses` write, and pins the parsed `security-cargo-audit` job
   and `security.yml`'s reviewed `on:` triggers.
-  Keep new workflows inside that subset. `security.yml`'s
+  Keep new workflows inside that subset. An organization ruleset also
+  requires `supply-chain-policy.yml` at `main` by path (#470,
+  `docs/github-launch-controls.md` §2a): a required check name alone accepts
+  a check run a same-repository PR's own job posts on a head no trusted run
+  judged. `audit_settings.py` fails without it (warns on user-owned repos). `security.yml`'s
   `security-supply-chain-policy` stays required until the ruleset switch and a
   later retire PR (`docs/github-launch-controls.md`, "Switching the
   supply-chain policy check").

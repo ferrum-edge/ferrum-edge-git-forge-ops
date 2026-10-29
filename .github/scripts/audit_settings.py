@@ -67,6 +67,18 @@ SOURCE_BOUND_STATUS_CHECKS = (
     "validate-trusted-policy",
 )
 
+# The required-check binding above names a check, not the workflow that ran it,
+# and a pull request's own `pull_request` job reports through the same app.
+# Same-name duplicates cannot override a failing trusted run (every run with
+# the name must pass), but a pushed head that no trusted run ever judged can be
+# satisfied by a check run the pull request's job posts itself (#470). An
+# organization ruleset `workflows` rule closes that: it is satisfied only by a
+# run of this file at the default branch, so a head without one cannot merge.
+# Only the supply-chain policy is listed: ruleset workflows run on the default
+# `opened`/`synchronize`/`reopened` types only, which would strand the state
+# guard's `labeled` override flow, and the state guard runs on every event the
+# policy does (docs/github-launch-controls.md, section 2a).
+REQUIRED_RULESET_WORKFLOWS = (".github/workflows/supply-chain-policy.yml",)
 RELEASE_TAG_PATTERN = "refs/tags/v*"
 
 # `settings-audit.yml` binds this environment so its administration-read token
@@ -212,6 +224,11 @@ def audit_action_permissions(
 
 
 def ruleset_targets_branch(ruleset: dict, branch: str) -> bool:
+    # The listing includes organization rulesets. Their shape is not this
+    # audit's baseline (`audit_required_workflows` checks the one rule taken
+    # from them), so only the repository's own rulesets are matched here.
+    if ruleset.get("source_type") != "Repository":
+        return False
     if ruleset.get("target") != "branch" or ruleset.get("enforcement") != "active":
         return False
     ref_name = ruleset.get("conditions", {}).get("ref_name", {})
@@ -349,7 +366,53 @@ def audit_main_ruleset(
     )
 
 
+def audit_required_workflows(
+    audit: Audit, repository: dict, branch_rules: list, branch: str
+) -> None:
+    """The default branch must require each trusted workflow by path (#470).
+
+    Read from the branch's effective rules, which include organization
+    rulesets. A `workflows` entry counts only when it names this repository,
+    the exact path and the default branch's ref. GitHub offers the rule only
+    through organization or enterprise rulesets, so a user-owned repository
+    gets a warning naming the residual risk instead of a violation it could
+    never clear.
+    """
+    repository_id = repository.get("id")
+    expected_ref = f"refs/heads/{branch}"
+    required = {
+        entry.get("path")
+        for rule in branch_rules
+        if isinstance(rule, dict) and rule.get("type") == "workflows"
+        for entry in rule.get("parameters", {}).get("workflows", [])
+        if isinstance(entry, dict)
+        and entry.get("repository_id") == repository_id
+        and entry.get("ref") == expected_ref
+    }
+    user_owned = repository.get("owner", {}).get("type") == "User"
+    for path in REQUIRED_RULESET_WORKFLOWS:
+        if path in required:
+            audit.evidence.append(f"required workflow: {path} at {expected_ref}")
+        elif user_owned:
+            audit.warnings.append(
+                f"{branch!r} cannot require {path} by path: GitHub offers the "
+                "workflows rule only in organization rulesets. Until the "
+                "repository moves to an organization, a collaborator with write "
+                "access can merge a head no trusted policy run judged "
+                "(docs/github-launch-controls.md, section 2a)"
+            )
+        else:
+            audit.violations.append(
+                f"{branch!r} must require {path} at {expected_ref} through an "
+                "organization ruleset workflows rule; the required check name "
+                "alone accepts a check run the pull request's own job posts "
+                "(docs/github-launch-controls.md, section 2a)"
+            )
+
+
 def ruleset_targets_release_tags(ruleset: dict, pattern: str) -> bool:
+    if ruleset.get("source_type") != "Repository":
+        return False
     if ruleset.get("target") != "tag" or ruleset.get("enforcement") != "active":
         return False
     ref_name = ruleset.get("conditions", {}).get("ref_name", {})
@@ -633,6 +696,13 @@ def run(
         audit_main_ruleset(
             audit, matching[0], required_checks, state_writer_app_id, template_repo
         )
+    branch_rules = flatten_pages(
+        gh_json(
+            f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+            paginate=True,
+        )
+    )
+    audit_required_workflows(audit, gh_json(f"repos/{repo}"), branch_rules, branch)
 
     tag_matching = [
         item

@@ -265,6 +265,95 @@ Take step 2 after step 1 has merged, as an administrator:
    `main`. Pull requests branched after the merge report the check on their
    next `opened`, `synchronize`, `reopened` or `edited` event.
 
+## 2a. Require the trusted policy by workflow path
+
+A required status check names a check, not the workflow that ran it. Binding
+it to the GitHub Actions app does not narrow that, because a pull request's own
+`pull_request` jobs report through the same app. A same-repository pull
+request (one whose author can push a branch here) can therefore produce a head
+that no `pull_request_target` run ever judged. Its own job requests
+`contents: write` and `checks: write`, pushes a commit with `GITHUB_TOKEN`
+(GitHub starts no workflow for that push) and posts a successful check run
+under every required name. The ruleset accepts it and the pull request merges.
+Fork pull requests cannot do this: their token is read-only.
+
+Recorded in disposable repositories for #470 (2026-10-29):
+
+| Attempt | Result |
+|---|---|
+| Trusted run fails; a same-name job passes afterwards, newer by creation and completion (a `labeled` rerun, or `workflow_dispatch`) | Blocked: "Required status check is failing". Every run with the name must pass; the newest does not win. |
+| `[ci skip]` in the head commit | `pull_request_target` still ran. |
+| Retarget from another base to `main`, by hand or by GitHub after the base branch is merged and deleted | With `edited` and `branches: [main]` the trusted run starts and blocks. Without `edited` no trusted run exists and a same-name job alone merged. |
+| A `checks: write` job rewrites the failed trusted run | Refused (403, "can only be updated internally by GitHub Actions"). A posted same-name success stays blocked beside the failure. |
+| `GITHUB_TOKEN` push, then a posted same-name success, with only the required-check rule | **Merged.** |
+| The same, with an organization ruleset `workflows` rule requiring the policy file at `main` | Blocked: "Required workflow … is not satisfied". |
+
+So the required check stays, and an organization ruleset also requires the
+trusted policy by workflow path. A posted check run does not satisfy a
+`workflows` rule, and a head with no run of the file cannot merge. GitHub
+offers this rule only in organization (or enterprise) rulesets, which need
+GitHub Team or Enterprise.
+
+As an organization owner, after section 2:
+
+1. Read this repository's id: `gh api repos/owner/repo --jq .id`.
+2. **Organization settings → Repository → Rulesets → New branch ruleset**, or
+   `POST /orgs/{org}/rulesets` with this body:
+
+   ```json
+   {
+     "name": "trusted required workflows (repo default branch)",
+     "target": "branch",
+     "enforcement": "active",
+     "conditions": {
+       "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []},
+       "repository_name": {"include": ["repo"], "exclude": [], "protected": false}
+     },
+     "rules": [
+       {
+         "type": "workflows",
+         "parameters": {
+           "do_not_enforce_on_create": false,
+           "workflows": [
+             {
+               "path": ".github/workflows/supply-chain-policy.yml",
+               "ref": "refs/heads/main",
+               "repository_id": 123456789
+             }
+           ]
+         }
+       }
+     ],
+     "bypass_actors": []
+   }
+   ```
+
+   Like the required-check rule, the `workflows` rule blocks direct pushes to
+   `main`. Give the organization ruleset the same bypass actors as the `main`
+   ruleset: on a deployment repository the state-writer App (`Integration`,
+   `always`), or its ledger commits are refused; on the template, whatever
+   the `main` ruleset grants (here the admin role in `pull_request` mode).
+3. Dispatch `GitHub Settings Audit`. It reads the branch's effective rules
+   (`GET /repos/{repo}/rules/branches/main`) and fails until a `workflows`
+   rule names this repository, `.github/workflows/supply-chain-policy.yml`
+   and `refs/heads/main`. On a user-owned repository, where the rule does not
+   exist, it warns instead and the risk above remains.
+
+What changes for pull requests:
+
+- Ruleset workflows run only on `opened`, `synchronize` and `reopened`; the
+  file's own `types` are ignored. With the rule in place the policy no longer
+  runs on `edited`, so a pull request retargeted to `main` shows "Required
+  workflow is not satisfied" until it is closed and reopened or gets a new
+  push. That fails closed.
+- Each head gets one run of the policy, not two; its concurrency group is
+  unchanged.
+- The state guard is not listed. Its `gitforgeops/state-override` flow needs
+  `labeled` and `unlabeled` runs, which a ruleset workflow would not start. It
+  does not need to be listed: it runs on every event the policy does, a
+  head with no policy run cannot merge, and a posted success cannot override
+  its failing run.
+
 ## 3. Protect every deployment environment
 
 **Check your plan first.** On a private repository, GitHub Environments and
@@ -760,14 +849,11 @@ What the checker enforces for this check:
   `${{ }}`. Mentioning a context in a script, a step title or an action input
   is fine, since none of those names a check run.
 
-  This rule is defense in depth, not the boundary. How branch protection
-  resolves two check runs with the same name from the same app (the newest
-  wins, any failure blocks, or every run must pass) has not been verified. A
-  follow-up issue will run that experiment in a sandbox repository and, if a
-  duplicate can satisfy the rule, enforce the context by workflow path as
-  well. The GitHub Actions app binding does not help here, since a
-  candidate's own `pull_request` job also reports through that app; until
-  then exact-head review of every workflow change carries the guarantee.
+  This rule is defense in depth, not the boundary. Branch protection requires
+  every check run with a required name to pass, so a candidate's duplicate can
+  only add a failure, never override the trusted one. The boundary against a
+  head no trusted run judged is the organization ruleset that requires
+  `supply-chain-policy.yml` by path ([section 2a](#2a-require-the-trusted-policy-by-workflow-path)).
 - **The cargo-audit gate.** `security-cargo-audit` is required but defined by
   the pull request's own `security.yml`, so substrings anywhere in that file
   prove nothing: the trusted command can sit in a comment under a `true`, or
