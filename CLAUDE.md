@@ -471,9 +471,9 @@ namespace payload is built before the first mutation.
   refuses when a referencing proxy is not in the plan's live view, not
   declared, and not the kept target. Both surface as
   `Error::UnplannedPluginReference` (withholds like `StalePlan`). Keep the
-  re-read until hosted lifecycle qualification of the exact v0.9.19 build (the
-  minimum supported release) is recorded; the client cannot detect a gateway
-  that ignores the parameter.
+  re-read until hosted lifecycle qualification of the exact v0.9.19 build
+  (the intended minimum supported release) is recorded; the client cannot
+  detect a gateway that ignores the parameter.
 
   A mismatch or `412` is `Error::StalePlan`: a per-resource error that also
   withholds **every later write in the namespace** (creates and updates

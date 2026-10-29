@@ -15,9 +15,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   documentation now name it together. Vendored Contracts move to
   `contracts-edge-0.9.19`, whose plugin catalog moves `ai_token_metrics` to
   priority 4070; the local catalog follows. v0.9.19 includes ferrum-edge#6744
-  and requires `expected_proxy_ids` on PluginConfig writes, which apply
-  already sends; the client-side reference re-read (#603) stays until this
-  exact build is qualified. Generation refuses `len=` below 24 for
+  and requires `expected_proxy_ids` on PluginConfig updates and deletes,
+  which apply already sends; the client-side reference re-read (#603) stays
+  until this exact build is qualified. Generation refuses `len=` below 24 for
   `ai_transcript_audit` `redaction.hash_secret`, whose v0.9.19 minimum is 32
   characters, before any value is allocated. The consumer example notes
   v0.9.19's 16-character `keyauth` minimum and per-namespace `jwt`
