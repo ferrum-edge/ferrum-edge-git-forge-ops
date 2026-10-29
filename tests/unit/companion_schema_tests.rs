@@ -230,8 +230,15 @@ fn companion_schema_fixture_survives_an_export_round_trip() {
     let exported = gitforgeops::apply::render_file_yaml(&assembled.gateway).unwrap();
 
     // Every mirrored field is still there after serialization, and the
-    // document re-parses into the same configuration.
-    let document: serde_json::Value = gitforgeops::yaml::from_str(&exported).unwrap();
+    // document re-parses into the same configuration. It is read back with
+    // serde_yaml 0.9, the gateway's own reader, not with the code under test.
+    let document: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let document = serde_json::to_value(document).unwrap();
+    assert_eq!(
+        document,
+        gitforgeops::yaml::parse_value(&exported, gitforgeops::yaml::RESOURCE_LIMITS).unwrap(),
+        "the gateway and gitforgeops must read the export identically"
+    );
     let reparsed: gitforgeops::config::GatewayConfig = serde_json::from_value(document).unwrap();
     assert_eq!(
         serde_json::to_value(&reparsed).unwrap(),
@@ -241,7 +248,14 @@ fn companion_schema_fixture_survives_an_export_round_trip() {
 
     let mesh = assembled.mesh.expect("mesh fragment");
     let mesh_document = gitforgeops::apply::render_mesh_yaml(&mesh).unwrap();
-    let mesh_value: serde_json::Value = gitforgeops::yaml::from_str(&mesh_document).unwrap();
+    let mesh_value: serde_yaml::Value = serde_yaml::from_str(&mesh_document).unwrap();
+    let mesh_value = serde_json::to_value(mesh_value).unwrap();
+    assert_eq!(
+        mesh_value.as_object().map(|document| document.len()),
+        Some(2),
+        "{mesh_document}"
+    );
+    assert_eq!(mesh_value["version"], "1");
     let mesh_reparsed: gitforgeops::config::MeshConfigSpec =
         serde_json::from_value(mesh_value["mesh"].clone()).unwrap();
     assert_eq!(mesh_reparsed, mesh);

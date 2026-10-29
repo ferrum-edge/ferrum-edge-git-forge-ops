@@ -16,7 +16,8 @@
 //!   [`serde_saphyr::Budget`] with the same node and byte limits and a
 //!   shallower depth ([`SETTINGS_MAX_DEPTH`]).
 //!
-//! [`to_string`] renders every YAML document gitforgeops emits.
+//! [`to_string`] renders every YAML document gitforgeops emits, refusing a
+//! mapping key too long for the gateway's reader.
 //!
 //! # Scalar semantics
 //!
@@ -39,21 +40,25 @@
 //! - `.inf`/`.nan`, which become JSON `null`;
 //! - an integer outside the `i64`/`u64` range;
 //! - more than one document, and a repeated key;
-//! - a raw U+0085, U+2028 or U+2029, which YAML 1.1 readers treat as a line
-//!   break and YAML 1.2 readers do not.
+//! - input the two readers would read differently: a raw U+0085, U+2028 or
+//!   U+2029 (a line break to YAML 1.1 readers only), a U+FEFF other than one
+//!   leading byte-order mark, a plain scalar starting with `?` inside a flow
+//!   collection (an explicit-key indicator to libyaml), and a block scalar
+//!   ending the file without a final line break.
 //!
 //! The merge key `<<` is an ordinary string key, as it is for the gateway, so
 //! in a typed section it surfaces as the unknown field `<<`.
 //!
-//! No [`parse_value`] error carries a scalar value: a resource file may hold
-//! credentials, so messages name the line, key path, key and tag only.
-//! [`from_str`] errors are `serde`'s and may name an offending settings value
-//! (settings hold no credentials); neither quotes source lines.
+//! No [`parse_value`] error carries a scalar *value*: a resource file may hold
+//! credentials, so messages name the line, the key path, a duplicate or
+//! non-string key, and the tag. [`from_str`] errors are `serde`'s and may name
+//! an offending settings value (settings hold no credentials). Neither quotes
+//! source lines.
 
 use std::collections::HashMap;
 use std::fmt;
 
-use granit_parser::{Event, Parser, ScalarStyle, Span, Tag};
+use granit_parser::{Event, Parser, ScalarStyle, Span, StructureStyle, Tag};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
@@ -67,7 +72,7 @@ pub const MAX_YAML_DEPTH: usize = 128;
 pub const SETTINGS_MAX_DEPTH: usize = 32;
 
 /// Resource and overlay files. A per-resource file is small by design; the
-/// node bound counts every node an alias copies.
+/// node bound counts every node an alias or anchor copies.
 pub const RESOURCE_LIMITS: Limits = Limits {
     max_depth: MAX_YAML_DEPTH,
     max_nodes: 1_000_000,
@@ -81,14 +86,15 @@ pub const IMPORT_LIMITS: Limits = Limits {
     max_scalar_bytes: 128 * 1024 * 1024,
 };
 
-/// Bounds on one composed document, counted with alias expansion.
+/// Bounds on one composed document, counted with alias and anchor copies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Deepest collection nesting.
     pub max_depth: usize,
-    /// Total scalars and collections, each alias charged for what it copies.
+    /// Total scalars and collections, each alias and anchor charged for what
+    /// it copies.
     pub max_nodes: usize,
-    /// Total scalar bytes (keys included), each alias charged likewise.
+    /// Total scalar bytes (keys included), charged likewise.
     pub max_scalar_bytes: usize,
 }
 
@@ -126,11 +132,9 @@ impl std::error::Error for YamlError {}
 ///
 /// An empty stream (or one holding only comments) is `null`.
 pub fn parse_value(contents: &str, limits: Limits) -> Result<Value, YamlError> {
-    refuse_ambiguous_line_breaks(contents)?;
-    let mut options = granit_parser::Options::default();
-    options.set_emit_comments(false);
-    options.block_nesting_limit = limits.max_depth;
-    options.flow_nesting_limit = limits.max_depth;
+    // The composer refuses flow-context `?` scalars itself, so the event scan
+    // is needed only where a final block scalar can be unterminated.
+    refuse_reader_disagreements(contents, limits.max_depth, false)?;
     let mut composer = Composer {
         limits,
         nodes: 0,
@@ -140,7 +144,7 @@ pub fn parse_value(contents: &str, limits: Limits) -> Result<Value, YamlError> {
         root: None,
     };
     let mut documents = 0usize;
-    for event in Parser::new_from_str_with_options(contents, options) {
+    for event in Parser::new_from_str_with_options(contents, parser_options(limits.max_depth)) {
         let (event, span) = event.map_err(|error| YamlError::new(error.to_string()))?;
         match event {
             Event::StreamStart | Event::StreamEnd | Event::DocumentEnd => {}
@@ -156,11 +160,11 @@ pub fn parse_value(contents: &str, limits: Limits) -> Result<Value, YamlError> {
             Event::Scalar(text, style, anchor, tag) => {
                 composer.scalar(&text, style, anchor, tag.as_deref(), &span)?;
             }
-            Event::SequenceStart(_, anchor, tag) => {
-                composer.open(Kind::Sequence, anchor, tag.as_deref(), &span)?;
+            Event::SequenceStart(style, anchor, tag) => {
+                composer.open(Kind::Sequence, style, anchor, tag.as_deref(), &span)?;
             }
-            Event::MappingStart(_, anchor, tag) => {
-                composer.open(Kind::Mapping, anchor, tag.as_deref(), &span)?;
+            Event::MappingStart(style, anchor, tag) => {
+                composer.open(Kind::Mapping, style, anchor, tag.as_deref(), &span)?;
             }
             Event::SequenceEnd | Event::MappingEnd => composer.close(&span)?,
             Event::Alias(anchor) => composer.alias(anchor, &span)?,
@@ -173,8 +177,14 @@ pub fn parse_value(contents: &str, limits: Limits) -> Result<Value, YamlError> {
 }
 
 /// Deserialize repository settings into `T` with the shared limits.
+///
+/// For typed settings structs only. Scalars are read through the target
+/// field's type, so `'5'` fills an integer field and an empty value cannot
+/// fill a string one. A self-describing target such as `serde_json::Value`
+/// gets `serde-saphyr`'s own scalar inference, not the gateway's: JSON-shaped
+/// data goes through [`parse_value`].
 pub fn from_str<T: DeserializeOwned>(contents: &str) -> Result<T, YamlError> {
-    refuse_ambiguous_line_breaks(contents)?;
+    refuse_reader_disagreements(contents, SETTINGS_MAX_DEPTH, true)?;
     let options = serde_saphyr::options! {
         budget: serde_saphyr::budget! {
             max_depth: SETTINGS_MAX_DEPTH,
@@ -207,7 +217,24 @@ pub fn from_str<T: DeserializeOwned>(contents: &str) -> Result<T, YamlError> {
 /// whose folding and chomping rules are where readers disagree, and which
 /// split one value across lines for line-oriented tools. Strings a YAML 1.1
 /// reader would type differently (`yes`, `on`, `017`) stay quoted.
+///
+/// A mapping key whose rendering exceeds [`MAX_RENDERED_KEY_BYTES`] is
+/// refused: the gateway's reader rejects an implicit key longer than 1024
+/// bytes, while `serde-saphyr` switches to the explicit `? key` form only past
+/// 1024 *characters*, so a long multibyte key would render a document the
+/// gateway cannot load.
 pub fn to_string<T: Serialize>(value: &T) -> Result<String, YamlError> {
+    let shape = serde_json::to_value(value).map_err(|error| YamlError::new(error.to_string()))?;
+    let mut path = String::new();
+    refuse_unportable_keys(&shape, &mut path)?;
+    render(value)
+}
+
+/// Longest rendered mapping key [`to_string`] emits, under the gateway
+/// reader's 1024-byte implicit-key limit.
+pub const MAX_RENDERED_KEY_BYTES: usize = 1000;
+
+fn render<T: Serialize>(value: &T) -> Result<String, YamlError> {
     let options = serde_saphyr::ser_options! {
         prefer_block_scalars: false,
     };
@@ -215,23 +242,137 @@ pub fn to_string<T: Serialize>(value: &T) -> Result<String, YamlError> {
         .map_err(|error| YamlError::new(error.to_string()))
 }
 
-/// U+0085, U+2028 and U+2029 are line breaks to a YAML 1.1 reader (and to
-/// many editors and diff views) but content to a YAML 1.2 one, so the same
-/// bytes would show a reviewer a different document than gitforgeops reads.
-/// Inside a quoted string they can be written as `\N`, `\L` and `\P`.
-fn refuse_ambiguous_line_breaks(contents: &str) -> Result<(), YamlError> {
-    for (index, line) in contents.split('\n').enumerate() {
-        if let Some(column) = line.find(['\u{85}', '\u{2028}', '\u{2029}']) {
+fn refuse_unportable_keys(value: &Value, path: &mut String) -> Result<(), YamlError> {
+    match value {
+        Value::Object(entries) => {
+            for (key, child) in entries {
+                // Quoting at most quadruples a byte (`\x01`) and adds two
+                // quotes, so shorter keys cannot reach the limit.
+                if key.len() > (MAX_RENDERED_KEY_BYTES - 2) / 4 {
+                    let rendered = render(key)?;
+                    let rendered = rendered.trim_end_matches('\n').len();
+                    if rendered > MAX_RENDERED_KEY_BYTES {
+                        let location = if path.is_empty() {
+                            "the document root".to_string()
+                        } else {
+                            format!("`{path}`")
+                        };
+                        return Err(YamlError::new(format!(
+                            "a mapping key in {location} renders to {rendered} bytes, over the \
+                             {MAX_RENDERED_KEY_BYTES}-byte limit the gateway's YAML reader \
+                             accepts for a key; shorten it"
+                        )));
+                    }
+                }
+                let restore = path.len();
+                path.push('.');
+                path.push_str(key);
+                refuse_unportable_keys(child, path)?;
+                path.truncate(restore);
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let restore = path.len();
+                path.push_str(&format!("[{index}]"));
+                refuse_unportable_keys(item, path)?;
+                path.truncate(restore);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn parser_options(max_depth: usize) -> granit_parser::Options {
+    let mut options = granit_parser::Options::default();
+    options.set_emit_comments(false);
+    options.block_nesting_limit = max_depth;
+    options.flow_nesting_limit = max_depth;
+    options
+}
+
+/// Refuse input that `granit-parser` and the gateway's libyaml-based reader
+/// both accept but read differently, before either reader runs.
+///
+/// - U+0085, U+2028 and U+2029 are line breaks to a YAML 1.1 reader (and to
+///   many editors and diff views) but content to a YAML 1.2 one, so the same
+///   bytes would show a reviewer a different document than gitforgeops reads.
+///   Inside a quoted string they can be written as `\N`, `\L` and `\P`.
+/// - U+FEFF is accepted once, as a leading byte-order mark. libyaml strips
+///   one and keeps a second as part of the first key; granit strips them all.
+/// - A clipped or kept block scalar (`|`, `>`, `|+`) that ends the file
+///   without a final line break gains a trailing newline under granit but not
+///   under libyaml.
+/// - Inside a flow collection, libyaml takes a leading `?` as an explicit-key
+///   indicator even without a following space; granit reads `?x` as a string.
+///
+/// The last two need parser events. `scan_flow` asks for the flow check on
+/// every input; otherwise the events are scanned only for a file that does
+/// not end in a line break.
+fn refuse_reader_disagreements(
+    contents: &str,
+    max_depth: usize,
+    scan_flow: bool,
+) -> Result<(), YamlError> {
+    let body = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    for (index, line) in body.split('\n').enumerate() {
+        if let Some(column) = line.find(['\u{85}', '\u{2028}', '\u{2029}', '\u{feff}']) {
             return Err(YamlError::new(format!(
-                "raw U+0085, U+2028 or U+2029 line separator at line {} byte {}; YAML \
-                 readers disagree on whether it breaks the line — write it as \\N, \\L or \\P \
-                 inside a double-quoted string",
+                "raw U+0085, U+2028, U+2029 or U+FEFF at line {} byte {}; YAML readers \
+                 disagree on how to read it — write it as \\N, \\L, \\P or \\uFEFF inside a \
+                 double-quoted string, and keep at most one leading byte-order mark",
                 index + 1,
                 column + 1
             )));
         }
     }
+    let unterminated = !body.is_empty() && !body.ends_with(['\n', '\r']);
+    if !scan_flow && !unterminated {
+        return Ok(());
+    }
+    // A parse error ends the scan: the real parse reports it.
+    let mut final_block_scalar = false;
+    let mut flow_depth = 0usize;
+    for (event, span) in
+        Parser::new_from_str_with_options(body, parser_options(max_depth)).map_while(Result::ok)
+    {
+        match event {
+            Event::Scalar(text, style, ..) => {
+                if flow_depth > 0 && matches!(style, ScalarStyle::Plain) && text.starts_with('?') {
+                    return Err(flow_question_mark(&span));
+                }
+                // Strip chomping (`|-`) ends without a newline under both
+                // readers; clip and keep gain one under granit alone.
+                final_block_scalar = matches!(style, ScalarStyle::Literal | ScalarStyle::Folded)
+                    && text.ends_with('\n');
+            }
+            Event::SequenceStart(style, ..) | Event::MappingStart(style, ..) => {
+                if style == StructureStyle::Flow || flow_depth > 0 {
+                    flow_depth += 1;
+                }
+                final_block_scalar = false;
+            }
+            Event::SequenceEnd | Event::MappingEnd => flow_depth = flow_depth.saturating_sub(1),
+            Event::Alias(_) => final_block_scalar = false,
+            _ => {}
+        }
+    }
+    if unterminated && final_block_scalar {
+        return Err(YamlError::new(
+            "the file ends inside a `|` or `>` block scalar without a final line break; YAML \
+             readers disagree on whether its value ends in a newline — end the file with one",
+        ));
+    }
     Ok(())
+}
+
+fn flow_question_mark(span: &Span) -> YamlError {
+    YamlError::at(
+        "plain scalar starting with `?` inside a flow collection; the gateway's YAML reader \
+         takes `?` there as an explicit-key indicator — quote the value",
+        span,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +411,7 @@ struct Frame {
     body: Body,
     anchor: usize,
     size: Size,
+    flow: bool,
 }
 
 struct Composer {
@@ -292,7 +434,7 @@ impl Composer {
             return Err(YamlError::at(
                 format!(
                     "document expands past the accepted shape (over {} nodes, {} scalar bytes \
-                     or {} levels deep, counting alias copies); refusing to compose it",
+                     or {} levels deep, counting alias and anchor copies); refusing to compose it",
                     self.limits.max_nodes, self.limits.max_scalar_bytes, self.limits.max_depth
                 ),
                 span,
@@ -309,6 +451,9 @@ impl Composer {
         tag: Option<&Tag>,
         span: &Span,
     ) -> Result<(), YamlError> {
+        if matches!(style, ScalarStyle::Plain) && text.starts_with('?') && self.in_flow() {
+            return Err(flow_question_mark(span));
+        }
         let size = Size {
             nodes: 1,
             scalar_bytes: text.len(),
@@ -322,6 +467,7 @@ impl Composer {
     fn open(
         &mut self,
         kind: Kind,
+        style: StructureStyle,
         anchor: usize,
         tag: Option<&Tag>,
         span: &Span,
@@ -367,6 +513,7 @@ impl Composer {
                 scalar_bytes: 0,
                 height: 1,
             },
+            flow: style == StructureStyle::Flow,
         });
         Ok(())
     }
@@ -411,7 +558,11 @@ impl Composer {
         span: &Span,
     ) -> Result<(), YamlError> {
         if anchor != 0 {
-            // A redefined anchor replaces the earlier one, as YAML requires.
+            // The anchor table keeps its own copy, which is charged like an
+            // alias copy: nested anchors would otherwise retain a subtree once
+            // per enclosing anchor without counting it. A redefined anchor
+            // replaces the earlier one, as YAML requires.
+            self.charge(size, span)?;
             self.anchors.insert(anchor, (value.clone(), size));
         }
         if self.awaiting_key() {
@@ -458,6 +609,10 @@ impl Composer {
             }
         }
         Ok(())
+    }
+
+    fn in_flow(&self) -> bool {
+        self.stack.last().is_some_and(|frame| frame.flow)
     }
 
     fn awaiting_key(&self) -> bool {
@@ -782,6 +937,37 @@ mod tests {
         // would need terabytes.
         assert!(peak < 512 << 20, "peak {peak} bytes");
         assert!(from_str::<serde_json::Value>(&doc).is_err());
+    }
+
+    /// Anchors nested around a large subtree: each enclosing anchor keeps its
+    /// own copy, and those copies are charged, so no alias is needed to be
+    /// refused within the bound.
+    #[test]
+    fn nested_anchor_copies_are_charged() {
+        let nest = |levels: usize, leaf: &str| {
+            format!(
+                "{}{leaf}{}",
+                (0..levels).map(|i| format!("&a{i} [")).collect::<String>(),
+                "]".repeat(levels)
+            )
+        };
+        let big = format!("'{}'", "s".repeat(1 << 20));
+        let (result, peak) = crate::alloc_meter::peak_bytes(|| {
+            parse_value(&nest(120, &big), RESOURCE_LIMITS).map(|_| ())
+        });
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("expands past the accepted shape"), "{error}");
+        assert!(peak < 192 << 20, "peak {peak} bytes");
+
+        let ones = vec!["1"; 20_000].join(", ");
+        let (result, peak) = crate::alloc_meter::peak_bytes(|| {
+            parse_value(&nest(120, &ones), RESOURCE_LIMITS).map(|_| ())
+        });
+        assert!(result.is_err());
+        assert!(peak < 512 << 20, "peak {peak} bytes");
+
+        // A few nested anchors are still fine.
+        assert!(parse(&format!("k: {}\n", nest(3, "[1, 2]"))).is_ok());
     }
 
     /// One long scalar copied by many aliases is bounded by scalar bytes,

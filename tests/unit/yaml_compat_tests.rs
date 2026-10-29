@@ -382,6 +382,125 @@ fn rendered_documents_read_back_identically() {
     }
 }
 
+/// Classes where granit-parser and libyaml both accept a document but read
+/// it differently. Each must be refused, never read with granit's value.
+#[test]
+fn reader_disagreements_are_refused() {
+    let mut documents: Vec<String> = Vec::new();
+    // `?` starting a plain scalar in flow context: libyaml's explicit key.
+    for flow in [
+        "[?x]",
+        "[?x, y]",
+        "{?x: 1}",
+        "{?x}",
+        "[?x: y]",
+        "[?true]",
+        "k: [?abc]",
+        "[a, ?b]",
+        "{a: ?b}",
+        "[?]",
+        "[!!str ?x]",
+    ] {
+        documents.push(format!("{flow}\n"));
+    }
+    // Repeated byte-order marks.
+    for bom in [
+        "\u{feff}\u{feff}k: v\n",
+        "\u{feff}\u{feff}\u{feff}k: v\n",
+        "k: \u{feff}v\n",
+    ] {
+        documents.push(bom.to_string());
+    }
+    // Block scalars ending the file without a final line break.
+    for header in ["|", "|+", ">", ">+", "|2", ">2", "|+2", "|2+"] {
+        for body in ["abc", "abc\n  def", "abc\n\n  def", "abc\n  "] {
+            documents.push(format!("k: {header}\n  {body}"));
+            documents.push(format!("- {header}\n  {body}"));
+            documents.push(format!(
+                "a:\n  k: {header}\n    {}",
+                body.replace("\n  ", "\n    ")
+            ));
+        }
+    }
+    for document in &documents {
+        let gateway = match gateway_reading(document) {
+            Gateway::Reads(value) => Some(value),
+            Gateway::Lossy | Gateway::Refuses => None,
+        };
+        // Either reader may refuse; neither may accept a different value.
+        for (reader, read) in [
+            (
+                "parse_value",
+                yaml::parse_value(document, RESOURCE_LIMITS).ok(),
+            ),
+            ("from_str", yaml::from_str::<Value>(document).ok()),
+        ] {
+            if let Some(read) = read {
+                assert_eq!(Some(&read), gateway.as_ref(), "{reader} on {document:?}");
+            }
+        }
+        assert!(
+            yaml::parse_value(document, RESOURCE_LIMITS).is_err(),
+            "parse_value accepted {document:?}"
+        );
+    }
+    // The same constructs with a final line break, or written unambiguously,
+    // read as the gateway reads them.
+    for document in [
+        "k: |\n  abc\n",
+        "k: >\n  abc\n",
+        "k: |+\n  abc\n\n",
+        "k: |-\n  abc",
+        "k: |\n  abc\nj: x",
+        "['?x']\n",
+        "[? x]\n",
+        "- ?x\n",
+        "k: ?x\n",
+        "\u{feff}k: v\n",
+        "k: \"\\uFEFFv\"\n",
+    ] {
+        assert_agrees(document);
+        assert!(
+            yaml::parse_value(document, RESOURCE_LIMITS).is_ok(),
+            "{document:?}"
+        );
+    }
+}
+
+/// A long key is either rendered as the gateway can read it or refused;
+/// libyaml limits implicit keys to 1024 *bytes*, serde-saphyr to 1024
+/// characters.
+#[test]
+fn long_keys_render_readably_or_are_refused() {
+    for (unit, widths) in [
+        ("a", 990..1200),
+        ("é", 490..530),
+        ("😀", 240..270),
+        ("\u{1}", 240..270),
+        ("aé", 320..360),
+    ] {
+        for width in widths {
+            let key = unit.repeat(width);
+            let document = json!({ "outer": { key.clone(): "v" } });
+            match yaml::to_string(&document) {
+                Ok(rendered) => {
+                    let gateway: serde_yaml::Value = serde_yaml::from_str(&rendered)
+                        .unwrap_or_else(|error| {
+                            panic!("gateway refuses {} {unit:?}: {error}", width)
+                        });
+                    assert_eq!(serde_json::to_value(gateway).unwrap(), document);
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(message.contains("`.outer`"), "{message}");
+                    assert!(!message.contains(&key), "{message}");
+                }
+            }
+        }
+    }
+    assert!(yaml::to_string(&json!({ "é".repeat(513): 1 })).is_err());
+}
+
 /// Typed settings read plain scalars into string fields as the gateway's
 /// typed deserializer does, and refuse what it refuses.
 #[test]

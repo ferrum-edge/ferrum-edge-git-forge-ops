@@ -550,9 +550,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   differential suite checks that against `serde_yaml` 0.9 (now a test-only
   dependency), and rendered documents read back identically under it.
   Refused instead of silently rewritten: application and `%TAG` tags,
-  `!!binary` and other non-core tags, `.inf`/`.nan` (formerly JSON `null`) and
-  raw U+0085/U+2028/U+2029. Multi-line strings are emitted double-quoted
-  rather than as `|` blocks.
+  `!!binary` and other non-core tags, `.inf`/`.nan` (formerly JSON `null`),
+  and input the two parsers would read differently (raw U+0085/U+2028/U+2029,
+  a second byte-order mark, a `?`-leading plain scalar in a flow collection,
+  and a `|`/`>` block scalar ending the file without a final newline). Anchor
+  copies count against the limits like alias copies. Rendering refuses a
+  mapping key over 1,000 bytes, which the gateway's reader could not load.
+  Multi-line strings are emitted double-quoted rather than as `|` blocks.
+  Typed settings now read scalars through the field type: `'5'` or `1_000`
+  fills an integer field, and an empty value no longer fills a required
+  string (quote it: `name: ""`).
 
 - Required home jobs are pinned exactly in the supply-chain checker
   (#566). The `gitforgeops-required-static-validation` verdict job

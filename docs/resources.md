@@ -213,11 +213,17 @@ delete the declaration instead: in `exclusive` mode an undeclared live row is
 - **Refused rather than rewritten:** tags other than `!!str`, `!!int`,
   `!!float`, `!!bool`, `!!null`, `!!map` and `!!seq` (including `!custom`
   tags and `!!binary`), `.inf`/`.nan`, integers outside the 64-bit range,
-  repeated keys, more than one document per file, and raw U+0085, U+2028 or
-  U+2029 characters (write `\N`, `\L` or `\P` in a double-quoted string).
+  repeated keys, and more than one document per file.
+- **Refused because YAML readers disagree on them:** raw U+0085, U+2028 or
+  U+2029 characters (write `\N`, `\L` or `\P` in a double-quoted string),
+  more than one leading byte-order mark, a plain value starting with `?`
+  inside `[…]` or `{…}` (quote it), and a `|` or `>` block scalar that ends
+  the file without a final newline (add one).
 - **Anchors and aliases** work, but a file may not expand past 1,000,000
   nodes, 64 MiB of scalar text or 128 levels of nesting, counting every copy
-  an alias makes.
+  an anchor or alias makes.
+- **Keys** are limited to 1,000 bytes as rendered, so the gateway can read
+  every exported document.
 
 ## Proxy backend scheme
 

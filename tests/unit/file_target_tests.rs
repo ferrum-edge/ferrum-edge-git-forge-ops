@@ -48,8 +48,11 @@ fn fixture() -> GatewayConfig {
     gitforgeops::yaml::from_str(FIXTURE).expect("fixture parses")
 }
 
+/// Read the seal as the gateway does: with serde_yaml 0.9, not the code under
+/// test.
 fn counts_of(yaml: &str) -> serde_json::Map<String, serde_json::Value> {
-    let doc: serde_json::Value = gitforgeops::yaml::from_str(yaml).expect("written yaml parses");
+    let doc: serde_yaml::Value = serde_yaml::from_str(yaml).expect("written yaml parses");
+    let doc = serde_json::to_value(doc).expect("written yaml is JSON-shaped");
     doc.get("resource_counts")
         .and_then(|v| v.as_object())
         .cloned()
@@ -134,8 +137,8 @@ fn written_file_parses_back_into_gateway_config() {
     apply_file(&config, path.to_str().expect("utf-8 path")).expect("apply_file");
 
     let written = std::fs::read_to_string(&path).expect("read back");
-    let parsed: GatewayConfig =
-        gitforgeops::yaml::from_str(&written).expect("parses as GatewayConfig");
+    // Typed, through the gateway's own reader (serde_yaml 0.9).
+    let parsed: GatewayConfig = serde_yaml::from_str(&written).expect("parses as GatewayConfig");
 
     assert_eq!(parsed.proxies.len(), config.proxies.len());
     assert_eq!(parsed.consumers.len(), config.consumers.len());
