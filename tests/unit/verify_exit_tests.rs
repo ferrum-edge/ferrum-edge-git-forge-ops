@@ -23,7 +23,7 @@ use tempfile::TempDir;
 
 /// Checks for `staging` only, the way the shipped example leaves out
 /// `production`.
-const STAGING_ONLY: &str = r#"version: 1
+pub(super) const STAGING_ONLY: &str = r#"version: 1
 environments:
   staging:
     checks:
@@ -84,7 +84,7 @@ fn stdout(output: &Output) -> String {
 }
 
 /// A loopback data plane that answers one request with `status`.
-fn data_plane(status: u16) -> String {
+pub(super) fn data_plane(status: u16) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind data plane");
     let url = format!("http://{}", listener.local_addr().expect("local addr"));
     std::thread::spawn(move || {
@@ -107,11 +107,19 @@ fn data_plane(status: u16) -> String {
     url
 }
 
-/// A loopback address nothing is listening on.
-fn closed_port() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+/// A loopback data plane that accepts every connection and closes it without
+/// answering. The listener stays bound for the whole process, so no other
+/// socket can take the port between bind and connect (a bind-and-drop "closed
+/// port" could be reused by a concurrent test). A persistent accept error
+/// ends the loop instead of spinning.
+pub(super) fn hang_up_data_plane() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind data plane");
     let url = format!("http://{}", listener.local_addr().expect("local addr"));
-    drop(listener);
+    std::thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            drop(stream);
+        }
+    });
     url
 }
 
@@ -187,7 +195,7 @@ fn declared_checks_without_a_data_plane_url_are_an_error_not_a_skip() {
 #[test]
 fn a_declared_check_that_fails_exits_with_the_failure_code() {
     let dir = repo(Some(STAGING_ONLY));
-    let url = closed_port();
+    let url = hang_up_data_plane();
     let output = verify(
         &dir,
         &["--format", "json"],

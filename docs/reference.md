@@ -57,7 +57,7 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 
 | Command | Codes |
 |---|---|
-| all | `0` success, `1` error or blocking finding |
+| all | `0` success (including `--help` and `--version`), `1` error or blocking finding, including a usage error such as an unknown flag or subcommand |
 | `diff --exit-on-drift` | `0` in sync, `2` drift, `6` no alerted drift but fingerprinted secrets unverified with no baseline supplied (viewer credential), `1` the check could not complete |
 | `verify` | `0` all checks passed, `4` a check failed, `5` no checks declared (skipped), `1` could not run |
 | `doctor` | `0` nothing blocking, `3` something blocking, `1` the diagnosis itself failed |
