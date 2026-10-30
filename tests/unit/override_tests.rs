@@ -591,3 +591,123 @@ fn plan_override_note_quotes_the_approver_through_peer_text() {
         "Override inactive: label missing."
     );
 }
+
+fn rate_limit_document(redis_failure_policy: &str) -> gitforgeops::config::schema::GatewayConfig {
+    serde_json::from_value(json!({
+        "plugin_configs": [
+            {
+                "id": "limiter",
+                "namespace": "ferrum",
+                "plugin_name": "rate_limiting",
+                "scope": "global",
+                "config": {
+                    "limits": [{"scope": "default", "requests_per_second": 10}],
+                    "redis_failure_policy": redis_failure_policy
+                }
+            },
+            {
+                "id": "unbounded",
+                "namespace": "ferrum",
+                "plugin_name": "rate_limiting",
+                "scope": "global",
+                "config": {}
+            }
+        ]
+    }))
+    .unwrap()
+}
+
+fn rate_limit_policy() -> gitforgeops::policy::PolicyConfig {
+    use gitforgeops::policy::config::{PolicyRules, RateLimitCompletenessRuleConfig};
+    gitforgeops::policy::PolicyConfig {
+        policies: PolicyRules {
+            rate_limit_completeness: RateLimitCompletenessRuleConfig {
+                enabled: true,
+                severity: gitforgeops::policy::Severity::Error,
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// #562 review: `plan` and `review` preview the same policy verdict `apply`
+/// reaches. A `redis_failure_policy` placeholder whose bundle value is
+/// `local_fallback` produces a blocking finding only after credential
+/// resolution: an active override clears the committed finding but not that
+/// one, in the preview and in apply alike.
+#[test]
+fn preview_and_apply_agree_on_a_resolution_only_policy_finding() {
+    use gitforgeops::policy::github_override::{
+        apply_override, preview_policy_findings, RESOLUTION_ONLY_REMEDIATION,
+    };
+    use gitforgeops::policy::refusal::{
+        refuse_policy_violations, refuse_post_resolution_policy_violations,
+    };
+    use gitforgeops::policy::{evaluate_policies, PolicyFinding};
+    use gitforgeops::verdict::policy_blocker;
+
+    let policy = rate_limit_policy();
+    let unresolved = evaluate_policies(
+        &rate_limit_document("${gh-env-secret:alloc=require}"),
+        &policy,
+    );
+    let resolved = evaluate_policies(&rate_limit_document("local_fallback"), &policy);
+    let blocking = |findings: &[PolicyFinding]| findings.iter().filter(|f| f.is_blocking()).count();
+    assert_eq!(blocking(&unresolved), 1, "{unresolved:?}");
+    assert_eq!(blocking(&resolved), 2, "{resolved:?}");
+
+    let active = active_decision();
+    let inactive = OverrideDecision::inactive("label missing");
+    for decision in [None, Some(&inactive), Some(&active)] {
+        // apply, api mode: gate 1 on the unresolved document, gate 2 after
+        // credential resolution.
+        let mut gate_one = unresolved.clone();
+        if let Some(decision) = decision {
+            apply_override(&mut gate_one, decision);
+        }
+        let first = refuse_policy_violations(&gate_one, "", decision, None);
+        let mut gate_two = resolved.clone();
+        let second =
+            refuse_post_resolution_policy_violations(&mut gate_two, &unresolved, decision, None);
+        let apply_refuses = first.is_some() || second.is_some();
+
+        let (preview, uncovered) = preview_policy_findings(&unresolved, Some(&resolved), decision);
+        let plan_blocks = policy_blocker(&preview).is_some();
+        assert_eq!(plan_blocks, apply_refuses, "{decision:?}");
+        assert!(plan_blocks, "{decision:?}");
+
+        if decision.is_some_and(|decision| decision.active) {
+            assert!(first.is_none());
+            let message = second.expect("resolution-only finding refuses");
+            assert!(message.contains("appeared only after credential resolution"));
+            assert_eq!(uncovered, 1);
+            let open: Vec<_> = preview.iter().filter(|f| f.is_blocking()).collect();
+            assert_eq!(open.len(), 1, "{preview:?}");
+            assert_eq!(open[0].id, "limiter");
+            assert_eq!(
+                open[0].remediation.as_deref(),
+                Some(RESOLUTION_ONLY_REMEDIATION)
+            );
+            assert_eq!(policy_blocker(&preview).unwrap().count, 1);
+        } else {
+            assert_eq!(uncovered, 0);
+            assert_eq!(policy_blocker(&preview).unwrap().count, 2);
+        }
+        // The committed finding appears once, not once per gate.
+        assert_eq!(
+            preview.iter().filter(|f| f.id == "unbounded").count(),
+            1,
+            "{preview:?}"
+        );
+
+        // File mode never re-checks after resolution, so neither does its
+        // preview: the active override clears everything apply gates.
+        let (file_preview, _) = preview_policy_findings(&unresolved, None, decision);
+        assert_eq!(
+            policy_blocker(&file_preview).is_some(),
+            first.is_some(),
+            "{decision:?}"
+        );
+    }
+}

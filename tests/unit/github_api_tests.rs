@@ -1711,7 +1711,8 @@ async fn override_reviews_walk_numbered_pages_from_the_fixed_origin() {
     assert!(recorded.iter().all(|request| !request.contains("/steal")));
 }
 
-type SequencedRoute = (String, Vec<(u16, String)>);
+/// `(needle, responses in order, extra header lines on every response)`.
+type SequencedRoute = (String, Vec<(u16, String)>, String);
 
 /// A loopback stub whose routes answer a sequence of responses: each request
 /// matching a needle takes the next response, and the last one repeats.
@@ -1721,7 +1722,13 @@ fn spawn_sequenced_github_stub(routes: Vec<SequencedRoute>) -> (String, Arc<Mute
     let routes = Arc::new(Mutex::new(
         routes
             .into_iter()
-            .map(|(needle, responses)| (needle, std::collections::VecDeque::from(responses)))
+            .map(|(needle, responses, headers)| {
+                (
+                    needle,
+                    std::collections::VecDeque::from(responses),
+                    headers.replace("{base}", &base),
+                )
+            })
             .collect::<Vec<_>>(),
     ));
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1739,23 +1746,28 @@ fn spawn_sequenced_github_stub(routes: Vec<SequencedRoute>) -> (String, Arc<Mute
                     .lock()
                     .expect("record request")
                     .push(request.clone());
-                let (status, body) = {
+                let (status, body, headers) = {
                     let mut routes = routes.lock().expect("routes");
                     routes
                         .iter_mut()
-                        .find(|(needle, _)| request.contains(needle.as_str()))
-                        .and_then(|(_, responses)| {
-                            if responses.len() > 1 {
+                        .find(|(needle, _, _)| request.contains(needle.as_str()))
+                        .and_then(|(_, responses, headers)| {
+                            let response = if responses.len() > 1 {
                                 responses.pop_front()
                             } else {
                                 responses.front().cloned()
-                            }
+                            };
+                            response.map(|(status, body)| (status, body, headers.clone()))
                         })
-                        .unwrap_or((404, "{\"message\":\"Not Found\"}".to_string()))
+                        .unwrap_or((
+                            404,
+                            "{\"message\":\"Not Found\"}".to_string(),
+                            String::new(),
+                        ))
                 };
                 if write!(
                     stream,
-                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{headers}\r\n{}",
                     body.len(),
                     body
                 )
@@ -1789,13 +1801,18 @@ fn override_routes(permissions: &[(u16, &str)]) -> Vec<SequencedRoute> {
     }])
     .to_string();
     vec![
-        (format!("GET /repos/{REPO}/pulls/7 HTTP"), vec![(200, pr)]),
+        (
+            format!("GET /repos/{REPO}/pulls/7 HTTP"),
+            vec![(200, pr)],
+            String::new(),
+        ),
         (
             events_page(&format!("{REPO}/issues/7"), 1),
             vec![(
                 200,
                 serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
             )],
+            String::new(),
         ),
         (
             format!("GET /repos/{REPO}/collaborators/maintainer/permission"),
@@ -1809,14 +1826,16 @@ fn override_routes(permissions: &[(u16, &str)]) -> Vec<SequencedRoute> {
                     )
                 })
                 .collect(),
+            String::new(),
         ),
-        (reviews_page(1), vec![(200, review)]),
+        (reviews_page(1), vec![(200, review)], String::new()),
         (
             format!("GET /repos/{REPO}/git/trees/"),
             vec![(
                 200,
                 serde_json::json!({"truncated": false, "tree": []}).to_string(),
             )],
+            String::new(),
         ),
     ]
 }
@@ -1826,8 +1845,14 @@ fn override_routes(permissions: &[(u16, &str)]) -> Vec<SequencedRoute> {
 async fn run_override_check(
     permissions: &[(u16, &str)],
 ) -> (gitforgeops::policy::OverrideDecision, usize) {
+    run_override_routes(override_routes(permissions)).await
+}
+
+async fn run_override_routes(
+    routes: Vec<SequencedRoute>,
+) -> (gitforgeops::policy::OverrideDecision, usize) {
     use gitforgeops::policy::github_override::check_override_at;
-    let (api_base, requests) = spawn_sequenced_github_stub(override_routes(permissions));
+    let (api_base, requests) = spawn_sequenced_github_stub(routes);
     let cfg = gitforgeops::policy::OverrideConfig {
         require_label: OVERRIDE_LABEL.into(),
         required_permission: "write".into(),
@@ -1882,4 +1907,138 @@ async fn override_permission_unreadable_during_final_pass_is_inactive() {
     let (decision, permission_reads) = run_override_check(&[(200, "write"), (500, "write")]).await;
     assert!(!decision.active, "{}", decision.reason);
     assert_eq!(permission_reads, 2);
+}
+
+/// `Link` header lines that may announce a next page: every short page
+/// carrying one fails closed (#562 review). Each entry is the raw header
+/// line(s) a stub response carries.
+const AMBIGUOUS_OR_NEXT_LINKS: &[&str] = &[
+    "Link: <{base}/x>; rel=next\r\n",
+    "Link: <{base}/x>; rel = \"next\"\r\n",
+    "Link: <{base}/x>; rel=\"prev next\"\r\n",
+    "Link: <{base}/x>; REL=\"NEXT\"\r\n",
+    "Link: <{base}/x>;rel=\"Next\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev\", <{base}/x>; rel=\"next\"\r\n",
+    "Link: <{base}/p1>; title=\"a, b\"; rel=\"prev\", <{base}/x>; rel=next\r\n",
+    "Link: <{base}/p1>; rel=\"prev\"\r\nLink: <{base}/x>; rel=\"next\"\r\n",
+    "Link: not-a-link\r\n",
+    "Link: <{base}/x\r\n",
+    "Link: <{base}/x>; rel\r\n",
+    "Link: <{base}/x>; rel=\r\n",
+    "Link: <{base}/x>; rel=\"\"\r\n",
+    "Link: <{base}/x>; rel=\"next\r\n",
+    "Link: <{base}/x>; rel=prev next\r\n",
+    "Link: <{base}/x>; rel*=UTF-8''next\r\n",
+    "Link: <{base}/x> rel=\"prev\"\r\n",
+];
+
+/// `Link` header lines that unambiguously announce no next page.
+const NO_NEXT_LINKS: &[&str] = &[
+    "",
+    "Link: <{base}/p1>; rel=\"prev\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev first\"\r\n",
+    "Link: <{base}/p1>; rel=prev, <{base}/p0>; rel=\"first\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev\"; title=\"next page\"\r\n",
+    "Link: <{base}/p1>; rel=\"nextish\"\r\n",
+];
+
+#[test]
+fn link_header_parser_fails_closed_on_next_or_ambiguity() {
+    use gitforgeops::policy::github_override::link_header_may_announce_next;
+    for line in AMBIGUOUS_OR_NEXT_LINKS {
+        // A single header line is checked here; multi-line entries are covered
+        // end to end below.
+        let first = line.split("\r\n").next().unwrap();
+        let value = first.strip_prefix("Link: ").unwrap();
+        if line.matches("Link:").count() == 1 {
+            assert!(link_header_may_announce_next(value), "{line:?}");
+        }
+    }
+    for line in NO_NEXT_LINKS.iter().filter(|line| !line.is_empty()) {
+        let value = line.trim_end().strip_prefix("Link: ").unwrap();
+        assert!(!link_header_may_announce_next(value), "{line:?}");
+    }
+}
+
+#[tokio::test]
+async fn short_event_and_review_pages_fail_closed_on_every_next_or_ambiguous_link() {
+    use gitforgeops::policy::github_override::{fetch_reviews_at, find_override_labeler_at};
+    let repo_pr = format!("{REPO}/issues/7");
+    for line in AMBIGUOUS_OR_NEXT_LINKS {
+        let (api_base, requests) = spawn_github_stub_with_headers(vec![(
+            events_page(&repo_pr, 1),
+            200,
+            serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+            line.to_string(),
+        )]);
+        let error =
+            find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+                .await
+                .expect_err(line);
+        assert!(
+            error.to_string().contains("announces a next page"),
+            "{line:?}: {error}"
+        );
+        assert_eq!(requests.lock().expect("recorded").len(), 1, "{line:?}");
+
+        let (api_base, requests) = spawn_github_stub_with_headers(vec![(
+            reviews_page(1),
+            200,
+            serde_json::json!([plain_review_json(1, "maintainer")]).to_string(),
+            line.to_string(),
+        )]);
+        let error = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+            .await
+            .expect_err(line);
+        assert!(
+            error.to_string().contains("announces a next page"),
+            "{line:?}: {error}"
+        );
+        assert_eq!(requests.lock().expect("recorded").len(), 1, "{line:?}");
+    }
+    for line in NO_NEXT_LINKS {
+        let (api_base, _) = spawn_github_stub_with_headers(vec![(
+            events_page(&repo_pr, 1),
+            200,
+            serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+            line.to_string(),
+        )]);
+        let labeler =
+            find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+                .await
+                .unwrap_or_else(|error| panic!("{line:?}: {error}"));
+        assert_eq!(labeler.as_deref(), Some("maintainer"), "{line:?}");
+
+        let (api_base, _) = spawn_github_stub_with_headers(vec![(
+            reviews_page(1),
+            200,
+            serde_json::json!([plain_review_json(1, "maintainer")]).to_string(),
+            line.to_string(),
+        )]);
+        let reviews = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+            .await
+            .unwrap_or_else(|error| panic!("{line:?}: {error}"));
+        assert_eq!(reviews.len(), 1, "{line:?}");
+    }
+}
+
+/// End to end: an ambiguous or next-announcing `Link` on the short events page
+/// or the short reviews page leaves the override inactive.
+#[tokio::test]
+async fn override_is_inactive_when_a_short_page_link_may_announce_more() {
+    for line in AMBIGUOUS_OR_NEXT_LINKS {
+        for route in [1, 3] {
+            let mut routes = override_routes(&[(200, "write")]);
+            routes[route].2 = line.to_string();
+            let (decision, _) = run_override_routes(routes).await;
+            assert!(!decision.active, "route {route} {line:?}");
+        }
+    }
+    for line in NO_NEXT_LINKS {
+        let mut routes = override_routes(&[(200, "write")]);
+        routes[1].2 = line.to_string();
+        routes[3].2 = line.to_string();
+        let (decision, _) = run_override_routes(routes).await;
+        assert!(decision.active, "{line:?}: {}", decision.reason);
+    }
 }

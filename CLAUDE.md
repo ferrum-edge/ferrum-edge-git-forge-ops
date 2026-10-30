@@ -1372,17 +1372,25 @@ applied revision.
   protected configuration. Ignored build/runtime outputs elsewhere (`target/`,
   worktrees, `.state/`, `assembled/`) are not compared.
 - **Evidence.** Labeler, permission and reviews are paginated by page number
-  from the fixed origin; a short page whose `Link` header still announces
-  `rel="next"` fails closed. The final pass re-reads the PR, labeler,
-  **permission** (must still be sufficient) and reviews.
-- **Reviewed findings only.** api-mode apply re-evaluates policy after
+  from the fixed origin; a short page fails closed when any `Link` header
+  may announce a next page (`link_header_may_announce_next`: an RFC 8288
+  `next` relation in token or quoted form, any case, among space-separated
+  types, across link-values and headers; any value that does not parse
+  unambiguously counts as one). No `Link` URL is ever requested. The final
+  pass re-reads the PR, labeler, **permission** (must still be sufficient)
+  and reviews.
+- **Committed findings only.** api-mode apply re-evaluates policy after
   credential resolution. The override covers a blocking finding there only if
-  the pre-resolution evaluation (what `plan` and `review` showed) had the same
-  rule, severity, kind, namespace, id and message
+  the unresolved (committed) document's evaluation had the same rule,
+  severity, kind, namespace, id and message
   (`github_override::apply_override_to_reviewed`,
   `refusal::refuse_post_resolution_policy_violations`). A resolution-only
   finding refuses apply, saying it appeared only after credential resolution;
-  details stay scrubbed.
+  details stay scrubbed. `plan` and `review` evaluate both documents and show
+  the same verdict through `github_override::preview_policy_findings`
+  (unresolved findings with the whole override, plus in api mode each
+  resolution-only finding, which stays a `Policy` blocker carrying
+  `RESOLUTION_ONLY_REMEDIATION`).
 - A set `GITFORGEOPS_PR_NUMBER` that is not a positive integer is an error
   (`github_override::parse_pr_number`), never a fallback to the commit's
   associated PR. Unset or blank falls back.
@@ -1454,7 +1462,9 @@ gateway, as `Vec<ApplyBlocker>` over eleven `BlockerKind`s:
   lock and bundle read (the policy gate evaluates the unresolved document, as
   the security audit sees it); API mode evaluates policy again after credential
   resolution and before validation, using the resolved-slot report to scrub
-  diagnostics. Both policy refusals include the same override guidance. The
+  diagnostics, and covers only findings also present unresolved; `plan` and
+  `review` preview both gates through `preview_policy_findings`. Both policy
+  refusals include the same override guidance. The
   required-slot check runs before the first gateway call. Share predicates,
   not control flow.
 

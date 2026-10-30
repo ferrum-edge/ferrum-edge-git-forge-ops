@@ -139,7 +139,7 @@ impl BlockerKind {
                  ${gh-env-secret:...} placeholders, or override on the PR"
             }
             BlockerKind::Policy => {
-                "error-severity policy violation(s); fix the resource or override on the PR"
+                "error-severity policy violation(s); fix the resource or override on the PR (an override does not cover a finding that appears only after credential resolution)"
             }
             BlockerKind::RequiredCredentials => {
                 "alloc=require slot(s) with no bundle value; seed the credential bundle, or \

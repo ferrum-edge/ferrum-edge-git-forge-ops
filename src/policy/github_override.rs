@@ -608,12 +608,132 @@ fn announces_next_page(headers: &reqwest::header::HeaderMap) -> bool {
         .get_all(reqwest::header::LINK)
         .iter()
         .any(|value| match value.to_str() {
-            Ok(text) => {
-                parse_next_link(text).is_some()
-                    || text.to_ascii_lowercase().contains("rel=\"next\"")
-            }
+            Ok(text) => link_header_may_announce_next(text),
             Err(_) => true,
         })
+}
+
+/// Whether one `Link` header value may announce a next page.
+///
+/// True when any link-value carries a `next` relation (RFC 8288: `rel` named
+/// case-insensitively, a token or quoted-string value, optional whitespace
+/// around `=`, space-separated relation types compared case-insensitively),
+/// and also whenever the value cannot be parsed unambiguously, so a short page
+/// carrying it fails closed. Only the relations are read: no URL is used.
+pub fn link_header_may_announce_next(header: &str) -> bool {
+    match link_relations(header) {
+        Some(relations) => relations
+            .iter()
+            .any(|relation| relation.eq_ignore_ascii_case("next")),
+        None => true,
+    }
+}
+
+/// Every relation type named by every link-value of one `Link` header value,
+/// or `None` when the value is not an unambiguous RFC 8288 `#link-value` list.
+fn link_relations(header: &str) -> Option<Vec<String>> {
+    fn is_tchar(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    }
+    fn skip_ows(bytes: &[u8], at: &mut usize) {
+        while *at < bytes.len() && matches!(bytes[*at], b' ' | b'\t') {
+            *at += 1;
+        }
+    }
+    fn token(bytes: &[u8], at: &mut usize) -> Option<String> {
+        let start = *at;
+        while *at < bytes.len() && is_tchar(bytes[*at]) {
+            *at += 1;
+        }
+        (*at > start).then(|| String::from_utf8_lossy(&bytes[start..*at]).into_owned())
+    }
+    fn quoted(bytes: &[u8], at: &mut usize) -> Option<String> {
+        // Caller has seen the opening quote.
+        *at += 1;
+        let mut value = Vec::new();
+        while *at < bytes.len() {
+            match bytes[*at] {
+                b'"' => {
+                    *at += 1;
+                    return String::from_utf8(value).ok();
+                }
+                b'\\' => {
+                    let escaped = *bytes.get(*at + 1)?;
+                    value.push(escaped);
+                    *at += 2;
+                }
+                byte => {
+                    value.push(byte);
+                    *at += 1;
+                }
+            }
+        }
+        None
+    }
+
+    let bytes = header.as_bytes();
+    let mut at = 0;
+    let mut relations = Vec::new();
+    loop {
+        skip_ows(bytes, &mut at);
+        match bytes.get(at) {
+            None => return Some(relations),
+            // Empty list elements are allowed by the `#` rule.
+            Some(b',') => {
+                at += 1;
+                continue;
+            }
+            Some(b'<') => {}
+            Some(_) => return None,
+        }
+        // `<URI-Reference>`: a URI cannot contain a raw `<` or `>`.
+        let close = bytes[at + 1..]
+            .iter()
+            .position(|byte| matches!(byte, b'<' | b'>'))?;
+        if bytes[at + 1 + close] != b'>' {
+            return None;
+        }
+        at += close + 2;
+        loop {
+            skip_ows(bytes, &mut at);
+            match bytes.get(at) {
+                None => return Some(relations),
+                Some(b',') => {
+                    at += 1;
+                    break;
+                }
+                Some(b';') => at += 1,
+                Some(_) => return None,
+            }
+            skip_ows(bytes, &mut at);
+            let name = token(bytes, &mut at)?;
+            skip_ows(bytes, &mut at);
+            let value = if bytes.get(at) == Some(&b'=') {
+                at += 1;
+                skip_ows(bytes, &mut at);
+                Some(if bytes.get(at) == Some(&b'"') {
+                    quoted(bytes, &mut at)?
+                } else {
+                    token(bytes, &mut at)?
+                })
+            } else {
+                None
+            };
+            let name = name.to_ascii_lowercase();
+            if name == "rel" {
+                // A `rel` without a value names no relation unambiguously.
+                let value = value?;
+                let types: Vec<String> = value.split_ascii_whitespace().map(String::from).collect();
+                if types.is_empty() {
+                    return None;
+                }
+                relations.extend(types);
+            } else if name == "rel*" {
+                // An extended-notation relation is not unambiguously absent.
+                return None;
+            }
+        }
+    }
 }
 
 async fn fetch_json(
@@ -686,10 +806,10 @@ pub fn apply_override(findings: &mut [super::PolicyFinding], decision: &Override
     }
 }
 
-/// The identity an override review is bound to: rule, severity, resource and
-/// message. The reviewer saw exactly these findings (`plan` and `review`
-/// evaluate the unresolved document), so a finding that differs in any of
-/// them is a finding nobody reviewed.
+/// The identity an override is bound to: rule, severity, resource and message
+/// of a finding in the unresolved (committed) document. A finding after
+/// credential resolution that differs in any of them is one the override
+/// review did not accept.
 fn reviewed_identity(
     finding: &super::PolicyFinding,
 ) -> (&str, super::Severity, &str, &str, &str, &str) {
@@ -703,13 +823,17 @@ fn reviewed_identity(
     )
 }
 
+/// Explains a blocking finding that only credential resolution produced.
+pub const RESOLUTION_ONLY_REMEDIATION: &str = "appeared only after credential resolution; a policy override covers only findings in the committed (unresolved) configuration, so fix the resource or the credential value";
+
 /// [`apply_override`] limited to blocking findings that also appear in
-/// `reviewed`, the evaluation the override review could see.
+/// `reviewed`, the evaluation of the unresolved (committed) document.
 ///
-/// Apply re-evaluates policy after credential resolution. A blocking finding
-/// that exists only in the resolved document never appeared in `plan` or the
-/// PR comment, so the override does not cover it; it stays blocking. Returns
-/// how many blocking findings were left uncovered for that reason.
+/// api-mode apply re-evaluates policy after credential resolution. A blocking
+/// finding that exists only in the resolved document is not a finding of the
+/// reviewed revision's committed bytes, so the override does not cover it; it
+/// stays blocking. Returns how many blocking findings were left uncovered for
+/// that reason.
 pub fn apply_override_to_reviewed(
     findings: &mut [super::PolicyFinding],
     decision: &OverrideDecision,
@@ -739,4 +863,46 @@ pub fn apply_override_to_reviewed(
         }
     }
     uncovered
+}
+
+/// The policy findings `plan` and `review` preview, gated exactly as `apply`
+/// gates them.
+///
+/// `apply` refuses on the unresolved document with the whole override, then
+/// (api mode only) on the resolved document with the override limited to
+/// unresolved findings ([`apply_override_to_reviewed`]). The preview is the
+/// unresolved findings plus, when `resolved` is given, every resolved finding
+/// with no unresolved twin. Such a finding stays blocking under an active
+/// override and carries [`RESOLUTION_ONLY_REMEDIATION`]. Returns the list and
+/// how many blocking findings the override leaves uncovered.
+pub fn preview_policy_findings(
+    unresolved: &[super::PolicyFinding],
+    resolved: Option<&[super::PolicyFinding]>,
+    decision: Option<&OverrideDecision>,
+) -> (Vec<super::PolicyFinding>, usize) {
+    let mut preview = unresolved.to_vec();
+    if let Some(decision) = decision {
+        apply_override(&mut preview, decision);
+    }
+    let Some(resolved) = resolved else {
+        return (preview, 0);
+    };
+    let mut resolved = resolved.to_vec();
+    let uncovered = decision
+        .map(|decision| apply_override_to_reviewed(&mut resolved, decision, unresolved))
+        .unwrap_or(0);
+    let known: std::collections::HashSet<_> = unresolved.iter().map(reviewed_identity).collect();
+    let active = decision.is_some_and(|decision| decision.active);
+    let resolution_only: Vec<_> = resolved
+        .into_iter()
+        .filter(|finding| !known.contains(&reviewed_identity(finding)))
+        .map(|mut finding| {
+            if active && finding.is_blocking() {
+                finding.remediation = Some(RESOLUTION_ONLY_REMEDIATION.to_string());
+            }
+            finding
+        })
+        .collect();
+    preview.extend(resolution_only);
+    (preview, uncovered)
 }

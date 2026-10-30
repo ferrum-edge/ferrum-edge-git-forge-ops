@@ -2419,6 +2419,12 @@ async fn cmd_plan(
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },
     );
+    // Apply's first policy gate evaluates the unresolved document; capture it
+    // before resolution so the preview gates exactly as apply does.
+    let unresolved_policy_findings = policy_cfg
+        .as_ref()
+        .map(|cfg| policy::evaluate_policies(&desired, cfg))
+        .unwrap_or_default();
     // Loaded before resolution: the ledger is the evidence for the
     // retired-Consumer slot checks apply will refuse on.
     let state = StateFile::load(&resolved.name)?;
@@ -2707,11 +2713,21 @@ async fn cmd_plan(
     // override decision they are printed *with* is the same one that decides
     // whether they block. `apply` resolves that override once and shares it
     // between the two fail-closed reporters; plan does the same so a preview
-    // and the post-merge apply cannot disagree.
-    let mut policy_findings = match &policy_cfg {
-        Some(cfg) => policy::evaluate_policies(&desired, cfg),
-        None => Vec::new(),
-    };
+    // and the post-merge apply cannot disagree. Apply gates the unresolved
+    // document and, in api mode, the resolved one with the override limited
+    // to unresolved findings; `preview_policy_findings` shows both gates.
+    let resolved_policy_findings = (env_config.gateway_mode == GatewayMode::Api).then(|| {
+        policy_cfg
+            .as_ref()
+            .map(|cfg| policy::evaluate_policies(&desired, cfg))
+            .unwrap_or_default()
+    });
+    let (mut policy_findings, _) = policy::github_override::preview_policy_findings(
+        &unresolved_policy_findings,
+        resolved_policy_findings.as_deref(),
+        None,
+    );
+    let mut resolution_only_uncovered = 0;
     let security_overridable = verdict::security_blocker(&security_findings, false).is_some();
     let policy_overridable = policy_findings.iter().any(|f| f.is_blocking());
     let mut security_overridden = false;
@@ -2724,7 +2740,12 @@ async fn cmd_plan(
         match resolve_pr_number(&env_config).await? {
             Some(pr) => match policy::check_override(&env_config, &override_cfg, pr).await {
                 Ok(decision) => {
-                    policy::github_override::apply_override(&mut policy_findings, &decision);
+                    (policy_findings, resolution_only_uncovered) =
+                        policy::github_override::preview_policy_findings(
+                            &unresolved_policy_findings,
+                            resolved_policy_findings.as_deref(),
+                            Some(&decision),
+                        );
                     security_overridden = decision.active;
                     override_note = Some(policy::github_override::plan_override_note(&decision));
                 }
@@ -2804,6 +2825,13 @@ async fn cmd_plan(
                 safe(&pf.namespace),
                 safe_line(&pf.message),
                 overridden
+            );
+        }
+        if resolution_only_uncovered > 0 {
+            reportln!(
+                json_mode,
+                "  {resolution_only_uncovered} blocking finding(s) {}.",
+                policy::github_override::RESOLUTION_ONLY_REMEDIATION
             );
         }
         reportln!(json_mode);
@@ -4165,6 +4193,11 @@ async fn cmd_review(
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },
     );
+    // Apply's first policy gate sees the unresolved document.
+    let unresolved_policy_findings = policy_cfg
+        .as_ref()
+        .map(|cfg| policy::evaluate_policies(&desired, cfg))
+        .unwrap_or_default();
     let state = StateFile::load(&resolved.name)?;
     let ledger = consumer_ledger(&resolved, &state, &allocation_binding);
     let secret_report = resolve_credentials(&mut desired, &env_config, Some(&ledger))?;
@@ -4275,10 +4308,20 @@ async fn cmd_review(
     // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
 
-    let mut policy_findings = policy_cfg
-        .as_ref()
-        .map(|cfg| policy::evaluate_policies(&desired, cfg))
-        .unwrap_or_default();
+    // The same two gates apply runs: unresolved findings with the whole
+    // override, then (api mode) resolved findings with the override limited
+    // to unresolved ones (see cmd_plan).
+    let resolved_policy_findings = (env_config.gateway_mode == GatewayMode::Api).then(|| {
+        policy_cfg
+            .as_ref()
+            .map(|cfg| policy::evaluate_policies(&desired, cfg))
+            .unwrap_or_default()
+    });
+    let (mut policy_findings, _) = policy::github_override::preview_policy_findings(
+        &unresolved_policy_findings,
+        resolved_policy_findings.as_deref(),
+        None,
+    );
     let override_cfg = policy_cfg
         .as_ref()
         .map(|cfg| cfg.overrides.clone())
@@ -4296,7 +4339,11 @@ async fn cmd_review(
                 pr_number,
             )
             .await?;
-            policy::github_override::apply_override(&mut policy_findings, &decision);
+            (policy_findings, _) = policy::github_override::preview_policy_findings(
+                &unresolved_policy_findings,
+                resolved_policy_findings.as_deref(),
+                Some(&decision),
+            );
             Some(decision)
         }
         _ => None,

@@ -68,9 +68,11 @@ pub fn refuse_policy_violations(
 /// The api-mode policy re-check after credential resolution.
 ///
 /// The override decision covers only blocking findings that also appear in
-/// `reviewed`, the pre-resolution evaluation `plan` and `review` show. A
+/// `reviewed`, the evaluation of the unresolved (committed) document. A
 /// blocking finding that exists only in the resolved document refuses apply
-/// even with an active override, and the refusal says why. `findings` is left
+/// even with an active override, and the refusal says why; `plan` and
+/// `review` preview the same verdict through
+/// [`github_override::preview_policy_findings`]. `findings` is left
 /// post-override for the audit trail. Values never appear in the note; finding
 /// details go through `scrubber` like every other post-resolution refusal.
 pub fn refuse_post_resolution_policy_violations(
@@ -90,7 +92,7 @@ pub fn refuse_post_resolution_policy_violations(
     )?;
     if uncovered > 0 {
         output.push_str(&format!(
-            "({uncovered} blocking finding(s) appeared only after credential resolution. The override covers only findings its review could see before resolution, so it does not cover them; plan and review never showed them.)\n"
+            "({uncovered} blocking finding(s) appeared only after credential resolution. A policy override covers only findings in the committed (unresolved) configuration, so it does not cover them.)\n"
         ));
     }
     Some(output)
