@@ -580,7 +580,7 @@ class AgentSetupTests(unittest.TestCase):
             )
             violations = check_agent_setup.collect_violations(root)
         joined = "\n".join(violations)
-        self.assertIn('python3 "$validator" --root "$GITHUB_WORKSPACE"', joined)
+        self.assertIn('python3 -I "$validator" --root "$GITHUB_WORKSPACE"', joined)
         self.assertIn("unittest discover", joined)
         self.assertIn("shellcheck --external-sources", joined)
 

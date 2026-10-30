@@ -234,7 +234,7 @@ PROBE_VERIFY_RUN = (
 CREDENTIAL_HANDOFF_RUN = (
     "set -euo pipefail",
     'creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"',
-    'python3 .github/scripts/credential_bundles.py "$creds_file"',
+    'python3 -I .github/scripts/credential_bundles.py "$creds_file"',
     'echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"',
 )
 APPLY_CREDENTIAL_HANDOFF_RUN = CREDENTIAL_HANDOFF_RUN + (
@@ -1432,11 +1432,21 @@ def monitoring_workflow_violations(text: str) -> list[str]:
     return violations
 
 
+# Interpreter flags (`-I`, `-B`, ...) do not make the candidate's helper trusted.
+_CANDIDATE_CLASSIFIER = re.compile(
+    r"python3?(?:[ \t]+-[A-Za-z]+)*[ \t]+(?:\./)?\.github/scripts/changed_files\.py"
+)
+
+
 def trusted_classifier_violations(
     workflow: str, text: str, trusted_invocation: str, expected_count: int
 ) -> list[str]:
     violations: list[str] = []
-    if text.count(trusted_invocation) != expected_count:
+    found = text.count(trusted_invocation)
+    legacy_invocation = trusted_invocation.replace("python3 -I ", "python3 ")
+    if legacy_invocation != trusted_invocation:  # ISSUE_562_LEGACY
+        found += text.count(legacy_invocation)
+    if found != expected_count:
         violations.append(
             f"{workflow}: path scope must run exactly {expected_count} default-branch trusted classifier invocation(s)"
         )
@@ -1448,7 +1458,7 @@ def trusted_classifier_violations(
         violations.append(
             f"{workflow}: unprotected PR base SHA must not supply trusted classifier code"
         )
-    if "result=$(python3 .github/scripts/changed_files.py" in text:
+    if _CANDIDATE_CLASSIFIER.search(text):
         violations.append(
             f"{workflow}: path scope must not invoke the candidate-branch classifier"
         )
@@ -1906,9 +1916,28 @@ def _workflow_level_gate_violations(label: str, text: str) -> list[str]:
     return violations
 
 
+# Issue #562 rollout, step 1 of 2. The checker on the protected branch judges
+# every pull request's workflows, so a pinned line cannot change in the same
+# pull request as its pin. This step pins the new forms (a job
+# `timeout-minutes`, `python3 -I`) and also accepts the reviewed forms they
+# replace; step 2 switches the workflows and deletes everything marked
+# `ISSUE_562_LEGACY`. The legacy forms are derived, never listed, so they can
+# only differ from the new pins by exactly those two changes.
+_ISSUE_562_JOB_TIMEOUT = re.compile(r" {4}timeout-minutes: \d+")
+
+
+def _issue_562_legacy_lines(lines, *, drop_job_timeout: bool = True) -> list[str]:
+    """ISSUE_562_LEGACY: pinned lines as reviewed before #562."""
+    legacy = [line.replace("python3 -I ", "python3 ") for line in lines]
+    if drop_job_timeout:
+        legacy = [line for line in legacy if not _ISSUE_562_JOB_TIMEOUT.fullmatch(line)]
+    return legacy
+
+
 VALIDATE_PR_JOBS = [
     ("scope", [
         "    runs-on: ubuntu-26.04",
+        "    timeout-minutes: 10",
         "    outputs:",
         "      relevant: ${{ steps.classify.outputs.relevant }}",
         "    steps:",
@@ -1959,7 +1988,7 @@ VALIDATE_PR_JOBS = [
         "          [ \"$stable\" = true ] || exit 1",
         "          helper=trusted-scope/.github/scripts/changed_files.py",
         "          if [ -f \"$helper\" ]; then",
-        "            result=$(python3 trusted-scope/.github/scripts/changed_files.py \\",
+        "            result=$(python3 -I trusted-scope/.github/scripts/changed_files.py \\",
         "              \"$pages_file\" \"$current_changed\" declarative)",
         "          else",
         "            # The helper does not exist on the base of its own bootstrap PR.",
@@ -1978,6 +2007,7 @@ VALIDATE_PR_JOBS = [
         "    needs: scope",
         "    if: needs.scope.outputs.relevant == 'true'",
         "    runs-on: ubuntu-26.04",
+        "    timeout-minutes: 30",
         "    outputs:",
         "      envs: ${{ steps.list.outputs.envs }}",
         "    steps:",
@@ -2020,6 +2050,7 @@ VALIDATE_PR_JOBS = [
         "    needs: list-envs",
         "    if: needs.list-envs.outputs.envs != '[]' && needs.list-envs.outputs.envs != ''",
         "    runs-on: ubuntu-26.04",
+        "    timeout-minutes: 45",
         "    strategy:",
         "      fail-fast: false",
         "      matrix:",
@@ -2126,6 +2157,7 @@ VALIDATE_PR_JOBS = [
         "    if: always()",
         "    needs: [validator-pairing, scope, list-envs, validate]",
         "    runs-on: ubuntu-26.04",
+        "    timeout-minutes: 10",
         "    env:",
         "      PAIRING_RESULT: ${{ needs.validator-pairing.result }}",
         "      SCOPE_RESULT: ${{ needs.scope.result }}",
@@ -2157,6 +2189,7 @@ VALIDATE_PR_JOBS = [
 
 RUST_CI_CHECK_JOB = [
     "    runs-on: ubuntu-26.04",
+    "    timeout-minutes: 45",
     "    steps:",
     "      - uses: actions/checkout@<sha> # v7",
     "        with:",
@@ -2207,7 +2240,7 @@ RUST_CI_CHECK_JOB = [
     "          [ \"$stable\" = true ] || exit 1",
     "          helper=trusted-scope/.github/scripts/changed_files.py",
     "          if [ -f \"$helper\" ]; then",
-    "            result=$(python3 trusted-scope/.github/scripts/changed_files.py \\",
+    "            result=$(python3 -I trusted-scope/.github/scripts/changed_files.py \\",
     "              \"$pages_file\" \"$current_changed\" rust)",
     "          else",
     "            # The helper is absent only while the PR that first introduces it",
@@ -2263,6 +2296,24 @@ RUST_CI_CHECK_JOB = [
     "            }",
     "          done",
 ]
+# ISSUE_562_LEGACY: `validator-pairing` already carried its job timeout.
+_ISSUE_562_LEGACY_VALIDATE_PR_JOBS = [
+    (name, _issue_562_legacy_lines(lines, drop_job_timeout=name != "validator-pairing"))
+    for name, lines in VALIDATE_PR_JOBS
+]
+_ISSUE_562_LEGACY_RUST_CI_CHECK_JOB = _issue_562_legacy_lines(RUST_CI_CHECK_JOB)
+# The coverage floor sits below the line coverage measured on `main` when the
+# gate was introduced (88.17% at 671fd4f). Lowering it is a policy change made
+# here, in review, never in the workflow alone.
+COVERAGE_LINE_FLOOR = 87
+COVERAGE_RUN = re.compile(
+    r"run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov\.info"
+    r" --fail-under-lines (?P<floor>\d+)"
+)
+# ISSUE_562_LEGACY: the ungated measurement.
+_ISSUE_562_LEGACY_COVERAGE_RUN = (
+    "run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info"
+)
 
 def required_static_validation_violations(text: str) -> list[str]:
     """The required static-validation context must keep its exact verdict job.
@@ -2281,7 +2332,7 @@ def required_static_validation_violations(text: str) -> list[str]:
     jobs = [
         (name, _verbatim_job_lines(body)) for name, body in workflow_jobs(text)
     ]
-    if jobs != VALIDATE_PR_JOBS:
+    if jobs not in (VALIDATE_PR_JOBS, _ISSUE_562_LEGACY_VALIDATE_PR_JOBS):
         violations.append(
             "validate-pr.yml: every job the required "
             "gitforgeops-required-static-validation context depends on — "
@@ -2306,7 +2357,7 @@ def rust_ci_test_scope_violations(text: str) -> list[str]:
     """
     violations = _workflow_level_gate_violations("rust-ci.yml", text)
     job = workflow_job(text, "rust-ci-check")
-    if _verbatim_job_lines(job) != RUST_CI_CHECK_JOB:
+    if _verbatim_job_lines(job) not in (RUST_CI_CHECK_JOB, _ISSUE_562_LEGACY_RUST_CI_CHECK_JOB):
         violations.append(
             "rust-ci.yml: rust-ci-check must keep its reviewed header, step "
             "order, conditions and scripts exactly; a green required context "
@@ -2325,9 +2376,20 @@ def rust_ci_test_scope_violations(text: str) -> list[str]:
         line.strip()
         for line in policy_step(workflow_job(text, "coverage"), "cargo llvm-cov")
     ]
-    if "run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info" not in coverage:
+    floors = [
+        int(match.group("floor"))
+        for match in map(COVERAGE_RUN.fullmatch, coverage)
+        if match is not None
+    ]
+    if not floors and _ISSUE_562_LEGACY_COVERAGE_RUN not in coverage:
         violations.append(
-            "rust-ci.yml: coverage must measure the library target and the aggregated suite"
+            "rust-ci.yml: coverage must measure the library target and the aggregated "
+            f"suite with --fail-under-lines of at least {COVERAGE_LINE_FLOOR}"
+        )
+    elif any(floor < COVERAGE_LINE_FLOOR for floor in floors):
+        violations.append(
+            f"rust-ci.yml: --fail-under-lines may not drop below {COVERAGE_LINE_FLOOR}; "
+            "lowering the coverage floor is a reviewed change to check_supply_chain.py"
         )
     return violations
 
@@ -3680,7 +3742,10 @@ def _credential_handoff_refusal(workflow: str, document: dict, job: dict, step: 
     for scope in _env_scopes(document) + _env_scopes(job):
         if not isinstance(scope, dict) or drivers.intersection(key.casefold() for key in scope):
             return "workflow and job env may not bind " + ", ".join(CREDENTIAL_HANDOFF_DRIVERS)
-    if not isinstance(step.get("run"), str) or not pinned_run_matches(step["run"], shape):
+    if not isinstance(step.get("run"), str) or not any(
+        pinned_run_matches(step["run"], candidate)
+        for candidate in (shape, tuple(_issue_562_legacy_lines(shape)))  # ISSUE_562_LEGACY
+    ):
         return "the hand-off script must match its pinned shape"
     return None
 
@@ -4930,6 +4995,7 @@ PINNED_RUST_TOOLCHAIN = "<rust toolchain>"
 # and `CARGO_AUDIT_ACTIONS` judge them) and the toolchain are free.
 CARGO_AUDIT_JOB_SHAPE = {
     "runs-on": "ubuntu-26.04",
+    "timeout-minutes": "20",
     "permissions": {"contents": "read"},
     "steps": [
         {
@@ -4962,9 +5028,9 @@ CARGO_AUDIT_JOB_SHAPE = {
             "run": "\n".join(
                 (
                     'if [ "$EVENT_NAME" = pull_request ]; then',
-                    "  python3 trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
+                    "  python3 -I trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
                     "else",
-                    "  python3 .github/scripts/tests/test_check_cargo_audit.py",
+                    "  python3 -I .github/scripts/tests/test_check_cargo_audit.py",
                     "fi",
                 )
             ),
@@ -4975,17 +5041,32 @@ CARGO_AUDIT_JOB_SHAPE = {
             "run": "\n".join(
                 (
                     'if [ "$EVENT_NAME" = pull_request ]; then',
-                    "  python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\",
+                    "  python3 -I trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\",
                     "    --policy trusted-cargo-audit/.github/cargo-audit-policy.json \\",
                     '    --source-root "$GITHUB_WORKSPACE"',
                     "else",
-                    "  python3 .github/scripts/check_cargo_audit.py",
+                    "  python3 -I .github/scripts/check_cargo_audit.py",
                     "fi",
                 )
             ),
         },
     ],
 }
+
+
+
+def _issue_562_legacy_cargo_audit_shape() -> dict:
+    """ISSUE_562_LEGACY: the cargo-audit job as reviewed before #562."""
+    shape = {key: value for key, value in CARGO_AUDIT_JOB_SHAPE.items() if key != "timeout-minutes"}
+    shape["steps"] = [
+        {**step, "run": "\n".join(_issue_562_legacy_lines(step["run"].split("\n")))}
+        if "run" in step
+        else step
+        for step in CARGO_AUDIT_JOB_SHAPE["steps"]
+    ]
+    return shape
+
+
 _PINNED_USES_VALUE = re.compile(r"([^@\s]+)@[0-9a-f]{40}")
 # Workflow-level keys that reach every job's shell.
 _SHELL_REACHING_WORKFLOW_KEYS = ("env", "defaults")
@@ -5037,11 +5118,20 @@ def cargo_audit_job_shape_violations(text: str) -> list[str]:
     if not isinstance(job, dict):
         violations.append(f"security.yml: the required {CARGO_AUDIT_JOB!r} job is missing")
         return violations
-    for key in sorted(set(job) | set(CARGO_AUDIT_JOB_SHAPE)):
-        if key != "steps" and job.get(key) != CARGO_AUDIT_JOB_SHAPE.get(key):
+    legacy = _issue_562_legacy_cargo_audit_shape()  # ISSUE_562_LEGACY
+    if not _cargo_audit_shape_differences(job, legacy):
+        return violations
+    return violations + _cargo_audit_shape_differences(job, CARGO_AUDIT_JOB_SHAPE)
+
+
+def _cargo_audit_shape_differences(job: dict, shape: dict) -> list[str]:
+    """How a parsed `security-cargo-audit` job differs from a reviewed shape."""
+    violations: list[str] = []
+    for key in sorted(set(job) | set(shape)):
+        if key != "steps" and job.get(key) != shape.get(key):
             violations.append(
                 f"security.yml: {CARGO_AUDIT_JOB} must keep its reviewed job keys; "
-                f"{key!r} should be {CARGO_AUDIT_JOB_SHAPE.get(key)!r}, "
+                f"{key!r} should be {shape.get(key)!r}, "
                 f"found {job.get(key)!r}"
             )
     steps = job.get("steps")
@@ -5050,7 +5140,7 @@ def cargo_audit_job_shape_violations(text: str) -> list[str]:
         if isinstance(steps, list)
         else []
     )
-    expected_steps = CARGO_AUDIT_JOB_SHAPE["steps"]
+    expected_steps = shape["steps"]
     for index in range(max(len(found_steps), len(expected_steps))):
         found = found_steps[index] if index < len(found_steps) else "<end of steps>"
         wanted = expected_steps[index] if index < len(expected_steps) else "<end of steps>"
@@ -5100,12 +5190,13 @@ def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
                 )
 
     for required in (
-        "python3 trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
-        "python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py",
+        "python3 -I trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
+        "python3 -I trusted-cargo-audit/.github/scripts/check_cargo_audit.py",
         "--policy trusted-cargo-audit/.github/cargo-audit-policy.json",
         '--source-root "$GITHUB_WORKSPACE"',
     ):
-        if required not in text:
+        legacy = required.replace("python3 -I ", "python3 ")  # ISSUE_562_LEGACY
+        if required not in text and legacy not in text:
             violations.append(
                 f"security.yml: trusted cargo-audit policy runner is missing {required!r}"
             )
@@ -6119,7 +6210,7 @@ def main(argv: list[str] | None = None) -> int:
     for rename_sensitive_workflow, trusted_invocation, expected_count in (
         (
             "rust-ci.yml",
-            "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
+            "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py",
             2,
         ),
         (
@@ -6129,7 +6220,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         (
             "validate-pr.yml",
-            "result=$(python3 trusted-scope/.github/scripts/changed_files.py",
+            "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py",
             1,
         ),
     ):
@@ -6168,7 +6259,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
-    if 'result=$(python3 "$helper"' not in state_guard:
+    if not any(  # ISSUE_562_LEGACY: the second form
+        invocation in state_guard
+        for invocation in ('result=$(python3 -I "$helper"', 'result=$(python3 "$helper"')
+    ):
         violations.append(
             "state-guard.yml: classifier execution must use the trusted helper variable"
         )

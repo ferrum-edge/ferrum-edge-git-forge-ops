@@ -7948,5 +7948,119 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         ]
 
 
+class Issue562RolloutTests(unittest.TestCase):
+    """Step 1 of #562 pins the new workflow forms and keeps the reviewed ones.
+
+    The protected checker judges every candidate's workflows, so the pinned
+    jobs gain `timeout-minutes` and `python3 -I` in a later pull request than
+    their pins. Both forms pass here; a half-switched job does not.
+    """
+
+    @staticmethod
+    def _after_job_header(text: str, job: str, minutes: int) -> str:
+        header = f"  {job}:\n"
+        start = text.index(header)
+        runs_on = text.index("    runs-on: ubuntu-26.04\n", start)
+        end = runs_on + len("    runs-on: ubuntu-26.04\n")
+        return text[:end] + f"    timeout-minutes: {minutes}\n" + text[end:]
+
+    def _switched_rust_ci(self, floor: int = 87) -> str:
+        text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
+        text = self._after_job_header(text, "rust-ci-check", 45)
+        text = self._after_job_header(text, "coverage", 45)
+        text = text.replace("python3 trusted-scope/", "python3 -I trusted-scope/")
+        return text.replace(
+            "--output-path lcov.info\n",
+            f"--output-path lcov.info --fail-under-lines {floor}\n",
+            1,
+        )
+
+    def test_rust_ci_accepts_the_reviewed_and_the_switched_job(self):
+        reviewed = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(reviewed), [])
+        switched = self._switched_rust_ci()
+        self.assertNotEqual(switched, reviewed)
+        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(switched), [])
+
+        half = self._after_job_header(reviewed, "rust-ci-check", 45)
+        self.assertTrue(
+            any(
+                "rust-ci-check must keep its reviewed header" in item
+                for item in check_supply_chain.rust_ci_test_scope_violations(half)
+            )
+        )
+
+    def test_coverage_floor_cannot_drop_below_the_measured_baseline(self):
+        lowered = self._switched_rust_ci(check_supply_chain.COVERAGE_LINE_FLOOR - 1)
+        violations = check_supply_chain.rust_ci_test_scope_violations(lowered)
+        self.assertTrue(any("may not drop below" in item for item in violations), violations)
+        raised = self._switched_rust_ci(check_supply_chain.COVERAGE_LINE_FLOOR + 5)
+        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(raised), [])
+
+    def test_validate_pr_accepts_the_reviewed_and_the_switched_jobs(self):
+        reviewed = (ROOT / ".github/workflows/validate-pr.yml").read_text(encoding="utf-8")
+        self.assertEqual(check_supply_chain.required_static_validation_violations(reviewed), [])
+        switched = reviewed.replace("python3 trusted-scope/", "python3 -I trusted-scope/")
+        for job, minutes in (
+            ("scope", 10),
+            ("list-envs", 30),
+            ("validate", 45),
+            ("gitforgeops-required-static-validation", 10),
+        ):
+            switched = self._after_job_header(switched, job, minutes)
+        self.assertEqual(check_supply_chain.required_static_validation_violations(switched), [])
+
+        # The isolated classifier without the job timeouts is neither form.
+        half = reviewed.replace("python3 trusted-scope/", "python3 -I trusted-scope/")
+        self.assertTrue(check_supply_chain.required_static_validation_violations(half))
+
+    def test_cargo_audit_accepts_the_reviewed_and_the_switched_job(self):
+        reviewed = (ROOT / ".github/workflows/security.yml").read_text(encoding="utf-8")
+        switched = self._after_job_header(reviewed, "security-cargo-audit", 20).replace(
+            "  python3 ", "  python3 -I "
+        )
+        for text in (reviewed, switched):
+            self.assertEqual(check_supply_chain.trusted_cargo_audit_policy_violations(text), [])
+        timed_only = self._after_job_header(reviewed, "security-cargo-audit", 20)
+        self.assertTrue(check_supply_chain.cargo_audit_job_shape_violations(timed_only))
+
+    def test_interpreter_flags_do_not_hide_the_candidate_classifier(self):
+        for invocation in (
+            "result=$(python3 -I .github/scripts/changed_files.py",
+            "result=$(python3 -I -B ./.github/scripts/changed_files.py",
+        ):
+            text = (
+                "ref: ${{ github.event.repository.default_branch }}\n"
+                "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py\n"
+                "result='{\"complete\":false,\"matches\":true}'\n"
+                f"{invocation}\n"
+            )
+            violations = check_supply_chain.trusted_classifier_violations(
+                "rust-ci.yml",
+                text,
+                "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py",
+                1,
+            )
+            self.assertTrue(any("candidate-branch" in item for item in violations), violations)
+
+    def test_credential_handoff_accepts_the_isolated_bundle_loader(self):
+        legacy = tuple(
+            line.replace("python3 -I ", "python3 ")
+            for line in check_supply_chain.CREDENTIAL_HANDOFF_RUN
+        )
+        self.assertNotEqual(legacy, check_supply_chain.CREDENTIAL_HANDOFF_RUN)
+        for shape in (legacy, check_supply_chain.CREDENTIAL_HANDOFF_RUN):
+            step = {
+                "name": "Load credential bundles",
+                "env": {"FERRUM_CREDS_BUNDLE": "${{ secrets.FERRUM_CREDS_BUNDLE }}"},
+                "run": "\n".join(shape),
+            }
+            self.assertIsNone(
+                check_supply_chain._credential_handoff_refusal(
+                    ".github/workflows/rotate.yml", {}, {}, step
+                )
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
