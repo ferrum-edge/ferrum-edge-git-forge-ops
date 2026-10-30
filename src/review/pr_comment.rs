@@ -838,10 +838,10 @@ pub fn render_mesh_retraction(publication: MeshPublication, output_path: &str) -
 const MAX_EMPTY_SELECTION_NAMESPACES: usize = 10;
 
 /// The note a review whose namespace filter selected no desired resources
-/// carries on its environment banner (#562). `plan`, `diff` and `apply`
-/// refuse the same selection; review only reports it, so the comment still
-/// posts and default review exits 0. Names are fenced and bounded, because
-/// on-disk namespace directories come from the pull request.
+/// carries on its environment banner (#562). `validate`, `plan`, `diff`,
+/// `apply` and `export` refuse the same selection; review only reports it, so
+/// the comment still posts and default review exits 0. Names are fenced and
+/// bounded, because on-disk namespace directories come from the pull request.
 pub fn render_empty_namespace_selection(scope: &crate::config::NamespaceScope) -> String {
     let filter = bounded_inline_code(scope.filter.as_deref().unwrap_or("<unset>"));
     let mut namespaces: Vec<String> = scope
@@ -859,9 +859,9 @@ pub fn render_empty_namespace_selection(scope: &crate::config::NamespaceScope) -
     }
     format!(
         "\n\n**Namespace filter selected nothing** — filter {filter} selected 0 desired \
-         resources while the tree holds {} in namespace(s) {}. `plan` and `apply` refuse \
-         this selection unless `--allow-empty-namespace` is passed; this review compared \
-         an empty desired set.",
+         resources while the tree holds {} in namespace(s) {}. `validate`, `plan`, `diff`, \
+         `apply` and `export` refuse this selection unless `--allow-empty-namespace` is \
+         passed; this review compared an empty desired set.",
         scope.on_disk_count,
         namespaces.join(", ")
     )

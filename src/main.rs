@@ -4131,8 +4131,9 @@ async fn cmd_review(
     let file_publication_narrowed =
         file_publication_narrowed(&env_config, &resolved, &assembled.namespace_scope);
     // Review never refuses an empty selection (its comment must still post
-    // and default review exits 0), but the same filter refuses `plan` and
-    // `apply`, so it says so on stderr and on the comment's banner (#562).
+    // and default review exits 0), but the same filter refuses `validate`,
+    // `plan`, `diff`, `apply` and `export`, so it says so on stderr and on
+    // the comment's banner (#562).
     let namespace_warning = assembled.namespace_scope.desired_finding(true);
     if let Some(finding) = &namespace_warning {
         print_namespace_finding(finding);
