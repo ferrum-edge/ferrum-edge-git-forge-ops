@@ -217,8 +217,319 @@ fn file_mode_checks_the_output_path_instead_of_gateway_credentials() {
         ..EnvConfig::default()
     };
     let checks = doctor::local::run(dir.path(), Some(&env));
-    assert_eq!(find(&checks, "file-output").status, Status::Fail);
+    // File publication creates missing parents (`create_dir_all`), so a
+    // missing parent under a writable ancestor is not a blocker.
+    let output = find(&checks, "file-output");
+    assert_eq!(output.status, Status::Pass, "{output:?}");
+    assert!(output.detail.contains("created"), "{output:?}");
     assert!(ids(&checks).iter().all(|id| *id != "gateway-url"));
+}
+
+fn file_env(path: &std::path::Path) -> EnvConfig {
+    EnvConfig {
+        gateway_mode: GatewayMode::File,
+        file_output_path: path.display().to_string(),
+        ..EnvConfig::default()
+    }
+}
+
+#[test]
+fn a_file_output_ancestor_that_is_a_file_fails() {
+    let dir = repo(&[("blocker", "not a directory\n")]);
+    let env = file_env(&dir.path().join("blocker/out/resources.yaml"));
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    let output = find(&checks, "file-output");
+    assert_eq!(output.status, Status::Fail, "{output:?}");
+}
+
+/// The publication primitive writes straight to an existing non-regular
+/// destination, so a directory there fails it ("Is a directory").
+#[test]
+fn a_file_output_destination_that_is_a_directory_fails() {
+    let dir = repo(&[]);
+    let destination = dir.path().join("assembled/resources.yaml");
+    std::fs::create_dir_all(&destination).expect("directory destination");
+    let checks = doctor::local::run(dir.path(), Some(&file_env(&destination)));
+    let output = find(&checks, "file-output");
+    assert_eq!(output.status, Status::Fail, "{output:?}");
+    assert!(output.detail.contains("is a directory"), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_output_destination_symlinked_to_a_directory_fails() {
+    let dir = repo(&[]);
+    std::fs::create_dir_all(dir.path().join("target-dir")).expect("target");
+    std::fs::create_dir_all(dir.path().join("assembled")).expect("parent");
+    let destination = dir.path().join("assembled/resources.yaml");
+    std::os::unix::fs::symlink(dir.path().join("target-dir"), &destination).expect("symlink");
+    let checks = doctor::local::run(dir.path(), Some(&file_env(&destination)));
+    let output = find(&checks, "file-output");
+    assert_eq!(output.status, Status::Fail, "{output:?}");
+    assert!(output.detail.contains("is a directory"), "{output:?}");
+}
+
+/// A device is written directly, never through a temp file in its parent, so
+/// `/dev`'s own writability is irrelevant: the device's is what counts.
+#[cfg(unix)]
+#[test]
+fn a_file_output_device_destination_is_judged_by_its_own_writability() {
+    let dir = repo(&[]);
+    let checks = doctor::local::run(
+        dir.path(),
+        Some(&file_env(std::path::Path::new("/dev/null"))),
+    );
+    let output = find(&checks, "file-output");
+    assert_eq!(output.status, Status::Pass, "{output:?}");
+    assert!(output.detail.contains("written directly"), "{output:?}");
+}
+
+/// Set `path`'s mode and report whether the restriction is observable: as
+/// root, permission bits refuse nothing and the test has nothing to show.
+#[cfg(unix)]
+fn restricted_dir(path: &std::path::Path, mode: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    let probe = path.join(".doctor-root-probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn restore_dir(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_output_parent_that_is_not_writable_fails() {
+    let dir = repo(&[]);
+    let parent = dir.path().join("assembled");
+    std::fs::create_dir_all(&parent).expect("parent");
+    if !restricted_dir(&parent, 0o555) {
+        restore_dir(&parent);
+        return;
+    }
+    let direct = doctor::local::run(dir.path(), Some(&file_env(&parent.join("resources.yaml"))));
+    // ...and the same for a missing parent whose nearest existing ancestor
+    // is not writable.
+    let nested = doctor::local::run(
+        dir.path(),
+        Some(&file_env(&parent.join("deeper/resources.yaml"))),
+    );
+    restore_dir(&parent);
+    for checks in [direct, nested] {
+        let output = find(&checks, "file-output");
+        assert_eq!(output.status, Status::Fail, "{output:?}");
+        assert!(output.detail.contains("not writable"), "{output:?}");
+    }
+}
+
+// -- the resource tree loads as the commands load it -------------------------
+
+const LOADABLE_PROXY: &str =
+    "kind: Proxy\nspec:\n  id: app\n  backend_host: app.internal\n  backend_port: 8080\n";
+
+#[test]
+fn a_tree_that_loads_passes_the_resource_load_check() {
+    let dir = repo(&[("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY)]);
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    let load = find(&checks, "resource-load");
+    assert_eq!(load.status, Status::Pass, "{load:?}");
+    assert_eq!(load.environment.as_deref(), Some("default"));
+}
+
+#[test]
+fn a_resource_file_that_does_not_parse_fails_the_resource_load_check() {
+    let dir = repo(&[
+        (
+            ".gitforgeops/config.yaml",
+            "version: 1\nenvironments:\n  production: {}\n",
+        ),
+        (
+            "resources/ferrum/proxies/app.yaml",
+            "kind: Proxy\nspec: [\n",
+        ),
+    ]);
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    let load = find(&checks, "resource-load");
+    assert_eq!(load.status, Status::Fail, "{load:?}");
+    assert_eq!(load.environment.as_deref(), Some("production"));
+    assert!(load.detail.contains("app.yaml"), "{load:?}");
+    assert!(load.remediation.is_some());
+}
+
+#[test]
+fn an_unknown_field_fails_the_resource_load_check() {
+    let dir = repo(&[(
+        "resources/ferrum/proxies/app.yaml",
+        "kind: Proxy\nspec:\n  id: app\n  backend_host: a\n  backend_port: 1\n  bogus: 1\n",
+    )]);
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    assert_eq!(find(&checks, "resource-load").status, Status::Fail);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_namespace_directory_fails_the_resource_load_check() {
+    let dir = repo(&[("elsewhere/proxies/app.yaml", LOADABLE_PROXY)]);
+    std::fs::create_dir_all(dir.path().join("resources")).expect("resources");
+    std::os::unix::fs::symlink(
+        dir.path().join("elsewhere"),
+        dir.path().join("resources/ferrum"),
+    )
+    .expect("symlink");
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    let load = find(&checks, "resource-load");
+    assert_eq!(load.status, Status::Fail, "{load:?}");
+    assert!(load.detail.contains("symbolic link"), "{load:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_resources_directory_fails_rather_than_reading_as_empty() {
+    let dir = repo(&[("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY)]);
+    let resources = dir.path().join("resources");
+    if !restricted_dir(&resources, 0o000) {
+        restore_dir(&resources);
+        return;
+    }
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    restore_dir(&resources);
+    for id in ["resources", "resource-load"] {
+        let check = find(&checks, id);
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+    }
+}
+
+#[test]
+fn a_missing_resources_directory_is_one_failure_not_two() {
+    let dir = repo(&[]);
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    assert_eq!(find(&checks, "resources").status, Status::Fail);
+    assert_eq!(find(&checks, "resource-load").status, Status::Skipped);
+}
+
+#[test]
+fn the_resource_load_check_applies_each_environments_overlay() {
+    let dir = repo(&[
+        (
+            ".gitforgeops/config.yaml",
+            "version: 1\nenvironments:\n  staging: {}\n  production:\n    overlay: production\n",
+        ),
+        ("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY),
+        (
+            "overlays/production/ferrum/proxies/app.yaml",
+            "kind: Proxy\nspec:\n  id: app\n  bogus: 1\n",
+        ),
+    ]);
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    let loads: Vec<&Check> = checks
+        .iter()
+        .filter(|check| check.id == "resource-load")
+        .collect();
+    assert_eq!(loads.len(), 2, "{loads:?}");
+    for load in loads {
+        let expected = match load.environment.as_deref() {
+            Some("production") => Status::Fail,
+            Some("staging") => Status::Pass,
+            other => panic!("unexpected environment {other:?}"),
+        };
+        assert_eq!(load.status, expected, "{load:?}");
+    }
+}
+
+/// `validate`, `plan`, `diff`, `apply` and `export` refuse a namespace filter
+/// that selects nothing from a non-empty tree; so does `resource-load`.
+#[test]
+fn a_namespace_filter_that_selects_nothing_fails_the_resource_load_check() {
+    // From FERRUM_NAMESPACE, on the synthetic environment.
+    let dir = repo(&[("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY)]);
+    let env = EnvConfig {
+        namespace_filter: Some("typo".to_string()),
+        ..api_env()
+    };
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    let load = find(&checks, "resource-load");
+    assert_eq!(load.status, Status::Fail, "{load:?}");
+    assert!(load.detail.contains("'typo'"), "{load:?}");
+    assert!(load.detail.contains("selected 0"), "{load:?}");
+
+    // From an environment's own `namespace_filter`.
+    let dir = repo(&[
+        (
+            ".gitforgeops/config.yaml",
+            "version: 1\nenvironments:\n  production:\n    namespace_filter: typo\n",
+        ),
+        ("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY),
+    ]);
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    let load = find(&checks, "resource-load");
+    assert_eq!(load.status, Status::Fail, "{load:?}");
+    assert_eq!(load.environment.as_deref(), Some("production"));
+    assert!(load.detail.contains("'typo'"), "{load:?}");
+
+    // A filter that matches still passes.
+    let env = EnvConfig {
+        namespace_filter: Some("ferrum".to_string()),
+        ..api_env()
+    };
+    let dir = repo(&[("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY)]);
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    assert_eq!(find(&checks, "resource-load").status, Status::Pass);
+}
+
+// -- overlays are resolved as the commands resolve them ----------------------
+
+#[test]
+fn a_missing_overlay_selected_by_ferrum_overlay_fails() {
+    // No repository config: the synthetic environment takes FERRUM_OVERLAY.
+    let dir = repo(&[("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY)]);
+    let env = EnvConfig {
+        overlay: Some("staging".to_string()),
+        ..api_env()
+    };
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    let overlays = find(&checks, "overlays");
+    assert_eq!(overlays.status, Status::Fail, "{overlays:?}");
+    assert!(overlays.detail.contains("FERRUM_OVERLAY"), "{overlays:?}");
+
+    // A configured environment without its own overlay falls back to it too.
+    let dir = repo(&[(
+        ".gitforgeops/config.yaml",
+        "version: 1\nenvironments:\n  production: {}\n",
+    )]);
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    assert_eq!(find(&checks, "overlays").status, Status::Fail);
+}
+
+// -- the validator must be executable ----------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn a_validator_binary_without_the_execute_bit_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = repo(&[("bin/ferrum-edge", "#!/bin/sh\nexit 0\n")]);
+    let binary = dir.path().join("bin/ferrum-edge");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let env = EnvConfig {
+        edge_binary_path: binary.display().to_string(),
+        ..api_env()
+    };
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    let check = find(&checks, "validator-binary");
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.detail.contains("not executable"), "{check:?}");
+
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    assert_eq!(find(&checks, "validator-binary").status, Status::Pass);
 }
 
 // -- unknown is not a pass -------------------------------------------------
@@ -260,6 +571,152 @@ fn github_checks_without_the_state_writer_app_id_are_unknown() {
         },
     );
     assert_eq!(find(&checks, "settings-audit").status, Status::Unknown);
+}
+
+#[test]
+fn a_non_integer_state_writer_app_id_fails_before_the_auditor_runs() {
+    // Doctor accepts only a canonical numeric App id (ASCII digits). That is
+    // stricter than argparse's `type=int`, which also takes Unicode decimal
+    // digits, so the detail must not claim the scheduled audit fails too.
+    let dir = repo(&[]);
+    for app_id in ["abc", "4.2", "0x2a", "42abc", "4__2", "\u{0664}\u{0662}"] {
+        let checks = doctor::github::run(
+            dir.path(),
+            &doctor::github::GithubContext {
+                repository: Some("acme/repo".to_string()),
+                token: Some("token".to_string()),
+                state_writer_app_id: Some(app_id.to_string()),
+                template_repo: false,
+            },
+        );
+        let check = find(&checks, "settings-audit");
+        assert_eq!(check.status, Status::Fail, "{app_id}: {check:?}");
+        assert!(
+            check.detail.contains("not a canonical numeric App id"),
+            "{check:?}"
+        );
+        assert!(!check.detail.contains("settings-audit.yml"), "{check:?}");
+        assert!(
+            check.detail.contains("GITFORGEOPS_STATE_APP_ID"),
+            "{check:?}"
+        );
+    }
+}
+
+#[test]
+fn the_unknown_detail_is_the_auditors_last_meaningful_line() {
+    // argparse prints usage first and the error last; a traceback puts the
+    // exception last.
+    let checks = doctor::github::audit_checks(
+        false,
+        "",
+        "usage: -c [-h] --repo REPO [--branch BRANCH]\n\
+         -c: error: argument --release-tag-pattern: expected one argument\n",
+    );
+    let check = find(&checks, "settings-audit");
+    assert_eq!(check.status, Status::Unknown, "{check:?}");
+    assert!(check.detail.contains("expected one argument"), "{check:?}");
+    // Not a token problem, so the remedy does not blame the token.
+    let remediation = check.remediation.as_deref().expect("remediation");
+    assert!(!remediation.contains("GH_TOKEN"), "{remediation}");
+
+    let checks = doctor::github::audit_checks(
+        false,
+        "",
+        "Traceback (most recent call last):\n  File \"<string>\", line 1\n\
+         KeyError: 'environments'\n",
+    );
+    assert!(find(&checks, "settings-audit")
+        .detail
+        .contains("KeyError: 'environments'"));
+}
+
+#[test]
+fn an_auditor_api_refusal_still_points_at_the_token() {
+    let checks = doctor::github::audit_checks(
+        false,
+        "",
+        "settings audit failed closed: GitHub API request failed for \
+         repos/acme/repo/rulesets: gh: Resource not accessible by integration (HTTP 403)\n",
+    );
+    let check = find(&checks, "settings-audit");
+    assert_eq!(check.status, Status::Unknown);
+    assert!(check
+        .remediation
+        .as_deref()
+        .is_some_and(|text| text.contains("GH_TOKEN")));
+}
+
+#[test]
+fn an_auditor_exit_zero_without_its_success_line_is_unknown() {
+    let checks = doctor::github::audit_checks(
+        true,
+        "Repository protection evidence:\n  PASS: something is fine\n",
+        "",
+    );
+    let check = find(&checks, "settings-audit");
+    assert_eq!(check.status, Status::Unknown, "{check:?}");
+    assert!(
+        check.detail.contains(doctor::github::AUDIT_SUCCESS_LINE),
+        "{check:?}"
+    );
+}
+
+#[test]
+fn the_bundled_auditor_prints_the_success_line_doctor_requires() {
+    let auditor = include_str!("../../.github/scripts/audit_settings.py");
+    let definition = format!(
+        "AUDIT_SUCCESS_LINE = \"{}\"",
+        doctor::github::AUDIT_SUCCESS_LINE
+    );
+    assert!(auditor.contains(&definition), "{definition}");
+    assert!(auditor.contains("print(AUDIT_SUCCESS_LINE)"));
+}
+
+#[test]
+fn the_github_context_reads_blank_variables_as_unset() {
+    use std::collections::BTreeMap;
+    let context = |vars: &[(&str, &str)], repo: Option<&str>, app: Option<&str>| {
+        let vars: BTreeMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        doctor::github::GithubContext::from_lookup(repo, app, |name| vars.get(name).cloned())
+    };
+    let ctx = context(
+        &[
+            ("GH_TOKEN", ""),
+            ("GITHUB_TOKEN", "fallback"),
+            ("GITHUB_REPOSITORY", " "),
+            ("GITFORGEOPS_STATE_APP_ID", ""),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(ctx.token.as_deref(), Some("fallback"));
+    assert_eq!(ctx.repository, None);
+    assert_eq!(ctx.state_writer_app_id, None);
+    assert!(!ctx.template_repo);
+
+    let ctx = context(
+        &[
+            ("GH_TOKEN", "primary"),
+            ("GITHUB_TOKEN", "fallback"),
+            ("GITHUB_REPOSITORY", "acme/env"),
+            ("GITFORGEOPS_TEMPLATE_REPO", "True"),
+        ],
+        Some("acme/flag"),
+        Some("7"),
+    );
+    assert_eq!(ctx.token.as_deref(), Some("primary"));
+    assert_eq!(ctx.repository.as_deref(), Some("acme/flag"));
+    assert_eq!(ctx.state_writer_app_id.as_deref(), Some("7"));
+    assert!(ctx.template_repo);
+
+    // The workflow compares the lowercased value byte for byte: surrounding
+    // space is not "true".
+    let ctx = context(&[("GITFORGEOPS_TEMPLATE_REPO", " true")], None, None);
+    assert!(!ctx.template_repo);
 }
 
 #[test]

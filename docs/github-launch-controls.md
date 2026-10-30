@@ -1128,7 +1128,9 @@ GH_TOKEN=<administration-read-token> python3 .github/scripts/audit_settings.py \
   --required-check 'validate-trusted-policy'
 ```
 
-`--required-check` may be omitted; those seven contexts are the default. Until
+`--required-check` may be omitted; those seven contexts are the default.
+`--branch` may be omitted too: the audit then reads the repository's default
+branch from its metadata, the same value `settings-audit.yml` passes. Until
 the [ruleset switch](#switching-the-supply-chain-policy-check), a ruleset
 without `trusted-supply-chain-policy` or `validate-trusted-policy` is reported
 as a `WARN`, not a failure.

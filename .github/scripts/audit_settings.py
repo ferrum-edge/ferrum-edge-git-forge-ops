@@ -13,6 +13,11 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 
+# Printed last, and only when every control holds. `gitforgeops doctor`
+# (src/doctor/github.rs `AUDIT_SUCCESS_LINE`) requires this exact line before
+# it reports the audit as passed, so an exit status alone never counts.
+AUDIT_SUCCESS_LINE = "All launch protection controls are active."
+
 ALLOWED_ACTION_PATTERNS = {
     "aquasecurity/setup-trivy@*",
     "aquasecurity/trivy-action@*",
@@ -831,10 +836,28 @@ def run(
     return audit
 
 
+def default_branch(repo: str) -> str:
+    """The repository's default branch, as settings-audit.yml passes it."""
+    metadata = gh_json(f"repos/{repo}")
+    branch = metadata.get("default_branch") if isinstance(metadata, dict) else None
+    if not isinstance(branch, str) or not branch.strip():
+        raise RuntimeError(
+            f"repository metadata for {repo} has no default_branch; pass --branch"
+        )
+    return branch
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--branch", default="main")
+    parser.add_argument(
+        "--branch",
+        help=(
+            "branch the main ruleset must protect; defaults to the repository's "
+            "default branch, read from its metadata (settings-audit.yml passes "
+            "the same value explicitly)"
+        ),
+    )
     parser.add_argument("--required-check", action="append", default=[])
     parser.add_argument("--state-writer-app-id", type=int)
     parser.add_argument("--release-tag-pattern", default=RELEASE_TAG_PATTERN)
@@ -870,9 +893,10 @@ def main() -> int:
         )
         return 1
     try:
+        branch = args.branch if args.branch is not None else default_branch(args.repo)
         audit = run(
             args.repo,
-            args.branch,
+            branch,
             required_checks,
             args.state_writer_app_id,
             args.release_tag_pattern,
@@ -901,7 +925,7 @@ def main() -> int:
         for item in audit.violations:
             print(f"  FAIL: {item}", file=sys.stderr)
         return 1
-    print("All launch protection controls are active.")
+    print(AUDIT_SUCCESS_LINE)
     return 0
 
 

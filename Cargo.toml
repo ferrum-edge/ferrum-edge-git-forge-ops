@@ -50,6 +50,12 @@ ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed2
 # in the destination directory.
 tempfile = "3"
 
+[target.'cfg(unix)'.dependencies]
+# Already in the tree through `tempfile`. Taken directly for its safe
+# `access(2)` wrapper: `doctor` asks whether the validator is executable and
+# the file-mode output directory writable without writing anything.
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 # Test-only gateway oracle: the gateway still reads YAML with serde_yaml 0.9, so
 # tests/unit/yaml_compat_tests.rs and the export readback tests check src/yaml.rs

@@ -1395,13 +1395,44 @@ misconfigured?" without provisioning anything.
    and `settings-audit.yml` schedules — and republishing each violation as a
    `settings-control` check. Doctor runs the copy compiled into its binary
    (`python3 -I -c`), never the checkout's, with only `GH_TOKEN` and what
-   `python3`/`gh` need.
+   `python3`/`gh` need. It decides arguments as `settings-audit.yml` does:
+   `--template-repo` exactly when `GITFORGEOPS_TEMPLATE_REPO` lowercases to
+   `true` (never from a missing `config.yaml`), otherwise
+   `--state-writer-app-id`, refused as a `Fail` unless it is a canonical
+   numeric App id (ASCII digits; stricter than Python's `int()`, so a refusal
+   does not imply the scheduled audit fails); no `--branch`, so the auditor reads the repository's default
+   branch. A pass needs exit 0 **and** the auditor's `AUDIT_SUCCESS_LINE`
+   (shared constant, pinned by a test); a failed run's `Unknown` quotes its
+   last meaningful stderr line and blames `GH_TOKEN` only for token failures.
+   Blank `GH_TOKEN`, `GITHUB_REPOSITORY`, `--repo` and app-id values are unset
+   (`GithubContext::from_lookup`).
 
 Scopes are trust boundaries: `local` (no credential), `github`
 (administration-read token), `gateway` (that environment's deployment
 credentials, reads only). Default `local,github`; gateway is opt-in. Credentials
 are reported by presence only (`Check::secret_presence` says presence is not
 correctness). A 401 remediation prints the four JWT claim settings to compare.
+
+- `process-env` is a local check. `resource-load` runs, per environment
+  resolved as the commands resolve it, `pipeline::load_and_assemble` — the
+  offline boundary every command crosses (no bundle, state, lock or network) —
+  and fails on what it refuses, including a namespace filter that selects
+  nothing from a non-empty tree (`desired_finding(false)`; doctor takes no
+  `--allow-empty-namespace`); an unreadable `resources/` fails, a missing
+  one is reported once. `overlays` uses `validate_overlay_selection`, so a
+  missing `FERRUM_OVERLAY` selection fails.
+- `file-output` mirrors `apply::file_target`: an existing destination that is
+  a directory (symlinks followed) fails; another non-regular one (a device, a
+  FIFO) is written directly, so only its own write permission counts;
+  otherwise the nearest existing ancestor must be writable (publication runs
+  `create_dir_all`, then a temp file and rename). Permissions come from
+  `faccessat(AT_EACCESS)` via `rustix` (effective ids; `access(2)` only where
+  that is unavailable), never by writing. `validator-binary` requires the
+  execute permission on Unix.
+- The gateway scope is `Skipped` when `GITFORGEOPS_TEMPLATE_REPO=true`, on a
+  checkout without `config.yaml` and with neither the gateway URL nor the
+  signing secret (one alone is an incomplete deployment, reported `Unknown`),
+  and in file mode, decided before the tree is assembled for the token scope.
 
 ### Preview verdicts (`src/verdict.rs`)
 
