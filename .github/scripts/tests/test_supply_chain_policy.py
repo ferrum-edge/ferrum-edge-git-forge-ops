@@ -8212,6 +8212,43 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             )
         )
 
+    def test_reusable_callers_carry_no_budget_and_app_token_jobs_are_ledgers(self):
+        caller = self._document(
+            "on: push\njobs:\n  call:\n"
+            "    uses: org/repo/.github/workflows/x.yml@" + "a" * 40 + "\n"
+        )
+        self.assertEqual(check_supply_chain.job_timeout_violations("x.yml", caller), [])
+        minted = self._document(
+            "on: push\njobs:\n  ship:\n    runs-on: ubuntu-26.04\n"
+            "    timeout-minutes: 100\n    steps:\n"
+            "      - name: Apply\n        run: true\n"
+            "      - name: Mint\n        timeout-minutes: 2\n"
+            "        uses: actions/create-github-app-token@" + "b" * 40 + "\n"
+        )
+        self.assertTrue(
+            any(
+                "every step needs" in item
+                for item in check_supply_chain.job_timeout_violations("x.yml", minted)
+            )
+        )
+
+    def test_a_python_shell_must_be_isolated(self):
+        def workflow(shell):
+            return self._document(
+                "on: push\njobs:\n  check:\n    runs-on: ubuntu-26.04\n"
+                "    timeout-minutes: 5\n    steps:\n"
+                f"      - shell: {shell}\n        run: print(1)\n"
+            )
+
+        for shell in ("python", "python3 {0}", "/usr/bin/python3 -u {0}"):
+            self.assertTrue(
+                check_supply_chain.python_isolation_violations("x.yml", workflow(shell)), shell
+            )
+        for shell in ("python3 -I {0}", "bash"):
+            self.assertEqual(
+                check_supply_chain.python_isolation_violations("x.yml", workflow(shell)), [], shell
+            )
+
     def test_local_actions_run_python_isolated(self):
         def violations(script):
             action = check_supply_chain.parse_workflow(
@@ -8241,6 +8278,9 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["python3 - <<'PY'", "print(1)", "PY"],
             ["true && python3 -c 'pass'"],
             ["/usr/bin/python3 -c 'import sys'"],
+            ["./venv/bin/python3 x.py"],
+            ["pypy3 x.py"],
+            ["python3 -u x.py -I"],
             ["bash <<'SH'", "python3 x.py", "SH"],
             ["python3 -I - <<'PY'", "print(1)", "PY", "python3 y.py"],
         ):
@@ -8254,6 +8294,8 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["python3 -I -m unittest discover -s tests"],
             ["# a plain `python3 -` would put the workspace first"],
             ["/usr/bin/python3 -I -c 'import sys'"],
+            ["python3 -u -I x.py"],
+            ["python3 -Is x.py"],
             ["python3 -I - \"$CHECKER\" <<'PY'", "print('python')", "import python3", "PY"],
             ["echo done"],
         ):

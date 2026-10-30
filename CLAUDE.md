@@ -188,12 +188,14 @@ cargo fmt --all && cargo fmt --all -- --check
   namespaces never enter the privileged live-read boundary.
 - Rust is pinned to 1.99.1 in `rust-toolchain.toml`. External Actions use full
   commit SHAs.
-- Every workflow job declares a literal `timeout-minutes` (at most 120;
-  `job_timeout_violations`). A job that commits the state ledger gives every
-  step its own timeout and a job budget of at least their sum plus 5 minutes,
-  because a job timeout cancels the job and skips the `!cancelled()` ledger
-  commit. Every workflow interpreter is `python3 -I`
-  (`python_isolation_violations`). `rust-ci.yml` coverage runs with
+- Every workflow job declares a literal `timeout-minutes`
+  (`job_timeout_violations`): at most 120, or 360 for a job that commits the
+  state ledger (known by job id, the state-writer key or the App-token
+  action). Such a job gives every step its own timeout and a budget of at
+  least their sum plus 5 minutes, because a job timeout cancels the job and
+  skips the `!cancelled()` ledger commit. Reusable-workflow call jobs carry
+  none (GitHub refuses it). Every workflow and local-action interpreter,
+  including a Python `shell:`, is `python3 -I` (`python_isolation_violations`). `rust-ci.yml` coverage runs with
   `--fail-under-lines`, never below `COVERAGE_LINE_FLOOR` (87; measured 88.17%
   when introduced).
 

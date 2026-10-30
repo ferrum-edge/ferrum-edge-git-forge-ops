@@ -510,8 +510,9 @@ no compatible SSH key on GitHub, materialization fails and points to
 ### Supported hosts
 
 A production file-mode gateway, and wherever its materialized document is
-written, runs on **Linux**. macOS is a development host. Windows has no
-private publication: `write_atomically` refuses it before writing.
+written, runs on **Linux**. macOS is a development host. Windows is not
+supported for file-mode publication: no mode is applied to the gateway
+document there, and private outputs are refused before writing.
 
 Publication protects a document with POSIX mode bits only: `0640` for a new
 gateway document (an existing file's owner and group bits are kept, `other`

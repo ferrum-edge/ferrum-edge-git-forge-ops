@@ -3987,6 +3987,7 @@ LEDGER_JOBS = {
 }
 LEDGER_JOB_STEP = "Mint narrowly scoped state-writer token"
 LEDGER_JOB_SECRET = "GITFORGEOPS_STATE_APP_PRIVATE_KEY"
+LEDGER_JOB_ACTION = "actions/create-github-app-token@"
 _TIMEOUT_MINUTES = re.compile(r"[1-9][0-9]{0,2}")
 
 
@@ -4013,12 +4014,23 @@ def job_timeout_violations(workflow: str, document: dict) -> list[str]:
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
+        if "uses" in job:
+            # A reusable-workflow call job has no runner of its own and GitHub
+            # refuses `timeout-minutes` on it; the called workflow's jobs carry
+            # the budgets.
+            continue
         label = f"{workflow}: jobs.{job_name}"
         budget = _timeout_minutes(job)
         steps = job.get("steps") if isinstance(job.get("steps"), list) else []
         ledger = (
             job_name in named
             or LEDGER_JOB_SECRET in json.dumps(job)
+            or any(
+                isinstance(step, dict)
+                and isinstance(step.get("uses"), str)
+                and step["uses"].startswith(LEDGER_JOB_ACTION)
+                for step in steps
+            )
             or any(
                 isinstance(step, dict) and step.get("name") == LEDGER_JOB_STEP for step in steps
             )
@@ -4058,14 +4070,33 @@ def job_timeout_violations(workflow: str, document: dict) -> list[str]:
 # directory and keeps the working directory (often a candidate checkout) and
 # the script's directory off the import path. Every workflow interpreter
 # runs isolated; a script that needs a sibling module adds its own directory.
-_PYTHON_COMMAND = re.compile(r"(?<![\w.$-])python(?:3(?:\.\d+)?)?(?![\w.-])")
-_ISOLATED_FLAG = re.compile(r"[ \t]+-I(?=[ \t]|$)")
+_PYTHON_COMMAND = re.compile(
+    r"(?<![\w.$-])(?:pypy|python)(?:3(?:\.\d+)?)?(?![\w.-])"
+)
+# The interpreter's own options, up to its first operand. `-I` may come
+# anywhere among them, alone or in a short-option cluster (`-Is`).
+_INTERPRETER_OPTIONS = re.compile(r"(?:[ \t]+-(?!-)[A-Za-z]+)*")
+_ISOLATED_OPTION = re.compile(r"[ \t]+-[A-Za-z]*I[A-Za-z]*")
 # `python3 -I - <<'TAG'`: the body is Python source for an isolated
 # interpreter, not shell, so a word like `python` in it starts nothing.
 _ISOLATED_HEREDOC = re.compile(
-    r"python(?:3(?:\.\d+)?)?[ \t]+-I(?:[ \t]+-[A-Za-z]+)*[ \t]+-(?:[ \t]+[^<\s]+)*"
+    r"python(?:3(?:\.\d+)?)?(?:[ \t]+-[A-Za-z]+)*[ \t]+-(?:[ \t]+[^<\s]+)*"
     r"[ \t]*<<-?[ \t]*(['\"]?)(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\1"
 )
+
+
+def _shell_values(node, path: str = ""):
+    """Every `shell:` value under `node`, including `defaults.run.shell`."""
+    if isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _shell_values(item, f"{path}[{index}]")
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            if isinstance(key, str) and key.casefold() == "shell":
+                yield child, value
+            else:
+                yield from _shell_values(value, child)
 
 
 def python_isolation_violations(workflow: str, document: dict) -> list[str]:
@@ -4076,6 +4107,15 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
     a shell parse this reader does not attempt, and refusing is the safe side.
     """
     violations: list[str] = []
+    for path, shell in _shell_values(document):
+        if not isinstance(shell, str) or _PYTHON_COMMAND.search(shell) is None:
+            continue
+        options = _INTERPRETER_OPTIONS.match(shell, _PYTHON_COMMAND.search(shell).end()).group()
+        if not _ISOLATED_OPTION.search(options):
+            violations.append(
+                f"{workflow}: {path}: a Python `shell:` runs the step body unisolated; "
+                "use `python3 -I {0}` or a `run:` that invokes `python3 -I`"
+            )
     for path, script, _job in _run_scripts(document):
         heredoc_tag = None
         for line in script.split("\n"):
@@ -4086,7 +4126,8 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
             if line.lstrip().startswith("#"):
                 continue
             for match in _PYTHON_COMMAND.finditer(line):
-                if not _ISOLATED_FLAG.match(line, match.end()):
+                options = _INTERPRETER_OPTIONS.match(line, match.end()).group()
+                if not _ISOLATED_OPTION.search(options):
                     violations.append(
                         f"{workflow}: {path}: run Python as `python3 -I`, never "
                         f"{line.strip()!r}; isolated mode keeps the working directory, "
