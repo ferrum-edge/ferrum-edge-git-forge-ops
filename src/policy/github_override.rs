@@ -245,8 +245,9 @@ async fn check_override_context(
         .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
         // Bearer-token calls to api.github.com only: never follow a redirect
-        // with the token, never downgrade to http://. Pagination follows the
-        // `Link` header through fresh requests, not 3xx responses.
+        // with the token, never downgrade to http://. Pagination requests
+        // numbered pages from the fixed origin until one is empty, never a
+        // `Link` URL or a 3xx target.
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)
         .build()
