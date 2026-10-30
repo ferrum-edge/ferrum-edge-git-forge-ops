@@ -1378,22 +1378,22 @@ applied revision.
   file may be absent from split review's data checkout, which copies only
   protected configuration. Ignored build/runtime outputs elsewhere (`target/`,
   worktrees, `.state/`, `assembled/`) are not compared.
-- **Evidence.** Label events and reviews are paginated by page number from
-  the fixed origin; permission is one unpaginated read, taken again in the
-  final pass. A short page fails closed when any `Link` header may announce a
-  next page (`link_header_may_announce_next` over `next_link`: an RFC 8288
-  `next` relation in token or quoted form, any case, among space-separated
-  types, across link-values and headers). Any value that does not parse
-  unambiguously counts as one: a relation type that is neither a
-  `reg-rel-type` nor an absolute-URI `ext-rel-type` (so `rel="prev,next"`),
-  an empty target, a target or extension type outside RFC 3986 characters or
-  with an invalid percent-escape (`%GG`), two different `next` targets, or a
-  malformed entry, which never hides a later one. No `Link` URL is ever
-  requested for override evidence. SSH key discovery uses the same parser
-  over every `Link` header: it follows a same-origin, same-path `next`, and
-  refuses an ambiguous value only when the page held no compatible key. The
-  final pass re-reads the PR, labeler, **permission** (must still be
-  sufficient) and reviews.
+- **Evidence.** Label events and reviews are read by page number from the
+  fixed origin until a page returns zero items; that empty page is the only
+  proof of completeness. A short page is not the last: the next numbered page
+  is always requested and anything on it is read. A missing or failing page,
+  or the 20-page cap without an empty page, fails closed. The `Link` header is
+  neither followed nor consulted for override evidence. Permission is one
+  unpaginated read, taken again in the final pass. The final pass re-reads
+  the PR, labeler, **permission** (must still be sufficient) and reviews.
+- **SSH key discovery** (availability only) uses the strict RFC 8288 parser
+  `github_override::next_link` over every `Link` header. A relation type that
+  is neither a `reg-rel-type` nor an absolute-URI `ext-rel-type` (so
+  `rel="prev,next"`), an empty target, a target or extension type outside
+  RFC 3986 characters or with an invalid percent-escape (`%GG`), two
+  different `next` targets, or a malformed entry (which never hides a later
+  one) is `Ambiguous`. Discovery follows a same-origin, same-path `next` and
+  refuses an ambiguous value only when the page held no compatible key.
 - **Committed findings only.** api-mode apply re-evaluates policy after
   credential resolution. The override covers a blocking finding there only if
   the unresolved (committed) document's evaluation had the same rule,

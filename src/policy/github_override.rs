@@ -470,37 +470,23 @@ where
 /// "latest" = highest page, later index within a page. We scan pages in order
 /// and keep the most recent matching add event, tracking whether a later
 /// unlabel supersedes it.
-const MAX_ISSUE_EVENT_PAGES: usize = 20;
-const PAGE_SIZE: usize = 100;
-
-/// Decide whether a numbered page ends the listing.
 ///
-/// A short page ends it only when no `Link` header announces a next page. A
-/// short page that still claims `rel="next"` contradicts itself (GitHub may cap
-/// `per_page` below the request, or the listing moved), so the read fails
-/// closed instead of treating the history as complete. The announced URL is
-/// never requested: the next read is always the next numbered page from the
-/// fixed origin.
-fn page_is_last(items: usize, announces_next: bool, what: &str) -> crate::error::Result<bool> {
-    match (items < PAGE_SIZE, announces_next) {
-        (false, _) => Ok(false),
-        (true, false) => Ok(true),
-        (true, true) => Err(crate::error::Error::Config(format!(
-            "override {what} page is short but GitHub announces a next page; refusing an incomplete history"
-        ))),
-    }
-}
+/// Completeness is proven by data, never by headers: numbered pages are read
+/// from the fixed origin until one returns zero items. A short page is not
+/// taken as the last (GitHub may cap `per_page`, or the listing may grow
+/// while it is read), so the next numbered page is always requested too, and
+/// anything it holds is read. Reaching the page cap without an empty page
+/// fails closed.
+const MAX_ISSUE_EVENT_PAGES: usize = 20;
 
 /// The login that most recently added `label_name`, against an explicit API
 /// origin (`None` when a later `unlabeled` event supersedes it).
 ///
 /// Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`]; tests pass a
-/// loopback stub. Pages are requested by number from `api_base`. A response's
-/// `Link` header is never followed, so the bearer token cannot be sent to a
-/// host or path a response names; it is read only to refuse a short page that
-/// still announces a next one. An exactly full page requires another read to
-/// prove completeness, and reaching the page cap with a full page fails closed
-/// so a later relabel cannot be missed.
+/// loopback stub. Pages are requested by number from `api_base` until one is
+/// empty (see [`MAX_ISSUE_EVENT_PAGES`]). A response's `Link` header is
+/// neither followed nor consulted, so the bearer token cannot be sent to a
+/// host or path a response names and no header can end the history early.
 pub async fn find_override_labeler_at(
     client: &Client,
     api_base: &str,
@@ -515,10 +501,10 @@ pub async fn find_override_labeler_at(
     for page in 1..=MAX_ISSUE_EVENT_PAGES {
         let url =
             format!("{api_base}/repos/{repo}/issues/{pr_number}/events?per_page=100&page={page}");
-        let (value, announces_next) = fetch_json_page(client, &url, token).await?;
-        let events: Vec<IssueEvent> = serde_json::from_value(value)
-            .map_err(|e| crate::http_client::malformed_response("parse events", &e))?;
-        let complete = page_is_last(events.len(), announces_next, "label event")?;
+        let events: Vec<IssueEvent> =
+            serde_json::from_value(fetch_json(client, &url, token).await?)
+                .map_err(|e| crate::http_client::malformed_response("parse events", &e))?;
+        let complete = events.is_empty();
 
         for event in events {
             let matches_label = event
@@ -563,20 +549,18 @@ pub async fn fetch_reviews_at(
 ) -> crate::error::Result<Vec<OverrideReview>> {
     let api_base = api_base.trim_end_matches('/');
     let mut reviews = Vec::new();
-    // Request numbered pages from the fixed API origin, never a supplied URL.
-    // An exactly full final page requires another read to prove completeness,
-    // and a short page that announces a next one fails closed.
+    // Request numbered pages from the fixed API origin, never a supplied URL,
+    // until one is empty (see MAX_ISSUE_EVENT_PAGES); headers decide nothing.
     for page in 1..=MAX_ISSUE_EVENT_PAGES {
         let url =
             format!("{api_base}/repos/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}");
-        let (value, announces_next) = fetch_json_page(client, &url, token).await?;
-        let batch: Vec<OverrideReview> = serde_json::from_value(value)
-            .map_err(|e| crate::http_client::malformed_response("parse reviews", &e))?;
-        let complete = page_is_last(batch.len(), announces_next, "review")?;
-        reviews.extend(batch);
-        if complete {
+        let batch: Vec<OverrideReview> =
+            serde_json::from_value(fetch_json(client, &url, token).await?)
+                .map_err(|e| crate::http_client::malformed_response("parse reviews", &e))?;
+        if batch.is_empty() {
             return Ok(reviews);
         }
+        reviews.extend(batch);
     }
     Err(crate::error::Error::Config(
         "override review history exceeds pagination safety cap".into(),
@@ -602,7 +586,11 @@ pub enum NextLink {
 /// malformed entry never hides a later one (it makes the whole value
 /// [`NextLink::Ambiguous`]). Every relation type must be a valid
 /// `reg-rel-type` or `ext-rel-type`, and every target a non-empty
-/// `URI-Reference` without whitespace.
+/// `URI-Reference` of RFC 3986 characters.
+///
+/// Used by SSH key discovery, where pagination affects only availability.
+/// Override evidence never consults `Link`: it reads numbered pages until one
+/// is empty.
 pub fn next_link(header: &str) -> NextLink {
     let Some(values) = link_values(header) else {
         return NextLink::Ambiguous;
@@ -631,25 +619,6 @@ pub fn parse_next_link(header: &str) -> Option<String> {
         NextLink::Next(target) => Some(target),
         NextLink::Absent | NextLink::Ambiguous => None,
     }
-}
-
-/// Whether any `Link` header value announces a next page. An unreadable value
-/// counts as an announcement, so a short page carrying it fails closed.
-fn announces_next_page(headers: &reqwest::header::HeaderMap) -> bool {
-    headers
-        .get_all(reqwest::header::LINK)
-        .iter()
-        .any(|value| match value.to_str() {
-            Ok(text) => link_header_may_announce_next(text),
-            Err(_) => true,
-        })
-}
-
-/// Whether one `Link` header value may announce a next page: a `next`
-/// relation, or any value that does not parse unambiguously, so a short page
-/// carrying it fails closed. Only the relations are read: no URL is used.
-pub fn link_header_may_announce_next(header: &str) -> bool {
-    !matches!(next_link(header), NextLink::Absent)
 }
 
 /// An RFC 8288 `relation-type`: a `reg-rel-type` (`LOALPHA *( LOALPHA / DIGIT
@@ -848,15 +817,6 @@ async fn fetch_json(
     url: &str,
     token: &str,
 ) -> crate::error::Result<serde_json::Value> {
-    Ok(fetch_json_page(client, url, token).await?.0)
-}
-
-/// [`fetch_json`] that also reports whether the response announces a next page.
-async fn fetch_json_page(
-    client: &Client,
-    url: &str,
-    token: &str,
-) -> crate::error::Result<(serde_json::Value, bool)> {
     let resp = client
         .get(url)
         .bearer_auth(token)
@@ -874,12 +834,9 @@ async fn fetch_json_page(
             message: body,
         });
     }
-    let announces_next = announces_next_page(resp.headers());
-    let value = resp
-        .json()
+    resp.json()
         .await
-        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
-    Ok((value, announces_next))
+        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))
 }
 
 async fn fetch_permission_at(
