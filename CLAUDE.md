@@ -102,14 +102,14 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | 0 | Success. `review` stays 0 on offline apply blockers unless `--fail-on-blockers` / `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`. |
-| 1 | Error. `plan` also exits 1 on offline apply blockers, invalid backup namespaces or live ownership conflicts. Empty-namespace refusals are 1, not 2. |
+| 1 | Error, including clap usage and parse errors (`--help` and `--version` exit 0). `plan` also exits 1 on offline apply blockers, invalid backup namespaces or live ownership conflicts. Empty-namespace refusals are 1, not 2. |
 | 2 | `diff --exit-on-drift` found drift (`DRIFT_EXIT_CODE`). |
 | 3 | `doctor` found a blocker (`DOCTOR_FAILED_EXIT_CODE`). |
 | 4 | `verify` check failed (`VERIFY_FAILED_EXIT_CODE`). |
 | 5 | `verify` had no declared check for the environment (`VERIFY_SKIPPED_EXIT_CODE`). Skipped is never a pass. |
 | 6 | `diff --exit-on-drift` found no drift in an alerted category with no fingerprint baseline supplied, but fingerprinted secrets were unverified (`SECRETS_UNVERIFIED_EXIT_CODE`). Never in sync; monitoring warns, does not fail. A supplied baseline that cannot verify secrets exits 1 instead. |
 
-`tests/unit/exit_code_matrix_tests.rs` pins this table per command against the real binary (clap usage errors also exit 2).
+`tests/unit/exit_code_matrix_tests.rs` pins this table per command against the real binary. Usage errors exit 1, never clap's default 2, so a mistyped `diff --exit-on-drift` flag cannot read as drift.
 
 ## Build / Test / Lint
 

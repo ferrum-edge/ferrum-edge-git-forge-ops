@@ -64,15 +64,18 @@ async fn main() {
         }
     }
     // Help, version and usage errors go through the sink like everything
-    // else.
+    // else. `--help` and `--version` exit 0. A usage or parse error exits 1,
+    // the documented error code, never clap's default 2: that is
+    // `DRIFT_EXIT_CODE`, and a mistyped `diff --exit-on-drift` flag must not
+    // read as drift.
     let cli = cli::Cli::try_parse().unwrap_or_else(|error| {
         let rendered = error.render().to_string();
         if error.use_stderr() {
             eout!("{rendered}");
-        } else {
-            out!("{rendered}");
+            process::exit(1);
         }
-        process::exit(error.exit_code());
+        out!("{rendered}");
+        process::exit(0);
     });
     let explicit_env = cli.env.clone();
     // `--allow-credential-slot-remap` downgrades the credential-slot-remap

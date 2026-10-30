@@ -125,11 +125,11 @@ struct Case {
     evidence: &'static str,
 }
 
-/// The exit status clap gives a usage error. It is numerically the same as
-/// `DRIFT_EXIT_CODE`: a wrapper that reads 2 from `diff --exit-on-drift` as
-/// "drift found" cannot tell a mistyped flag from drift without the stderr.
-/// Pinned as it is, not endorsed.
-const CLAP_USAGE_EXIT_CODE: i32 = 2;
+/// A usage or parse error is an ordinary error (1). It must never be clap's
+/// default 2, which is `DRIFT_EXIT_CODE`: the drift monitor reads 2 from
+/// `diff --exit-on-drift` as "drift found", so a mistyped flag would be
+/// reported as drift instead of a failed check.
+const USAGE_ERROR_EXIT_CODE: i32 = 1;
 
 const VALIDATOR_ACCEPTS: &str = "#!/bin/sh\nexit 0\n";
 const VALIDATOR_REJECTS: &str = "#!/bin/sh\necho 'stub rejection' >&2\nexit 1\n";
@@ -474,14 +474,14 @@ fn cases() -> Vec<Case> {
             expected: DRIFT_EXIT_CODE,
             evidence: "MODIFY",
         },
-        // -- 2 (clap): usage errors, numerically DRIFT_EXIT_CODE -----------
+        // -- 1 (clap): usage errors are errors, never DRIFT_EXIT_CODE -----
         Case {
             name: "no subcommand",
             tree: Proxy,
             live: Offline,
             args: &[],
             env: &[],
-            expected: CLAP_USAGE_EXIT_CODE,
+            expected: USAGE_ERROR_EXIT_CODE,
             evidence: "Usage:",
         },
         Case {
@@ -490,7 +490,7 @@ fn cases() -> Vec<Case> {
             live: Offline,
             args: &["bogus"],
             env: &[],
-            expected: CLAP_USAGE_EXIT_CODE,
+            expected: USAGE_ERROR_EXIT_CODE,
             evidence: "unrecognized subcommand 'bogus'",
         },
         Case {
@@ -499,7 +499,7 @@ fn cases() -> Vec<Case> {
             live: Offline,
             args: &["validate", "--bogus"],
             env: &[],
-            expected: CLAP_USAGE_EXIT_CODE,
+            expected: USAGE_ERROR_EXIT_CODE,
             evidence: "unexpected argument '--bogus'",
         },
         Case {
@@ -508,7 +508,7 @@ fn cases() -> Vec<Case> {
             live: Offline,
             args: &["diff", "--exit-on-drift", "--bogus"],
             env: &[],
-            expected: CLAP_USAGE_EXIT_CODE,
+            expected: USAGE_ERROR_EXIT_CODE,
             evidence: "unexpected argument '--bogus'",
         },
         Case {
@@ -517,7 +517,7 @@ fn cases() -> Vec<Case> {
             live: Offline,
             args: &["doctor", "--scope", "bogus"],
             env: &[],
-            expected: CLAP_USAGE_EXIT_CODE,
+            expected: USAGE_ERROR_EXIT_CODE,
             evidence: "invalid value 'bogus'",
         },
         // -- 3: doctor blocker --------------------------------------------
@@ -735,6 +735,6 @@ fn exit_code_constants_match_the_documented_table() {
     assert_eq!(VERIFY_FAILED_EXIT_CODE, 4);
     assert_eq!(VERIFY_SKIPPED_EXIT_CODE, 5);
     assert_eq!(SECRETS_UNVERIFIED_EXIT_CODE, 6);
-    // Documented collision, not a contract to widen: see CLAP_USAGE_EXIT_CODE.
-    assert_eq!(CLAP_USAGE_EXIT_CODE, DRIFT_EXIT_CODE);
+    // A usage error must stay distinguishable from drift.
+    assert_ne!(USAGE_ERROR_EXIT_CODE, DRIFT_EXIT_CODE);
 }
