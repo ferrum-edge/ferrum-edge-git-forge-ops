@@ -27,6 +27,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -52,10 +53,10 @@ jobs:
           else
             validator=.github/scripts/check_agent_setup.py
           fi
-          python3 "$validator" --root "$GITHUB_WORKSPACE"
+          python3 -I "$validator" --root "$GITHUB_WORKSPACE"
 
       - name: Test agent setup validator
-        run: python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'
+        run: python3 -I -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'
 
       - name: Parse shell dispatchers
         run: |

@@ -44,6 +44,7 @@ concurrency:
 jobs:
   lifecycle-acceptance:
     runs-on: ubuntu-26.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -101,7 +102,7 @@ jobs:
           set -euo pipefail
           attestation="${RUNNER_TEMP}/github-acceptance.json"
           printf '%s' "$ATTESTATION" > "$attestation"
-          python3 .github/scripts/lifecycle_result.py attest \
+          python3 -I .github/scripts/lifecycle_result.py attest \
             --result lifecycle-result.json \
             --attestation "$attestation" \
             --revision "$GITHUB_SHA" \
@@ -110,7 +111,7 @@ jobs:
       - name: Summarize
         if: ${{ !cancelled() }}
         run: |
-          python3 .github/scripts/lifecycle_result.py verify \
+          python3 -I .github/scripts/lifecycle_result.py verify \
             --result lifecycle-result.json \
             --revision "$GITHUB_SHA" \
             --summary "$GITHUB_STEP_SUMMARY" || true

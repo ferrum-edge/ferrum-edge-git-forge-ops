@@ -71,7 +71,7 @@ jobs:
 
       - name: Check release baseline consistency
         if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops'
-        run: python3 .github/scripts/check_release_baseline.py
+        run: python3 -I .github/scripts/check_release_baseline.py
 
       # The required-checks test above proves the unit and policy suites
       # passed. It cannot prove the product was run: the lifecycle suite is
@@ -163,7 +163,7 @@ jobs:
               echo "No result artifact." >> "$GITHUB_STEP_SUMMARY"
               continue
             fi
-            if python3 .github/scripts/lifecycle_result.py verify \
+            if python3 -I .github/scripts/lifecycle_result.py verify \
               --result "${dir}/lifecycle-result.json" \
               --revision "$RELEASE_SHA" \
               "${gateway_args[@]}" \
@@ -190,6 +190,7 @@ jobs:
     needs: authorize-release
     if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops' || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
     runs-on: ubuntu-26.04
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -203,7 +204,7 @@ jobs:
 
       - name: Check release baseline consistency
         if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops'
-        run: python3 .github/scripts/check_release_baseline.py
+        run: python3 -I .github/scripts/check_release_baseline.py
 
       - name: Ensure release tag points to the default branch
         if: startsWith(github.ref, 'refs/tags/v')
@@ -217,7 +218,7 @@ jobs:
           fi
 
       - name: Verify and record immutable build inputs
-        run: python3 .github/scripts/check_supply_chain.py --write-manifest supply-chain-inputs.json
+        run: python3 -I .github/scripts/check_supply_chain.py --write-manifest supply-chain-inputs.json
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
@@ -307,7 +308,7 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json, os
           from pathlib import Path
 

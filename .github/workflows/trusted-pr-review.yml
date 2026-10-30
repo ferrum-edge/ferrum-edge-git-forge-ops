@@ -32,6 +32,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+    timeout-minutes: 15
     outputs:
       targets: ${{ steps.targets.outputs.targets }}
       head_sha: ${{ steps.metadata.outputs.head_sha }}
@@ -198,7 +199,7 @@ jobs:
             echo "PR file metadata changed during trusted classification; wait for the new run." >&2
             exit 1
           }
-          classification=$(python3 trusted/.github/scripts/changed_files.py \
+          classification=$(python3 -I trusted/.github/scripts/changed_files.py \
             "$pages_file" "$declared_changed" declarative)
           [ "$(jq -r '.complete' <<< "$classification")" = true ] || {
             echo "Changed-file pagination was incomplete; trusted review fails closed." >&2
@@ -242,7 +243,7 @@ jobs:
       - name: Sanitize declarative PR input
         if: steps.metadata.outputs.privileged == 'true'
         run: |
-          python3 trusted/.github/scripts/pr_input.py prepare \
+          python3 -I trusted/.github/scripts/pr_input.py prepare \
             "$RUNNER_TEMP/pr-source.tar.gz" pr-input \
             "${{ steps.metadata.outputs.head_sha }}"
 
@@ -306,7 +307,7 @@ jobs:
           # static validation only until their directory is trusted on main.
           # Protected config-only changes remain static-only because privileged
           # review replaces candidate `.gitforgeops` files.
-          targets=$(python3 trusted/.github/scripts/pr_input.py targets \
+          targets=$(python3 -I trusted/.github/scripts/pr_input.py targets \
             trusted "$scopes" "$RUNNER_TEMP/trusted-changed-paths.json")
           echo "Trusted source SHA: ${{ steps.metadata.outputs.trusted_sha }}"
           echo "Live-review targets: $targets"
@@ -329,6 +330,7 @@ jobs:
       needs.prepare.outputs.targets != '[]' &&
       needs.prepare.outputs.targets != ''
     runs-on: ubuntu-26.04
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write
@@ -370,7 +372,7 @@ jobs:
       - name: Verify manifest, paths, types, sizes, and hashes
         id: verify
         run: |
-          python3 trusted/.github/scripts/pr_input.py verify \
+          python3 -I trusted/.github/scripts/pr_input.py verify \
             review-input "${{ needs.prepare.outputs.head_sha }}"
 
       - name: Revalidate PR head after environment approval

@@ -47,6 +47,7 @@ permissions:
 jobs:
   rust-ci-check:
     runs-on: ubuntu-26.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -99,7 +100,7 @@ jobs:
           [ "$stable" = true ] || exit 1
           helper=trusted-scope/.github/scripts/changed_files.py
           if [ -f "$helper" ]; then
-            result=$(python3 trusted-scope/.github/scripts/changed_files.py \
+            result=$(python3 -I trusted-scope/.github/scripts/changed_files.py \
               "$pages_file" "$current_changed" rust)
           else
             # The helper is absent only while the PR that first introduces it
@@ -162,6 +163,7 @@ jobs:
 
   coverage:
     runs-on: ubuntu-26.04
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: read
@@ -217,7 +219,7 @@ jobs:
           [ "$stable" = true ] || exit 1
           helper=trusted-scope/.github/scripts/changed_files.py
           if [ -f "$helper" ]; then
-            result=$(python3 trusted-scope/.github/scripts/changed_files.py \
+            result=$(python3 -I trusted-scope/.github/scripts/changed_files.py \
               "$pages_file" "$current_changed" rust)
           else
             # Bootstrap the trusted helper by running the complete coverage
@@ -243,21 +245,28 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin
             target
           key: ${{ runner.os }}-rust-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-coverage-
 
+      # Always install from the pinned action's checksum manifest, as
+      # security.yml does for cargo-audit. `~/.cargo/bin` is deliberately not
+      # cached: a restored binary would skip that verification.
       - name: Install cargo-llvm-cov
         if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-llvm-cov@0.9.0
+          checksum: true
+          fallback: none
 
       - name: cargo llvm-cov
         if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'
-        run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info
+        # Floor set below the measured baseline: 88.17% of lines (26615/30185)
+        # on main at 671fd4f (issue #562). Raise it as coverage grows; never
+        # lower it to land a change.
+        run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info --fail-under-lines 87
 
       - name: Upload coverage artifact
         if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'

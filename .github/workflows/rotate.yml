@@ -27,6 +27,7 @@ permissions:
 jobs:
   preflight:
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -52,12 +53,17 @@ jobs:
   rotate:
     needs: preflight
     runs-on: ubuntu-26.04
+    # Every step carries its own timeout and this job budget covers their sum,
+    # so a hung step fails (and is recorded) while the ledger commit still
+    # runs. A job timeout cancels the job, which skips that commit.
+    timeout-minutes: 105
     environment: ${{ inputs.environment }}
     concurrency:
       group: ferrum-apply-${{ inputs.environment }}
       cancel-in-progress: false
     steps:
       - name: Validate environment input
+        timeout-minutes: 2
         env:
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
         run: |
@@ -68,6 +74,7 @@ jobs:
           }
 
       - name: Validate API-mode routing
+        timeout-minutes: 2
         id: deployment-mode
         env:
           RAW_MODE: ${{ vars.FERRUM_GATEWAY_MODE }}
@@ -97,6 +104,7 @@ jobs:
       # drift check reading rotation metadata that never landed. Prove them
       # here, before anything is mutated.
       - name: Require state-writer App credentials
+        timeout-minutes: 2
         env:
           STATE_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
           STATE_APP_PRIVATE_KEY: ${{ secrets.GITFORGEOPS_STATE_APP_PRIVATE_KEY }}
@@ -114,6 +122,7 @@ jobs:
       # protected branch as it stands now that the lock is held, exactly as the
       # apply job does.
       - name: Check out protected main for rotation
+        timeout-minutes: 5
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -127,6 +136,7 @@ jobs:
       # re-run of an old rotation would otherwise write its credential against
       # an obsolete ledger.
       - name: Refresh protected branch and reject stale deployments
+        timeout-minutes: 5
         id: freshness
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -192,11 +202,13 @@ jobs:
           echo "applied_sha=$fresh_head" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
+        timeout-minutes: 5
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.99.1
         with:
           toolchain: 1.99.1
 
       - name: Cache cargo registry
+        timeout-minutes: 5
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
@@ -206,9 +218,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install gitforgeops
+        timeout-minutes: 30
         run: cargo install --path . --locked
 
       - name: Require a configured environment
+        timeout-minutes: 2
         env:
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
         run: |
@@ -221,6 +235,7 @@ jobs:
           }
 
       - name: Load credential bundles
+        timeout-minutes: 2
         # Every credential-bundle secret is bound by name — never the whole
         # `secrets` context. The shard list is capped by MAX_BUNDLE_SHARDS in
         # src/secrets/bundle.rs and .github/scripts/credential_bundles.py; see
@@ -245,10 +260,11 @@ jobs:
         run: |
           set -euo pipefail
           creds_file="${RUNNER_TEMP:-/tmp}/ferrum-creds-${GITHUB_RUN_ID}-${GITHUB_JOB}-$$.json"
-          python3 .github/scripts/credential_bundles.py "$creds_file"
+          python3 -I .github/scripts/credential_bundles.py "$creds_file"
           echo "FERRUM_CREDS_JSON_FILE=$creds_file" >> "$GITHUB_ENV"
 
       - name: Rotate
+        timeout-minutes: 30
         # Rotate now pushes the updated consumer to the live gateway, so it
         # needs the full gateway-connection secret set that apply-on-merge
         # has. Without the TLS material, rotate fails to connect in envs
@@ -297,6 +313,7 @@ jobs:
             --recipient "$INPUT_RECIPIENT"
 
       - name: Mint narrowly scoped state-writer token
+        timeout-minutes: 2
         # `!cancelled()` for the same reason apply-on-merge uses it: rotation
         # persists what it managed to do before returning a deferred error, so
         # skipping the commit on failure loses the record of a credential that
@@ -310,6 +327,7 @@ jobs:
           permission-contents: write
 
       - name: Commit state update
+        timeout-minutes: 10
         if: ${{ !cancelled() }}
         # Rotation metadata (last_rotated, delivery recipient/run) lives in
         # .state/<env>.json. If we can't persist the update, a stale state
