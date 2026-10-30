@@ -1198,6 +1198,20 @@ fn read_request_head(stream: &mut TcpStream) -> bool {
     true
 }
 
+/// A loopback address that refuses every connection. Port 1 is privileged, so
+/// no test endpoint can ever bind it; binding an ephemeral listener and
+/// dropping it instead frees the port for a concurrent test's endpoint, which
+/// then answers in its place. The precondition is checked rather than
+/// assumed: if something on this host does listen on port 1, the test fails
+/// here, naming the cause, instead of misreporting the code under test.
+pub(super) fn refused_port() -> std::net::SocketAddr {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) {
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => addr,
+        other => panic!("127.0.0.1:1 must refuse connections for this test, got {other:?}"),
+    }
+}
+
 /// The check from #353: `attempts` omitted, so the default of three applies.
 fn enqueue_probe(extra: &str) -> SmokeCheck {
     let config = load_smoke(&format!(
@@ -1289,9 +1303,7 @@ async fn replay_safe_is_the_explicit_opt_in_for_a_non_idempotent_retry() {
 async fn a_connection_that_was_never_established_is_retried_for_any_method() {
     // A refused connection carried no request, so nothing can have been
     // applied: that much is provable, and the bound still holds.
-    let closed = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let base_url = format!("http://{}", closed.local_addr().expect("addr"));
-    drop(closed);
+    let base_url = format!("http://{}", refused_port());
     let check = enqueue_probe("        method: POST\n");
     let result = run_check(&base_url, &check, &ProbeCredentials::none(), None).await;
     assert_eq!(result.outcome, Outcome::Unreachable);
