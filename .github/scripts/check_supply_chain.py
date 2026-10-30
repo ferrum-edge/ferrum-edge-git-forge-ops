@@ -4186,12 +4186,16 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
                         "`PYTHON*` variables and the user site off the interpreter"
                     )
                     break
+            inside_expanding = expanding_tag is not None
             expanding = _EXPANDING_HEREDOC.search(line)
             if expanding is not None and expanding_tag is None:
                 expanding_tag = expanding.group("tag")
             heredoc = _ISOLATED_HEREDOC.match(line)
             if (
                 heredoc is not None
+                # Inside another heredoc the opener is that body's text, not a
+                # command, so its lines stay that heredoc's to scan.
+                and not inside_expanding
                 and _isolated_from(line, _PYTHON_COMMAND.search(line).end())
                 # An opener whose tag never closes skips nothing.
                 and any(later.strip() == heredoc.group("tag") for later in lines[number + 1:])
