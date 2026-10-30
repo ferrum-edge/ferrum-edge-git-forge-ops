@@ -351,9 +351,10 @@ Set via `FERRUM_GATEWAY_MODE`.
   for pure-add namespaces, POST `/restore` for full replace.
 - **file** — flat YAML for a file-mode gateway, published atomically (temp +
   fsync + rename) with a `resource_counts` seal.
-  Production file-mode hosts are Linux. Publication protects documents with
-  mode bits only; macOS inherited ACLs can widen access, so macOS is a
-  development host (docs/credential-broker.md, Supported hosts).
+  Production file-mode hosts are Linux; macOS is a development host.
+  Publication sets mode bits only and does not strip ACLs, so the
+  destination directory must carry no default (Linux) or inheritable (macOS)
+  ACL entries (docs/credential-broker.md, Supported hosts).
 
 Mesh is file-only in both modes. There is no mesh admin API, so api-mode apply
 validates the mesh document and prints a notice instead of pushing it.

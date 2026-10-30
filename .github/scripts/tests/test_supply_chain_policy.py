@@ -8176,6 +8176,55 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
         long = self._document(workflow(361, 5, 60))
         self.assertTrue(check_supply_chain.job_timeout_violations("x.yml", long))
 
+    def test_a_ledger_job_is_known_without_its_mint_step_name(self):
+        def workflow(job, secret):
+            env = (
+                "        env:\n          KEY: ${{ secrets." + check_supply_chain.LEDGER_JOB_SECRET + " }}\n"
+                if secret
+                else ""
+            )
+            return (
+                f"on: push\njobs:\n  {job}:\n    runs-on: ubuntu-26.04\n"
+                "    timeout-minutes: 100\n    steps:\n"
+                "      - name: Apply\n        run: true\n"
+                f"      - name: Mint state-writer token\n{env}        run: true\n"
+            )
+
+        for job, secret in (("promote", False), ("other", True)):
+            document = self._document(workflow(job, secret))
+            self.assertTrue(
+                any(
+                    "every step needs" in item
+                    for item in check_supply_chain.job_timeout_violations(
+                        ".github/workflows/apply-on-merge.yml", document
+                    )
+                ),
+                (job, secret),
+            )
+        # Renaming a ledger job away is itself refused.
+        document = self._document(workflow("renamed", False))
+        self.assertTrue(
+            any(
+                "ledger-committing job is missing" in item
+                for item in check_supply_chain.job_timeout_violations(
+                    ".github/workflows/rotate.yml", document
+                )
+            )
+        )
+
+    def test_local_actions_run_python_isolated(self):
+        def violations(script):
+            action = check_supply_chain.parse_workflow(
+                "name: probe\nruns:\n  using: composite\n  steps:\n"
+                f"    - shell: bash\n      run: {script}\n"
+            )
+            return check_supply_chain.local_action_fence_violations(
+                ".github/workflows/rust-ci.yml", ".github/actions/probe/action.yml", action
+            )
+
+        self.assertTrue(any("python3 -I" in item for item in violations("python3 -c 'pass'")))
+        self.assertEqual(violations("python3 -I -c 'pass'"), [])
+
     def test_every_workflow_interpreter_runs_isolated(self):
         def workflow(script):
             return (
@@ -8191,6 +8240,9 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["python3.12 -B x.py"],
             ["python3 - <<'PY'", "print(1)", "PY"],
             ["true && python3 -c 'pass'"],
+            ["/usr/bin/python3 -c 'import sys'"],
+            ["bash <<'SH'", "python3 x.py", "SH"],
+            ["python3 -I - <<'PY'", "print(1)", "PY", "python3 y.py"],
         ):
             document = self._document(workflow(script))
             self.assertTrue(
@@ -8201,6 +8253,8 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ['result=$(python3 -I "$helper" a b)'],
             ["python3 -I -m unittest discover -s tests"],
             ["# a plain `python3 -` would put the workspace first"],
+            ["/usr/bin/python3 -I -c 'import sys'"],
+            ["python3 -I - \"$CHECKER\" <<'PY'", "print('python')", "import python3", "PY"],
             ["echo done"],
         ):
             document = self._document(workflow(script))

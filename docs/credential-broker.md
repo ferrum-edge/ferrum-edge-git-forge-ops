@@ -510,19 +510,24 @@ no compatible SSH key on GitHub, materialization fails and points to
 ### Supported hosts
 
 A production file-mode gateway, and wherever its materialized document is
-written, runs on **Linux**. Publication protects a document with POSIX mode
-bits only: `0640` for a new gateway document (an existing file's owner and
-group bits are kept, `other` is always cleared) and `0600` for private
-outputs. On Linux, a file created that way carries no extended ACL.
+written, runs on **Linux**. macOS is a development host. Windows has no
+private publication: `write_atomically` refuses it before writing.
 
-macOS is supported for development only. There, an inheritable ACL on the
-destination directory (for example `everyone allow read`, shown by
-`ls -le`) is applied to every new file, so a document published `0640` can
-still be readable by every local user. GitForgeOps does not strip ACLs. On a
-macOS host, publish only into a directory without inheritable ACL entries,
-and never hold a materialized document there that carries production
-credentials. Windows has no private publication: `write_atomically` refuses
-it before writing.
+Publication protects a document with POSIX mode bits only: `0640` for a new
+gateway document (an existing file's owner and group bits are kept, `other`
+is always cleared) and `0600` for private outputs. GitForgeOps neither strips
+nor checks ACLs. An ACL the destination directory passes to new files can
+grant access the mode bits do not show:
+
+- **Linux:** a default ACL (`setfacl -d`, shown by `getfacl` as `default:`
+  entries) is copied onto the temporary file. A named-user or named-group
+  entry then reads through the ACL mask that `0640` sets to `r--`.
+- **macOS:** an inheritable entry (for example `everyone allow read`, shown by
+  `ls -le`) is applied to every new file.
+
+Publish only into a directory with no default or inheritable ACL entries, and
+keep it that way. On macOS, never hold a materialized document carrying
+production credentials.
 
 ## Audit trail
 

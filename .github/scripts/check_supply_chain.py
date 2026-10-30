@@ -19,7 +19,7 @@ import re
 import stat
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -3979,7 +3979,14 @@ _DIGEST_PINNED_IMAGE = re.compile(r"[^\s@${}]+@sha256:[0-9a-f]{64}")
 MAX_JOB_TIMEOUT_MINUTES = 120
 MAX_LEDGER_JOB_TIMEOUT_MINUTES = 360
 LEDGER_JOB_MARGIN_MINUTES = 5
+# Ledger jobs are known by id and by what they hold, never by a step's display
+# name alone: renaming the mint step must not drop the per-step budgets.
+LEDGER_JOBS = {
+    "apply-on-merge.yml": ("apply", "promote"),
+    "rotate.yml": ("rotate",),
+}
 LEDGER_JOB_STEP = "Mint narrowly scoped state-writer token"
+LEDGER_JOB_SECRET = "GITFORGEOPS_STATE_APP_PRIVATE_KEY"
 _TIMEOUT_MINUTES = re.compile(r"[1-9][0-9]{0,2}")
 
 
@@ -3995,14 +4002,26 @@ def job_timeout_violations(workflow: str, document: dict) -> list[str]:
     """Every job is bounded; a job that commits the ledger is bounded per step."""
     violations: list[str] = []
     jobs = document.get("jobs")
-    for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
+    jobs = jobs if isinstance(jobs, dict) else {}
+    named = LEDGER_JOBS.get(PurePosixPath(workflow).name, ())
+    violations.extend(
+        f"{workflow}: jobs.{job_name}: the ledger-committing job is missing; renaming it "
+        "would drop its per-step budgets"
+        for job_name in named
+        if not isinstance(jobs.get(job_name), dict)
+    )
+    for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
         label = f"{workflow}: jobs.{job_name}"
         budget = _timeout_minutes(job)
         steps = job.get("steps") if isinstance(job.get("steps"), list) else []
-        ledger = any(
-            isinstance(step, dict) and step.get("name") == LEDGER_JOB_STEP for step in steps
+        ledger = (
+            job_name in named
+            or LEDGER_JOB_SECRET in json.dumps(job)
+            or any(
+                isinstance(step, dict) and step.get("name") == LEDGER_JOB_STEP for step in steps
+            )
         )
         ceiling = MAX_LEDGER_JOB_TIMEOUT_MINUTES if ledger else MAX_JOB_TIMEOUT_MINUTES
         if budget is None or budget > ceiling:
@@ -4039,15 +4058,31 @@ def job_timeout_violations(workflow: str, document: dict) -> list[str]:
 # directory and keeps the working directory (often a candidate checkout) and
 # the script's directory off the import path. Every workflow interpreter
 # runs isolated; a script that needs a sibling module adds its own directory.
-_PYTHON_COMMAND = re.compile(r"(?<![\w./$-])python(?:3(?:\.\d+)?)?(?![\w.-])")
+_PYTHON_COMMAND = re.compile(r"(?<![\w.$-])python(?:3(?:\.\d+)?)?(?![\w.-])")
 _ISOLATED_FLAG = re.compile(r"[ \t]+-I(?=[ \t]|$)")
+# `python3 -I - <<'TAG'`: the body is Python source for an isolated
+# interpreter, not shell, so a word like `python` in it starts nothing.
+_ISOLATED_HEREDOC = re.compile(
+    r"python(?:3(?:\.\d+)?)?[ \t]+-I(?:[ \t]+-[A-Za-z]+)*[ \t]+-(?:[ \t]+[^<\s]+)*"
+    r"[ \t]*<<-?[ \t]*(['\"]?)(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\1"
+)
 
 
 def python_isolation_violations(workflow: str, document: dict) -> list[str]:
-    """Every Python interpreter a workflow `run:` starts is in isolated mode."""
+    """Every Python interpreter a workflow or local action `run:` starts is isolated.
+
+    Absolute paths (`/usr/bin/python3`) count. A mention in quoted shell text
+    (`echo "install python3"`) is refused too: telling a command from text is
+    a shell parse this reader does not attempt, and refusing is the safe side.
+    """
     violations: list[str] = []
     for path, script, _job in _run_scripts(document):
+        heredoc_tag = None
         for line in script.split("\n"):
+            if heredoc_tag is not None:
+                if line.strip() == heredoc_tag:
+                    heredoc_tag = None
+                continue
             if line.lstrip().startswith("#"):
                 continue
             for match in _PYTHON_COMMAND.finditer(line):
@@ -4058,6 +4093,9 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
                         "`PYTHON*` variables and the user site off the interpreter"
                     )
                     break
+            heredoc = _ISOLATED_HEREDOC.search(line)
+            if heredoc is not None:
+                heredoc_tag = heredoc.group("tag")
     return violations
 
 
@@ -4839,6 +4877,7 @@ def local_action_fence_violations(workflow: str, label: str, action: dict) -> li
         _run_interpolation_violations(label, action, lambda job: allowed, refusal)
     )
     violations.extend(shell_expression_violations(label, action))
+    violations.extend(python_isolation_violations(label, action))
     runs = action.get("runs")
     steps = runs.get("steps") if isinstance(runs, dict) else None
     for index, step in enumerate(steps if isinstance(steps, list) else ()):
