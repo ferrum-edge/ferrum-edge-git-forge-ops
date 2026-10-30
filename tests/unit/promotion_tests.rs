@@ -1741,6 +1741,70 @@ async fn a_legacy_keyed_probe_value_resolves_under_its_canonical_slot() {
     }
 }
 
+/// #640: an allowlisted probe declares a secret at `keyauth[0]["foo/jwt"]
+/// .secret`. Its raw legacy spelling, `ferrum/probe/keyauth.foo/jwt.secret`,
+/// is also the legacy spelling of Consumer `probe/keyauth.foo`'s JWT secret,
+/// which nobody allowlisted. That value must never be projected or sent: the
+/// check fails closed as unresolvable.
+#[tokio::test]
+async fn an_ambiguous_legacy_spelling_never_sends_another_consumers_value() {
+    let placeholder = "${gh-env-secret:alloc=generate}";
+    let other_value = "unlisted-consumer-jwt-secret-0123456789";
+    let desired: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "consumers": [
+            {
+                "id": "probe",
+                "username": "probe",
+                "namespace": "ferrum",
+                "labels": { VERIFY_PROBE_LABEL: "true" },
+                "credentials": {
+                    "keyauth": [{ "foo/jwt": { "secret": placeholder } }]
+                }
+            },
+            {
+                "id": "probe/keyauth.foo",
+                "username": "other",
+                "namespace": "ferrum",
+                "credentials": { "jwt": [{ "secret": placeholder }] }
+            }
+        ]
+    }))
+    .expect("desired config");
+    let slot = "ferrum/probe/keyauth/foo~1jwt/secret";
+    let checks = checks_sending("GET", slot);
+    let allowlist = ProbeConsumerAllowlist::parse("ferrum/probe").expect("allowlist");
+    let bundle = BTreeMap::from([(
+        "ferrum/probe/keyauth.foo/jwt.secret".to_string(),
+        other_value.to_string(),
+    )]);
+    let credentials =
+        authorize_probe_credentials("staging", &checks, &desired, Some(&allowlist), &bundle)
+            .expect("the probe's own slot is authorized");
+    assert_eq!(
+        credentials.slots().count(),
+        0,
+        "another Consumer's value was projected"
+    );
+
+    let (base_url, heads) = spawn_recording_origin();
+    let check = SmokeCheck {
+        timeout_secs: 2,
+        ..checks.checks[0].clone()
+    };
+    let result = run_check(&base_url, &check, &credentials, None).await;
+    assert_eq!(result.outcome, Outcome::Unreachable, "{}", result.detail);
+    assert!(
+        result.detail.contains("not in the bundle"),
+        "{}",
+        result.detail
+    );
+    assert!(!result.detail.contains(other_value));
+    assert!(
+        heads.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "no request may be sent without the probe's own credential"
+    );
+}
+
 #[test]
 fn a_redacted_or_placeholder_probe_value_is_refused_naming_the_slot() {
     let authorization = authorize_probe_slots(

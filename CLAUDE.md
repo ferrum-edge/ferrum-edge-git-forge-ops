@@ -1490,7 +1490,11 @@ Edge recognizes exactly five credential types, each an **array**
   false drift). The assembler normalizes object form on load.
 - Slot paths elide `ArrayIndex(0)` so normalization does not rename (orphan)
   existing slots; entries ≥1 get `[N]`. Older encodings stay in the read-only
-  lookup candidate list.
+  lookup candidate list (`slot_lookup_candidates`, also used by verify's
+  probe projection). The raw legacy dotted form is generated only when
+  unambiguous: never when the namespace or consumer id contains `/` or `~`,
+  or a path key contains `/`, `~`, `.`, `[` or `]`, so one Consumer's
+  candidate can never be another Consumer's slot.
 
 `basicauth[].username` and `mtls_auth[].identity` are **identities, not
 secrets**. `secrets::resolver::is_identity_credential_leaf(credential_type,

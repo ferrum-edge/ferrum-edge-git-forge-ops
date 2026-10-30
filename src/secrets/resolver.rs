@@ -574,6 +574,11 @@ fn join_slot_components(components: &[SlotComponent<'_>]) -> String {
 /// Verbatim join that keeps `[0]`. This is the shape emitted by gitforgeops
 /// releases between the array-walker landing and index-0 elision; kept as a
 /// read-only lookup candidate so those bundles still resolve.
+///
+/// It escapes every literal exactly as the canonical join does, so it is
+/// injective and cannot alias another slot: a raw `[0]` component only ever
+/// comes from an array index (a literal key spelled `[0]` escapes to
+/// `~20]`), and the canonical form never contains one.
 fn join_slot_components_verbatim(components: &[SlotComponent<'_>]) -> String {
     components
         .iter()
@@ -582,6 +587,33 @@ fn join_slot_components_verbatim(components: &[SlotComponent<'_>]) -> String {
         .join("/")
 }
 
+/// Can `s` appear unescaped as the namespace or consumer id of a legacy
+/// dotted slot without making the spelling ambiguous?
+///
+/// The legacy form is raw: a `/` would shift the namespace / consumer-id /
+/// path split, so one Consumer's candidate could be another Consumer's slot,
+/// and a `~` could spell a canonical escape sequence (`a~1b` is the canonical
+/// spelling of namespace `a/b`). Either refuses the legacy candidate.
+fn legacy_identity_is_unambiguous(s: &str) -> bool {
+    !s.contains(['/', '~'])
+}
+
+/// Can `s` appear unescaped as a credential-path key of a legacy dotted slot?
+/// The identity rule, plus `.`, `[` and `]`, which are the dotted path's own
+/// separators.
+fn legacy_path_key_is_unambiguous(s: &str) -> bool {
+    legacy_identity_is_unambiguous(s) && !s.contains(['.', '[', ']'])
+}
+
+/// The legacy dotted spelling (`<ns>/<id>/keyauth.key`, or `keyauth[0].key`
+/// with `keep_index_zero`) of a Consumer credential slot, when it is
+/// unambiguous.
+///
+/// `None` whenever a raw component could make this spelling coincide with
+/// another slot's canonical or legacy spelling (see
+/// [`legacy_identity_is_unambiguous`], [`legacy_path_key_is_unambiguous`]):
+/// a read-only compatibility lookup must never resolve another Consumer's
+/// value. Such a slot is looked up by its escaped spellings only.
 fn legacy_slot_from_components(
     components: &[SlotComponent<'_>],
     keep_index_zero: bool,
@@ -590,15 +622,15 @@ fn legacy_slot_from_components(
         return None;
     }
     let namespace = match components.first() {
-        Some(SlotComponent::Literal(s)) => *s,
+        Some(SlotComponent::Literal(s)) if legacy_identity_is_unambiguous(s) => *s,
         _ => return None,
     };
     let consumer_id = match components.get(1) {
-        Some(SlotComponent::Literal(s)) => *s,
+        Some(SlotComponent::Literal(s)) if legacy_identity_is_unambiguous(s) => *s,
         _ => return None,
     };
     let top_cred_key = match components.get(2) {
-        Some(SlotComponent::Literal(s)) => *s,
+        Some(SlotComponent::Literal(s)) if legacy_path_key_is_unambiguous(s) => *s,
         _ => return None,
     };
 
@@ -606,9 +638,7 @@ fn legacy_slot_from_components(
     for c in components.iter().skip(3) {
         match c {
             SlotComponent::Literal(s) => {
-                // Legacy dotted paths are ambiguous once a nested key itself
-                // contains a dot or bracket marker.
-                if s.contains('.') || s.contains('[') || s.contains(']') {
+                if !legacy_path_key_is_unambiguous(s) {
                     return None;
                 }
                 path.push('.');
@@ -2184,7 +2214,12 @@ fn legacy_array_prefixes(components: &[SlotComponent<'_>]) -> Vec<String> {
     if let [SlotComponent::Literal(namespace), SlotComponent::Literal(consumer_id), SlotComponent::Literal(top)] =
         components
     {
-        if !top.contains(['.', '[', ']']) {
+        // The same unambiguity rule as `legacy_slot_from_components`, so the
+        // retirement scan never attributes another Consumer's keys.
+        if legacy_identity_is_unambiguous(namespace)
+            && legacy_identity_is_unambiguous(consumer_id)
+            && legacy_path_key_is_unambiguous(top)
+        {
             prefixes.push(format!("{namespace}/{consumer_id}/{top}"));
         }
         return prefixes;
