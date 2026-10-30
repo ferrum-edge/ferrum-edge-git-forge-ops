@@ -103,6 +103,7 @@ async fn main() {
                 encrypt_to.as_deref(),
                 explicit_env.as_deref(),
                 resolve_options,
+                cli.allow_empty_namespace,
             )
             .await
         }
@@ -1598,6 +1599,7 @@ async fn cmd_export(
     encrypt_to: Option<&str>,
     explicit_env: Option<&str>,
     resolve_options: secrets::ResolveOptions<'_>,
+    allow_empty_namespace: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let allocation_binding = AllocationBinding::from_env()?;
     if encrypt_to.is_some() && !materialize {
@@ -1624,6 +1626,18 @@ async fn cmd_export(
         apply::ensure_distinct_publication_paths(path, &env_config.mesh_file_output_path)?;
     }
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
+    // The exported document is what a file-mode gateway is handed, so a
+    // filter that selected nothing refuses before the bundle, the state or
+    // any write, exactly as `apply` refuses before publishing (#562).
+    if let Some(finding) = assembled
+        .namespace_scope
+        .desired_finding(allow_empty_namespace)
+    {
+        print_namespace_finding(&finding);
+        if finding.is_error() {
+            process::exit(config::EMPTY_NAMESPACE_EXIT_CODE);
+        }
+    }
     let mut gateway_config = assembled.gateway;
     enforce_exclusive_scope(&resolved, &gateway_config)?;
 
@@ -4119,6 +4133,14 @@ async fn cmd_review(
     let probe_allowlist_invalid = allowlist_error.is_some();
     let file_publication_narrowed =
         file_publication_narrowed(&env_config, &resolved, &assembled.namespace_scope);
+    // Review never refuses an empty selection (its comment must still post
+    // and default review exits 0), but the same filter refuses `validate`,
+    // `plan`, `diff`, `apply` and `export`, so it says so on stderr and on
+    // the comment's banner (#562).
+    let namespace_warning = assembled.namespace_scope.desired_finding(true);
+    if let Some(finding) = &namespace_warning {
+        print_namespace_finding(finding);
+    }
     let mut desired = assembled.gateway;
     // PR review preview must match apply's real validation surface, so a
     // reviewer looking at the comment sees the same errors the post-merge
@@ -4307,6 +4329,11 @@ async fn cmd_review(
         {
             ownership_note.push_str(&note);
         }
+    }
+    if namespace_warning.is_some() {
+        ownership_note.push_str(&review::render_empty_namespace_selection(
+            &assembled.namespace_scope,
+        ));
     }
     // Neither refusal has a findings section of its own. The remedy is fixed
     // text, so nothing from the environment or the smoke file reaches the PR.

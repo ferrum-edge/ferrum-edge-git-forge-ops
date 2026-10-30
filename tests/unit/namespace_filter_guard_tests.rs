@@ -973,3 +973,122 @@ fn oversized_resource_or_overlay_files_stop_the_cli_before_the_gateway() {
         );
     }
 }
+
+// #562: `export` writes the document a file-mode gateway is handed, so a
+// filter that selects nothing refuses before anything is written, exactly as
+// `apply` refuses before publishing it.
+#[cfg(unix)]
+#[test]
+fn export_zero_survivors_exits_error_before_writing() {
+    let repo = Repo::with_proxy();
+    let output = repo.run(
+        &["export", "--output", "out/gateway.yaml"],
+        &[("FERRUM_NAMESPACE", "does-not-exist")],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(EMPTY_NAMESPACE_EXIT_CODE),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_mismatch_text(&output);
+    assert!(!repo.dir.path().join("out/gateway.yaml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn export_opt_out_is_a_warning() {
+    let repo = Repo::with_proxy();
+    let output = repo.run(
+        &[
+            "export",
+            "--allow-empty-namespace",
+            "--output",
+            "out/gateway.yaml",
+        ],
+        &[("FERRUM_NAMESPACE", "does-not-exist")],
+    );
+    assert!(
+        output.status.success(),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(err.contains("Warning"), "{err}");
+    assert!(err.contains("does-not-exist"), "{err}");
+    assert!(repo.dir.path().join("out/gateway.yaml").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn export_matching_namespace_is_unchanged() {
+    let repo = Repo::with_proxy();
+    let output = repo.run(
+        &["export", "--output", "out/gateway.yaml"],
+        &[("FERRUM_NAMESPACE", "ferrum")],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("selected 0 desired resources"));
+}
+
+// #562: `review` keeps its exit-0 contract, but the reviewer must see that
+// the filtered job compared nothing: the warning goes to stderr and onto the
+// comment's environment banner.
+#[cfg(unix)]
+#[test]
+fn review_zero_survivors_warns_on_stderr_and_in_the_comment() {
+    let repo = Repo::with_proxy();
+    let output = repo.run(&["review"], &[("FERRUM_NAMESPACE", "does-not-exist")]);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(err.contains("Warning"), "{err}");
+    assert!(err.contains("selected 0 desired resources"), "{err}");
+    let comment = stdout(&output);
+    assert!(
+        comment.contains("Namespace filter selected nothing"),
+        "{comment}"
+    );
+    assert!(comment.contains("does-not-exist"), "{comment}");
+
+    let matching = repo.run(&["review"], &[("FERRUM_NAMESPACE", "ferrum")]);
+    assert!(matching.status.success(), "{}", stderr(&matching));
+    assert!(!stdout(&matching).contains("Namespace filter selected nothing"));
+}
+
+// `export --materialize` refuses the empty selection before it reads the
+// credential bundle or the state ledger: the bundle named here does not exist,
+// and reading it would fail with a different error.
+#[cfg(unix)]
+#[test]
+fn export_materialize_zero_survivors_refuses_before_the_bundle_and_state() {
+    let repo = Repo::with_proxy();
+    let missing_bundle = repo.dir.path().join("no-such-bundle.json");
+    let missing_bundle = missing_bundle.to_string_lossy().to_string();
+    let output = repo.run(
+        &["export", "--materialize", "--output", "out/gateway.yaml"],
+        &[
+            ("FERRUM_NAMESPACE", "does-not-exist"),
+            ("FERRUM_CREDS_JSON_FILE", missing_bundle.as_str()),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(EMPTY_NAMESPACE_EXIT_CODE),
+        "{} {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_mismatch_text(&output);
+    let err = stderr(&output);
+    assert!(!err.contains("no-such-bundle"), "{err}");
+    assert!(!repo.dir.path().join("out/gateway.yaml").exists());
+    assert!(!repo.dir.path().join("out").exists());
+    assert!(!repo.dir.path().join(".state").exists());
+}

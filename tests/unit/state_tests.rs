@@ -1386,3 +1386,35 @@ fn ledger_serialization_is_deterministic_across_reloads() {
     sorted.sort();
     assert_eq!(keys, sorted);
 }
+
+/// #562: an unparsable managed or pending-create key never silently shrinks
+/// the shared-mode delete fence or the large-prune denominator. Load refuses
+/// it before any command reads the ledger, and save refuses to publish one,
+/// so the namespace and fence derivations never see it.
+#[test]
+fn state_refuses_unparsable_pending_create_keys_on_load_and_save() {
+    let dir = TempDir::new().unwrap();
+    with_cwd(dir.path(), || {
+        std::fs::create_dir_all(".state").unwrap();
+        let state_json = r#"{
+            "version": 3,
+            "environment": "production",
+            "resources": {},
+            "pending_creates": ["team-a:Proxy:api"]
+        }"#;
+        std::fs::write(".state/production.json", state_json).unwrap();
+        let err = StateFile::load("production").unwrap_err().to_string();
+        assert!(err.contains("invalid resource key"), "{err}");
+
+        let mut state = StateFile {
+            environment: "staging".to_string(),
+            ..StateFile::default()
+        };
+        state
+            .resources
+            .insert("not-a-state-key".to_string(), "managed:v1".to_string());
+        let err = state.save().unwrap_err().to_string();
+        assert!(err.contains("invalid resource key"), "{err}");
+        assert!(!std::path::Path::new(".state/staging.json").exists());
+    });
+}

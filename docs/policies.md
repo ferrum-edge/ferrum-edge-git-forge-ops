@@ -78,6 +78,16 @@ global ones with the same `plugin_name`, disabled instances dropped.
   `access_control`, `mesh_authz` or `spiffe_identity`) fails the policy load.
   `spiffe_identity` never counts: it extracts an identity but lets callers
   without one through. List custom authenticators by their `plugin_name`.
+  Names match `plugin_name` exactly, as the gateway resolves plugins:
+  surrounding whitespace is ignored, case is not, so `Company_SSO` is not
+  `company_sso`. An entry that is a built-in in another case (`KEY_AUTH`)
+  fails the policy load, here and in `custom_auth_plugin_protocols`,
+  `allowed_plugin_names` and `guardrail_plugin_names`, unless
+  `plugin_name_is_known.allowed_extra_plugin_names` lists exactly that name.
+  The gateway accepts a custom plugin that differs from a built-in only by
+  case, and that list (read whether or not the rule is enabled) is how the
+  repository declares one; the entry then matches only a plugin named exactly
+  `KEY_AUTH`, never `key_auth`.
 - **Per protocol.** The gateway filters each request's plugin chain by
   protocol. `http`/`https` proxies serve HTTP, gRPC and WebSocket; `tcp`/`tcps`
   get a TCP listener and `udp`/`dtls` a UDP listener. A proxy passes only when
@@ -127,7 +137,8 @@ global ones with the same `plugin_name`, disabled instances dropped.
   they implement under `custom_auth_plugin_protocols`, for example
   `company_sso: [http, grpc, websocket]` (values: `http`, `grpc`, `websocket`,
   `tcp`, `udp`). Each key must also be in `auth_plugin_names` and must not be a
-  built-in or a non-plugin spelling such as `jwt` or `oauth2`.
+  built-in or a non-plugin spelling such as `jwt` or `oauth2`. Two keys that
+  differ only in surrounding whitespace fail the policy load.
 
 The security audit's "No auth plugin" warning and breaking-change detection
 use the same definition and allowlist, even when the rule is disabled.
@@ -171,7 +182,8 @@ resolves later are not checked.
 ### `allowed_proxy_plugins`
 
 Checks each proxy's effective enabled plugins (including namespace globals and
-attached scoped configs), matching `plugin_name` case-insensitively. Messages
+attached scoped configs), matching `plugin_name` exactly (surrounding
+whitespace in an entry is ignored). Messages
 name the plugin, never its configuration.
 
 ### `waf_enforcement`
@@ -206,7 +218,10 @@ the gateway no longer accepts.
 
 Checks `plugin_name` against the gateway's 82 built-ins plus
 `allowed_extra_plugin_names`. Custom names match exactly and case-sensitively,
-as the gateway loads them. `jwt`, `oauth2` and `oidc` are not plugin names;
+as the gateway loads them, so a custom `KEY_AUTH` listed here is accepted as
+itself and never folded to `key_auth`. The list also declares such a name for
+the other plugin allowlists (see `require_auth_plugin`), even when this rule
+is disabled. `jwt`, `oauth2` and `oidc` are not plugin names;
 `jwt_auth`, `oauth2_introspection` and `oidc_relying_party` are.
 
 Retired names (`oauth2_auth`, `semantic_ai_firewall`) and reserved names

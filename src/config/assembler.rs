@@ -657,9 +657,12 @@ pub fn apply_overlay_with_options(
                     deep_merge_values(base_value, overlay.value, &mut Vec::new(), overlay.kind);
                 *base_resource = strict::resource_from_json_value(merged, &overlay.path, options)?;
 
-                if *base_ns == "ferrum" && overlay_key.namespace != "ferrum" {
-                    *base_ns = overlay_key.namespace;
-                }
+                // The overlay matched on the base's effective namespace, and
+                // may spell the default `namespace: ferrum` (which `assemble`
+                // replaces with the directory). Re-anchor the directory to
+                // that matched namespace for every base, not only one loaded
+                // from `resources/ferrum/`, so the merge cannot move the row.
+                *base_ns = overlay_key.namespace;
             }
             None => {
                 return Err(crate::error::Error::OrphanOverlay {

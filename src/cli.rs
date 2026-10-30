@@ -42,7 +42,8 @@ pub struct Cli {
 
     /// Accept a namespace filter that selected zero desired resources while
     /// the on-disk tree is non-empty. Without this flag `validate`, `plan`,
-    /// and `diff` refuse that mismatch as an error-severity finding (exit 1).
+    /// `diff`, `apply` and `export` refuse that mismatch as an error-severity
+    /// finding (exit 1); `review` only warns.
     /// There is deliberately no environment variable — continuing against an
     /// empty selection is a per-run decision, not a repository setting.
     #[arg(long, global = true)]

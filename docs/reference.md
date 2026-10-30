@@ -142,10 +142,12 @@ review and leave static review as comment output.
 ### Namespace filters
 
 `FERRUM_NAMESPACE` (or an environment's `namespace_filter`) limits a run to one
-namespace. `validate`, `plan`, `diff` and `apply` refuse a filter that selects
-no desired resources while the tree is not empty (exit `1`, naming the
-namespaces on disk). `--allow-empty-namespace` turns that into a warning for
-one run; there is no environment variable for it. In file mode, `plan` and
+namespace. `validate`, `plan`, `diff`, `apply` and `export` refuse a filter
+that selects no desired resources while the tree is not empty (exit `1`,
+naming the namespaces on disk; `export` writes nothing). `--allow-empty-namespace`
+turns that into a warning for one run; there is no environment variable for
+it. `review` reports the same selection as a warning on stderr and in the PR
+comment, and keeps its exit code. In file mode, `plan` and
 `apply` refuse an ad-hoc filter that would drop resources from the
 document-wide file (`narrowed-file-publication`); set `namespace_filter` on the
 environment instead.

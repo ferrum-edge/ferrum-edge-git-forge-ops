@@ -157,9 +157,9 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
         }
     }
     for name in &cfg.auth_plugin_names {
-        let lowered = name.to_ascii_lowercase();
-        if crate::plugin_catalog::is_builtin(&lowered)
-            && !crate::plugin_catalog::is_auth_plugin(&lowered)
+        let trimmed = crate::plugin_catalog::normalize_allowlist_name(name);
+        if crate::plugin_catalog::is_builtin(trimmed)
+            && !crate::plugin_catalog::is_auth_plugin(trimmed)
         {
             return Err(crate::error::Error::Config(format!(
                 "require_auth_plugin.auth_plugin_names lists built-in plugin '{name}', which \
@@ -170,9 +170,19 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
         }
     }
     let allowlist = cfg.auth_allowlist();
+    let mut declared: BTreeMap<&str, &String> = BTreeMap::new();
     for name in cfg.custom_auth_plugin_protocols.keys() {
-        let lowered = name.to_ascii_lowercase();
-        if crate::plugin_catalog::is_builtin(&lowered) {
+        let trimmed = crate::plugin_catalog::normalize_allowlist_name(name);
+        // Two keys that trim to one name would otherwise collapse into one
+        // entry, and whichever survived could broaden its protocols.
+        if let Some(previous) = declared.insert(trimmed, name) {
+            return Err(crate::error::Error::Config(format!(
+                "require_auth_plugin.custom_auth_plugin_protocols declares '{trimmed}' twice \
+                 ('{previous}' and '{name}' differ only in surrounding whitespace); keep one entry"
+            )));
+        }
+        let lowered = trimmed.to_ascii_lowercase();
+        if crate::plugin_catalog::is_builtin(trimmed) {
             return Err(crate::error::Error::Config(format!(
                 "require_auth_plugin.custom_auth_plugin_protocols lists built-in plugin '{name}'; \
                  the gateway fixes a built-in's protocols, so remove the entry"
@@ -185,7 +195,7 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
                  plugin; remove the entry"
             )));
         }
-        if !allowlist.contains(name) {
+        if !allowlist.contains(trimmed) {
             return Err(crate::error::Error::Config(format!(
                 "require_auth_plugin.custom_auth_plugin_protocols lists '{name}', which is not \
                  in require_auth_plugin.auth_plugin_names"
@@ -193,6 +203,72 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
         }
     }
     Ok(())
+}
+
+/// Refuse an allowlist entry that spells a built-in in another case, unless
+/// the repository declares a custom plugin by exactly that name.
+///
+/// Plugin names match exactly, as the gateway's plugin factories resolve
+/// `plugin_name`, so an undeclared `KEY_AUTH` is almost certainly a typo for
+/// `key_auth` that would silently match nothing. The gateway does allow a
+/// custom plugin whose name differs from a built-in only by case; listing it
+/// in `plugin_name_is_known.allowed_extra_plugin_names` (whether or not that
+/// rule is enabled) is the declaration that it exists.
+fn refuse_miscased_builtins<'a>(
+    field: &str,
+    entries: impl IntoIterator<Item = &'a String>,
+    declared_custom: &[String],
+) -> crate::error::Result<()> {
+    for entry in entries {
+        let trimmed = crate::plugin_catalog::normalize_allowlist_name(entry);
+        // Declarations are trimmed exactly as `plugin_name_is_known` reads
+        // them, so a padded declaration covers the same name.
+        if declared_custom
+            .iter()
+            .any(|declared| crate::plugin_catalog::normalize_allowlist_name(declared) == trimmed)
+        {
+            continue;
+        }
+        if let Some(builtin) = crate::plugin_catalog::miscased_builtin(trimmed) {
+            return Err(crate::error::Error::Config(format!(
+                "{field} lists '{entry}', which matches no built-in plugin: plugin names are \
+                 case-sensitive. Did you mean `{builtin}`? If '{trimmed}' is a custom plugin \
+                 compiled into your gateway build, declare it in \
+                 plugin_name_is_known.allowed_extra_plugin_names"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Every plugin-name allowlist, held to the exact-identity rule. Runs before
+/// [`validate_require_auth_plugin`], so a miscased built-in is reported as
+/// such rather than as a missing allowlist entry.
+fn validate_plugin_name_allowlists(rules: &PolicyRules) -> crate::error::Result<()> {
+    let declared = &rules.plugin_name_is_known.allowed_extra_plugin_names;
+    refuse_miscased_builtins(
+        "require_auth_plugin.auth_plugin_names",
+        &rules.require_auth_plugin.auth_plugin_names,
+        declared,
+    )?;
+    refuse_miscased_builtins(
+        "require_auth_plugin.custom_auth_plugin_protocols",
+        rules
+            .require_auth_plugin
+            .custom_auth_plugin_protocols
+            .keys(),
+        declared,
+    )?;
+    refuse_miscased_builtins(
+        "allowed_proxy_plugins.allowed_plugin_names",
+        &rules.allowed_proxy_plugins.allowed_plugin_names,
+        declared,
+    )?;
+    refuse_miscased_builtins(
+        "require_ai_guardrails.guardrail_plugin_names",
+        &rules.require_ai_guardrails.guardrail_plugin_names,
+        declared,
+    )
 }
 
 /// Spellings that are not real `plugin_name` values but appear in
@@ -219,8 +295,8 @@ const LEGACY_AUTH_PLUGIN_ALIASES: &[&str] = &[
     "mtlsauth",
 ];
 
-/// Ferrum Edge built-in auth plugin ids. Matching is case-insensitive against
-/// the plugin's `plugin_name` field.
+/// Ferrum Edge built-in auth plugin ids. Matching is exact against the
+/// plugin's `plugin_name` field, as the gateway resolves plugins.
 ///
 /// The canonical ten come from [`crate::plugin_catalog::AUTH_PLUGIN_NAMES`]
 /// so this list cannot drift from the gateway's registry; the legacy aliases
@@ -234,9 +310,8 @@ pub fn default_auth_plugin_names() -> Vec<String> {
 }
 
 pub fn is_default_auth_plugin_name(plugin_name: &str) -> bool {
-    let plugin_name = plugin_name.to_ascii_lowercase();
-    crate::plugin_catalog::AUTH_PLUGIN_NAMES.contains(&plugin_name.as_str())
-        || LEGACY_AUTH_PLUGIN_ALIASES.contains(&plugin_name.as_str())
+    crate::plugin_catalog::AUTH_PLUGIN_NAMES.contains(&plugin_name)
+        || LEGACY_AUTH_PLUGIN_ALIASES.contains(&plugin_name)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -520,6 +595,7 @@ pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<Polic
         )));
     }
     validate_overrides(&loaded.overrides)?;
+    validate_plugin_name_allowlists(&loaded.policies)?;
     validate_require_auth_plugin(&loaded.policies.require_auth_plugin)?;
     Ok(Some(loaded))
 }
