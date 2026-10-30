@@ -192,7 +192,8 @@ cargo fmt --all && cargo fmt --all -- --check
   (`job_timeout_violations`): at most 120, or 360 for a job that commits the
   state ledger (known by job id, the state-writer key or the App-token
   action). Such a job gives every step its own timeout and a budget of at
-  least their sum plus 5 minutes, because a job timeout cancels the job and
+  least their sum plus 15 minutes (runner setup downloads actions before any
+  step timeout applies), because a job timeout cancels the job and
   skips the `!cancelled()` ledger commit. Reusable-workflow call jobs carry
   none (GitHub refuses it). Every workflow and local-action interpreter,
   including a Python `shell:`, is `python3 -I` (`python_isolation_violations`). `rust-ci.yml` coverage runs with

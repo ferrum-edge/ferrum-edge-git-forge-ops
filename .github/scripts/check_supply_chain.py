@@ -3978,7 +3978,7 @@ _DIGEST_PINNED_IMAGE = re.compile(r"[^\s@${}]+@sha256:[0-9a-f]{64}")
 # recorded) before the job budget can cancel the commit.
 MAX_JOB_TIMEOUT_MINUTES = 120
 MAX_LEDGER_JOB_TIMEOUT_MINUTES = 360
-LEDGER_JOB_MARGIN_MINUTES = 5
+LEDGER_JOB_MARGIN_MINUTES = 15
 # Ledger jobs are known by id and by what they hold, never by a step's display
 # name alone: renaming the mint step must not drop the per-step budgets.
 LEDGER_JOBS = {
@@ -4073,16 +4073,47 @@ def job_timeout_violations(workflow: str, document: dict) -> list[str]:
 _PYTHON_COMMAND = re.compile(
     r"(?<![\w.$-])(?:pypy|python)(?:3(?:\.\d+)?)?(?![\w.-])"
 )
-# The interpreter's own options, up to its first operand. `-I` may come
-# anywhere among them, alone or in a short-option cluster (`-Is`).
-_INTERPRETER_OPTIONS = re.compile(r"(?:[ \t]+-(?!-)[A-Za-z]+)*")
-_ISOLATED_OPTION = re.compile(r"[ \t]+-[A-Za-z]*I[A-Za-z]*")
-# `python3 -I - <<'TAG'`: the body is Python source for an isolated
-# interpreter, not shell, so a word like `python` in it starts nothing.
+_OPTION_TOKEN = re.compile(r"[ \t]+(\S+)")
+# Short options that take the next token as their argument (`-X dev`,
+# `-W error`), and ones that end option parsing (`-c CODE`, `-m MODULE`).
+_ARGUMENT_OPTIONS = frozenset("XW")
+_FINAL_OPTIONS = frozenset("cm")
+# `python3 -I - <<'TAG'` with the interpreter as the line's command and a
+# quoted delimiter: the body is literal Python source for an isolated
+# interpreter, so a word like `python` in it starts nothing. An unquoted
+# delimiter is still shell (`$(...)` runs), so its body is scanned.
 _ISOLATED_HEREDOC = re.compile(
-    r"python(?:3(?:\.\d+)?)?(?:[ \t]+-[A-Za-z]+)*[ \t]+-(?:[ \t]+[^<\s]+)*"
-    r"[ \t]*<<-?[ \t]*(['\"]?)(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\1"
+    r"^[ \t]*(?:\S*/)?python(?:3(?:\.\d+)?)?(?:[ \t]+-[A-Za-z]+)*[ \t]+-(?:[ \t]+[^<\s]+)*"
+    r"[ \t]*<<-?[ \t]*(['\"])(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\1[ \t]*$"
 )
+
+
+def _isolated_from(text: str, position: int) -> bool:
+    """Whether the interpreter named just before `position` gets `-I`.
+
+    Reads its short options in order, as CPython does: `-I` alone or in a
+    cluster (`-Is`) counts until an option that takes an argument consumes
+    the next token (`-X -I` is `-X` with argument `-I`) or `-c`/`-m`/an
+    operand ends option parsing.
+    """
+    expecting_argument = False
+    for token in _OPTION_TOKEN.finditer(text, position):
+        word = token.group(1)
+        if expecting_argument:
+            expecting_argument = False
+            continue
+        if not word.startswith("-") or word == "-" or word.startswith("--"):
+            return False
+        for index, letter in enumerate(word[1:]):
+            if letter == "I":
+                return True
+            if letter in _FINAL_OPTIONS:
+                return False
+            if letter in _ARGUMENT_OPTIONS:
+                expecting_argument = index == len(word) - 2
+                break
+        position = token.end()
+    return False
 
 
 def _shell_values(node, path: str = ""):
@@ -4102,16 +4133,21 @@ def _shell_values(node, path: str = ""):
 def python_isolation_violations(workflow: str, document: dict) -> list[str]:
     """Every Python interpreter a workflow or local action `run:` starts is isolated.
 
-    Absolute paths (`/usr/bin/python3`) count. A mention in quoted shell text
+    A consistency rule over literal text, like the other workflow text rules
+    (#476), not a sandbox: an interpreter named through a variable (`"$PY"`)
+    or built at run time is not seen, and review of every workflow change
+    covers that. Absolute paths (`/usr/bin/python3`) and every interpreter in
+    a `shell:` value count. A mention in quoted shell text
     (`echo "install python3"`) is refused too: telling a command from text is
     a shell parse this reader does not attempt, and refusing is the safe side.
     """
     violations: list[str] = []
     for path, shell in _shell_values(document):
-        if not isinstance(shell, str) or _PYTHON_COMMAND.search(shell) is None:
+        if not isinstance(shell, str):
             continue
-        options = _INTERPRETER_OPTIONS.match(shell, _PYTHON_COMMAND.search(shell).end()).group()
-        if not _ISOLATED_OPTION.search(options):
+        if any(
+            not _isolated_from(shell, match.end()) for match in _PYTHON_COMMAND.finditer(shell)
+        ):
             violations.append(
                 f"{workflow}: {path}: a Python `shell:` runs the step body unisolated; "
                 "use `python3 -I {0}` or a `run:` that invokes `python3 -I`"
@@ -4126,16 +4162,15 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
             if line.lstrip().startswith("#"):
                 continue
             for match in _PYTHON_COMMAND.finditer(line):
-                options = _INTERPRETER_OPTIONS.match(line, match.end()).group()
-                if not _ISOLATED_OPTION.search(options):
+                if not _isolated_from(line, match.end()):
                     violations.append(
                         f"{workflow}: {path}: run Python as `python3 -I`, never "
                         f"{line.strip()!r}; isolated mode keeps the working directory, "
                         "`PYTHON*` variables and the user site off the interpreter"
                     )
                     break
-            heredoc = _ISOLATED_HEREDOC.search(line)
-            if heredoc is not None:
+            heredoc = _ISOLATED_HEREDOC.match(line)
+            if heredoc is not None and _isolated_from(line, _PYTHON_COMMAND.search(line).end()):
                 heredoc_tag = heredoc.group("tag")
     return violations
 

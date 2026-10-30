@@ -126,7 +126,7 @@ jobs:
     # Every step carries its own timeout and this job budget covers their sum,
     # so a hung step fails (and is recorded) while the ledger commit still
     # runs. A job timeout cancels the job, which skips that commit.
-    timeout-minutes: 245
+    timeout-minutes: 255
     permissions:
       contents: read
       pull-requests: write
@@ -752,7 +752,7 @@ jobs:
     # Every step carries its own timeout and this job budget covers their sum,
     # so a hung step fails (and is recorded) while the ledger commit still
     # runs. A job timeout cancels the job, which skips that commit.
-    timeout-minutes: 250
+    timeout-minutes: 260
     permissions:
       contents: read
       pull-requests: write

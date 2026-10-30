@@ -472,7 +472,7 @@ fn both_verify_steps_carry_a_step_timeout_that_covers_the_budget() {
 /// Minutes a job may spend outside its steps (runner setup, post-steps)
 /// before its budget could cancel the ledger commit. Mirrors
 /// `LEDGER_JOB_MARGIN_MINUTES` in `.github/scripts/check_supply_chain.py`.
-const LEDGER_JOB_MARGIN_MINUTES: u64 = 5;
+const LEDGER_JOB_MARGIN_MINUTES: u64 = 15;
 
 #[test]
 fn ledger_job_budgets_cover_every_step() {

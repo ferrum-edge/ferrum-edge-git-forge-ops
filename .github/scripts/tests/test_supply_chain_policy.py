@@ -8166,10 +8166,10 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             any("every step needs" in item
                 for item in check_supply_chain.job_timeout_violations("x.yml", unbounded))
         )
-        # 60 + 5 steps leave no margin inside a 68-minute job.
-        tight = self._document(workflow(68, 5, 60))
+        # 60 + 5 steps leave too little setup margin inside a 78-minute job.
+        tight = self._document(workflow(78, 5, 60))
         self.assertTrue(
-            any("must be at least 70" in item
+            any("must be at least 80" in item
                 for item in check_supply_chain.job_timeout_violations("x.yml", tight))
         )
         # A ledger job may exceed the ordinary ceiling, never GitHub's own.
@@ -8240,7 +8240,12 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
                 f"      - shell: {shell}\n        run: print(1)\n"
             )
 
-        for shell in ("python", "python3 {0}", "/usr/bin/python3 -u {0}"):
+        for shell in (
+            "python",
+            "python3 {0}",
+            "/usr/bin/python3 -u {0}",
+            "bash -c 'python3 -I {0}; python3 -c pass'",
+        ):
             self.assertTrue(
                 check_supply_chain.python_isolation_violations("x.yml", workflow(shell)), shell
             )
@@ -8281,6 +8286,12 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["./venv/bin/python3 x.py"],
             ["pypy3 x.py"],
             ["python3 -u x.py -I"],
+            ["python3 -X -I -c 'import sys'"],
+            ["python3 -XI x.py"],
+            ["python3 -W -I x.py"],
+            ["python3 -c -I"],
+            ["python3 -I - <<PY", "$(python3 -c 'pass')", "PY"],
+            ["echo 'python3 -I - <<TAG'", "python3 -c 'pass'"],
             ["bash <<'SH'", "python3 x.py", "SH"],
             ["python3 -I - <<'PY'", "print(1)", "PY", "python3 y.py"],
         ):
@@ -8296,6 +8307,7 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["/usr/bin/python3 -I -c 'import sys'"],
             ["python3 -u -I x.py"],
             ["python3 -Is x.py"],
+            ["python3 -X dev -I x.py"],
             ["python3 -I - \"$CHECKER\" <<'PY'", "print('python')", "import python3", "PY"],
             ["echo done"],
         ):
