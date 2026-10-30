@@ -64,7 +64,7 @@ stay red on `main` until the settings behind them exist:
 | Workflow | Red until | Section |
 | --- | --- | --- |
 | `Release` | the `main` ruleset declares required checks. Until then `gh pr checks --required` exits non-zero with "no required checks reported", so every push to `main` fails the publication gate. | [§2](#2-protect-main-with-an-active-ruleset) |
-| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template), the `main` ruleset binds `state-guard-reject-state-edits` (and, once required, `trusted-supply-chain-policy`) to the GitHub Actions app, and an organization ruleset requires every workflow that reports a required check by path, with the `main` ruleset's bypass actors | [§1](#1-create-the-state-writer-github-app), [§2](#switching-the-supply-chain-policy-check), [§2a](#2a-require-the-trusted-workflows-by-path), [§5](#5-enable-settings-drift-monitoring) |
+| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template), the `main` ruleset binds `state-guard-reject-state-edits` (and, once required, `trusted-supply-chain-policy` and `validate-trusted-policy`) to the GitHub Actions app, and an organization ruleset requires every workflow that reports a required check by path, with the `main` ruleset's bypass actors | [§1](#1-create-the-state-writer-github-app), [§2](#switching-the-supply-chain-policy-check), [§2a](#2a-require-the-trusted-workflows-by-path), [§5](#5-enable-settings-drift-monitoring) |
 
 Neither workflow may assume a control it cannot verify. Configure §1-§5 first
 and neither goes red.
@@ -87,17 +87,6 @@ scheduled `drift-check` fail loudly when the configuration is missing.
 gateway mutation. A protected `main` rejects a direct push by
 `github-actions[bot]`, so the workflows mint a short-lived installation token
 for a dedicated App instead.
-
-The guard has no concurrency group, so every delivery runs to completion and
-cannot cancel another delivery. A manual cancellation or runner failure can
-still interrupt a run. This avoids the same-head cancellation seen on #407,
-where branch protection read the newest check suite. The guard is also safe if
-protection requires every suite's latest run to pass: each run is bound to its
-delivered head, and an authorized run re-reads the head, base and label just
-before reporting success. `check_supply_chain.py` enforces the
-`pull_request_target` trigger, a single default-branch checkout with no PR
-checkout, the absence of a concurrency declaration, and the final override
-revalidation.
 
 Create and install a GitHub App with:
 
@@ -143,6 +132,16 @@ permission lookup (an App's bot account answers 404) only disqualifies that
 reviewer. The same authorization is required when the file list cannot
 be fully enumerated. Keep both `/.state` and `/.state/` in CODEOWNERS;
 the trusted static-validation classifier must cover both as well.
+
+The guard has no concurrency group, so every delivery runs to completion and
+cannot cancel another delivery; a manual cancellation or runner failure can
+still interrupt a run. Each run is bound to its delivered head, and an
+authorized run re-reads the head, base and label just before reporting
+success, so the guard is safe whether branch protection reads the newest check
+suite or requires every suite's latest run to pass. `check_supply_chain.py`
+enforces the `pull_request_target` trigger, a single default-branch checkout
+with no PR checkout, the absence of a concurrency declaration, and the final
+head/base/label recheck.
 
 At runtime, `.state` must be a real directory and state and lock entries must
 be regular files. Symlinks and intermediate environment paths are refused, even
@@ -265,9 +264,10 @@ Take step 2 after step 1 has merged, as an administrator:
 
    Then dispatch `GitHub Settings Audit` from `main`. The
    `trusted-supply-chain-policy` warning must be gone. The audit fails if
-   `trusted-supply-chain-policy` or `state-guard-reject-state-edits` is
-   required from any source other than GitHub Actions, and warns for each
-   other context that is not yet bound. The scheduled audit therefore goes
+   `state-guard-reject-state-edits`, or `trusted-supply-chain-policy` or
+   `validate-trusted-policy` once required, is required from any source other
+   than GitHub Actions, and warns for each other context that is not yet
+   bound. The scheduled audit therefore goes
    red as soon as step 1 merges, until this step binds
    `state-guard-reject-state-edits`.
 5. Pull requests whose branch predates the merge do not carry
@@ -560,17 +560,10 @@ baselines. A comparison with no drift but unverified secrets exits `6` and is
 reported as `In sync, secrets unverified`: a warning, never "in sync", and not
 a failure. Explicit CLI acceptance retains its documented limits.
 
-**Human deployment step (#440).** Before deploying the viewer-only workflow,
-a repository administrator must provision the gateway's distinct viewer key as
-`FERRUM_ADMIN_JWT_VIEWER_SECRET` in every API environment selected by
-`matrix.scope.monitoring_environment`: `<env>-monitor` when
-`monitoring.unattended` is true, otherwise the deployment environment itself.
-Use GitHub **Settings → Environments → selected environment → Environment
-secrets**. After the workflow switch, remove `FERRUM_ADMIN_JWT_SECRET` from each
-`<env>-monitor`; deployment environments retain it for apply, trusted review and
-rotate. The audit now refuses the admin name in monitoring and requires the
-viewer name. This is a manual secret-entry operation, never a script that reads,
-prints or copies secret values. See [Scheduled monitoring](reference.md#scheduled-monitoring).
+**Provisioning.** A repository administrator provisions the gateway's viewer
+key as `FERRUM_ADMIN_JWT_VIEWER_SECRET` in every environment the drift matrix
+binds, and `<env>-monitor` must not hold `FERRUM_ADMIN_JWT_SECRET`; see
+[Scheduled monitoring](reference.md#scheduled-monitoring).
 
 ### 3.2 Monitoring outcomes
 
@@ -913,7 +906,8 @@ What the checker enforces for this check:
   by that context in its own workflow: `trusted-supply-chain-policy` in
   `supply-chain-policy.yml`, `state-guard-reject-state-edits` in
   `state-guard.yml`, and likewise `rust-ci-check`, `security-cargo-audit`,
-  `security-supply-chain-policy` and `gitforgeops-required-static-validation`
+  `security-supply-chain-policy`, `gitforgeops-required-static-validation`
+  and `validate-trusted-policy` in `agent-setup-policy.yml`
   (`REQUIRED_CHECK_WORKFLOWS`, kept equal to the bootstrap's
   `REQUIRED_STATUS_CHECKS` by a test). No job's `name:` may be computed with
   `${{ }}`. Mentioning a context in a script, a step title or an action input

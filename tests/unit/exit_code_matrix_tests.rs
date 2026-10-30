@@ -1,4 +1,4 @@
-//! The documented exit-code contract (CLAUDE.md, "Exit codes"), one table.
+//! The documented exit-code contract (docs/reference.md, "Exit codes"), one table.
 //!
 //! Workflows, the drift monitor and operators branch on the process status
 //! alone, so a refactor of `main.rs` dispatch must not silently move a code.
@@ -806,7 +806,7 @@ fn every_documented_exit_code_is_returned_by_the_command_that_documents_it() {
     assert_eq!(reached, (0..=6).collect::<BTreeSet<i32>>());
 }
 
-/// The table in CLAUDE.md names these numbers; the constants are what `main`
+/// The documented table names these numbers; the constants are what `main`
 /// exits with. A renumbered constant must fail here, not only in the matrix.
 #[test]
 fn exit_code_constants_match_the_documented_table() {

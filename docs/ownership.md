@@ -52,9 +52,10 @@ prunable (exclusive). `full_replace` does not use the journal.
   `ownership.namespaces`, which is required.
 - Unmanaged resources in those namespaces are **pruned**.
 - `ownership.large_prune_threshold_percent` (default `25`) stops an apply that
-  would delete more than that share of the managed set, unless
-  `--allow-large-prune` is passed. The comparison uses the exact ratio, so an
-  exact match is allowed.
+  would delete more than that share of the prunable live resources in the
+  selected owned namespaces, unless `--allow-large-prune` is passed.
+  API-spec-owned rows count only with `--confirm-api-spec-deletion`. The
+  comparison uses the exact ratio, so an exact match is allowed.
 
 Every command that loads desired resources (`validate`, `plan`, `review`,
 `diff`, `export`, `apply`) enforces the namespace list after overlays and

@@ -115,7 +115,8 @@ pub enum Commands {
         #[arg(long)]
         auto_approve: bool,
         /// Allow apply even when the plan would delete more than
-        /// `ownership.large_prune_threshold_percent` of managed resources.
+        /// `ownership.large_prune_threshold_percent` of in-scope managed
+        /// resources (shared) or prunable live resources (exclusive).
         /// Does not bypass the stale (cached) gateway-view safety gate.
         #[arg(long)]
         allow_large_prune: bool,
