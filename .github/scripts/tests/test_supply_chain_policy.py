@@ -5787,7 +5787,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertNotEqual(suite_only, text)
         violations = check_supply_chain.rust_ci_test_scope_violations(suite_only)
         self.assertTrue(
-            any("coverage must measure the library target" in item for item in violations),
+            any("measure the library target" in item for item in violations),
             violations,
         )
 
@@ -7967,12 +7967,58 @@ class Issue562RolloutTests(unittest.TestCase):
     def _switched_rust_ci(self, floor: int = 87) -> str:
         text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
         text = self._after_job_header(text, "rust-ci-check", 45)
-        text = self._after_job_header(text, "coverage", 45)
         text = text.replace("python3 trusted-scope/", "python3 -I trusted-scope/")
-        return text.replace(
-            "--output-path lcov.info\n",
-            f"--output-path lcov.info --fail-under-lines {floor}\n",
+        coverage = check_supply_chain.workflow_job(text, "coverage")
+        switched = "".join(
+            line.replace(
+                check_supply_chain.COVERAGE_FLOOR_PLACEHOLDER, f"--fail-under-lines {floor}"
+            )
+            + "\n"
+            for line in check_supply_chain.COVERAGE_JOB
+        )
+        return text.replace(coverage, switched, 1)
+
+    def test_coverage_job_is_pinned_against_decoys(self):
+        switched = self._switched_rust_ci()
+        # A decoy `env.run` keeps the approved text while another command runs.
+        decoy = switched.replace(
+            "        run: cargo llvm-cov --lib",
+            "        env:\n          run: cargo llvm-cov --lib",
             1,
+        ).replace(
+            "--fail-under-lines 87\n",
+            "--fail-under-lines 87\n        run: touch lcov.info\n",
+            1,
+        )
+        self.assertNotEqual(decoy, switched)
+        self.assertTrue(
+            any(
+                "coverage must keep its reviewed header" in item
+                for item in check_supply_chain.rust_ci_test_scope_violations(decoy)
+            )
+        )
+        # A quoted path to the candidate's classifier, the trusted text kept in a comment.
+        quoted = switched.replace(
+            "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py \\\n"
+            "              \"$pages_file\" \"$current_changed\" rust)\n"
+            "          else\n            # Bootstrap",
+            "result=$(python3 -I \".github/scripts/changed_files.py\" \\\n"
+            "              \"$pages_file\" \"$current_changed\" rust)\n"
+            "          else\n            # Bootstrap",
+            1,
+        )
+        self.assertNotEqual(quoted, switched)
+        self.assertTrue(check_supply_chain.rust_ci_test_scope_violations(quoted))
+        self.assertTrue(
+            any(
+                "candidate-branch" in item
+                for item in check_supply_chain.trusted_classifier_violations(
+                    "rust-ci.yml",
+                    quoted + "\n# result=$(python3 -I trusted-scope/.github/scripts/changed_files.py\n",
+                    "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py",
+                    2,
+                )
+            )
         )
 
     def test_rust_ci_accepts_the_reviewed_and_the_switched_job(self):

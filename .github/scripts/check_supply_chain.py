@@ -1432,9 +1432,10 @@ def monitoring_workflow_violations(text: str) -> list[str]:
     return violations
 
 
-# Interpreter flags (`-I`, `-B`, ...) do not make the candidate's helper trusted.
+# Interpreter flags (`-I`, `-B`, ...) and quoting do not make the candidate's
+# helper trusted. A text rule only; the pinned jobs are what bind execution.
 _CANDIDATE_CLASSIFIER = re.compile(
-    r"python3?(?:[ \t]+-[A-Za-z]+)*[ \t]+(?:\./)?\.github/scripts/changed_files\.py"
+    r"python3?(?:[ \t]+-[A-Za-z]+)*[ \t]+[\"']?(?:\./)?\.github/scripts/changed_files\.py"
 )
 
 
@@ -2306,14 +2307,220 @@ _ISSUE_562_LEGACY_RUST_CI_CHECK_JOB = _issue_562_legacy_lines(RUST_CI_CHECK_JOB)
 # gate was introduced (88.17% at 671fd4f). Lowering it is a policy change made
 # here, in review, never in the workflow alone.
 COVERAGE_LINE_FLOOR = 87
-COVERAGE_RUN = re.compile(
-    r"run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov\.info"
-    r" --fail-under-lines (?P<floor>\d+)"
-)
-# ISSUE_562_LEGACY: the ungated measurement.
-_ISSUE_562_LEGACY_COVERAGE_RUN = (
-    "run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info"
-)
+_COVERAGE_FLOOR = re.compile(r"--fail-under-lines (\d+)$")
+COVERAGE_FLOOR_PLACEHOLDER = "--fail-under-lines <floor>"
+# The whole `coverage` job, pinned like `rust-ci-check`: text matches inside a
+# step accept a decoy (`env: {run: ...}` beside the real `run:`, a heredoc
+# line) and a quoted path to the candidate's own classifier. Only the floor is
+# free, and it is held to COVERAGE_LINE_FLOOR separately.
+COVERAGE_JOB = [
+    "    runs-on: ubuntu-26.04",
+    "    timeout-minutes: 45",
+    "    permissions:",
+    "      contents: read",
+    "      pull-requests: read",
+    "    steps:",
+    "      - uses: actions/checkout@<sha> # v7",
+    "        with:",
+    "          persist-credentials: false",
+    "      - name: Check out trusted path classifier",
+    "        if: github.event_name == 'pull_request'",
+    "        uses: actions/checkout@<sha> # v7",
+    "        with:",
+    "          ref: ${{ github.event.repository.default_branch }}",
+    "          path: trusted-scope",
+    "          persist-credentials: false",
+    "      - name: Detect Rust-impacting PR paths",
+    "        if: github.event_name == 'pull_request'",
+    "        id: scope",
+    "        env:",
+    "          GH_TOKEN: ${{ github.token }}",
+    "          REPO: ${{ github.repository }}",
+    "          PR_NUMBER: ${{ github.event.pull_request.number }}",
+    "          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+    "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    "        run: |",
+    "          set -euo pipefail",
+    "          pages_file=$(mktemp)",
+    "          trap 'rm -f \"$pages_file\"' EXIT",
+    "          stable=false",
+    "          for attempt in 1 2 3; do",
+    "            before=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
+    "            before_head=$(jq -r '.head.sha' <<< \"$before\")",
+    "            before_base=$(jq -r '.base.sha' <<< \"$before\")",
+    "            before_ref=$(jq -r '.base.ref' <<< \"$before\")",
+    "            before_count=$(jq -r '.changed_files' <<< \"$before\")",
+    "            [[ \"$before_head\" =~ ^[0-9a-f]{40}$ && \"$before_base\" =~ ^[0-9a-f]{40}$ && \"$before_count\" =~ ^[0-9]+$ ]] || exit 1",
+    "            [ \"$before_head\" = \"$EXPECTED_HEAD_SHA\" ] && [ \"$before_ref\" = \"$DEFAULT_BRANCH\" ] || exit 1",
+    "            gh api \"repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100\" --paginate --slurp > \"$pages_file\"",
+    "            after=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
+    "            after_head=$(jq -r '.head.sha' <<< \"$after\")",
+    "            after_base=$(jq -r '.base.sha' <<< \"$after\")",
+    "            after_ref=$(jq -r '.base.ref' <<< \"$after\")",
+    "            after_count=$(jq -r '.changed_files' <<< \"$after\")",
+    "            if [ \"$before_head\" = \"$after_head\" ] && [ \"$before_base\" = \"$after_base\" ] && \\",
+    "               [ \"$before_ref\" = \"$after_ref\" ] && [ \"$before_count\" = \"$after_count\" ]; then",
+    "              current_changed=$after_count",
+    "              stable=true",
+    "              break",
+    "            fi",
+    "            echo \"::warning::PR file metadata changed during attempt ${attempt}; retrying.\"",
+    "          done",
+    "          [ \"$stable\" = true ] || exit 1",
+    "          helper=trusted-scope/.github/scripts/changed_files.py",
+    "          if [ -f \"$helper\" ]; then",
+    "            result=$(python3 -I trusted-scope/.github/scripts/changed_files.py \\",
+    "              \"$pages_file\" \"$current_changed\" rust)",
+    "          else",
+    "            # Bootstrap the trusted helper by running the complete coverage",
+    "            # gate. The PR-controlled helper is deliberately never executed.",
+    "            echo \"::warning::Trusted path classifier is not present on the PR base; running coverage fail-safe.\"",
+    "            result='{\"complete\":false,\"matches\":true}'",
+    "          fi",
+    "          rust=$(jq -r '.matches' <<< \"$result\")",
+    "          if [ \"$(jq -r '.complete' <<< \"$result\")\" != true ]; then rust=true; fi",
+    "          echo \"rust=$rust\" >> \"$GITHUB_OUTPUT\"",
+    "      - name: Install Rust toolchain",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust <rust toolchain>",
+    "        with:",
+    "          toolchain: <rust toolchain>",
+    "          components: llvm-tools-preview",
+    "      - name: Cache cargo registry + target",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: actions/cache@<sha> # v6",
+    "        with:",
+    "          path: |",
+    "            ~/.cargo/registry",
+    "            ~/.cargo/git",
+    "            target",
+    "          key: ${{ runner.os }}-rust-coverage-${{ hashFiles('**/Cargo.lock') }}",
+    "          restore-keys: |",
+    "            ${{ runner.os }}-rust-coverage-",
+    "      # Always install from the pinned action's checksum manifest, as",
+    "      # security.yml does for cargo-audit. `~/.cargo/bin` is deliberately not",
+    "      # cached: a restored binary would skip that verification.",
+    "      - name: Install cargo-llvm-cov",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: taiki-e/install-action@<sha> # v2.87.30",
+    "        with:",
+    "          tool: cargo-llvm-cov@0.9.0",
+    "          checksum: true",
+    "          fallback: none",
+    "      - name: cargo llvm-cov",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        # Floor set below the measured baseline: 88.17% of lines (26615/30185)",
+    "        # on main at 671fd4f (issue #562). Raise it as coverage grows; never",
+    "        # lower it to land a change.",
+    "        run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info --fail-under-lines <floor>",
+    "      - name: Upload coverage artifact",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: actions/upload-artifact@<sha> # v7",
+    "        with:",
+    "          name: lcov",
+    "          path: lcov.info",
+]
+# ISSUE_562_LEGACY: the coverage job as reviewed before #562 (no budget, no
+# floor, plain `python3`, `~/.cargo/bin` cached, no installer checksum).
+_ISSUE_562_LEGACY_COVERAGE_JOB = [
+    "    runs-on: ubuntu-26.04",
+    "    permissions:",
+    "      contents: read",
+    "      pull-requests: read",
+    "    steps:",
+    "      - uses: actions/checkout@<sha> # v7",
+    "        with:",
+    "          persist-credentials: false",
+    "      - name: Check out trusted path classifier",
+    "        if: github.event_name == 'pull_request'",
+    "        uses: actions/checkout@<sha> # v7",
+    "        with:",
+    "          ref: ${{ github.event.repository.default_branch }}",
+    "          path: trusted-scope",
+    "          persist-credentials: false",
+    "      - name: Detect Rust-impacting PR paths",
+    "        if: github.event_name == 'pull_request'",
+    "        id: scope",
+    "        env:",
+    "          GH_TOKEN: ${{ github.token }}",
+    "          REPO: ${{ github.repository }}",
+    "          PR_NUMBER: ${{ github.event.pull_request.number }}",
+    "          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+    "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    "        run: |",
+    "          set -euo pipefail",
+    "          pages_file=$(mktemp)",
+    "          trap 'rm -f \"$pages_file\"' EXIT",
+    "          stable=false",
+    "          for attempt in 1 2 3; do",
+    "            before=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
+    "            before_head=$(jq -r '.head.sha' <<< \"$before\")",
+    "            before_base=$(jq -r '.base.sha' <<< \"$before\")",
+    "            before_ref=$(jq -r '.base.ref' <<< \"$before\")",
+    "            before_count=$(jq -r '.changed_files' <<< \"$before\")",
+    "            [[ \"$before_head\" =~ ^[0-9a-f]{40}$ && \"$before_base\" =~ ^[0-9a-f]{40}$ && \"$before_count\" =~ ^[0-9]+$ ]] || exit 1",
+    "            [ \"$before_head\" = \"$EXPECTED_HEAD_SHA\" ] && [ \"$before_ref\" = \"$DEFAULT_BRANCH\" ] || exit 1",
+    "            gh api \"repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100\" --paginate --slurp > \"$pages_file\"",
+    "            after=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
+    "            after_head=$(jq -r '.head.sha' <<< \"$after\")",
+    "            after_base=$(jq -r '.base.sha' <<< \"$after\")",
+    "            after_ref=$(jq -r '.base.ref' <<< \"$after\")",
+    "            after_count=$(jq -r '.changed_files' <<< \"$after\")",
+    "            if [ \"$before_head\" = \"$after_head\" ] && [ \"$before_base\" = \"$after_base\" ] && \\",
+    "               [ \"$before_ref\" = \"$after_ref\" ] && [ \"$before_count\" = \"$after_count\" ]; then",
+    "              current_changed=$after_count",
+    "              stable=true",
+    "              break",
+    "            fi",
+    "            echo \"::warning::PR file metadata changed during attempt ${attempt}; retrying.\"",
+    "          done",
+    "          [ \"$stable\" = true ] || exit 1",
+    "          helper=trusted-scope/.github/scripts/changed_files.py",
+    "          if [ -f \"$helper\" ]; then",
+    "            result=$(python3 trusted-scope/.github/scripts/changed_files.py \\",
+    "              \"$pages_file\" \"$current_changed\" rust)",
+    "          else",
+    "            # Bootstrap the trusted helper by running the complete coverage",
+    "            # gate. The PR-controlled helper is deliberately never executed.",
+    "            echo \"::warning::Trusted path classifier is not present on the PR base; running coverage fail-safe.\"",
+    "            result='{\"complete\":false,\"matches\":true}'",
+    "          fi",
+    "          rust=$(jq -r '.matches' <<< \"$result\")",
+    "          if [ \"$(jq -r '.complete' <<< \"$result\")\" != true ]; then rust=true; fi",
+    "          echo \"rust=$rust\" >> \"$GITHUB_OUTPUT\"",
+    "      - name: Install Rust toolchain",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust <rust toolchain>",
+    "        with:",
+    "          toolchain: <rust toolchain>",
+    "          components: llvm-tools-preview",
+    "      - name: Cache cargo registry + target",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: actions/cache@<sha> # v6",
+    "        with:",
+    "          path: |",
+    "            ~/.cargo/registry",
+    "            ~/.cargo/git",
+    "            ~/.cargo/bin",
+    "            target",
+    "          key: ${{ runner.os }}-rust-coverage-${{ hashFiles('**/Cargo.lock') }}",
+    "          restore-keys: |",
+    "            ${{ runner.os }}-rust-coverage-",
+    "      - name: Install cargo-llvm-cov",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: taiki-e/install-action@<sha> # v2.87.30",
+    "        with:",
+    "          tool: cargo-llvm-cov@0.9.0",
+    "      - name: cargo llvm-cov",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info",
+    "      - name: Upload coverage artifact",
+    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
+    "        uses: actions/upload-artifact@<sha> # v7",
+    "        with:",
+    "          name: lcov",
+    "          path: lcov.info",
+]
 
 def required_static_validation_violations(text: str) -> list[str]:
     """The required static-validation context must keep its exact verdict job.
@@ -2372,19 +2579,15 @@ def rust_ci_test_scope_violations(text: str) -> list[str]:
             violations.append(
                 f"rust-ci.yml: the cargo test step must run `{command}` unfiltered"
             )
-    coverage = [
-        line.strip()
-        for line in policy_step(workflow_job(text, "coverage"), "cargo llvm-cov")
-    ]
-    floors = [
-        int(match.group("floor"))
-        for match in map(COVERAGE_RUN.fullmatch, coverage)
-        if match is not None
-    ]
-    if not floors and _ISSUE_562_LEGACY_COVERAGE_RUN not in coverage:
+    coverage = _verbatim_job_lines(workflow_job(text, "coverage"))
+    floors = [int(match.group(1)) for line in coverage if (match := _COVERAGE_FLOOR.search(line))]
+    pinned = [_COVERAGE_FLOOR.sub(COVERAGE_FLOOR_PLACEHOLDER, line) for line in coverage]
+    if pinned not in (COVERAGE_JOB, _ISSUE_562_LEGACY_COVERAGE_JOB):
         violations.append(
-            "rust-ci.yml: coverage must measure the library target and the aggregated "
-            f"suite with --fail-under-lines of at least {COVERAGE_LINE_FLOOR}"
+            "rust-ci.yml: coverage must keep its reviewed header, step order, conditions "
+            "and scripts exactly: classify with the trusted helper, then measure the "
+            "library target and the aggregated suite with --fail-under-lines of at "
+            f"least {COVERAGE_LINE_FLOOR}"
         )
     elif any(floor < COVERAGE_LINE_FLOOR for floor in floors):
         violations.append(
