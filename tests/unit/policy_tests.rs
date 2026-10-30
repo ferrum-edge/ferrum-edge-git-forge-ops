@@ -5294,3 +5294,33 @@ fn a_declared_custom_plugin_named_like_a_builtin_matches_only_itself() {
     let builtin = auth_findings(&with("key_auth"), &loaded);
     assert_eq!(builtin.len(), 1, "{builtin:?}");
 }
+
+#[test]
+fn padded_extra_plugin_names_are_read_trimmed_by_the_rule_and_the_case_guard() {
+    // `plugin_name_is_known` reads a padded declaration as the name it pads.
+    let loaded = load_policy_yaml(
+        "version: 1\npolicies:\n  plugin_name_is_known:\n    enabled: true\n    severity: error\n    allowed_extra_plugin_names: [\" company_sso \", \"  \"]\n",
+    )
+    .unwrap()
+    .unwrap();
+    let with = |plugin_name: &str| GatewayConfig {
+        plugin_configs: vec![global_plugin("p1", plugin_name)],
+        ..Default::default()
+    };
+    let known = evaluate_policies(&with("company_sso"), &loaded);
+    assert!(known.is_empty(), "{known:?}");
+    let unknown = evaluate_policies(&with("company_sso2"), &loaded);
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0].rule_id, "plugin_name_is_known");
+
+    // The miscased-built-in guard honors the same padded declaration.
+    let loaded = load_policy_yaml(
+        "version: 1\npolicies:\n  allowed_proxy_plugins:\n    enabled: true\n    allowed_plugin_names: [KEY_AUTH]\n  plugin_name_is_known:\n    allowed_extra_plugin_names: [\" KEY_AUTH \"]\n",
+    )
+    .unwrap()
+    .unwrap();
+    let mut known = loaded.clone();
+    known.policies.plugin_name_is_known.enabled = true;
+    let custom = evaluate_policies(&with("KEY_AUTH"), &known);
+    assert!(custom.is_empty(), "{custom:?}");
+}

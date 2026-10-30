@@ -28,8 +28,16 @@ impl PolicyCheck for PluginNameIsKnownRule {
         // generated `create_custom_plugin` match arms: the gateway loads a
         // custom plugin only when the serialized `plugin_name` equals the
         // compiled stem, so a case variant is not loadable even when the
-        // correctly cased name is allowed here.
-        let extra: &[String] = &self.config.allowed_extra_plugin_names;
+        // correctly cased name is allowed here. Surrounding whitespace in an
+        // entry is insignificant and a blank entry names nothing, as in every
+        // other plugin-name allowlist.
+        let extra: Vec<&str> = self
+            .config
+            .allowed_extra_plugin_names
+            .iter()
+            .map(|name| crate::plugin_catalog::normalize_allowlist_name(name))
+            .filter(|name| !name.is_empty())
+            .collect();
 
         for plugin in &cfg.plugin_configs {
             let name = plugin.plugin_name.as_str();
@@ -41,7 +49,7 @@ impl PolicyCheck for PluginNameIsKnownRule {
                 continue;
             }
 
-            if is_builtin(name) || extra.iter().any(|allowed| allowed == name) {
+            if is_builtin(name) || extra.contains(&name) {
                 continue;
             }
 

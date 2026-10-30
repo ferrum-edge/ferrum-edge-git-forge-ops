@@ -221,7 +221,12 @@ fn refuse_miscased_builtins<'a>(
 ) -> crate::error::Result<()> {
     for entry in entries {
         let trimmed = crate::plugin_catalog::normalize_allowlist_name(entry);
-        if declared_custom.iter().any(|declared| declared == trimmed) {
+        // Declarations are trimmed exactly as `plugin_name_is_known` reads
+        // them, so a padded declaration covers the same name.
+        if declared_custom
+            .iter()
+            .any(|declared| crate::plugin_catalog::normalize_allowlist_name(declared) == trimmed)
+        {
             continue;
         }
         if let Some(builtin) = crate::plugin_catalog::miscased_builtin(trimmed) {
