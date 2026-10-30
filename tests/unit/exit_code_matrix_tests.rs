@@ -19,7 +19,6 @@
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
@@ -34,7 +33,7 @@ use super::diff_exit_tests::{
     backup, config_export, live_proxy, spawn_backup_stub, EXPORT_KEY_ID, FERRUM_PROXY, JWT_SECRET,
     KEYAUTH_CONSUMER, VIEWER_ONLY,
 };
-use super::verify_exit_tests::{data_plane, STAGING_ONLY};
+use super::verify_exit_tests::{data_plane, hang_up_data_plane, STAGING_ONLY};
 
 /// A Consumer with a literal (non-placeholder) secret: the offline `Security`
 /// apply blocker, decidable without a gateway.
@@ -322,13 +321,12 @@ fn cases() -> Vec<Case> {
         )
         .tree(NoResources),
         Case::new(
-            "rotate without a resources directory",
+            "rotate without a provisioning repository",
             &["rotate", "--consumer", "x", "--credential", "keyauth/key"],
             1,
             Stderr,
-            &["no resources directory found"],
-        )
-        .tree(NoResources),
+            &["Error: GITHUB_REPOSITORY not set"],
+        ),
         Case::new(
             "envs with an unsupported repository config",
             &["envs"],
@@ -570,7 +568,7 @@ fn cases() -> Vec<Case> {
             Stdout,
             &[
                 "FAIL    Validator digest allowlist is populated",
-                "1 failed",
+                ", 1 failed,",
             ],
         ),
         Case::new(
@@ -578,7 +576,7 @@ fn cases() -> Vec<Case> {
             &["doctor", "--scope", "local"],
             DOCTOR_FAILED_EXIT_CODE,
             Stdout,
-            &["FAIL    Resource tree is present", "1 failed"],
+            &["FAIL    Resource tree is present", ", 1 failed,"],
         )
         .tree(PinnedNoResources),
         // -- 4: verify failed ---------------------------------------------
@@ -616,17 +614,20 @@ fn cases() -> Vec<Case> {
             &["verify"],
             VERIFY_SKIPPED_EXIT_CODE,
             Stdout,
-            &["skipped: no smoke checks declared for production"],
+            &["skipped: no smoke checks declared for production in .gitforgeops/smoke.yaml"],
         )
         .tree(StagingSmoke)
         .env(&[("FERRUM_ENV", "production")]),
         Case::new(
+            // `staging` has checks in `Tree::StagingSmoke`; here the same
+            // environment skips only because the file is absent.
             "verify with no smoke file",
             &["verify"],
             VERIFY_SKIPPED_EXIT_CODE,
             Stdout,
-            &["not a pass"],
-        ),
+            &["skipped: no smoke checks declared for staging in .gitforgeops/smoke.yaml"],
+        )
+        .env(staging),
         // -- 6: secrets unverified ----------------------------------------
         Case::new(
             "diff --exit-on-drift in sync with unverified secrets",
@@ -658,20 +659,6 @@ fn executable(dir: &Path, name: &str, script: &str) -> PathBuf {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
         .expect("chmod validator stub");
     path
-}
-
-/// A loopback data plane that accepts every connection and closes it without
-/// answering. The listener stays bound for the whole process, so no other
-/// socket can take the port between bind and connect.
-fn hang_up_data_plane() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind data plane");
-    let url = format!("http://{}", listener.local_addr().expect("local addr"));
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            drop(stream);
-        }
-    });
-    url
 }
 
 /// The variables a [`Live`] setup contributes.
