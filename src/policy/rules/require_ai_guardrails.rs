@@ -77,11 +77,14 @@ impl PolicyCheck for RequireAiGuardrailsRule {
             )];
         }
 
+        // Read entries the way the emptiness check above does: surrounding
+        // whitespace is insignificant and a blank entry names nothing.
         let guardrails: Vec<String> = self
             .config
             .guardrail_plugin_names
             .iter()
-            .map(|name| name.to_ascii_lowercase())
+            .map(|name| crate::plugin_catalog::normalize_allowlist_name(name))
+            .filter(|name| !name.is_empty())
             .collect();
         let guardrail_list = guardrails.join(", ");
 

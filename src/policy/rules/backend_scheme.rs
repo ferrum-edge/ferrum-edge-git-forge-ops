@@ -40,8 +40,13 @@ impl PolicyCheck for BackendSchemeRule {
         // policy file still written against the legacy value set (`wss`, `grpcs`,
         // `tcp_tls`, …) keeps meaning the same thing it did before the rename.
         let mut allowed: Vec<String> = Vec::new();
+        // Entries are read the way the emptiness check above reads them:
+        // surrounding whitespace is insignificant and a blank entry names nothing.
         for entry in &self.config.allowed_protocols {
-            let lowered = entry.to_lowercase();
+            let lowered = entry.trim().to_lowercase();
+            if lowered.is_empty() {
+                continue;
+            }
             let canonical = BackendScheme::from_wire(&lowered)
                 .map(|scheme| scheme.as_str().to_string())
                 .unwrap_or(lowered);

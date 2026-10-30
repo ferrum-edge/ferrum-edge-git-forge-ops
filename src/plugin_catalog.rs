@@ -608,6 +608,13 @@ pub fn protocol_list(protocols: &[PluginProtocol]) -> String {
         .join(", ")
 }
 
+/// How a policy allowlist entry names a plugin: case-insensitive, with
+/// surrounding whitespace insignificant, matching the enabled-rule emptiness
+/// checks that already treat a whitespace-only entry as blank.
+pub fn normalize_allowlist_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
 /// Which `plugin_name`s count as authentication for a repository, and which
 /// protocols the gateway runs each of them on. Shared by
 /// `require_auth_plugin`, the security audit and breaking-change detection so
@@ -622,14 +629,19 @@ pub struct AuthAllowlist {
 }
 
 impl AuthAllowlist {
-    /// `names` are matched case-insensitively. `custom_protocols` declares the
+    /// `names` are matched case-insensitively, with surrounding whitespace
+    /// ignored and blank entries dropped. `custom_protocols` declares the
     /// protocols of custom authenticators; see [`AuthAllowlist::protocols`].
     pub fn new(names: &[String], custom_protocols: &BTreeMap<String, Vec<PluginProtocol>>) -> Self {
         Self {
-            names: names.iter().map(|name| name.to_ascii_lowercase()).collect(),
+            names: names
+                .iter()
+                .map(|name| normalize_allowlist_name(name))
+                .filter(|name| !name.is_empty())
+                .collect(),
             custom_protocols: custom_protocols
                 .iter()
-                .map(|(name, protocols)| (name.to_ascii_lowercase(), protocols.clone()))
+                .map(|(name, protocols)| (normalize_allowlist_name(name), protocols.clone()))
                 .collect(),
         }
     }

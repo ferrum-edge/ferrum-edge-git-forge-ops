@@ -157,7 +157,7 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
         }
     }
     for name in &cfg.auth_plugin_names {
-        let lowered = name.to_ascii_lowercase();
+        let lowered = crate::plugin_catalog::normalize_allowlist_name(name);
         if crate::plugin_catalog::is_builtin(&lowered)
             && !crate::plugin_catalog::is_auth_plugin(&lowered)
         {
@@ -171,7 +171,7 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
     }
     let allowlist = cfg.auth_allowlist();
     for name in cfg.custom_auth_plugin_protocols.keys() {
-        let lowered = name.to_ascii_lowercase();
+        let lowered = crate::plugin_catalog::normalize_allowlist_name(name);
         if crate::plugin_catalog::is_builtin(&lowered) {
             return Err(crate::error::Error::Config(format!(
                 "require_auth_plugin.custom_auth_plugin_protocols lists built-in plugin '{name}'; \
@@ -185,7 +185,7 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
                  plugin; remove the entry"
             )));
         }
-        if !allowlist.contains(name) {
+        if !allowlist.contains(&lowered) {
             return Err(crate::error::Error::Config(format!(
                 "require_auth_plugin.custom_auth_plugin_protocols lists '{name}', which is not \
                  in require_auth_plugin.auth_plugin_names"

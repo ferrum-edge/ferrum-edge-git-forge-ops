@@ -37,11 +37,14 @@ impl PolicyCheck for AllowedProxyPluginsRule {
             )];
         }
 
+        // Read entries the way the emptiness check above does: surrounding
+        // whitespace is insignificant and a blank entry names nothing.
         let allowed: Vec<String> = self
             .config
             .allowed_plugin_names
             .iter()
-            .map(|s| s.to_ascii_lowercase())
+            .map(|s| crate::plugin_catalog::normalize_allowlist_name(s))
+            .filter(|s| !s.is_empty())
             .collect();
         let allowed_for_message = allowed.join(", ");
         let plugin_keys: HashSet<(&str, &str)> = cfg

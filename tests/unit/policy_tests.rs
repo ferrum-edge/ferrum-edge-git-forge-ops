@@ -4941,3 +4941,122 @@ fn policy_config_load_refuses_symbolic_links() {
     let error = load_policies_from_path(&link).unwrap_err();
     assert!(error.to_string().contains("symbolic links"), "{error}");
 }
+
+// ---------------------------------------------------------------------------
+// Allowlist entry normalization (#562)
+//
+// The enabled-rule emptiness check treats whitespace as insignificant
+// (`["  "]` is "no nonblank entries"), so matching must too: a padded entry
+// such as `" key_auth "` is the same name, not a name no plugin can carry.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn allowlist_rules_match_padded_entries_the_way_the_emptiness_check_reads_them() {
+    // backend_scheme: a padded, upper-cased entry still canonicalizes.
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
+        ..Default::default()
+    };
+    let schemes = PolicyConfig {
+        policies: PolicyRules {
+            backend_scheme: BackendSchemeRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_protocols: vec![" HTTPS ".to_string(), "  ".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &schemes);
+    assert!(findings.is_empty(), "{findings:?}");
+
+    // allowed_proxy_plugins.
+    let mut p = proxy("p1", BackendScheme::Https, 30_000, true);
+    p.plugins = vec![PluginAssociation {
+        plugin_config_id: "plugin-keyauth".to_string(),
+    }];
+    let mut keyauth = plugin_config("plugin-keyauth", "key_auth", "ferrum");
+    keyauth.proxy_id = Some("p1".into());
+    let cfg = GatewayConfig {
+        proxies: vec![p],
+        plugin_configs: vec![keyauth],
+        ..Default::default()
+    };
+    let plugins = PolicyConfig {
+        policies: PolicyRules {
+            allowed_proxy_plugins: AllowedProxyPluginsRuleConfig {
+                enabled: true,
+                severity: Severity::Error,
+                allowed_plugin_names: vec![" key_auth ".to_string(), " ".to_string()],
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let findings = evaluate_policies(&cfg, &plugins);
+    assert!(findings.is_empty(), "{findings:?}");
+
+    // require_ai_guardrails.
+    let cfg = GatewayConfig {
+        proxies: vec![proxy("llm", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![
+            catalog_plugin(
+                "mcp-1",
+                "mcp_gateway",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+            catalog_plugin(
+                "shield-1",
+                "ai_prompt_shield",
+                PluginScope::Global,
+                None,
+                serde_json::json!({}),
+            ),
+        ],
+        ..Default::default()
+    };
+    let mut guardrails = ai_policies();
+    guardrails
+        .policies
+        .require_ai_guardrails
+        .guardrail_plugin_names = vec![" ai_prompt_shield ".to_string()];
+    let findings = evaluate_policies(&cfg, &guardrails);
+    assert!(findings.is_empty(), "{findings:?}");
+}
+
+#[test]
+fn auth_allowlist_reads_padded_names_and_validation_sees_the_same_name() {
+    use gitforgeops::policy::config::load_policies_from_path;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let allowlist = gitforgeops::plugin_catalog::AuthAllowlist::new(
+        &[" key_auth ".to_string(), " company_sso ".to_string()],
+        &std::collections::BTreeMap::from([(
+            " company_sso ".to_string(),
+            vec![PluginProtocol::Http, PluginProtocol::Grpc],
+        )]),
+    );
+    assert!(allowlist.contains("key_auth"));
+    assert!(allowlist.contains("company_sso"));
+    assert_eq!(
+        allowlist.protocols("company_sso"),
+        &[PluginProtocol::Http, PluginProtocol::Grpc]
+    );
+
+    // A padded non-authenticating built-in is the same mistake as an
+    // unpadded one, not a custom authenticator.
+    let mut file = NamedTempFile::new().unwrap();
+    write!(
+        file,
+        "version: 1\npolicies:\n  require_auth_plugin:\n    auth_plugin_names: [\" opa \"]\n"
+    )
+    .unwrap();
+    let error = load_policies_from_path(file.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not authenticate callers"), "{error}");
+}
