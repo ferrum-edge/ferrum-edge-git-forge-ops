@@ -1388,13 +1388,35 @@ misconfigured?" without provisioning anything.
    and `settings-audit.yml` schedules — and republishing each violation as a
    `settings-control` check. Doctor runs the copy compiled into its binary
    (`python3 -I -c`), never the checkout's, with only `GH_TOKEN` and what
-   `python3`/`gh` need.
+   `python3`/`gh` need. It decides arguments as `settings-audit.yml` does:
+   `--template-repo` exactly when `GITFORGEOPS_TEMPLATE_REPO` lowercases to
+   `true` (never from a missing `config.yaml`), otherwise
+   `--state-writer-app-id`, refused as a `Fail` when Python's `int()` would
+   reject it; no `--branch`, so the auditor reads the repository's default
+   branch. A pass needs exit 0 **and** the auditor's `AUDIT_SUCCESS_LINE`
+   (shared constant, pinned by a test); a failed run's `Unknown` quotes its
+   last meaningful stderr line and blames `GH_TOKEN` only for token failures.
+   Blank `GH_TOKEN`, `GITHUB_REPOSITORY`, `--repo` and app-id values are unset
+   (`GithubContext::from_lookup`).
 
 Scopes are trust boundaries: `local` (no credential), `github`
 (administration-read token), `gateway` (that environment's deployment
 credentials, reads only). Default `local,github`; gateway is opt-in. Credentials
 are reported by presence only (`Check::secret_presence` says presence is not
 correctness). A 401 remediation prints the four JWT claim settings to compare.
+
+- `process-env` is a local check. `resource-load` runs, per environment
+  resolved as the commands resolve it, `pipeline::load_and_assemble` — the
+  offline boundary every command crosses (no bundle, state, lock or network) —
+  and fails on what it refuses; an unreadable `resources/` fails, a missing
+  one is reported once. `overlays` uses `validate_overlay_selection`, so a
+  missing `FERRUM_OVERLAY` selection fails.
+- `file-output` judges the destination's nearest existing ancestor
+  (publication runs `create_dir_all`) with `access(2)` via `rustix`, never by
+  writing. `validator-binary` requires the execute permission on Unix.
+- The gateway scope is `Skipped` when `GITFORGEOPS_TEMPLATE_REPO=true`, on a
+  checkout without `config.yaml` and without gateway credentials, and in file
+  mode, decided before the tree is assembled for the token scope.
 
 ### Preview verdicts (`src/verdict.rs`)
 

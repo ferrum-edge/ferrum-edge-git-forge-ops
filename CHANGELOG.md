@@ -404,6 +404,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `gitforgeops doctor` follow-ups from the #562 audit. The GitHub scope picks
+  template mode from `GITFORGEOPS_TEMPLATE_REPO`, as `settings-audit.yml` does,
+  passes the App id only outside template mode, fails a non-integer App id
+  before running the auditor, and lets the auditor read the repository's
+  default branch (`audit_settings.py` now does so when `--branch` is omitted).
+  An auditor exit 0 counts only with its success line; a failed run quotes its
+  last stderr line and blames `GH_TOKEN` only for token failures. Blank
+  `GH_TOKEN` falls back to `GITHUB_TOKEN`, and a blank slug is no slug. Local
+  checks gain `resource-load` (the commands' offline load and assembly per
+  environment), fail an unreadable `resources/`, honour `FERRUM_OVERLAY`,
+  require the validator's execute permission, and judge the file-mode output
+  directory by writability, not existence. `process-env` runs only in the local
+  scope; the gateway scope is skipped on a template and, before assembling the
+  tree, in file mode.
 - `GitForgeOps Trusted PR Live Review` no longer fails its `prepare` job when
   the reviewed commit is no longer any open PR's head by the time it runs: the
   PR was merged or closed, or pushed again, while static validation ran. Each

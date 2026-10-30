@@ -847,9 +847,9 @@ gitforgeops doctor --format json
 
 | Scope | Needs | Checks |
 | --- | --- | --- |
-| `local` (default) | nothing | config and overlays, template vs deployment repository, resource tree, policy file, validator binary and digest, per-mode requirements, environment variables |
-| `github` (default) | `GH_TOKEN` with Administration: read | runs `audit_settings.py` (the same audit the bootstrap and `settings-audit.yml` use): rulesets, App bypass, environments, labels, required checks |
-| `gateway` (opt-in) | the environment's credentials | `GET /health` (connectivity, TLS, writes enabled) and `GET /cluster` (proves the JWT secret and claims are accepted). On Ferrum Edge v0.9.16 and later, `GET /cluster` refuses a namespace-scoped token. The token is then proven on `GET /namespaces`, and the cluster view is skipped; see [Namespace-scoped admin tokens](docs/reference.md#namespace-scoped-admin-tokens) |
+| `local` (default) | nothing | config and overlays (including `FERRUM_OVERLAY`), template vs deployment repository, resource tree and whether it loads and assembles for each environment (offline, as every command does first), policy file, validator binary (present and executable) and digest, per-mode requirements (file mode: the output location is writable), environment variables |
+| `github` (default) | `GH_TOKEN` with Administration: read | runs `audit_settings.py` (the same audit the bootstrap and `settings-audit.yml` use): rulesets, App bypass, environments, labels, required checks. Template mode follows `GITFORGEOPS_TEMPLATE_REPO=true`, as the scheduled audit does; otherwise export `GITFORGEOPS_STATE_APP_ID` |
+| `gateway` (opt-in) | the environment's credentials | `GET /health` (connectivity, TLS, writes enabled) and `GET /cluster` (proves the JWT secret and claims are accepted). On Ferrum Edge v0.9.16 and later, `GET /cluster` refuses a namespace-scoped token. The token is then proven on `GET /namespaces`, and the cluster view is skipped; see [Namespace-scoped admin tokens](docs/reference.md#namespace-scoped-admin-tokens). Skipped in file mode and on a template |
 
 Each check is `PASS`, `FAIL`, `WARN`, `UNKNOWN` (could not be performed, for
 example without a token; never counted as a pass) or `SKIP` (does not apply,
