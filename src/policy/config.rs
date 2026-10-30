@@ -156,14 +156,6 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
             )));
         }
     }
-    refuse_miscased_builtins(
-        "require_auth_plugin.auth_plugin_names",
-        &cfg.auth_plugin_names,
-    )?;
-    refuse_miscased_builtins(
-        "require_auth_plugin.custom_auth_plugin_protocols",
-        cfg.custom_auth_plugin_protocols.keys(),
-    )?;
     for name in &cfg.auth_plugin_names {
         let trimmed = crate::plugin_catalog::normalize_allowlist_name(name);
         if crate::plugin_catalog::is_builtin(trimmed)
@@ -213,37 +205,64 @@ fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::err
     Ok(())
 }
 
-/// Refuse an allowlist entry that spells a built-in in another case.
+/// Refuse an allowlist entry that spells a built-in in another case, unless
+/// the repository declares a custom plugin by exactly that name.
 ///
 /// Plugin names match exactly, as the gateway's plugin factories resolve
-/// `plugin_name`, so `KEY_AUTH` would silently match nothing (or, for a custom
-/// name, a different plugin than the one meant).
+/// `plugin_name`, so an undeclared `KEY_AUTH` is almost certainly a typo for
+/// `key_auth` that would silently match nothing. The gateway does allow a
+/// custom plugin whose name differs from a built-in only by case; listing it
+/// in `plugin_name_is_known.allowed_extra_plugin_names` (whether or not that
+/// rule is enabled) is the declaration that it exists.
 fn refuse_miscased_builtins<'a>(
     field: &str,
     entries: impl IntoIterator<Item = &'a String>,
+    declared_custom: &[String],
 ) -> crate::error::Result<()> {
     for entry in entries {
         let trimmed = crate::plugin_catalog::normalize_allowlist_name(entry);
+        if declared_custom.iter().any(|declared| declared == trimmed) {
+            continue;
+        }
         if let Some(builtin) = crate::plugin_catalog::miscased_builtin(trimmed) {
             return Err(crate::error::Error::Config(format!(
-                "{field} lists '{entry}', which matches no plugin: plugin names are \
-                 case-sensitive. Did you mean `{builtin}`?"
+                "{field} lists '{entry}', which matches no built-in plugin: plugin names are \
+                 case-sensitive. Did you mean `{builtin}`? If '{trimmed}' is a custom plugin \
+                 compiled into your gateway build, declare it in \
+                 plugin_name_is_known.allowed_extra_plugin_names"
             )));
         }
     }
     Ok(())
 }
 
-/// Plugin-name allowlists outside `require_auth_plugin`, held to the same
-/// exact-identity rule.
+/// Every plugin-name allowlist, held to the exact-identity rule. Runs before
+/// [`validate_require_auth_plugin`], so a miscased built-in is reported as
+/// such rather than as a missing allowlist entry.
 fn validate_plugin_name_allowlists(rules: &PolicyRules) -> crate::error::Result<()> {
+    let declared = &rules.plugin_name_is_known.allowed_extra_plugin_names;
+    refuse_miscased_builtins(
+        "require_auth_plugin.auth_plugin_names",
+        &rules.require_auth_plugin.auth_plugin_names,
+        declared,
+    )?;
+    refuse_miscased_builtins(
+        "require_auth_plugin.custom_auth_plugin_protocols",
+        rules
+            .require_auth_plugin
+            .custom_auth_plugin_protocols
+            .keys(),
+        declared,
+    )?;
     refuse_miscased_builtins(
         "allowed_proxy_plugins.allowed_plugin_names",
         &rules.allowed_proxy_plugins.allowed_plugin_names,
+        declared,
     )?;
     refuse_miscased_builtins(
         "require_ai_guardrails.guardrail_plugin_names",
         &rules.require_ai_guardrails.guardrail_plugin_names,
+        declared,
     )
 }
 
@@ -571,8 +590,8 @@ pub fn load_policies_from_path(path: &Path) -> crate::error::Result<Option<Polic
         )));
     }
     validate_overrides(&loaded.overrides)?;
-    validate_require_auth_plugin(&loaded.policies.require_auth_plugin)?;
     validate_plugin_name_allowlists(&loaded.policies)?;
+    validate_require_auth_plugin(&loaded.policies.require_auth_plugin)?;
     Ok(Some(loaded))
 }
 

@@ -5129,38 +5129,93 @@ fn custom_protocol_keys_that_trim_to_one_name_are_refused_and_never_broaden() {
 
 #[test]
 fn every_plugin_name_allowlist_refuses_a_miscased_builtin() {
+    // (rule, rule body naming the entry, refused field, entry, built-in meant)
     let cases = [
         (
-            "  require_auth_plugin:\n    auth_plugin_names: [KEY_AUTH]\n",
+            "require_auth_plugin",
+            "    auth_plugin_names: [KEY_AUTH]\n",
             "require_auth_plugin.auth_plugin_names",
+            "KEY_AUTH",
             "key_auth",
         ),
         (
-            "  require_auth_plugin:\n    auth_plugin_names: [company_sso]\n    custom_auth_plugin_protocols:\n      Key_Auth: [http]\n",
+            "require_auth_plugin",
+            "    auth_plugin_names: [KEY_AUTH]\n    custom_auth_plugin_protocols:\n      KEY_AUTH: [http]\n",
+            "require_auth_plugin.auth_plugin_names",
+            "KEY_AUTH",
+            "key_auth",
+        ),
+        (
+            "require_auth_plugin",
+            "    auth_plugin_names: [company_sso]\n    custom_auth_plugin_protocols:\n      Key_Auth: [http]\n",
             "require_auth_plugin.custom_auth_plugin_protocols",
+            "Key_Auth",
             "key_auth",
         ),
         (
-            "  allowed_proxy_plugins:\n    allowed_plugin_names: [key_auth, Rate_Limiting]\n",
+            "allowed_proxy_plugins",
+            "    allowed_plugin_names: [key_auth, KEY_AUTH]\n",
             "allowed_proxy_plugins.allowed_plugin_names",
-            "rate_limiting",
+            "KEY_AUTH",
+            "key_auth",
         ),
         (
-            "  require_ai_guardrails:\n    guardrail_plugin_names: [\" AI_Prompt_Shield\"]\n",
+            "require_ai_guardrails",
+            "    guardrail_plugin_names: [\" AI_Prompt_Shield\"]\n",
             "require_ai_guardrails.guardrail_plugin_names",
+            "AI_Prompt_Shield",
             "ai_prompt_shield",
         ),
     ];
-    for (rules, field, builtin) in cases {
-        let error = load_policy_yaml(&format!("version: 1\npolicies:\n{rules}"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(field), "{error}");
-        assert!(
-            error.contains(&format!("Did you mean `{builtin}`?")),
-            "{error}"
-        );
+    for (rule, body, field, entry, builtin) in cases {
+        for enabled in [true, false] {
+            let rules = format!("  {rule}:\n    enabled: {enabled}\n{body}");
+            // Undeclared: refused, whether or not either rule is enabled.
+            for known in ["", "  plugin_name_is_known:\n    enabled: true\n"] {
+                let error = load_policy_yaml(&format!("version: 1\npolicies:\n{rules}{known}"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(field), "{error}");
+                assert!(
+                    error.contains(&format!("Did you mean `{builtin}`?")),
+                    "{error}"
+                );
+                assert!(
+                    error.contains("declare it in plugin_name_is_known.allowed_extra_plugin_names"),
+                    "{error}"
+                );
+            }
+            // Declared as a custom plugin by exactly that name: loads, even
+            // with `plugin_name_is_known` disabled.
+            for known_enabled in [true, false] {
+                let declared = format!(
+                    "  plugin_name_is_known:\n    enabled: {known_enabled}\n    allowed_extra_plugin_names: [{entry}]\n"
+                );
+                let loaded = load_policy_yaml(&format!("version: 1\npolicies:\n{rules}{declared}"));
+                if body.contains("[company_sso]") {
+                    // The guard steps aside; the ordinary rule that a
+                    // declared protocol needs an allowlist entry still holds.
+                    let error = loaded.unwrap_err().to_string();
+                    assert!(
+                        error.contains("which is not in require_auth_plugin.auth_plugin_names"),
+                        "{error}"
+                    );
+                } else {
+                    loaded
+                        .unwrap_or_else(|error| panic!("{rule} {entry}: {error}"))
+                        .unwrap();
+                }
+            }
+        }
     }
+
+    // A declaration in another case does not cover the entry.
+    let error = load_policy_yaml(
+        "version: 1\npolicies:\n  allowed_proxy_plugins:\n    allowed_plugin_names: [KEY_AUTH]\n  plugin_name_is_known:\n    allowed_extra_plugin_names: [Key_Auth]\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("Did you mean `key_auth`?"), "{error}");
 
     // Custom names are not built-ins in another case, so any case loads.
     load_policy_yaml(
@@ -5205,4 +5260,37 @@ fn a_policy_entry_does_not_authenticate_a_plugin_named_in_another_case() {
         .require_auth_plugin
         .auth_allowlist()
         .contains("Company_SSO"));
+}
+
+#[test]
+fn a_declared_custom_plugin_named_like_a_builtin_matches_only_itself() {
+    // Edge accepts a custom plugin whose name differs from a built-in only by
+    // case. Declared under `plugin_name_is_known`, `KEY_AUTH` is that plugin:
+    // its entry matches a `KEY_AUTH` PluginConfig with the protocols declared
+    // for it, and never the built-in `key_auth`.
+    let loaded = load_policy_yaml(
+        "version: 1\npolicies:\n  require_auth_plugin:\n    enabled: true\n    auth_plugin_names: [KEY_AUTH]\n    custom_auth_plugin_protocols:\n      KEY_AUTH: [http, grpc, websocket]\n  plugin_name_is_known:\n    enabled: true\n    allowed_extra_plugin_names: [KEY_AUTH]\n",
+    )
+    .unwrap()
+    .unwrap();
+
+    let allowlist = loaded.policies.require_auth_plugin.auth_allowlist();
+    assert!(allowlist.contains("KEY_AUTH"));
+    assert!(!allowlist.contains("key_auth"));
+    assert_eq!(allowlist.protocols("KEY_AUTH"), HTTP_FAMILY_PROTOCOLS);
+
+    let with = |plugin_name: &str| GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("auth-1", plugin_name)],
+        ..Default::default()
+    };
+
+    // The declared custom plugin authenticates every HTTP-family protocol and
+    // is a known name.
+    let custom = evaluate_policies(&with("KEY_AUTH"), &loaded);
+    assert!(custom.is_empty(), "{custom:?}");
+
+    // The built-in is not on this allowlist, so it authenticates nothing.
+    let builtin = auth_findings(&with("key_auth"), &loaded);
+    assert_eq!(builtin.len(), 1, "{builtin:?}");
 }

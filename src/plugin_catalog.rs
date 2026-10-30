@@ -613,13 +613,16 @@ pub fn protocol_list(protocols: &[PluginProtocol]) -> String {
 /// treat a whitespace-only entry as blank. Case is significant: the gateway's
 /// plugin factories match `plugin_name` exactly, so `Company_SSO` and
 /// `company_sso` are different plugins. Policy loading refuses an entry that
-/// is a built-in name in another case ([`miscased_builtin`]).
+/// is a built-in name in another case ([`miscased_builtin`]) unless
+/// `plugin_name_is_known.allowed_extra_plugin_names` declares a custom plugin
+/// by exactly that name.
 pub fn normalize_allowlist_name(name: &str) -> &str {
     name.trim()
 }
 
 /// The built-in `name` spells in another case, when it is not itself a
-/// built-in: such an allowlist entry matches no plugin the gateway loads.
+/// built-in: such an allowlist entry matches no built-in, and is a typo unless
+/// a custom plugin by exactly that name exists.
 pub fn miscased_builtin(name: &str) -> Option<&'static str> {
     if is_builtin(name) {
         return None;

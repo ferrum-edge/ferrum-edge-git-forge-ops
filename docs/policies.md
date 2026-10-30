@@ -82,7 +82,12 @@ global ones with the same `plugin_name`, disabled instances dropped.
   surrounding whitespace is ignored, case is not, so `Company_SSO` is not
   `company_sso`. An entry that is a built-in in another case (`KEY_AUTH`)
   fails the policy load, here and in `custom_auth_plugin_protocols`,
-  `allowed_plugin_names` and `guardrail_plugin_names`.
+  `allowed_plugin_names` and `guardrail_plugin_names`, unless
+  `plugin_name_is_known.allowed_extra_plugin_names` lists exactly that name.
+  The gateway accepts a custom plugin that differs from a built-in only by
+  case, and that list (read whether or not the rule is enabled) is how the
+  repository declares one; the entry then matches only a plugin named exactly
+  `KEY_AUTH`, never `key_auth`.
 - **Per protocol.** The gateway filters each request's plugin chain by
   protocol. `http`/`https` proxies serve HTTP, gRPC and WebSocket; `tcp`/`tcps`
   get a TCP listener and `udp`/`dtls` a UDP listener. A proxy passes only when
@@ -213,7 +218,10 @@ the gateway no longer accepts.
 
 Checks `plugin_name` against the gateway's 82 built-ins plus
 `allowed_extra_plugin_names`. Custom names match exactly and case-sensitively,
-as the gateway loads them. `jwt`, `oauth2` and `oidc` are not plugin names;
+as the gateway loads them, so a custom `KEY_AUTH` listed here is accepted as
+itself and never folded to `key_auth`. The list also declares such a name for
+the other plugin allowlists (see `require_auth_plugin`), even when this rule
+is disabled. `jwt`, `oauth2` and `oidc` are not plugin names;
 `jwt_auth`, `oauth2_introspection` and `oidc_relying_party` are.
 
 Retired names (`oauth2_auth`, `semantic_ai_firewall`) and reserved names
