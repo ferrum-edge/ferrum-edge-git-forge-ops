@@ -655,9 +655,10 @@ pub fn link_header_may_announce_next(header: &str) -> bool {
 /// An RFC 8288 `relation-type`: a `reg-rel-type` (`LOALPHA *( LOALPHA / DIGIT
 /// / "." / "-" )`, compared case-insensitively, so either case is accepted) or
 /// an `ext-rel-type` (an absolute URI: a scheme, `:`, then RFC 3986 URI
-/// characters only). `,` and `;` are refused even inside an extension URI:
-/// they are list and parameter separators in the header, so a type holding
-/// one is treated as ambiguous rather than read either way.
+/// characters with valid percent-escapes, which `Url` also parses). `,` and
+/// `;` are refused even inside an extension URI: they are list and parameter
+/// separators in the header, so a type holding one is treated as ambiguous
+/// rather than read either way.
 fn is_relation_type(relation: &str) -> bool {
     let bytes = relation.as_bytes();
     let Some((&first, rest)) = bytes.split_first() else {
@@ -678,10 +679,39 @@ fn is_relation_type(relation: &str) -> bool {
     let scheme_ok = bytes[1..colon]
         .iter()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'));
-    let uri_ok = bytes[colon + 1..]
-        .iter()
-        .all(|&byte| byte.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+=%".contains(&byte));
-    scheme_ok && uri_ok && colon + 1 < bytes.len()
+    scheme_ok
+        && colon + 1 < bytes.len()
+        && is_uri_text(&bytes[colon + 1..], b",;")
+        && reqwest::Url::parse(relation).is_ok()
+}
+
+/// RFC 3986 characters only: unreserved, reserved (minus `forbidden`) and
+/// `pct-encoded` (`%` then exactly two hex digits), with at most one `#`.
+fn is_uri_text(bytes: &[u8], forbidden: &[u8]) -> bool {
+    let mut at = 0;
+    let mut fragments = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == b'%' {
+            let escape = bytes.get(at + 1..at + 3);
+            if !escape.is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
+                return false;
+            }
+            at += 3;
+            continue;
+        }
+        if byte == b'#' {
+            fragments += 1;
+        }
+        let allowed = byte.is_ascii_alphanumeric()
+            || b"-._~".contains(&byte)
+            || b":/?#[]@!$&'()*+,;=".contains(&byte);
+        if !allowed || forbidden.contains(&byte) || fragments > 1 {
+            return false;
+        }
+        at += 1;
+    }
+    true
 }
 
 /// Every link-value of one `Link` header value as `(target, relation types)`,
@@ -748,10 +778,10 @@ fn link_values(header: &str) -> Option<Vec<(String, Vec<String>)>> {
         if bytes[at + 1 + close] != b'>' {
             return None;
         }
-        // A minimal `URI-Reference` check: non-empty visible ASCII, no
-        // whitespace (`<` and `>` are already excluded).
+        // `URI-Reference`: non-empty RFC 3986 characters with valid
+        // percent-escapes (`<`, `>` and whitespace are outside that set).
         let target = &bytes[at + 1..at + 1 + close];
-        if target.is_empty() || !target.iter().all(|byte| byte.is_ascii_graphic()) {
+        if target.is_empty() || !is_uri_text(target, b"") {
             return None;
         }
         let target = String::from_utf8(target.to_vec()).ok()?;

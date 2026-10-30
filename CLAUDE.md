@@ -1379,7 +1379,8 @@ applied revision.
   types, across link-values and headers). Any value that does not parse
   unambiguously counts as one: a relation type that is neither a
   `reg-rel-type` nor an absolute-URI `ext-rel-type` (so `rel="prev,next"`),
-  an empty or whitespace-bearing target, two different `next` targets, or a
+  an empty target, a target or extension type outside RFC 3986 characters or
+  with an invalid percent-escape (`%GG`), two different `next` targets, or a
   malformed entry, which never hides a later one. No `Link` URL is ever
   requested for override evidence. SSH key discovery uses the same parser
   over every `Link` header: it follows a same-origin, same-path `next`, and

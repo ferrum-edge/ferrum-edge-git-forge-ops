@@ -1945,6 +1945,15 @@ const AMBIGUOUS_OR_NEXT_LINKS: &[&str] = &[
     "Link: < {base}/x>; rel=\"prev\"\r\n",
     // Two different `next` targets.
     "Link: <{base}/a>; rel=\"next\", <{base}/b>; rel=\"next\"\r\n",
+    // Targets and extension relation types outside RFC 3986 (#562 final).
+    "Link: <https://api.github.com/%GG>; rel=\"prev\"\r\n",
+    "Link: <https://api.github.com/x>; rel=\"https://example.com/%GG\"\r\n",
+    "Link: <{base}/x%4>; rel=\"next\"\r\n",
+    "Link: <{base}/x%>; rel=\"prev\"\r\n",
+    "Link: <{base}/a|b>; rel=\"prev\"\r\n",
+    "Link: <{base}/a\"b>; rel=\"prev\"\r\n",
+    "Link: <{base}/a#b#c>; rel=\"prev\"\r\n",
+    "Link: <{base}/x>; rel=\"https://example.com/a{b}\"\r\n",
 ];
 
 /// `Link` header lines that unambiguously announce no next page.
@@ -1958,14 +1967,19 @@ const NO_NEXT_LINKS: &[&str] = &[
     "Link: <{base}/p1>; rel=\"prev  first\"\r\n",
     "Link: <{base}/p1>; rel=\"prev https://example.com/rels/page\"\r\n",
     "Link: <{base}/p1>; rel=\"prev.v2 first-page\"\r\n",
+    "Link: <{base}/p1?q=a%2Cb&x=1#top>; rel=\"prev\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev https://example.com/rels/a%20b\"\r\n",
 ];
 
 #[test]
 fn link_header_parser_fails_closed_on_next_or_ambiguity() {
     use gitforgeops::policy::github_override::link_header_may_announce_next;
+    // The stub substitutes its origin for `{base}`; so does this table.
+    let base = |line: &str| line.replace("{base}", "http://127.0.0.1:1");
     for line in AMBIGUOUS_OR_NEXT_LINKS {
         // A single header line is checked here; multi-line entries are covered
         // end to end below.
+        let line = base(line);
         let first = line.split("\r\n").next().unwrap();
         let value = first.strip_prefix("Link: ").unwrap();
         if line.matches("Link:").count() == 1 {
@@ -1973,6 +1987,7 @@ fn link_header_parser_fails_closed_on_next_or_ambiguity() {
         }
     }
     for line in NO_NEXT_LINKS.iter().filter(|line| !line.is_empty()) {
+        let line = base(line);
         let value = line.trim_end().strip_prefix("Link: ").unwrap();
         assert!(!link_header_may_announce_next(value), "{line:?}");
     }
