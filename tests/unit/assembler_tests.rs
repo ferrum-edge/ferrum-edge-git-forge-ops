@@ -1089,3 +1089,51 @@ fn overlay_refuses_a_file_over_the_size_cap() {
     assert!(error.contains("byte limit"), "{error}");
     assert!(error.contains(&file.display().to_string()), "{error}");
 }
+
+/// An overlay matches its base on the effective namespace, so the merged
+/// resource must stay in that namespace. Before #562 only a base loaded from
+/// `resources/ferrum/` adopted the overlay's namespace: a base under another
+/// directory that overrode `spec.namespace` moved back to its directory when
+/// the overlay spelled the default `namespace: ferrum`.
+#[test]
+fn overlay_keeps_the_effective_namespace_it_matched_outside_the_default_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    write_overlay(
+        temp.path(),
+        "team-beta/proxies/shared.yaml",
+        "kind: Proxy\nspec:\n  id: shared\n  namespace: ferrum\n  backend_host: overlayed.internal\n",
+    );
+    let mut proxy = make_proxy("shared");
+    if let Resource::Proxy { spec } = &mut proxy {
+        spec.namespace = "team-beta".to_string();
+    }
+    let mut resources = vec![("team-alpha".to_string(), proxy)];
+    apply_overlay(&mut resources, temp.path()).unwrap();
+    let config = assemble_gateway(resources);
+
+    assert_eq!(config.proxies.len(), 1);
+    assert_eq!(config.proxies[0].backend_host, "overlayed.internal");
+    assert_eq!(config.proxies[0].namespace, "team-beta");
+}
+
+/// The same overlay against a base loaded from `resources/ferrum/` already
+/// kept the matched namespace; it must keep doing so.
+#[test]
+fn overlay_keeps_the_effective_namespace_it_matched_from_the_default_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    write_overlay(
+        temp.path(),
+        "team-beta/proxies/shared.yaml",
+        "kind: Proxy\nspec:\n  id: shared\n  namespace: ferrum\n  backend_host: overlayed.internal\n",
+    );
+    let mut proxy = make_proxy("shared");
+    if let Resource::Proxy { spec } = &mut proxy {
+        spec.namespace = "team-beta".to_string();
+    }
+    let mut resources = vec![("ferrum".to_string(), proxy)];
+    apply_overlay(&mut resources, temp.path()).unwrap();
+    let config = assemble_gateway(resources);
+
+    assert_eq!(config.proxies[0].backend_host, "overlayed.internal");
+    assert_eq!(config.proxies[0].namespace, "team-beta");
+}
