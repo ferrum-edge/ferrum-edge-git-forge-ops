@@ -1198,12 +1198,14 @@ fn read_request_head(stream: &mut TcpStream) -> bool {
     true
 }
 
-/// A loopback address that refuses every connection. Port 1 is privileged, so
-/// no test endpoint can ever bind it; binding an ephemeral listener and
-/// dropping it instead frees the port for a concurrent test's endpoint, which
-/// then answers in its place. The precondition is checked rather than
-/// assumed: if something on this host does listen on port 1, the test fails
-/// here, naming the cause, instead of misreporting the code under test.
+/// A loopback address that refuses every connection. Every test endpoint
+/// binds port 0, and the kernel never assigns port 1 from its ephemeral
+/// range, so no concurrent test can take it; binding an ephemeral listener
+/// and dropping it instead frees that port for a concurrent test's endpoint,
+/// which then answers in its place. Port 1 is not unbindable (root can bind
+/// it), so the refusal is checked rather than assumed: a listener there, or a
+/// firewall that drops the connection, fails the test here, naming the
+/// cause, instead of misreporting the code under test.
 pub(super) fn refused_port() -> std::net::SocketAddr {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) {

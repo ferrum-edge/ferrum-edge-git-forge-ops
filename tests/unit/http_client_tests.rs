@@ -904,7 +904,7 @@ async fn the_health_recheck_is_best_effort() {
 /// configured host, port or path prefix into CI or local logs.
 #[tokio::test]
 async fn transport_failures_do_not_disclose_the_gateway_url() {
-    // A port no test can bind refuses the connection immediately; the admin
+    // A port no concurrent test is assigned refuses the connection at once; the admin
     // client is then exercised on its non-retrying error path.
     let addr = super::promotion_tests::refused_port();
 
