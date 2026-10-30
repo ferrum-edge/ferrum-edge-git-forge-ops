@@ -532,6 +532,38 @@ fn override_covers_only_findings_present_before_credential_resolution() {
     )
     .is_some());
 
+    // A multiset: one reviewed finding covers one identical resolved finding.
+    // A second identical copy that only resolution produced stays blocking,
+    // in apply and in the preview alike.
+    let mut duplicated = vec![reviewed[0].clone(), reviewed[0].clone()];
+    let message =
+        refuse_post_resolution_policy_violations(&mut duplicated, &reviewed, Some(&decision), None)
+            .expect("the second identical finding is not covered");
+    assert!(
+        message.contains("1 blocking finding(s) appeared only after credential resolution"),
+        "{message}"
+    );
+    assert_eq!(duplicated[0].overridden_by.as_deref(), Some("maintainer"));
+    assert!(duplicated[1].is_blocking());
+    let (preview, uncovered) = gitforgeops::policy::github_override::preview_policy_findings(
+        &reviewed,
+        Some(&[reviewed[0].clone(), reviewed[0].clone()]),
+        Some(&decision),
+    );
+    assert_eq!(uncovered, 1);
+    assert_eq!(preview.len(), 2, "{preview:?}");
+    assert_eq!(preview.iter().filter(|f| f.is_blocking()).count(), 1);
+    // Two reviewed copies cover two resolved copies.
+    let twice = vec![reviewed[0].clone(), reviewed[0].clone()];
+    let mut resolved_twice = twice.clone();
+    assert!(refuse_post_resolution_policy_violations(
+        &mut resolved_twice,
+        &twice,
+        Some(&decision),
+        None
+    )
+    .is_none());
+
     // Without an active override every blocking finding refuses as before.
     let mut inactive = reviewed.clone();
     let message = refuse_post_resolution_policy_violations(
@@ -710,4 +742,20 @@ fn preview_and_apply_agree_on_a_resolution_only_policy_finding() {
             "{decision:?}"
         );
     }
+}
+
+/// Apply mode (source == data): deleting a reviewed, tracked
+/// `.gitforgeops/smoke.yaml` is a difference from the reviewed tree.
+#[test]
+fn actual_input_refuses_a_deleted_tracked_gitforgeops_file() {
+    let (dir, _, _) = fixture();
+    write(dir.path(), ".gitforgeops/smoke.yaml", "version: 2\n");
+    let head = commit(dir.path());
+    let tree = head_tree(dir.path());
+    assert_eq!(
+        verify_input(&tree, dir.path(), dir.path(), false, None),
+        Ok(head)
+    );
+    std::fs::remove_file(dir.path().join(".gitforgeops/smoke.yaml")).unwrap();
+    assert!(verify_input(&tree, dir.path(), dir.path(), false, None).is_err());
 }

@@ -583,22 +583,45 @@ pub async fn fetch_reviews_at(
     ))
 }
 
-/// Extract the `rel="next"` URL from a GitHub `Link` header. Returns `None`
-/// when there is no next page.
-pub fn parse_next_link(header: &str) -> Option<String> {
-    for entry in header.split(',') {
-        let entry = entry.trim();
-        // Format: `<URL>; rel="next"`
-        let (url_part, rel_part) = entry.split_once(';')?;
-        let url = url_part
-            .trim()
-            .trim_start_matches('<')
-            .trim_end_matches('>');
-        if rel_part.trim() == "rel=\"next\"" {
-            return Some(url.to_string());
-        }
+/// What one `Link` header value says about a next page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextLink {
+    /// The value parses unambiguously and no link-value has a `next` relation.
+    Absent,
+    /// The first link-value with a `next` relation, and its target as written.
+    Next(String),
+    /// The value is not an unambiguous RFC 8288 `#link-value` list.
+    Ambiguous,
+}
+
+/// Classify one `Link` header value (RFC 8288): `rel` is matched
+/// case-insensitively with a token or quoted-string value and optional
+/// whitespace around `=`; relation types are space-separated and compared
+/// case-insensitively; every comma-separated link-value is read, so a
+/// malformed entry never hides a later one (it makes the whole value
+/// [`NextLink::Ambiguous`]).
+pub fn next_link(header: &str) -> NextLink {
+    match link_values(header) {
+        None => NextLink::Ambiguous,
+        Some(values) => values
+            .into_iter()
+            .find(|(_, relations)| {
+                relations
+                    .iter()
+                    .any(|relation| relation.eq_ignore_ascii_case("next"))
+            })
+            .map_or(NextLink::Absent, |(target, _)| NextLink::Next(target)),
     }
-    None
+}
+
+/// The `next` target of a `Link` header value, or `None` when it names none
+/// or does not parse unambiguously. Callers that must prove a listing
+/// complete use [`next_link`] and treat [`NextLink::Ambiguous`] as more.
+pub fn parse_next_link(header: &str) -> Option<String> {
+    match next_link(header) {
+        NextLink::Next(target) => Some(target),
+        NextLink::Absent | NextLink::Ambiguous => None,
+    }
 }
 
 /// Whether any `Link` header value announces a next page. An unreadable value
@@ -613,25 +636,16 @@ fn announces_next_page(headers: &reqwest::header::HeaderMap) -> bool {
         })
 }
 
-/// Whether one `Link` header value may announce a next page.
-///
-/// True when any link-value carries a `next` relation (RFC 8288: `rel` named
-/// case-insensitively, a token or quoted-string value, optional whitespace
-/// around `=`, space-separated relation types compared case-insensitively),
-/// and also whenever the value cannot be parsed unambiguously, so a short page
+/// Whether one `Link` header value may announce a next page: a `next`
+/// relation, or any value that does not parse unambiguously, so a short page
 /// carrying it fails closed. Only the relations are read: no URL is used.
 pub fn link_header_may_announce_next(header: &str) -> bool {
-    match link_relations(header) {
-        Some(relations) => relations
-            .iter()
-            .any(|relation| relation.eq_ignore_ascii_case("next")),
-        None => true,
-    }
+    !matches!(next_link(header), NextLink::Absent)
 }
 
-/// Every relation type named by every link-value of one `Link` header value,
+/// Every link-value of one `Link` header value as `(target, relation types)`,
 /// or `None` when the value is not an unambiguous RFC 8288 `#link-value` list.
-fn link_relations(header: &str) -> Option<Vec<String>> {
+fn link_values(header: &str) -> Option<Vec<(String, Vec<String>)>> {
     fn is_tchar(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
     }
@@ -673,11 +687,11 @@ fn link_relations(header: &str) -> Option<Vec<String>> {
 
     let bytes = header.as_bytes();
     let mut at = 0;
-    let mut relations = Vec::new();
+    let mut values = Vec::new();
     loop {
         skip_ows(bytes, &mut at);
         match bytes.get(at) {
-            None => return Some(relations),
+            None => return Some(values),
             // Empty list elements are allowed by the `#` rule.
             Some(b',') => {
                 at += 1;
@@ -693,11 +707,17 @@ fn link_relations(header: &str) -> Option<Vec<String>> {
         if bytes[at + 1 + close] != b'>' {
             return None;
         }
+        let target = String::from_utf8(bytes[at + 1..at + 1 + close].to_vec()).ok()?;
         at += close + 2;
+        let mut relations = Vec::new();
+        let mut last = false;
         loop {
             skip_ows(bytes, &mut at);
             match bytes.get(at) {
-                None => return Some(relations),
+                None => {
+                    last = true;
+                    break;
+                }
                 Some(b',') => {
                     at += 1;
                     break;
@@ -732,6 +752,10 @@ fn link_relations(header: &str) -> Option<Vec<String>> {
                 // An extended-notation relation is not unambiguously absent.
                 return None;
             }
+        }
+        values.push((target, relations));
+        if last {
+            return Some(values);
         }
     }
 }
@@ -810,16 +834,14 @@ pub fn apply_override(findings: &mut [super::PolicyFinding], decision: &Override
 /// of a finding in the unresolved (committed) document. A finding after
 /// credential resolution that differs in any of them is one the override
 /// review did not accept.
-fn reviewed_identity(
-    finding: &super::PolicyFinding,
-) -> (&str, super::Severity, &str, &str, &str, &str) {
+fn reviewed_identity(finding: &super::PolicyFinding) -> FindingIdentity {
     (
-        finding.rule_id.as_str(),
+        finding.rule_id.clone(),
         finding.severity,
-        finding.kind.as_str(),
-        finding.namespace.as_str(),
-        finding.id.as_str(),
-        finding.message.as_str(),
+        finding.kind.clone(),
+        finding.namespace.clone(),
+        finding.id.clone(),
+        finding.message.clone(),
     )
 }
 
@@ -846,23 +868,51 @@ pub fn apply_override_to_reviewed(
         .approver
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
-    let reviewed: std::collections::HashSet<_> = reviewed
-        .iter()
-        .filter(|finding| finding.severity.blocks_apply())
-        .map(reviewed_identity)
-        .collect();
+    // A multiset: one unresolved finding covers one identical resolved
+    // finding, never several.
+    let mut reviewed = identity_counts(
+        reviewed
+            .iter()
+            .filter(|finding| finding.severity.blocks_apply()),
+    );
     let mut uncovered = 0;
     for finding in findings.iter_mut() {
         if !finding.severity.blocks_apply() {
             continue;
         }
-        if reviewed.contains(&reviewed_identity(finding)) {
+        if take_identity(&mut reviewed, finding) {
             finding.overridden_by = Some(by.clone());
         } else {
             uncovered += 1;
         }
     }
     uncovered
+}
+
+type FindingIdentity = (String, super::Severity, String, String, String, String);
+
+fn identity_counts<'a>(
+    findings: impl Iterator<Item = &'a super::PolicyFinding>,
+) -> std::collections::HashMap<FindingIdentity, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for finding in findings {
+        *counts.entry(reviewed_identity(finding)).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Consume one occurrence of `finding`'s identity; false once exhausted.
+fn take_identity(
+    counts: &mut std::collections::HashMap<FindingIdentity, usize>,
+    finding: &super::PolicyFinding,
+) -> bool {
+    match counts.get_mut(&reviewed_identity(finding)) {
+        Some(count) if *count > 0 => {
+            *count -= 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// The policy findings `plan` and `review` preview, gated exactly as `apply`
@@ -891,11 +941,14 @@ pub fn preview_policy_findings(
     let uncovered = decision
         .map(|decision| apply_override_to_reviewed(&mut resolved, decision, unresolved))
         .unwrap_or(0);
-    let known: std::collections::HashSet<_> = unresolved.iter().map(reviewed_identity).collect();
+    // Each unresolved finding has at most one resolved twin, matched in the
+    // same order `apply_override_to_reviewed` covers them; the rest are
+    // resolution-only.
+    let mut twins = identity_counts(unresolved.iter());
     let active = decision.is_some_and(|decision| decision.active);
     let resolution_only: Vec<_> = resolved
         .into_iter()
-        .filter(|finding| !known.contains(&reviewed_identity(finding)))
+        .filter(|finding| !take_identity(&mut twins, finding))
         .map(|mut finding| {
             if active && finding.is_blocking() {
                 finding.remediation = Some(RESOLUTION_ONLY_REMEDIATION.to_string());

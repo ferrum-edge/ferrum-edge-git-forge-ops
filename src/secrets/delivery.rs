@@ -201,7 +201,9 @@ pub async fn fetch_ssh_recipient(
                 message: body,
             });
         }
-        let next = resp
+        // An unparseable `Link` value could hide a next page, and stopping
+        // there would end the recipient search early: refuse it instead.
+        let next = match resp
             .headers()
             .get(reqwest::header::LINK)
             .map(|header| {
@@ -210,7 +212,16 @@ pub async fn fetch_ssh_recipient(
                 })
             })
             .transpose()?
-            .and_then(crate::policy::github_override::parse_next_link);
+            .map(crate::policy::github_override::next_link)
+        {
+            None | Some(crate::policy::github_override::NextLink::Absent) => None,
+            Some(crate::policy::github_override::NextLink::Next(target)) => Some(target),
+            Some(crate::policy::github_override::NextLink::Ambiguous) => {
+                return Err(crate::error::Error::HttpClient(
+                    "invalid SSH key pagination header".into(),
+                ))
+            }
+        };
         let keys: Vec<SshKey> = resp
             .json()
             .await

@@ -763,9 +763,19 @@ async fn surface_delivered_credentials(
         }
     }
 
-    let pr_number = std::env::var("GITFORGEOPS_PR_NUMBER")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
+    // Values are already committed to the bundle here, so refusing would
+    // strand them undelivered. `cmd_apply` refuses a malformed number before
+    // allocation; if one still arrives, never post to a guessed PR: warn and
+    // deliver the ciphertext on stdout instead.
+    let pr_number = match policy::github_override::pr_number_from_env() {
+        Ok(number) => number,
+        Err(error) => {
+            eoutln!(
+                "Warning: {error}; the credential delivery is NOT posted to any PR and falls back to stdout."
+            );
+            None
+        }
+    };
     let can_post_pr = pr_number.is_some()
         && env_config.github_token.is_some()
         && env_config.github_repository.is_some();
@@ -2953,6 +2963,10 @@ async fn cmd_apply(
     // recipient is refused here, before any state, bundle, gateway or GitHub
     // access, rather than read as "no recipient".
     let allocation_binding = AllocationBinding::from_env()?;
+    // The PR number routes override evaluation and the credential delivery
+    // comment. Refuse a malformed one here, before allocation, so delivery
+    // never has to choose between a wrong PR and a stranded secret.
+    policy::github_override::pr_number_from_env()?;
     let allow_nontransactional_plugin_attach =
         allow_nontransactional_plugin_attach || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;

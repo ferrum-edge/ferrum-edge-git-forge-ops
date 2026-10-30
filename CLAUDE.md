@@ -1371,18 +1371,21 @@ applied revision.
   file may be absent from split review's data checkout, which copies only
   protected configuration. Ignored build/runtime outputs elsewhere (`target/`,
   worktrees, `.state/`, `assembled/`) are not compared.
-- **Evidence.** Labeler, permission and reviews are paginated by page number
-  from the fixed origin; a short page fails closed when any `Link` header
-  may announce a next page (`link_header_may_announce_next`: an RFC 8288
-  `next` relation in token or quoted form, any case, among space-separated
-  types, across link-values and headers; any value that does not parse
-  unambiguously counts as one). No `Link` URL is ever requested. The final
-  pass re-reads the PR, labeler, **permission** (must still be sufficient)
-  and reviews.
+- **Evidence.** Label events and reviews are paginated by page number from
+  the fixed origin (permission is a single read); a short page fails closed
+  when any `Link` header may announce a next page
+  (`link_header_may_announce_next` over `next_link`: an RFC 8288 `next`
+  relation in token or quoted form, any case, among space-separated types,
+  across link-values and headers; any value that does not parse
+  unambiguously counts as one, and a malformed entry never hides a later
+  one). No `Link` URL is ever requested. SSH key discovery uses the same
+  parser and refuses an ambiguous value. The final pass re-reads the PR,
+  labeler, **permission** (must still be sufficient) and reviews.
 - **Committed findings only.** api-mode apply re-evaluates policy after
   credential resolution. The override covers a blocking finding there only if
   the unresolved (committed) document's evaluation had the same rule,
-  severity, kind, namespace, id and message
+  severity, kind, namespace, id and message, counted as a multiset (one
+  unresolved finding covers one identical resolved finding)
   (`github_override::apply_override_to_reviewed`,
   `refusal::refuse_post_resolution_policy_violations`). A resolution-only
   finding refuses apply, saying it appeared only after credential resolution;
@@ -1391,9 +1394,15 @@ applied revision.
   (unresolved findings with the whole override, plus in api mode each
   resolution-only finding, which stays a `Policy` blocker carrying
   `RESOLUTION_ONLY_REMEDIATION`).
-- A set `GITFORGEOPS_PR_NUMBER` that is not a positive integer is an error
-  (`github_override::parse_pr_number`), never a fallback to the commit's
-  associated PR. Unset or blank falls back.
+- `GITFORGEOPS_PR_NUMBER` is parsed strictly (`github_override::parse_pr_number`:
+  unset or blank is absent, otherwise ASCII digits only and positive). A
+  malformed value is an error in `plan` when it evaluates an override (`review`
+  takes its PR from `--pr`), and in `apply` unconditionally, right after the allocation
+  binding and before any state, bundle, gateway or GitHub access; it never
+  falls back to the commit's associated PR. Credential delivery
+  (`surface_delivered_credentials`) uses the same parse; values are already
+  committed there, so a malformed value (unreachable through `apply`) posts
+  nothing, warns and delivers on stdout rather than stranding them.
 
 ### Setup doctor (`src/doctor/`)
 

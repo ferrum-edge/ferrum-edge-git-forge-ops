@@ -2042,3 +2042,106 @@ async fn override_is_inactive_when_a_short_page_link_may_announce_more() {
         assert!(decision.active, "{line:?}: {}", decision.reason);
     }
 }
+
+/// The shared parser reads every link-value: a malformed entry never hides a
+/// later one, and makes the whole value ambiguous rather than "no next".
+#[test]
+fn next_link_reads_every_link_value_and_flags_malformed_entries() {
+    use gitforgeops::policy::github_override::{next_link, parse_next_link, NextLink};
+    // An entry without parameters is a valid link-value with no relation.
+    assert_eq!(
+        next_link("<https://h/p1>, <https://h/p2>; rel=\"next\""),
+        NextLink::Next("https://h/p2".into())
+    );
+    assert_eq!(
+        parse_next_link("<https://h/p1>, <https://h/p2>; rel=\"next\"").as_deref(),
+        Some("https://h/p2")
+    );
+    assert_eq!(
+        next_link("<https://h/p0>; rel=\"prev\"; title=\"a, b\", <https://h/p2>; rel=next"),
+        NextLink::Next("https://h/p2".into())
+    );
+    for malformed in [
+        "garbage, <https://h/p2>; rel=\"next\"",
+        "<https://h/p1> junk, <https://h/p2>; rel=\"next\"",
+        "<https://h/p1>; rel=\"prev\", not-a-link",
+    ] {
+        assert_eq!(next_link(malformed), NextLink::Ambiguous, "{malformed}");
+        assert_eq!(parse_next_link(malformed), None, "{malformed}");
+    }
+    assert_eq!(next_link("<https://h/p1>; rel=\"prev\""), NextLink::Absent);
+}
+
+/// SSH key discovery refuses an ambiguous `Link` header rather than ending the
+/// recipient search early.
+#[tokio::test]
+async fn ssh_key_discovery_refuses_an_ambiguous_link_header() {
+    use gitforgeops::secrets::discover_recipient_at;
+    let first_page = format!("GET /users/{RECIPIENT}/keys?per_page=100 ");
+    let second_page = format!("GET /users/{RECIPIENT}/keys?per_page=100&page=2");
+    let (public_key, _) = recipient_keypair();
+    let (api_base, requests) = spawn_github_stub_with_headers(vec![
+        (
+            second_page.clone(),
+            200,
+            serde_json::json!([{"key": public_key}]).to_string(),
+            String::new(),
+        ),
+        (
+            first_page,
+            200,
+            "[{\"key\":\"unsupported-public-key\"}]".to_string(),
+            format!(
+                "Link: garbage, <{{base}}/users/{RECIPIENT}/keys?per_page=100&page=2>; rel=\"next\"\r\n"
+            ),
+        ),
+    ]);
+    let error = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect_err("ambiguous pagination is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid SSH key pagination header"),
+        "{error}"
+    );
+    assert_eq!(count_requests(&requests, &second_page), 0);
+}
+
+/// An exactly full page followed by an empty one completes the history.
+#[tokio::test]
+async fn exactly_one_full_page_then_an_empty_page_completes() {
+    use gitforgeops::policy::github_override::{fetch_reviews_at, find_override_labeler_at};
+    let repo_pr = format!("{REPO}/issues/7");
+    let (api_base, requests) = spawn_github_stub(vec![
+        (
+            events_page(&repo_pr, 1),
+            200,
+            full_events_page(label_event("labeled", "maintainer")),
+        ),
+        (events_page(&repo_pr, 2), 200, "[]".to_string()),
+    ]);
+    let labeler =
+        find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+            .await
+            .expect("labeler lookup");
+    assert_eq!(labeler.as_deref(), Some("maintainer"));
+    assert_eq!(requests.lock().expect("recorded").len(), 2);
+
+    let full: Vec<_> = (1..=100)
+        .map(|id| plain_review_json(id, "someone"))
+        .collect();
+    let (api_base, requests) = spawn_github_stub(vec![
+        (
+            reviews_page(1),
+            200,
+            serde_json::Value::Array(full).to_string(),
+        ),
+        (reviews_page(2), 200, "[]".to_string()),
+    ]);
+    let reviews = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+        .await
+        .expect("reviews");
+    assert_eq!(reviews.len(), 100);
+    assert_eq!(requests.lock().expect("recorded").len(), 2);
+}

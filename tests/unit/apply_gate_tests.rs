@@ -623,6 +623,40 @@ fn malformed_pr_number_refuses_plan_and_apply_instead_of_falling_back() {
     }
 }
 
+/// The PR number also routes the credential delivery comment, so apply
+/// refuses a malformed one before any allocation or publication even when no
+/// policy needs an override (a lenient parse accepted `+7`).
+#[test]
+fn apply_refuses_a_malformed_pr_number_without_any_policy() {
+    let repo = Repo::with_consumer(BROKERED_CONSUMER);
+    for malformed in ["+7", "seven"] {
+        let output = repo.run(
+            &["apply", "--auto-approve"],
+            &[
+                ("GITFORGEOPS_PR_NUMBER", malformed),
+                ("FERRUM_CREDS_JSON", BUNDLE),
+            ],
+        );
+        let shown = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{malformed}: {shown}");
+        assert!(
+            shown.contains("GITFORGEOPS_PR_NUMBER is set but is not a positive integer"),
+            "{malformed}: {shown}"
+        );
+        assert!(!repo.published().exists());
+        assert!(!repo.dir.path().join(".state/default.json").exists());
+    }
+    let output = repo.run(
+        &["apply", "--auto-approve"],
+        &[
+            ("GITFORGEOPS_PR_NUMBER", "7"),
+            ("FERRUM_CREDS_JSON", BUNDLE),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(repo.published().exists());
+}
+
 #[test]
 fn apply_refuses_a_literal_consumer_credential_and_publishes_nothing() {
     let repo = Repo::with_consumer(LITERAL_CONSUMER);
