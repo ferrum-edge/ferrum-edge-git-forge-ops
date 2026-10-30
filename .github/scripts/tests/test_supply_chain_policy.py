@@ -2114,7 +2114,10 @@ class SupplyChainPolicyTests(unittest.TestCase):
             with self.subTest(job=job), tempfile.TemporaryDirectory() as directory:
                 root = self._mirror_repo(Path(directory))
                 path = root / ".github/workflows/apply-on-merge.yml"
-                binding = "      - name: Validate\n        env:\n          FERRUM_ENV: "
+                binding = (
+                    "      - name: Validate\n        timeout-minutes: 10\n        env:\n"
+                    "          FERRUM_ENV: "
+                )
                 original = path.read_text(encoding="utf-8")
                 self.assertIn(binding + expected, original)
                 path.write_text(original.replace(
@@ -2463,12 +2466,12 @@ class SupplyChainPolicyTests(unittest.TestCase):
             "        run: |\n"
         )
         trusted_enforce = (
-            "            python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\\n"
+            "            python3 -I trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\\n"
             "              --policy trusted-cargo-audit/.github/cargo-audit-policy.json \\\n"
             '              --source-root "$GITHUB_WORKSPACE"\n'
         )
         trusted_tests = (
-            "            python3 trusted-cargo-audit/.github/scripts/tests/"
+            "            python3 -I trusted-cargo-audit/.github/scripts/tests/"
             "test_check_cargo_audit.py\n"
         )
         job = "  security-cargo-audit:\n    runs-on: ubuntu-26.04\n"
@@ -2524,8 +2527,8 @@ class SupplyChainPolicyTests(unittest.TestCase):
             ),
         }
         required = (
-            "python3 trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
-            "python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py",
+            "python3 -I trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py",
+            "python3 -I trusted-cargo-audit/.github/scripts/check_cargo_audit.py",
             "--policy trusted-cargo-audit/.github/cargo-audit-policy.json",
             '--source-root "$GITHUB_WORKSPACE"',
         )
@@ -2561,7 +2564,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
 
     def test_cargo_audit_comment_bypass_is_refused_by_the_trusted_checker(self):
         trusted = (
-            "            python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\\n"
+            "            python3 -I trusted-cargo-audit/.github/scripts/check_cargo_audit.py \\\n"
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = self._mirror_repo(Path(temporary))
@@ -7948,40 +7951,67 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         ]
 
 
-class Issue562RolloutTests(unittest.TestCase):
-    """Step 1 of #562 pins the new workflow forms and keeps the reviewed ones.
-
-    The protected checker judges every candidate's workflows, so the pinned
-    jobs gain `timeout-minutes` and `python3 -I` in a later pull request than
-    their pins. Both forms pass here; a half-switched job does not.
-    """
+class Issue562PinnedFormTests(unittest.TestCase):
+    """#562: pinned jobs are bounded and isolated; the forms they replaced are refused."""
 
     @staticmethod
-    def _after_job_header(text: str, job: str, minutes: int) -> str:
+    def _workflow(name: str) -> str:
+        return (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+
+    @staticmethod
+    def _without_job_timeout(text: str, job: str) -> str:
         header = f"  {job}:\n"
         start = text.index(header)
-        runs_on = text.index("    runs-on: ubuntu-26.04\n", start)
-        end = runs_on + len("    runs-on: ubuntu-26.04\n")
-        return text[:end] + f"    timeout-minutes: {minutes}\n" + text[end:]
+        line = text.index("    timeout-minutes: ", start)
+        end = text.index("\n", line) + 1
+        return text[:line] + text[end:]
 
-    def _switched_rust_ci(self, floor: int = 87) -> str:
-        text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
-        text = self._after_job_header(text, "rust-ci-check", 45)
-        text = text.replace("python3 trusted-scope/", "python3 -I trusted-scope/")
-        coverage = check_supply_chain.workflow_job(text, "coverage")
-        switched = "".join(
-            line.replace(
-                check_supply_chain.COVERAGE_FLOOR_PLACEHOLDER, f"--fail-under-lines {floor}"
-            )
-            + "\n"
-            for line in check_supply_chain.COVERAGE_JOB
-        )
-        return text.replace(coverage, switched, 1)
+    def _with_floor(self, floor: int) -> str:
+        text = self._workflow("rust-ci.yml")
+        self.assertEqual(text.count("--fail-under-lines 87\n"), 1)
+        return text.replace("--fail-under-lines 87\n", f"--fail-under-lines {floor}\n", 1)
+
+    def test_pinned_jobs_refuse_their_pre_562_forms(self):
+        rust_ci = self._workflow("rust-ci.yml")
+        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(rust_ci), [])
+        for weakened in (
+            rust_ci.replace("python3 -I trusted-scope/", "python3 trusted-scope/"),
+            self._without_job_timeout(rust_ci, "rust-ci-check"),
+            self._without_job_timeout(rust_ci, "coverage"),
+            rust_ci.replace(" --fail-under-lines 87\n", "\n", 1),
+        ):
+            self.assertNotEqual(weakened, rust_ci)
+            self.assertTrue(check_supply_chain.rust_ci_test_scope_violations(weakened))
+
+        validate = self._workflow("validate-pr.yml")
+        self.assertEqual(check_supply_chain.required_static_validation_violations(validate), [])
+        for weakened in (
+            validate.replace("python3 -I trusted-scope/", "python3 trusted-scope/"),
+            self._without_job_timeout(validate, "scope"),
+        ):
+            self.assertNotEqual(weakened, validate)
+            self.assertTrue(check_supply_chain.required_static_validation_violations(weakened))
+
+        security = self._workflow("security.yml")
+        self.assertEqual(check_supply_chain.trusted_cargo_audit_policy_violations(security), [])
+        for weakened in (
+            self._without_job_timeout(security, "security-cargo-audit"),
+            security.replace("  python3 -I trusted-cargo-audit/", "  python3 trusted-cargo-audit/"),
+        ):
+            self.assertNotEqual(weakened, security)
+            self.assertTrue(check_supply_chain.cargo_audit_job_shape_violations(weakened))
+
+    def test_coverage_floor_cannot_drop_below_the_measured_baseline(self):
+        lowered = self._with_floor(check_supply_chain.COVERAGE_LINE_FLOOR - 1)
+        violations = check_supply_chain.rust_ci_test_scope_violations(lowered)
+        self.assertTrue(any("may not drop below" in item for item in violations), violations)
+        raised = self._with_floor(check_supply_chain.COVERAGE_LINE_FLOOR + 5)
+        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(raised), [])
 
     def test_coverage_job_is_pinned_against_decoys(self):
-        switched = self._switched_rust_ci()
+        reviewed = self._workflow("rust-ci.yml")
         # A decoy `env.run` keeps the approved text while another command runs.
-        decoy = switched.replace(
+        decoy = reviewed.replace(
             "        run: cargo llvm-cov --lib",
             "        env:\n          run: cargo llvm-cov --lib",
             1,
@@ -7990,85 +8020,30 @@ class Issue562RolloutTests(unittest.TestCase):
             "--fail-under-lines 87\n        run: touch lcov.info\n",
             1,
         )
-        self.assertNotEqual(decoy, switched)
+        self.assertNotEqual(decoy, reviewed)
         self.assertTrue(
             any(
                 "coverage must keep its reviewed header" in item
                 for item in check_supply_chain.rust_ci_test_scope_violations(decoy)
             )
         )
-        # A quoted path to the candidate's classifier, the trusted text kept in a comment.
-        quoted = switched.replace(
-            "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py \\\n"
-            "              \"$pages_file\" \"$current_changed\" rust)\n"
-            "          else\n            # Bootstrap",
-            "result=$(python3 -I \".github/scripts/changed_files.py\" \\\n"
-            "              \"$pages_file\" \"$current_changed\" rust)\n"
-            "          else\n            # Bootstrap",
+        skipped = reviewed.replace(
+            "      - name: cargo llvm-cov\n",
+            "      - name: cargo llvm-cov\n        continue-on-error: true\n",
             1,
         )
-        self.assertNotEqual(quoted, switched)
+        self.assertNotEqual(skipped, reviewed)
+        self.assertTrue(check_supply_chain.rust_ci_test_scope_violations(skipped))
+        # A quoted path to the candidate's classifier in the coverage job.
+        coverage = check_supply_chain.workflow_job(reviewed, "coverage")
+        quoted_job = coverage.replace(
+            "python3 -I trusted-scope/.github/scripts/changed_files.py",
+            'python3 -I ".github/scripts/changed_files.py"',
+            1,
+        )
+        self.assertNotEqual(quoted_job, coverage)
+        quoted = reviewed.replace(coverage, quoted_job, 1)
         self.assertTrue(check_supply_chain.rust_ci_test_scope_violations(quoted))
-        self.assertTrue(
-            any(
-                "candidate-branch" in item
-                for item in check_supply_chain.trusted_classifier_violations(
-                    "rust-ci.yml",
-                    quoted + "\n# result=$(python3 -I trusted-scope/.github/scripts/changed_files.py\n",
-                    "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py",
-                    2,
-                )
-            )
-        )
-
-    def test_rust_ci_accepts_the_reviewed_and_the_switched_job(self):
-        reviewed = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
-        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(reviewed), [])
-        switched = self._switched_rust_ci()
-        self.assertNotEqual(switched, reviewed)
-        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(switched), [])
-
-        half = self._after_job_header(reviewed, "rust-ci-check", 45)
-        self.assertTrue(
-            any(
-                "rust-ci-check must keep its reviewed header" in item
-                for item in check_supply_chain.rust_ci_test_scope_violations(half)
-            )
-        )
-
-    def test_coverage_floor_cannot_drop_below_the_measured_baseline(self):
-        lowered = self._switched_rust_ci(check_supply_chain.COVERAGE_LINE_FLOOR - 1)
-        violations = check_supply_chain.rust_ci_test_scope_violations(lowered)
-        self.assertTrue(any("may not drop below" in item for item in violations), violations)
-        raised = self._switched_rust_ci(check_supply_chain.COVERAGE_LINE_FLOOR + 5)
-        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(raised), [])
-
-    def test_validate_pr_accepts_the_reviewed_and_the_switched_jobs(self):
-        reviewed = (ROOT / ".github/workflows/validate-pr.yml").read_text(encoding="utf-8")
-        self.assertEqual(check_supply_chain.required_static_validation_violations(reviewed), [])
-        switched = reviewed.replace("python3 trusted-scope/", "python3 -I trusted-scope/")
-        for job, minutes in (
-            ("scope", 10),
-            ("list-envs", 30),
-            ("validate", 45),
-            ("gitforgeops-required-static-validation", 10),
-        ):
-            switched = self._after_job_header(switched, job, minutes)
-        self.assertEqual(check_supply_chain.required_static_validation_violations(switched), [])
-
-        # The isolated classifier without the job timeouts is neither form.
-        half = reviewed.replace("python3 trusted-scope/", "python3 -I trusted-scope/")
-        self.assertTrue(check_supply_chain.required_static_validation_violations(half))
-
-    def test_cargo_audit_accepts_the_reviewed_and_the_switched_job(self):
-        reviewed = (ROOT / ".github/workflows/security.yml").read_text(encoding="utf-8")
-        switched = self._after_job_header(reviewed, "security-cargo-audit", 20).replace(
-            "  python3 ", "  python3 -I "
-        )
-        for text in (reviewed, switched):
-            self.assertEqual(check_supply_chain.trusted_cargo_audit_policy_violations(text), [])
-        timed_only = self._after_job_header(reviewed, "security-cargo-audit", 20)
-        self.assertTrue(check_supply_chain.cargo_audit_job_shape_violations(timed_only))
 
     def test_interpreter_flags_do_not_hide_the_candidate_classifier(self):
         for invocation in (
@@ -8104,34 +8079,33 @@ class Issue562RolloutTests(unittest.TestCase):
         ):
             self.assertIsNone(check_supply_chain._CANDIDATE_CLASSIFIER.search(trusted), trusted)
 
-    def test_state_guard_accepts_either_helper_form_and_nothing_else(self):
-        for invocation in ('result=$(python3 -I "$helper"', 'result=$(python3 "$helper"'):
-            self.assertEqual(
-                check_supply_chain.state_guard_helper_violations(f"{invocation} a b)\n"), []
-            )
-        self.assertTrue(
-            check_supply_chain.state_guard_helper_violations(
-                "result=$(python3 -I trusted-guard/.github/scripts/changed_files.py a b)\n"
-            )
+    def test_state_guard_requires_the_isolated_helper_invocation(self):
+        self.assertEqual(
+            check_supply_chain.state_guard_helper_violations('result=$(python3 -I "$helper" a b)\n'),
+            [],
         )
+        for refused in (
+            'result=$(python3 "$helper" a b)\n',
+            "result=$(python3 -I trusted-guard/.github/scripts/changed_files.py a b)\n",
+        ):
+            self.assertTrue(check_supply_chain.state_guard_helper_violations(refused), refused)
 
-    def test_credential_handoff_accepts_the_isolated_bundle_loader(self):
+    def test_credential_handoff_requires_the_isolated_bundle_loader(self):
         legacy = tuple(
             line.replace("python3 -I ", "python3 ")
             for line in check_supply_chain.CREDENTIAL_HANDOFF_RUN
         )
         self.assertNotEqual(legacy, check_supply_chain.CREDENTIAL_HANDOFF_RUN)
-        for shape in (legacy, check_supply_chain.CREDENTIAL_HANDOFF_RUN):
+        for shape, refused in ((check_supply_chain.CREDENTIAL_HANDOFF_RUN, False), (legacy, True)):
             step = {
                 "name": "Load credential bundles",
                 "env": {"FERRUM_CREDS_BUNDLE": "${{ secrets.FERRUM_CREDS_BUNDLE }}"},
                 "run": "\n".join(shape),
             }
-            self.assertIsNone(
-                check_supply_chain._credential_handoff_refusal(
-                    ".github/workflows/rotate.yml", {}, {}, step
-                )
+            refusal = check_supply_chain._credential_handoff_refusal(
+                ".github/workflows/rotate.yml", {}, {}, step
             )
+            self.assertEqual(refusal is not None, refused, refusal)
 
 
 class JobBudgetAndIsolationTests(unittest.TestCase):

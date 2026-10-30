@@ -142,8 +142,8 @@ def write_valid_setup(
         '[[ -f "$validator" ]]\n'
         "else\n"
         "validator=.github/scripts/check_agent_setup.py\n"
-        'python3 "$validator" --root "$GITHUB_WORKSPACE"\n'
-        "python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'\n"
+        'python3 -I "$validator" --root "$GITHUB_WORKSPACE"\n'
+        "python3 -I -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'\n"
         "shellcheck --external-sources --source-path=SCRIPTDIR\n"
         "group: agent-setup-ci-${{ github.event.pull_request.number || github.ref }}\n"
         "cancel-in-progress: true\n",
@@ -163,7 +163,7 @@ def write_valid_setup(
         "ref: ${{ github.event.repository.default_branch }}\n"
         "validator=.agent-setup-base/.github/scripts/check_agent_setup.py\n"
         '[[ -f "$validator" ]]\n'
-        'python3 "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"\n'
+        'python3 -I "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"\n'
         "group: agent-setup-policy-${{ github.event.pull_request.number }}\n"
         "cancel-in-progress: true\n",
         encoding="utf-8",
@@ -563,23 +563,22 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("github.event.pull_request.base.sha", joined)
         self.assertIn("candidate validator for bootstrap", joined)
 
-    def test_agent_workflows_accept_isolated_and_reviewed_interpreters(self):
-        # Issue #562 step 1 of 2: the protected validator judges candidate
-        # workflows, so both interpreter forms pass until step 2 switches them.
-        for isolated in (False, True):
+    def test_agent_workflows_refuse_a_non_isolated_interpreter(self):
+        # Issue #562: the validator and its tests run as `python3 -I`.
+        for name in ("agent-setup-ci.yml", "agent-setup-policy.yml"):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 write_valid_setup(root)
-                if isolated:
-                    for name in ("agent-setup-ci.yml", "agent-setup-policy.yml"):
-                        workflow = root / ".github" / "workflows" / name
-                        workflow.write_text(
-                            workflow.read_text(encoding="utf-8").replace(
-                                "python3 ", "python3 -I "
-                            ),
-                            encoding="utf-8",
-                        )
-                self.assertEqual(check_agent_setup.collect_violations(root), [], isolated)
+                self.assertEqual(check_agent_setup.collect_violations(root), [])
+                workflow = root / ".github" / "workflows" / name
+                workflow.write_text(
+                    workflow.read_text(encoding="utf-8").replace("python3 -I ", "python3 "),
+                    encoding="utf-8",
+                )
+                violations = check_agent_setup.collect_violations(root)
+                self.assertTrue(
+                    any("missing fail-closed control" in item for item in violations), name
+                )
 
     def test_ci_workflow_cannot_keep_markers_but_drop_validation_steps(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -588,9 +587,9 @@ class AgentSetupTests(unittest.TestCase):
             workflow = root / ".github" / "workflows" / "agent-setup-ci.yml"
             workflow.write_text(
                 workflow.read_text(encoding="utf-8")
-                .replace('python3 "$validator" --root "$GITHUB_WORKSPACE"\n', "")
+                .replace('python3 -I "$validator" --root "$GITHUB_WORKSPACE"\n', "")
                 .replace(
-                    "python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'\n",
+                    "python3 -I -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'\n",
                     "",
                 )
                 .replace("shellcheck --external-sources --source-path=SCRIPTDIR\n", ""),
