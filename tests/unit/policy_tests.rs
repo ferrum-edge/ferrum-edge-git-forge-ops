@@ -261,7 +261,7 @@ fn allowed_proxy_plugins_flags_disallowed_associations() {
             allowed_proxy_plugins: AllowedProxyPluginsRuleConfig {
                 enabled: true,
                 severity: Severity::Error,
-                allowed_plugin_names: vec!["KEY_AUTH".to_string(), "rate_limiting".to_string()],
+                allowed_plugin_names: vec!["key_auth".to_string(), "rate_limiting".to_string()],
             },
             ..Default::default()
         },
@@ -2667,7 +2667,7 @@ fn require_auth_plugin_fails_closed_for_unverified_stream_authenticators() {
     // A custom authenticator's supported protocols are not visible here, so
     // without a declaration it counts for plain HTTP requests only, the
     // gateway's trait default.
-    let policies = require_auth_policies(Some(&["company_sso", "MTLS_AUTH"]));
+    let policies = require_auth_policies(Some(&["company_sso", "mtls_auth"]));
 
     let http = GatewayConfig {
         proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
@@ -2689,8 +2689,8 @@ fn require_auth_plugin_fails_closed_for_unverified_stream_authenticators() {
     };
     assert_eq!(auth_findings(&stream, &policies).len(), 1);
 
-    // The allowlist matches case-insensitively, but only the exact built-in
-    // name runs on a stream listener.
+    // The allowlist matches `plugin_name` exactly, as the gateway resolves
+    // it: a case variant is neither listed nor run on a stream listener.
     let case_variant = GatewayConfig {
         proxies: vec![stream_proxy("stream", BackendScheme::Tcp, true)],
         plugin_configs: vec![global_plugin("mtls-1", "MTLS_AUTH")],
@@ -3580,15 +3580,27 @@ fn policy_config_rejects_non_auth_builtins_in_auth_plugin_names() {
 
     // A non-auth built-in could only ever be reported as ignored, and its
     // protocols cannot be declared, so it is rejected at load.
-    for name in ["opa", "access_control", "spiffe_identity", "Access_Control"] {
+    for name in ["opa", "access_control", "spiffe_identity"] {
         let names = format!("[jwt_auth, {name}]");
         let err = load(&names).unwrap_err().to_string();
         assert!(err.contains(&format!("built-in plugin '{name}'")), "{err}");
         assert!(err.contains("does not authenticate callers"), "{err}");
     }
 
-    // Authenticators, in any case, custom names and legacy aliases still load.
-    let loaded = load("[Jwt_Auth, mtls_auth, company_sso, jwt]")
+    // Plugin names are case-sensitive, so a built-in in another case matches
+    // nothing; it is refused with the name it probably meant.
+    for (name, builtin) in [
+        ("Jwt_Auth", "jwt_auth"),
+        ("Access_Control", "access_control"),
+    ] {
+        let names = format!("[mtls_auth, {name}]");
+        let err = load(&names).unwrap_err().to_string();
+        assert!(err.contains(&format!("'{name}'")), "{err}");
+        assert!(err.contains(&format!("Did you mean `{builtin}`?")), "{err}");
+    }
+
+    // Authenticators, custom names and legacy aliases still load.
+    let loaded = load("[jwt_auth, mtls_auth, company_sso, jwt]")
         .unwrap()
         .unwrap();
     let names = &loaded.policies.require_auth_plugin.auth_plugin_names;
@@ -4814,7 +4826,7 @@ fn allowed_proxy_plugins_checks_effective_namespace_globals() {
             allowed_proxy_plugins: AllowedProxyPluginsRuleConfig {
                 enabled: true,
                 severity: Severity::Error,
-                allowed_plugin_names: vec!["KEY_AUTH".into()],
+                allowed_plugin_names: vec!["key_auth".into()],
             },
             ..Default::default()
         },
@@ -5059,4 +5071,138 @@ fn auth_allowlist_reads_padded_names_and_validation_sees_the_same_name() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("does not authenticate callers"), "{error}");
+}
+
+fn load_policy_yaml(
+    yaml: &str,
+) -> gitforgeops::error::Result<Option<gitforgeops::policy::config::PolicyConfig>> {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    write!(file, "{yaml}").unwrap();
+    gitforgeops::policy::config::load_policies_from_path(file.path())
+}
+
+#[test]
+fn a_padded_custom_protocol_key_loads_against_its_unpadded_allowlist_name() {
+    let loaded = load_policy_yaml(
+        "version: 1\npolicies:\n  require_auth_plugin:\n    auth_plugin_names: [company_sso]\n    custom_auth_plugin_protocols:\n      \"company_sso \": [http, grpc]\n",
+    )
+    .unwrap()
+    .unwrap();
+    let allowlist = loaded.policies.require_auth_plugin.auth_allowlist();
+    assert!(allowlist.contains("company_sso"));
+    assert_eq!(
+        allowlist.protocols("company_sso"),
+        &[PluginProtocol::Http, PluginProtocol::Grpc]
+    );
+}
+
+#[test]
+fn custom_protocol_keys_that_trim_to_one_name_are_refused_and_never_broaden() {
+    // At policy load: refused, naming both spellings.
+    let error = load_policy_yaml(
+        "version: 1\npolicies:\n  require_auth_plugin:\n    auth_plugin_names: [company_sso]\n    custom_auth_plugin_protocols:\n      company_sso: [http]\n      \"company_sso \": [http, grpc, websocket]\n",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("declares 'company_sso' twice"), "{error}");
+
+    // A direct caller keeps the narrowest declaration, in either order.
+    let narrow = vec![PluginProtocol::Http, PluginProtocol::Grpc];
+    let broad = vec![
+        PluginProtocol::Http,
+        PluginProtocol::Grpc,
+        PluginProtocol::WebSocket,
+    ];
+    for (first, second) in [(&narrow, &broad), (&broad, &narrow)] {
+        let allowlist = gitforgeops::plugin_catalog::AuthAllowlist::new(
+            &["company_sso".to_string()],
+            &std::collections::BTreeMap::from([
+                ("company_sso".to_string(), first.clone()),
+                (" company_sso".to_string(), second.clone()),
+                ("  ".to_string(), broad.clone()),
+            ]),
+        );
+        assert_eq!(allowlist.protocols("company_sso"), narrow.as_slice());
+    }
+}
+
+#[test]
+fn every_plugin_name_allowlist_refuses_a_miscased_builtin() {
+    let cases = [
+        (
+            "  require_auth_plugin:\n    auth_plugin_names: [KEY_AUTH]\n",
+            "require_auth_plugin.auth_plugin_names",
+            "key_auth",
+        ),
+        (
+            "  require_auth_plugin:\n    auth_plugin_names: [company_sso]\n    custom_auth_plugin_protocols:\n      Key_Auth: [http]\n",
+            "require_auth_plugin.custom_auth_plugin_protocols",
+            "key_auth",
+        ),
+        (
+            "  allowed_proxy_plugins:\n    allowed_plugin_names: [key_auth, Rate_Limiting]\n",
+            "allowed_proxy_plugins.allowed_plugin_names",
+            "rate_limiting",
+        ),
+        (
+            "  require_ai_guardrails:\n    guardrail_plugin_names: [\" AI_Prompt_Shield\"]\n",
+            "require_ai_guardrails.guardrail_plugin_names",
+            "ai_prompt_shield",
+        ),
+    ];
+    for (rules, field, builtin) in cases {
+        let error = load_policy_yaml(&format!("version: 1\npolicies:\n{rules}"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(field), "{error}");
+        assert!(
+            error.contains(&format!("Did you mean `{builtin}`?")),
+            "{error}"
+        );
+    }
+
+    // Custom names are not built-ins in another case, so any case loads.
+    load_policy_yaml(
+        "version: 1\npolicies:\n  allowed_proxy_plugins:\n    allowed_plugin_names: [Company_Plugin, key_auth]\n",
+    )
+    .unwrap()
+    .unwrap();
+}
+
+#[test]
+fn a_policy_entry_does_not_authenticate_a_plugin_named_in_another_case() {
+    // The gateway's plugin factories match `plugin_name` exactly, so a policy
+    // written for `company_sso` says nothing about a `Company_SSO` plugin.
+    let mut rule = gitforgeops::policy::config::RequireAuthPluginRuleConfig {
+        enabled: true,
+        severity: Severity::Error,
+        ..Default::default()
+    };
+    rule.auth_plugin_names = vec!["company_sso".to_string()];
+    rule.custom_auth_plugin_protocols = std::collections::BTreeMap::from([(
+        "company_sso".to_string(),
+        HTTP_FAMILY_PROTOCOLS.to_vec(),
+    )]);
+    let policies = PolicyConfig {
+        policies: PolicyRules {
+            require_auth_plugin: rule,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let with = |plugin_name: &str| GatewayConfig {
+        proxies: vec![proxy("api", BackendScheme::Https, 30_000, true)],
+        plugin_configs: vec![global_plugin("sso-1", plugin_name)],
+        ..Default::default()
+    };
+
+    assert!(auth_findings(&with("company_sso"), &policies).is_empty());
+    let findings = auth_findings(&with("Company_SSO"), &policies);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(!policies
+        .policies
+        .require_auth_plugin
+        .auth_allowlist()
+        .contains("Company_SSO"));
 }

@@ -78,6 +78,11 @@ global ones with the same `plugin_name`, disabled instances dropped.
   `access_control`, `mesh_authz` or `spiffe_identity`) fails the policy load.
   `spiffe_identity` never counts: it extracts an identity but lets callers
   without one through. List custom authenticators by their `plugin_name`.
+  Names match `plugin_name` exactly, as the gateway resolves plugins:
+  surrounding whitespace is ignored, case is not, so `Company_SSO` is not
+  `company_sso`. An entry that is a built-in in another case (`KEY_AUTH`)
+  fails the policy load, here and in `custom_auth_plugin_protocols`,
+  `allowed_plugin_names` and `guardrail_plugin_names`.
 - **Per protocol.** The gateway filters each request's plugin chain by
   protocol. `http`/`https` proxies serve HTTP, gRPC and WebSocket; `tcp`/`tcps`
   get a TCP listener and `udp`/`dtls` a UDP listener. A proxy passes only when
@@ -127,7 +132,8 @@ global ones with the same `plugin_name`, disabled instances dropped.
   they implement under `custom_auth_plugin_protocols`, for example
   `company_sso: [http, grpc, websocket]` (values: `http`, `grpc`, `websocket`,
   `tcp`, `udp`). Each key must also be in `auth_plugin_names` and must not be a
-  built-in or a non-plugin spelling such as `jwt` or `oauth2`.
+  built-in or a non-plugin spelling such as `jwt` or `oauth2`. Two keys that
+  differ only in surrounding whitespace fail the policy load.
 
 The security audit's "No auth plugin" warning and breaking-change detection
 use the same definition and allowlist, even when the rule is disabled.
@@ -171,7 +177,8 @@ resolves later are not checked.
 ### `allowed_proxy_plugins`
 
 Checks each proxy's effective enabled plugins (including namespace globals and
-attached scoped configs), matching `plugin_name` case-insensitively. Messages
+attached scoped configs), matching `plugin_name` exactly (surrounding
+whitespace in an entry is ignored). Messages
 name the plugin, never its configuration.
 
 ### `waf_enforcement`

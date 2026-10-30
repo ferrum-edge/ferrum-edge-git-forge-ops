@@ -1046,19 +1046,23 @@ fn breaking_detects_configured_custom_auth_plugin_deletion() {
 }
 
 #[test]
-fn breaking_auth_classification_follows_the_policy_allowlist_case_insensitively() {
+fn breaking_auth_classification_follows_the_policy_allowlist_exactly() {
     // The configured allowlist replaces the defaults, exactly as it does for
-    // `require_auth_plugin` and the security audit.
-    let policy = auth_policy(&["ACME_AUTH"]);
-    let reasons = plugin_breaking_reasons(
-        vec![],
+    // `require_auth_plugin` and the security audit. Names match `plugin_name`
+    // exactly, as the gateway resolves plugins: `ACME_AUTH` is another plugin.
+    let live = || {
         vec![
             make_plugin_config("sso", "ferrum", "acme_auth", PluginScope::Global),
             make_plugin_config("keys", "ferrum", "key_auth", PluginScope::Global),
-        ],
-        Some(&policy),
-    );
+        ]
+    };
+    let policy = auth_policy(&[" acme_auth "]);
+    let reasons = plugin_breaking_reasons(vec![], live(), Some(&policy));
     assert_eq!(reasons, vec!["Auth plugin deleted".to_string()]);
+
+    let miscased = auth_policy(&["ACME_AUTH"]);
+    let reasons = plugin_breaking_reasons(vec![], live(), Some(&miscased));
+    assert!(reasons.is_empty(), "{reasons:?}");
 }
 
 #[test]

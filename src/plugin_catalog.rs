@@ -608,11 +608,26 @@ pub fn protocol_list(protocols: &[PluginProtocol]) -> String {
         .join(", ")
 }
 
-/// How a policy allowlist entry names a plugin: case-insensitive, with
-/// surrounding whitespace insignificant, matching the enabled-rule emptiness
-/// checks that already treat a whitespace-only entry as blank.
-pub fn normalize_allowlist_name(name: &str) -> String {
-    name.trim().to_ascii_lowercase()
+/// How a policy allowlist entry names a plugin: surrounding whitespace is
+/// insignificant, matching the enabled-rule emptiness checks that already
+/// treat a whitespace-only entry as blank. Case is significant: the gateway's
+/// plugin factories match `plugin_name` exactly, so `Company_SSO` and
+/// `company_sso` are different plugins. Policy loading refuses an entry that
+/// is a built-in name in another case ([`miscased_builtin`]).
+pub fn normalize_allowlist_name(name: &str) -> &str {
+    name.trim()
+}
+
+/// The built-in `name` spells in another case, when it is not itself a
+/// built-in: such an allowlist entry matches no plugin the gateway loads.
+pub fn miscased_builtin(name: &str) -> Option<&'static str> {
+    if is_builtin(name) {
+        return None;
+    }
+    BUILTIN_PLUGINS
+        .iter()
+        .find(|builtin| builtin.name.eq_ignore_ascii_case(name))
+        .map(|builtin| builtin.name)
 }
 
 /// Which `plugin_name`s count as authentication for a repository, and which
@@ -621,39 +636,54 @@ pub fn normalize_allowlist_name(name: &str) -> String {
 /// they cannot disagree about which authenticators run.
 #[derive(Debug, Clone)]
 pub struct AuthAllowlist {
-    /// Allowlisted names, lowercased.
+    /// Allowlisted names, trimmed.
     names: Vec<String>,
     /// Declared `supported_protocols()` of custom authenticators, keyed by
-    /// lowercased name.
+    /// trimmed name.
     custom_protocols: BTreeMap<String, Vec<PluginProtocol>>,
 }
 
 impl AuthAllowlist {
-    /// `names` are matched case-insensitively, with surrounding whitespace
-    /// ignored and blank entries dropped. `custom_protocols` declares the
-    /// protocols of custom authenticators; see [`AuthAllowlist::protocols`].
+    /// `names` are matched exactly against `plugin_name`, as the gateway
+    /// resolves plugins, with surrounding whitespace ignored and blank entries
+    /// dropped. `custom_protocols` declares the protocols of custom
+    /// authenticators; see [`AuthAllowlist::protocols`].
     pub fn new(names: &[String], custom_protocols: &BTreeMap<String, Vec<PluginProtocol>>) -> Self {
+        let mut declared: BTreeMap<String, Vec<PluginProtocol>> = BTreeMap::new();
+        for (name, protocols) in custom_protocols {
+            let name = normalize_allowlist_name(name);
+            if name.is_empty() {
+                continue;
+            }
+            match declared.get_mut(name) {
+                // Two keys that trim to one name. Policy loading refuses this
+                // first; a direct caller gets the narrowest declaration, never
+                // the union, so a padded duplicate cannot broaden coverage.
+                Some(existing) => existing.retain(|protocol| protocols.contains(protocol)),
+                None => {
+                    declared.insert(name.to_string(), protocols.clone());
+                }
+            }
+        }
         Self {
             names: names
                 .iter()
                 .map(|name| normalize_allowlist_name(name))
                 .filter(|name| !name.is_empty())
+                .map(str::to_string)
                 .collect(),
-            custom_protocols: custom_protocols
-                .iter()
-                .map(|(name, protocols)| (normalize_allowlist_name(name), protocols.clone()))
-                .collect(),
+            custom_protocols: declared,
         }
     }
 
-    /// The allowlisted names, lowercased.
+    /// The allowlisted names, trimmed.
     pub fn names(&self) -> &[String] {
         &self.names
     }
 
-    /// Is `plugin_name` on the allowlist? Case-insensitive.
+    /// Is `plugin_name` on the allowlist? Exact, as the gateway resolves it.
     pub fn contains(&self, plugin_name: &str) -> bool {
-        self.names.contains(&plugin_name.to_ascii_lowercase())
+        self.names.iter().any(|name| name == plugin_name)
     }
 
     /// The protocols the gateway runs `plugin_name` on. A built-in is matched
@@ -667,7 +697,7 @@ impl AuthAllowlist {
             return builtin_auth_protocols(plugin_name);
         }
         self.custom_protocols
-            .get(&plugin_name.to_ascii_lowercase())
+            .get(plugin_name)
             .map_or(CUSTOM_PLUGIN_DEFAULT_PROTOCOLS, Vec::as_slice)
     }
 

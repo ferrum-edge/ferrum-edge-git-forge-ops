@@ -18,7 +18,8 @@ impl RequireAuthPluginRule {
 
     /// Explicit allowlist matching keeps valid auth plugin ids accepted while
     /// rejecting unrelated names that merely contain auth-like substrings.
-    /// Matching is case-insensitive against the allowlist.
+    /// Matching is exact against the allowlist, as the gateway resolves
+    /// `plugin_name`.
     ///
     /// Scope resolution (including the `enabled` guard, without which an
     /// attacker could commit `enabled: false` on an auth plugin and pass this

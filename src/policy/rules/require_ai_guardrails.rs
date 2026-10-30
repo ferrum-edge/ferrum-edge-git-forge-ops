@@ -78,8 +78,9 @@ impl PolicyCheck for RequireAiGuardrailsRule {
         }
 
         // Read entries the way the emptiness check above does: surrounding
-        // whitespace is insignificant and a blank entry names nothing.
-        let guardrails: Vec<String> = self
+        // whitespace is insignificant and a blank entry names nothing. Case
+        // is significant, as in the gateway's plugin resolution.
+        let guardrails: Vec<&str> = self
             .config
             .guardrail_plugin_names
             .iter()
@@ -99,7 +100,7 @@ impl PolicyCheck for RequireAiGuardrailsRule {
 
             let attached: Vec<&&PluginConfig> = effective
                 .iter()
-                .filter(|plugin| guardrails.contains(&plugin.plugin_name.to_ascii_lowercase()))
+                .filter(|plugin| guardrails.contains(&plugin.plugin_name.as_str()))
                 .collect();
 
             if attached.is_empty() {

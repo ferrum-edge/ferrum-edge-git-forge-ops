@@ -38,8 +38,9 @@ impl PolicyCheck for AllowedProxyPluginsRule {
         }
 
         // Read entries the way the emptiness check above does: surrounding
-        // whitespace is insignificant and a blank entry names nothing.
-        let allowed: Vec<String> = self
+        // whitespace is insignificant and a blank entry names nothing. Case
+        // is significant, as in the gateway's plugin resolution.
+        let allowed: Vec<&str> = self
             .config
             .allowed_plugin_names
             .iter()
@@ -79,8 +80,7 @@ impl PolicyCheck for AllowedProxyPluginsRule {
             // Use the same enabled/global/scoped merge as runtime-facing rules.
             for plugin in effective_plugins(cfg, proxy) {
                 let plugin_name = &plugin.plugin_name;
-                let actual = plugin_name.to_ascii_lowercase();
-                if allowed.iter().any(|name| name == &actual) {
+                if allowed.contains(&plugin_name.as_str()) {
                     continue;
                 }
 

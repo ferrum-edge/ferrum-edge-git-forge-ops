@@ -42,7 +42,8 @@ policies:
   require_auth_plugin:
     enabled: false
     severity: error
-    # Plugin names that count as authentication. Matching is case-insensitive.
+    # Plugin names that count as authentication. Matching is exact and
+    # case-sensitive, as the gateway resolves plugin_name.
     # Omit the key entirely to use all ten built-in authenticators:
     # mtls_auth, jwks_auth, oauth2_introspection, oidc_relying_party,
     # jwt_auth, key_auth, ldap_auth, basic_auth, hmac_auth, soap_ws_security.
