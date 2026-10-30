@@ -201,27 +201,9 @@ pub async fn fetch_ssh_recipient(
                 message: body,
             });
         }
-        // An unparseable `Link` value could hide a next page, and stopping
-        // there would end the recipient search early: refuse it instead.
-        let next = match resp
-            .headers()
-            .get(reqwest::header::LINK)
-            .map(|header| {
-                header.to_str().map_err(|_| {
-                    crate::error::Error::HttpClient("invalid SSH key pagination header".into())
-                })
-            })
-            .transpose()?
-            .map(crate::policy::github_override::next_link)
-        {
-            None | Some(crate::policy::github_override::NextLink::Absent) => None,
-            Some(crate::policy::github_override::NextLink::Next(target)) => Some(target),
-            Some(crate::policy::github_override::NextLink::Ambiguous) => {
-                return Err(crate::error::Error::HttpClient(
-                    "invalid SSH key pagination header".into(),
-                ))
-            }
-        };
+        // Decided now, refused only if this page holds no compatible key: a
+        // key already found does not depend on the pagination header.
+        let next = next_key_page(resp.headers());
         let keys: Vec<SshKey> = resp
             .json()
             .await
@@ -235,7 +217,7 @@ pub async fn fetch_ssh_recipient(
             let fingerprint = fingerprint_for(trimmed).unwrap_or_else(|| "unknown".to_string());
             return Ok(Some((recipient, fingerprint)));
         }
-        let Some(next) = next else {
+        let Some(next) = next? else {
             return Ok(None);
         };
         if page + 1 == MAX_SSH_KEY_PAGES {
@@ -260,6 +242,29 @@ pub async fn fetch_ssh_recipient(
     Err(crate::error::Error::Config(
         "SSH key discovery did not complete".into(),
     ))
+}
+
+/// The next key page announced across every `Link` header of a response.
+///
+/// An unreadable or ambiguous value could hide a next page, and stopping
+/// there would end the recipient search early, so it is refused; so are two
+/// different `next` targets. The caller still checks the target's origin and
+/// path before requesting it.
+fn next_key_page(headers: &reqwest::header::HeaderMap) -> crate::error::Result<Option<String>> {
+    use crate::policy::github_override::{next_link, NextLink};
+    let refused = || crate::error::Error::HttpClient("invalid SSH key pagination header".into());
+    let mut next: Option<String> = None;
+    for value in headers.get_all(reqwest::header::LINK) {
+        match next_link(value.to_str().map_err(|_| refused())?) {
+            NextLink::Absent => {}
+            NextLink::Ambiguous => return Err(refused()),
+            NextLink::Next(target) => match &next {
+                Some(existing) if existing != &target => return Err(refused()),
+                _ => next = Some(target),
+            },
+        }
+    }
+    Ok(next)
 }
 
 fn fingerprint_for(openssh: &str) -> Option<String> {

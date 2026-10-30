@@ -1930,6 +1930,21 @@ const AMBIGUOUS_OR_NEXT_LINKS: &[&str] = &[
     "Link: <{base}/x>; rel=prev next\r\n",
     "Link: <{base}/x>; rel*=UTF-8''next\r\n",
     "Link: <{base}/x> rel=\"prev\"\r\n",
+    // Relation types outside the RFC 8288 grammar (#562 review round 2).
+    "Link: <{base}/x>; rel=\"prev,next\"\r\n",
+    "Link: <{base}/x>; rel=\"prev;next\"\r\n",
+    "Link: <{base}/x>; rel=\" next\"\r\n",
+    "Link: <{base}/x>; rel=\"prev \"\r\n",
+    "Link: <{base}/x>; rel=\"prev\tnext\"\r\n",
+    "Link: <{base}/x>; rel=\"next\\\"\"\r\n",
+    "Link: <{base}/x>; rel=\"1next\"\r\n",
+    "Link: <{base}/x>; rel=\"pr_ev\"\r\n",
+    "Link: <{base}/x>; rel=\"https://example.com/a,next\"\r\n",
+    // Malformed targets.
+    "Link: <>; rel=\"prev\"\r\n",
+    "Link: < {base}/x>; rel=\"prev\"\r\n",
+    // Two different `next` targets.
+    "Link: <{base}/a>; rel=\"next\", <{base}/b>; rel=\"next\"\r\n",
 ];
 
 /// `Link` header lines that unambiguously announce no next page.
@@ -1940,6 +1955,9 @@ const NO_NEXT_LINKS: &[&str] = &[
     "Link: <{base}/p1>; rel=prev, <{base}/p0>; rel=\"first\"\r\n",
     "Link: <{base}/p1>; rel=\"prev\"; title=\"next page\"\r\n",
     "Link: <{base}/p1>; rel=\"nextish\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev  first\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev https://example.com/rels/page\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev.v2 first-page\"\r\n",
 ];
 
 #[test]
@@ -2144,4 +2162,76 @@ async fn exactly_one_full_page_then_an_empty_page_completes() {
         .expect("reviews");
     assert_eq!(reviews.len(), 100);
     assert_eq!(requests.lock().expect("recorded").len(), 2);
+}
+
+/// A compatible key already on the page is used even when the page's `Link`
+/// header is ambiguous: the refusal only guards a search that would continue.
+#[tokio::test]
+async fn ssh_key_discovery_uses_a_found_key_despite_an_ambiguous_link_header() {
+    use gitforgeops::secrets::discover_recipient_at;
+    let (public_key, _) = recipient_keypair();
+    let (api_base, requests) = spawn_github_stub_with_headers(vec![(
+        keys_path(),
+        200,
+        serde_json::json!([{"key": public_key}]).to_string(),
+        "Link: garbage\r\n".to_string(),
+    )]);
+    let recipient = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect("discovery")
+        .expect("the compatible key on page 1");
+    assert_eq!(recipient.login(), RECIPIENT);
+    assert_eq!(count_requests(&requests, &keys_path()), 1);
+}
+
+/// SSH key discovery reads every `Link` header: a `next` in the second one is
+/// followed (same origin and path), and an ambiguous second one is refused.
+#[tokio::test]
+async fn ssh_key_discovery_reads_every_link_header() {
+    use gitforgeops::secrets::discover_recipient_at;
+    let (public_key, _) = recipient_keypair();
+    let first_page = format!("GET /users/{RECIPIENT}/keys?per_page=100 ");
+    let second_page = format!("GET /users/{RECIPIENT}/keys?per_page=100&page=2");
+    let routes = |second_header: String| {
+        vec![
+            (
+                second_page.clone(),
+                200,
+                serde_json::json!([{"key": public_key}]).to_string(),
+                String::new(),
+            ),
+            (
+                first_page.clone(),
+                200,
+                "[{\"key\":\"unsupported-public-key\"}]".to_string(),
+                format!(
+                    "Link: <{{base}}/users/{RECIPIENT}/keys?per_page=100&page=1>; rel=\"prev\"\r\n{second_header}"
+                ),
+            ),
+        ]
+    };
+
+    let (api_base, requests) = spawn_github_stub_with_headers(routes(format!(
+        "Link: <{{base}}/users/{RECIPIENT}/keys?per_page=100&page=2>; rel=\"next\"\r\n"
+    )));
+    let recipient = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect("discovery")
+        .expect("the key on page 2");
+    assert_eq!(recipient.login(), RECIPIENT);
+    assert_eq!(count_requests(&requests, &second_page), 1);
+
+    let (api_base, requests) = spawn_github_stub_with_headers(routes(format!(
+        "Link: <{{base}}/users/{RECIPIENT}/keys?per_page=100&page=2>; rel=\"prev,next\"\r\n"
+    )));
+    let error = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect_err("an ambiguous second header is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid SSH key pagination header"),
+        "{error}"
+    );
+    assert_eq!(count_requests(&requests, &second_page), 0);
 }

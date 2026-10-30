@@ -1372,15 +1372,20 @@ applied revision.
   protected configuration. Ignored build/runtime outputs elsewhere (`target/`,
   worktrees, `.state/`, `assembled/`) are not compared.
 - **Evidence.** Label events and reviews are paginated by page number from
-  the fixed origin (permission is a single read); a short page fails closed
-  when any `Link` header may announce a next page
-  (`link_header_may_announce_next` over `next_link`: an RFC 8288 `next`
-  relation in token or quoted form, any case, among space-separated types,
-  across link-values and headers; any value that does not parse
-  unambiguously counts as one, and a malformed entry never hides a later
-  one). No `Link` URL is ever requested. SSH key discovery uses the same
-  parser and refuses an ambiguous value. The final pass re-reads the PR,
-  labeler, **permission** (must still be sufficient) and reviews.
+  the fixed origin; permission is one unpaginated read, taken again in the
+  final pass. A short page fails closed when any `Link` header may announce a
+  next page (`link_header_may_announce_next` over `next_link`: an RFC 8288
+  `next` relation in token or quoted form, any case, among space-separated
+  types, across link-values and headers). Any value that does not parse
+  unambiguously counts as one: a relation type that is neither a
+  `reg-rel-type` nor an absolute-URI `ext-rel-type` (so `rel="prev,next"`),
+  an empty or whitespace-bearing target, two different `next` targets, or a
+  malformed entry, which never hides a later one. No `Link` URL is ever
+  requested for override evidence. SSH key discovery uses the same parser
+  over every `Link` header: it follows a same-origin, same-path `next`, and
+  refuses an ambiguous value only when the page held no compatible key. The
+  final pass re-reads the PR, labeler, **permission** (must still be
+  sufficient) and reviews.
 - **Committed findings only.** api-mode apply re-evaluates policy after
   credential resolution. The override covers a blocking finding there only if
   the unresolved (committed) document's evaluation had the same rule,
@@ -1392,8 +1397,9 @@ applied revision.
   details stay scrubbed. `plan` and `review` evaluate both documents and show
   the same verdict through `github_override::preview_policy_findings`
   (unresolved findings with the whole override, plus in api mode each
-  resolution-only finding, which stays a `Policy` blocker carrying
-  `RESOLUTION_ONLY_REMEDIATION`).
+  resolution-only finding, which stays a `Policy` blocker; it carries
+  `RESOLUTION_ONLY_REMEDIATION` when an active override leaves the finding
+  blocking).
 - `GITFORGEOPS_PR_NUMBER` is parsed strictly (`github_override::parse_pr_number`:
   unset or blank is absent, otherwise ASCII digits only and positive). A
   malformed value is an error in `plan` when it evaluates an override (`review`

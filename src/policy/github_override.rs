@@ -588,9 +588,10 @@ pub async fn fetch_reviews_at(
 pub enum NextLink {
     /// The value parses unambiguously and no link-value has a `next` relation.
     Absent,
-    /// The first link-value with a `next` relation, and its target as written.
+    /// The target of the link-value(s) with a `next` relation, as written.
     Next(String),
-    /// The value is not an unambiguous RFC 8288 `#link-value` list.
+    /// The value is not an unambiguous RFC 8288 `#link-value` list, or names
+    /// two different `next` targets.
     Ambiguous,
 }
 
@@ -599,19 +600,27 @@ pub enum NextLink {
 /// whitespace around `=`; relation types are space-separated and compared
 /// case-insensitively; every comma-separated link-value is read, so a
 /// malformed entry never hides a later one (it makes the whole value
-/// [`NextLink::Ambiguous`]).
+/// [`NextLink::Ambiguous`]). Every relation type must be a valid
+/// `reg-rel-type` or `ext-rel-type`, and every target a non-empty
+/// `URI-Reference` without whitespace.
 pub fn next_link(header: &str) -> NextLink {
-    match link_values(header) {
-        None => NextLink::Ambiguous,
-        Some(values) => values
-            .into_iter()
-            .find(|(_, relations)| {
-                relations
-                    .iter()
-                    .any(|relation| relation.eq_ignore_ascii_case("next"))
-            })
-            .map_or(NextLink::Absent, |(target, _)| NextLink::Next(target)),
+    let Some(values) = link_values(header) else {
+        return NextLink::Ambiguous;
+    };
+    let mut next: Option<String> = None;
+    for (target, relations) in values {
+        if !relations
+            .iter()
+            .any(|relation| relation.eq_ignore_ascii_case("next"))
+        {
+            continue;
+        }
+        match &next {
+            Some(existing) if existing != &target => return NextLink::Ambiguous,
+            _ => next = Some(target),
+        }
     }
+    next.map_or(NextLink::Absent, NextLink::Next)
 }
 
 /// The `next` target of a `Link` header value, or `None` when it names none
@@ -641,6 +650,38 @@ fn announces_next_page(headers: &reqwest::header::HeaderMap) -> bool {
 /// carrying it fails closed. Only the relations are read: no URL is used.
 pub fn link_header_may_announce_next(header: &str) -> bool {
     !matches!(next_link(header), NextLink::Absent)
+}
+
+/// An RFC 8288 `relation-type`: a `reg-rel-type` (`LOALPHA *( LOALPHA / DIGIT
+/// / "." / "-" )`, compared case-insensitively, so either case is accepted) or
+/// an `ext-rel-type` (an absolute URI: a scheme, `:`, then RFC 3986 URI
+/// characters only). `,` and `;` are refused even inside an extension URI:
+/// they are list and parameter separators in the header, so a type holding
+/// one is treated as ambiguous rather than read either way.
+fn is_relation_type(relation: &str) -> bool {
+    let bytes = relation.as_bytes();
+    let Some((&first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    if rest
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return true;
+    }
+    let Some(colon) = bytes.iter().position(|&byte| byte == b':') else {
+        return false;
+    };
+    let scheme_ok = bytes[1..colon]
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'));
+    let uri_ok = bytes[colon + 1..]
+        .iter()
+        .all(|&byte| byte.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+=%".contains(&byte));
+    scheme_ok && uri_ok && colon + 1 < bytes.len()
 }
 
 /// Every link-value of one `Link` header value as `(target, relation types)`,
@@ -707,7 +748,13 @@ fn link_values(header: &str) -> Option<Vec<(String, Vec<String>)>> {
         if bytes[at + 1 + close] != b'>' {
             return None;
         }
-        let target = String::from_utf8(bytes[at + 1..at + 1 + close].to_vec()).ok()?;
+        // A minimal `URI-Reference` check: non-empty visible ASCII, no
+        // whitespace (`<` and `>` are already excluded).
+        let target = &bytes[at + 1..at + 1 + close];
+        if target.is_empty() || !target.iter().all(|byte| byte.is_ascii_graphic()) {
+            return None;
+        }
+        let target = String::from_utf8(target.to_vec()).ok()?;
         at += close + 2;
         let mut relations = Vec::new();
         let mut last = false;
@@ -742,12 +789,18 @@ fn link_values(header: &str) -> Option<Vec<(String, Vec<String>)>> {
             let name = name.to_ascii_lowercase();
             if name == "rel" {
                 // A `rel` without a value names no relation unambiguously.
+                // `relation-types`: relation types separated by `1*SP`, no
+                // leading or trailing space; each must be a valid type.
                 let value = value?;
-                let types: Vec<String> = value.split_ascii_whitespace().map(String::from).collect();
-                if types.is_empty() {
+                if value.is_empty() || value.starts_with(' ') || value.ends_with(' ') {
                     return None;
                 }
-                relations.extend(types);
+                for relation in value.split(' ').filter(|relation| !relation.is_empty()) {
+                    if !is_relation_type(relation) {
+                        return None;
+                    }
+                    relations.push(relation.to_string());
+                }
             } else if name == "rel*" {
                 // An extended-notation relation is not unambiguously absent.
                 return None;
