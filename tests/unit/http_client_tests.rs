@@ -904,14 +904,13 @@ async fn the_health_recheck_is_best_effort() {
 /// configured host, port or path prefix into CI or local logs.
 #[tokio::test]
 async fn transport_failures_do_not_disclose_the_gateway_url() {
-    // A freshly released ephemeral port refuses the connection immediately;
-    // the admin client is then exercised on its non-retrying error path.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
+    // A port no concurrent test is assigned refuses the connection at once; the admin
+    // client is then exercised on its non-retrying error path.
+    let addr = super::promotion_tests::refused_port();
 
     let host = addr.ip().to_string();
-    let port = addr.port().to_string();
+    // With the colon, so the check stays specific for a one-digit port.
+    let port = format!(":{}", addr.port());
     let env = stub_env(format!("http://{addr}"));
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 

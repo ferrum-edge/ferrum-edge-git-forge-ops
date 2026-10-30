@@ -1005,7 +1005,7 @@ async fn an_accepted_token_with_an_unparseable_cluster_body_still_passes() {
 
 #[tokio::test]
 async fn an_unreachable_gateway_leaves_the_token_question_unknown() {
-    let env = stub_env("http://127.0.0.1:1".to_string());
+    let env = stub_env(format!("http://{}", super::promotion_tests::refused_port()));
     let checks = doctor::gateway::run("production", &env, &[]).await;
     assert_eq!(find(&checks, "gateway-reachable").status, Status::Fail);
     // Not attempted, and said so rather than silently missing from the report.
