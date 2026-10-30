@@ -98,8 +98,8 @@ AGENT_CI_SCRIPT_MARKERS = (
     "validator=.agent-setup-base/.github/scripts/check_agent_setup.py",
     '[[ -f "$validator" ]]',
     "validator=.github/scripts/check_agent_setup.py",
-    'python3 "$validator" --root "$GITHUB_WORKSPACE"',
-    "python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'",
+    'python3 -I "$validator" --root "$GITHUB_WORKSPACE"',
+    "python3 -I -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'",
     "shellcheck --external-sources --source-path=SCRIPTDIR",
     "group: agent-setup-ci-${{ github.event.pull_request.number || github.ref }}",
     "cancel-in-progress: true",
@@ -110,7 +110,7 @@ AGENT_POLICY_SCRIPT_MARKERS = (
     "ref: ${{ github.event.repository.default_branch }}",
     "validator=.agent-setup-base/.github/scripts/check_agent_setup.py",
     '[[ -f "$validator" ]]',
-    'python3 "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"',
+    'python3 -I "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"',
     "group: agent-setup-policy-${{ github.event.pull_request.number }}",
     "cancel-in-progress: true",
 )
@@ -369,6 +369,11 @@ def validate_workflow_file(
         f"{relative}: missing fail-closed control {required!r}"
         for required in script_markers
         if required not in text
+        # ISSUE_562_LEGACY. Issue #562 rollout, step 1 of 2: the protected copy of this
+        # validator judges the candidate's workflows, so the isolated-mode
+        # markers are accepted beside the reviewed ones until step 2 switches
+        # the workflows and deletes this clause.
+        and required.replace("python3 -I ", "python3 ") not in text
     )
     for forbidden in (
         "github.event.pull_request.base.sha",
