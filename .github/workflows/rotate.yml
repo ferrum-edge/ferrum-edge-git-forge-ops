@@ -56,7 +56,7 @@ jobs:
     # Every step carries its own timeout and this job budget covers their sum,
     # so a hung step fails (and is recorded) while the ledger commit still
     # runs. A job timeout cancels the job, which skips that commit.
-    timeout-minutes: 105
+    timeout-minutes: 110
     environment: ${{ inputs.environment }}
     concurrency:
       group: ferrum-apply-${{ inputs.environment }}

@@ -4089,6 +4089,99 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
 _DIGEST_PINNED_IMAGE = re.compile(r"[^\s@${}]+@sha256:[0-9a-f]{64}")
 
 
+# Issue #562. GitHub's default job timeout is 360 minutes: a hung step holds
+# a runner, and in a deployment job the per-environment concurrency group,
+# for six hours. Every job therefore declares a literal budget. A job that
+# commits the state ledger cannot rely on that budget alone: a job timeout
+# cancels the job, and the `!cancelled()` ledger commit after a changed
+# gateway is skipped. There every step carries its own timeout and the job
+# budget covers their sum plus a margin, so a hung step fails (and is
+# recorded) before the job budget can cancel the commit.
+MAX_JOB_TIMEOUT_MINUTES = 120
+MAX_LEDGER_JOB_TIMEOUT_MINUTES = 360
+LEDGER_JOB_MARGIN_MINUTES = 5
+LEDGER_JOB_STEP = "Mint narrowly scoped state-writer token"
+_TIMEOUT_MINUTES = re.compile(r"[1-9][0-9]{0,2}")
+
+
+def _timeout_minutes(node: dict) -> int | None:
+    """A node's `timeout-minutes` when it is a literal whole number of minutes."""
+    value = node.get("timeout-minutes")
+    if isinstance(value, str) and _TIMEOUT_MINUTES.fullmatch(value):
+        return int(value)
+    return None
+
+
+def job_timeout_violations(workflow: str, document: dict) -> list[str]:
+    """Every job is bounded; a job that commits the ledger is bounded per step."""
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    for job_name, job in jobs.items() if isinstance(jobs, dict) else ():
+        if not isinstance(job, dict):
+            continue
+        label = f"{workflow}: jobs.{job_name}"
+        budget = _timeout_minutes(job)
+        steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+        ledger = any(
+            isinstance(step, dict) and step.get("name") == LEDGER_JOB_STEP for step in steps
+        )
+        ceiling = MAX_LEDGER_JOB_TIMEOUT_MINUTES if ledger else MAX_JOB_TIMEOUT_MINUTES
+        if budget is None or budget > ceiling:
+            violations.append(
+                f"{label}: every job needs a literal timeout-minutes between 1 and {ceiling}; "
+                "the 360-minute default holds a runner and the deployment lock"
+            )
+            continue
+        if not ledger:
+            continue
+        step_budgets = [
+            _timeout_minutes(step) if isinstance(step, dict) else None for step in steps
+        ]
+        unbounded = [index + 1 for index, minutes in enumerate(step_budgets) if minutes is None]
+        if unbounded:
+            violations.append(
+                f"{label}: commits the state ledger, so every step needs a literal "
+                f"timeout-minutes (steps {unbounded} have none); a job timeout cancels "
+                "the job and skips the ledger commit"
+            )
+            continue
+        total = sum(step_budgets)
+        if total + LEDGER_JOB_MARGIN_MINUTES > budget:
+            violations.append(
+                f"{label}: its step timeouts sum to {total} minutes, so the job budget "
+                f"must be at least {total + LEDGER_JOB_MARGIN_MINUTES} (step sum plus "
+                f"{LEDGER_JOB_MARGIN_MINUTES}); otherwise the job can time out before "
+                "a step does and skip the ledger commit"
+            )
+    return violations
+
+
+# Issue #562. `python3 -I` ignores `PYTHON*` variables and the user site
+# directory and keeps the working directory (often a candidate checkout) and
+# the script's directory off the import path. Every workflow interpreter
+# runs isolated; a script that needs a sibling module adds its own directory.
+_PYTHON_COMMAND = re.compile(r"(?<![\w./$-])python(?:3(?:\.\d+)?)?(?![\w.-])")
+_ISOLATED_FLAG = re.compile(r"[ \t]+-I(?=[ \t]|$)")
+
+
+def python_isolation_violations(workflow: str, document: dict) -> list[str]:
+    """Every Python interpreter a workflow `run:` starts is in isolated mode."""
+    violations: list[str] = []
+    for path, script, _job in _run_scripts(document):
+        for line in script.split("\n"):
+            if line.lstrip().startswith("#"):
+                continue
+            for match in _PYTHON_COMMAND.finditer(line):
+                if not _ISOLATED_FLAG.match(line, match.end()):
+                    violations.append(
+                        f"{workflow}: {path}: run Python as `python3 -I`, never "
+                        f"{line.strip()!r}; isolated mode keeps the working directory, "
+                        "`PYTHON*` variables and the user site off the interpreter"
+                    )
+                    break
+    return violations
+
+
 def container_options_violations(workflow: str, document: dict) -> list[str]:
     """Job and service containers are digest-pinned, take no `options:` and are not computed.
 
@@ -6168,6 +6261,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 container_options_violations(workflow.relative_to(root).as_posix(), document)
+            )
+            violations.extend(
+                job_timeout_violations(workflow.relative_to(root).as_posix(), document)
+            )
+            violations.extend(
+                python_isolation_violations(workflow.relative_to(root).as_posix(), document)
             )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(

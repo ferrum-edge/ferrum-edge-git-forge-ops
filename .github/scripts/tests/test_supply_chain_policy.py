@@ -8134,5 +8134,94 @@ class Issue562RolloutTests(unittest.TestCase):
             )
 
 
+class JobBudgetAndIsolationTests(unittest.TestCase):
+    """#562: bounded jobs, per-step ledger budgets and isolated workflow Python."""
+
+    @staticmethod
+    def _document(text: str) -> dict:
+        return check_supply_chain.parse_workflow(text)
+
+    def test_repository_workflows_are_bounded_and_isolated(self):
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            document = self._document(path.read_text(encoding="utf-8"))
+            self.assertEqual(check_supply_chain.job_timeout_violations(path.name, document), [])
+            self.assertEqual(
+                check_supply_chain.python_isolation_violations(path.name, document), []
+            )
+
+    def test_every_job_needs_a_literal_bounded_budget(self):
+        base = "on: push\njobs:\n  check:\n    runs-on: ubuntu-26.04\n{timeout}    steps:\n      - run: true\n"
+        for timeout in ("", "    timeout-minutes: 0\n", "    timeout-minutes: 121\n",
+                        "    timeout-minutes: ${{ inputs.minutes }}\n"):
+            document = self._document(base.format(timeout=timeout))
+            self.assertTrue(
+                check_supply_chain.job_timeout_violations("x.yml", document), timeout
+            )
+        document = self._document(base.format(timeout="    timeout-minutes: 30\n"))
+        self.assertEqual(check_supply_chain.job_timeout_violations("x.yml", document), [])
+
+    def test_a_ledger_job_bounds_every_step_inside_its_budget(self):
+        def workflow(job_minutes, mint_minutes, apply_minutes):
+            apply_timeout = (
+                f"        timeout-minutes: {apply_minutes}\n" if apply_minutes else ""
+            )
+            return (
+                "on: push\njobs:\n  apply:\n    runs-on: ubuntu-26.04\n"
+                f"    timeout-minutes: {job_minutes}\n    steps:\n"
+                f"      - name: Apply\n{apply_timeout}        run: true\n"
+                f"      - name: {check_supply_chain.LEDGER_JOB_STEP}\n"
+                f"        timeout-minutes: {mint_minutes}\n        run: true\n"
+            )
+
+        ok = self._document(workflow(200, 5, 60))
+        self.assertEqual(check_supply_chain.job_timeout_violations("x.yml", ok), [])
+        unbounded = self._document(workflow(200, 5, None))
+        self.assertTrue(
+            any("every step needs" in item
+                for item in check_supply_chain.job_timeout_violations("x.yml", unbounded))
+        )
+        # 60 + 5 steps leave no margin inside a 68-minute job.
+        tight = self._document(workflow(68, 5, 60))
+        self.assertTrue(
+            any("must be at least 70" in item
+                for item in check_supply_chain.job_timeout_violations("x.yml", tight))
+        )
+        # A ledger job may exceed the ordinary ceiling, never GitHub's own.
+        long = self._document(workflow(361, 5, 60))
+        self.assertTrue(check_supply_chain.job_timeout_violations("x.yml", long))
+
+    def test_every_workflow_interpreter_runs_isolated(self):
+        def workflow(script):
+            return (
+                "on: push\njobs:\n  check:\n    runs-on: ubuntu-26.04\n"
+                "    timeout-minutes: 5\n    steps:\n      - run: |\n"
+                + "".join(f"          {line}\n" for line in script)
+            )
+
+        for script in (
+            ["python3 .github/scripts/x.py"],
+            ['result=$(python3 "$helper")'],
+            ["python -m unittest"],
+            ["python3.12 -B x.py"],
+            ["python3 - <<'PY'", "print(1)", "PY"],
+            ["true && python3 -c 'pass'"],
+        ):
+            document = self._document(workflow(script))
+            self.assertTrue(
+                check_supply_chain.python_isolation_violations("x.yml", document), script
+            )
+        for script in (
+            ["python3 -I .github/scripts/x.py"],
+            ['result=$(python3 -I "$helper" a b)'],
+            ["python3 -I -m unittest discover -s tests"],
+            ["# a plain `python3 -` would put the workspace first"],
+            ["echo done"],
+        ):
+            document = self._document(workflow(script))
+            self.assertEqual(
+                check_supply_chain.python_isolation_violations("x.yml", document), [], script
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
