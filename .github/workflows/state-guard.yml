@@ -86,6 +86,7 @@ permissions:
 jobs:
   state-guard-reject-state-edits:
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       # The only checkout in this workflow, and it names the protected default
       # branch explicitly. Never add a checkout of `github.event.pull_request.head.*`
@@ -153,7 +154,7 @@ jobs:
           }
           helper=trusted-guard/.github/scripts/changed_files.py
           if [ -f "$helper" ]; then
-            result=$(python3 "$helper" "$pages_file" "$current_changed" state)
+            result=$(python3 -I "$helper" "$pages_file" "$current_changed" state)
           else
             # One-time bootstrap for the PR that first adds the helper: its
             # base commit cannot contain the new file yet. Keep this equivalent

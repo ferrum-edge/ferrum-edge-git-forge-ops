@@ -15,6 +15,7 @@ permissions:
 jobs:
   preflight:
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - name: Require protected default branch
         env:
@@ -29,6 +30,7 @@ jobs:
   list-envs:
     needs: preflight
     runs-on: ubuntu-26.04
+    timeout-minutes: 30
     outputs:
       scopes: ${{ steps.list.outputs.scopes }}
     steps:
@@ -91,6 +93,7 @@ jobs:
       needs.list-envs.outputs.scopes != '[]'
       && needs.list-envs.outputs.scopes != ''
     runs-on: ubuntu-26.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -220,7 +223,7 @@ jobs:
           else
             args+=(--exit-code "$EXIT_CODE")
           fi
-          python3 .github/scripts/drift_report.py "${args[@]}"
+          python3 -I .github/scripts/drift_report.py "${args[@]}"
 
       - name: Publish outcome
         if: ${{ !cancelled() }}
@@ -240,6 +243,7 @@ jobs:
     needs: [list-envs, drift]
     if: ${{ !cancelled() && needs.list-envs.result == 'success' }}
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -272,11 +276,11 @@ jobs:
               --detail "the drift job produced no outcome for this environment"
               --output "drift-outcomes/${environment}.json")
             [ "$unattended" = "true" ] && args+=(--unattended)
-            python3 .github/scripts/drift_report.py "${args[@]}"
+            python3 -I .github/scripts/drift_report.py "${args[@]}"
           done < <(jq -r '.[] | [.environment, .monitoring_environment, (.unattended_monitoring|tostring)] | @tsv' <<< "$SCOPES")
 
       - name: Summarize monitoring coverage
         run: |
-          python3 .github/scripts/drift_report.py summarize \
+          python3 -I .github/scripts/drift_report.py summarize \
             --input drift-outcomes \
             --summary "$GITHUB_STEP_SUMMARY"

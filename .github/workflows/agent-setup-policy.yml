@@ -24,6 +24,7 @@ concurrency:
 jobs:
   validate-trusted-policy:
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - name: Check out candidate as validation data
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -48,4 +49,4 @@ jobs:
             echo "Trusted default-branch validator is unavailable; refusing candidate bootstrap." >&2
             exit 1
           }
-          python3 "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"
+          python3 -I "$validator" --root "$GITHUB_WORKSPACE/.agent-setup-candidate"

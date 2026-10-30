@@ -110,7 +110,7 @@ def check(root: Path) -> list[str]:
 
     if "- 'release/**'" not in workflow:
         issues.append("record-only finalization must not trigger another image publication")
-    if workflow.count("python3 .github/scripts/check_release_baseline.py") != 2:
+    if workflow.count("python3 -I .github/scripts/check_release_baseline.py") != 2:
         issues.append("both release jobs must check the baseline")
     exact_gateway_arg = (
         "gateway_args=(--gateway \"$(jq -er '.tested_gateway.binary_sha256' "

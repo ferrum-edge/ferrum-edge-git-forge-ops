@@ -21,6 +21,7 @@ concurrency:
 jobs:
   validator-pin-canary:
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     permissions:
       contents: read
       issues: write

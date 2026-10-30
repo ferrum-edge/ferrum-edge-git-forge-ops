@@ -24,6 +24,7 @@ concurrency:
 jobs:
   base-image-pin-canary:
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     permissions:
       contents: read
       issues: write
@@ -51,7 +52,7 @@ jobs:
         id: base
         run: |
           set -euo pipefail
-          ref=$(python3 .github/scripts/check_base_image_pin.py --print-base-ref)
+          ref=$(python3 -I .github/scripts/check_base_image_pin.py --print-base-ref)
           printf 'ref=%s\n' "$ref" >>"$GITHUB_OUTPUT"
           echo "::notice::Scanning the moving tag $ref."
 
@@ -71,7 +72,7 @@ jobs:
         id: evaluate
         run: |
           set -uo pipefail
-          python3 .github/scripts/check_base_image_pin.py \
+          python3 -I .github/scripts/check_base_image_pin.py \
             --trivy-report base-image-scan.json \
             --report-file base-image-pin-report.md
           status=$?

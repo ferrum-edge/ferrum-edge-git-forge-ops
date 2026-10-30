@@ -441,7 +441,9 @@ const STEP_TIMEOUT: &str = "        timeout-minutes: ";
 fn both_verify_steps_carry_a_step_timeout_that_covers_the_budget() {
     // A backstop for the in-process deadline. It must be a STEP timeout: a job
     // timeout cancels the job, and the `!cancelled()` ledger commit after a
-    // live mutation is then skipped.
+    // live mutation is then skipped. The job budgets that do exist (#562)
+    // cover every step's timeout plus a margin, so a step always times out
+    // first; `ledger_job_budgets_cover_every_step` pins that.
     let workflow = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/apply-on-merge.yml"),
     )
@@ -465,11 +467,64 @@ fn both_verify_steps_carry_a_step_timeout_that_covers_the_budget() {
         assert!(minutes * 60 > needed, "{minutes} minutes");
         assert!(step.contains("continue-on-error: true"), "{step}");
     }
-    for line in workflow.lines() {
-        assert!(
-            !line.starts_with("    timeout-minutes:"),
-            "a job-level timeout would skip the ledger commit: {line}"
-        );
+}
+
+/// Minutes a job may spend outside its steps (runner setup, post-steps)
+/// before its budget could cancel the ledger commit. Mirrors
+/// `LEDGER_JOB_MARGIN_MINUTES` in `.github/scripts/check_supply_chain.py`.
+const LEDGER_JOB_MARGIN_MINUTES: u64 = 15;
+
+#[test]
+fn ledger_job_budgets_cover_every_step() {
+    // A job timeout cancels the job and skips the `!cancelled()` ledger
+    // commit, so in each job that commits the ledger every step carries its
+    // own timeout and the job budget exceeds their sum: a hung step fails and
+    // is recorded, and the commit still runs.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    for (file, jobs) in [
+        ("apply-on-merge.yml", &["apply", "promote"][..]),
+        ("rotate.yml", &["rotate"][..]),
+    ] {
+        let workflow = std::fs::read_to_string(root.join(file)).expect("read workflow");
+        for job in jobs {
+            let header = format!("\n  {job}:\n");
+            let start = workflow.find(&header).expect("job header") + header.len();
+            let rest = &workflow[start..];
+            let end = rest
+                .match_indices("\n  ")
+                .find(|(index, _)| {
+                    rest[index + 3..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c != ' ' && c != '#')
+                })
+                .map_or(rest.len(), |(index, _)| index);
+            let body = &rest[..end];
+            let budget: u64 = body
+                .lines()
+                .find_map(|line| line.strip_prefix("    timeout-minutes: "))
+                .expect("a job-level timeout-minutes")
+                .trim()
+                .parse()
+                .expect("whole minutes");
+            let steps: Vec<&str> = body.split("\n      - ").skip(1).collect();
+            assert!(!steps.is_empty(), "{file} {job}");
+            let mut total = 0;
+            for step in &steps {
+                let minutes: u64 = step
+                    .lines()
+                    .find_map(|line| line.strip_prefix(STEP_TIMEOUT))
+                    .unwrap_or_else(|| panic!("{file} {job}: step without a timeout: {step}"))
+                    .trim()
+                    .parse()
+                    .expect("whole minutes");
+                total += minutes;
+            }
+            assert!(
+                total + LEDGER_JOB_MARGIN_MINUTES <= budget,
+                "{file} {job}: steps sum to {total}, job budget {budget}"
+            );
+        }
     }
 }
 

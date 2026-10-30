@@ -369,11 +369,6 @@ def validate_workflow_file(
         f"{relative}: missing fail-closed control {required!r}"
         for required in script_markers
         if required not in text
-        # ISSUE_562_LEGACY. Issue #562 rollout, step 1 of 2: the protected copy of this
-        # validator judges the candidate's workflows, so the isolated-mode
-        # markers are accepted beside the reviewed ones until step 2 switches
-        # the workflows and deletes this clause.
-        and required.replace("python3 -I ", "python3 ") not in text
     )
     for forbidden in (
         "github.event.pull_request.base.sha",

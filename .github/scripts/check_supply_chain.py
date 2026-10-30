@@ -19,7 +19,7 @@ import re
 import stat
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1432,25 +1432,33 @@ def monitoring_workflow_violations(text: str) -> list[str]:
     return violations
 
 
-# The candidate's own classifier, however the interpreter is spelled or the
-# path quoted (`python3.12`, `-X utf8`, `--`, `"$GITHUB_WORKSPACE/..."`): any
-# `.github/scripts/changed_files.py` not under a protected checkout. A text
-# rule only; the pinned jobs are what bind execution.
-_CANDIDATE_CLASSIFIER = re.compile(
-    r"(?<![\w.-])(?<!trusted-scope/)(?<!trusted-guard/)(?<!trusted/)"
-    r"(?:\./)*\.github/scripts/changed_files\.py"
+# The candidate's own classifier, however the interpreter is spelled
+# (`python3.12`, `-X utf8`, `--`): any whole path token ending in
+# `.github/scripts/changed_files.py` whose directory prefix is not exactly a
+# protected checkout. `"$GITHUB_WORKSPACE/..."`, `././...` and
+# `foo/trusted/...` are all the candidate's. A text rule only (a path quoted
+# mid-way is not seen); the pinned jobs are what bind execution.
+_CLASSIFIER_PATH = re.compile(
+    r"(?:(?<=^)|(?<=[\s\"'=();|&<>`]))(?P<prefix>[^\s\"'=();|&<>`]*?)"
+    r"\.github/scripts/changed_files\.py",
+    re.MULTILINE,
 )
+TRUSTED_CLASSIFIER_PREFIXES = frozenset({"trusted-scope/", "trusted-guard/", "trusted/"})
+
+
+def invokes_candidate_classifier(text: str) -> bool:
+    """Whether `text` names a `changed_files.py` outside a protected checkout."""
+    return any(
+        match.group("prefix") not in TRUSTED_CLASSIFIER_PREFIXES
+        for match in _CLASSIFIER_PATH.finditer(text)
+    )
 
 
 def trusted_classifier_violations(
     workflow: str, text: str, trusted_invocation: str, expected_count: int
 ) -> list[str]:
     violations: list[str] = []
-    found = text.count(trusted_invocation)
-    legacy_invocation = trusted_invocation.replace("python3 -I ", "python3 ")
-    if legacy_invocation != trusted_invocation:  # ISSUE_562_LEGACY
-        found += text.count(legacy_invocation)
-    if found != expected_count:
+    if text.count(trusted_invocation) != expected_count:
         violations.append(
             f"{workflow}: path scope must run exactly {expected_count} default-branch trusted classifier invocation(s)"
         )
@@ -1462,7 +1470,7 @@ def trusted_classifier_violations(
         violations.append(
             f"{workflow}: unprotected PR base SHA must not supply trusted classifier code"
         )
-    if _CANDIDATE_CLASSIFIER.search(text):
+    if invokes_candidate_classifier(text):
         violations.append(
             f"{workflow}: path scope must not invoke the candidate-branch classifier"
         )
@@ -1608,8 +1616,7 @@ STATE_GUARD_HELPER_INVOCATION = 'result=$(python3 -I "$helper"'
 
 def state_guard_helper_violations(text: str) -> list[str]:
     """The state guard runs the classifier through its trusted helper variable."""
-    legacy = STATE_GUARD_HELPER_INVOCATION.replace("python3 -I ", "python3 ")  # ISSUE_562_LEGACY
-    if STATE_GUARD_HELPER_INVOCATION in text or legacy in text:
+    if STATE_GUARD_HELPER_INVOCATION in text:
         return []
     return ["state-guard.yml: classifier execution must use the trusted helper variable"]
 
@@ -1929,24 +1936,6 @@ def _workflow_level_gate_violations(label: str, text: str) -> list[str]:
             "their scripts); keep shell and working-directory explicit"
         )
     return violations
-
-
-# Issue #562 rollout, step 1 of 2. The checker on the protected branch judges
-# every pull request's workflows, so a pinned line cannot change in the same
-# pull request as its pin. This step pins the new forms (a job
-# `timeout-minutes`, `python3 -I`) and also accepts the reviewed forms they
-# replace; step 2 switches the workflows and deletes everything marked
-# `ISSUE_562_LEGACY`. The legacy forms are derived, never listed, so they can
-# only differ from the new pins by exactly those two changes.
-_ISSUE_562_LEGACY_JOB_TIMEOUT = re.compile(r" {4}timeout-minutes: \d+")
-
-
-def _issue_562_legacy_lines(lines, *, drop_job_timeout: bool = True) -> list[str]:
-    """ISSUE_562_LEGACY: pinned lines as reviewed before #562."""
-    legacy = [line.replace("python3 -I ", "python3 ") for line in lines]
-    if drop_job_timeout:
-        legacy = [line for line in legacy if not _ISSUE_562_LEGACY_JOB_TIMEOUT.fullmatch(line)]
-    return legacy
 
 
 VALIDATE_PR_JOBS = [
@@ -2311,17 +2300,11 @@ RUST_CI_CHECK_JOB = [
     "            }",
     "          done",
 ]
-# ISSUE_562_LEGACY: `validator-pairing` already carried its job timeout.
-_ISSUE_562_LEGACY_VALIDATE_PR_JOBS = [
-    (name, _issue_562_legacy_lines(lines, drop_job_timeout=name != "validator-pairing"))
-    for name, lines in VALIDATE_PR_JOBS
-]
-_ISSUE_562_LEGACY_RUST_CI_CHECK_JOB = _issue_562_legacy_lines(RUST_CI_CHECK_JOB)
 # The coverage floor sits below the line coverage measured on `main` when the
 # gate was introduced (88.17% at 671fd4f). Lowering it is a policy change made
 # here, in review, never in the workflow alone.
 COVERAGE_LINE_FLOOR = 87
-_COVERAGE_FLOOR = re.compile(r"--fail-under-lines (\d+)$")
+_COVERAGE_FLOOR = re.compile(r"--fail-under-lines (\d{1,3})$")
 COVERAGE_FLOOR_PLACEHOLDER = "--fail-under-lines <floor>"
 # The whole `coverage` job, pinned like `rust-ci-check`: text matches inside a
 # step accept a decoy (`env: {run: ...}` beside the real `run:`, a heredoc
@@ -2434,107 +2417,6 @@ COVERAGE_JOB = [
     "          name: lcov",
     "          path: lcov.info",
 ]
-# ISSUE_562_LEGACY: the coverage job as reviewed before #562 (no budget, no
-# floor, plain `python3`, `~/.cargo/bin` cached, no installer checksum).
-_ISSUE_562_LEGACY_COVERAGE_JOB = [
-    "    runs-on: ubuntu-26.04",
-    "    permissions:",
-    "      contents: read",
-    "      pull-requests: read",
-    "    steps:",
-    "      - uses: actions/checkout@<sha> # v7",
-    "        with:",
-    "          persist-credentials: false",
-    "      - name: Check out trusted path classifier",
-    "        if: github.event_name == 'pull_request'",
-    "        uses: actions/checkout@<sha> # v7",
-    "        with:",
-    "          ref: ${{ github.event.repository.default_branch }}",
-    "          path: trusted-scope",
-    "          persist-credentials: false",
-    "      - name: Detect Rust-impacting PR paths",
-    "        if: github.event_name == 'pull_request'",
-    "        id: scope",
-    "        env:",
-    "          GH_TOKEN: ${{ github.token }}",
-    "          REPO: ${{ github.repository }}",
-    "          PR_NUMBER: ${{ github.event.pull_request.number }}",
-    "          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
-    "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
-    "        run: |",
-    "          set -euo pipefail",
-    "          pages_file=$(mktemp)",
-    "          trap 'rm -f \"$pages_file\"' EXIT",
-    "          stable=false",
-    "          for attempt in 1 2 3; do",
-    "            before=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
-    "            before_head=$(jq -r '.head.sha' <<< \"$before\")",
-    "            before_base=$(jq -r '.base.sha' <<< \"$before\")",
-    "            before_ref=$(jq -r '.base.ref' <<< \"$before\")",
-    "            before_count=$(jq -r '.changed_files' <<< \"$before\")",
-    "            [[ \"$before_head\" =~ ^[0-9a-f]{40}$ && \"$before_base\" =~ ^[0-9a-f]{40}$ && \"$before_count\" =~ ^[0-9]+$ ]] || exit 1",
-    "            [ \"$before_head\" = \"$EXPECTED_HEAD_SHA\" ] && [ \"$before_ref\" = \"$DEFAULT_BRANCH\" ] || exit 1",
-    "            gh api \"repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100\" --paginate --slurp > \"$pages_file\"",
-    "            after=$(gh api \"repos/${REPO}/pulls/${PR_NUMBER}\")",
-    "            after_head=$(jq -r '.head.sha' <<< \"$after\")",
-    "            after_base=$(jq -r '.base.sha' <<< \"$after\")",
-    "            after_ref=$(jq -r '.base.ref' <<< \"$after\")",
-    "            after_count=$(jq -r '.changed_files' <<< \"$after\")",
-    "            if [ \"$before_head\" = \"$after_head\" ] && [ \"$before_base\" = \"$after_base\" ] && \\",
-    "               [ \"$before_ref\" = \"$after_ref\" ] && [ \"$before_count\" = \"$after_count\" ]; then",
-    "              current_changed=$after_count",
-    "              stable=true",
-    "              break",
-    "            fi",
-    "            echo \"::warning::PR file metadata changed during attempt ${attempt}; retrying.\"",
-    "          done",
-    "          [ \"$stable\" = true ] || exit 1",
-    "          helper=trusted-scope/.github/scripts/changed_files.py",
-    "          if [ -f \"$helper\" ]; then",
-    "            result=$(python3 trusted-scope/.github/scripts/changed_files.py \\",
-    "              \"$pages_file\" \"$current_changed\" rust)",
-    "          else",
-    "            # Bootstrap the trusted helper by running the complete coverage",
-    "            # gate. The PR-controlled helper is deliberately never executed.",
-    "            echo \"::warning::Trusted path classifier is not present on the PR base; running coverage fail-safe.\"",
-    "            result='{\"complete\":false,\"matches\":true}'",
-    "          fi",
-    "          rust=$(jq -r '.matches' <<< \"$result\")",
-    "          if [ \"$(jq -r '.complete' <<< \"$result\")\" != true ]; then rust=true; fi",
-    "          echo \"rust=$rust\" >> \"$GITHUB_OUTPUT\"",
-    "      - name: Install Rust toolchain",
-    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
-    "        uses: dtolnay/rust-toolchain@<sha> # pinned action; Rust <rust toolchain>",
-    "        with:",
-    "          toolchain: <rust toolchain>",
-    "          components: llvm-tools-preview",
-    "      - name: Cache cargo registry + target",
-    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
-    "        uses: actions/cache@<sha> # v6",
-    "        with:",
-    "          path: |",
-    "            ~/.cargo/registry",
-    "            ~/.cargo/git",
-    "            ~/.cargo/bin",
-    "            target",
-    "          key: ${{ runner.os }}-rust-coverage-${{ hashFiles('**/Cargo.lock') }}",
-    "          restore-keys: |",
-    "            ${{ runner.os }}-rust-coverage-",
-    "      - name: Install cargo-llvm-cov",
-    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
-    "        uses: taiki-e/install-action@<sha> # v2.87.30",
-    "        with:",
-    "          tool: cargo-llvm-cov@0.9.0",
-    "      - name: cargo llvm-cov",
-    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
-    "        run: cargo llvm-cov --lib --test unit_tests --lcov --output-path lcov.info",
-    "      - name: Upload coverage artifact",
-    "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
-    "        uses: actions/upload-artifact@<sha> # v7",
-    "        with:",
-    "          name: lcov",
-    "          path: lcov.info",
-]
 
 def required_static_validation_violations(text: str) -> list[str]:
     """The required static-validation context must keep its exact verdict job.
@@ -2553,7 +2435,7 @@ def required_static_validation_violations(text: str) -> list[str]:
     jobs = [
         (name, _verbatim_job_lines(body)) for name, body in workflow_jobs(text)
     ]
-    if jobs not in (VALIDATE_PR_JOBS, _ISSUE_562_LEGACY_VALIDATE_PR_JOBS):
+    if jobs != VALIDATE_PR_JOBS:
         violations.append(
             "validate-pr.yml: every job the required "
             "gitforgeops-required-static-validation context depends on — "
@@ -2578,7 +2460,7 @@ def rust_ci_test_scope_violations(text: str) -> list[str]:
     """
     violations = _workflow_level_gate_violations("rust-ci.yml", text)
     job = workflow_job(text, "rust-ci-check")
-    if _verbatim_job_lines(job) not in (RUST_CI_CHECK_JOB, _ISSUE_562_LEGACY_RUST_CI_CHECK_JOB):
+    if _verbatim_job_lines(job) != RUST_CI_CHECK_JOB:
         violations.append(
             "rust-ci.yml: rust-ci-check must keep its reviewed header, step "
             "order, conditions and scripts exactly; a green required context "
@@ -2596,7 +2478,7 @@ def rust_ci_test_scope_violations(text: str) -> list[str]:
     coverage = _verbatim_job_lines(workflow_job(text, "coverage"))
     floors = [int(match.group(1)) for line in coverage if (match := _COVERAGE_FLOOR.search(line))]
     pinned = [_COVERAGE_FLOOR.sub(COVERAGE_FLOOR_PLACEHOLDER, line) for line in coverage]
-    if pinned not in (COVERAGE_JOB, _ISSUE_562_LEGACY_COVERAGE_JOB):
+    if pinned != COVERAGE_JOB:
         violations.append(
             "rust-ci.yml: coverage must keep its reviewed header, step order, conditions "
             "and scripts exactly: classify with the trusted helper, then measure the "
@@ -3959,10 +3841,7 @@ def _credential_handoff_refusal(workflow: str, document: dict, job: dict, step: 
     for scope in _env_scopes(document) + _env_scopes(job):
         if not isinstance(scope, dict) or drivers.intersection(key.casefold() for key in scope):
             return "workflow and job env may not bind " + ", ".join(CREDENTIAL_HANDOFF_DRIVERS)
-    if not isinstance(step.get("run"), str) or not any(
-        pinned_run_matches(step["run"], candidate)
-        for candidate in (shape, tuple(_issue_562_legacy_lines(shape)))  # ISSUE_562_LEGACY
-    ):
+    if not isinstance(step.get("run"), str) or not pinned_run_matches(step["run"], shape):
         return "the hand-off script must match its pinned shape"
     return None
 
@@ -4087,6 +3966,249 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
 # A container image's own `ENV` (LD_PRELOAD, BASH_ENV, ...) applies to every
 # step of its job, as `options:` would, so the image is pinned like an action.
 _DIGEST_PINNED_IMAGE = re.compile(r"[^\s@${}]+@sha256:[0-9a-f]{64}")
+
+
+# Issue #562. GitHub's default job timeout is 360 minutes: a hung step holds
+# a runner, and in a deployment job the per-environment concurrency group,
+# for six hours. Every job therefore declares a literal budget. A job that
+# commits the state ledger cannot rely on that budget alone: a job timeout
+# cancels the job, and the `!cancelled()` ledger commit after a changed
+# gateway is skipped. There every step carries its own timeout and the job
+# budget covers their sum plus a margin, so a hung step fails (and is
+# recorded) before the job budget can cancel the commit.
+MAX_JOB_TIMEOUT_MINUTES = 120
+MAX_LEDGER_JOB_TIMEOUT_MINUTES = 360
+LEDGER_JOB_MARGIN_MINUTES = 15
+# Ledger jobs are known by id and by what they hold, never by a step's display
+# name alone: renaming the mint step must not drop the per-step budgets.
+LEDGER_JOBS = {
+    "apply-on-merge.yml": ("apply", "promote"),
+    "rotate.yml": ("rotate",),
+}
+LEDGER_JOB_STEP = "Mint narrowly scoped state-writer token"
+LEDGER_JOB_SECRET = "GITFORGEOPS_STATE_APP_PRIVATE_KEY"
+LEDGER_JOB_ACTION = "actions/create-github-app-token@"
+_TIMEOUT_MINUTES = re.compile(r"[1-9][0-9]{0,2}")
+
+
+def _timeout_minutes(node: dict) -> int | None:
+    """A node's `timeout-minutes` when it is a literal whole number of minutes."""
+    value = node.get("timeout-minutes")
+    if isinstance(value, str) and _TIMEOUT_MINUTES.fullmatch(value):
+        return int(value)
+    return None
+
+
+def job_timeout_violations(workflow: str, document: dict) -> list[str]:
+    """Every job is bounded; a job that commits the ledger is bounded per step."""
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    jobs = jobs if isinstance(jobs, dict) else {}
+    named = LEDGER_JOBS.get(PurePosixPath(workflow).name, ())
+    violations.extend(
+        f"{workflow}: jobs.{job_name}: the ledger-committing job is missing or calls a "
+        "reusable workflow; either would drop its per-step budgets"
+        for job_name in named
+        if not isinstance(jobs.get(job_name), dict) or "uses" in jobs[job_name]
+    )
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if "uses" in job:
+            # A reusable-workflow call job has no runner of its own and GitHub
+            # refuses `timeout-minutes` on it; the called workflow's jobs carry
+            # the budgets.
+            continue
+        label = f"{workflow}: jobs.{job_name}"
+        budget = _timeout_minutes(job)
+        steps = job.get("steps") if isinstance(job.get("steps"), list) else []
+        ledger = (
+            job_name in named
+            or LEDGER_JOB_SECRET in json.dumps(job)
+            or "app_private_key" in json.dumps(job).casefold()
+            or any(
+                isinstance(step, dict)
+                and isinstance(step.get("uses"), str)
+                and step["uses"].startswith(LEDGER_JOB_ACTION)
+                for step in steps
+            )
+            or any(
+                isinstance(step, dict) and step.get("name") == LEDGER_JOB_STEP for step in steps
+            )
+        )
+        ceiling = MAX_LEDGER_JOB_TIMEOUT_MINUTES if ledger else MAX_JOB_TIMEOUT_MINUTES
+        if budget is None or budget > ceiling:
+            violations.append(
+                f"{label}: every job needs a literal timeout-minutes between 1 and {ceiling}; "
+                "the 360-minute default holds a runner and the deployment lock"
+            )
+            continue
+        if not ledger:
+            continue
+        step_budgets = [
+            _timeout_minutes(step) if isinstance(step, dict) else None for step in steps
+        ]
+        unbounded = [index + 1 for index, minutes in enumerate(step_budgets) if minutes is None]
+        if unbounded:
+            violations.append(
+                f"{label}: commits the state ledger, so every step needs a literal "
+                f"timeout-minutes (steps {unbounded} have none); a job timeout cancels "
+                "the job and skips the ledger commit"
+            )
+            continue
+        total = sum(step_budgets)
+        if total + LEDGER_JOB_MARGIN_MINUTES > budget:
+            violations.append(
+                f"{label}: its step timeouts sum to {total} minutes, so the job budget "
+                f"must be at least {total + LEDGER_JOB_MARGIN_MINUTES} (step sum plus "
+                f"{LEDGER_JOB_MARGIN_MINUTES}); otherwise the job can time out before "
+                "a step does and skip the ledger commit"
+            )
+    return violations
+
+
+# Issue #562. `python3 -I` ignores `PYTHON*` variables and the user site
+# directory and keeps the working directory (often a candidate checkout) and
+# the script's directory off the import path. Every workflow interpreter
+# runs isolated; a script that needs a sibling module adds its own directory.
+_PYTHON_COMMAND = re.compile(
+    r"(?<![\w.$-])(?:pypy|python)(?:3(?:\.\d+)?)?(?![\w.-])"
+)
+_OPTION_TOKEN = re.compile(r"[ \t]+(\S+)")
+_SHELL_BOUNDARY = re.compile(r"[;&|<>()`$]")
+# Every heredoc opener on a command line, quoted or not (`<<<` is a
+# here-string, not an opener).
+_HEREDOC_OPENER = re.compile(
+    r"(?<!<)<<(?P<dash>-?)[ \t]*(?P<quote>['\"]?)(?P<tag>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+)
+# Short options that take the next token as their argument (`-X dev`,
+# `-W error`), and ones that end option parsing (`-c CODE`, `-m MODULE`).
+_ARGUMENT_OPTIONS = frozenset("XW")
+_FINAL_OPTIONS = frozenset("cm")
+# `python3 -I - <<'TAG'` with the interpreter as the line's command and a
+# quoted delimiter: the body is literal Python source for an isolated
+# interpreter, so a word like `python` in it starts nothing. An unquoted
+# delimiter is still shell (`$(...)` runs), so its body is scanned.
+_ISOLATED_HEREDOC = re.compile(
+    r"^[ \t]*(?:\S*/)?python(?:3(?:\.\d+)?)?(?:[ \t]+-[A-Za-z]+)*(?:[ \t]+-(?:[ \t]+[^<\s]+)*)?"
+    r"[ \t]*(?P<opener><<-?[ \t]*(?P<quote>['\"])(?P<tag>[A-Za-z_][A-Za-z0-9_]*)(?P=quote))[ \t]*$"
+)
+
+
+def _isolated_from(text: str, position: int) -> bool:
+    """Whether the interpreter named just before `position` gets `-I`.
+
+    Reads its short options in order, as CPython does: `-I` alone or in a
+    cluster (`-Is`) counts until an option that takes an argument consumes
+    the next token (`-X -I` is `-X` with argument `-I`) or `-c`/`-m`/an
+    operand ends option parsing.
+    """
+    expecting_argument = False
+    # Only the interpreter's own contiguous arguments: no whitespace (a
+    # redirection or `;` right after the name) or a shell operator ends them,
+    # so `python3<<<x;echo -I` does not borrow `echo`'s `-I`.
+    while (token := _OPTION_TOKEN.match(text, position)) is not None:
+        word = token.group(1)
+        if _SHELL_BOUNDARY.search(word):
+            return False
+        position = token.end()
+        if expecting_argument:
+            expecting_argument = False
+            continue
+        if not word.startswith("-") or word == "-" or word.startswith("--"):
+            return False
+        for index, letter in enumerate(word[1:]):
+            if letter == "I":
+                return True
+            if letter in _FINAL_OPTIONS:
+                return False
+            if letter in _ARGUMENT_OPTIONS:
+                expecting_argument = index == len(word) - 2
+                break
+    return False
+
+
+def _shell_values(node, path: str = ""):
+    """Every `shell:` value under `node`, including `defaults.run.shell`."""
+    if isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _shell_values(item, f"{path}[{index}]")
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            if isinstance(key, str) and key.casefold() == "shell":
+                yield child, value
+            else:
+                yield from _shell_values(value, child)
+
+
+def python_isolation_violations(workflow: str, document: dict) -> list[str]:
+    """Every Python interpreter a workflow or local action `run:` starts is isolated.
+
+    A consistency rule over literal text, like the other workflow text rules
+    (#476), not a sandbox: an interpreter named through a variable (`"$PY"`)
+    or built at run time is not seen, and review of every workflow change
+    covers that. Absolute paths (`/usr/bin/python3`) and every interpreter in
+    a `shell:` value count. A mention in quoted shell text
+    (`echo "install python3"`) is refused too: telling a command from text is
+    a shell parse this reader does not attempt, and refusing is the safe side.
+    """
+    violations: list[str] = []
+    for path, shell in _shell_values(document):
+        if not isinstance(shell, str):
+            continue
+        if any(
+            not _isolated_from(shell, match.end()) for match in _PYTHON_COMMAND.finditer(shell)
+        ):
+            violations.append(
+                f"{workflow}: {path}: a Python `shell:` runs the step body unisolated; "
+                "use `python3 -I {0}` or a `run:` that invokes `python3 -I`"
+            )
+    for path, script, _job in _run_scripts(document):
+        lines = script.split("\n")
+        # Heredocs opened on a command line and not yet closed, in order:
+        # (delimiter, strips leading tabs, body is skipped as isolated Python).
+        pending: list[tuple[str, bool, bool]] = []
+        for number, line in enumerate(lines):
+            if pending:
+                tag, strip_tabs, skipped = pending[0]
+                if (line.lstrip("\t") if strip_tabs else line) == tag:
+                    pending.pop(0)
+                    continue
+                if skipped:
+                    continue
+                # A body line is text, never a command line: no comment rule
+                # (an unquoted body expands `$(...)` even after `#`) and no
+                # new heredoc openers. Quoted bodies are scanned too: a
+                # `bash <<'SH'` body runs.
+            elif line.lstrip().startswith("#"):
+                continue
+            for match in _PYTHON_COMMAND.finditer(line):
+                if not _isolated_from(line, match.end()):
+                    violations.append(
+                        f"{workflow}: {path}: run Python as `python3 -I`, never "
+                        f"{line.strip()!r}; isolated mode keeps the working directory, "
+                        "`PYTHON*` variables and the user site off the interpreter"
+                    )
+                    break
+            if pending:
+                continue
+            isolated = _ISOLATED_HEREDOC.match(line)
+            for opener in _HEREDOC_OPENER.finditer(line):
+                tag, strip_tabs = opener.group("tag"), bool(opener.group("dash"))
+                skipped = (
+                    isolated is not None
+                    and len(pending) == 0
+                    and opener.start() == isolated.start("opener")
+                    and _isolated_from(line, _PYTHON_COMMAND.search(line).end())
+                    # An opener whose delimiter never closes skips nothing.
+                    and any(
+                        (later.lstrip("\t") if strip_tabs else later) == tag
+                        for later in lines[number + 1:]
+                    )
+                )
+                pending.append((tag, strip_tabs, skipped))
+    return violations
 
 
 def container_options_violations(workflow: str, document: dict) -> list[str]:
@@ -4867,6 +4989,7 @@ def local_action_fence_violations(workflow: str, label: str, action: dict) -> li
         _run_interpolation_violations(label, action, lambda job: allowed, refusal)
     )
     violations.extend(shell_expression_violations(label, action))
+    violations.extend(python_isolation_violations(label, action))
     runs = action.get("runs")
     steps = runs.get("steps") if isinstance(runs, dict) else None
     for index, step in enumerate(steps if isinstance(steps, list) else ()):
@@ -5272,18 +5395,6 @@ CARGO_AUDIT_JOB_SHAPE = {
 
 
 
-def _issue_562_legacy_cargo_audit_shape() -> dict:
-    """ISSUE_562_LEGACY: the cargo-audit job as reviewed before #562."""
-    shape = {key: value for key, value in CARGO_AUDIT_JOB_SHAPE.items() if key != "timeout-minutes"}
-    shape["steps"] = [
-        {**step, "run": "\n".join(_issue_562_legacy_lines(step["run"].split("\n")))}
-        if "run" in step
-        else step
-        for step in CARGO_AUDIT_JOB_SHAPE["steps"]
-    ]
-    return shape
-
-
 _PINNED_USES_VALUE = re.compile(r"([^@\s]+)@[0-9a-f]{40}")
 # Workflow-level keys that reach every job's shell.
 _SHELL_REACHING_WORKFLOW_KEYS = ("env", "defaults")
@@ -5334,9 +5445,6 @@ def cargo_audit_job_shape_violations(text: str) -> list[str]:
     job = jobs.get(CARGO_AUDIT_JOB) if isinstance(jobs, dict) else None
     if not isinstance(job, dict):
         violations.append(f"security.yml: the required {CARGO_AUDIT_JOB!r} job is missing")
-        return violations
-    legacy = _issue_562_legacy_cargo_audit_shape()  # ISSUE_562_LEGACY
-    if not _cargo_audit_shape_differences(job, legacy):
         return violations
     return violations + _cargo_audit_shape_differences(job, CARGO_AUDIT_JOB_SHAPE)
 
@@ -5412,8 +5520,7 @@ def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
         "--policy trusted-cargo-audit/.github/cargo-audit-policy.json",
         '--source-root "$GITHUB_WORKSPACE"',
     ):
-        legacy = required.replace("python3 -I ", "python3 ")  # ISSUE_562_LEGACY
-        if required not in text and legacy not in text:
+        if required not in text:
             violations.append(
                 f"security.yml: trusted cargo-audit policy runner is missing {required!r}"
             )
@@ -6168,6 +6275,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             violations.extend(
                 container_options_violations(workflow.relative_to(root).as_posix(), document)
+            )
+            violations.extend(
+                job_timeout_violations(workflow.relative_to(root).as_posix(), document)
+            )
+            violations.extend(
+                python_isolation_violations(workflow.relative_to(root).as_posix(), document)
             )
         if "ferrum-edge-linux-x86_64" in text:
             violations.append(

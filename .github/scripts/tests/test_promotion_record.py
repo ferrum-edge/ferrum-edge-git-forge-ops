@@ -505,7 +505,7 @@ class WorkflowWiringTests(unittest.TestCase):
         # The `Record promotion result` mapping, up to the write it feeds.
         script = self._run_script(job, "Record promotion result")
         script = script[
-            : script.index("python3 .github/scripts/promotion_record.py write")
+            : script.index("python3 -I .github/scripts/promotion_record.py write")
         ]
         script += 'printf "%s" "$verify"\n'
         completed = subprocess.run(

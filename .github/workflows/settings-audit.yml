@@ -19,6 +19,7 @@ permissions:
 jobs:
   protection-baseline:
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     # The audit token reads repository administration settings, so it must not
     # be a plain repository secret: any branch a write-access collaborator can
     # push is a branch they can dispatch, and a repository secret is handed to
@@ -86,4 +87,4 @@ jobs:
           else
             args+=(--state-writer-app-id "$STATE_WRITER_APP_ID")
           fi
-          python3 .github/scripts/audit_settings.py "${args[@]}"
+          python3 -I .github/scripts/audit_settings.py "${args[@]}"

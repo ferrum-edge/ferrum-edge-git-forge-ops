@@ -39,6 +39,7 @@ permissions:
 jobs:
   security-supply-chain-policy:
     runs-on: ubuntu-26.04
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -107,14 +108,15 @@ jobs:
           raise SystemExit(module.main())
           PY
           else
-            python3 .github/scripts/check_supply_chain.py
+            python3 -I .github/scripts/check_supply_chain.py
           fi
 
       - name: Test privileged-input boundary
-        run: python3 -m unittest discover -s .github/scripts/tests -v
+        run: python3 -I -m unittest discover -s .github/scripts/tests -v
 
   security-cargo-audit:
     runs-on: ubuntu-26.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -149,9 +151,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "$EVENT_NAME" = pull_request ]; then
-            python3 trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py
+            python3 -I trusted-cargo-audit/.github/scripts/tests/test_check_cargo_audit.py
           else
-            python3 .github/scripts/tests/test_check_cargo_audit.py
+            python3 -I .github/scripts/tests/test_check_cargo_audit.py
           fi
 
       - name: Enforce cargo audit policy
@@ -159,9 +161,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "$EVENT_NAME" = pull_request ]; then
-            python3 trusted-cargo-audit/.github/scripts/check_cargo_audit.py \
+            python3 -I trusted-cargo-audit/.github/scripts/check_cargo_audit.py \
               --policy trusted-cargo-audit/.github/cargo-audit-policy.json \
               --source-root "$GITHUB_WORKSPACE"
           else
-            python3 .github/scripts/check_cargo_audit.py
+            python3 -I .github/scripts/check_cargo_audit.py
           fi
