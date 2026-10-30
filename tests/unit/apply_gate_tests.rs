@@ -590,6 +590,39 @@ fn supplied_pr_and_revision_cannot_authorize_any_caller_without_evidence() {
     assert!(!repo.dir.path().join(".state/default.json").exists());
 }
 
+/// #562: a set but malformed `GITFORGEOPS_PR_NUMBER` is an error in plan and
+/// apply, never a silent fallback to the commit's associated PR.
+#[test]
+fn malformed_pr_number_refuses_plan_and_apply_instead_of_falling_back() {
+    let repo = Repo::with_files(&[
+        ("resources/ferrum/proxies/app.yaml", HTTP_PROXY),
+        (".gitforgeops/policies.yaml", HTTPS_ONLY_POLICY),
+    ]);
+    let sha = "a".repeat(40);
+    for malformed in ["seven", "0", "-3"] {
+        let context = [
+            ("GITFORGEOPS_PR_NUMBER", malformed),
+            ("GITHUB_SHA", sha.as_str()),
+            ("GITHUB_REPOSITORY", "fixture/repo"),
+        ];
+        for args in [&["plan"][..], &["apply", "--auto-approve"][..]] {
+            let output = repo.run(args, &context);
+            let shown = format!("{}{}", stdout(&output), stderr(&output));
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{args:?} {malformed}: {shown}"
+            );
+            assert!(
+                shown.contains("GITFORGEOPS_PR_NUMBER is set but is not a positive integer"),
+                "{args:?} {malformed}: {shown}"
+            );
+            assert!(!repo.published().exists());
+            assert!(!repo.dir.path().join(".state/default.json").exists());
+        }
+    }
+}
+
 #[test]
 fn apply_refuses_a_literal_consumer_credential_and_publishes_nothing() {
     let repo = Repo::with_consumer(LITERAL_CONSUMER);

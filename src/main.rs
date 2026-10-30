@@ -18,7 +18,9 @@ use gitforgeops::http_client::conditional::PreparedConsumerRotation;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
 use gitforgeops::policy;
-use gitforgeops::policy::refusal::refuse_policy_violations;
+use gitforgeops::policy::refusal::{
+    refuse_policy_violations, refuse_post_resolution_policy_violations,
+};
 use gitforgeops::reconcile::{previously_managed, resolved_namespaces};
 use gitforgeops::review;
 use gitforgeops::secrets;
@@ -619,15 +621,19 @@ fn enforce_exclusive_scope(
 ///
 /// Order:
 ///   1. `GITFORGEOPS_PR_NUMBER` env var (set explicitly by review workflows).
+///      Set but not a positive integer is an error, never a silent fallback
+///      to step 2, which could attribute the run to a different PR.
 ///   2. For post-merge applies: the PR associated with `GITHUB_SHA` via the
 ///      `/repos/{repo}/commits/{sha}/pulls` endpoint. Requires GITHUB_TOKEN.
-async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
-    if let Some(n) = std::env::var("GITFORGEOPS_PR_NUMBER")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        return Some(n);
+async fn resolve_pr_number(env_config: &EnvConfig) -> gitforgeops::error::Result<Option<u64>> {
+    if let Some(n) = policy::github_override::pr_number_from_env()? {
+        return Ok(Some(n));
     }
+    Ok(associated_pr_number(env_config).await)
+}
+
+/// Step 2 of [`resolve_pr_number`]: best effort, `None` when unavailable.
+async fn associated_pr_number(env_config: &EnvConfig) -> Option<u64> {
     let token = env_config.github_token.as_deref()?;
     let repo = env_config.github_repository.as_deref()?;
     let sha = std::env::var("GITHUB_SHA").ok()?;
@@ -2715,18 +2721,12 @@ async fn cmd_plan(
             .as_ref()
             .map(|cfg| cfg.overrides.clone())
             .unwrap_or_default();
-        match resolve_pr_number(&env_config).await {
+        match resolve_pr_number(&env_config).await? {
             Some(pr) => match policy::check_override(&env_config, &override_cfg, pr).await {
                 Ok(decision) => {
                     policy::github_override::apply_override(&mut policy_findings, &decision);
                     security_overridden = decision.active;
-                    override_note = Some(match (&decision.active, &decision.approver) {
-                        (true, Some(approver)) => {
-                            format!("Blocking findings overridden by @{approver}.")
-                        }
-                        (true, None) => "Blocking findings overridden.".to_string(),
-                        (false, _) => format!("Override inactive: {}.", decision.reason),
-                    });
+                    override_note = Some(policy::github_override::plan_override_note(&decision));
                 }
                 // Fail closed. An override that could not be verified is not
                 // an override, and turning an unreachable GitHub API into a
@@ -3002,7 +3002,7 @@ async fn cmd_apply(
         .map(|cfg| cfg.overrides.clone())
         .unwrap_or_default();
     let override_decision = if security_blocked || policy_cfg.is_some() {
-        match resolve_pr_number(&env_config).await {
+        match resolve_pr_number(&env_config).await? {
             Some(pr) => Some(policy::check_override(&env_config, &override_cfg, pr).await?),
             None => None,
         }
@@ -3059,8 +3059,13 @@ async fn cmd_apply(
     // any gateway write or file publish. Overridden rule_ids are captured here
     // and written into state after a successful apply so audits can see which
     // blocking findings were bypassed by whom.
+    // The pre-resolution findings are what `plan` and `review` showed, so they
+    // are the only findings an override review could have seen. The api-mode
+    // re-check after credential resolution limits the override to them.
+    let mut reviewed_policy_findings: Vec<policy::PolicyFinding> = Vec::new();
     if let Some(policy_cfg) = &policy_cfg {
         let mut findings = policy::evaluate_policies(&desired, policy_cfg);
+        reviewed_policy_findings = findings.clone();
         if let Some(d) = &override_decision {
             policy::github_override::apply_override(&mut findings, d);
         }
@@ -3119,11 +3124,22 @@ async fn cmd_apply(
     // Config-string policy checks also need to see resolved values. Keep the
     // early unresolved-document gate above, then recheck API mode after secret
     // resolution so substitution cannot make a blocking finding disappear.
+    // The override covers only findings also present before resolution: a
+    // blocking finding that appears only here was never shown by plan or
+    // review, so no override review could have accepted it.
     if env_config.gateway_mode == GatewayMode::Api {
         if let Some(policy_cfg) = &policy_cfg {
             let mut findings = policy::evaluate_policies(&desired, policy_cfg);
-            if let Some(d) = &override_decision {
-                policy::github_override::apply_override(&mut findings, d);
+            let scrubber =
+                secrets::SecretScrubber::from_gateway_config_with_report(&desired, &secret_report);
+            if let Some(message) = refuse_post_resolution_policy_violations(
+                &mut findings,
+                &reviewed_policy_findings,
+                override_decision.as_ref(),
+                Some(&scrubber),
+            ) {
+                eout!("{message}");
+                return Err("unresolved policy violations".into());
             }
             if let Some(approver) = &override_approver {
                 for finding in &findings {
@@ -3134,17 +3150,6 @@ async fn cmd_apply(
                         }
                     }
                 }
-            }
-            let scrubber =
-                secrets::SecretScrubber::from_gateway_config_with_report(&desired, &secret_report);
-            if let Some(message) = refuse_policy_violations(
-                &findings,
-                " (after credential resolution)",
-                override_decision.as_ref(),
-                Some(&scrubber),
-            ) {
-                eout!("{message}");
-                return Err("unresolved policy violations".into());
             }
         }
     }

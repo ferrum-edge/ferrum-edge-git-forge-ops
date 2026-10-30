@@ -1364,6 +1364,29 @@ input verification in `src/policy/override_input.rs`. Pagination and unknown
 permissions fail closed. Audit entries record PR, review id, authorized head and
 applied revision.
 
+- **Bound inputs.** Every file under `.gitforgeops/` is bound input, walked
+  from disk whether Git tracks, ignores (`.gitignore`, `.git/info/exclude`,
+  `core.excludesFile`) or never saw it: each file present must be the reviewed
+  head's regular blob (symlinks and non-regular files refused). A reviewed
+  file may be absent from split review's data checkout, which copies only
+  protected configuration. Ignored build/runtime outputs elsewhere (`target/`,
+  worktrees, `.state/`, `assembled/`) are not compared.
+- **Evidence.** Labeler, permission and reviews are paginated by page number
+  from the fixed origin; a short page whose `Link` header still announces
+  `rel="next"` fails closed. The final pass re-reads the PR, labeler,
+  **permission** (must still be sufficient) and reviews.
+- **Reviewed findings only.** api-mode apply re-evaluates policy after
+  credential resolution. The override covers a blocking finding there only if
+  the pre-resolution evaluation (what `plan` and `review` showed) had the same
+  rule, severity, kind, namespace, id and message
+  (`github_override::apply_override_to_reviewed`,
+  `refusal::refuse_post_resolution_policy_violations`). A resolution-only
+  finding refuses apply, saying it appeared only after credential resolution;
+  details stay scrubbed.
+- A set `GITFORGEOPS_PR_NUMBER` that is not a positive integer is an error
+  (`github_override::parse_pr_number`), never a fallback to the commit's
+  associated PR. Unset or blank falls back.
+
 ### Setup doctor (`src/doctor/`)
 
 `gitforgeops doctor` answers "is this repo ready to deploy, and what is

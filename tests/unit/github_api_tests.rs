@@ -1506,11 +1506,15 @@ async fn override_labeler_pagination_ignores_response_link_urls() {
         ),
     ];
     let (api_base, requests) = spawn_github_stub_with_headers(routes);
-    let labeler =
-        find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
-            .await
-            .expect("labeler lookup");
-    assert_eq!(labeler.as_deref(), Some("maintainer"));
+    // Page 2 is short yet announces a next page, so the history is refused as
+    // incomplete (#562) rather than read to its end through the Link URL.
+    let error = find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+        .await
+        .expect_err("a short page that announces a next page is incomplete");
+    assert!(
+        error.to_string().contains("announces a next page"),
+        "{error}"
+    );
 
     let recorded = requests.lock().expect("recorded").clone();
     assert_eq!(recorded.len(), 2, "{recorded:?}");
@@ -1569,4 +1573,313 @@ async fn override_labeler_pagination_cap_fails_closed() {
         "{error}"
     );
     assert_eq!(requests.lock().expect("recorded").len(), 20);
+}
+
+/// #562: a short page ends the history only when GitHub does not announce a
+/// next page. A short page with `rel="next"` fails closed; the announced URL
+/// receives no request.
+#[tokio::test]
+async fn override_labeler_short_page_announcing_next_fails_closed() {
+    use gitforgeops::policy::github_override::find_override_labeler_at;
+    let repo_pr = format!("{REPO}/issues/7");
+    let routes = vec![
+        (
+            events_page(&repo_pr, 1),
+            200,
+            serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+            format!(
+                "Link: <{{base}}/repos/{repo_pr}/events?per_page=100&page=2>; rel=\"next\", <{{base}}/repos/{repo_pr}/events?per_page=100&page=2>; rel=\"last\"\r\n"
+            ),
+        ),
+        (
+            events_page(&repo_pr, 2),
+            200,
+            serde_json::json!([label_event("unlabeled", "maintainer")]).to_string(),
+            String::new(),
+        ),
+    ];
+    let (api_base, requests) = spawn_github_stub_with_headers(routes);
+    let error = find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+        .await
+        .expect_err("short page with a next link is incomplete");
+    assert!(
+        error.to_string().contains("announces a next page"),
+        "{error}"
+    );
+    let recorded = requests.lock().expect("recorded").clone();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+}
+
+/// A short final page whose `Link` header names only earlier pages completes.
+#[tokio::test]
+async fn override_labeler_short_page_with_only_prev_link_completes() {
+    use gitforgeops::policy::github_override::find_override_labeler_at;
+    let repo_pr = format!("{REPO}/issues/7");
+    let routes = vec![
+        (
+            events_page(&repo_pr, 1),
+            200,
+            full_events_page(label_event("labeled", "earlier")),
+            "Link: <{base}/next>; rel=\"next\"\r\n".to_string(),
+        ),
+        (
+            events_page(&repo_pr, 2),
+            200,
+            serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+            "Link: <{base}/p1>; rel=\"prev\", <{base}/p1>; rel=\"first\"\r\n".to_string(),
+        ),
+    ];
+    let (api_base, requests) = spawn_github_stub_with_headers(routes);
+    let labeler =
+        find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+            .await
+            .expect("labeler lookup");
+    assert_eq!(labeler.as_deref(), Some("maintainer"));
+    assert_eq!(requests.lock().expect("recorded").len(), 2);
+}
+
+fn reviews_page(page: usize) -> String {
+    format!("GET /repos/{REPO}/pulls/7/reviews?per_page=100&page={page} ")
+}
+
+fn plain_review_json(id: u64, login: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "commit_id": "a".repeat(40),
+        "state": "COMMENTED",
+        "body": "ordinary",
+        "user": {"login": login},
+    })
+}
+
+/// #562: review pagination refuses a short page that announces a next page,
+/// so a later revoking review on an unread page cannot be missed.
+#[tokio::test]
+async fn override_reviews_short_page_announcing_next_fails_closed() {
+    use gitforgeops::policy::github_override::fetch_reviews_at;
+    let routes = vec![
+        (
+            reviews_page(1),
+            200,
+            serde_json::json!([plain_review_json(1, "maintainer")]).to_string(),
+            "Link: <{base}/steal?page=2>; rel=\"next\"\r\n".to_string(),
+        ),
+        (String::from("/steal"), 200, "[]".to_string(), String::new()),
+    ];
+    let (api_base, requests) = spawn_github_stub_with_headers(routes);
+    let error = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+        .await
+        .expect_err("short review page with a next link is incomplete");
+    assert!(
+        error.to_string().contains("announces a next page"),
+        "{error}"
+    );
+    let recorded = requests.lock().expect("recorded").clone();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert!(!recorded[0].contains("/steal"));
+}
+
+/// Reviews keep reading numbered pages from the fixed origin past a full page.
+#[tokio::test]
+async fn override_reviews_walk_numbered_pages_from_the_fixed_origin() {
+    use gitforgeops::policy::github_override::fetch_reviews_at;
+    let full: Vec<_> = (1..=100)
+        .map(|id| plain_review_json(id, "someone"))
+        .collect();
+    let routes = vec![
+        (
+            reviews_page(1),
+            200,
+            serde_json::Value::Array(full).to_string(),
+            "Link: <{base}/steal?page=2>; rel=\"next\"\r\n".to_string(),
+        ),
+        (
+            reviews_page(2),
+            200,
+            serde_json::json!([plain_review_json(101, "maintainer")]).to_string(),
+            String::new(),
+        ),
+    ];
+    let (api_base, requests) = spawn_github_stub_with_headers(routes);
+    let reviews = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+        .await
+        .expect("reviews");
+    assert_eq!(reviews.len(), 101);
+    assert_eq!(reviews[100].id, 101);
+    let recorded = requests.lock().expect("recorded").clone();
+    assert_eq!(recorded.len(), 2, "{recorded:?}");
+    assert!(recorded.iter().all(|request| !request.contains("/steal")));
+}
+
+type SequencedRoute = (String, Vec<(u16, String)>);
+
+/// A loopback stub whose routes answer a sequence of responses: each request
+/// matching a needle takes the next response, and the last one repeats.
+fn spawn_sequenced_github_stub(routes: Vec<SequencedRoute>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let base = format!("http://{}", listener.local_addr().expect("stub addr"));
+    let routes = Arc::new(Mutex::new(
+        routes
+            .into_iter()
+            .map(|(needle, responses)| (needle, std::collections::VecDeque::from(responses)))
+            .collect::<Vec<_>>(),
+    ));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let thread_requests = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let routes = Arc::clone(&routes);
+            let requests = Arc::clone(&thread_requests);
+            std::thread::spawn(move || loop {
+                let request = match read_request(&mut stream) {
+                    Some(request) => request,
+                    None => return,
+                };
+                requests
+                    .lock()
+                    .expect("record request")
+                    .push(request.clone());
+                let (status, body) = {
+                    let mut routes = routes.lock().expect("routes");
+                    routes
+                        .iter_mut()
+                        .find(|(needle, _)| request.contains(needle.as_str()))
+                        .and_then(|(_, responses)| {
+                            if responses.len() > 1 {
+                                responses.pop_front()
+                            } else {
+                                responses.front().cloned()
+                            }
+                        })
+                        .unwrap_or((404, "{\"message\":\"Not Found\"}".to_string()))
+                };
+                if write!(
+                    stream,
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .is_err()
+                {
+                    return;
+                }
+            });
+        }
+    });
+    (base, requests)
+}
+
+/// Every route of a complete, valid override, with the labeler's permission
+/// answered by `permissions` in order.
+fn override_routes(permissions: &[(u16, &str)]) -> Vec<SequencedRoute> {
+    let head = "a".repeat(40);
+    let pr = serde_json::json!({
+        "labels": [{"name": OVERRIDE_LABEL}],
+        "head": {"sha": head},
+        "merged": false,
+        "merge_commit_sha": null,
+    })
+    .to_string();
+    let review = serde_json::json!([{
+        "id": 42,
+        "commit_id": head,
+        "state": "APPROVED",
+        "body": format!("gitforgeops-override {OVERRIDE_LABEL}"),
+        "user": {"login": "maintainer"},
+    }])
+    .to_string();
+    vec![
+        (format!("GET /repos/{REPO}/pulls/7 HTTP"), vec![(200, pr)]),
+        (
+            events_page(&format!("{REPO}/issues/7"), 1),
+            vec![(
+                200,
+                serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+            )],
+        ),
+        (
+            format!("GET /repos/{REPO}/collaborators/maintainer/permission"),
+            permissions
+                .iter()
+                .map(|(status, permission)| {
+                    (
+                        *status,
+                        serde_json::json!({"permission": permission, "role_name": permission})
+                            .to_string(),
+                    )
+                })
+                .collect(),
+        ),
+        (reviews_page(1), vec![(200, review)]),
+        (
+            format!("GET /repos/{REPO}/git/trees/"),
+            vec![(
+                200,
+                serde_json::json!({"truncated": false, "tree": []}).to_string(),
+            )],
+        ),
+    ]
+}
+
+/// Run the whole override check against a stub; the input verifier is a fixed
+/// pass, so the decision reflects only the GitHub evidence.
+async fn run_override_check(
+    permissions: &[(u16, &str)],
+) -> (gitforgeops::policy::OverrideDecision, usize) {
+    use gitforgeops::policy::github_override::check_override_at;
+    let (api_base, requests) = spawn_sequenced_github_stub(override_routes(permissions));
+    let cfg = gitforgeops::policy::OverrideConfig {
+        require_label: OVERRIDE_LABEL.into(),
+        required_permission: "write".into(),
+    };
+    let decision = check_override_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        TOKEN,
+        &cfg,
+        7,
+        |_, _, _| Ok("b".repeat(40)),
+    )
+    .await
+    .expect("override check");
+    let permission_reads = requests
+        .lock()
+        .expect("recorded")
+        .iter()
+        .filter(|request| request.contains("/permission"))
+        .count();
+    (decision, permission_reads)
+}
+
+/// Stable evidence yields an active override; the harness is complete.
+#[tokio::test]
+async fn override_with_stable_evidence_is_active() {
+    let (decision, permission_reads) = run_override_check(&[(200, "write")]).await;
+    assert!(decision.active, "{}", decision.reason);
+    assert_eq!(decision.approver.as_deref(), Some("maintainer"));
+    assert_eq!(decision.review_id, Some(42));
+    assert_eq!(permission_reads, 2);
+}
+
+/// #562: the final evidence pass re-reads the labeler's permission. A labeler
+/// demoted from write to read while evidence was collected revokes it.
+#[tokio::test]
+async fn override_permission_demoted_during_verification_is_inactive() {
+    let (decision, permission_reads) = run_override_check(&[(200, "write"), (200, "read")]).await;
+    assert!(!decision.active);
+    assert!(
+        decision.reason.contains("override evidence changed"),
+        "{}",
+        decision.reason
+    );
+    assert_eq!(permission_reads, 2);
+}
+
+/// A permission read that fails in the final pass also revokes it.
+#[tokio::test]
+async fn override_permission_unreadable_during_final_pass_is_inactive() {
+    let (decision, permission_reads) = run_override_check(&[(200, "write"), (500, "write")]).await;
+    assert!(!decision.active, "{}", decision.reason);
+    assert_eq!(permission_reads, 2);
 }

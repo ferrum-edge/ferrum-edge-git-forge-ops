@@ -65,6 +65,37 @@ pub fn refuse_policy_violations(
     Some(output)
 }
 
+/// The api-mode policy re-check after credential resolution.
+///
+/// The override decision covers only blocking findings that also appear in
+/// `reviewed`, the pre-resolution evaluation `plan` and `review` show. A
+/// blocking finding that exists only in the resolved document refuses apply
+/// even with an active override, and the refusal says why. `findings` is left
+/// post-override for the audit trail. Values never appear in the note; finding
+/// details go through `scrubber` like every other post-resolution refusal.
+pub fn refuse_post_resolution_policy_violations(
+    findings: &mut [PolicyFinding],
+    reviewed: &[PolicyFinding],
+    override_decision: Option<&github_override::OverrideDecision>,
+    scrubber: Option<&SecretScrubber>,
+) -> Option<String> {
+    let uncovered = override_decision
+        .map(|decision| github_override::apply_override_to_reviewed(findings, decision, reviewed))
+        .unwrap_or(0);
+    let mut output = refuse_policy_violations(
+        findings,
+        " (after credential resolution)",
+        override_decision,
+        scrubber,
+    )?;
+    if uncovered > 0 {
+        output.push_str(&format!(
+            "({uncovered} blocking finding(s) appeared only after credential resolution. The override covers only findings its review could see before resolution, so it does not cover them; plan and review never showed them.)\n"
+        ));
+    }
+    Some(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

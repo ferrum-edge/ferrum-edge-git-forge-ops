@@ -211,8 +211,13 @@ pub fn verify_input(
     let mut actual_input = BTreeMap::new();
     for directory in ["resources", "overlays", ".gitforgeops"] {
         let start = data.join(directory);
-        if !start.exists() {
-            continue;
+        match std::fs::symlink_metadata(&start) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("cannot enumerate desired input".into()),
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err("desired input root is not a directory".into())
+            }
+            Ok(_) => {}
         }
         for entry in walkdir::WalkDir::new(&start).follow_links(false) {
             let entry = entry.map_err(|_| "cannot enumerate desired input")?;
@@ -227,7 +232,8 @@ pub fn verify_input(
                 .strip_prefix(data)
                 .map_err(|_| "desired input escapes its root")?;
             let relative = relative.to_str().ok_or("non-UTF-8 desired path")?;
-            if !input(relative) {
+            let configuration = relative.starts_with(".gitforgeops/");
+            if !input(relative) && !configuration {
                 continue;
             }
             if !entry.file_type().is_file() {
@@ -235,7 +241,29 @@ pub fn verify_input(
             }
             let path = entry.path().to_str().ok_or("non-UTF-8 desired path")?;
             let hash = git(source, &["hash-object", "--no-filters", "--", path])?;
-            actual_input.insert(relative.to_string(), hash.trim().to_string());
+            let hash = hash.trim();
+            if input(relative) {
+                actual_input.insert(relative.to_string(), hash.to_string());
+                continue;
+            }
+            // Everything under `.gitforgeops/` is bound input, whether Git
+            // tracks it, ignores it (`.gitignore`, `.git/info/exclude`,
+            // `core.excludesFile`) or never saw it: the binary reads files such
+            // as `smoke.yaml` from disk. Each file present must be the reviewed
+            // head's regular blob, byte for byte. A reviewed file may be absent
+            // here (trusted review copies only protected configuration).
+            match expected_source.get(relative) {
+                Some((mode, kind, expected))
+                    if kind == "blob"
+                        && matches!(mode.as_str(), "100644" | "100755")
+                        && expected == hash => {}
+                _ => {
+                    return Err(
+                        "repository configuration under .gitforgeops differs from the reviewed revision"
+                            .into(),
+                    )
+                }
+            }
         }
     }
     if actual_input != expected_input {

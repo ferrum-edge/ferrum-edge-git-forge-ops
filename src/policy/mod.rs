@@ -11,7 +11,7 @@ pub use config::{load_policies, OverrideConfig, PolicyConfig};
 pub use github_override::{check_override, OverrideDecision};
 pub use registry::{build_registry, evaluate_policies};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,

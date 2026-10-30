@@ -39,6 +39,50 @@ impl OverrideDecision {
     }
 }
 
+/// The `=== Override ===` line `plan` prints for a decision. The approver is
+/// GitHub's text, so only a [`crate::display::peer_text`] copy is quoted.
+pub fn plan_override_note(decision: &OverrideDecision) -> String {
+    match (decision.active, &decision.approver) {
+        (true, Some(approver)) => format!(
+            "Blocking findings overridden by @{}.",
+            crate::display::peer_text(approver)
+        ),
+        (true, None) => "Blocking findings overridden.".to_string(),
+        (false, _) => format!("Override inactive: {}.", decision.reason),
+    }
+}
+
+/// The variable a workflow sets to name the PR an override is evaluated on.
+pub const PR_NUMBER_ENV: &str = "GITFORGEOPS_PR_NUMBER";
+
+/// Parse a [`PR_NUMBER_ENV`] value. Unset or blank is `None` (the caller may
+/// fall back to the commit's associated PR); anything else must be a positive
+/// decimal integer. A malformed value is an error rather than a silent
+/// fallback, which could evaluate the override on a different PR.
+pub fn parse_pr_number(value: Option<&str>) -> crate::error::Result<Option<u64>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match value.parse::<u64>() {
+        Ok(number) if number > 0 && value.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(number)),
+        _ => Err(crate::error::Error::Config(format!(
+            "{PR_NUMBER_ENV} is set but is not a positive integer; refusing to guess the pull request"
+        ))),
+    }
+}
+
+/// [`parse_pr_number`] over the process environment. A non-UTF-8 value is
+/// malformed, not unset.
+pub fn pr_number_from_env() -> crate::error::Result<Option<u64>> {
+    match std::env::var(PR_NUMBER_ENV) {
+        Ok(value) => parse_pr_number(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(crate::error::Error::Config(format!(
+            "{PR_NUMBER_ENV} is set but is not a positive integer; refusing to guess the pull request"
+        ))),
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct Label {
     name: String,
@@ -208,8 +252,45 @@ async fn check_override_context(
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
-    let pr_url = format!("https://api.github.com/repos/{repo}/pulls/{pr_number}");
-    let pr: PullRequest = match fetch_json(&client, &pr_url, token).await {
+    check_override_at(
+        &client,
+        crate::secrets::DEFAULT_GITHUB_API_BASE,
+        repo,
+        token,
+        override_cfg,
+        pr_number,
+        |tree, merged, merge_revision| {
+            super::override_input::verify_current_input(
+                tree,
+                merged,
+                merge_revision,
+                review_context,
+            )
+        },
+    )
+    .await
+}
+
+/// [`check_override`] against an explicit API origin and input verifier.
+///
+/// Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`] and
+/// [`super::override_input::verify_current_input`]; tests pass a loopback stub
+/// and a fixed verdict. Every request goes to a fixed path under `api_base`.
+pub async fn check_override_at<F>(
+    client: &Client,
+    api_base: &str,
+    repo: &str,
+    token: &str,
+    override_cfg: &OverrideConfig,
+    pr_number: u64,
+    verify_input: F,
+) -> crate::error::Result<OverrideDecision>
+where
+    F: FnOnce(&serde_json::Value, bool, Option<&str>) -> Result<String, String>,
+{
+    let api_base = api_base.trim_end_matches('/');
+    let pr_url = format!("{api_base}/repos/{repo}/pulls/{pr_number}");
+    let pr: PullRequest = match fetch_json(client, &pr_url, token).await {
         Ok(value) => match serde_json::from_value(value) {
             Ok(pr) => pr,
             Err(e) => {
@@ -238,20 +319,26 @@ async fn check_override_context(
     // matching `labeled` event across all pages and the matching `unlabeled`
     // events, so a label that was added, removed, and re-added is correctly
     // attributed to the last add.
-    let approver =
-        match find_override_labeler(&client, repo, pr_number, token, &override_cfg.require_label)
-            .await
-        {
-            Ok(Some(login)) => login,
-            Ok(None) => {
-                return Ok(OverrideDecision::inactive(
-                    "no labeling event found for override label across all event pages",
-                ))
-            }
-            Err(e) => return Ok(OverrideDecision::inactive(&format!("fetch events: {e}"))),
-        };
+    let approver = match find_override_labeler_at(
+        client,
+        api_base,
+        repo,
+        pr_number,
+        token,
+        &override_cfg.require_label,
+    )
+    .await
+    {
+        Ok(Some(login)) => login,
+        Ok(None) => {
+            return Ok(OverrideDecision::inactive(
+                "no labeling event found for override label across all event pages",
+            ))
+        }
+        Err(e) => return Ok(OverrideDecision::inactive(&format!("fetch events: {e}"))),
+    };
 
-    let permission = match fetch_permission(&client, repo, &approver, token).await {
+    let permission = match fetch_permission_at(client, api_base, repo, &approver, token).await {
         Ok(p) => p,
         Err(e) => {
             return Ok(OverrideDecision::inactive(&format!(
@@ -272,7 +359,7 @@ async fn check_override_context(
         )));
     }
 
-    let reviews = match fetch_reviews(&client, repo, pr_number, token).await {
+    let reviews = match fetch_reviews_at(client, api_base, repo, pr_number, token).await {
         Ok(reviews) => reviews,
         Err(_) => {
             return Ok(OverrideDecision::inactive(
@@ -294,10 +381,10 @@ async fn check_override_context(
         }
     };
     let tree_url = format!(
-        "https://api.github.com/repos/{repo}/git/trees/{}?recursive=1",
+        "{api_base}/repos/{repo}/git/trees/{}?recursive=1",
         pr.head.sha
     );
-    let tree = match fetch_json(&client, &tree_url, token).await {
+    let tree = match fetch_json(client, &tree_url, token).await {
         Ok(tree) => tree,
         Err(_) => {
             return Ok(OverrideDecision::inactive(
@@ -305,18 +392,13 @@ async fn check_override_context(
             ))
         }
     };
-    let applied_revision = match super::override_input::verify_current_input(
-        &tree,
-        pr.merged,
-        pr.merge_commit_sha.as_deref(),
-        review_context,
-    ) {
+    let applied_revision = match verify_input(&tree, pr.merged, pr.merge_commit_sha.as_deref()) {
         Ok(revision) => revision,
         Err(reason) => return Ok(OverrideDecision::inactive(&reason)),
     };
     // Close the API-read window as far as a client can: a push, merge, or label
     // change while collecting evidence invalidates this decision.
-    let current = fetch_json(&client, &pr_url, token)
+    let current = fetch_json(client, &pr_url, token)
         .await
         .ok()
         .and_then(|value| serde_json::from_value::<PullRequest>(value).ok());
@@ -325,12 +407,26 @@ async fn check_override_context(
             "PR changed during override verification",
         ));
     }
-    let current_labeler =
-        find_override_labeler(&client, repo, pr_number, token, &override_cfg.require_label)
-            .await
-            .ok()
-            .flatten();
-    let current_reviews = fetch_reviews(&client, repo, pr_number, token).await.ok();
+    let current_labeler = find_override_labeler_at(
+        client,
+        api_base,
+        repo,
+        pr_number,
+        token,
+        &override_cfg.require_label,
+    )
+    .await
+    .ok()
+    .flatten();
+    // The labeler's permission is part of the evidence: a demotion while the
+    // rest was collected revokes the override like a relabel does.
+    let permission_still_sufficient = fetch_permission_at(client, api_base, repo, &approver, token)
+        .await
+        .ok()
+        .is_some_and(|permission| override_cfg.is_sufficient(&permission));
+    let current_reviews = fetch_reviews_at(client, api_base, repo, pr_number, token)
+        .await
+        .ok();
     let current_review = current_reviews.as_ref().and_then(|reviews| {
         authorized_review(
             reviews,
@@ -339,7 +435,10 @@ async fn check_override_context(
             &pr.head.sha,
         )
     });
-    if current_labeler.as_deref() != Some(approver.as_str()) || current_review != Some(review) {
+    if current_labeler.as_deref() != Some(approver.as_str())
+        || !permission_still_sufficient
+        || current_review != Some(review)
+    {
         return Ok(OverrideDecision::inactive(
             "override evidence changed during verification",
         ));
@@ -372,33 +471,36 @@ async fn check_override_context(
 /// and keep the most recent matching add event, tracking whether a later
 /// unlabel supersedes it.
 const MAX_ISSUE_EVENT_PAGES: usize = 20;
+const PAGE_SIZE: usize = 100;
 
-async fn find_override_labeler(
-    client: &Client,
-    repo: &str,
-    pr_number: u64,
-    token: &str,
-    label_name: &str,
-) -> crate::error::Result<Option<String>> {
-    find_override_labeler_at(
-        client,
-        crate::secrets::DEFAULT_GITHUB_API_BASE,
-        repo,
-        pr_number,
-        token,
-        label_name,
-    )
-    .await
+/// Decide whether a numbered page ends the listing.
+///
+/// A short page ends it only when no `Link` header announces a next page. A
+/// short page that still claims `rel="next"` contradicts itself (GitHub may cap
+/// `per_page` below the request, or the listing moved), so the read fails
+/// closed instead of treating the history as complete. The announced URL is
+/// never requested: the next read is always the next numbered page from the
+/// fixed origin.
+fn page_is_last(items: usize, announces_next: bool, what: &str) -> crate::error::Result<bool> {
+    match (items < PAGE_SIZE, announces_next) {
+        (false, _) => Ok(false),
+        (true, false) => Ok(true),
+        (true, true) => Err(crate::error::Error::Config(format!(
+            "override {what} page is short but GitHub announces a next page; refusing an incomplete history"
+        ))),
+    }
 }
 
-/// [`find_override_labeler`] against an explicit API origin.
+/// The login that most recently added `label_name`, against an explicit API
+/// origin (`None` when a later `unlabeled` event supersedes it).
 ///
 /// Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`]; tests pass a
 /// loopback stub. Pages are requested by number from `api_base`. A response's
 /// `Link` header is never followed, so the bearer token cannot be sent to a
-/// host or path a response names. An exactly full page requires another read
-/// to prove completeness, and reaching the page cap with a full page fails
-/// closed so a later relabel cannot be missed.
+/// host or path a response names; it is read only to refuse a short page that
+/// still announces a next one. An exactly full page requires another read to
+/// prove completeness, and reaching the page cap with a full page fails closed
+/// so a later relabel cannot be missed.
 pub async fn find_override_labeler_at(
     client: &Client,
     api_base: &str,
@@ -413,10 +515,10 @@ pub async fn find_override_labeler_at(
     for page in 1..=MAX_ISSUE_EVENT_PAGES {
         let url =
             format!("{api_base}/repos/{repo}/issues/{pr_number}/events?per_page=100&page={page}");
-        let events: Vec<IssueEvent> =
-            serde_json::from_value(fetch_json(client, &url, token).await?)
-                .map_err(|e| crate::http_client::malformed_response("parse events", &e))?;
-        let complete = events.len() < 100;
+        let (value, announces_next) = fetch_json_page(client, &url, token).await?;
+        let events: Vec<IssueEvent> = serde_json::from_value(value)
+            .map_err(|e| crate::http_client::malformed_response("parse events", &e))?;
+        let complete = page_is_last(events.len(), announces_next, "label event")?;
 
         for event in events {
             let matches_label = event
@@ -449,23 +551,28 @@ pub async fn find_override_labeler_at(
     ))
 }
 
-async fn fetch_reviews(
+/// Every submitted review on the PR, oldest first, against an explicit API
+/// origin. Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`];
+/// tests pass a loopback stub.
+pub async fn fetch_reviews_at(
     client: &Client,
+    api_base: &str,
     repo: &str,
     pr_number: u64,
     token: &str,
 ) -> crate::error::Result<Vec<OverrideReview>> {
+    let api_base = api_base.trim_end_matches('/');
     let mut reviews = Vec::new();
     // Request numbered pages from the fixed API origin, never a supplied URL.
-    // An exactly full final page requires another read to prove completeness.
+    // An exactly full final page requires another read to prove completeness,
+    // and a short page that announces a next one fails closed.
     for page in 1..=MAX_ISSUE_EVENT_PAGES {
-        let url = format!(
-            "https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}"
-        );
-        let batch: Vec<OverrideReview> =
-            serde_json::from_value(fetch_json(client, &url, token).await?)
-                .map_err(|e| crate::http_client::malformed_response("parse reviews", &e))?;
-        let complete = batch.len() < 100;
+        let url =
+            format!("{api_base}/repos/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}");
+        let (value, announces_next) = fetch_json_page(client, &url, token).await?;
+        let batch: Vec<OverrideReview> = serde_json::from_value(value)
+            .map_err(|e| crate::http_client::malformed_response("parse reviews", &e))?;
+        let complete = page_is_last(batch.len(), announces_next, "review")?;
         reviews.extend(batch);
         if complete {
             return Ok(reviews);
@@ -494,11 +601,35 @@ pub fn parse_next_link(header: &str) -> Option<String> {
     None
 }
 
+/// Whether any `Link` header value announces a next page. An unreadable value
+/// counts as an announcement, so a short page carrying it fails closed.
+fn announces_next_page(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .any(|value| match value.to_str() {
+            Ok(text) => {
+                parse_next_link(text).is_some()
+                    || text.to_ascii_lowercase().contains("rel=\"next\"")
+            }
+            Err(_) => true,
+        })
+}
+
 async fn fetch_json(
     client: &Client,
     url: &str,
     token: &str,
 ) -> crate::error::Result<serde_json::Value> {
+    Ok(fetch_json_page(client, url, token).await?.0)
+}
+
+/// [`fetch_json`] that also reports whether the response announces a next page.
+async fn fetch_json_page(
+    client: &Client,
+    url: &str,
+    token: &str,
+) -> crate::error::Result<(serde_json::Value, bool)> {
     let resp = client
         .get(url)
         .bearer_auth(token)
@@ -516,18 +647,22 @@ async fn fetch_json(
             message: body,
         });
     }
-    resp.json()
+    let announces_next = announces_next_page(resp.headers());
+    let value = resp
+        .json()
         .await
-        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))
+        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+    Ok((value, announces_next))
 }
 
-async fn fetch_permission(
+async fn fetch_permission_at(
     client: &Client,
+    api_base: &str,
     repo: &str,
     login: &str,
     token: &str,
 ) -> crate::error::Result<String> {
-    let url = format!("https://api.github.com/repos/{repo}/collaborators/{login}/permission");
+    let url = format!("{api_base}/repos/{repo}/collaborators/{login}/permission");
     let value = fetch_json(client, &url, token).await?;
     let parsed: PermissionResponse = serde_json::from_value(value)
         .map_err(|e| crate::http_client::malformed_response("parse permission", &e))?;
@@ -549,4 +684,59 @@ pub fn apply_override(findings: &mut [super::PolicyFinding], decision: &Override
             finding.overridden_by = Some(by.clone());
         }
     }
+}
+
+/// The identity an override review is bound to: rule, severity, resource and
+/// message. The reviewer saw exactly these findings (`plan` and `review`
+/// evaluate the unresolved document), so a finding that differs in any of
+/// them is a finding nobody reviewed.
+fn reviewed_identity(
+    finding: &super::PolicyFinding,
+) -> (&str, super::Severity, &str, &str, &str, &str) {
+    (
+        finding.rule_id.as_str(),
+        finding.severity,
+        finding.kind.as_str(),
+        finding.namespace.as_str(),
+        finding.id.as_str(),
+        finding.message.as_str(),
+    )
+}
+
+/// [`apply_override`] limited to blocking findings that also appear in
+/// `reviewed`, the evaluation the override review could see.
+///
+/// Apply re-evaluates policy after credential resolution. A blocking finding
+/// that exists only in the resolved document never appeared in `plan` or the
+/// PR comment, so the override does not cover it; it stays blocking. Returns
+/// how many blocking findings were left uncovered for that reason.
+pub fn apply_override_to_reviewed(
+    findings: &mut [super::PolicyFinding],
+    decision: &OverrideDecision,
+    reviewed: &[super::PolicyFinding],
+) -> usize {
+    if !decision.active {
+        return 0;
+    }
+    let by = decision
+        .approver
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let reviewed: std::collections::HashSet<_> = reviewed
+        .iter()
+        .filter(|finding| finding.severity.blocks_apply())
+        .map(reviewed_identity)
+        .collect();
+    let mut uncovered = 0;
+    for finding in findings.iter_mut() {
+        if !finding.severity.blocks_apply() {
+            continue;
+        }
+        if reviewed.contains(&reviewed_identity(finding)) {
+            finding.overridden_by = Some(by.clone());
+        } else {
+            uncovered += 1;
+        }
+    }
+    uncovered
 }
