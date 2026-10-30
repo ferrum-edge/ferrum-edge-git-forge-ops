@@ -798,6 +798,20 @@ pub(crate) fn consumer_credential_slot(
     credential_type: &str,
     path: &[ConfigPathComponent],
 ) -> String {
+    join_slot_components(&consumer_slot_components(
+        namespace,
+        consumer_id,
+        credential_type,
+        path,
+    ))
+}
+
+fn consumer_slot_components<'a>(
+    namespace: &'a str,
+    consumer_id: &'a str,
+    credential_type: &'a str,
+    path: &'a [ConfigPathComponent],
+) -> Vec<SlotComponent<'a>> {
     let mut components = vec![
         SlotComponent::Literal(namespace),
         SlotComponent::Literal(consumer_id),
@@ -807,7 +821,25 @@ pub(crate) fn consumer_credential_slot(
         ConfigPathComponent::Key(key) => SlotComponent::Literal(key),
         ConfigPathComponent::Index(index) => SlotComponent::ArrayIndex(*index),
     }));
-    join_slot_components(&components)
+    components
+}
+
+/// Look up a Consumer credential's bundle value exactly as resolution does:
+/// the canonical slot first, then the read-only legacy encodings, with the
+/// same refusals (`[REDACTED]`, placeholder text, too short). `committed` is
+/// the placeholder the repository declares at this leaf. Errors name the
+/// canonical slot, never the value.
+pub(crate) fn lookup_consumer_credential<'a>(
+    namespace: &str,
+    consumer_id: &str,
+    credential_type: &str,
+    path: &[ConfigPathComponent],
+    committed: &str,
+    bundle: &'a CredentialBundle,
+) -> crate::error::Result<Option<&'a String>> {
+    let components = consumer_slot_components(namespace, consumer_id, credential_type, path);
+    let slot = join_slot_components(&components);
+    lookup_slot_value(&components, &slot, committed, bundle)
 }
 
 /// Is this credential leaf an *identity* rather than a secret?

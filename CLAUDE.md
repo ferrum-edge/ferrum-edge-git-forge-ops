@@ -871,6 +871,13 @@ run arbitrary commands from a repository file, so the closed schema in
 - TLS is always verified. `FERRUM_TLS_NO_VERIFY` is deliberately not passed to
   `verify::runner`; a private CA goes in `FERRUM_GATEWAY_CA_CERT`. The
   data-plane base URL is `FERRUM_VERIFY_BASE_URL`.
+- Cleartext follows the admin client's send-time rule in every context:
+  `http://` only to a literal loopback IP (`127.0.0.0/8`, `::1`), only with
+  `FERRUM_ALLOW_INSECURE_HTTP=true`; never a hostname (`localhost` included)
+  or a remote host, in or out of GitHub Actions. Enforced at load
+  (`validate_verify_transport`) and again on the exact request URL
+  (`runner::check_target`). HTTPS clients set `https_only`; plaintext
+  clients bypass environment proxies.
 - Header values are exactly one of `literal:` or `slot:`. An unresolvable slot
   fails the check instead of sending an empty header (which could make a
   `401`-expecting check pass for the wrong reason).
@@ -1880,7 +1887,7 @@ credentials. Booleans accept `true|false|1|0`.
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` on `$PATH` | Validator binary. |
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode gateway document. |
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Standalone `{version, mesh}` document. File-mode `validate`/`plan`/`apply` and `export --output` refuse, before any publication, state or broker write, when it resolves to the same file as the gateway document (`apply::ensure_distinct_publication_paths`: `./`/`..` spellings, symlinked parents and existing file identity all count). |
-| `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `verify`. |
+| `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `verify`. `https://`, or `http://` only to a literal loopback IP with `FERRUM_ALLOW_INSECURE_HTTP=true`, in every context (no `localhost`). |
 | `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set by environment-bound workflow steps; makes an unset allowlist a refusal instead of "not visible". |
 | `FERRUM_VERIFY_PROBE_CONSUMERS` | unset | Operator allowlist of probe Consumers (`<ns>/<consumer-id>`, comma-separated); a GitHub Environment variable in CI. Unset: `verify` refuses every slot-sending check. See [Traffic verification](#traffic-verification-srcverify). |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Dev only. TLS stays on but any certificate is accepted. |
@@ -1896,6 +1903,8 @@ credentials. Booleans accept `true|false|1|0`.
 prints a loud stderr banner once per process, and both are refused when
 `GITHUB_ACTIONS=true` unless the gateway host is loopback (`localhost`,
 `127.0.0.0/8`, `::1`). `config::env::validate_gateway_transport` owns the rule.
+`FERRUM_VERIFY_BASE_URL` is stricter (`validate_verify_transport`): cleartext
+only to a literal loopback IP, in every context.
 
 ## Testing
 
