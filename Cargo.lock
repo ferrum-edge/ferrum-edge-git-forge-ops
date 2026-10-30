@@ -975,6 +975,7 @@ dependencies = [
  "jsonwebtoken",
  "rand 0.10.3",
  "reqwest",
+ "rustix",
  "serde",
  "serde-saphyr",
  "serde_ignored",
