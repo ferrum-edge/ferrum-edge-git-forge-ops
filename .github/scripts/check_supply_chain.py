@@ -4006,10 +4006,10 @@ def job_timeout_violations(workflow: str, document: dict) -> list[str]:
     jobs = jobs if isinstance(jobs, dict) else {}
     named = LEDGER_JOBS.get(PurePosixPath(workflow).name, ())
     violations.extend(
-        f"{workflow}: jobs.{job_name}: the ledger-committing job is missing; renaming it "
-        "would drop its per-step budgets"
+        f"{workflow}: jobs.{job_name}: the ledger-committing job is missing or calls a "
+        "reusable workflow; either would drop its per-step budgets"
         for job_name in named
-        if not isinstance(jobs.get(job_name), dict)
+        if not isinstance(jobs.get(job_name), dict) or "uses" in jobs[job_name]
     )
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
@@ -4025,6 +4025,7 @@ def job_timeout_violations(workflow: str, document: dict) -> list[str]:
         ledger = (
             job_name in named
             or LEDGER_JOB_SECRET in json.dumps(job)
+            or "app_private_key" in json.dumps(job).casefold()
             or any(
                 isinstance(step, dict)
                 and isinstance(step.get("uses"), str)
@@ -4083,7 +4084,7 @@ _FINAL_OPTIONS = frozenset("cm")
 # interpreter, so a word like `python` in it starts nothing. An unquoted
 # delimiter is still shell (`$(...)` runs), so its body is scanned.
 _ISOLATED_HEREDOC = re.compile(
-    r"^[ \t]*(?:\S*/)?python(?:3(?:\.\d+)?)?(?:[ \t]+-[A-Za-z]+)*[ \t]+-(?:[ \t]+[^<\s]+)*"
+    r"^[ \t]*(?:\S*/)?python(?:3(?:\.\d+)?)?(?:[ \t]+-[A-Za-z]+)*(?:[ \t]+-(?:[ \t]+[^<\s]+)*)?"
     r"[ \t]*<<-?[ \t]*(['\"])(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\1[ \t]*$"
 )
 
@@ -4154,7 +4155,8 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
             )
     for path, script, _job in _run_scripts(document):
         heredoc_tag = None
-        for line in script.split("\n"):
+        lines = script.split("\n")
+        for number, line in enumerate(lines):
             if heredoc_tag is not None:
                 if line.strip() == heredoc_tag:
                     heredoc_tag = None
@@ -4170,7 +4172,12 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
                     )
                     break
             heredoc = _ISOLATED_HEREDOC.match(line)
-            if heredoc is not None and _isolated_from(line, _PYTHON_COMMAND.search(line).end()):
+            if (
+                heredoc is not None
+                and _isolated_from(line, _PYTHON_COMMAND.search(line).end())
+                # An opener whose tag never closes skips nothing.
+                and any(later.strip() == heredoc.group("tag") for later in lines[number + 1:])
+            ):
                 heredoc_tag = heredoc.group("tag")
     return violations
 

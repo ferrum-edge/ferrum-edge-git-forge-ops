@@ -8201,6 +8201,13 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
                 ),
                 (job, secret),
             )
+        # A ledger job turned into a reusable-workflow caller is refused.
+        caller = self._document(
+            "on: push\njobs:\n  rotate:\n    uses: ./.github/workflows/inner.yml\n"
+        )
+        self.assertTrue(
+            check_supply_chain.job_timeout_violations(".github/workflows/rotate.yml", caller)
+        )
         # Renaming a ledger job away is itself refused.
         document = self._document(workflow("renamed", False))
         self.assertTrue(
@@ -8292,6 +8299,8 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["python3 -c -I"],
             ["python3 -I - <<PY", "$(python3 -c 'pass')", "PY"],
             ["echo 'python3 -I - <<TAG'", "python3 -c 'pass'"],
+            ["echo python3 -I - <<'PY'", "python3 evil.py", "PY"],
+            ["python3 -I - <<'PY'", "print(1)", "python3 evil.py"],
             ["bash <<'SH'", "python3 x.py", "SH"],
             ["python3 -I - <<'PY'", "print(1)", "PY", "python3 y.py"],
         ):
@@ -8309,6 +8318,7 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["python3 -Is x.py"],
             ["python3 -X dev -I x.py"],
             ["python3 -I - \"$CHECKER\" <<'PY'", "print('python')", "import python3", "PY"],
+            ["python3 -I <<'PY'", "print('python')", "PY"],
             ["echo done"],
         ):
             document = self._document(workflow(script))
