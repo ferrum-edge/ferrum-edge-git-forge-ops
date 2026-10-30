@@ -39,6 +39,50 @@ impl OverrideDecision {
     }
 }
 
+/// The `=== Override ===` line `plan` prints for a decision. The approver is
+/// GitHub's text, so only a [`crate::display::peer_text`] copy is quoted.
+pub fn plan_override_note(decision: &OverrideDecision) -> String {
+    match (decision.active, &decision.approver) {
+        (true, Some(approver)) => format!(
+            "Blocking findings overridden by @{}.",
+            crate::display::peer_text(approver)
+        ),
+        (true, None) => "Blocking findings overridden.".to_string(),
+        (false, _) => format!("Override inactive: {}.", decision.reason),
+    }
+}
+
+/// The variable a workflow sets to name the PR an override is evaluated on.
+pub const PR_NUMBER_ENV: &str = "GITFORGEOPS_PR_NUMBER";
+
+/// Parse a [`PR_NUMBER_ENV`] value. Unset or blank is `None` (the caller may
+/// fall back to the commit's associated PR); anything else must be a positive
+/// decimal integer. A malformed value is an error rather than a silent
+/// fallback, which could evaluate the override on a different PR.
+pub fn parse_pr_number(value: Option<&str>) -> crate::error::Result<Option<u64>> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match value.parse::<u64>() {
+        Ok(number) if number > 0 && value.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(number)),
+        _ => Err(crate::error::Error::Config(format!(
+            "{PR_NUMBER_ENV} is set but is not a positive integer; refusing to guess the pull request"
+        ))),
+    }
+}
+
+/// [`parse_pr_number`] over the process environment. A non-UTF-8 value is
+/// malformed, not unset.
+pub fn pr_number_from_env() -> crate::error::Result<Option<u64>> {
+    match std::env::var(PR_NUMBER_ENV) {
+        Ok(value) => parse_pr_number(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(crate::error::Error::Config(format!(
+            "{PR_NUMBER_ENV} is set but is not a positive integer; refusing to guess the pull request"
+        ))),
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct Label {
     name: String,
@@ -201,15 +245,53 @@ async fn check_override_context(
         .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
         .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
         // Bearer-token calls to api.github.com only: never follow a redirect
-        // with the token, never downgrade to http://. Pagination follows the
-        // `Link` header through fresh requests, not 3xx responses.
+        // with the token, never downgrade to http://. Pagination requests
+        // numbered pages from the fixed origin until one is empty, never a
+        // `Link` URL or a 3xx target.
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
 
-    let pr_url = format!("https://api.github.com/repos/{repo}/pulls/{pr_number}");
-    let pr: PullRequest = match fetch_json(&client, &pr_url, token).await {
+    check_override_at(
+        &client,
+        crate::secrets::DEFAULT_GITHUB_API_BASE,
+        repo,
+        token,
+        override_cfg,
+        pr_number,
+        |tree, merged, merge_revision| {
+            super::override_input::verify_current_input(
+                tree,
+                merged,
+                merge_revision,
+                review_context,
+            )
+        },
+    )
+    .await
+}
+
+/// [`check_override`] against an explicit API origin and input verifier.
+///
+/// Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`] and
+/// [`super::override_input::verify_current_input`]; tests pass a loopback stub
+/// and a fixed verdict. Every request goes to a fixed path under `api_base`.
+pub async fn check_override_at<F>(
+    client: &Client,
+    api_base: &str,
+    repo: &str,
+    token: &str,
+    override_cfg: &OverrideConfig,
+    pr_number: u64,
+    verify_input: F,
+) -> crate::error::Result<OverrideDecision>
+where
+    F: FnOnce(&serde_json::Value, bool, Option<&str>) -> Result<String, String>,
+{
+    let api_base = api_base.trim_end_matches('/');
+    let pr_url = format!("{api_base}/repos/{repo}/pulls/{pr_number}");
+    let pr: PullRequest = match fetch_json(client, &pr_url, token).await {
         Ok(value) => match serde_json::from_value(value) {
             Ok(pr) => pr,
             Err(e) => {
@@ -238,20 +320,26 @@ async fn check_override_context(
     // matching `labeled` event across all pages and the matching `unlabeled`
     // events, so a label that was added, removed, and re-added is correctly
     // attributed to the last add.
-    let approver =
-        match find_override_labeler(&client, repo, pr_number, token, &override_cfg.require_label)
-            .await
-        {
-            Ok(Some(login)) => login,
-            Ok(None) => {
-                return Ok(OverrideDecision::inactive(
-                    "no labeling event found for override label across all event pages",
-                ))
-            }
-            Err(e) => return Ok(OverrideDecision::inactive(&format!("fetch events: {e}"))),
-        };
+    let approver = match find_override_labeler_at(
+        client,
+        api_base,
+        repo,
+        pr_number,
+        token,
+        &override_cfg.require_label,
+    )
+    .await
+    {
+        Ok(Some(login)) => login,
+        Ok(None) => {
+            return Ok(OverrideDecision::inactive(
+                "no labeling event found for override label across all event pages",
+            ))
+        }
+        Err(e) => return Ok(OverrideDecision::inactive(&format!("fetch events: {e}"))),
+    };
 
-    let permission = match fetch_permission(&client, repo, &approver, token).await {
+    let permission = match fetch_permission_at(client, api_base, repo, &approver, token).await {
         Ok(p) => p,
         Err(e) => {
             return Ok(OverrideDecision::inactive(&format!(
@@ -272,7 +360,7 @@ async fn check_override_context(
         )));
     }
 
-    let reviews = match fetch_reviews(&client, repo, pr_number, token).await {
+    let reviews = match fetch_reviews_at(client, api_base, repo, pr_number, token).await {
         Ok(reviews) => reviews,
         Err(_) => {
             return Ok(OverrideDecision::inactive(
@@ -294,10 +382,10 @@ async fn check_override_context(
         }
     };
     let tree_url = format!(
-        "https://api.github.com/repos/{repo}/git/trees/{}?recursive=1",
+        "{api_base}/repos/{repo}/git/trees/{}?recursive=1",
         pr.head.sha
     );
-    let tree = match fetch_json(&client, &tree_url, token).await {
+    let tree = match fetch_json(client, &tree_url, token).await {
         Ok(tree) => tree,
         Err(_) => {
             return Ok(OverrideDecision::inactive(
@@ -305,18 +393,13 @@ async fn check_override_context(
             ))
         }
     };
-    let applied_revision = match super::override_input::verify_current_input(
-        &tree,
-        pr.merged,
-        pr.merge_commit_sha.as_deref(),
-        review_context,
-    ) {
+    let applied_revision = match verify_input(&tree, pr.merged, pr.merge_commit_sha.as_deref()) {
         Ok(revision) => revision,
         Err(reason) => return Ok(OverrideDecision::inactive(&reason)),
     };
     // Close the API-read window as far as a client can: a push, merge, or label
     // change while collecting evidence invalidates this decision.
-    let current = fetch_json(&client, &pr_url, token)
+    let current = fetch_json(client, &pr_url, token)
         .await
         .ok()
         .and_then(|value| serde_json::from_value::<PullRequest>(value).ok());
@@ -325,12 +408,26 @@ async fn check_override_context(
             "PR changed during override verification",
         ));
     }
-    let current_labeler =
-        find_override_labeler(&client, repo, pr_number, token, &override_cfg.require_label)
-            .await
-            .ok()
-            .flatten();
-    let current_reviews = fetch_reviews(&client, repo, pr_number, token).await.ok();
+    let current_labeler = find_override_labeler_at(
+        client,
+        api_base,
+        repo,
+        pr_number,
+        token,
+        &override_cfg.require_label,
+    )
+    .await
+    .ok()
+    .flatten();
+    // The labeler's permission is part of the evidence: a demotion while the
+    // rest was collected revokes the override like a relabel does.
+    let permission_still_sufficient = fetch_permission_at(client, api_base, repo, &approver, token)
+        .await
+        .ok()
+        .is_some_and(|permission| override_cfg.is_sufficient(&permission));
+    let current_reviews = fetch_reviews_at(client, api_base, repo, pr_number, token)
+        .await
+        .ok();
     let current_review = current_reviews.as_ref().and_then(|reviews| {
         authorized_review(
             reviews,
@@ -339,7 +436,10 @@ async fn check_override_context(
             &pr.head.sha,
         )
     });
-    if current_labeler.as_deref() != Some(approver.as_str()) || current_review != Some(review) {
+    if current_labeler.as_deref() != Some(approver.as_str())
+        || !permission_still_sufficient
+        || current_review != Some(review)
+    {
         return Ok(OverrideDecision::inactive(
             "override evidence changed during verification",
         ));
@@ -371,34 +471,23 @@ async fn check_override_context(
 /// "latest" = highest page, later index within a page. We scan pages in order
 /// and keep the most recent matching add event, tracking whether a later
 /// unlabel supersedes it.
+///
+/// Completeness is proven by data, never by headers: numbered pages are read
+/// from the fixed origin until one returns zero items. A short page is not
+/// taken as the last (GitHub may cap `per_page`, or the listing may grow
+/// while it is read), so the next numbered page is always requested too, and
+/// anything it holds is read. Reaching the page cap without an empty page
+/// fails closed.
 const MAX_ISSUE_EVENT_PAGES: usize = 20;
 
-async fn find_override_labeler(
-    client: &Client,
-    repo: &str,
-    pr_number: u64,
-    token: &str,
-    label_name: &str,
-) -> crate::error::Result<Option<String>> {
-    find_override_labeler_at(
-        client,
-        crate::secrets::DEFAULT_GITHUB_API_BASE,
-        repo,
-        pr_number,
-        token,
-        label_name,
-    )
-    .await
-}
-
-/// [`find_override_labeler`] against an explicit API origin.
+/// The login that most recently added `label_name`, against an explicit API
+/// origin (`None` when a later `unlabeled` event supersedes it).
 ///
 /// Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`]; tests pass a
-/// loopback stub. Pages are requested by number from `api_base`. A response's
-/// `Link` header is never followed, so the bearer token cannot be sent to a
-/// host or path a response names. An exactly full page requires another read
-/// to prove completeness, and reaching the page cap with a full page fails
-/// closed so a later relabel cannot be missed.
+/// loopback stub. Pages are requested by number from `api_base` until one is
+/// empty (see [`MAX_ISSUE_EVENT_PAGES`]). A response's `Link` header is
+/// neither followed nor consulted, so the bearer token cannot be sent to a
+/// host or path a response names and no header can end the history early.
 pub async fn find_override_labeler_at(
     client: &Client,
     api_base: &str,
@@ -416,7 +505,7 @@ pub async fn find_override_labeler_at(
         let events: Vec<IssueEvent> =
             serde_json::from_value(fetch_json(client, &url, token).await?)
                 .map_err(|e| crate::http_client::malformed_response("parse events", &e))?;
-        let complete = events.len() < 100;
+        let complete = events.is_empty();
 
         for event in events {
             let matches_label = event
@@ -449,49 +538,279 @@ pub async fn find_override_labeler_at(
     ))
 }
 
-async fn fetch_reviews(
+/// Every submitted review on the PR, oldest first, against an explicit API
+/// origin. Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`];
+/// tests pass a loopback stub.
+pub async fn fetch_reviews_at(
     client: &Client,
+    api_base: &str,
     repo: &str,
     pr_number: u64,
     token: &str,
 ) -> crate::error::Result<Vec<OverrideReview>> {
+    let api_base = api_base.trim_end_matches('/');
     let mut reviews = Vec::new();
-    // Request numbered pages from the fixed API origin, never a supplied URL.
-    // An exactly full final page requires another read to prove completeness.
+    // Request numbered pages from the fixed API origin, never a supplied URL,
+    // until one is empty (see MAX_ISSUE_EVENT_PAGES); headers decide nothing.
     for page in 1..=MAX_ISSUE_EVENT_PAGES {
-        let url = format!(
-            "https://api.github.com/repos/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}"
-        );
+        let url =
+            format!("{api_base}/repos/{repo}/pulls/{pr_number}/reviews?per_page=100&page={page}");
         let batch: Vec<OverrideReview> =
             serde_json::from_value(fetch_json(client, &url, token).await?)
                 .map_err(|e| crate::http_client::malformed_response("parse reviews", &e))?;
-        let complete = batch.len() < 100;
-        reviews.extend(batch);
-        if complete {
+        if batch.is_empty() {
             return Ok(reviews);
         }
+        reviews.extend(batch);
     }
     Err(crate::error::Error::Config(
         "override review history exceeds pagination safety cap".into(),
     ))
 }
 
-/// Extract the `rel="next"` URL from a GitHub `Link` header. Returns `None`
-/// when there is no next page.
-pub fn parse_next_link(header: &str) -> Option<String> {
-    for entry in header.split(',') {
-        let entry = entry.trim();
-        // Format: `<URL>; rel="next"`
-        let (url_part, rel_part) = entry.split_once(';')?;
-        let url = url_part
-            .trim()
-            .trim_start_matches('<')
-            .trim_end_matches('>');
-        if rel_part.trim() == "rel=\"next\"" {
-            return Some(url.to_string());
+/// What one `Link` header value says about a next page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextLink {
+    /// The value parses unambiguously and no link-value has a `next` relation.
+    Absent,
+    /// The target of the link-value(s) with a `next` relation, as written.
+    Next(String),
+    /// The value is not an unambiguous RFC 8288 `#link-value` list, or names
+    /// two different `next` targets.
+    Ambiguous,
+}
+
+/// Classify one `Link` header value (RFC 8288): `rel` is matched
+/// case-insensitively with a token or quoted-string value and optional
+/// whitespace around `=`; relation types are space-separated and compared
+/// case-insensitively; every comma-separated link-value is read, so a
+/// malformed entry never hides a later one (it makes the whole value
+/// [`NextLink::Ambiguous`]). Every relation type must be a valid
+/// `reg-rel-type` or `ext-rel-type`, and every target a non-empty
+/// `URI-Reference` of RFC 3986 characters.
+///
+/// Used by SSH key discovery, where pagination affects only availability.
+/// Override evidence never consults `Link`: it reads numbered pages until one
+/// is empty.
+pub fn next_link(header: &str) -> NextLink {
+    let Some(values) = link_values(header) else {
+        return NextLink::Ambiguous;
+    };
+    let mut next: Option<String> = None;
+    for (target, relations) in values {
+        if !relations
+            .iter()
+            .any(|relation| relation.eq_ignore_ascii_case("next"))
+        {
+            continue;
+        }
+        match &next {
+            Some(existing) if existing != &target => return NextLink::Ambiguous,
+            _ => next = Some(target),
         }
     }
-    None
+    next.map_or(NextLink::Absent, NextLink::Next)
+}
+
+/// The `next` target of a `Link` header value, or `None` when it names none
+/// or does not parse unambiguously. Callers that must prove a listing
+/// complete use [`next_link`] and treat [`NextLink::Ambiguous`] as more.
+pub fn parse_next_link(header: &str) -> Option<String> {
+    match next_link(header) {
+        NextLink::Next(target) => Some(target),
+        NextLink::Absent | NextLink::Ambiguous => None,
+    }
+}
+
+/// An RFC 8288 `relation-type`: a `reg-rel-type` (`LOALPHA *( LOALPHA / DIGIT
+/// / "." / "-" )`, compared case-insensitively, so either case is accepted) or
+/// an `ext-rel-type` (an absolute URI: a scheme, `:`, then RFC 3986 URI
+/// characters with valid percent-escapes, which `Url` also parses). `,` and
+/// `;` are refused even inside an extension URI: they are list and parameter
+/// separators in the header, so a type holding one is treated as ambiguous
+/// rather than read either way.
+fn is_relation_type(relation: &str) -> bool {
+    let bytes = relation.as_bytes();
+    let Some((&first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    if rest
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return true;
+    }
+    let Some(colon) = bytes.iter().position(|&byte| byte == b':') else {
+        return false;
+    };
+    let scheme_ok = bytes[1..colon]
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'));
+    scheme_ok
+        && colon + 1 < bytes.len()
+        && is_uri_text(&bytes[colon + 1..], b",;")
+        && reqwest::Url::parse(relation).is_ok()
+}
+
+/// RFC 3986 characters only: unreserved, reserved (minus `forbidden`) and
+/// `pct-encoded` (`%` then exactly two hex digits), with at most one `#`.
+fn is_uri_text(bytes: &[u8], forbidden: &[u8]) -> bool {
+    let mut at = 0;
+    let mut fragments = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == b'%' {
+            let escape = bytes.get(at + 1..at + 3);
+            if !escape.is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
+                return false;
+            }
+            at += 3;
+            continue;
+        }
+        if byte == b'#' {
+            fragments += 1;
+        }
+        let allowed = byte.is_ascii_alphanumeric()
+            || b"-._~".contains(&byte)
+            || b":/?#[]@!$&'()*+,;=".contains(&byte);
+        if !allowed || forbidden.contains(&byte) || fragments > 1 {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
+/// Every link-value of one `Link` header value as `(target, relation types)`,
+/// or `None` when the value is not an unambiguous RFC 8288 `#link-value` list.
+fn link_values(header: &str) -> Option<Vec<(String, Vec<String>)>> {
+    fn is_tchar(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    }
+    fn skip_ows(bytes: &[u8], at: &mut usize) {
+        while *at < bytes.len() && matches!(bytes[*at], b' ' | b'\t') {
+            *at += 1;
+        }
+    }
+    fn token(bytes: &[u8], at: &mut usize) -> Option<String> {
+        let start = *at;
+        while *at < bytes.len() && is_tchar(bytes[*at]) {
+            *at += 1;
+        }
+        (*at > start).then(|| String::from_utf8_lossy(&bytes[start..*at]).into_owned())
+    }
+    fn quoted(bytes: &[u8], at: &mut usize) -> Option<String> {
+        // Caller has seen the opening quote.
+        *at += 1;
+        let mut value = Vec::new();
+        while *at < bytes.len() {
+            match bytes[*at] {
+                b'"' => {
+                    *at += 1;
+                    return String::from_utf8(value).ok();
+                }
+                b'\\' => {
+                    let escaped = *bytes.get(*at + 1)?;
+                    value.push(escaped);
+                    *at += 2;
+                }
+                byte => {
+                    value.push(byte);
+                    *at += 1;
+                }
+            }
+        }
+        None
+    }
+
+    let bytes = header.as_bytes();
+    let mut at = 0;
+    let mut values = Vec::new();
+    loop {
+        skip_ows(bytes, &mut at);
+        match bytes.get(at) {
+            None => return Some(values),
+            // Empty list elements are allowed by the `#` rule.
+            Some(b',') => {
+                at += 1;
+                continue;
+            }
+            Some(b'<') => {}
+            Some(_) => return None,
+        }
+        // `<URI-Reference>`: a URI cannot contain a raw `<` or `>`.
+        let close = bytes[at + 1..]
+            .iter()
+            .position(|byte| matches!(byte, b'<' | b'>'))?;
+        if bytes[at + 1 + close] != b'>' {
+            return None;
+        }
+        // `URI-Reference`: non-empty RFC 3986 characters with valid
+        // percent-escapes (`<`, `>` and whitespace are outside that set).
+        let target = &bytes[at + 1..at + 1 + close];
+        if target.is_empty() || !is_uri_text(target, b"") {
+            return None;
+        }
+        let target = String::from_utf8(target.to_vec()).ok()?;
+        at += close + 2;
+        let mut relations = Vec::new();
+        let mut last = false;
+        loop {
+            skip_ows(bytes, &mut at);
+            match bytes.get(at) {
+                None => {
+                    last = true;
+                    break;
+                }
+                Some(b',') => {
+                    at += 1;
+                    break;
+                }
+                Some(b';') => at += 1,
+                Some(_) => return None,
+            }
+            skip_ows(bytes, &mut at);
+            let name = token(bytes, &mut at)?;
+            skip_ows(bytes, &mut at);
+            let value = if bytes.get(at) == Some(&b'=') {
+                at += 1;
+                skip_ows(bytes, &mut at);
+                Some(if bytes.get(at) == Some(&b'"') {
+                    quoted(bytes, &mut at)?
+                } else {
+                    token(bytes, &mut at)?
+                })
+            } else {
+                None
+            };
+            let name = name.to_ascii_lowercase();
+            if name == "rel" {
+                // A `rel` without a value names no relation unambiguously.
+                // `relation-types`: relation types separated by `1*SP`, no
+                // leading or trailing space; each must be a valid type.
+                let value = value?;
+                if value.is_empty() || value.starts_with(' ') || value.ends_with(' ') {
+                    return None;
+                }
+                for relation in value.split(' ').filter(|relation| !relation.is_empty()) {
+                    if !is_relation_type(relation) {
+                        return None;
+                    }
+                    relations.push(relation.to_string());
+                }
+            } else if name == "rel*" {
+                // An extended-notation relation is not unambiguously absent.
+                return None;
+            }
+        }
+        values.push((target, relations));
+        if last {
+            return Some(values);
+        }
+    }
 }
 
 async fn fetch_json(
@@ -521,13 +840,14 @@ async fn fetch_json(
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))
 }
 
-async fn fetch_permission(
+async fn fetch_permission_at(
     client: &Client,
+    api_base: &str,
     repo: &str,
     login: &str,
     token: &str,
 ) -> crate::error::Result<String> {
-    let url = format!("https://api.github.com/repos/{repo}/collaborators/{login}/permission");
+    let url = format!("{api_base}/repos/{repo}/collaborators/{login}/permission");
     let value = fetch_json(client, &url, token).await?;
     let parsed: PermissionResponse = serde_json::from_value(value)
         .map_err(|e| crate::http_client::malformed_response("parse permission", &e))?;
@@ -549,4 +869,134 @@ pub fn apply_override(findings: &mut [super::PolicyFinding], decision: &Override
             finding.overridden_by = Some(by.clone());
         }
     }
+}
+
+/// The identity an override is bound to: rule, severity, resource and message
+/// of a finding in the unresolved (committed) document. A finding after
+/// credential resolution that differs in any of them is one the override
+/// review did not accept.
+fn reviewed_identity(finding: &super::PolicyFinding) -> FindingIdentity {
+    (
+        finding.rule_id.clone(),
+        finding.severity,
+        finding.kind.clone(),
+        finding.namespace.clone(),
+        finding.id.clone(),
+        finding.message.clone(),
+    )
+}
+
+/// Explains a blocking finding that only credential resolution produced.
+pub const RESOLUTION_ONLY_REMEDIATION: &str = "appeared only after credential resolution; a policy override covers only findings in the committed (unresolved) configuration, so fix the resource or the credential value";
+
+/// [`apply_override`] limited to blocking findings that also appear in
+/// `reviewed`, the evaluation of the unresolved (committed) document.
+///
+/// api-mode apply re-evaluates policy after credential resolution. A blocking
+/// finding that exists only in the resolved document is not a finding of the
+/// reviewed revision's committed bytes, so the override does not cover it; it
+/// stays blocking. Returns how many blocking findings were left uncovered for
+/// that reason.
+pub fn apply_override_to_reviewed(
+    findings: &mut [super::PolicyFinding],
+    decision: &OverrideDecision,
+    reviewed: &[super::PolicyFinding],
+) -> usize {
+    if !decision.active {
+        return 0;
+    }
+    let by = decision
+        .approver
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    // A multiset: one unresolved finding covers one identical resolved
+    // finding, never several.
+    let mut reviewed = identity_counts(
+        reviewed
+            .iter()
+            .filter(|finding| finding.severity.blocks_apply()),
+    );
+    let mut uncovered = 0;
+    for finding in findings.iter_mut() {
+        if !finding.severity.blocks_apply() {
+            continue;
+        }
+        if take_identity(&mut reviewed, finding) {
+            finding.overridden_by = Some(by.clone());
+        } else {
+            uncovered += 1;
+        }
+    }
+    uncovered
+}
+
+type FindingIdentity = (String, super::Severity, String, String, String, String);
+
+fn identity_counts<'a>(
+    findings: impl Iterator<Item = &'a super::PolicyFinding>,
+) -> std::collections::HashMap<FindingIdentity, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for finding in findings {
+        *counts.entry(reviewed_identity(finding)).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Consume one occurrence of `finding`'s identity; false once exhausted.
+fn take_identity(
+    counts: &mut std::collections::HashMap<FindingIdentity, usize>,
+    finding: &super::PolicyFinding,
+) -> bool {
+    match counts.get_mut(&reviewed_identity(finding)) {
+        Some(count) if *count > 0 => {
+            *count -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The policy findings `plan` and `review` preview, gated exactly as `apply`
+/// gates them.
+///
+/// `apply` refuses on the unresolved document with the whole override, then
+/// (api mode only) on the resolved document with the override limited to
+/// unresolved findings ([`apply_override_to_reviewed`]). The preview is the
+/// unresolved findings plus, when `resolved` is given, every resolved finding
+/// with no unresolved twin. Such a finding stays blocking under an active
+/// override and carries [`RESOLUTION_ONLY_REMEDIATION`]. Returns the list and
+/// how many blocking findings the override leaves uncovered.
+pub fn preview_policy_findings(
+    unresolved: &[super::PolicyFinding],
+    resolved: Option<&[super::PolicyFinding]>,
+    decision: Option<&OverrideDecision>,
+) -> (Vec<super::PolicyFinding>, usize) {
+    let mut preview = unresolved.to_vec();
+    if let Some(decision) = decision {
+        apply_override(&mut preview, decision);
+    }
+    let Some(resolved) = resolved else {
+        return (preview, 0);
+    };
+    let mut resolved = resolved.to_vec();
+    let uncovered = decision
+        .map(|decision| apply_override_to_reviewed(&mut resolved, decision, unresolved))
+        .unwrap_or(0);
+    // Each unresolved finding has at most one resolved twin, matched in the
+    // same order `apply_override_to_reviewed` covers them; the rest are
+    // resolution-only.
+    let mut twins = identity_counts(unresolved.iter());
+    let active = decision.is_some_and(|decision| decision.active);
+    let resolution_only: Vec<_> = resolved
+        .into_iter()
+        .filter(|finding| !take_identity(&mut twins, finding))
+        .map(|mut finding| {
+            if active && finding.is_blocking() {
+                finding.remediation = Some(RESOLUTION_ONLY_REMEDIATION.to_string());
+            }
+            finding
+        })
+        .collect();
+    preview.extend(resolution_only);
+    (preview, uncovered)
 }

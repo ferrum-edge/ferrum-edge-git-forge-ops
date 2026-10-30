@@ -98,7 +98,13 @@ fn fixture() -> (tempfile::TempDir, String, Value) {
     );
     write(dir.path(), ".gitforgeops/policies.yaml", "version: 1\n");
     let head = commit(dir.path());
-    let tree = git(dir.path(), &["ls-tree", "-rz", "HEAD"]);
+    let tree = head_tree(dir.path());
+    (dir, head, tree)
+}
+
+/// The GitHub recursive-tree evidence for the fixture's current `HEAD`.
+fn head_tree(root: &Path) -> Value {
+    let tree = git(root, &["ls-tree", "-rz", "HEAD"]);
     let entries: Vec<_> = tree
         .split('\0')
         .filter(|row| !row.is_empty())
@@ -108,7 +114,7 @@ fn fixture() -> (tempfile::TempDir, String, Value) {
             json!({"path": path, "mode": fields[0], "type": fields[1], "sha": fields[2]})
         })
         .collect();
-    (dir, head, json!({"truncated": false, "tree": entries}))
+    json!({"truncated": false, "tree": entries})
 }
 
 #[test]
@@ -292,4 +298,464 @@ fn custom_or_absent_role_name_falls_back_to_legacy_permission() {
     assert_eq!(custom.effective_permission(), "write");
     let absent = permission_response(json!({"permission": "admin"}));
     assert_eq!(absent.effective_permission(), "admin");
+}
+
+/// #562: every file under `.gitforgeops/` is bound input, including files Git
+/// ignores. The binary reads `smoke.yaml` from disk, so an excluded untracked
+/// copy must not slip past the reviewed tree.
+#[test]
+fn actual_input_binds_ignored_files_under_gitforgeops() {
+    // `.git/info/exclude`
+    let (dir, head, tree) = fixture();
+    write(dir.path(), ".git/info/exclude", ".gitforgeops/smoke.yaml\n");
+    assert_eq!(
+        verify_input(&tree, dir.path(), dir.path(), false, None),
+        Ok(head)
+    );
+    write(dir.path(), ".gitforgeops/smoke.yaml", "version: 2\n");
+    assert!(git(dir.path(), &["status", "--porcelain"]).is_empty());
+    assert!(verify_input(&tree, dir.path(), dir.path(), false, None).is_err());
+
+    // `core.excludesFile`
+    let (dir, _, tree) = fixture();
+    let excludes = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(excludes.path(), "smoke.yaml\n").unwrap();
+    git(
+        dir.path(),
+        &[
+            "config",
+            "core.excludesFile",
+            excludes.path().to_str().unwrap(),
+        ],
+    );
+    write(dir.path(), ".gitforgeops/smoke.yaml", "version: 2\n");
+    assert!(git(dir.path(), &["status", "--porcelain"]).is_empty());
+    assert!(verify_input(&tree, dir.path(), dir.path(), false, None).is_err());
+
+    // A reviewed `.gitignore` entry.
+    let (dir, _, _) = fixture();
+    write(dir.path(), ".gitignore", ".gitforgeops/*.local.yaml\n");
+    let head = commit(dir.path());
+    let tree = head_tree(dir.path());
+    assert_eq!(
+        verify_input(&tree, dir.path(), dir.path(), false, None),
+        Ok(head)
+    );
+    write(dir.path(), ".gitforgeops/smoke.local.yaml", "version: 2\n");
+    assert!(git(dir.path(), &["status", "--porcelain"]).is_empty());
+    assert!(verify_input(&tree, dir.path(), dir.path(), false, None).is_err());
+}
+
+/// Binding `.gitforgeops/` does not start comparing ignored build and runtime
+/// outputs elsewhere.
+#[test]
+fn actual_input_still_ignores_build_and_runtime_outputs() {
+    let (dir, head, tree) = fixture();
+    write(dir.path(), ".git/info/exclude", "target/\n.worktrees/\n");
+    write(dir.path(), "target/debug/gitforgeops", "binary\n");
+    write(dir.path(), ".worktrees/other/src/main.rs", "// elsewhere\n");
+    write(dir.path(), ".state/dev.json", "{}\n");
+    write(dir.path(), "assembled/resources.yaml", "generated\n");
+    assert_eq!(
+        verify_input(&tree, dir.path(), dir.path(), false, None),
+        Ok(head)
+    );
+}
+
+/// Split trusted review copies only protected configuration into the data
+/// checkout. A reviewed `.gitforgeops` file may be absent there, but each file
+/// present must be the reviewed blob, and nothing unreviewed may be added.
+#[test]
+fn split_review_binds_present_gitforgeops_files_to_the_reviewed_tree() {
+    let (source, _, _) = fixture();
+    write(source.path(), ".gitforgeops/smoke.yaml", "version: 2\n");
+    write(source.path(), ".gitforgeops/baseline.json", "{}\n");
+    commit(source.path());
+    let tree = head_tree(source.path());
+    let data = tempfile::tempdir().unwrap();
+    write(
+        data.path(),
+        "resources/team/proxies/app.yaml",
+        "kind: Proxy\n",
+    );
+    write(data.path(), ".gitforgeops/policies.yaml", "version: 1\n");
+    assert!(verify_input(&tree, source.path(), data.path(), false, None).is_ok());
+    write(data.path(), ".gitforgeops/smoke.yaml", "version: 2\n");
+    assert!(verify_input(&tree, source.path(), data.path(), false, None).is_ok());
+    write(
+        data.path(),
+        ".gitforgeops/smoke.yaml",
+        "version: 2\nchecks: {}\n",
+    );
+    assert!(verify_input(&tree, source.path(), data.path(), false, None).is_err());
+    write(data.path(), ".gitforgeops/smoke.yaml", "version: 2\n");
+    write(data.path(), ".gitforgeops/extra/notes.yaml", "unreviewed\n");
+    assert!(verify_input(&tree, source.path(), data.path(), false, None).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn actual_input_refuses_symlinks_under_gitforgeops() {
+    let (dir, _, tree) = fixture();
+    std::os::unix::fs::symlink("policies.yaml", dir.path().join(".gitforgeops/smoke.yaml"))
+        .unwrap();
+    assert!(verify_input(&tree, dir.path(), dir.path(), false, None).is_err());
+
+    let (source, _, tree) = fixture();
+    let data = tempfile::tempdir().unwrap();
+    let real = tempfile::tempdir().unwrap();
+    write(real.path(), "policies.yaml", "version: 1\n");
+    write(
+        data.path(),
+        "resources/team/proxies/app.yaml",
+        "kind: Proxy\n",
+    );
+    std::os::unix::fs::symlink(real.path(), data.path().join(".gitforgeops")).unwrap();
+    assert!(verify_input(&tree, source.path(), data.path(), false, None).is_err());
+}
+
+fn policy_finding(rule_id: &str, id: &str, message: &str) -> gitforgeops::policy::PolicyFinding {
+    gitforgeops::policy::PolicyFinding {
+        rule_id: rule_id.into(),
+        severity: gitforgeops::policy::Severity::Error,
+        kind: "PluginConfig".into(),
+        id: id.into(),
+        namespace: "ferrum".into(),
+        message: message.into(),
+        remediation: None,
+        overridden_by: None,
+    }
+}
+
+fn active_decision() -> OverrideDecision {
+    OverrideDecision {
+        active: true,
+        approver: Some("maintainer".into()),
+        permission: Some("write".into()),
+        reason: "verified".into(),
+        pr_number: Some(7),
+        authorized_head: Some("a".repeat(40)),
+        review_id: Some(42),
+        applied_revision: Some("a".repeat(40)),
+    }
+}
+
+/// #562: apply re-evaluates policy after credential resolution. The override
+/// covers the findings plan and review showed; a blocking finding that appears
+/// only after resolution refuses apply and says why, without its value.
+#[test]
+fn override_covers_only_findings_present_before_credential_resolution() {
+    use gitforgeops::policy::refusal::refuse_post_resolution_policy_violations;
+    use gitforgeops::secrets::{
+        PlaceholderAlloc, ResolveReport, ResolveResult, SecretPlaceholder, SecretScrubber,
+        SlotStatus,
+    };
+
+    let reviewed = vec![policy_finding(
+        "backend_scheme",
+        "app",
+        "http is not allowed",
+    )];
+    let decision = active_decision();
+
+    // Exactly the reviewed findings: covered, apply continues.
+    let mut same = reviewed.clone();
+    assert!(
+        refuse_post_resolution_policy_violations(&mut same, &reviewed, Some(&decision), None)
+            .is_none()
+    );
+    assert_eq!(same[0].overridden_by.as_deref(), Some("maintainer"));
+
+    // A resolution-only finding is not covered, even with an active override.
+    let secret = "Q7m2Vx9c2L-resolved";
+    let config: gitforgeops::config::schema::GatewayConfig = serde_json::from_value(json!({
+        "consumers": [{
+            "id": "app",
+            "username": "app",
+            "namespace": "ferrum",
+            "credentials": {"keyauth": [{"key": secret}]}
+        }]
+    }))
+    .unwrap();
+    let report = ResolveReport {
+        results: vec![ResolveResult {
+            consumer_id: "app".into(),
+            namespace: "ferrum".into(),
+            cred_key: "keyauth/key".into(),
+            slot: gitforgeops::secrets::slot_path("ferrum", "app", "keyauth/key"),
+            placeholder: SecretPlaceholder {
+                alloc: PlaceholderAlloc::Require,
+                length_bytes: 32,
+            },
+            status: SlotStatus::Resolved,
+        }],
+        ..ResolveReport::default()
+    };
+    let scrubber = SecretScrubber::from_gateway_config_with_report(&config, &report);
+    let mut resolved = reviewed.clone();
+    resolved.push(policy_finding(
+        "rate_limit_completeness",
+        "limiter",
+        &format!("resolved value {secret} weakens the limiter"),
+    ));
+    let message = refuse_post_resolution_policy_violations(
+        &mut resolved,
+        &reviewed,
+        Some(&decision),
+        Some(&scrubber),
+    )
+    .expect("a resolution-only finding refuses apply");
+    assert!(message.contains("after credential resolution"), "{message}");
+    assert!(
+        message.contains("1 blocking finding(s) appeared only after credential resolution"),
+        "{message}"
+    );
+    assert!(message.contains("does not cover them"), "{message}");
+    assert!(message.contains("rate_limit_completeness"), "{message}");
+    assert!(!message.contains("backend_scheme"), "{message}");
+    assert!(!message.contains(secret), "{message}");
+    assert_eq!(resolved[0].overridden_by.as_deref(), Some("maintainer"));
+    assert!(resolved[1].is_blocking());
+
+    // The same rule on the same resource with a different message is a
+    // different finding than the one reviewed.
+    let mut changed = vec![policy_finding(
+        "backend_scheme",
+        "app",
+        "http is not allowed (resolved)",
+    )];
+    assert!(refuse_post_resolution_policy_violations(
+        &mut changed,
+        &reviewed,
+        Some(&decision),
+        None
+    )
+    .is_some());
+
+    // A multiset: one reviewed finding covers one identical resolved finding.
+    // A second identical copy that only resolution produced stays blocking,
+    // in apply and in the preview alike.
+    let mut duplicated = vec![reviewed[0].clone(), reviewed[0].clone()];
+    let message =
+        refuse_post_resolution_policy_violations(&mut duplicated, &reviewed, Some(&decision), None)
+            .expect("the second identical finding is not covered");
+    assert!(
+        message.contains("1 blocking finding(s) appeared only after credential resolution"),
+        "{message}"
+    );
+    assert_eq!(duplicated[0].overridden_by.as_deref(), Some("maintainer"));
+    assert!(duplicated[1].is_blocking());
+    let (preview, uncovered) = gitforgeops::policy::github_override::preview_policy_findings(
+        &reviewed,
+        Some(&[reviewed[0].clone(), reviewed[0].clone()]),
+        Some(&decision),
+    );
+    assert_eq!(uncovered, 1);
+    assert_eq!(preview.len(), 2, "{preview:?}");
+    assert_eq!(preview.iter().filter(|f| f.is_blocking()).count(), 1);
+    // Two reviewed copies cover two resolved copies.
+    let twice = vec![reviewed[0].clone(), reviewed[0].clone()];
+    let mut resolved_twice = twice.clone();
+    assert!(refuse_post_resolution_policy_violations(
+        &mut resolved_twice,
+        &twice,
+        Some(&decision),
+        None
+    )
+    .is_none());
+
+    // Without an active override every blocking finding refuses as before.
+    let mut inactive = reviewed.clone();
+    let message = refuse_post_resolution_policy_violations(
+        &mut inactive,
+        &reviewed,
+        Some(&OverrideDecision::inactive("label missing")),
+        None,
+    )
+    .expect("no override");
+    assert!(!message.contains("appeared only after"), "{message}");
+}
+
+/// #562: `GITFORGEOPS_PR_NUMBER` is either unset/blank or a positive integer.
+/// Anything else is an error, never a fallback to the commit's associated PR.
+#[test]
+fn pr_number_override_must_be_a_positive_integer() {
+    use gitforgeops::policy::github_override::parse_pr_number;
+    assert_eq!(parse_pr_number(None).unwrap(), None);
+    assert_eq!(parse_pr_number(Some("")).unwrap(), None);
+    assert_eq!(parse_pr_number(Some("  ")).unwrap(), None);
+    assert_eq!(parse_pr_number(Some("7")).unwrap(), Some(7));
+    for malformed in [
+        "0",
+        "-1",
+        "+7",
+        "7 ",
+        " 7",
+        "seven",
+        "7.0",
+        "null",
+        "18446744073709551616",
+    ] {
+        let error = parse_pr_number(Some(malformed)).expect_err(malformed);
+        assert!(
+            error.to_string().contains("GITFORGEOPS_PR_NUMBER"),
+            "{malformed}: {error}"
+        );
+    }
+}
+
+/// #562: plan quotes the approver (GitHub's text) through `peer_text`, which
+/// bounds it.
+#[test]
+fn plan_override_note_quotes_the_approver_through_peer_text() {
+    use gitforgeops::policy::github_override::plan_override_note;
+    let mut decision = active_decision();
+    assert_eq!(
+        plan_override_note(&decision),
+        "Blocking findings overridden by @maintainer."
+    );
+    decision.approver = Some("x".repeat(20 * 1024));
+    let note = plan_override_note(&decision);
+    assert!(note.contains("[truncated]"), "{}", note.len());
+    assert!(note.len() < 17 * 1024, "{}", note.len());
+    assert_eq!(
+        plan_override_note(&OverrideDecision::inactive("label missing")),
+        "Override inactive: label missing."
+    );
+}
+
+fn rate_limit_document(redis_failure_policy: &str) -> gitforgeops::config::schema::GatewayConfig {
+    serde_json::from_value(json!({
+        "plugin_configs": [
+            {
+                "id": "limiter",
+                "namespace": "ferrum",
+                "plugin_name": "rate_limiting",
+                "scope": "global",
+                "config": {
+                    "limits": [{"scope": "default", "requests_per_second": 10}],
+                    "redis_failure_policy": redis_failure_policy
+                }
+            },
+            {
+                "id": "unbounded",
+                "namespace": "ferrum",
+                "plugin_name": "rate_limiting",
+                "scope": "global",
+                "config": {}
+            }
+        ]
+    }))
+    .unwrap()
+}
+
+fn rate_limit_policy() -> gitforgeops::policy::PolicyConfig {
+    use gitforgeops::policy::config::{PolicyRules, RateLimitCompletenessRuleConfig};
+    gitforgeops::policy::PolicyConfig {
+        policies: PolicyRules {
+            rate_limit_completeness: RateLimitCompletenessRuleConfig {
+                enabled: true,
+                severity: gitforgeops::policy::Severity::Error,
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// #562 review: `plan` and `review` preview the same policy verdict `apply`
+/// reaches. A `redis_failure_policy` placeholder whose bundle value is
+/// `local_fallback` produces a blocking finding only after credential
+/// resolution: an active override clears the committed finding but not that
+/// one, in the preview and in apply alike.
+#[test]
+fn preview_and_apply_agree_on_a_resolution_only_policy_finding() {
+    use gitforgeops::policy::github_override::{
+        apply_override, preview_policy_findings, RESOLUTION_ONLY_REMEDIATION,
+    };
+    use gitforgeops::policy::refusal::{
+        refuse_policy_violations, refuse_post_resolution_policy_violations,
+    };
+    use gitforgeops::policy::{evaluate_policies, PolicyFinding};
+    use gitforgeops::verdict::policy_blocker;
+
+    let policy = rate_limit_policy();
+    let unresolved = evaluate_policies(
+        &rate_limit_document("${gh-env-secret:alloc=require}"),
+        &policy,
+    );
+    let resolved = evaluate_policies(&rate_limit_document("local_fallback"), &policy);
+    let blocking = |findings: &[PolicyFinding]| findings.iter().filter(|f| f.is_blocking()).count();
+    assert_eq!(blocking(&unresolved), 1, "{unresolved:?}");
+    assert_eq!(blocking(&resolved), 2, "{resolved:?}");
+
+    let active = active_decision();
+    let inactive = OverrideDecision::inactive("label missing");
+    for decision in [None, Some(&inactive), Some(&active)] {
+        // apply, api mode: gate 1 on the unresolved document, gate 2 after
+        // credential resolution.
+        let mut gate_one = unresolved.clone();
+        if let Some(decision) = decision {
+            apply_override(&mut gate_one, decision);
+        }
+        let first = refuse_policy_violations(&gate_one, "", decision, None);
+        let mut gate_two = resolved.clone();
+        let second =
+            refuse_post_resolution_policy_violations(&mut gate_two, &unresolved, decision, None);
+        let apply_refuses = first.is_some() || second.is_some();
+
+        let (preview, uncovered) = preview_policy_findings(&unresolved, Some(&resolved), decision);
+        let plan_blocks = policy_blocker(&preview).is_some();
+        assert_eq!(plan_blocks, apply_refuses, "{decision:?}");
+        assert!(plan_blocks, "{decision:?}");
+
+        if decision.is_some_and(|decision| decision.active) {
+            assert!(first.is_none());
+            let message = second.expect("resolution-only finding refuses");
+            assert!(message.contains("appeared only after credential resolution"));
+            assert_eq!(uncovered, 1);
+            let open: Vec<_> = preview.iter().filter(|f| f.is_blocking()).collect();
+            assert_eq!(open.len(), 1, "{preview:?}");
+            assert_eq!(open[0].id, "limiter");
+            assert_eq!(
+                open[0].remediation.as_deref(),
+                Some(RESOLUTION_ONLY_REMEDIATION)
+            );
+            assert_eq!(policy_blocker(&preview).unwrap().count, 1);
+        } else {
+            assert_eq!(uncovered, 0);
+            assert_eq!(policy_blocker(&preview).unwrap().count, 2);
+        }
+        // The committed finding appears once, not once per gate.
+        assert_eq!(
+            preview.iter().filter(|f| f.id == "unbounded").count(),
+            1,
+            "{preview:?}"
+        );
+
+        // File mode never re-checks after resolution, so neither does its
+        // preview: the active override clears everything apply gates.
+        let (file_preview, _) = preview_policy_findings(&unresolved, None, decision);
+        assert_eq!(
+            policy_blocker(&file_preview).is_some(),
+            first.is_some(),
+            "{decision:?}"
+        );
+    }
+}
+
+/// Apply mode (source == data): deleting a reviewed, tracked
+/// `.gitforgeops/smoke.yaml` is a difference from the reviewed tree.
+#[test]
+fn actual_input_refuses_a_deleted_tracked_gitforgeops_file() {
+    let (dir, _, _) = fixture();
+    write(dir.path(), ".gitforgeops/smoke.yaml", "version: 2\n");
+    let head = commit(dir.path());
+    let tree = head_tree(dir.path());
+    assert_eq!(
+        verify_input(&tree, dir.path(), dir.path(), false, None),
+        Ok(head)
+    );
+    std::fs::remove_file(dir.path().join(".gitforgeops/smoke.yaml")).unwrap();
+    assert!(verify_input(&tree, dir.path(), dir.path(), false, None).is_err());
 }

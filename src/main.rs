@@ -18,7 +18,9 @@ use gitforgeops::http_client::conditional::PreparedConsumerRotation;
 use gitforgeops::http_client::AdminClient;
 use gitforgeops::import;
 use gitforgeops::policy;
-use gitforgeops::policy::refusal::refuse_policy_violations;
+use gitforgeops::policy::refusal::{
+    refuse_policy_violations, refuse_post_resolution_policy_violations,
+};
 use gitforgeops::reconcile::{previously_managed, resolved_namespaces};
 use gitforgeops::review;
 use gitforgeops::secrets;
@@ -518,15 +520,19 @@ fn enforce_exclusive_scope(
 ///
 /// Order:
 ///   1. `GITFORGEOPS_PR_NUMBER` env var (set explicitly by review workflows).
+///      Set but not a positive integer is an error, never a silent fallback
+///      to step 2, which could attribute the run to a different PR.
 ///   2. For post-merge applies: the PR associated with `GITHUB_SHA` via the
 ///      `/repos/{repo}/commits/{sha}/pulls` endpoint. Requires GITHUB_TOKEN.
-async fn resolve_pr_number(env_config: &EnvConfig) -> Option<u64> {
-    if let Some(n) = std::env::var("GITFORGEOPS_PR_NUMBER")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        return Some(n);
+async fn resolve_pr_number(env_config: &EnvConfig) -> gitforgeops::error::Result<Option<u64>> {
+    if let Some(n) = policy::github_override::pr_number_from_env()? {
+        return Ok(Some(n));
     }
+    Ok(associated_pr_number(env_config).await)
+}
+
+/// Step 2 of [`resolve_pr_number`]: best effort, `None` when unavailable.
+async fn associated_pr_number(env_config: &EnvConfig) -> Option<u64> {
     let token = env_config.github_token.as_deref()?;
     let repo = env_config.github_repository.as_deref()?;
     let sha = std::env::var("GITHUB_SHA").ok()?;
@@ -656,9 +662,19 @@ async fn surface_delivered_credentials(
         }
     }
 
-    let pr_number = std::env::var("GITFORGEOPS_PR_NUMBER")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
+    // Values are already committed to the bundle here, so refusing would
+    // strand them undelivered. `cmd_apply` refuses a malformed number before
+    // allocation; if one still arrives, never post to a guessed PR: warn and
+    // deliver the ciphertext on stdout instead.
+    let pr_number = match policy::github_override::pr_number_from_env() {
+        Ok(number) => number,
+        Err(error) => {
+            eoutln!(
+                "Warning: {error}; the credential delivery is NOT posted to any PR and falls back to stdout."
+            );
+            None
+        }
+    };
     let can_post_pr = pr_number.is_some()
         && env_config.github_token.is_some()
         && env_config.github_repository.is_some();
@@ -2312,6 +2328,12 @@ async fn cmd_plan(
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },
     );
+    // Apply's first policy gate evaluates the unresolved document; capture it
+    // before resolution so the preview gates exactly as apply does.
+    let unresolved_policy_findings = policy_cfg
+        .as_ref()
+        .map(|cfg| policy::evaluate_policies(&desired, cfg))
+        .unwrap_or_default();
     // Loaded before resolution: the ledger is the evidence for the
     // retired-Consumer slot checks apply will refuse on.
     let state = StateFile::load(&resolved.name)?;
@@ -2600,11 +2622,21 @@ async fn cmd_plan(
     // override decision they are printed *with* is the same one that decides
     // whether they block. `apply` resolves that override once and shares it
     // between the two fail-closed reporters; plan does the same so a preview
-    // and the post-merge apply cannot disagree.
-    let mut policy_findings = match &policy_cfg {
-        Some(cfg) => policy::evaluate_policies(&desired, cfg),
-        None => Vec::new(),
-    };
+    // and the post-merge apply cannot disagree. Apply gates the unresolved
+    // document and, in api mode, the resolved one with the override limited
+    // to unresolved findings; `preview_policy_findings` shows both gates.
+    let resolved_policy_findings = (env_config.gateway_mode == GatewayMode::Api).then(|| {
+        policy_cfg
+            .as_ref()
+            .map(|cfg| policy::evaluate_policies(&desired, cfg))
+            .unwrap_or_default()
+    });
+    let (mut policy_findings, _) = policy::github_override::preview_policy_findings(
+        &unresolved_policy_findings,
+        resolved_policy_findings.as_deref(),
+        None,
+    );
+    let mut resolution_only_uncovered = 0;
     let security_overridable = verdict::security_blocker(&security_findings, false).is_some();
     let policy_overridable = policy_findings.iter().any(|f| f.is_blocking());
     let mut security_overridden = false;
@@ -2614,18 +2646,17 @@ async fn cmd_plan(
             .as_ref()
             .map(|cfg| cfg.overrides.clone())
             .unwrap_or_default();
-        match resolve_pr_number(&env_config).await {
+        match resolve_pr_number(&env_config).await? {
             Some(pr) => match policy::check_override(&env_config, &override_cfg, pr).await {
                 Ok(decision) => {
-                    policy::github_override::apply_override(&mut policy_findings, &decision);
+                    (policy_findings, resolution_only_uncovered) =
+                        policy::github_override::preview_policy_findings(
+                            &unresolved_policy_findings,
+                            resolved_policy_findings.as_deref(),
+                            Some(&decision),
+                        );
                     security_overridden = decision.active;
-                    override_note = Some(match (&decision.active, &decision.approver) {
-                        (true, Some(approver)) => {
-                            format!("Blocking findings overridden by @{approver}.")
-                        }
-                        (true, None) => "Blocking findings overridden.".to_string(),
-                        (false, _) => format!("Override inactive: {}.", decision.reason),
-                    });
+                    override_note = Some(policy::github_override::plan_override_note(&decision));
                 }
                 // Fail closed. An override that could not be verified is not
                 // an override, and turning an unreachable GitHub API into a
@@ -2703,6 +2734,13 @@ async fn cmd_plan(
                 safe(&pf.namespace),
                 safe_line(&pf.message),
                 overridden
+            );
+        }
+        if resolution_only_uncovered > 0 {
+            reportln!(
+                json_mode,
+                "  {resolution_only_uncovered} blocking finding(s) {}.",
+                policy::github_override::RESOLUTION_ONLY_REMEDIATION
             );
         }
         reportln!(json_mode);
@@ -2824,6 +2862,10 @@ async fn cmd_apply(
     // recipient is refused here, before any state, bundle, gateway or GitHub
     // access, rather than read as "no recipient".
     let allocation_binding = AllocationBinding::from_env()?;
+    // The PR number routes override evaluation and the credential delivery
+    // comment. Refuse a malformed one here, before allocation, so delivery
+    // never has to choose between a wrong PR and a stranded secret.
+    policy::github_override::pr_number_from_env()?;
     let allow_nontransactional_plugin_attach =
         allow_nontransactional_plugin_attach || env_config.allow_nontransactional_plugin_attach;
     let assembled = load_and_assemble_all(&resolved, &env_config)?;
@@ -2901,7 +2943,7 @@ async fn cmd_apply(
         .map(|cfg| cfg.overrides.clone())
         .unwrap_or_default();
     let override_decision = if security_blocked || policy_cfg.is_some() {
-        match resolve_pr_number(&env_config).await {
+        match resolve_pr_number(&env_config).await? {
             Some(pr) => Some(policy::check_override(&env_config, &override_cfg, pr).await?),
             None => None,
         }
@@ -2958,8 +3000,13 @@ async fn cmd_apply(
     // any gateway write or file publish. Overridden rule_ids are captured here
     // and written into state after a successful apply so audits can see which
     // blocking findings were bypassed by whom.
+    // The pre-resolution findings are what `plan` and `review` showed, so they
+    // are the only findings an override review could have seen. The api-mode
+    // re-check after credential resolution limits the override to them.
+    let mut reviewed_policy_findings: Vec<policy::PolicyFinding> = Vec::new();
     if let Some(policy_cfg) = &policy_cfg {
         let mut findings = policy::evaluate_policies(&desired, policy_cfg);
+        reviewed_policy_findings = findings.clone();
         if let Some(d) = &override_decision {
             policy::github_override::apply_override(&mut findings, d);
         }
@@ -3018,11 +3065,22 @@ async fn cmd_apply(
     // Config-string policy checks also need to see resolved values. Keep the
     // early unresolved-document gate above, then recheck API mode after secret
     // resolution so substitution cannot make a blocking finding disappear.
+    // The override covers only findings also present before resolution: a
+    // blocking finding that appears only here was never shown by plan or
+    // review, so no override review could have accepted it.
     if env_config.gateway_mode == GatewayMode::Api {
         if let Some(policy_cfg) = &policy_cfg {
             let mut findings = policy::evaluate_policies(&desired, policy_cfg);
-            if let Some(d) = &override_decision {
-                policy::github_override::apply_override(&mut findings, d);
+            let scrubber =
+                secrets::SecretScrubber::from_gateway_config_with_report(&desired, &secret_report);
+            if let Some(message) = refuse_post_resolution_policy_violations(
+                &mut findings,
+                &reviewed_policy_findings,
+                override_decision.as_ref(),
+                Some(&scrubber),
+            ) {
+                eout!("{message}");
+                return Err("unresolved policy violations".into());
             }
             if let Some(approver) = &override_approver {
                 for finding in &findings {
@@ -3033,17 +3091,6 @@ async fn cmd_apply(
                         }
                     }
                 }
-            }
-            let scrubber =
-                secrets::SecretScrubber::from_gateway_config_with_report(&desired, &secret_report);
-            if let Some(message) = refuse_policy_violations(
-                &findings,
-                " (after credential resolution)",
-                override_decision.as_ref(),
-                Some(&scrubber),
-            ) {
-                eout!("{message}");
-                return Err("unresolved policy violations".into());
             }
         }
     }
@@ -4059,6 +4106,11 @@ async fn cmd_review(
             OwnershipMode::Exclusive => diff::OwnershipScope::Exclusive,
         },
     );
+    // Apply's first policy gate sees the unresolved document.
+    let unresolved_policy_findings = policy_cfg
+        .as_ref()
+        .map(|cfg| policy::evaluate_policies(&desired, cfg))
+        .unwrap_or_default();
     let state = StateFile::load(&resolved.name)?;
     let ledger = consumer_ledger(&resolved, &state, &allocation_binding);
     let secret_report = resolve_credentials(&mut desired, &env_config, Some(&ledger))?;
@@ -4169,10 +4221,20 @@ async fn cmd_review(
     // security_findings was computed pre-resolve above; reuse it here.
     let bp_findings = diff::check_best_practices(&desired);
 
-    let mut policy_findings = policy_cfg
-        .as_ref()
-        .map(|cfg| policy::evaluate_policies(&desired, cfg))
-        .unwrap_or_default();
+    // The same two gates apply runs: unresolved findings with the whole
+    // override, then (api mode) resolved findings with the override limited
+    // to unresolved ones (see cmd_plan).
+    let resolved_policy_findings = (env_config.gateway_mode == GatewayMode::Api).then(|| {
+        policy_cfg
+            .as_ref()
+            .map(|cfg| policy::evaluate_policies(&desired, cfg))
+            .unwrap_or_default()
+    });
+    let (mut policy_findings, _) = policy::github_override::preview_policy_findings(
+        &unresolved_policy_findings,
+        resolved_policy_findings.as_deref(),
+        None,
+    );
     let override_cfg = policy_cfg
         .as_ref()
         .map(|cfg| cfg.overrides.clone())
@@ -4190,7 +4252,11 @@ async fn cmd_review(
                 pr_number,
             )
             .await?;
-            policy::github_override::apply_override(&mut policy_findings, &decision);
+            (policy_findings, _) = policy::github_override::preview_policy_findings(
+                &unresolved_policy_findings,
+                resolved_policy_findings.as_deref(),
+                Some(&decision),
+            );
             Some(decision)
         }
         _ => None,

@@ -1499,6 +1499,12 @@ async fn override_labeler_pagination_ignores_response_link_urls() {
             off_path_link,
         ),
         (
+            events_page(&repo_pr, 3),
+            200,
+            "[]".to_string(),
+            String::new(),
+        ),
+        (
             String::from("/steal"),
             200,
             serde_json::json!([label_event("labeled", "attacker")]).to_string(),
@@ -1513,10 +1519,9 @@ async fn override_labeler_pagination_ignores_response_link_urls() {
     assert_eq!(labeler.as_deref(), Some("maintainer"));
 
     let recorded = requests.lock().expect("recorded").clone();
-    assert_eq!(recorded.len(), 2, "{recorded:?}");
-    assert!(recorded[0].starts_with(&events_page(&repo_pr, 1)));
-    assert!(recorded[1].starts_with(&events_page(&repo_pr, 2)));
-    for request in &recorded {
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+    for (index, request) in recorded.iter().enumerate() {
+        assert!(request.starts_with(&events_page(&repo_pr, index + 1)));
         assert!(!request.contains("/steal"), "{request}");
         assert_github_headers(request);
     }
@@ -1542,6 +1547,7 @@ async fn override_labeler_honours_a_later_unlabel_on_a_later_page() {
             200,
             serde_json::json!([label_event("unlabeled", "maintainer")]).to_string(),
         ),
+        (events_page(&repo_pr, 3), 200, "[]".to_string()),
     ];
     let (api_base, _requests) = spawn_github_stub(routes);
     let labeler =
@@ -1551,7 +1557,7 @@ async fn override_labeler_honours_a_later_unlabel_on_a_later_page() {
     assert_eq!(labeler, None);
 }
 
-/// Reaching the page cap with a still-full page fails closed.
+/// Reaching the page cap without an empty page fails closed.
 #[tokio::test]
 async fn override_labeler_pagination_cap_fails_closed() {
     use gitforgeops::policy::github_override::find_override_labeler_at;
@@ -1569,4 +1575,777 @@ async fn override_labeler_pagination_cap_fails_closed() {
         "{error}"
     );
     assert_eq!(requests.lock().expect("recorded").len(), 20);
+}
+
+/// #562: completeness is proven by an empty page, not by a short one. A short
+/// page is followed by the next numbered page, and what it holds is read.
+#[tokio::test]
+async fn override_labeler_reads_past_a_short_page_until_an_empty_one() {
+    use gitforgeops::policy::github_override::find_override_labeler_at;
+    let repo_pr = format!("{REPO}/issues/7");
+    let (api_base, requests) = spawn_github_stub(vec![
+        (
+            events_page(&repo_pr, 1),
+            200,
+            serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+        ),
+        (
+            events_page(&repo_pr, 2),
+            200,
+            serde_json::json!([label_event("unlabeled", "maintainer")]).to_string(),
+        ),
+        (events_page(&repo_pr, 3), 200, "[]".to_string()),
+    ]);
+    let labeler =
+        find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+            .await
+            .expect("labeler lookup");
+    assert_eq!(labeler, None, "the unlabel after a short page is read");
+    assert_eq!(requests.lock().expect("recorded").len(), 3);
+
+    // A missing or failing next page is an error, never "complete".
+    let (api_base, _) = spawn_github_stub(vec![(
+        events_page(&repo_pr, 1),
+        200,
+        serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+    )]);
+    assert!(
+        find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+            .await
+            .is_err()
+    );
+}
+
+fn reviews_page(page: usize) -> String {
+    format!("GET /repos/{REPO}/pulls/7/reviews?per_page=100&page={page} ")
+}
+
+fn plain_review_json(id: u64, login: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "commit_id": "a".repeat(40),
+        "state": "COMMENTED",
+        "body": "ordinary",
+        "user": {"login": login},
+    })
+}
+
+/// #562: review pagination reads past a short page until an empty one, so a
+/// later revoking review on the next page cannot be missed.
+#[tokio::test]
+async fn override_reviews_read_past_a_short_page_until_an_empty_one() {
+    use gitforgeops::policy::github_override::fetch_reviews_at;
+    let (api_base, requests) = spawn_github_stub_with_headers(vec![
+        (
+            reviews_page(1),
+            200,
+            serde_json::json!([plain_review_json(1, "maintainer")]).to_string(),
+            "Link: <{base}/steal?page=2>; rel=\"next\"\r\n".to_string(),
+        ),
+        (
+            reviews_page(2),
+            200,
+            serde_json::json!([plain_review_json(2, "maintainer")]).to_string(),
+            String::new(),
+        ),
+        (reviews_page(3), 200, "[]".to_string(), String::new()),
+        (String::from("/steal"), 200, "[]".to_string(), String::new()),
+    ]);
+    let reviews = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+        .await
+        .expect("reviews");
+    assert_eq!(
+        reviews.iter().map(|review| review.id).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    let recorded = requests.lock().expect("recorded").clone();
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+    assert!(recorded.iter().all(|request| !request.contains("/steal")));
+}
+
+/// Reviews keep reading numbered pages from the fixed origin past a full page.
+#[tokio::test]
+async fn override_reviews_walk_numbered_pages_from_the_fixed_origin() {
+    use gitforgeops::policy::github_override::fetch_reviews_at;
+    let full: Vec<_> = (1..=100)
+        .map(|id| plain_review_json(id, "someone"))
+        .collect();
+    let routes = vec![
+        (
+            reviews_page(1),
+            200,
+            serde_json::Value::Array(full).to_string(),
+            "Link: <{base}/steal?page=2>; rel=\"next\"\r\n".to_string(),
+        ),
+        (
+            reviews_page(2),
+            200,
+            serde_json::json!([plain_review_json(101, "maintainer")]).to_string(),
+            String::new(),
+        ),
+        (reviews_page(3), 200, "[]".to_string(), String::new()),
+    ];
+    let (api_base, requests) = spawn_github_stub_with_headers(routes);
+    let reviews = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+        .await
+        .expect("reviews");
+    assert_eq!(reviews.len(), 101);
+    assert_eq!(reviews[100].id, 101);
+    let recorded = requests.lock().expect("recorded").clone();
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+    assert!(recorded.iter().all(|request| !request.contains("/steal")));
+}
+
+/// `(needle, responses in order, extra header lines on every response)`.
+type SequencedRoute = (String, Vec<(u16, String)>, String);
+
+/// A loopback stub whose routes answer a sequence of responses: each request
+/// matching a needle takes the next response, and the last one repeats.
+fn spawn_sequenced_github_stub(routes: Vec<SequencedRoute>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let base = format!("http://{}", listener.local_addr().expect("stub addr"));
+    let routes = Arc::new(Mutex::new(
+        routes
+            .into_iter()
+            .map(|(needle, responses, headers)| {
+                (
+                    needle,
+                    std::collections::VecDeque::from(responses),
+                    headers.replace("{base}", &base),
+                )
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let thread_requests = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let routes = Arc::clone(&routes);
+            let requests = Arc::clone(&thread_requests);
+            std::thread::spawn(move || loop {
+                let request = match read_request(&mut stream) {
+                    Some(request) => request,
+                    None => return,
+                };
+                requests
+                    .lock()
+                    .expect("record request")
+                    .push(request.clone());
+                let (status, body, headers) = {
+                    let mut routes = routes.lock().expect("routes");
+                    routes
+                        .iter_mut()
+                        .find(|(needle, _, _)| request.contains(needle.as_str()))
+                        .and_then(|(_, responses, headers)| {
+                            let response = if responses.len() > 1 {
+                                responses.pop_front()
+                            } else {
+                                responses.front().cloned()
+                            };
+                            response.map(|(status, body)| (status, body, headers.clone()))
+                        })
+                        .unwrap_or((
+                            404,
+                            "{\"message\":\"Not Found\"}".to_string(),
+                            String::new(),
+                        ))
+                };
+                if write!(
+                    stream,
+                    "HTTP/1.1 {status} STUB\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{headers}\r\n{}",
+                    body.len(),
+                    body
+                )
+                .is_err()
+                {
+                    return;
+                }
+            });
+        }
+    });
+    (base, requests)
+}
+
+/// Every route of a complete, valid override, with the labeler's permission
+/// answered by `permissions` in order.
+fn override_routes(permissions: &[(u16, &str)]) -> Vec<SequencedRoute> {
+    let head = "a".repeat(40);
+    let pr = serde_json::json!({
+        "labels": [{"name": OVERRIDE_LABEL}],
+        "head": {"sha": head},
+        "merged": false,
+        "merge_commit_sha": null,
+    })
+    .to_string();
+    let review = serde_json::json!([{
+        "id": 42,
+        "commit_id": head,
+        "state": "APPROVED",
+        "body": format!("gitforgeops-override {OVERRIDE_LABEL}"),
+        "user": {"login": "maintainer"},
+    }])
+    .to_string();
+    vec![
+        (
+            format!("GET /repos/{REPO}/pulls/7 HTTP"),
+            vec![(200, pr)],
+            String::new(),
+        ),
+        (
+            events_page(&format!("{REPO}/issues/7"), 1),
+            vec![(
+                200,
+                serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+            )],
+            String::new(),
+        ),
+        (
+            format!("GET /repos/{REPO}/collaborators/maintainer/permission"),
+            permissions
+                .iter()
+                .map(|(status, permission)| {
+                    (
+                        *status,
+                        serde_json::json!({"permission": permission, "role_name": permission})
+                            .to_string(),
+                    )
+                })
+                .collect(),
+            String::new(),
+        ),
+        (reviews_page(1), vec![(200, review)], String::new()),
+        (
+            format!("GET /repos/{REPO}/git/trees/"),
+            vec![(
+                200,
+                serde_json::json!({"truncated": false, "tree": []}).to_string(),
+            )],
+            String::new(),
+        ),
+        // Evidence listings end only at an empty page.
+        (
+            events_page(&format!("{REPO}/issues/7"), 2),
+            vec![(200, "[]".to_string())],
+            String::new(),
+        ),
+        (
+            reviews_page(2),
+            vec![(200, "[]".to_string())],
+            String::new(),
+        ),
+    ]
+}
+
+/// Run the whole override check against a stub; the input verifier is a fixed
+/// pass, so the decision reflects only the GitHub evidence.
+async fn run_override_check(
+    permissions: &[(u16, &str)],
+) -> (gitforgeops::policy::OverrideDecision, usize) {
+    run_override_routes(override_routes(permissions)).await
+}
+
+async fn run_override_routes(
+    routes: Vec<SequencedRoute>,
+) -> (gitforgeops::policy::OverrideDecision, usize) {
+    use gitforgeops::policy::github_override::check_override_at;
+    let (api_base, requests) = spawn_sequenced_github_stub(routes);
+    let cfg = gitforgeops::policy::OverrideConfig {
+        require_label: OVERRIDE_LABEL.into(),
+        required_permission: "write".into(),
+    };
+    let decision = check_override_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        TOKEN,
+        &cfg,
+        7,
+        |_, _, _| Ok("b".repeat(40)),
+    )
+    .await
+    .expect("override check");
+    let permission_reads = requests
+        .lock()
+        .expect("recorded")
+        .iter()
+        .filter(|request| request.contains("/permission"))
+        .count();
+    (decision, permission_reads)
+}
+
+/// Stable evidence yields an active override; the harness is complete.
+#[tokio::test]
+async fn override_with_stable_evidence_is_active() {
+    let (decision, permission_reads) = run_override_check(&[(200, "write")]).await;
+    assert!(decision.active, "{}", decision.reason);
+    assert_eq!(decision.approver.as_deref(), Some("maintainer"));
+    assert_eq!(decision.review_id, Some(42));
+    assert_eq!(permission_reads, 2);
+}
+
+/// #562: the final evidence pass re-reads the labeler's permission. A labeler
+/// demoted from write to read while evidence was collected revokes it.
+#[tokio::test]
+async fn override_permission_demoted_during_verification_is_inactive() {
+    let (decision, permission_reads) = run_override_check(&[(200, "write"), (200, "read")]).await;
+    assert!(!decision.active);
+    assert!(
+        decision.reason.contains("override evidence changed"),
+        "{}",
+        decision.reason
+    );
+    assert_eq!(permission_reads, 2);
+}
+
+/// A permission read that fails in the final pass also revokes it.
+#[tokio::test]
+async fn override_permission_unreadable_during_final_pass_is_inactive() {
+    let (decision, permission_reads) = run_override_check(&[(200, "write"), (500, "write")]).await;
+    assert!(!decision.active, "{}", decision.reason);
+    assert_eq!(permission_reads, 2);
+}
+
+/// `Link` header lines the strict parser reads as `Next` or `Ambiguous` (#562
+/// review). Override pagination ignores them; SSH key discovery refuses the
+/// ambiguous ones. Each entry is the raw header line(s) a stub response
+/// carries.
+const AMBIGUOUS_OR_NEXT_LINKS: &[&str] = &[
+    "Link: <{base}/x>; rel=next\r\n",
+    "Link: <{base}/x>; rel = \"next\"\r\n",
+    "Link: <{base}/x>; rel=\"prev next\"\r\n",
+    "Link: <{base}/x>; REL=\"NEXT\"\r\n",
+    "Link: <{base}/x>;rel=\"Next\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev\", <{base}/x>; rel=\"next\"\r\n",
+    "Link: <{base}/p1>; title=\"a, b\"; rel=\"prev\", <{base}/x>; rel=next\r\n",
+    "Link: <{base}/p1>; rel=\"prev\"\r\nLink: <{base}/x>; rel=\"next\"\r\n",
+    "Link: not-a-link\r\n",
+    "Link: <{base}/x\r\n",
+    "Link: <{base}/x>; rel\r\n",
+    "Link: <{base}/x>; rel=\r\n",
+    "Link: <{base}/x>; rel=\"\"\r\n",
+    "Link: <{base}/x>; rel=\"next\r\n",
+    "Link: <{base}/x>; rel=prev next\r\n",
+    "Link: <{base}/x>; rel*=UTF-8''next\r\n",
+    "Link: <{base}/x> rel=\"prev\"\r\n",
+    // Relation types outside the RFC 8288 grammar (#562 review round 2).
+    "Link: <{base}/x>; rel=\"prev,next\"\r\n",
+    "Link: <{base}/x>; rel=\"prev;next\"\r\n",
+    "Link: <{base}/x>; rel=\" next\"\r\n",
+    "Link: <{base}/x>; rel=\"prev \"\r\n",
+    "Link: <{base}/x>; rel=\"prev\tnext\"\r\n",
+    "Link: <{base}/x>; rel=\"next\\\"\"\r\n",
+    "Link: <{base}/x>; rel=\"1next\"\r\n",
+    "Link: <{base}/x>; rel=\"pr_ev\"\r\n",
+    "Link: <{base}/x>; rel=\"https://example.com/a,next\"\r\n",
+    // Malformed targets.
+    "Link: <>; rel=\"prev\"\r\n",
+    "Link: < {base}/x>; rel=\"prev\"\r\n",
+    // Two different `next` targets.
+    "Link: <{base}/a>; rel=\"next\", <{base}/b>; rel=\"next\"\r\n",
+    // Targets and extension relation types outside RFC 3986 (#562 final).
+    "Link: <https://api.github.com/%GG>; rel=\"prev\"\r\n",
+    "Link: <https://api.github.com/x>; rel=\"https://example.com/%GG\"\r\n",
+    "Link: <{base}/x%4>; rel=\"next\"\r\n",
+    "Link: <{base}/x%>; rel=\"prev\"\r\n",
+    "Link: <{base}/a|b>; rel=\"prev\"\r\n",
+    "Link: <{base}/a\"b>; rel=\"prev\"\r\n",
+    "Link: <{base}/a#b#c>; rel=\"prev\"\r\n",
+    "Link: <{base}/x>; rel=\"https://example.com/a{b}\"\r\n",
+];
+
+/// `Link` header lines that unambiguously announce no next page.
+const NO_NEXT_LINKS: &[&str] = &[
+    "",
+    "Link: <{base}/p1>; rel=\"prev\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev first\"\r\n",
+    "Link: <{base}/p1>; rel=prev, <{base}/p0>; rel=\"first\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev\"; title=\"next page\"\r\n",
+    "Link: <{base}/p1>; rel=\"nextish\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev  first\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev https://example.com/rels/page\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev.v2 first-page\"\r\n",
+    "Link: <{base}/p1?q=a%2Cb&x=1#top>; rel=\"prev\"\r\n",
+    "Link: <{base}/p1>; rel=\"prev https://example.com/rels/a%20b\"\r\n",
+];
+
+/// `Link` values that are not even well-formed URIs (#562 round 4). The strict
+/// parser need not classify these: override evidence ignores `Link` entirely.
+const MALFORMED_URI_LINKS: &[&str] = &[
+    "Link: <https://[>; rel=\"prev\"\r\n",
+    "Link: <https://api.github.com/x>; rel=\"https://example.com/[\"\r\n",
+    "Link: <https://[>; rel=\"next\"\r\n",
+];
+
+/// The strict parser SSH key discovery uses still classifies the tables.
+#[test]
+fn next_link_classifies_next_ambiguous_and_absent_values() {
+    use gitforgeops::policy::github_override::{next_link, NextLink};
+    // The stub substitutes its origin for `{base}`; so does this table.
+    let base = |line: &str| line.replace("{base}", "http://127.0.0.1:1");
+    for line in AMBIGUOUS_OR_NEXT_LINKS {
+        // A single header line is checked here; multi-line entries are covered
+        // by SSH key discovery's every-header test.
+        let line = base(line);
+        let value = line
+            .split("\r\n")
+            .next()
+            .unwrap()
+            .strip_prefix("Link: ")
+            .unwrap();
+        if line.matches("Link:").count() == 1 {
+            assert_ne!(next_link(value), NextLink::Absent, "{line:?}");
+        }
+    }
+    for line in NO_NEXT_LINKS.iter().filter(|line| !line.is_empty()) {
+        let line = base(line);
+        let value = line.trim_end().strip_prefix("Link: ").unwrap();
+        assert_eq!(next_link(value), NextLink::Absent, "{line:?}");
+    }
+}
+
+fn every_link_header() -> impl Iterator<Item = &'static str> {
+    AMBIGUOUS_OR_NEXT_LINKS
+        .iter()
+        .chain(NO_NEXT_LINKS)
+        .chain(MALFORMED_URI_LINKS)
+        .copied()
+}
+
+/// #562 round 4: the `Link` header never decides override-evidence
+/// completeness. Whatever a short page's header says, an empty next page
+/// completes the history, and a non-empty next page is read on.
+#[tokio::test]
+async fn link_headers_never_decide_override_pagination() {
+    use gitforgeops::policy::github_override::{fetch_reviews_at, find_override_labeler_at};
+    let repo_pr = format!("{REPO}/issues/7");
+    for line in every_link_header() {
+        // Short page, then an empty page: complete.
+        let (api_base, requests) = spawn_github_stub_with_headers(vec![
+            (
+                events_page(&repo_pr, 1),
+                200,
+                serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+                line.to_string(),
+            ),
+            (
+                events_page(&repo_pr, 2),
+                200,
+                "[]".to_string(),
+                line.to_string(),
+            ),
+        ]);
+        let labeler =
+            find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+                .await
+                .unwrap_or_else(|error| panic!("{line:?}: {error}"));
+        assert_eq!(labeler.as_deref(), Some("maintainer"), "{line:?}");
+        assert_eq!(requests.lock().expect("recorded").len(), 2, "{line:?}");
+
+        let (api_base, requests) = spawn_github_stub_with_headers(vec![
+            (
+                reviews_page(1),
+                200,
+                serde_json::json!([plain_review_json(1, "maintainer")]).to_string(),
+                line.to_string(),
+            ),
+            (reviews_page(2), 200, "[]".to_string(), line.to_string()),
+        ]);
+        let reviews = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+            .await
+            .unwrap_or_else(|error| panic!("{line:?}: {error}"));
+        assert_eq!(reviews.len(), 1, "{line:?}");
+        assert_eq!(requests.lock().expect("recorded").len(), 2, "{line:?}");
+
+        // Short page, then a non-empty page: read on until empty.
+        let (api_base, _) = spawn_github_stub_with_headers(vec![
+            (
+                events_page(&repo_pr, 1),
+                200,
+                serde_json::json!([label_event("labeled", "maintainer")]).to_string(),
+                line.to_string(),
+            ),
+            (
+                events_page(&repo_pr, 2),
+                200,
+                serde_json::json!([label_event("unlabeled", "maintainer")]).to_string(),
+                line.to_string(),
+            ),
+            (
+                events_page(&repo_pr, 3),
+                200,
+                "[]".to_string(),
+                String::new(),
+            ),
+        ]);
+        let labeler =
+            find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+                .await
+                .unwrap_or_else(|error| panic!("{line:?}: {error}"));
+        assert_eq!(labeler, None, "{line:?}");
+
+        let (api_base, _) = spawn_github_stub_with_headers(vec![
+            (
+                reviews_page(1),
+                200,
+                serde_json::json!([plain_review_json(1, "maintainer")]).to_string(),
+                line.to_string(),
+            ),
+            (
+                reviews_page(2),
+                200,
+                serde_json::json!([plain_review_json(2, "maintainer")]).to_string(),
+                line.to_string(),
+            ),
+            (reviews_page(3), 200, "[]".to_string(), String::new()),
+        ]);
+        let reviews = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+            .await
+            .unwrap_or_else(|error| panic!("{line:?}: {error}"));
+        assert_eq!(reviews.len(), 2, "{line:?}");
+    }
+}
+
+/// End to end: a valid override stays active whatever `Link` header its short
+/// evidence pages carry.
+#[tokio::test]
+async fn override_decision_ignores_link_headers() {
+    for line in every_link_header() {
+        let mut routes = override_routes(&[(200, "write")]);
+        for index in [1, 3, 5, 6] {
+            routes[index].2 = line.to_string();
+        }
+        let (decision, _) = run_override_routes(routes).await;
+        assert!(decision.active, "{line:?}: {}", decision.reason);
+    }
+}
+
+/// #562 round 4, Sol's scenario: a short evidence page carrying a malformed
+/// `Link` header used to read as complete. The next numbered page holds the
+/// revocation (an unlabel, or the labeler's later review), it is read, and the
+/// override is inactive.
+#[tokio::test]
+async fn a_revocation_after_a_short_page_with_a_malformed_link_is_read() {
+    let malformed = "Link: <https://[>; rel=\"prev\"\r\n".to_string();
+
+    let mut routes = override_routes(&[(200, "write")]);
+    routes[1].2 = malformed.clone();
+    routes[5].1 = vec![(
+        200,
+        serde_json::json!([label_event("unlabeled", "maintainer")]).to_string(),
+    )];
+    routes.push((
+        events_page(&format!("{REPO}/issues/7"), 3),
+        vec![(200, "[]".to_string())],
+        String::new(),
+    ));
+    let (decision, _) = run_override_routes(routes).await;
+    assert!(!decision.active);
+    assert!(
+        decision.reason.contains("no labeling event found"),
+        "{}",
+        decision.reason
+    );
+
+    let mut routes = override_routes(&[(200, "write")]);
+    routes[3].2 = malformed;
+    routes[6].1 = vec![(
+        200,
+        serde_json::json!([{
+            "id": 43,
+            "commit_id": "a".repeat(40),
+            "state": "CHANGES_REQUESTED",
+            "body": "reconsidered",
+            "user": {"login": "maintainer"},
+        }])
+        .to_string(),
+    )];
+    routes.push((
+        reviews_page(3),
+        vec![(200, "[]".to_string())],
+        String::new(),
+    ));
+    let (decision, _) = run_override_routes(routes).await;
+    assert!(!decision.active);
+    assert!(
+        decision
+            .reason
+            .contains("labeler must submit a fresh review"),
+        "{}",
+        decision.reason
+    );
+}
+
+/// The shared parser reads every link-value: a malformed entry never hides a
+/// later one, and makes the whole value ambiguous rather than "no next".
+#[test]
+fn next_link_reads_every_link_value_and_flags_malformed_entries() {
+    use gitforgeops::policy::github_override::{next_link, parse_next_link, NextLink};
+    // An entry without parameters is a valid link-value with no relation.
+    assert_eq!(
+        next_link("<https://h/p1>, <https://h/p2>; rel=\"next\""),
+        NextLink::Next("https://h/p2".into())
+    );
+    assert_eq!(
+        parse_next_link("<https://h/p1>, <https://h/p2>; rel=\"next\"").as_deref(),
+        Some("https://h/p2")
+    );
+    assert_eq!(
+        next_link("<https://h/p0>; rel=\"prev\"; title=\"a, b\", <https://h/p2>; rel=next"),
+        NextLink::Next("https://h/p2".into())
+    );
+    for malformed in [
+        "garbage, <https://h/p2>; rel=\"next\"",
+        "<https://h/p1> junk, <https://h/p2>; rel=\"next\"",
+        "<https://h/p1>; rel=\"prev\", not-a-link",
+    ] {
+        assert_eq!(next_link(malformed), NextLink::Ambiguous, "{malformed}");
+        assert_eq!(parse_next_link(malformed), None, "{malformed}");
+    }
+    assert_eq!(next_link("<https://h/p1>; rel=\"prev\""), NextLink::Absent);
+}
+
+/// SSH key discovery refuses an ambiguous `Link` header rather than ending the
+/// recipient search early.
+#[tokio::test]
+async fn ssh_key_discovery_refuses_an_ambiguous_link_header() {
+    use gitforgeops::secrets::discover_recipient_at;
+    let first_page = format!("GET /users/{RECIPIENT}/keys?per_page=100 ");
+    let second_page = format!("GET /users/{RECIPIENT}/keys?per_page=100&page=2");
+    let (public_key, _) = recipient_keypair();
+    let (api_base, requests) = spawn_github_stub_with_headers(vec![
+        (
+            second_page.clone(),
+            200,
+            serde_json::json!([{"key": public_key}]).to_string(),
+            String::new(),
+        ),
+        (
+            first_page,
+            200,
+            "[{\"key\":\"unsupported-public-key\"}]".to_string(),
+            format!(
+                "Link: garbage, <{{base}}/users/{RECIPIENT}/keys?per_page=100&page=2>; rel=\"next\"\r\n"
+            ),
+        ),
+    ]);
+    let error = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect_err("ambiguous pagination is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid SSH key pagination header"),
+        "{error}"
+    );
+    assert_eq!(count_requests(&requests, &second_page), 0);
+}
+
+/// An exactly full page followed by an empty one completes the history.
+#[tokio::test]
+async fn exactly_one_full_page_then_an_empty_page_completes() {
+    use gitforgeops::policy::github_override::{fetch_reviews_at, find_override_labeler_at};
+    let repo_pr = format!("{REPO}/issues/7");
+    let (api_base, requests) = spawn_github_stub(vec![
+        (
+            events_page(&repo_pr, 1),
+            200,
+            full_events_page(label_event("labeled", "maintainer")),
+        ),
+        (events_page(&repo_pr, 2), 200, "[]".to_string()),
+    ]);
+    let labeler =
+        find_override_labeler_at(&test_client(), &api_base, REPO, 7, TOKEN, OVERRIDE_LABEL)
+            .await
+            .expect("labeler lookup");
+    assert_eq!(labeler.as_deref(), Some("maintainer"));
+    assert_eq!(requests.lock().expect("recorded").len(), 2);
+
+    let full: Vec<_> = (1..=100)
+        .map(|id| plain_review_json(id, "someone"))
+        .collect();
+    let (api_base, requests) = spawn_github_stub(vec![
+        (
+            reviews_page(1),
+            200,
+            serde_json::Value::Array(full).to_string(),
+        ),
+        (reviews_page(2), 200, "[]".to_string()),
+    ]);
+    let reviews = fetch_reviews_at(&test_client(), &api_base, REPO, 7, TOKEN)
+        .await
+        .expect("reviews");
+    assert_eq!(reviews.len(), 100);
+    assert_eq!(requests.lock().expect("recorded").len(), 2);
+}
+
+/// A compatible key already on the page is used even when the page's `Link`
+/// header is ambiguous: the refusal only guards a search that would continue.
+#[tokio::test]
+async fn ssh_key_discovery_uses_a_found_key_despite_an_ambiguous_link_header() {
+    use gitforgeops::secrets::discover_recipient_at;
+    let (public_key, _) = recipient_keypair();
+    let (api_base, requests) = spawn_github_stub_with_headers(vec![(
+        keys_path(),
+        200,
+        serde_json::json!([{"key": public_key}]).to_string(),
+        "Link: garbage\r\n".to_string(),
+    )]);
+    let recipient = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect("discovery")
+        .expect("the compatible key on page 1");
+    assert_eq!(recipient.login(), RECIPIENT);
+    assert_eq!(count_requests(&requests, &keys_path()), 1);
+}
+
+/// SSH key discovery reads every `Link` header: a `next` in the second one is
+/// followed (same origin and path), and an ambiguous second one is refused.
+#[tokio::test]
+async fn ssh_key_discovery_reads_every_link_header() {
+    use gitforgeops::secrets::discover_recipient_at;
+    let (public_key, _) = recipient_keypair();
+    let first_page = format!("GET /users/{RECIPIENT}/keys?per_page=100 ");
+    let second_page = format!("GET /users/{RECIPIENT}/keys?per_page=100&page=2");
+    let routes = |second_header: String| {
+        vec![
+            (
+                second_page.clone(),
+                200,
+                serde_json::json!([{"key": public_key}]).to_string(),
+                String::new(),
+            ),
+            (
+                first_page.clone(),
+                200,
+                "[{\"key\":\"unsupported-public-key\"}]".to_string(),
+                format!(
+                    "Link: <{{base}}/users/{RECIPIENT}/keys?per_page=100&page=1>; rel=\"prev\"\r\n{second_header}"
+                ),
+            ),
+        ]
+    };
+
+    let (api_base, requests) = spawn_github_stub_with_headers(routes(format!(
+        "Link: <{{base}}/users/{RECIPIENT}/keys?per_page=100&page=2>; rel=\"next\"\r\n"
+    )));
+    let recipient = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect("discovery")
+        .expect("the key on page 2");
+    assert_eq!(recipient.login(), RECIPIENT);
+    assert_eq!(count_requests(&requests, &second_page), 1);
+
+    let (api_base, requests) = spawn_github_stub_with_headers(routes(format!(
+        "Link: <{{base}}/users/{RECIPIENT}/keys?per_page=100&page=2>; rel=\"prev,next\"\r\n"
+    )));
+    let error = discover_recipient_at(&test_client(), &api_base, RECIPIENT)
+        .await
+        .expect_err("an ambiguous second header is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid SSH key pagination header"),
+        "{error}"
+    );
+    assert_eq!(count_requests(&requests, &second_page), 0);
 }

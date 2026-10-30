@@ -590,6 +590,73 @@ fn supplied_pr_and_revision_cannot_authorize_any_caller_without_evidence() {
     assert!(!repo.dir.path().join(".state/default.json").exists());
 }
 
+/// #562: a set but malformed `GITFORGEOPS_PR_NUMBER` is an error in plan and
+/// apply, never a silent fallback to the commit's associated PR.
+#[test]
+fn malformed_pr_number_refuses_plan_and_apply_instead_of_falling_back() {
+    let repo = Repo::with_files(&[
+        ("resources/ferrum/proxies/app.yaml", HTTP_PROXY),
+        (".gitforgeops/policies.yaml", HTTPS_ONLY_POLICY),
+    ]);
+    let sha = "a".repeat(40);
+    for malformed in ["seven", "0", "-3"] {
+        let context = [
+            ("GITFORGEOPS_PR_NUMBER", malformed),
+            ("GITHUB_SHA", sha.as_str()),
+            ("GITHUB_REPOSITORY", "fixture/repo"),
+        ];
+        for args in [&["plan"][..], &["apply", "--auto-approve"][..]] {
+            let output = repo.run(args, &context);
+            let shown = format!("{}{}", stdout(&output), stderr(&output));
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{args:?} {malformed}: {shown}"
+            );
+            assert!(
+                shown.contains("GITFORGEOPS_PR_NUMBER is set but is not a positive integer"),
+                "{args:?} {malformed}: {shown}"
+            );
+            assert!(!repo.published().exists());
+            assert!(!repo.dir.path().join(".state/default.json").exists());
+        }
+    }
+}
+
+/// The PR number also routes the credential delivery comment, so apply
+/// refuses a malformed one before any allocation or publication even when no
+/// policy needs an override (a lenient parse accepted `+7`).
+#[test]
+fn apply_refuses_a_malformed_pr_number_without_any_policy() {
+    let repo = Repo::with_consumer(BROKERED_CONSUMER);
+    for malformed in ["+7", "seven"] {
+        let output = repo.run(
+            &["apply", "--auto-approve"],
+            &[
+                ("GITFORGEOPS_PR_NUMBER", malformed),
+                ("FERRUM_CREDS_JSON", BUNDLE),
+            ],
+        );
+        let shown = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{malformed}: {shown}");
+        assert!(
+            shown.contains("GITFORGEOPS_PR_NUMBER is set but is not a positive integer"),
+            "{malformed}: {shown}"
+        );
+        assert!(!repo.published().exists());
+        assert!(!repo.dir.path().join(".state/default.json").exists());
+    }
+    let output = repo.run(
+        &["apply", "--auto-approve"],
+        &[
+            ("GITFORGEOPS_PR_NUMBER", "7"),
+            ("FERRUM_CREDS_JSON", BUNDLE),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(repo.published().exists());
+}
+
 #[test]
 fn apply_refuses_a_literal_consumer_credential_and_publishes_nothing() {
     let repo = Repo::with_consumer(LITERAL_CONSUMER);

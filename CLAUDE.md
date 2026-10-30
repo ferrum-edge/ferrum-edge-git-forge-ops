@@ -1371,6 +1371,53 @@ input verification in `src/policy/override_input.rs`. Pagination and unknown
 permissions fail closed. Audit entries record PR, review id, authorized head and
 applied revision.
 
+- **Bound inputs.** Every file under `.gitforgeops/` is bound input, walked
+  from disk whether Git tracks, ignores (`.gitignore`, `.git/info/exclude`,
+  `core.excludesFile`) or never saw it: each file present must be the reviewed
+  head's regular blob (symlinks and non-regular files refused). A reviewed
+  file may be absent from split review's data checkout, which copies only
+  protected configuration. Ignored build/runtime outputs elsewhere (`target/`,
+  worktrees, `.state/`, `assembled/`) are not compared.
+- **Evidence.** Label events and reviews are read by page number from the
+  fixed origin until a page returns zero items; that empty page is the only
+  proof of completeness. A short page is not the last: the next numbered page
+  is always requested and anything on it is read. A missing or failing page,
+  or the 20-page cap without an empty page, fails closed. The `Link` header is
+  neither followed nor consulted for override evidence. Permission is one
+  unpaginated read, taken again in the final pass. The final pass re-reads
+  the PR, labeler, **permission** (must still be sufficient) and reviews.
+- **SSH key discovery** (availability only) uses the strict RFC 8288 parser
+  `github_override::next_link` over every `Link` header. A relation type that
+  is neither a `reg-rel-type` nor an absolute-URI `ext-rel-type` (so
+  `rel="prev,next"`), an empty target, a target or extension type outside
+  RFC 3986 characters or with an invalid percent-escape (`%GG`), two
+  different `next` targets, or a malformed entry (which never hides a later
+  one) is `Ambiguous`. Discovery follows a same-origin, same-path `next` and
+  refuses an ambiguous value only when the page held no compatible key.
+- **Committed findings only.** api-mode apply re-evaluates policy after
+  credential resolution. The override covers a blocking finding there only if
+  the unresolved (committed) document's evaluation had the same rule,
+  severity, kind, namespace, id and message, counted as a multiset (one
+  unresolved finding covers one identical resolved finding)
+  (`github_override::apply_override_to_reviewed`,
+  `refusal::refuse_post_resolution_policy_violations`). A resolution-only
+  finding refuses apply, saying it appeared only after credential resolution;
+  details stay scrubbed. `plan` and `review` evaluate both documents and show
+  the same verdict through `github_override::preview_policy_findings`
+  (unresolved findings with the whole override, plus in api mode each
+  resolution-only finding, which stays a `Policy` blocker; it carries
+  `RESOLUTION_ONLY_REMEDIATION` when an active override leaves the finding
+  blocking).
+- `GITFORGEOPS_PR_NUMBER` is parsed strictly (`github_override::parse_pr_number`:
+  unset or blank is absent, otherwise ASCII digits only and positive). A
+  malformed value is an error in `plan` when it evaluates an override (`review`
+  takes its PR from `--pr`), and in `apply` unconditionally, right after the allocation
+  binding and before any state, bundle, gateway or GitHub access; it never
+  falls back to the commit's associated PR. Credential delivery
+  (`surface_delivered_credentials`) uses the same parse; values are already
+  committed there, so a malformed value (unreachable through `apply`) posts
+  nothing, warns and delivers on stdout rather than stranding them.
+
 ### Setup doctor (`src/doctor/`)
 
 `gitforgeops doctor` answers "is this repo ready to deploy, and what is
@@ -1469,7 +1516,9 @@ gateway, as `Vec<ApplyBlocker>` over eleven `BlockerKind`s:
   lock and bundle read (the policy gate evaluates the unresolved document, as
   the security audit sees it); API mode evaluates policy again after credential
   resolution and before validation, using the resolved-slot report to scrub
-  diagnostics. Both policy refusals include the same override guidance. The
+  diagnostics, and covers only findings also present unresolved; `plan` and
+  `review` preview both gates through `preview_policy_findings`. Both policy
+  refusals include the same override guidance. The
   required-slot check runs before the first gateway call. Share predicates,
   not control flow.
 
