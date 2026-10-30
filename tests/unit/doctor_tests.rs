@@ -242,6 +242,48 @@ fn a_file_output_ancestor_that_is_a_file_fails() {
     assert_eq!(output.status, Status::Fail, "{output:?}");
 }
 
+/// The publication primitive writes straight to an existing non-regular
+/// destination, so a directory there fails it ("Is a directory").
+#[test]
+fn a_file_output_destination_that_is_a_directory_fails() {
+    let dir = repo(&[]);
+    let destination = dir.path().join("assembled/resources.yaml");
+    std::fs::create_dir_all(&destination).expect("directory destination");
+    let checks = doctor::local::run(dir.path(), Some(&file_env(&destination)));
+    let output = find(&checks, "file-output");
+    assert_eq!(output.status, Status::Fail, "{output:?}");
+    assert!(output.detail.contains("is a directory"), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_output_destination_symlinked_to_a_directory_fails() {
+    let dir = repo(&[]);
+    std::fs::create_dir_all(dir.path().join("target-dir")).expect("target");
+    std::fs::create_dir_all(dir.path().join("assembled")).expect("parent");
+    let destination = dir.path().join("assembled/resources.yaml");
+    std::os::unix::fs::symlink(dir.path().join("target-dir"), &destination).expect("symlink");
+    let checks = doctor::local::run(dir.path(), Some(&file_env(&destination)));
+    let output = find(&checks, "file-output");
+    assert_eq!(output.status, Status::Fail, "{output:?}");
+    assert!(output.detail.contains("is a directory"), "{output:?}");
+}
+
+/// A device is written directly, never through a temp file in its parent, so
+/// `/dev`'s own writability is irrelevant: the device's is what counts.
+#[cfg(unix)]
+#[test]
+fn a_file_output_device_destination_is_judged_by_its_own_writability() {
+    let dir = repo(&[]);
+    let checks = doctor::local::run(
+        dir.path(),
+        Some(&file_env(std::path::Path::new("/dev/null"))),
+    );
+    let output = find(&checks, "file-output");
+    assert_eq!(output.status, Status::Pass, "{output:?}");
+    assert!(output.detail.contains("written directly"), "{output:?}");
+}
+
 /// Set `path`'s mode and report whether the restriction is observable: as
 /// root, permission bits refuse nothing and the test has nothing to show.
 #[cfg(unix)]
@@ -533,10 +575,11 @@ fn github_checks_without_the_state_writer_app_id_are_unknown() {
 
 #[test]
 fn a_non_integer_state_writer_app_id_fails_before_the_auditor_runs() {
-    // The scheduled audit hands the same value to argparse's `type=int`,
-    // which rejects it and turns the workflow red.
+    // Doctor accepts only a canonical numeric App id (ASCII digits). That is
+    // stricter than argparse's `type=int`, which also takes Unicode decimal
+    // digits, so the detail must not claim the scheduled audit fails too.
     let dir = repo(&[]);
-    for app_id in ["abc", "4.2", "0x2a", "42abc", "4__2"] {
+    for app_id in ["abc", "4.2", "0x2a", "42abc", "4__2", "\u{0664}\u{0662}"] {
         let checks = doctor::github::run(
             dir.path(),
             &doctor::github::GithubContext {
@@ -548,7 +591,11 @@ fn a_non_integer_state_writer_app_id_fails_before_the_auditor_runs() {
         );
         let check = find(&checks, "settings-audit");
         assert_eq!(check.status, Status::Fail, "{app_id}: {check:?}");
-        assert!(check.detail.contains("not an integer"), "{check:?}");
+        assert!(
+            check.detail.contains("not a canonical numeric App id"),
+            "{check:?}"
+        );
+        assert!(!check.detail.contains("settings-audit.yml"), "{check:?}");
         assert!(
             check.detail.contains("GITFORGEOPS_STATE_APP_ID"),
             "{check:?}"

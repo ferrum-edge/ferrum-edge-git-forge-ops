@@ -94,10 +94,13 @@ impl GithubContext {
     }
 }
 
-/// Whether Python's `int()` — what argparse's `type=int` calls on
-/// `--state-writer-app-id` — accepts `value`: surrounding whitespace, an
-/// optional sign, and ASCII digits with single underscores between them.
-fn python_int_accepts(value: &str) -> bool {
+/// Whether `value` is a canonical numeric App id: surrounding whitespace, an
+/// optional sign, and ASCII digits with single underscores between them —
+/// the ASCII subset of what Python's `int()` (argparse's `type=int` on
+/// `--state-writer-app-id`) accepts. Deliberately stricter than `int()`,
+/// which also takes Unicode decimal digits, so a value refused here is not
+/// necessarily one the scheduled audit refuses.
+fn is_canonical_app_id(value: &str) -> bool {
     let trimmed = value.trim();
     let digits = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
     !digits.is_empty()
@@ -153,14 +156,14 @@ pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
         )];
     }
 
-    // The scheduled audit passes the variable straight to argparse's
-    // `type=int`, which rejects anything else and turns the workflow red.
-    // Name the value's source here instead of relaying argparse's usage text.
+    // An App id is a plain decimal number. Refuse anything else here, naming
+    // the value's source, instead of relaying argparse's usage text (or, for
+    // a value `int()` happens to take, auditing against the wrong actor).
     let app_id = (!context.template_repo)
         .then_some(context.state_writer_app_id.as_deref())
         .flatten();
     if let Some(app_id) = app_id {
-        if !python_int_accepts(app_id) {
+        if !is_canonical_app_id(app_id) {
             return vec![Check::new(
                 "settings-audit",
                 "Repository settings match the launch baseline",
@@ -168,8 +171,8 @@ pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
                 Status::Fail,
                 format!(
                     "the state-writer App id ({STATE_APP_ID_VARIABLE} or \
-                     --state-writer-app-id) is not an integer: '{}'; \
-                     settings-audit.yml fails on the same value",
+                     --state-writer-app-id) is not a canonical numeric App id \
+                     (ASCII digits): '{}'",
                     crate::diagnostics::sanitize_line(app_id)
                 ),
             )

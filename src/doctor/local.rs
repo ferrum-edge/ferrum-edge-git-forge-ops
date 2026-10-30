@@ -6,7 +6,8 @@
 //! from "this is a deployment repository with a specific thing missing".
 //!
 //! Nothing here writes. Writability and executability are asked of the
-//! operating system (`access(2)` on Unix), never tested by creating a file.
+//! operating system (`faccessat(2)` with `AT_EACCESS` on Unix), never tested
+//! by creating a file.
 
 use std::path::{Path, PathBuf};
 
@@ -550,10 +551,31 @@ enum Located {
     Missing,
 }
 
+/// Ask the operating system whether this process may `access` `path`, with
+/// its **effective** user and group ids (`faccessat(AT_FDCWD, ..,
+/// AT_EACCESS)`), which are what an `open` or `exec` would be judged by.
+///
+/// Falls back to `access(2)` (real ids) only where the effective check is
+/// unavailable: Android, where rustix defines no `AT_EACCESS`, and a macOS
+/// without `faccessat`, which rustix emulates with `access` and answers
+/// `OPNOTSUPP` (or `NOSYS`) for any flag. Real and effective ids differ only
+/// for a set-id process, which `gitforgeops` is not.
+#[cfg(unix)]
+fn effective_access(path: &Path, access: rustix::fs::Access) -> bool {
+    #[cfg(not(target_os = "android"))]
+    match rustix::fs::accessat(rustix::fs::CWD, path, access, rustix::fs::AtFlags::EACCESS) {
+        Ok(()) => return true,
+        Err(error)
+            if error == rustix::io::Errno::OPNOTSUPP || error == rustix::io::Errno::NOSYS => {}
+        Err(_) => return false,
+    }
+    rustix::fs::access(path, access).is_ok()
+}
+
 /// Whether this process may execute `path`.
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
-    path.is_file() && rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok()
+    path.is_file() && effective_access(path, rustix::fs::Access::EXEC_OK)
 }
 
 #[cfg(not(unix))]
@@ -595,7 +617,7 @@ fn which_binary(binary: &str) -> Located {
 #[cfg(unix)]
 fn directory_is_writable(path: &Path) -> bool {
     use rustix::fs::Access;
-    rustix::fs::access(path, Access::WRITE_OK | Access::EXEC_OK).is_ok()
+    effective_access(path, Access::WRITE_OK | Access::EXEC_OK)
 }
 
 #[cfg(not(unix))]
@@ -603,14 +625,74 @@ fn directory_is_writable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|metadata| !metadata.permissions().readonly())
 }
 
-/// Judge where file-mode apply publishes: a temp file in the destination's
-/// directory, then a rename, after `create_dir_all` on that directory. So the
-/// question is whether the nearest existing ancestor of the destination is a
-/// directory this process may write.
+/// Whether this process may open the existing `path` for writing.
+#[cfg(unix)]
+fn file_is_writable(path: &Path) -> bool {
+    effective_access(path, rustix::fs::Access::WRITE_OK)
+}
+
+#[cfg(not(unix))]
+fn file_is_writable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| !metadata.permissions().readonly())
+}
+
+/// Judge the destination the way the publication primitive
+/// (`apply::file_target`) treats it. An existing destination that is not a
+/// regular file, followed through symlinks (`destination_needs_direct_write`),
+/// is written in place with no temp file: a directory there fails with "Is a
+/// directory", and anything else (a device, a pipe) needs only its own write
+/// permission. Otherwise the document goes to a temp file in the
+/// destination's directory and is renamed over it, after `create_dir_all` on
+/// that directory, so the question is whether the nearest existing ancestor
+/// is a directory this process may write.
 fn file_output(root: &Path, configured: &str) -> Check {
     const ID: &str = "file-output";
     const TITLE: &str = "File-mode output directory is writable";
     let output = root.join(configured);
+    if let Ok(metadata) = std::fs::metadata(&output) {
+        if metadata.is_dir() {
+            return Check::new(
+                ID,
+                TITLE,
+                Scope::Local,
+                Status::Fail,
+                format!(
+                    "FERRUM_FILE_OUTPUT_PATH ({configured}) is a directory; publication \
+                     writes the document to that path itself"
+                ),
+            )
+            .remedy("Point FERRUM_FILE_OUTPUT_PATH at a file path, not a directory.");
+        }
+        if !metadata.is_file() {
+            return if file_is_writable(&output) {
+                Check::pass(
+                    ID,
+                    TITLE,
+                    Scope::Local,
+                    format!(
+                        "assembled documents will be written directly to {configured}, \
+                         which is not a regular file"
+                    ),
+                )
+            } else {
+                Check::new(
+                    ID,
+                    TITLE,
+                    Scope::Local,
+                    Status::Fail,
+                    format!(
+                        "FERRUM_FILE_OUTPUT_PATH ({configured}) is not a regular file and \
+                         is not writable by this user"
+                    ),
+                )
+                .remedy(
+                    "Publication writes straight to an existing non-regular destination. \
+                     Grant this user write access to it, or point FERRUM_FILE_OUTPUT_PATH \
+                     at a regular file path.",
+                )
+            };
+        }
+    }
     let parent = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
