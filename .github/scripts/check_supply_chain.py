@@ -4078,7 +4078,11 @@ _OPTION_TOKEN = re.compile(r"[ \t]+(\S+)")
 _SHELL_BOUNDARY = re.compile(r"[;&|<>()`$]")
 # Any heredoc opener whose delimiter is unquoted: Bash expands `$(...)` and
 # backticks in its body, `#` lines included.
-_EXPANDING_HEREDOC = re.compile(r"<<-?[ \t]*(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\b")
+# Every heredoc opener on a command line, quoted or not (`<<<` is a
+# here-string, not an opener).
+_HEREDOC_OPENER = re.compile(
+    r"(?<!<)<<(?P<dash>-?)[ \t]*(?P<quote>['\"]?)(?P<tag>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+)
 # Short options that take the next token as their argument (`-X dev`,
 # `-W error`), and ones that end option parsing (`-c CODE`, `-m MODULE`).
 _ARGUMENT_OPTIONS = frozenset("XW")
@@ -4089,7 +4093,7 @@ _FINAL_OPTIONS = frozenset("cm")
 # delimiter is still shell (`$(...)` runs), so its body is scanned.
 _ISOLATED_HEREDOC = re.compile(
     r"^[ \t]*(?:\S*/)?python(?:3(?:\.\d+)?)?(?:[ \t]+-[A-Za-z]+)*(?:[ \t]+-(?:[ \t]+[^<\s]+)*)?"
-    r"[ \t]*<<-?[ \t]*(['\"])(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\1[ \t]*$"
+    r"[ \t]*(?P<opener><<-?[ \t]*(?P<quote>['\"])(?P<tag>[A-Za-z_][A-Za-z0-9_]*)(?P=quote))[ \t]*$"
 )
 
 
@@ -4163,20 +4167,23 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
                 "use `python3 -I {0}` or a `run:` that invokes `python3 -I`"
             )
     for path, script, _job in _run_scripts(document):
-        heredoc_tag = None
-        expanding_tag = None
         lines = script.split("\n")
+        # Heredocs opened on a command line and not yet closed, in order:
+        # (delimiter, strips leading tabs, body is skipped as isolated Python).
+        pending: list[tuple[str, bool, bool]] = []
         for number, line in enumerate(lines):
-            if heredoc_tag is not None:
-                if line.strip() == heredoc_tag:
-                    heredoc_tag = None
-                continue
-            if expanding_tag is not None and line.strip() == expanding_tag:
-                expanding_tag = None
-                continue
-            # A `#` line is a comment, except in an unquoted heredoc body,
-            # where Bash still expands `$(...)` and backticks on it.
-            if line.lstrip().startswith("#") and expanding_tag is None:
+            if pending:
+                tag, strip_tabs, skipped = pending[0]
+                if (line.lstrip("\t") if strip_tabs else line) == tag:
+                    pending.pop(0)
+                    continue
+                if skipped:
+                    continue
+                # A body line is text, never a command line: no comment rule
+                # (an unquoted body expands `$(...)` even after `#`) and no
+                # new heredoc openers. Quoted bodies are scanned too: a
+                # `bash <<'SH'` body runs.
+            elif line.lstrip().startswith("#"):
                 continue
             for match in _PYTHON_COMMAND.finditer(line):
                 if not _isolated_from(line, match.end()):
@@ -4186,21 +4193,23 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
                         "`PYTHON*` variables and the user site off the interpreter"
                     )
                     break
-            inside_expanding = expanding_tag is not None
-            expanding = _EXPANDING_HEREDOC.search(line)
-            if expanding is not None and expanding_tag is None:
-                expanding_tag = expanding.group("tag")
-            heredoc = _ISOLATED_HEREDOC.match(line)
-            if (
-                heredoc is not None
-                # Inside another heredoc the opener is that body's text, not a
-                # command, so its lines stay that heredoc's to scan.
-                and not inside_expanding
-                and _isolated_from(line, _PYTHON_COMMAND.search(line).end())
-                # An opener whose tag never closes skips nothing.
-                and any(later.strip() == heredoc.group("tag") for later in lines[number + 1:])
-            ):
-                heredoc_tag = heredoc.group("tag")
+            if pending:
+                continue
+            isolated = _ISOLATED_HEREDOC.match(line)
+            for opener in _HEREDOC_OPENER.finditer(line):
+                tag, strip_tabs = opener.group("tag"), bool(opener.group("dash"))
+                skipped = (
+                    isolated is not None
+                    and len(pending) == 0
+                    and opener.start() == isolated.start("opener")
+                    and _isolated_from(line, _PYTHON_COMMAND.search(line).end())
+                    # An opener whose delimiter never closes skips nothing.
+                    and any(
+                        (later.lstrip("\t") if strip_tabs else later) == tag
+                        for later in lines[number + 1:]
+                    )
+                )
+                pending.append((tag, strip_tabs, skipped))
     return violations
 
 
