@@ -8301,6 +8301,9 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["echo 'python3 -I - <<TAG'", "python3 -c 'pass'"],
             ["echo python3 -I - <<'PY'", "python3 evil.py", "PY"],
             ["python3 -I - <<'PY'", "print(1)", "python3 evil.py"],
+            ["python3<<<'print(1)';echo -I"],
+            ["python3 <<<'print(1)' -I"],
+            ["python3 -I - <<PY", "# $(python3 -c 'pass')", "PY"],
             ["bash <<'SH'", "python3 x.py", "SH"],
             ["python3 -I - <<'PY'", "print(1)", "PY", "python3 y.py"],
         ):

@@ -4075,6 +4075,10 @@ _PYTHON_COMMAND = re.compile(
     r"(?<![\w.$-])(?:pypy|python)(?:3(?:\.\d+)?)?(?![\w.-])"
 )
 _OPTION_TOKEN = re.compile(r"[ \t]+(\S+)")
+_SHELL_BOUNDARY = re.compile(r"[;&|<>()`$]")
+# Any heredoc opener whose delimiter is unquoted: Bash expands `$(...)` and
+# backticks in its body, `#` lines included.
+_EXPANDING_HEREDOC = re.compile(r"<<-?[ \t]*(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\b")
 # Short options that take the next token as their argument (`-X dev`,
 # `-W error`), and ones that end option parsing (`-c CODE`, `-m MODULE`).
 _ARGUMENT_OPTIONS = frozenset("XW")
@@ -4098,8 +4102,14 @@ def _isolated_from(text: str, position: int) -> bool:
     operand ends option parsing.
     """
     expecting_argument = False
-    for token in _OPTION_TOKEN.finditer(text, position):
+    # Only the interpreter's own contiguous arguments: no whitespace (a
+    # redirection or `;` right after the name) or a shell operator ends them,
+    # so `python3<<<x;echo -I` does not borrow `echo`'s `-I`.
+    while (token := _OPTION_TOKEN.match(text, position)) is not None:
         word = token.group(1)
+        if _SHELL_BOUNDARY.search(word):
+            return False
+        position = token.end()
         if expecting_argument:
             expecting_argument = False
             continue
@@ -4113,7 +4123,6 @@ def _isolated_from(text: str, position: int) -> bool:
             if letter in _ARGUMENT_OPTIONS:
                 expecting_argument = index == len(word) - 2
                 break
-        position = token.end()
     return False
 
 
@@ -4155,13 +4164,19 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
             )
     for path, script, _job in _run_scripts(document):
         heredoc_tag = None
+        expanding_tag = None
         lines = script.split("\n")
         for number, line in enumerate(lines):
             if heredoc_tag is not None:
                 if line.strip() == heredoc_tag:
                     heredoc_tag = None
                 continue
-            if line.lstrip().startswith("#"):
+            if expanding_tag is not None and line.strip() == expanding_tag:
+                expanding_tag = None
+                continue
+            # A `#` line is a comment, except in an unquoted heredoc body,
+            # where Bash still expands `$(...)` and backticks on it.
+            if line.lstrip().startswith("#") and expanding_tag is None:
                 continue
             for match in _PYTHON_COMMAND.finditer(line):
                 if not _isolated_from(line, match.end()):
@@ -4171,6 +4186,9 @@ def python_isolation_violations(workflow: str, document: dict) -> list[str]:
                         "`PYTHON*` variables and the user site off the interpreter"
                     )
                     break
+            expanding = _EXPANDING_HEREDOC.search(line)
+            if expanding is not None and expanding_tag is None:
+                expanding_tag = expanding.group("tag")
             heredoc = _ISOLATED_HEREDOC.match(line)
             if (
                 heredoc is not None
