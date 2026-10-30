@@ -3,20 +3,23 @@
 //! Workflows, the drift monitor and operators branch on the process status
 //! alone, so a refactor of `main.rs` dispatch must not silently move a code.
 //! Every row spawns the real binary and pins one `(command, input) → code`
-//! pair; the per-command modules (`diff_exit_tests.rs`, `verify_exit_tests.rs`,
-//! `apply_gate_tests.rs`, `namespace_filter_guard_tests.rs`, ...) pin the
-//! behaviour behind each code in depth. This module's job is breadth: every
-//! documented code is reachable, and each command returns the documented one.
+//! pair, plus evidence on one named stream (and its absence from the other)
+//! proving the code came from the intended path. The per-command modules
+//! (`diff_exit_tests.rs`, `verify_exit_tests.rs`, `apply_gate_tests.rs`,
+//! `namespace_filter_guard_tests.rs`, ...) pin the behaviour behind each code
+//! in depth. This module's job is breadth: every documented code is
+//! reachable, and each command returns the documented one.
 //!
 //! Hermetic: the child starts from `env_clear()` and receives only `PATH`,
-//! `HOME`, `TMPDIR`, the coverage profile path and the variables a row names,
-//! so no inherited `FERRUM_*`, `GITFORGEOPS_*` or `GITHUB_*` value reaches it.
-//! Gateways and data planes are loopback stubs from the sibling modules; the
-//! validator is a shell stub, which is why the matrix is Unix-only.
+//! `TMPDIR`, a per-row `HOME`, the coverage profile path and the variables a
+//! row names, so no inherited `FERRUM_*`, `GITFORGEOPS_*` or `GITHUB_*` value
+//! reaches it. Gateways and data planes are loopback stubs; the validator is
+//! a shell stub, which is why the matrix is Unix-only.
 
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
@@ -31,7 +34,7 @@ use super::diff_exit_tests::{
     backup, config_export, live_proxy, spawn_backup_stub, EXPORT_KEY_ID, FERRUM_PROXY, JWT_SECRET,
     KEYAUTH_CONSUMER, VIEWER_ONLY,
 };
-use super::verify_exit_tests::{closed_port, data_plane, STAGING_ONLY};
+use super::verify_exit_tests::{data_plane, STAGING_ONLY};
 
 /// A Consumer with a literal (non-placeholder) secret: the offline `Security`
 /// apply blocker, decidable without a gateway.
@@ -46,6 +49,31 @@ spec:
 /// The only closed repository-config version is 1.
 const BAD_REPO_CONFIG: &str = "version: 99\n";
 
+/// A populated validator digest allowlist, so doctor's pin check passes.
+const VALIDATOR_PIN: (&str, &str) = (
+    ".github/ferrum-edge-checksums.txt",
+    "0000000000000000000000000000000000000000000000000000000000000000  ferrum-edge\n",
+);
+
+/// A usage or parse error is an ordinary error (1). It must never be clap's
+/// default 2, which is `DRIFT_EXIT_CODE`: the drift monitor reads 2 from
+/// `diff --exit-on-drift` as "drift found", so a mistyped flag would be
+/// reported as drift instead of a failed check.
+const USAGE_ERROR_EXIT_CODE: i32 = 1;
+
+const VALIDATOR_ACCEPTS: &str = "#!/bin/sh\nexit 0\n";
+const VALIDATOR_REJECTS: &str = "#!/bin/sh\necho 'stub rejection' >&2\nexit 1\n";
+
+/// The value in a row's `env` that stands for the rejecting validator stub.
+const REJECTING_VALIDATOR: &str = "<rejecting validator>";
+
+const TOP_LEVEL_USAGE: &str = "Usage: gitforgeops [OPTIONS] <COMMAND>";
+const DIFF_USAGE: &str = "Usage: gitforgeops diff [OPTIONS]";
+const VERSION_LINE: &str = concat!("gitforgeops ", env!("CARGO_PKG_VERSION"));
+/// The `Error:` line on stderr; `validate` and `plan` also list the finding
+/// as `[error] ...` in their stdout report.
+const EMPTY_SELECTION: &str = "Error: namespace filter 'nothing' selected 0 desired resources";
+
 /// The repository the child runs in.
 #[derive(Clone, Copy)]
 enum Tree {
@@ -54,14 +82,17 @@ enum Tree {
     Proxy,
     /// No `resources/` directory at all.
     NoResources,
+    /// No `resources/` directory, but a populated validator allowlist, so the
+    /// resource-tree check is doctor's only failure.
+    PinnedNoResources,
     /// [`Tree::Proxy`] plus an unsupported `.gitforgeops/config.yaml`.
     BadRepoConfig,
     /// [`Tree::Proxy`] plus a Consumer with a literal secret.
     LiteralCredential,
     /// A Consumer with a brokered key, for the viewer `/config/export` read.
     BrokeredConsumer,
-    /// [`Tree::Proxy`] plus a populated validator digest allowlist, so every
-    /// local doctor check passes or is skipped.
+    /// [`Tree::Proxy`] plus a populated validator allowlist, so every local
+    /// doctor check passes or is skipped.
     DoctorReady,
     /// [`Tree::Proxy`] plus `.gitforgeops/smoke.yaml` declaring checks for
     /// `staging` only.
@@ -74,6 +105,7 @@ impl Tree {
         match self {
             Tree::Proxy => vec![proxy],
             Tree::NoResources => vec![],
+            Tree::PinnedNoResources => vec![VALIDATOR_PIN],
             Tree::BadRepoConfig => vec![proxy, (".gitforgeops/config.yaml", BAD_REPO_CONFIG)],
             Tree::LiteralCredential => vec![
                 proxy,
@@ -82,13 +114,7 @@ impl Tree {
             Tree::BrokeredConsumer => {
                 vec![("resources/ferrum/consumers/app.yaml", KEYAUTH_CONSUMER)]
             }
-            Tree::DoctorReady => vec![
-                proxy,
-                (
-                    ".github/ferrum-edge-checksums.txt",
-                    "0000000000000000000000000000000000000000000000000000000000000000  ferrum-edge\n",
-                ),
-            ],
+            Tree::DoctorReady => vec![proxy, VALIDATOR_PIN],
             Tree::StagingSmoke => vec![proxy, (".gitforgeops/smoke.yaml", STAGING_ONLY)],
         }
     }
@@ -107,9 +133,17 @@ enum Live {
     ViewerExport,
     /// A data plane answering every request with this status.
     DataPlane(u16),
-    /// A data-plane URL nothing listens on.
-    ClosedDataPlane,
+    /// A data plane that accepts each connection and closes it unanswered.
+    HangUpDataPlane,
 }
+
+/// The stream a row's evidence must appear on.
+#[derive(Clone, Copy, Debug)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+use Stream::{Stderr, Stdout};
 
 /// One row of the contract.
 struct Case {
@@ -120,473 +154,490 @@ struct Case {
     args: &'static [&'static str],
     env: &'static [(&'static str, &'static str)],
     expected: i32,
-    /// A substring of stdout + stderr proving the code came from the intended
-    /// path rather than an unrelated early failure.
-    evidence: &'static str,
+    /// Where the evidence must appear. The other stream must not carry it, so
+    /// swapping `out!` and `eout!` fails the row.
+    stream: Stream,
+    /// Non-empty substrings proving the code came from the intended path
+    /// rather than an unrelated early failure.
+    evidence: &'static [&'static str],
 }
 
-/// A usage or parse error is an ordinary error (1). It must never be clap's
-/// default 2, which is `DRIFT_EXIT_CODE`: the drift monitor reads 2 from
-/// `diff --exit-on-drift` as "drift found", so a mistyped flag would be
-/// reported as drift instead of a failed check.
-const USAGE_ERROR_EXIT_CODE: i32 = 1;
+impl Case {
+    fn new(
+        name: &'static str,
+        args: &'static [&'static str],
+        expected: i32,
+        stream: Stream,
+        evidence: &'static [&'static str],
+    ) -> Self {
+        Self {
+            name,
+            tree: Tree::Proxy,
+            live: Live::Offline,
+            args,
+            env: &[],
+            expected,
+            stream,
+            evidence,
+        }
+    }
 
-const VALIDATOR_ACCEPTS: &str = "#!/bin/sh\nexit 0\n";
-const VALIDATOR_REJECTS: &str = "#!/bin/sh\necho 'stub rejection' >&2\nexit 1\n";
+    fn tree(mut self, tree: Tree) -> Self {
+        self.tree = tree;
+        self
+    }
+
+    fn live(mut self, live: Live) -> Self {
+        self.live = live;
+        self
+    }
+
+    fn env(mut self, env: &'static [(&'static str, &'static str)]) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// A clap usage or parse error: exit 1, message on stderr only.
+    fn usage_error(
+        name: &'static str,
+        args: &'static [&'static str],
+        message: &'static [&'static str],
+    ) -> Self {
+        Self::new(name, args, USAGE_ERROR_EXIT_CODE, Stderr, message)
+    }
+}
 
 fn cases() -> Vec<Case> {
     use Live::*;
     use Tree::*;
+    let in_sync = Backup {
+        port: 8080,
+        cached: false,
+    };
+    let drifted = Backup {
+        port: 9999,
+        cached: false,
+    };
+    let staging = &[("FERRUM_ENV", "staging")];
     vec![
         // -- 0: success ---------------------------------------------------
-        Case {
-            name: "--version",
-            tree: Proxy,
-            live: Offline,
-            args: &["--version"],
-            env: &[],
-            expected: 0,
-            evidence: env!("CARGO_PKG_VERSION"),
-        },
-        Case {
-            name: "--help",
-            tree: Proxy,
-            live: Offline,
-            args: &["--help"],
-            env: &[],
-            expected: 0,
-            evidence: "Usage:",
-        },
-        Case {
-            name: "version",
-            tree: Proxy,
-            live: Offline,
-            args: &["version"],
-            env: &[],
-            expected: 0,
-            evidence: env!("CARGO_PKG_VERSION"),
-        },
-        Case {
-            name: "version --format json",
-            tree: Proxy,
-            live: Offline,
-            args: &["version", "--format", "json"],
-            env: &[],
-            expected: 0,
-            evidence: "\"version\"",
-        },
-        Case {
-            name: "validate on a valid tree",
-            tree: Proxy,
-            live: Offline,
-            args: &["validate"],
-            env: &[],
-            expected: 0,
-            evidence: "",
-        },
-        Case {
-            name: "export",
-            tree: Proxy,
-            live: Offline,
-            args: &["export"],
-            env: &[],
-            expected: 0,
-            evidence: "app.internal",
-        },
-        Case {
-            name: "envs",
-            tree: Proxy,
-            live: Offline,
-            args: &["envs"],
-            env: &[],
-            expected: 0,
-            evidence: "\"default\"",
-        },
-        Case {
-            name: "plan without a gateway and without blockers",
-            tree: Proxy,
-            live: Offline,
-            args: &["plan"],
-            env: &[],
-            expected: 0,
-            evidence: "gateway URL not configured",
-        },
-        Case {
-            name: "diff --exit-on-drift in sync",
-            tree: Proxy,
-            live: Backup {
-                port: 8080,
-                cached: false,
-            },
-            args: &["diff", "--exit-on-drift"],
-            env: &[],
-            expected: 0,
-            evidence: "No differences found",
-        },
-        Case {
-            name: "diff --exit-on-drift --accept-unverified-secrets",
-            tree: BrokeredConsumer,
-            live: ViewerExport,
-            args: &["diff", "--exit-on-drift", "--accept-unverified-secrets"],
-            env: &VIEWER_ONLY,
-            expected: 0,
-            evidence: "Fingerprinted secret fields were not verified",
-        },
-        Case {
-            name: "diff without --exit-on-drift reports drift and exits 0",
-            tree: Proxy,
-            live: Backup {
-                port: 9999,
-                cached: false,
-            },
-            args: &["diff"],
-            env: &[],
-            expected: 0,
-            evidence: "MODIFY",
-        },
-        Case {
-            name: "doctor --scope local on a ready tree",
-            tree: DoctorReady,
-            live: Offline,
-            args: &["doctor", "--scope", "local"],
-            env: &[],
-            expected: 0,
-            evidence: "No blocking problems found.",
-        },
-        Case {
-            name: "verify with a passing check",
-            tree: StagingSmoke,
-            live: DataPlane(200),
-            args: &["verify"],
-            env: &[("FERRUM_ENV", "staging")],
-            expected: 0,
-            evidence: "",
-        },
-        Case {
-            name: "review stays 0 on an offline blocker",
-            tree: LiteralCredential,
-            live: Offline,
-            args: &["review"],
-            env: &[],
-            expected: 0,
-            evidence: "Live gateway comparison failed",
-        },
+        Case::new("--version", &["--version"], 0, Stdout, &[VERSION_LINE]),
+        Case::new("-V", &["-V"], 0, Stdout, &[VERSION_LINE]),
+        Case::new("--help", &["--help"], 0, Stdout, &[TOP_LEVEL_USAGE]),
+        Case::new("-h", &["-h"], 0, Stdout, &[TOP_LEVEL_USAGE]),
+        Case::new("help", &["help"], 0, Stdout, &[TOP_LEVEL_USAGE]),
+        Case::new("help diff", &["help", "diff"], 0, Stdout, &[DIFF_USAGE]),
+        Case::new("diff --help", &["diff", "--help"], 0, Stdout, &[DIFF_USAGE]),
+        Case::new("version", &["version"], 0, Stdout, &[VERSION_LINE]),
+        Case::new(
+            "version --format json",
+            &["version", "--format", "json"],
+            0,
+            Stdout,
+            &["\"version\""],
+        ),
+        Case::new(
+            "validate on a valid tree",
+            &["validate"],
+            0,
+            Stdout,
+            &["Validation passed."],
+        ),
+        Case::new("export", &["export"], 0, Stdout, &["app.internal"]),
+        Case::new("envs", &["envs"], 0, Stdout, &["[\"default\"]"]),
+        Case::new(
+            "plan without a gateway and without blockers",
+            &["plan"],
+            0,
+            Stderr,
+            &["gateway URL not configured"],
+        ),
+        Case::new(
+            "diff --exit-on-drift in sync",
+            &["diff", "--exit-on-drift"],
+            0,
+            Stdout,
+            &["No differences found"],
+        )
+        .live(in_sync),
+        Case::new(
+            "diff --exit-on-drift --accept-unverified-secrets",
+            &["diff", "--exit-on-drift", "--accept-unverified-secrets"],
+            0,
+            Stdout,
+            &["Fingerprinted secret fields were not verified"],
+        )
+        .tree(BrokeredConsumer)
+        .live(ViewerExport)
+        .env(&VIEWER_ONLY),
+        Case::new(
+            "diff without --exit-on-drift reports drift and exits 0",
+            &["diff"],
+            0,
+            Stdout,
+            &["MODIFY Proxy app"],
+        )
+        .live(drifted),
+        Case::new(
+            "doctor --scope local on a ready tree",
+            &["doctor", "--scope", "local"],
+            0,
+            Stdout,
+            &["No blocking problems found."],
+        )
+        .tree(DoctorReady),
+        Case::new(
+            "verify with a passing check",
+            &["verify"],
+            0,
+            Stdout,
+            &["1 of 1 checks passed."],
+        )
+        .tree(StagingSmoke)
+        .live(DataPlane(200))
+        .env(staging),
+        Case::new(
+            "review stays 0 on an offline blocker",
+            &["review"],
+            0,
+            Stdout,
+            &["Apply is blocked", "1 blocking"],
+        )
+        .tree(LiteralCredential),
         // -- 1: error -----------------------------------------------------
-        Case {
-            name: "export without a resources directory",
-            tree: NoResources,
-            live: Offline,
-            args: &["export"],
-            env: &[],
-            expected: 1,
-            evidence: "no resources directory found",
-        },
-        Case {
-            name: "validate without a resources directory",
-            tree: NoResources,
-            live: Offline,
-            args: &["validate"],
-            env: &[],
-            expected: 1,
-            evidence: "no resources directory found",
-        },
-        Case {
-            name: "envs with an unsupported repository config",
-            tree: BadRepoConfig,
-            live: Offline,
-            args: &["envs"],
-            env: &[],
-            expected: 1,
-            evidence: "unsupported repository config version 99",
-        },
-        Case {
-            name: "export with an unsupported repository config",
-            tree: BadRepoConfig,
-            live: Offline,
-            args: &["export"],
-            env: &[],
-            expected: 1,
-            evidence: "unsupported repository config version 99",
-        },
-        Case {
-            name: "invalid enum env var",
-            tree: Proxy,
-            live: Offline,
-            args: &["export"],
-            env: &[("FERRUM_GATEWAY_MODE", "bogus")],
-            expected: 1,
-            evidence: "invalid FERRUM_GATEWAY_MODE value",
-        },
-        Case {
-            name: "invalid boolean env var",
-            tree: Proxy,
-            live: Offline,
-            args: &["export"],
-            env: &[("FERRUM_ALLOW_UNKNOWN_FIELDS", "maybe")],
-            expected: 1,
-            evidence: "invalid FERRUM_ALLOW_UNKNOWN_FIELDS value",
-        },
-        Case {
-            name: "invalid review boolean env var",
-            tree: Proxy,
-            live: Offline,
-            args: &["review"],
-            env: &[("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", "bogus")],
-            expected: 1,
-            evidence: "invalid GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS value",
-        },
-        Case {
-            name: "validate with a rejecting validator",
-            tree: Proxy,
-            live: Offline,
-            args: &["validate"],
-            env: &[("FERRUM_EDGE_BINARY_PATH", "<rejecting validator>")],
-            expected: 1,
-            evidence: "stub rejection",
-        },
-        Case {
-            name: "validate without a validator binary",
-            tree: Proxy,
-            live: Offline,
-            args: &["validate"],
-            env: &[("FERRUM_EDGE_BINARY_PATH", "/nonexistent/ferrum-edge")],
-            expected: 1,
-            evidence: "ferrum-edge binary not found",
-        },
-        Case {
-            name: "validate: empty-namespace refusal is 1, not 2",
-            tree: Proxy,
-            live: Offline,
-            args: &["validate"],
-            env: &[("FERRUM_NAMESPACE", "nothing")],
-            expected: EMPTY_NAMESPACE_EXIT_CODE,
-            evidence: "namespace filter 'nothing' selected 0 desired resources",
-        },
-        Case {
-            name: "plan: empty-namespace refusal is 1, not 2",
-            tree: Proxy,
-            live: Offline,
-            args: &["plan"],
-            env: &[("FERRUM_NAMESPACE", "nothing")],
-            expected: EMPTY_NAMESPACE_EXIT_CODE,
-            evidence: "namespace filter 'nothing' selected 0 desired resources",
-        },
-        Case {
-            name: "diff: empty-namespace refusal is 1, not 2",
-            tree: Proxy,
-            live: Offline,
-            args: &["diff"],
-            env: &[("FERRUM_NAMESPACE", "nothing")],
-            expected: EMPTY_NAMESPACE_EXIT_CODE,
-            evidence: "namespace filter 'nothing' selected 0 desired resources",
-        },
-        Case {
-            name: "diff --exit-on-drift: empty-namespace refusal is 1, not 2",
-            tree: Proxy,
-            live: Offline,
-            args: &["diff", "--exit-on-drift"],
-            env: &[("FERRUM_NAMESPACE", "nothing")],
-            expected: EMPTY_NAMESPACE_EXIT_CODE,
-            evidence: "namespace filter 'nothing' selected 0 desired resources",
-        },
-        Case {
-            name: "plan with an offline apply blocker",
-            tree: LiteralCredential,
-            live: Offline,
-            args: &["plan"],
-            env: &[],
-            expected: 1,
-            evidence: "=== Apply Blockers ===",
-        },
-        Case {
-            name: "review --fail-on-blockers with an offline blocker",
-            tree: LiteralCredential,
-            live: Offline,
-            args: &["review", "--fail-on-blockers"],
-            env: &[],
-            expected: 1,
-            evidence: "apply is blocked by 1 class(es): security",
-        },
-        Case {
-            name: "review with GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true and an offline blocker",
-            tree: LiteralCredential,
-            live: Offline,
-            args: &["review"],
-            env: &[("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", "true")],
-            expected: 1,
-            evidence: "apply is blocked by 1 class(es): security",
-        },
-        Case {
-            name: "apply refuses a literal credential before any gateway call",
-            tree: LiteralCredential,
-            live: Offline,
-            args: &["apply", "--auto-approve"],
-            env: &[],
-            expected: 1,
-            evidence: "Refusing to apply: 1 error-severity security finding",
-        },
-        Case {
-            name: "import from a missing file",
-            tree: Proxy,
-            live: Offline,
-            args: &[
+        Case::new(
+            "export without a resources directory",
+            &["export"],
+            1,
+            Stderr,
+            &["no resources directory found"],
+        )
+        .tree(NoResources),
+        Case::new(
+            "validate without a resources directory",
+            &["validate"],
+            1,
+            Stderr,
+            &["no resources directory found"],
+        )
+        .tree(NoResources),
+        Case::new(
+            "rotate without a resources directory",
+            &["rotate", "--consumer", "x", "--credential", "keyauth/key"],
+            1,
+            Stderr,
+            &["no resources directory found"],
+        )
+        .tree(NoResources),
+        Case::new(
+            "envs with an unsupported repository config",
+            &["envs"],
+            1,
+            Stderr,
+            &["unsupported repository config version 99"],
+        )
+        .tree(BadRepoConfig),
+        Case::new(
+            "export with an unsupported repository config",
+            &["export"],
+            1,
+            Stderr,
+            &["unsupported repository config version 99"],
+        )
+        .tree(BadRepoConfig),
+        Case::new(
+            "invalid enum env var",
+            &["export"],
+            1,
+            Stderr,
+            &["invalid FERRUM_GATEWAY_MODE value"],
+        )
+        .env(&[("FERRUM_GATEWAY_MODE", "bogus")]),
+        Case::new(
+            "invalid boolean env var",
+            &["export"],
+            1,
+            Stderr,
+            &["invalid FERRUM_ALLOW_UNKNOWN_FIELDS value"],
+        )
+        .env(&[("FERRUM_ALLOW_UNKNOWN_FIELDS", "maybe")]),
+        Case::new(
+            "invalid review boolean env var",
+            &["review"],
+            1,
+            Stderr,
+            &["invalid GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS value"],
+        )
+        .env(&[("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", "bogus")]),
+        Case::new(
+            "validate with a rejecting validator",
+            &["validate"],
+            1,
+            Stdout,
+            &["stub rejection"],
+        )
+        .env(&[("FERRUM_EDGE_BINARY_PATH", REJECTING_VALIDATOR)]),
+        Case::new(
+            "validate without a validator binary",
+            &["validate"],
+            1,
+            Stderr,
+            &["ferrum-edge binary not found"],
+        )
+        .env(&[("FERRUM_EDGE_BINARY_PATH", "/nonexistent/ferrum-edge")]),
+        Case::new(
+            "validate: empty-namespace refusal is 1, not 2",
+            &["validate"],
+            EMPTY_NAMESPACE_EXIT_CODE,
+            Stderr,
+            &[EMPTY_SELECTION],
+        )
+        .env(&[("FERRUM_NAMESPACE", "nothing")]),
+        Case::new(
+            "plan: empty-namespace refusal is 1, not 2",
+            &["plan"],
+            EMPTY_NAMESPACE_EXIT_CODE,
+            Stderr,
+            &[EMPTY_SELECTION],
+        )
+        .env(&[("FERRUM_NAMESPACE", "nothing")]),
+        Case::new(
+            "diff: empty-namespace refusal is 1, not 2",
+            &["diff"],
+            EMPTY_NAMESPACE_EXIT_CODE,
+            Stderr,
+            &[EMPTY_SELECTION],
+        )
+        .env(&[("FERRUM_NAMESPACE", "nothing")]),
+        Case::new(
+            "diff --exit-on-drift: empty-namespace refusal is 1, not 2",
+            &["diff", "--exit-on-drift"],
+            EMPTY_NAMESPACE_EXIT_CODE,
+            Stderr,
+            &[EMPTY_SELECTION],
+        )
+        .env(&[("FERRUM_NAMESPACE", "nothing")]),
+        Case::new(
+            "plan with an offline apply blocker",
+            &["plan"],
+            1,
+            Stdout,
+            &["=== Apply Blockers ==="],
+        )
+        .tree(LiteralCredential),
+        Case::new(
+            "review --fail-on-blockers with an offline blocker",
+            &["review", "--fail-on-blockers"],
+            1,
+            Stderr,
+            &["apply is blocked by 1 class(es): security"],
+        )
+        .tree(LiteralCredential),
+        Case::new(
+            "review with GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true and an offline blocker",
+            &["review"],
+            1,
+            Stderr,
+            &["apply is blocked by 1 class(es): security"],
+        )
+        .tree(LiteralCredential)
+        .env(&[("GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS", "true")]),
+        Case::new(
+            "apply refuses a literal credential before any gateway call",
+            &["apply", "--auto-approve"],
+            1,
+            Stderr,
+            &["Refusing to apply: 1 error-severity security finding"],
+        )
+        .tree(LiteralCredential),
+        Case::new(
+            "import from a missing file",
+            &[
                 "import",
                 "--from-file",
                 "does-not-exist.yaml",
                 "--output-dir",
                 "imported",
             ],
-            env: &[],
-            expected: 1,
-            evidence: "failed to read file does-not-exist.yaml",
-        },
-        Case {
-            name: "diff --exit-on-drift on a cached backup",
-            tree: Proxy,
-            live: Backup {
-                port: 9999,
-                cached: true,
-            },
-            args: &["diff", "--exit-on-drift"],
-            env: &[],
-            expected: 1,
-            evidence: "requires an authoritative backup",
-        },
-        Case {
-            name: "verify with declared checks and no data-plane URL",
-            tree: StagingSmoke,
-            live: Offline,
-            args: &["verify"],
-            env: &[("FERRUM_ENV", "staging")],
-            expected: 1,
-            evidence: "FERRUM_VERIFY_BASE_URL",
-        },
-        // -- 2: drift -----------------------------------------------------
-        Case {
-            name: "diff --exit-on-drift with managed drift",
-            tree: Proxy,
-            live: Backup {
-                port: 9999,
-                cached: false,
-            },
-            args: &["diff", "--exit-on-drift"],
-            env: &[],
-            expected: DRIFT_EXIT_CODE,
-            evidence: "MODIFY",
-        },
+            1,
+            Stderr,
+            &["failed to read file does-not-exist.yaml"],
+        ),
+        Case::new(
+            "diff --exit-on-drift on a cached backup",
+            &["diff", "--exit-on-drift"],
+            1,
+            Stderr,
+            &["requires an authoritative backup"],
+        )
+        .live(Backup {
+            port: 9999,
+            cached: true,
+        }),
+        Case::new(
+            "verify with declared checks and no data-plane URL",
+            &["verify"],
+            1,
+            Stderr,
+            &["FERRUM_VERIFY_BASE_URL"],
+        )
+        .tree(StagingSmoke)
+        .env(staging),
         // -- 1 (clap): usage errors are errors, never DRIFT_EXIT_CODE -----
-        Case {
-            name: "no subcommand",
-            tree: Proxy,
-            live: Offline,
-            args: &[],
-            env: &[],
-            expected: USAGE_ERROR_EXIT_CODE,
-            evidence: "Usage:",
-        },
-        Case {
-            name: "unknown subcommand",
-            tree: Proxy,
-            live: Offline,
-            args: &["bogus"],
-            env: &[],
-            expected: USAGE_ERROR_EXIT_CODE,
-            evidence: "unrecognized subcommand 'bogus'",
-        },
-        Case {
-            name: "unknown flag",
-            tree: Proxy,
-            live: Offline,
-            args: &["validate", "--bogus"],
-            env: &[],
-            expected: USAGE_ERROR_EXIT_CODE,
-            evidence: "unexpected argument '--bogus'",
-        },
-        Case {
-            name: "unknown flag on diff --exit-on-drift",
-            tree: Proxy,
-            live: Offline,
-            args: &["diff", "--exit-on-drift", "--bogus"],
-            env: &[],
-            expected: USAGE_ERROR_EXIT_CODE,
-            evidence: "unexpected argument '--bogus'",
-        },
-        Case {
-            name: "invalid enum flag value",
-            tree: Proxy,
-            live: Offline,
-            args: &["doctor", "--scope", "bogus"],
-            env: &[],
-            expected: USAGE_ERROR_EXIT_CODE,
-            evidence: "invalid value 'bogus'",
-        },
+        Case::new(
+            "no subcommand",
+            &[],
+            USAGE_ERROR_EXIT_CODE,
+            Stderr,
+            &[TOP_LEVEL_USAGE],
+        ),
+        Case::usage_error(
+            "unknown subcommand",
+            &["bogus"],
+            &["error: unrecognized subcommand 'bogus'"],
+        ),
+        Case::usage_error(
+            "help for an unknown subcommand",
+            &["help", "bogus"],
+            &["error: unrecognized subcommand 'bogus'"],
+        ),
+        Case::usage_error(
+            "unknown flag",
+            &["validate", "--bogus"],
+            &["error: unexpected argument '--bogus' found"],
+        ),
+        Case::usage_error(
+            "unknown flag on diff --exit-on-drift",
+            &["diff", "--exit-on-drift", "--bogus"],
+            &["error: unexpected argument '--bogus' found"],
+        ),
+        Case::usage_error(
+            "invalid enum flag value",
+            &["doctor", "--scope", "bogus"],
+            &["error: invalid value 'bogus' for '--scope <SCOPE>'"],
+        ),
+        Case::usage_error(
+            "value that fails validation",
+            &["review", "--pr", "abc"],
+            &["error: invalid value 'abc' for '--pr <PR>'"],
+        ),
+        Case::usage_error(
+            "missing value for an enum flag",
+            &["validate", "--format"],
+            &["error: a value is required for '--format <FORMAT>'"],
+        ),
+        Case::usage_error(
+            "missing value for a path flag",
+            &["diff", "--fingerprint-baseline"],
+            &["error: a value is required for '--fingerprint-baseline <PATH>'"],
+        ),
+        Case::usage_error(
+            "missing required argument",
+            &["import", "--from-api"],
+            &["error: the following required arguments were not provided"],
+        ),
+        Case::usage_error(
+            "missing required arguments",
+            &["rotate"],
+            &["error: the following required arguments were not provided"],
+        ),
+        Case::usage_error(
+            "conflicting arguments",
+            &[
+                "import",
+                "--from-api",
+                "--from-file",
+                "x",
+                "--output-dir",
+                "y",
+            ],
+            &["error: the argument '--from-api' cannot be used with '--from-file <FROM_FILE>'"],
+        ),
+        // -- 2: drift -----------------------------------------------------
+        Case::new(
+            "diff --exit-on-drift with managed drift",
+            &["diff", "--exit-on-drift"],
+            DRIFT_EXIT_CODE,
+            Stdout,
+            &["MODIFY Proxy app"],
+        )
+        .live(drifted),
         // -- 3: doctor blocker --------------------------------------------
-        Case {
-            name: "doctor --scope local without the validator digest allowlist",
-            tree: Proxy,
-            live: Offline,
-            args: &["doctor", "--scope", "local"],
-            env: &[],
-            expected: DOCTOR_FAILED_EXIT_CODE,
-            evidence: "Validator digest allowlist is populated",
-        },
-        Case {
-            name: "doctor --scope local without a resources directory",
-            tree: NoResources,
-            live: Offline,
-            args: &["doctor", "--scope", "local", "--format", "json"],
-            env: &[],
-            expected: DOCTOR_FAILED_EXIT_CODE,
-            evidence: "\"resources\"",
-        },
+        Case::new(
+            "doctor --scope local without the validator digest allowlist",
+            &["doctor", "--scope", "local"],
+            DOCTOR_FAILED_EXIT_CODE,
+            Stdout,
+            &[
+                "FAIL    Validator digest allowlist is populated",
+                "1 failed",
+            ],
+        ),
+        Case::new(
+            "doctor --scope local without a resources directory",
+            &["doctor", "--scope", "local"],
+            DOCTOR_FAILED_EXIT_CODE,
+            Stdout,
+            &["FAIL    Resource tree is present", "1 failed"],
+        )
+        .tree(PinnedNoResources),
         // -- 4: verify failed ---------------------------------------------
-        Case {
-            name: "verify with a check answered by the wrong status",
-            tree: StagingSmoke,
-            live: DataPlane(503),
-            args: &["verify"],
-            env: &[("FERRUM_ENV", "staging")],
-            expected: VERIFY_FAILED_EXIT_CODE,
-            evidence: "",
-        },
-        Case {
-            name: "verify with an unreachable data plane",
-            tree: StagingSmoke,
-            live: ClosedDataPlane,
-            args: &["verify"],
-            env: &[("FERRUM_ENV", "staging")],
-            expected: VERIFY_FAILED_EXIT_CODE,
-            evidence: "",
-        },
+        Case::new(
+            "verify with a check answered by the wrong status",
+            &["verify"],
+            VERIFY_FAILED_EXIT_CODE,
+            Stdout,
+            &[
+                "UNEXPECTED  orders route answers",
+                "expected 200, got 503",
+                "0 of 1 checks passed.",
+            ],
+        )
+        .tree(StagingSmoke)
+        .live(DataPlane(503))
+        .env(staging),
+        Case::new(
+            "verify against a data plane that hangs up",
+            &["verify"],
+            VERIFY_FAILED_EXIT_CODE,
+            Stdout,
+            &[
+                "UNREACHABLE orders route answers",
+                "expected 200, request failed after 1 attempt(s)",
+                "0 of 1 checks passed.",
+            ],
+        )
+        .tree(StagingSmoke)
+        .live(HangUpDataPlane)
+        .env(staging),
         // -- 5: verify skipped --------------------------------------------
-        Case {
-            name: "verify with no declared check for the environment",
-            tree: StagingSmoke,
-            live: Offline,
-            args: &["verify"],
-            env: &[("FERRUM_ENV", "production")],
-            expected: VERIFY_SKIPPED_EXIT_CODE,
-            evidence: "skipped: no smoke checks declared for production",
-        },
-        Case {
-            name: "verify with no smoke file",
-            tree: Proxy,
-            live: Offline,
-            args: &["verify"],
-            env: &[],
-            expected: VERIFY_SKIPPED_EXIT_CODE,
-            evidence: "not a pass",
-        },
+        Case::new(
+            "verify with no declared check for the environment",
+            &["verify"],
+            VERIFY_SKIPPED_EXIT_CODE,
+            Stdout,
+            &["skipped: no smoke checks declared for production"],
+        )
+        .tree(StagingSmoke)
+        .env(&[("FERRUM_ENV", "production")]),
+        Case::new(
+            "verify with no smoke file",
+            &["verify"],
+            VERIFY_SKIPPED_EXIT_CODE,
+            Stdout,
+            &["not a pass"],
+        ),
         // -- 6: secrets unverified ----------------------------------------
-        Case {
-            name: "diff --exit-on-drift in sync with unverified secrets",
-            tree: BrokeredConsumer,
-            live: ViewerExport,
-            args: &["diff", "--exit-on-drift"],
-            env: &VIEWER_ONLY,
-            expected: SECRETS_UNVERIFIED_EXIT_CODE,
-            evidence: "(in sync, secrets unverified)",
-        },
+        Case::new(
+            "diff --exit-on-drift in sync with unverified secrets",
+            &["diff", "--exit-on-drift"],
+            SECRETS_UNVERIFIED_EXIT_CODE,
+            Stderr,
+            &["(in sync, secrets unverified)"],
+        )
+        .tree(BrokeredConsumer)
+        .live(ViewerExport)
+        .env(&VIEWER_ONLY),
     ]
 }
 
@@ -607,6 +658,20 @@ fn executable(dir: &Path, name: &str, script: &str) -> PathBuf {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
         .expect("chmod validator stub");
     path
+}
+
+/// A loopback data plane that accepts every connection and closes it without
+/// answering. The listener stays bound for the whole process, so no other
+/// socket can take the port between bind and connect.
+fn hang_up_data_plane() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind data plane");
+    let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    url
 }
 
 /// The variables a [`Live`] setup contributes.
@@ -647,7 +712,7 @@ fn live_env(live: Live) -> Vec<(String, String)> {
             false,
         )),
         Live::DataPlane(status) => data_plane_env(data_plane(status)),
-        Live::ClosedDataPlane => data_plane_env(closed_port()),
+        Live::HangUpDataPlane => data_plane_env(hang_up_data_plane()),
     }
 }
 
@@ -660,10 +725,15 @@ struct Validators {
 fn run(case: &Case, scratch: &Path, validators: &Validators) -> Output {
     let repo = TempDir::new().expect("repository tempdir");
     write_tree(repo.path(), case.tree);
+    let home = TempDir::new().expect("home tempdir");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
-    command.args(case.args).current_dir(repo.path()).env_clear();
-    for name in ["PATH", "HOME", "TMPDIR"] {
+    command
+        .args(case.args)
+        .current_dir(repo.path())
+        .env_clear()
+        .env("HOME", home.path());
+    for name in ["PATH", "TMPDIR"] {
         if let Ok(value) = std::env::var(name) {
             command.env(name, value);
         }
@@ -681,13 +751,47 @@ fn run(case: &Case, scratch: &Path, validators: &Validators) -> Output {
     command.env("FERRUM_EDGE_BINARY_PATH", &validators.accepts);
     command.envs(live_env(case.live));
     for (name, value) in case.env {
-        if *value == "<rejecting validator>" {
+        if *value == REJECTING_VALIDATOR {
             command.env(name, &validators.rejects);
         } else {
             command.env(name, value);
         }
     }
     command.output().expect("run gitforgeops")
+}
+
+/// Why `output` does not satisfy `case`, if it does not.
+fn mismatch(case: &Case, output: &Output) -> Option<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (expected, other) = match case.stream {
+        Stdout => (&stdout, &stderr),
+        Stderr => (&stderr, &stdout),
+    };
+    let mut problems = Vec::new();
+    if output.status.code() != Some(case.expected) {
+        problems.push(format!(
+            "expected exit {}, got {:?}",
+            case.expected,
+            output.status.code()
+        ));
+    }
+    for evidence in case.evidence {
+        if !expected.contains(evidence) {
+            problems.push(format!("{:?} missing from {:?}", evidence, case.stream));
+        }
+        if other.contains(evidence) {
+            problems.push(format!("{:?} also on the other stream", evidence));
+        }
+    }
+    (!problems.is_empty()).then(|| {
+        format!(
+            "{} (gitforgeops {}): {}\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+            case.name,
+            case.args.join(" "),
+            problems.join("; ")
+        )
+    })
 }
 
 #[test]
@@ -700,27 +804,17 @@ fn every_documented_exit_code_is_returned_by_the_command_that_documents_it() {
     let mut failures = Vec::new();
     let mut reached = BTreeSet::new();
     for case in cases() {
-        let output = run(&case, scratch.path(), &validators);
-        let shown = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        // A row without evidence would pass on any output with the right code.
+        assert!(
+            !case.evidence.is_empty() && case.evidence.iter().all(|e| !e.is_empty()),
+            "row {:?} needs non-empty evidence",
+            case.name
         );
-        let code = output.status.code();
-        if code != Some(case.expected) || !shown.contains(case.evidence) {
-            failures.push(format!(
-                "{} (gitforgeops {}): expected exit {} with {:?}, got {:?}\n{}",
-                case.name,
-                case.args.join(" "),
-                case.expected,
-                case.evidence,
-                code,
-                shown
-            ));
-        }
+        let output = run(&case, scratch.path(), &validators);
+        failures.extend(mismatch(&case, &output));
         reached.insert(case.expected);
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
+    assert!(failures.is_empty(), "{}", failures.join("\n=====\n"));
     // Every row of the documented table has at least one witness.
     assert_eq!(reached, (0..=6).collect::<BTreeSet<i32>>());
 }

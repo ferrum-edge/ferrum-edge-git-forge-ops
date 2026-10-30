@@ -108,7 +108,7 @@ pub(super) fn data_plane(status: u16) -> String {
 }
 
 /// A loopback address nothing is listening on.
-pub(super) fn closed_port() -> String {
+fn closed_port() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("local addr"));
     drop(listener);
