@@ -8310,7 +8310,6 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             ["cat <<OUT", "python3 -I <<'PY'", "# $(python3 -c 'pass')", "PY", "OUT"],
             ["bash <<'SH'", "python3 x.py", "SH"],
             ["python3 -I - <<-'PY'", "\tprint(1)", "\tPY", "python3 y.py"],
-            ["bash <<'SH'", "python3 x.py", "SH"],
             ["python3 -I - <<'PY'", "print(1)", "PY", "python3 y.py"],
         ):
             document = self._document(workflow(script))

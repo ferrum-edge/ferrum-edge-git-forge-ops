@@ -190,8 +190,8 @@ cargo fmt --all && cargo fmt --all -- --check
   commit SHAs.
 - Every workflow job declares a literal `timeout-minutes`
   (`job_timeout_violations`): at most 120, or 360 for a job that commits the
-  state ledger (known by job id, the state-writer key or the App-token
-  action). Such a job gives every step its own timeout and a budget of at
+  state ledger (known by job id, the state-writer key or any
+  `app_private_key`, the App-token action, or the mint step name). Such a job gives every step its own timeout and a budget of at
   least their sum plus 15 minutes (runner setup downloads actions before any
   step timeout applies), because a job timeout cancels the job and
   skips the `!cancelled()` ledger commit. Reusable-workflow call jobs carry

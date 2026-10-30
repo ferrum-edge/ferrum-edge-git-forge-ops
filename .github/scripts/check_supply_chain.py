@@ -4076,8 +4076,6 @@ _PYTHON_COMMAND = re.compile(
 )
 _OPTION_TOKEN = re.compile(r"[ \t]+(\S+)")
 _SHELL_BOUNDARY = re.compile(r"[;&|<>()`$]")
-# Any heredoc opener whose delimiter is unquoted: Bash expands `$(...)` and
-# backticks in its body, `#` lines included.
 # Every heredoc opener on a command line, quoted or not (`<<<` is a
 # here-string, not an opener).
 _HEREDOC_OPENER = re.compile(
