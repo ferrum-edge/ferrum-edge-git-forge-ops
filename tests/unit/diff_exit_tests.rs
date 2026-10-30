@@ -20,10 +20,10 @@ use tempfile::TempDir;
 
 /// JWT signing secret. The stub ignores the token, but `AdminClient` refuses
 /// to build below 32 characters.
-const JWT_SECRET: &str = "diff-exit-test-secret-at-least-32-chars";
+pub(super) const JWT_SECRET: &str = "diff-exit-test-secret-at-least-32-chars";
 
 /// Repository proxy in namespace `ferrum`.
-const FERRUM_PROXY: &str = r#"kind: Proxy
+pub(super) const FERRUM_PROXY: &str = r#"kind: Proxy
 spec:
   id: "app"
   backend_host: "app.internal"
@@ -53,7 +53,7 @@ environments:
 "#;
 
 /// One `/backup` document.
-fn backup(proxies: serde_json::Value) -> String {
+pub(super) fn backup(proxies: serde_json::Value) -> String {
     serde_json::json!({
         "proxies": proxies,
         "consumers": [],
@@ -67,7 +67,7 @@ fn backup(proxies: serde_json::Value) -> String {
 /// assembler resolves a schemeless repository proxy to `https`, and a live row
 /// that left it null would compare as an ordinary Modify — drift from the
 /// fixture rather than from the property under test.
-fn live_proxy(
+pub(super) fn live_proxy(
     id: &str,
     namespace: &str,
     port: u16,
@@ -89,7 +89,7 @@ fn live_proxy(
 /// Routing on the namespace header rather than the path is what the admin API
 /// itself does — `/backup` is one endpoint and the namespace is a header — so
 /// a multi-namespace run is exercised the way production drives it.
-fn spawn_backup_stub(
+pub(super) fn spawn_backup_stub(
     namespaces: Vec<(String, String)>,
     requests: Arc<Mutex<Vec<String>>>,
     cached: bool,
@@ -1339,11 +1339,11 @@ fn label_live_fixture(live: &mut serde_json::Value) {
 /// Signing key for viewer-credential runs. The stub ignores the token.
 const VIEWER_SECRET: &str = "diff-exit-test-viewer-secret-32-chars";
 
-const EXPORT_KEY_ID: &str = "0123456789abcdef";
+pub(super) const EXPORT_KEY_ID: &str = "0123456789abcdef";
 
 /// Repository consumer with a brokered keyauth key. No bundle is loaded, so
 /// the key stays an unresolved placeholder, as in the drift check.
-const KEYAUTH_CONSUMER: &str = r#"kind: Consumer
+pub(super) const KEYAUTH_CONSUMER: &str = r#"kind: Consumer
 spec:
   id: "app"
   username: "app"
@@ -1357,7 +1357,7 @@ fn fingerprint(digit: char) -> String {
 
 /// One `GET /config/export` document for namespace `ferrum`: Consumer `app`
 /// with one fingerprinted keyauth key per digit.
-fn config_export(key_id: &str, keys: &[char]) -> String {
+pub(super) fn config_export(key_id: &str, keys: &[char]) -> String {
     let keyauth: Vec<serde_json::Value> = keys
         .iter()
         .map(|digit| serde_json::json!({ "key": fingerprint(*digit) }))
@@ -1399,7 +1399,7 @@ fn export_repo(export: String, cached: bool) -> Repo {
 
 /// The viewer secret set and the admin secret blanked (blank reads as unset),
 /// so a request that needed the admin credential could not be made.
-const VIEWER_ONLY: [(&str, &str); 2] = [
+pub(super) const VIEWER_ONLY: [(&str, &str); 2] = [
     ("FERRUM_ADMIN_JWT_VIEWER_SECRET", VIEWER_SECRET),
     ("FERRUM_ADMIN_JWT_SECRET", ""),
 ];

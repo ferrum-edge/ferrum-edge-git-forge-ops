@@ -23,7 +23,7 @@ use tempfile::TempDir;
 
 /// Checks for `staging` only, the way the shipped example leaves out
 /// `production`.
-const STAGING_ONLY: &str = r#"version: 1
+pub(super) const STAGING_ONLY: &str = r#"version: 1
 environments:
   staging:
     checks:
@@ -84,7 +84,7 @@ fn stdout(output: &Output) -> String {
 }
 
 /// A loopback data plane that answers one request with `status`.
-fn data_plane(status: u16) -> String {
+pub(super) fn data_plane(status: u16) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind data plane");
     let url = format!("http://{}", listener.local_addr().expect("local addr"));
     std::thread::spawn(move || {
@@ -108,7 +108,7 @@ fn data_plane(status: u16) -> String {
 }
 
 /// A loopback address nothing is listening on.
-fn closed_port() -> String {
+pub(super) fn closed_port() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("local addr"));
     drop(listener);

@@ -109,6 +109,8 @@ Exit codes:
 | 5 | `verify` had no declared check for the environment (`VERIFY_SKIPPED_EXIT_CODE`). Skipped is never a pass. |
 | 6 | `diff --exit-on-drift` found no drift in an alerted category with no fingerprint baseline supplied, but fingerprinted secrets were unverified (`SECRETS_UNVERIFIED_EXIT_CODE`). Never in sync; monitoring warns, does not fail. A supplied baseline that cannot verify secrets exits 1 instead. |
 
+`tests/unit/exit_code_matrix_tests.rs` pins this table per command against the real binary (clap usage errors also exit 2).
+
 ## Build / Test / Lint
 
 ```bash
