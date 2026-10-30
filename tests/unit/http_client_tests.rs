@@ -2406,6 +2406,10 @@ fn loopback_backup_bypasses_environment_proxies() {
             ("NO_PROXY", ""),
             ("no_proxy", ""),
         ])
+        // hyper-util's proxy matcher treats a process with REQUEST_METHOD
+        // set as CGI and ignores HTTP_PROXY, which would make this test pass
+        // even without `.no_proxy()`.
+        .env_remove("REQUEST_METHOD")
         .output()
         .unwrap();
     assert!(

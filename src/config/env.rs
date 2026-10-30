@@ -150,9 +150,11 @@ pub struct EnvConfig {
     /// Its own setting rather than a reuse of `gateway_url`: verification asks
     /// whether a *client* can reach the route that was just deployed, which is
     /// a different endpoint from the admin API that accepted the write, and on
-    /// most deployments a different host entirely. It is held to the same
-    /// transport rule as the gateway URL ([`validate_verify_transport`]),
-    /// because a check's headers can carry credential-bundle values.
+    /// most deployments a different host entirely. Because a check's headers
+    /// can carry credential-bundle values, it is held to the admin client's
+    /// send-time rule in every context ([`validate_verify_transport`]):
+    /// `https://`, or `http://` only to a literal loopback IP with
+    /// [`EnvConfig::allow_insecure_http`] — never `localhost` or a remote host.
     pub verify_base_url: Option<String>,
     /// The operator-held allowlist of verification probe Consumers
     /// (`FERRUM_VERIFY_PROBE_CONSUMERS`), raw; parsed by
@@ -377,7 +379,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
-/// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (`verify` refuses to run declared checks) |
+/// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (`verify` refuses to run declared checks); `http://` only to a literal loopback IP |
 /// | `FERRUM_VERIFY_PROBE_CONSUMERS` | `verify_probe_consumers` | unset (`verify` refuses every check that sends a slot) |
 /// | `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `verify_probe_consumers_bound` | `false` (an unset allowlist is "not visible", not "empty") |
 /// | `FERRUM_ALLOW_INSECURE_HTTP` | `allow_insecure_http` | `false` (an `http://` gateway URL is refused) |
@@ -441,7 +443,6 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
     warnings.extend(validate_verify_transport(
         verify_base_url.as_deref(),
         allow_insecure_http,
-        running_in_github_actions(),
     )?);
     warn_insecure_transport_once(&warnings);
 
@@ -677,18 +678,21 @@ fn parse_transport_url(var: &str, raw: &str) -> crate::error::Result<Url> {
     Ok(parsed)
 }
 
-/// Apply the gateway transport rule to `FERRUM_VERIFY_BASE_URL`.
+/// Apply the cleartext rule to `FERRUM_VERIFY_BASE_URL`.
 ///
 /// `verify` sends declared headers to this URL, and a header may carry a
-/// resolved credential-bundle slot, so it gets the same rule as the admin API:
-/// `https://` by default, `http://` only with `FERRUM_ALLOW_INSECURE_HTTP=true`
-/// and — under `GITHUB_ACTIONS` — only to a loopback host, and never embedded
-/// `user:password@`. `FERRUM_TLS_NO_VERIFY` has no bearing here: the verify
-/// client never honours it.
+/// resolved credential-bundle slot, so it gets the admin client's *send-time*
+/// rule (`AdminClient::authorize`), in every context: `https://` by default,
+/// and `http://` only to a literal loopback IP (`127.0.0.0/8` or `::1`) and
+/// only with `FERRUM_ALLOW_INSECURE_HTTP=true`. A hostname never qualifies —
+/// not even `localhost`, since DNS is not a trust boundary — and a remote host
+/// is refused outside GitHub Actions too. Embedded `user:password@` is always
+/// refused. `FERRUM_TLS_NO_VERIFY` has no bearing here: the verify client
+/// never honours it. The runner checks the same rule again on the exact URL
+/// it sends to.
 pub fn validate_verify_transport(
     verify_base_url: Option<&str>,
     allow_insecure_http: bool,
-    in_github_actions: bool,
 ) -> crate::error::Result<Vec<String>> {
     let Some(raw) = verify_base_url else {
         return Ok(Vec::new());
@@ -702,26 +706,38 @@ pub fn validate_verify_transport(
             "invalid FERRUM_VERIFY_BASE_URL: the value is an environment secret and is \
              withheld; expected {GATEWAY_URL_ACCEPTED}. Traffic checks can send \
              credential-bundle values in their headers, so a cleartext data plane is refused \
-             unless FERRUM_ALLOW_INSECURE_HTTP=true declares it a local development gateway"
+             unless FERRUM_ALLOW_INSECURE_HTTP=true declares it a local development gateway \
+             on a literal loopback IP"
         )));
     }
-    if in_github_actions
-        && parsed
-            .host()
-            .filter(|host| !host_is_loopback(host))
-            .is_some()
-    {
-        return Err(refused_in_github_actions(
-            "FERRUM_ALLOW_INSECURE_HTTP",
-            "the configured data-plane host is not loopback, so an http:// \
-             FERRUM_VERIFY_BASE_URL would put every credential a traffic check sends \
-             on the wire in cleartext",
+    if !parsed.host().is_some_and(|host| host_is_loopback_ip(&host)) {
+        return Err(crate::error::Error::Config(
+            "invalid FERRUM_VERIFY_BASE_URL: the value is an environment secret and is \
+             withheld. Traffic checks can send credential-bundle values in their headers, so \
+             cleartext http:// is accepted only to a literal loopback IP (127.0.0.0/8 or \
+             [::1]), never to a hostname (localhost included) or a remote host; \
+             FERRUM_ALLOW_INSECURE_HTTP=true does not extend cleartext beyond that. Use \
+             https:// (FERRUM_GATEWAY_CA_CERT carries a private CA)"
+                .to_string(),
         ));
     }
     Ok(vec![insecure_warning(
         "FERRUM_ALLOW_INSECURE_HTTP=true: traffic checks talk to the data plane over cleartext http://.",
         "Any credential a check sends is unencrypted on the wire. Local development only.",
     )])
+}
+
+/// Is the host a literal loopback IP (`127.0.0.0/8` or `::1`)?
+///
+/// Stricter than [`host_is_loopback`], which also accepts the name
+/// `localhost` for the gateway URL's CI rule. This is the admin client's
+/// send-time rule, which `FERRUM_VERIFY_BASE_URL` is held to at load.
+fn host_is_loopback_ip(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(_) => false,
+        Host::Ipv4(addr) => addr.is_loopback(),
+        Host::Ipv6(addr) => addr.is_loopback(),
+    }
 }
 
 /// Is the gateway host the machine running gitforgeops?

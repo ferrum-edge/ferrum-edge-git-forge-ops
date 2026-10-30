@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gitforgeops::config::repo_config::RepoConfig;
@@ -1528,10 +1528,9 @@ fn probe_projection_refuses_short_values_and_registers_only_authorized_credentia
     let mut short = bundle();
     short.insert(PROBE_SLOT.to_string(), "Q7short".to_string());
     let error = authorization.project(&short).unwrap_err().to_string();
-    assert!(
-        error.contains("traffic probe credential holds a secret shorter than 8 bytes"),
-        "{error}"
-    );
+    // The resolver's own refusal, naming the slot and never the value.
+    assert!(error.contains("shorter than 8 bytes"), "{error}");
+    assert!(error.contains(PROBE_SLOT), "{error}");
     assert!(!error.contains("Q7short"));
 }
 
@@ -1556,4 +1555,295 @@ fn probe_header_resolution_enforces_admission_without_touching_literals() {
         .iter()
         .any(|(name, value)| name == "X-Mode" && value == "x"));
     assert_eq!(gitforgeops::display::scrub_text(PROBE_VALUE), "[REDACTED]");
+}
+
+// -- verify transport and bundle lookup (#562) --------------------------------
+
+/// A loopback origin that answers every request `200` and records each
+/// request head it received, so a test can see both that the origin (and not
+/// a proxy) was reached and which credential it was sent.
+fn spawn_recording_origin() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind origin");
+    let addr = listener.local_addr().expect("origin addr");
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let thread_heads = Arc::clone(&heads);
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let heads = Arc::clone(&thread_heads);
+            std::thread::spawn(move || {
+                if stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .is_err()
+                {
+                    return;
+                }
+                let mut raw: Vec<u8> = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                heads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(String::from_utf8_lossy(&raw).to_ascii_lowercase());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+            });
+        }
+    });
+    (format!("http://{addr}"), heads)
+}
+
+/// The probe check, bounded to one quick attempt so a misrouted request
+/// fails fast rather than waiting out the default timeout.
+fn quick_probe_check() -> SmokeCheck {
+    SmokeCheck {
+        timeout_secs: 2,
+        ..checks_sending("GET", PROBE_SLOT).checks[0].clone()
+    }
+}
+
+fn probe_credentials(bundle: &BTreeMap<String, String>) -> ProbeCredentials {
+    authorize_probe_credentials(
+        "staging",
+        &checks_sending("GET", PROBE_SLOT),
+        &desired(),
+        Some(&allowlist()),
+        bundle,
+    )
+    .expect("authorized")
+}
+
+/// Also the child half of
+/// [`a_plaintext_loopback_check_bypasses_environment_proxies`]: run with every
+/// proxy variable pointing elsewhere, the credential must still reach the
+/// loopback origin directly.
+#[tokio::test]
+async fn a_plaintext_loopback_check_reaches_its_origin_directly() {
+    let (base_url, heads) = spawn_recording_origin();
+    let credentials = probe_credentials(&bundle());
+    let result = run_check(&base_url, &quick_probe_check(), &credentials, None).await;
+    assert_eq!(result.outcome, Outcome::Passed, "{}", result.detail);
+    let heads = heads.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(heads.len(), 1, "the origin must be reached exactly once");
+    assert!(heads[0].contains(&format!("x-api-key: {PROBE_VALUE}")));
+}
+
+#[test]
+fn a_plaintext_loopback_check_bypasses_environment_proxies() {
+    let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy.set_nonblocking(true).expect("nonblocking");
+    let proxy_url = format!("http://{}", proxy.local_addr().expect("proxy addr"));
+    // Proxy variables are process-global, so the check runs in a child test
+    // process: concurrent tests never inherit them.
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "unit::promotion_tests::a_plaintext_loopback_check_reaches_its_origin_directly",
+        ])
+        .envs([
+            ("HTTP_PROXY", proxy_url.as_str()),
+            ("http_proxy", proxy_url.as_str()),
+            ("HTTPS_PROXY", proxy_url.as_str()),
+            ("https_proxy", proxy_url.as_str()),
+            ("ALL_PROXY", proxy_url.as_str()),
+            ("all_proxy", proxy_url.as_str()),
+            ("NO_PROXY", ""),
+            ("no_proxy", ""),
+        ])
+        // hyper-util's proxy matcher treats a process with REQUEST_METHOD
+        // set as CGI and ignores HTTP_PROXY, which would make this test pass
+        // even without `.no_proxy()`.
+        .env_remove("REQUEST_METHOD")
+        .output()
+        .expect("run child test");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    assert_eq!(
+        proxy.accept().map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a proxy must never receive a traffic check or its credential"
+    );
+}
+
+#[tokio::test]
+async fn the_runner_refuses_cleartext_to_anything_but_a_literal_loopback_ip() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let credentials = probe_credentials(&bundle());
+    // A hostname is not a literal loopback IP, even `localhost`: whatever it
+    // resolves to, DNS is not a trust boundary.
+    for base_url in [
+        format!("http://localhost:{port}"),
+        format!("http://LOCALHOST:{port}"),
+        format!("ftp://127.0.0.1:{port}"),
+        format!("http://probe-user:probe-pass@127.0.0.1:{port}"),
+        "not a url".to_string(),
+    ] {
+        let result = run_check(&base_url, &quick_probe_check(), &credentials, None).await;
+        assert_eq!(result.outcome, Outcome::Unreachable, "{base_url}");
+        assert_eq!(result.attempts, 0, "{base_url}: no attempt may be made");
+        assert!(
+            result.detail.contains("literal loopback IP"),
+            "{base_url}: {}",
+            result.detail
+        );
+        for withheld in [port.to_string(), "probe-pass".to_string()] {
+            assert!(!result.detail.contains(&withheld), "{}", result.detail);
+        }
+        assert_no_value(&result.detail, &base_url);
+    }
+    assert_eq!(
+        listener.accept().map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "nothing may be sent over a refused transport"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_keyed_probe_value_resolves_under_its_canonical_slot() {
+    // Bundles allocated by older releases spelled the slot differently; the
+    // resolver still reads them, so verification must too.
+    for legacy in [
+        "ferrum/orders-probe/keyauth/[0]/key",
+        "ferrum/orders-probe/keyauth.key",
+        "ferrum/orders-probe/keyauth[0].key",
+    ] {
+        let mut values = bundle();
+        values.remove(PROBE_SLOT);
+        values.insert(legacy.to_string(), PROBE_VALUE.to_string());
+        let credentials = probe_credentials(&values);
+        assert_eq!(
+            credentials.slots().collect::<Vec<_>>(),
+            vec![PROBE_SLOT],
+            "{legacy}"
+        );
+        let (base_url, heads) = spawn_recording_origin();
+        let result = run_check(&base_url, &quick_probe_check(), &credentials, None).await;
+        assert_eq!(
+            result.outcome,
+            Outcome::Passed,
+            "{legacy}: {}",
+            result.detail
+        );
+        let heads = heads.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            heads[0].contains(&format!("x-api-key: {PROBE_VALUE}")),
+            "{legacy}: the legacy value must be the one sent"
+        );
+    }
+}
+
+/// #640: an allowlisted probe declares a secret at `keyauth[0]["foo/jwt"]
+/// .secret`. Its raw legacy spelling, `ferrum/probe/keyauth.foo/jwt.secret`,
+/// is also the legacy spelling of Consumer `probe/keyauth.foo`'s JWT secret,
+/// which nobody allowlisted. That value must never be projected or sent: the
+/// check fails closed as unresolvable.
+#[tokio::test]
+async fn an_ambiguous_legacy_spelling_never_sends_another_consumers_value() {
+    let placeholder = "${gh-env-secret:alloc=generate}";
+    let other_value = "unlisted-consumer-jwt-secret-0123456789";
+    let desired: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "consumers": [
+            {
+                "id": "probe",
+                "username": "probe",
+                "namespace": "ferrum",
+                "labels": { VERIFY_PROBE_LABEL: "true" },
+                "credentials": {
+                    "keyauth": [{ "foo/jwt": { "secret": placeholder } }]
+                }
+            },
+            {
+                "id": "probe/keyauth.foo",
+                "username": "other",
+                "namespace": "ferrum",
+                "credentials": { "jwt": [{ "secret": placeholder }] }
+            }
+        ]
+    }))
+    .expect("desired config");
+    let slot = "ferrum/probe/keyauth/foo~1jwt/secret";
+    let checks = checks_sending("GET", slot);
+    let allowlist = ProbeConsumerAllowlist::parse("ferrum/probe").expect("allowlist");
+    let bundle = BTreeMap::from([(
+        "ferrum/probe/keyauth.foo/jwt.secret".to_string(),
+        other_value.to_string(),
+    )]);
+    let credentials =
+        authorize_probe_credentials("staging", &checks, &desired, Some(&allowlist), &bundle)
+            .expect("the probe's own slot is authorized");
+    assert_eq!(
+        credentials.slots().count(),
+        0,
+        "another Consumer's value was projected"
+    );
+
+    let (base_url, heads) = spawn_recording_origin();
+    let check = SmokeCheck {
+        timeout_secs: 2,
+        ..checks.checks[0].clone()
+    };
+    let result = run_check(&base_url, &check, &credentials, None).await;
+    assert_eq!(result.outcome, Outcome::Unreachable, "{}", result.detail);
+    assert!(
+        result.detail.contains("not in the bundle"),
+        "{}",
+        result.detail
+    );
+    assert!(!result.detail.contains(other_value));
+    assert!(
+        heads.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+        "no request may be sent without the probe's own credential"
+    );
+}
+
+#[test]
+fn a_redacted_or_placeholder_probe_value_is_refused_naming_the_slot() {
+    let authorization = authorize_probe_slots(
+        "staging",
+        &checks_sending("GET", PROBE_SLOT),
+        &desired(),
+        Some(&allowlist()),
+    )
+    .expect("authorized");
+    for key in [PROBE_SLOT, "ferrum/orders-probe/keyauth.key"] {
+        for value in [
+            "[REDACTED]",
+            // The placeholder committed at this slot.
+            "${gh-env-secret:alloc=generate}",
+            // Any other text in the placeholder grammar.
+            "${gh-env-secret:alloc=require}",
+            "${GH-ENV-SECRET:something-long-enough}",
+        ] {
+            let mut values = bundle();
+            values.remove(PROBE_SLOT);
+            values.insert(key.to_string(), value.to_string());
+            let error = authorization
+                .project(&values)
+                .expect_err("must refuse")
+                .to_string();
+            assert!(error.contains(PROBE_SLOT), "{key} {value}: {error}");
+            if value == "[REDACTED]" {
+                assert!(error.contains("reserved sentinel"), "{error}");
+            } else {
+                assert!(error.contains("placeholder"), "{key} {value}: {error}");
+                assert!(
+                    !error.contains(value),
+                    "{key}: the value was echoed: {error}"
+                );
+            }
+        }
+    }
 }

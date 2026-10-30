@@ -11,6 +11,7 @@ pub mod http_client;
 pub mod import;
 pub mod json_output;
 pub mod jwt;
+pub mod pipeline;
 pub mod plugin_catalog;
 pub mod policy;
 pub mod reconcile;

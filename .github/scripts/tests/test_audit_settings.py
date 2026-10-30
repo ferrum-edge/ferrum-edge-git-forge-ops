@@ -1416,5 +1416,61 @@ class SharedConstantTests(unittest.TestCase):
         self.assertEqual(audit_settings.RELEASE_TAG_PATTERN, "refs/tags/v*")
 
 
+class MainEntryPointTests(unittest.TestCase):
+    """`main()` as settings-audit.yml and `gitforgeops doctor` invoke it."""
+
+    def invoke(self, argv, metadata):
+        import contextlib
+        import io
+        import os
+
+        calls = []
+
+        def fake_run(repo, branch, *rest, **kwargs):
+            calls.append(branch)
+            return audit_settings.Audit()
+
+        def fake_gh_json(path, *, paginate=False):
+            self.assertEqual(path, "repos/acme/repo")
+            return metadata
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(audit_settings, "run", fake_run), patch.object(
+            audit_settings, "gh_json", fake_gh_json
+        ), patch.object(sys, "argv", ["audit_settings.py", *argv]), patch.dict(
+            os.environ, {"GH_TOKEN": "test-token"}
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = audit_settings.main()
+        return status, calls, stdout.getvalue(), stderr.getvalue()
+
+    def test_without_branch_the_repository_default_branch_is_audited(self):
+        # The workflow passes `--branch "$DEFAULT_BRANCH"`; doctor passes no
+        # `--branch` and must reach the same branch.
+        status, calls, stdout, _ = self.invoke(
+            ["--repo", "acme/repo", "--state-writer-app-id", "99"],
+            {"default_branch": "trunk"},
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, ["trunk"])
+        self.assertEqual(stdout.splitlines()[-1], audit_settings.AUDIT_SUCCESS_LINE)
+
+    def test_an_explicit_branch_is_not_rediscovered(self):
+        status, calls, _, _ = self.invoke(
+            ["--repo", "acme/repo", "--branch", "main", "--template-repo"],
+            None,
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, ["main"])
+
+    def test_metadata_without_a_default_branch_fails_closed(self):
+        status, calls, stdout, stderr = self.invoke(
+            ["--repo", "acme/repo", "--template-repo"], {"id": 1}
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(calls, [])
+        self.assertIn("pass --branch", stderr)
+        self.assertNotIn(audit_settings.AUDIT_SUCCESS_LINE, stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
