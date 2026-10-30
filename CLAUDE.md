@@ -1408,15 +1408,18 @@ correctness). A 401 remediation prints the four JWT claim settings to compare.
 - `process-env` is a local check. `resource-load` runs, per environment
   resolved as the commands resolve it, `pipeline::load_and_assemble` — the
   offline boundary every command crosses (no bundle, state, lock or network) —
-  and fails on what it refuses; an unreadable `resources/` fails, a missing
+  and fails on what it refuses, including a namespace filter that selects
+  nothing from a non-empty tree (`desired_finding(false)`; doctor takes no
+  `--allow-empty-namespace`); an unreadable `resources/` fails, a missing
   one is reported once. `overlays` uses `validate_overlay_selection`, so a
   missing `FERRUM_OVERLAY` selection fails.
 - `file-output` judges the destination's nearest existing ancestor
   (publication runs `create_dir_all`) with `access(2)` via `rustix`, never by
   writing. `validator-binary` requires the execute permission on Unix.
 - The gateway scope is `Skipped` when `GITFORGEOPS_TEMPLATE_REPO=true`, on a
-  checkout without `config.yaml` and without gateway credentials, and in file
-  mode, decided before the tree is assembled for the token scope.
+  checkout without `config.yaml` and with neither the gateway URL nor the
+  signing secret (one alone is an incomplete deployment, reported `Unknown`),
+  and in file mode, decided before the tree is assembled for the token scope.
 
 ### Preview verdicts (`src/verdict.rs`)
 

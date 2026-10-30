@@ -231,6 +231,30 @@ fn the_gateway_scope_on_a_template_without_credentials_is_skipped() {
     assert!(!text.contains("UNKNOWN"), "{text}");
 }
 
+/// Half a gateway configuration on a checkout without `config.yaml` is an
+/// incomplete deployment, not a template: it must stay visible.
+#[test]
+fn a_template_checkout_with_only_one_gateway_credential_is_not_skipped() {
+    let doctor = Doctor::new(&[("resources/ferrum/proxies/app.yaml", PROXY)]);
+    for partial in [
+        ("FERRUM_GATEWAY_URL", "https://gateway.invalid:8443"),
+        (
+            "FERRUM_ADMIN_JWT_SECRET",
+            "doctor-test-signing-secret-long-enough-0000",
+        ),
+    ] {
+        let output = doctor.run(&["--scope", "gateway"], &[partial]);
+        let text = stdout(&output);
+        assert!(!text.contains("SKIP"), "{}: {text}", partial.0);
+        assert!(
+            text.contains("UNKNOWN Gateway is reachable"),
+            "{}: {text}",
+            partial.0
+        );
+        assert!(text.contains("no gateway URL or signing secret"), "{text}");
+    }
+}
+
 #[test]
 fn the_template_variable_skips_the_gateway_scope() {
     let doctor = Doctor::new(&[

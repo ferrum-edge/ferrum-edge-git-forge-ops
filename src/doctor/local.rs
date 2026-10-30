@@ -353,23 +353,42 @@ fn resource_load(root: &Path, env: Option<&EnvConfig>, environments: &[Environme
                 ))),
             };
             let check = match outcome {
-                Ok(assembled) => {
-                    let gateway = &assembled.gateway;
-                    Check::pass(
+                // `validate`, `plan`, `diff`, `apply` and `export` refuse a
+                // filter that selects nothing from a non-empty tree unless
+                // `--allow-empty-namespace` is passed, which doctor does not
+                // take: judge it as they do by default. Doctor-local, so
+                // `review`'s warning-only handling is untouched.
+                Ok(assembled) => match assembled.namespace_scope.desired_finding(false) {
+                    Some(finding) => Check::new(
                         ID,
                         TITLE,
                         Scope::Local,
-                        format!(
-                            "{} proxies, {} consumers, {} upstreams, {} plugin configs, \
-                             {} mesh fragment(s)",
-                            gateway.proxies.len(),
-                            gateway.consumers.len(),
-                            gateway.upstreams.len(),
-                            gateway.plugin_configs.len(),
-                            assembled.mesh_sources.len(),
-                        ),
+                        Status::Fail,
+                        crate::diagnostics::sanitize_line(&finding.message),
                     )
-                }
+                    .remedy(
+                        "`validate`, `plan`, `diff`, `apply` and `export` exit 1 on this \
+                         selection. Fix FERRUM_NAMESPACE or the environment's \
+                         `namespace_filter` so it names a namespace under resources/.",
+                    ),
+                    None => {
+                        let gateway = &assembled.gateway;
+                        Check::pass(
+                            ID,
+                            TITLE,
+                            Scope::Local,
+                            format!(
+                                "{} proxies, {} consumers, {} upstreams, {} plugin configs, \
+                             {} mesh fragment(s)",
+                                gateway.proxies.len(),
+                                gateway.consumers.len(),
+                                gateway.upstreams.len(),
+                                gateway.plugin_configs.len(),
+                                assembled.mesh_sources.len(),
+                            ),
+                        )
+                    }
+                },
                 // Already the `resources` check's failure: one missing
                 // directory is one finding.
                 Err(Error::NoResourcesDir(_)) => Check::new(

@@ -403,6 +403,46 @@ fn the_resource_load_check_applies_each_environments_overlay() {
     }
 }
 
+/// `validate`, `plan`, `diff`, `apply` and `export` refuse a namespace filter
+/// that selects nothing from a non-empty tree; so does `resource-load`.
+#[test]
+fn a_namespace_filter_that_selects_nothing_fails_the_resource_load_check() {
+    // From FERRUM_NAMESPACE, on the synthetic environment.
+    let dir = repo(&[("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY)]);
+    let env = EnvConfig {
+        namespace_filter: Some("typo".to_string()),
+        ..api_env()
+    };
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    let load = find(&checks, "resource-load");
+    assert_eq!(load.status, Status::Fail, "{load:?}");
+    assert!(load.detail.contains("'typo'"), "{load:?}");
+    assert!(load.detail.contains("selected 0"), "{load:?}");
+
+    // From an environment's own `namespace_filter`.
+    let dir = repo(&[
+        (
+            ".gitforgeops/config.yaml",
+            "version: 1\nenvironments:\n  production:\n    namespace_filter: typo\n",
+        ),
+        ("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY),
+    ]);
+    let checks = doctor::local::run(dir.path(), Some(&api_env()));
+    let load = find(&checks, "resource-load");
+    assert_eq!(load.status, Status::Fail, "{load:?}");
+    assert_eq!(load.environment.as_deref(), Some("production"));
+    assert!(load.detail.contains("'typo'"), "{load:?}");
+
+    // A filter that matches still passes.
+    let env = EnvConfig {
+        namespace_filter: Some("ferrum".to_string()),
+        ..api_env()
+    };
+    let dir = repo(&[("resources/ferrum/proxies/app.yaml", LOADABLE_PROXY)]);
+    let checks = doctor::local::run(dir.path(), Some(&env));
+    assert_eq!(find(&checks, "resource-load").status, Status::Pass);
+}
+
 // -- overlays are resolved as the commands resolve them ----------------------
 
 #[test]

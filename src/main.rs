@@ -4543,9 +4543,11 @@ async fn cmd_doctor(
                 detail,
             )
         };
+        // Both absent. Either one alone is an incomplete deployment
+        // configuration, which the gateway scope reports as unknown.
         let no_credentials = env_config
             .as_ref()
-            .is_some_and(|env| env.gateway_url.is_none() || env.admin_jwt_secret.is_none());
+            .is_some_and(|env| env.gateway_url.is_none() && env.admin_jwt_secret.is_none());
         let template_checkout =
             doctor::local::repository_kind(&root) == doctor::local::RepositoryKind::Template;
         match (&env_result, resolve_runtime(explicit_env)) {
