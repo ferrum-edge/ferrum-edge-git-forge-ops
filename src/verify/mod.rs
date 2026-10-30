@@ -52,7 +52,7 @@ use crate::secrets::parse_placeholder;
 use crate::secrets::plugin_config::ConfigPathComponent;
 use crate::secrets::resolver::{
     consumer_credential_slot, credential_type_from_slot, escape_slot_component,
-    is_identity_credential_leaf,
+    is_identity_credential_leaf, lookup_consumer_credential,
 };
 
 pub mod runner;
@@ -733,6 +733,18 @@ struct SlotOwner {
     namespace: String,
     consumer_id: String,
     labelled: bool,
+    source: SlotSource,
+}
+
+/// Where a brokered Consumer secret sits in the desired configuration: what
+/// the resolver needs to look its bundle value up the way resolution does,
+/// legacy slot encodings and refusals included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlotSource {
+    credential_type: String,
+    path: Vec<ConfigPathComponent>,
+    /// The placeholder text the repository commits at this leaf.
+    committed: String,
 }
 
 impl SlotOwner {
@@ -767,7 +779,7 @@ fn consumer_secret_slots(desired: &GatewayConfig) -> BTreeMap<String, SlotOwner>
         if consumer.id.is_empty() || consumer.namespace.is_empty() {
             continue;
         }
-        let mut slots = BTreeSet::new();
+        let mut slots = BTreeMap::new();
         for (credential_type, value) in &consumer.credentials {
             if !is_known_credential_type(credential_type) {
                 continue;
@@ -782,13 +794,17 @@ fn consumer_secret_slots(desired: &GatewayConfig) -> BTreeMap<String, SlotOwner>
                 &mut slots,
             );
         }
-        let owner = SlotOwner {
-            namespace: consumer.namespace.clone(),
-            consumer_id: consumer.id.clone(),
-            labelled: is_probe_consumer(&consumer.labels),
-        };
-        for slot in slots {
-            owners.insert(slot, owner.clone());
+        let labelled = is_probe_consumer(&consumer.labels);
+        for (slot, source) in slots {
+            owners.insert(
+                slot,
+                SlotOwner {
+                    namespace: consumer.namespace.clone(),
+                    consumer_id: consumer.id.clone(),
+                    labelled,
+                    source,
+                },
+            );
         }
     }
     owners
@@ -830,18 +846,25 @@ fn collect_brokered_secret_slots(
     value: &serde_json::Value,
     path: &mut Vec<ConfigPathComponent>,
     leaf: Option<&str>,
-    slots: &mut BTreeSet<String>,
+    slots: &mut BTreeMap<String, SlotSource>,
 ) {
     match value {
         serde_json::Value::String(text) => {
             let brokered = matches!(parse_placeholder(text), Some(Ok(_)));
             if brokered && !is_identity_credential_leaf(credential_type, leaf) {
-                slots.insert(consumer_credential_slot(
-                    namespace,
-                    consumer_id,
-                    credential_type,
-                    path.as_slice(),
-                ));
+                slots.insert(
+                    consumer_credential_slot(
+                        namespace,
+                        consumer_id,
+                        credential_type,
+                        path.as_slice(),
+                    ),
+                    SlotSource {
+                        credential_type: credential_type.to_string(),
+                        path: path.clone(),
+                        committed: text.clone(),
+                    },
+                );
             }
         }
         serde_json::Value::Array(items) => {
@@ -1061,25 +1084,39 @@ fn refusal_line(binding: &SlotBinding) -> String {
 /// configuration and the operator allowlist before any bundle is read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeAuthorization {
-    slots: BTreeSet<String>,
+    slots: BTreeMap<String, SlotOwner>,
 }
 
 impl ProbeAuthorization {
     /// The authorized slots, by name.
     pub fn slots(&self) -> impl Iterator<Item = &str> {
-        self.slots.iter().map(String::as_str)
+        self.slots.keys().map(String::as_str)
     }
 
-    /// Project `bundle` down to the authorized slots. An authorized slot the
-    /// bundle lacks is left out, so its check fails as unresolvable. Every
-    /// present value must pass display admission before it can be sent.
+    /// Project `bundle` down to the authorized slots, keyed by canonical slot.
+    ///
+    /// Each value is looked up the way credential resolution looks it up
+    /// ([`lookup_consumer_credential`]): the canonical slot, then the
+    /// read-only legacy encodings an older release allocated under, with the
+    /// same refusals — `[REDACTED]`, placeholder text, a value too short to
+    /// scrub. An authorized slot the bundle lacks is left out, so its check
+    /// fails as unresolvable. Every present value must also pass display
+    /// admission before it can be sent. Errors name the slot, never a value.
     pub fn project(
         &self,
         bundle: &BTreeMap<String, String>,
     ) -> crate::error::Result<ProbeCredentials> {
         let mut values = BTreeMap::new();
-        for slot in &self.slots {
-            if let Some(secret) = bundle.get(slot) {
+        for (slot, owner) in &self.slots {
+            let found = lookup_consumer_credential(
+                &owner.namespace,
+                &owner.consumer_id,
+                &owner.source.credential_type,
+                &owner.source.path,
+                &owner.source.committed,
+                bundle,
+            )?;
+            if let Some(secret) = found {
                 crate::display::register_probe_value(secret)?;
                 values.insert(slot.clone(), secret.clone());
             }
@@ -1111,10 +1148,15 @@ pub fn authorize_probe_slots(
     };
     let bindings = bind_probe_slots(checks, desired, Some(allowlist), None);
     refuse_unbound_slots(environment, &bindings)?;
+    let mut owners = consumer_secret_slots(desired);
     let slots = bindings
         .into_iter()
         .filter(|binding| binding.status == BindingStatus::Approved)
-        .map(|binding| binding.slot)
+        .filter_map(|binding| {
+            owners
+                .remove(&binding.slot)
+                .map(|owner| (binding.slot, owner))
+        })
         .collect();
     Ok(ProbeAuthorization { slots })
 }

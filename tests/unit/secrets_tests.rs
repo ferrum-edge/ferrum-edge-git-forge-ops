@@ -1151,6 +1151,81 @@ fn resolver_reads_legacy_dotted_slot_for_nested_credentials() {
     );
 }
 
+/// A Consumer whose credentials are given as JSON, for the legacy-collision
+/// regressions below.
+fn json_consumer(namespace: &str, id: &str, credentials: serde_json::Value) -> Consumer {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "username": id,
+        "namespace": namespace,
+        "credentials": credentials,
+    }))
+    .expect("consumer")
+}
+
+/// #640: the legacy dotted spelling is raw, so a `/` in a nested key, the
+/// namespace or the consumer id can make one Consumer's legacy candidate
+/// another Consumer's slot. Consumer A declares `keyauth[0]["foo/jwt"].secret`,
+/// whose legacy spelling `ferrum/probe/keyauth.foo/jwt.secret` is also the
+/// legacy spelling of Consumer `probe/keyauth.foo`'s JWT secret. A must never
+/// resolve B's value.
+#[test]
+fn an_ambiguous_legacy_spelling_never_resolves_another_consumers_value() {
+    let placeholder = "${gh-env-secret:alloc=generate}";
+    let other_value = "other-consumer-jwt-secret-0123456789abcdef";
+    let mut cfg = GatewayConfig::default();
+    cfg.consumers.push(json_consumer(
+        "ferrum",
+        "probe",
+        serde_json::json!({"keyauth": [{"foo/jwt": {"secret": placeholder}}]}),
+    ));
+    cfg.consumers.push(json_consumer(
+        "ferrum",
+        "probe/keyauth.foo",
+        serde_json::json!({"jwt": [{"secret": placeholder}]}),
+    ));
+    let bundle = BTreeMap::from([(
+        "ferrum/probe/keyauth.foo/jwt.secret".to_string(),
+        other_value.to_string(),
+    )]);
+
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    // Count rather than format results: nothing derived from resolution is
+    // written to the test log.
+    let resolved = report
+        .results
+        .iter()
+        .filter(|result| result.status == SlotStatus::Resolved)
+        .count();
+    assert!(
+        resolved == 0,
+        "an ambiguous legacy spelling must not resolve"
+    );
+    assert!(!serde_json::to_string(&cfg).unwrap().contains(other_value));
+}
+
+/// The legacy spelling does not escape `~`, so a namespace spelled like an
+/// escape sequence (`a~1b`) has a legacy candidate equal to the canonical
+/// slot of namespace `a/b`.
+#[test]
+fn a_tilde_in_a_legacy_component_never_aliases_another_consumers_canonical_slot() {
+    let placeholder = "${gh-env-secret:alloc=generate}";
+    let other_value = "other-namespace-key-0123456789abcdef";
+    let mut cfg = GatewayConfig::default();
+    cfg.consumers.push(json_consumer(
+        "a~1b",
+        "app",
+        serde_json::json!({"keyauth": [placeholder]}),
+    ));
+    // The canonical slot of Consumer `a/b`/`app`'s bare keyauth credential.
+    let bundle = BTreeMap::from([("a~1b/app/keyauth".to_string(), other_value.to_string())]);
+
+    let report = resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(report.results.len(), 1);
+    assert_ne!(report.results[0].status, SlotStatus::Resolved);
+    assert!(!serde_json::to_string(&cfg).unwrap().contains(other_value));
+}
+
 #[test]
 fn slot_components_escape_slash_and_tilde_in_names() {
     // Namespaces/consumer-ids can in principle contain `/` or `~`. Those

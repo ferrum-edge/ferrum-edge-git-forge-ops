@@ -317,7 +317,7 @@ case-insensitive), malformed or zero numbers, and bad URLs are errors. See
 | `FERRUM_ADMIN_JWT_VIEWER_SECRET` | — | Viewer-capped signing key for `diff`. Issuer, audience and TTL settings apply to its tokens too; the role claim is always `viewer`. |
 | `FERRUM_GATEWAY_CA_CERT`, `FERRUM_GATEWAY_CLIENT_CERT`, `FERRUM_GATEWAY_CLIENT_KEY` | — | Base64 PEM TLS material. |
 | `FERRUM_TLS_NO_VERIFY` | `false` | Accept any gateway certificate. Local use only. |
-| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Allow an `http://` gateway or data-plane URL. Local use only. |
+| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Allow an `http://` gateway or data-plane URL (data plane: literal loopback IP only). Local use only. |
 | `FERRUM_CREDS_JSON_FILE` | — | Path to a credential bundle file: `{"FERRUM_CREDS_BUNDLE": {"<slot>": "<value>"}, ...}`. |
 | `FERRUM_CREDS_JSON` | — | The same JSON inline, for small tests. A flat slot map is rejected. |
 | `FERRUM_CREDS_JSON_OUTPUT_FILE` | — | Where a completed `apply` writes its final bundle (input plus new slots), mode 0600. Must differ from the input file. |
@@ -364,6 +364,13 @@ exists:
   HTTPS clients enforce HTTPS at send time; plaintext loopback clients bypass
   environment proxies. `FERRUM_ALLOW_INSECURE_HTTP=true` therefore makes a
   cleartext gateway usable only at a literal loopback IP.
+- `FERRUM_VERIFY_BASE_URL` is held to that send-time rule at load, in every
+  context: an `http://` data plane is accepted only at a literal loopback IP
+  (`127.0.0.0/8`, `::1`) and only with `FERRUM_ALLOW_INSECURE_HTTP=true`. A
+  hostname (`localhost` included) or a remote host is refused, outside
+  GitHub Actions too. `verify` checks the exact request URL again before
+  sending, enforces HTTPS in its HTTPS clients, and bypasses environment
+  proxies for a plaintext loopback check.
 
 See also [GitHub launch controls](github-launch-controls.md#the-gateway-url-must-be-https).
 

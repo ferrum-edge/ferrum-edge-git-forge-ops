@@ -40,11 +40,26 @@ use super::{
 /// following one would re-send the declared headers — including a resolved
 /// credential slot in an ordinary header such as `X-API-Key`, which reqwest
 /// does not strip — to whatever host the `Location` names.
-fn client(check: &SmokeCheck, ca_cert: Option<&str>) -> crate::error::Result<reqwest::Client> {
+///
+/// Transport mirrors the admin client: an `https://` target is held to HTTPS
+/// in reqwest too, and a plaintext target — only ever a literal loopback IP,
+/// see [`check_target`] — bypasses environment proxies, so an `HTTP_PROXY`
+/// can neither read a check's credential in cleartext nor answer for the
+/// origin and make the check pass.
+fn client(
+    check: &SmokeCheck,
+    ca_cert: Option<&str>,
+    target: &url::Url,
+) -> crate::error::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(check.timeout())
         .connect_timeout(Duration::from_secs(check.timeout_secs.min(10)))
         .redirect(reqwest::redirect::Policy::none());
+    builder = if target.scheme() == "https" {
+        builder.https_only(true)
+    } else {
+        builder.no_proxy()
+    };
 
     if let Some(ca_b64) = ca_cert {
         let ca_pem = base64::engine::general_purpose::STANDARD
@@ -67,6 +82,42 @@ fn client(check: &SmokeCheck, ca_cert: Option<&str>) -> crate::error::Result<req
 
 fn join(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
+}
+
+/// The URL a check may be sent to, decided at send time.
+///
+/// `FERRUM_VERIFY_BASE_URL` is already held to this at load
+/// ([`crate::config::env::validate_verify_transport`]); checking again here,
+/// on the exact URL the request uses, is the same defense in depth as the
+/// admin client's `credential_target`: a check can carry a credential, so it
+/// travels only over `https://`, or cleartext `http://` to a literal loopback
+/// IP. A hostname never qualifies, `localhost` included. The refusal never
+/// names the URL, which is an environment secret.
+fn check_target(url: &str) -> Result<url::Url, String> {
+    let refused = || {
+        "refused before sending: a traffic check travels only over https://, or cleartext \
+         http:// to a literal loopback IP (127.0.0.0/8 or [::1]), with no credentials \
+         embedded in the URL; the data-plane URL is an environment secret and is withheld"
+            .to_string()
+    };
+    let parsed = url::Url::parse(url).map_err(|_| refused())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(refused());
+    }
+    let allowed = match parsed.scheme() {
+        "https" => parsed.host().is_some(),
+        "http" => match parsed.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        },
+        _ => false,
+    };
+    if allowed {
+        Ok(parsed)
+    } else {
+        Err(refused())
+    }
 }
 
 /// Run one check, retrying on an unreachable or timed-out attempt.
@@ -103,6 +154,10 @@ pub async fn run_check(
         attempts,
         detail,
     };
+    let target = match check_target(&url) {
+        Ok(target) => target,
+        Err(detail) => return failed(Outcome::Unreachable, 0, detail),
+    };
     // Fail closed on a slot that is not in the bundle. Sending the request
     // without the credential would make a check that expects 401 pass for
     // entirely the wrong reason.
@@ -129,7 +184,7 @@ pub async fn run_check(
         if attempt > 0 {
             tokio::time::sleep(check.backoff(attempt)).await;
         }
-        let client = match client(check, ca_cert) {
+        let client = match client(check, ca_cert, &target) {
             Ok(client) => client,
             Err(error) => return failed(Outcome::Unreachable, attempts, error.to_string()),
         };
@@ -143,7 +198,7 @@ pub async fn run_check(
                 )
             }
         };
-        let mut request = client.request(method, &url);
+        let mut request = client.request(method, target.clone());
         for (name, value) in &headers {
             request = request.header(name, value);
         }

@@ -50,6 +50,7 @@ fn clear_env() {
         "FERRUM_ADMIN_JWT_ROLE",
         "FERRUM_ADMIN_JWT_AUDIENCE",
         "FERRUM_ADMIN_JWT_TTL_SECS",
+        "FERRUM_VERIFY_BASE_URL",
     ] {
         std::env::remove_var(var);
     }
@@ -604,7 +605,7 @@ fn base_urls_refuse_query_strings_and_fragments() {
         assert!(error.contains("FERRUM_GATEWAY_URL"), "{url}: {error}");
         assert!(error.contains("query"), "{url}: {error}");
         assert!(!error.contains("gateway.example.com"), "{url}: {error}");
-        let error = validate_verify_transport(Some(url), true, false)
+        let error = validate_verify_transport(Some(url), true)
             .expect_err("a query/fragment verify base URL must fail at load")
             .to_string();
         assert!(error.contains("FERRUM_VERIFY_BASE_URL"), "{url}: {error}");
@@ -629,16 +630,16 @@ fn base_urls_refuse_query_strings_and_fragments() {
 /// gets the admin API's transport rule rather than none at all.
 #[test]
 fn verify_base_url_follows_the_gateway_transport_rule() {
-    assert!(validate_verify_transport(None, false, true)
+    assert!(validate_verify_transport(None, false)
         .expect("unset is not a transport")
         .is_empty());
     assert!(
-        validate_verify_transport(Some("https://edge.example.com"), false, true)
+        validate_verify_transport(Some("https://edge.example.com"), false)
             .expect("https is accepted")
             .is_empty()
     );
 
-    let error = validate_verify_transport(Some("http://edge.example.com"), false, false)
+    let error = validate_verify_transport(Some("http://edge.example.com"), false)
         .expect_err("cleartext is refused by default")
         .to_string();
     assert!(error.contains("FERRUM_VERIFY_BASE_URL"), "{error}");
@@ -649,18 +650,18 @@ fn verify_base_url_follows_the_gateway_transport_rule() {
         "the secret-backed data-plane URL must be withheld: {error}"
     );
 
-    let error = validate_verify_transport(Some("http://edge.example.com"), true, true)
-        .expect_err("the opt-in does not reach a remote host in CI")
+    let error = validate_verify_transport(Some("http://edge.example.com"), true)
+        .expect_err("the opt-in does not reach a remote host")
         .to_string();
-    assert!(error.contains("GITHUB_ACTIONS"), "{error}");
+    assert!(error.contains("literal loopback IP"), "{error}");
     assert!(
         !error.contains("edge.example.com"),
         "the secret-backed data-plane URL must be withheld: {error}"
     );
 
-    // The lifecycle suite's shape: a loopback data plane in CI, opted in.
-    let warnings = validate_verify_transport(Some("http://127.0.0.1:18081"), true, true)
-        .expect("loopback stays allowed in CI with the opt-in");
+    // The lifecycle suite's shape: a loopback data plane, opted in.
+    let warnings = validate_verify_transport(Some("http://127.0.0.1:18081"), true)
+        .expect("a literal loopback IP stays allowed with the opt-in");
     assert_eq!(warnings.len(), 1, "{warnings:?}");
 
     for url in [
@@ -668,12 +669,92 @@ fn verify_base_url_follows_the_gateway_transport_rule() {
         "ftp://edge.example.com",
         "not a url",
     ] {
-        let error = validate_verify_transport(Some(url), true, false)
+        let error = validate_verify_transport(Some(url), true)
             .expect_err("never a credential-bearing or foreign URL")
             .to_string();
         assert!(error.contains("FERRUM_VERIFY_BASE_URL"), "{url}: {error}");
         assert!(!error.contains("hunter2"), "secret echoed back: {error}");
     }
+}
+
+/// The data plane's cleartext rule is the admin client's send-time rule, in
+/// every context: `http://` only to a literal loopback IP, and only with the
+/// opt-in. A hostname — `localhost` included — and a remote host are refused
+/// even outside GitHub Actions.
+#[test]
+fn verify_cleartext_is_accepted_only_for_a_literal_loopback_ip_everywhere() {
+    for host in [
+        "localhost",
+        "LOCALHOST",
+        "edge.example.com",
+        "10.0.0.5",
+        "[fe80::1]",
+    ] {
+        let url = format!("http://{host}:18081");
+        let error = validate_verify_transport(Some(&url), true)
+            .expect_err("cleartext to a non-loopback-IP host must be refused")
+            .to_string();
+        assert!(error.contains("FERRUM_VERIFY_BASE_URL"), "{url}: {error}");
+        assert!(error.contains("literal loopback IP"), "{url}: {error}");
+        assert!(
+            !error.contains(&url) && !error.contains("18081"),
+            "the secret-backed data-plane URL must be withheld: {error}"
+        );
+    }
+    for host in ["127.0.0.1", "127.0.0.53", "[::1]"] {
+        let url = format!("http://{host}:18081");
+        let warnings = validate_verify_transport(Some(&url), true)
+            .unwrap_or_else(|e| panic!("{url} is a literal loopback IP: {e}"));
+        assert_eq!(warnings.len(), 1, "{url}: {warnings:?}");
+        // ...and still only with the opt-in.
+        assert!(validate_verify_transport(Some(&url), false).is_err());
+    }
+
+    // At load, outside GitHub Actions too: no context widens the rule.
+    let _guard = env_guard();
+    clear_env();
+    std::env::set_var("FERRUM_ALLOW_INSECURE_HTTP", "true");
+    for (url, accepted) in [
+        ("http://localhost:18081", false),
+        ("http://edge.example.com:18081", false),
+        ("http://127.0.0.1:18081", true),
+    ] {
+        for github_actions in [None, Some("true")] {
+            match github_actions {
+                Some(value) => std::env::set_var("GITHUB_ACTIONS", value),
+                None => std::env::remove_var("GITHUB_ACTIONS"),
+            }
+            std::env::set_var("FERRUM_VERIFY_BASE_URL", url);
+            assert_eq!(
+                load_env_config().is_ok(),
+                accepted,
+                "{url} under GITHUB_ACTIONS={github_actions:?}"
+            );
+        }
+    }
+    clear_env();
+}
+
+/// The verify rule is its own: tightening it must not change the gateway
+/// URL's documented rule, which accepts `localhost` and, outside CI, a remote
+/// host with the opt-in (the admin client then refuses at send time).
+#[test]
+fn gateway_transport_loopback_rule_is_unchanged_by_the_verify_rule() {
+    for host in ["localhost", "LOCALHOST", "127.0.0.1", "[::1]"] {
+        let url = format!("http://{host}:9000");
+        assert!(
+            validate_gateway_transport(Some(&url), true, false, true).is_ok(),
+            "{url}: the gateway still treats it as loopback in CI"
+        );
+    }
+    assert!(
+        validate_gateway_transport(Some("http://gateway.internal:9000"), true, false, false)
+            .is_ok()
+    );
+    assert!(
+        validate_gateway_transport(Some("http://gateway.internal:9000"), true, false, true)
+            .is_err()
+    );
 }
 
 /// In CI the opt-ins survive only against the runner's own machine.

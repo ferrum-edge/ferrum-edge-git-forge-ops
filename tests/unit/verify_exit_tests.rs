@@ -553,10 +553,9 @@ fn verify_refuses_a_short_authorized_probe_credential_before_any_request() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(1), "{shown}");
-    assert!(
-        shown.contains("traffic probe credential holds a secret shorter than 8 bytes"),
-        "{shown}"
-    );
+    // The resolver's refusal: it names the slot, never the value.
+    assert!(shown.contains("shorter than 8 bytes"), "{shown}");
+    assert!(shown.contains("ferrum/orders-probe/keyauth/key"), "{shown}");
     assert!(!shown.contains("Q7short"), "{shown}");
     assert!(!connected(&listener), "verify reached the data plane");
 }
