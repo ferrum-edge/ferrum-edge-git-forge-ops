@@ -909,7 +909,8 @@ async fn transport_failures_do_not_disclose_the_gateway_url() {
     let addr = super::promotion_tests::refused_port();
 
     let host = addr.ip().to_string();
-    let port = addr.port().to_string();
+    // With the colon, so the check stays specific for a one-digit port.
+    let port = format!(":{}", addr.port());
     let env = stub_env(format!("http://{addr}"));
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
