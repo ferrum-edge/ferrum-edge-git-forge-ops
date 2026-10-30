@@ -83,8 +83,8 @@ Global flags:
   plugin type change) to a report. See [Credential slot remaps](#credential-slot-remaps).
 - `--allow-empty-namespace` demotes the empty-selection refusal (a
   `FERRUM_NAMESPACE` that selects zero desired resources while the tree is
-  non-empty) from an error to a warning in `validate`, `plan`, `diff` and
-  `apply`.
+  non-empty) from an error to a warning in `validate`, `plan`, `diff`,
+  `apply` and `export`. `review` only ever warns.
 
 Both `--allow-*` flags are CLI-only on purpose, with no env var: accepting them
 is a per-run decision, not a repository setting. The bundled apply workflow
@@ -623,9 +623,11 @@ errors. api-mode apply neither publishes nor retracts.
 - `FERRUM_NAMESPACE` filters load, diff, apply and import. API import requires
   it (or an environment `namespace_filter`) and handles one namespace at a
   time. Other commands process all namespaces when it is unset.
-- `validate`, `plan`, `diff` and `apply` fail closed (exit 1) when the filter
-  selects zero desired resources while the on-disk tree has at least one;
-  `--allow-empty-namespace` demotes this to a warning. When filtered live
+- `validate`, `plan`, `diff`, `apply` and `export` fail closed (exit 1) when
+  the filter selects zero desired resources while the on-disk tree has at
+  least one (`export` before writing anything); `--allow-empty-namespace`
+  demotes this to a warning. `review` warns on stderr and on the comment's
+  environment banner and keeps its exit code. When filtered live
   inventory is empty only because the filter matched no live namespace, `plan`
   and `diff` say so in text and JSON.
 - File-mode documents are document-wide. An ad-hoc `FERRUM_NAMESPACE` that

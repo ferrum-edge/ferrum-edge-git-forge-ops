@@ -3,8 +3,9 @@
 //! A mistyped `FERRUM_NAMESPACE` (or environment `namespace_filter`) used to
 //! make `validate`, `plan`, and `diff --exit-on-drift` succeed against an
 //! empty desired set while the on-disk tree and the live gateway still held
-//! resources in other namespaces. This module is the shared diagnosis those
-//! three commands apply.
+//! resources in other namespaces. This module is the shared diagnosis that
+//! `validate`, `plan`, `diff`, `apply` and `export` refuse on, and that
+//! `review` reports as a warning.
 //!
 //! The refusal is an **error-severity finding**. It uses the same ordinary
 //! error exit code as every other fail-closed CLI error ([`EMPTY_NAMESPACE_EXIT_CODE`],
