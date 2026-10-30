@@ -507,6 +507,23 @@ Access is controlled by the environment's protection rules. If the actor has
 no compatible SSH key on GitHub, materialization fails and points to
 <https://github.com/settings/keys>.
 
+### Supported hosts
+
+A production file-mode gateway, and wherever its materialized document is
+written, runs on **Linux**. Publication protects a document with POSIX mode
+bits only: `0640` for a new gateway document (an existing file's owner and
+group bits are kept, `other` is always cleared) and `0600` for private
+outputs. On Linux, a file created that way carries no extended ACL.
+
+macOS is supported for development only. There, an inheritable ACL on the
+destination directory (for example `everyone allow read`, shown by
+`ls -le`) is applied to every new file, so a document published `0640` can
+still be readable by every local user. GitForgeOps does not strip ACLs. On a
+macOS host, publish only into a directory without inheritable ACL entries,
+and never hold a materialized document there that carries production
+credentials. Windows has no private publication: `write_atomically` refuses
+it before writing.
+
 ## Audit trail
 
 `.state/<env>.json` records, per slot: `last_rotated`, `delivered_to`,

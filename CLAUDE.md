@@ -188,6 +188,14 @@ cargo fmt --all && cargo fmt --all -- --check
   namespaces never enter the privileged live-read boundary.
 - Rust is pinned to 1.99.1 in `rust-toolchain.toml`. External Actions use full
   commit SHAs.
+- Every workflow job declares a literal `timeout-minutes` (at most 120;
+  `job_timeout_violations`). A job that commits the state ledger gives every
+  step its own timeout and a job budget of at least their sum plus 5 minutes,
+  because a job timeout cancels the job and skips the `!cancelled()` ledger
+  commit. Every workflow interpreter is `python3 -I`
+  (`python_isolation_violations`). `rust-ci.yml` coverage runs with
+  `--fail-under-lines`, never below `COVERAGE_LINE_FLOOR` (87; measured 88.17%
+  when introduced).
 
 ## Architecture
 
@@ -343,6 +351,9 @@ Set via `FERRUM_GATEWAY_MODE`.
   for pure-add namespaces, POST `/restore` for full replace.
 - **file** — flat YAML for a file-mode gateway, published atomically (temp +
   fsync + rename) with a `resource_counts` seal.
+  Production file-mode hosts are Linux. Publication protects documents with
+  mode bits only; macOS inherited ACLs can widen access, so macOS is a
+  development host (docs/credential-broker.md, Supported hosts).
 
 Mesh is file-only in both modes. There is no mesh admin API, so api-mode apply
 validates the mesh document and prints a notice instead of pushing it.
