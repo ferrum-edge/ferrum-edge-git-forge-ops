@@ -1432,10 +1432,13 @@ def monitoring_workflow_violations(text: str) -> list[str]:
     return violations
 
 
-# Interpreter flags (`-I`, `-B`, ...) and quoting do not make the candidate's
-# helper trusted. A text rule only; the pinned jobs are what bind execution.
+# The candidate's own classifier, however the interpreter is spelled or the
+# path quoted (`python3.12`, `-X utf8`, `--`, `"$GITHUB_WORKSPACE/..."`): any
+# `.github/scripts/changed_files.py` not under a protected checkout. A text
+# rule only; the pinned jobs are what bind execution.
 _CANDIDATE_CLASSIFIER = re.compile(
-    r"python3?(?:[ \t]+-[A-Za-z]+)*[ \t]+[\"']?(?:\./)?\.github/scripts/changed_files\.py"
+    r"(?<![\w.-])(?<!trusted-scope/)(?<!trusted-guard/)(?<!trusted/)"
+    r"(?:\./)*\.github/scripts/changed_files\.py"
 )
 
 
@@ -1598,6 +1601,17 @@ STATE_GUARD_FINAL_RECHECK = (
     '[ "$final_ref" = "$DEFAULT_BRANCH" ] || {',
     'grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {',
 )
+
+
+STATE_GUARD_HELPER_INVOCATION = 'result=$(python3 -I "$helper"'
+
+
+def state_guard_helper_violations(text: str) -> list[str]:
+    """The state guard runs the classifier through its trusted helper variable."""
+    legacy = STATE_GUARD_HELPER_INVOCATION.replace("python3 -I ", "python3 ")  # ISSUE_562_LEGACY
+    if STATE_GUARD_HELPER_INVOCATION in text or legacy in text:
+        return []
+    return ["state-guard.yml: classifier execution must use the trusted helper variable"]
 
 
 def state_guard_override_recheck_violations(text: str) -> list[str]:
@@ -1924,14 +1938,14 @@ def _workflow_level_gate_violations(label: str, text: str) -> list[str]:
 # replace; step 2 switches the workflows and deletes everything marked
 # `ISSUE_562_LEGACY`. The legacy forms are derived, never listed, so they can
 # only differ from the new pins by exactly those two changes.
-_ISSUE_562_JOB_TIMEOUT = re.compile(r" {4}timeout-minutes: \d+")
+_ISSUE_562_LEGACY_JOB_TIMEOUT = re.compile(r" {4}timeout-minutes: \d+")
 
 
 def _issue_562_legacy_lines(lines, *, drop_job_timeout: bool = True) -> list[str]:
     """ISSUE_562_LEGACY: pinned lines as reviewed before #562."""
     legacy = [line.replace("python3 -I ", "python3 ") for line in lines]
     if drop_job_timeout:
-        legacy = [line for line in legacy if not _ISSUE_562_JOB_TIMEOUT.fullmatch(line)]
+        legacy = [line for line in legacy if not _ISSUE_562_LEGACY_JOB_TIMEOUT.fullmatch(line)]
     return legacy
 
 
@@ -6462,13 +6476,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
-    if not any(  # ISSUE_562_LEGACY: the second form
-        invocation in state_guard
-        for invocation in ('result=$(python3 -I "$helper"', 'result=$(python3 "$helper"')
-    ):
-        violations.append(
-            "state-guard.yml: classifier execution must use the trusted helper variable"
-        )
+    violations.extend(state_guard_helper_violations(state_guard))
     violations.extend(state_guard_override_recheck_violations(state_guard))
 
     for state_workflow, commit_step in (

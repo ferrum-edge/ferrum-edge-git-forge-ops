@@ -8074,6 +8074,13 @@ class Issue562RolloutTests(unittest.TestCase):
         for invocation in (
             "result=$(python3 -I .github/scripts/changed_files.py",
             "result=$(python3 -I -B ./.github/scripts/changed_files.py",
+            'result=$(python3 -I ".github/scripts/changed_files.py"',
+            "result=$(python3 -I '.github/scripts/changed_files.py'",
+            "result=$(python3.12 .github/scripts/changed_files.py",
+            "result=$(python3 -X utf8 .github/scripts/changed_files.py",
+            "result=$(python3 -- .github/scripts/changed_files.py",
+            'result=$(python3 "$GITHUB_WORKSPACE/.github/scripts/changed_files.py"',
+            "result=$(python3 ././.github/scripts/changed_files.py",
         ):
             text = (
                 "ref: ${{ github.event.repository.default_branch }}\n"
@@ -8088,6 +8095,25 @@ class Issue562RolloutTests(unittest.TestCase):
                 1,
             )
             self.assertTrue(any("candidate-branch" in item for item in violations), violations)
+
+    def test_trusted_classifier_paths_are_not_the_candidate_classifier(self):
+        for trusted in (
+            "result=$(python3 -I trusted-scope/.github/scripts/changed_files.py",
+            "helper=trusted-guard/.github/scripts/changed_files.py",
+            "python3 -I trusted/.github/scripts/changed_files.py",
+        ):
+            self.assertIsNone(check_supply_chain._CANDIDATE_CLASSIFIER.search(trusted), trusted)
+
+    def test_state_guard_accepts_either_helper_form_and_nothing_else(self):
+        for invocation in ('result=$(python3 -I "$helper"', 'result=$(python3 "$helper"'):
+            self.assertEqual(
+                check_supply_chain.state_guard_helper_violations(f"{invocation} a b)\n"), []
+            )
+        self.assertTrue(
+            check_supply_chain.state_guard_helper_violations(
+                "result=$(python3 -I trusted-guard/.github/scripts/changed_files.py a b)\n"
+            )
+        )
 
     def test_credential_handoff_accepts_the_isolated_bundle_loader(self):
         legacy = tuple(

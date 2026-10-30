@@ -563,6 +563,24 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("github.event.pull_request.base.sha", joined)
         self.assertIn("candidate validator for bootstrap", joined)
 
+    def test_agent_workflows_accept_isolated_and_reviewed_interpreters(self):
+        # Issue #562 step 1 of 2: the protected validator judges candidate
+        # workflows, so both interpreter forms pass until step 2 switches them.
+        for isolated in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_valid_setup(root)
+                if isolated:
+                    for name in ("agent-setup-ci.yml", "agent-setup-policy.yml"):
+                        workflow = root / ".github" / "workflows" / name
+                        workflow.write_text(
+                            workflow.read_text(encoding="utf-8").replace(
+                                "python3 ", "python3 -I "
+                            ),
+                            encoding="utf-8",
+                        )
+                self.assertEqual(check_agent_setup.collect_violations(root), [], isolated)
+
     def test_ci_workflow_cannot_keep_markers_but_drop_validation_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
