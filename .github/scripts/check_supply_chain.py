@@ -1432,14 +1432,26 @@ def monitoring_workflow_violations(text: str) -> list[str]:
     return violations
 
 
-# The candidate's own classifier, however the interpreter is spelled or the
-# path quoted (`python3.12`, `-X utf8`, `--`, `"$GITHUB_WORKSPACE/..."`): any
-# `.github/scripts/changed_files.py` not under a protected checkout. A text
-# rule only; the pinned jobs are what bind execution.
-_CANDIDATE_CLASSIFIER = re.compile(
-    r"(?<![\w.-])(?<!trusted-scope/)(?<!trusted-guard/)(?<!trusted/)"
-    r"(?:\./)*\.github/scripts/changed_files\.py"
+# The candidate's own classifier, however the interpreter is spelled
+# (`python3.12`, `-X utf8`, `--`): any whole path token ending in
+# `.github/scripts/changed_files.py` whose directory prefix is not exactly a
+# protected checkout. `"$GITHUB_WORKSPACE/..."`, `././...` and
+# `foo/trusted/...` are all the candidate's. A text rule only (a path quoted
+# mid-way is not seen); the pinned jobs are what bind execution.
+_CLASSIFIER_PATH = re.compile(
+    r"(?:(?<=^)|(?<=[\s\"'=();|&<>`]))(?P<prefix>[^\s\"'=();|&<>`]*?)"
+    r"\.github/scripts/changed_files\.py",
+    re.MULTILINE,
 )
+TRUSTED_CLASSIFIER_PREFIXES = frozenset({"trusted-scope/", "trusted-guard/", "trusted/"})
+
+
+def invokes_candidate_classifier(text: str) -> bool:
+    """Whether `text` names a `changed_files.py` outside a protected checkout."""
+    return any(
+        match.group("prefix") not in TRUSTED_CLASSIFIER_PREFIXES
+        for match in _CLASSIFIER_PATH.finditer(text)
+    )
 
 
 def trusted_classifier_violations(
@@ -1458,7 +1470,7 @@ def trusted_classifier_violations(
         violations.append(
             f"{workflow}: unprotected PR base SHA must not supply trusted classifier code"
         )
-    if _CANDIDATE_CLASSIFIER.search(text):
+    if invokes_candidate_classifier(text):
         violations.append(
             f"{workflow}: path scope must not invoke the candidate-branch classifier"
         )
@@ -2292,7 +2304,7 @@ RUST_CI_CHECK_JOB = [
 # gate was introduced (88.17% at 671fd4f). Lowering it is a policy change made
 # here, in review, never in the workflow alone.
 COVERAGE_LINE_FLOOR = 87
-_COVERAGE_FLOOR = re.compile(r"--fail-under-lines (\d+)$")
+_COVERAGE_FLOOR = re.compile(r"--fail-under-lines (\d{1,3})$")
 COVERAGE_FLOOR_PLACEHOLDER = "--fail-under-lines <floor>"
 # The whole `coverage` job, pinned like `rust-ci-check`: text matches inside a
 # step accept a decoy (`env: {run: ...}` beside the real `run:`, a heredoc

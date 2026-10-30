@@ -8077,7 +8077,19 @@ class Issue562PinnedFormTests(unittest.TestCase):
             "helper=trusted-guard/.github/scripts/changed_files.py",
             "python3 -I trusted/.github/scripts/changed_files.py",
         ):
-            self.assertIsNone(check_supply_chain._CANDIDATE_CLASSIFIER.search(trusted), trusted)
+            self.assertFalse(check_supply_chain.invokes_candidate_classifier(trusted), trusted)
+        for candidate in (
+            "python3 -I foo/trusted/.github/scripts/changed_files.py",
+            "python3 -I xtrusted-scope/.github/scripts/changed_files.py",
+            "python3 -I candidate/.github/scripts/changed_files.py",
+        ):
+            self.assertTrue(check_supply_chain.invokes_candidate_classifier(candidate), candidate)
+
+    def test_an_overlong_coverage_floor_is_a_violation_not_a_crash(self):
+        text = (ROOT / ".github/workflows/rust-ci.yml").read_text(encoding="utf-8")
+        absurd = text.replace("--fail-under-lines 87\n", "--fail-under-lines " + "9" * 5000 + "\n", 1)
+        self.assertNotEqual(absurd, text)
+        self.assertTrue(check_supply_chain.rust_ci_test_scope_violations(absurd))
 
     def test_state_guard_requires_the_isolated_helper_invocation(self):
         self.assertEqual(
