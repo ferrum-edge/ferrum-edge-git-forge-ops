@@ -1190,14 +1190,17 @@ fn an_ambiguous_legacy_spelling_never_resolves_another_consumers_value() {
     )]);
 
     let report = resolve_secrets(&mut cfg, &bundle).unwrap();
-    for result in &report.results {
-        assert_ne!(
-            result.status,
-            SlotStatus::Resolved,
-            "{}: an ambiguous legacy spelling must not resolve",
-            result.slot
-        );
-    }
+    // Count rather than format results: nothing derived from resolution is
+    // written to the test log.
+    let resolved = report
+        .results
+        .iter()
+        .filter(|result| result.status == SlotStatus::Resolved)
+        .count();
+    assert!(
+        resolved == 0,
+        "an ambiguous legacy spelling must not resolve"
+    );
     assert!(!serde_json::to_string(&cfg).unwrap().contains(other_value));
 }
 
