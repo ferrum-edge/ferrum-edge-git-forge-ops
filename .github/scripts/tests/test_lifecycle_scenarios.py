@@ -821,10 +821,14 @@ class FaultProxyTests(unittest.TestCase):
     def test_drain_waits_for_a_hook_that_outlives_its_client(self):
         import http.client
         import socket
-        import time
+        import threading
+
+        # The hook fails only once the test has seen the client give up, so
+        # the ordering holds however slowly the runner schedules threads.
+        client_gave_up = threading.Event()
 
         def slow_then_broken():
-            time.sleep(0.5)
+            client_gave_up.wait(10)
             raise scenarios.ScenarioFailure("the racing write failed late")
 
         with loopback_server(201) as (target, _):
@@ -845,6 +849,7 @@ class FaultProxyTests(unittest.TestCase):
                 connection.close()
                 # The client gave up; the hook has not failed yet.
                 self.assertIsNone(fault.error)
+                client_gave_up.set()
                 proxy.drain()
                 self.assertIsInstance(fault.error, scenarios.ScenarioFailure)
                 self.assertEqual(proxy.failures, [])
