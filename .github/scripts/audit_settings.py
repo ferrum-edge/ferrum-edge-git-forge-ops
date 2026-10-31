@@ -146,13 +146,17 @@ MONITORING_MAX_AGE_HOURS = 48
 
 # A template repository is the copy customers clone from. It has no deployment
 # environments and no state-writer App, because nothing on it ever applies to a
-# gateway or commits an ownership ledger. Those two controls are therefore not
-# audited there; everything else is.
+# gateway or commits an ownership ledger. Those two controls, and the
+# successful-run coverage of unattended drift monitoring, are therefore not
+# audited there; everything else is, including any environment that is listed.
 TEMPLATE_SKIPPED_CONTROLS = (
     "template repository mode: state-writer App bypass on the default-branch "
     "ruleset is not audited (a template never commits an ownership ledger)",
     "template repository mode: the at-least-one-protected-environment "
     "requirement is not audited (a template has no deployment target)",
+    "template repository mode: unattended drift monitoring coverage (a recent "
+    f"successful {MONITORING_WORKFLOW_FILE} run) is not audited (a template "
+    "monitors no gateway)",
 )
 
 
@@ -875,7 +879,8 @@ def main() -> int:
         action="store_true",
         help=(
             "audit the template repository customers copy: skip the state-writer "
-            "App bypass and protected-environment requirements, audit everything else"
+            "App bypass, the protected-environment requirement and unattended "
+            "drift monitoring coverage, audit everything else"
         ),
     )
     args = parser.parse_args()

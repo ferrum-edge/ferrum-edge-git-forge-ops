@@ -46,13 +46,17 @@ to a gateway or commits an ownership ledger.
 
 Set repository variable `GITFORGEOPS_TEMPLATE_REPO=true` there (or pass
 `--template-repo` to the bootstrap script, which sets it). `settings-audit.yml`
-then runs the audit with `--template-repo`, which drops exactly two checks and
-names both in its evidence output:
+then runs the audit with `--template-repo`, which drops exactly three checks
+and names each in its evidence output:
 
 - the state-writer App bypass on the default-branch ruleset (§1);
-- the "at least one protected environment" requirement (§3).
+- the "at least one protected environment" requirement (§3);
+- the [successful-run coverage](#gateway-monitoring-coverage-is-audited-not-assumed)
+  of unattended drift monitoring (§5).
 
-Everything else stays enforced, including every environment that *is* listed.
+Everything else stays enforced, including every environment that *is* listed:
+it still gets the environment protection audit and, for an `<env>-monitor`
+environment, the secret-name audit.
 A deployment repository must leave the variable unset. The bootstrap script
 sets it back to `false` if it finds it set there.
 

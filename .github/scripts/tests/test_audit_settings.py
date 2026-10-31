@@ -940,12 +940,14 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
                 template_repo,
             )
 
-    def test_template_mode_skips_bypass_and_environment_requirements(self):
+    def test_template_mode_skips_bypass_environment_and_monitoring_coverage(self):
         audit = self.run_audit(self.template_responses(), template_repo=True)
         self.assertEqual(audit.violations, [])
         rendered = "\n".join(audit.evidence)
         self.assertIn("state-writer App bypass", rendered)
         self.assertIn("protected-environment", rendered)
+        self.assertIn("drift monitoring coverage", rendered)
+        self.assertEqual(len(audit_settings.TEMPLATE_SKIPPED_CONTROLS), 3)
 
     def test_the_same_repository_fails_without_template_mode(self):
         audit = self.run_audit(self.template_responses(), template_repo=False)

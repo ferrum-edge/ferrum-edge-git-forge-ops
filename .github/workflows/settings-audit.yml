@@ -57,9 +57,11 @@ jobs:
       # A template repository — the copy customers clone from — has no
       # deployment environment and no state-writer App, because nothing on it
       # applies to a gateway or commits an ownership ledger. Repository
-      # variable `GITFORGEOPS_TEMPLATE_REPO=true` drops exactly those two
-      # checks and leaves the rest of the baseline enforced; the audit says so
-      # in its own evidence output. A deployment repository must not set it.
+      # variable `GITFORGEOPS_TEMPLATE_REPO=true` drops exactly three checks:
+      # those two, plus the successful-run coverage of unattended drift
+      # monitoring. The rest of the baseline stays enforced; the audit names
+      # each skip in its own evidence output. A deployment repository must not
+      # set it.
       - name: Audit repository and deployment protections
         env:
           # Fine-grained PAT or GitHub App token with Administration: read.
