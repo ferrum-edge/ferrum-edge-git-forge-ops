@@ -66,11 +66,10 @@ deletes. The suite uses the approved validator binary as the gateway too, so it
 certifies the build this repository already trusts and adds no second
 artifact to pin.
 
-The released Ferrum Edge v0.9.6 source contains strong `ETag` and `If-Match`
-handling ([source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
-[PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)). That source
-does not establish an earliest or minimum version, or prove that a particular
-released binary contains or enforces the capability. The
+The Ferrum Edge v0.9.6 tag source (tagged, never published) contains strong
+`ETag` and `If-Match` handling ([source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
+[PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)); that source
+sets no minimum version and proves nothing about a released binary. The
 `conditional-overwrite` scenario must pass against the exact released build to
 qualify it, including the CLI's namespace and credential checks. This
 qualification also covers the gateway's backup and consumer representations.

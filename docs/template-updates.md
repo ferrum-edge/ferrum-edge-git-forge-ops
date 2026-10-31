@@ -47,8 +47,8 @@ Dockerfile  .dockerignore
 .github/ferrum-edge-checksums.txt  .github/cargo-audit-policy.json
 .github/dependabot.yml
 .gitforgeops/config.example.yaml  .gitforgeops/policies.example.yaml
-.gitforgeops/smoke.example.yaml
-release/  docs/  README.md  CLAUDE.md  SECURITY.md  LICENSE.md
+.gitforgeops/smoke.example.yaml  .env.example
+release/  docs/  README.md  CHANGELOG.md  CLAUDE.md  SECURITY.md  LICENSE.md
 ```
 
 **Yours**: never read from upstream and never written.

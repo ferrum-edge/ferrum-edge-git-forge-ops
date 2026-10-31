@@ -48,68 +48,27 @@ gateway's API contract, secret handling and ownership rules still apply.
 
 ## Commands
 
-```bash
-gitforgeops validate [--format text|json|github|github-annotations]  # assemble + `ferrum-edge validate`
-gitforgeops export [--output PATH]                   # flat YAML (placeholders kept) + mesh doc
-gitforgeops export --materialize [--encrypt-to LOGIN] # resolve creds, age-encrypt (materialize-file.yml)
-gitforgeops diff [--exit-on-drift] [--format text|json]  # desired vs live: /backup, or
-  [--fingerprint-baseline PATH]                      # /config/export when
-  [--write-fingerprint-baseline PATH]                # FERRUM_ADMIN_JWT_VIEWER_SECRET is set
-  [--force-baseline] [--accept-unverified-secrets]
-gitforgeops plan [--format text|json]                # validate + diff + breaking + security + best-practice
-                                                     # + policy + adoption + apply blockers
-gitforgeops apply [--auto-approve] [--allow-large-prune] [--confirm-api-spec-deletion] \
-  [--allow-nontransactional-plugin-attach]
-gitforgeops import (--from-api | --from-file PATH) --output-dir DIR \
-  [--credential-bundle-output PRIVATE_PATH] \
-  [--accept-unknown-field NAME]... [--allow-plaintext-plugin-config PLUGIN_NAME]...
-gitforgeops review [--pr N] [--require-live] [--fail-on-blockers]  # PR comment
-gitforgeops verify [--format text|json]              # declared traffic checks vs the data plane
-gitforgeops doctor [--format text|json] [--scope local|github|gateway|all]... \
-  [--repo OWNER/REPO] [--state-writer-app-id N]      # read-only readiness diagnosis
-gitforgeops envs [--format json|text] [--include-scopes]  # envs / trusted CI namespace scopes
-gitforgeops version [--format text|json]             # package version + build-time git metadata
-gitforgeops rotate --consumer ID --credential KEY [--namespace NS] [--recipient LOGIN]  # api mode
-```
+Commands, global flags and the per-command exit codes are documented once in
+[docs/reference.md](docs/reference.md#commands). Invariants to keep:
 
-`github` and `github-annotations` are the same validate format.
-
-Global flags:
-
-- `--env <name>` selects an environment from `.gitforgeops/config.yaml`.
-  Fallbacks: `FERRUM_ENV`, then the only entry or `default_environment`.
-- `--allow-credential-slot-remap` downgrades the credential slot-remap refusal
-  (array shrink, dropped credential type, deleted Consumer, revived slot,
-  plugin type change) to a report. See [Credential slot remaps](#credential-slot-remaps).
-- `--allow-empty-namespace` demotes the empty-selection refusal (a
-  `FERRUM_NAMESPACE` that selects zero desired resources while the tree is
-  non-empty) from an error to a warning in `validate`, `plan`, `diff`,
-  `apply` and `export`. `review` only ever warns.
-
-Both `--allow-*` flags are CLI-only on purpose, with no env var: accepting them
-is a per-run decision, not a repository setting. The bundled apply workflow
-never passes `--allow-credential-slot-remap`.
-
-`import` requires `--output-dir`, which must be empty. API import requires an
-explicit namespace filter. Both acknowledgement flags are repeatable and import
-fails closed without them.
-
-`--version` / `-V` print the Cargo package version. `version` adds build-time
-git commit and `git describe` (`unknown` when built without `.git`).
-
-Exit codes:
-
-| Code | Meaning |
-|---|---|
-| 0 | Success. `review` stays 0 on offline apply blockers unless `--fail-on-blockers` / `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`. |
-| 1 | Error, including clap usage and parse errors (`--help` and `--version` exit 0). `plan` also exits 1 on offline apply blockers, invalid backup namespaces or live ownership conflicts. Empty-namespace refusals are 1, not 2. |
-| 2 | `diff --exit-on-drift` found drift (`DRIFT_EXIT_CODE`). |
-| 3 | `doctor` found a blocker (`DOCTOR_FAILED_EXIT_CODE`). |
-| 4 | `verify` check failed (`VERIFY_FAILED_EXIT_CODE`). |
-| 5 | `verify` had no declared check for the environment (`VERIFY_SKIPPED_EXIT_CODE`). Skipped is never a pass. |
-| 6 | `diff --exit-on-drift` found no drift in an alerted category with no fingerprint baseline supplied, but fingerprinted secrets were unverified (`SECRETS_UNVERIFIED_EXIT_CODE`). Never in sync; monitoring warns, does not fail. A supplied baseline that cannot verify secrets exits 1 instead. |
-
-`tests/unit/exit_code_matrix_tests.rs` pins this table per command against the real binary. Usage errors exit 1, never clap's default 2, so a mistyped `diff --exit-on-drift` flag cannot read as drift.
+- `--allow-credential-slot-remap` (see
+  [Credential slot remaps](#credential-slot-remaps)) and
+  `--allow-empty-namespace` are CLI-only on purpose, with no env var: accepting
+  them is a per-run decision, not a repository setting. The bundled apply
+  workflow never passes `--allow-credential-slot-remap`.
+- Import's acknowledgement flags (`--accept-unknown-field`,
+  `--allow-plaintext-plugin-config`) are repeatable, and import fails closed
+  without them.
+- Exit codes: `DRIFT_EXIT_CODE` 2, `DOCTOR_FAILED_EXIT_CODE` 3,
+  `VERIFY_FAILED_EXIT_CODE` 4, `VERIFY_SKIPPED_EXIT_CODE` 5 (skipped is never a
+  pass), `SECRETS_UNVERIFIED_EXIT_CODE` 6 (never in sync; monitoring warns; a
+  supplied baseline that cannot verify secrets exits 1 instead). Empty-namespace
+  refusals are 1, not 2. `review` stays 0 on offline apply blockers unless
+  `--fail-on-blockers` / `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`; `plan`
+  exits 1 on them, on invalid backup namespaces and on live ownership conflicts.
+- `tests/unit/exit_code_matrix_tests.rs` pins the exit codes per command
+  against the real binary. Usage errors exit 1, never clap's default 2, so a
+  mistyped `diff --exit-on-drift` flag cannot read as drift.
 
 ## Build / Test / Lint
 
@@ -150,29 +109,29 @@ cargo fmt --all && cargo fmt --all -- --check
 - `supply-chain-policy.yml` (`pull_request_target`, so its definition comes
   from the protected branch) reports `trusted-supply-chain-policy`. It checks
   the PR head out into `candidate/` as data and runs only `python3 -I
-  base/.github/scripts/check_supply_chain.py --root candidate`. The checker
-  first refuses symlinks that leave the judged tree and special files, then
-  requires every workflow to end in exactly `.yml`/`.yaml` and fit a strict
-  YAML subset (no anchors, aliases, tags, explicit or quoted keys, flow
-  mappings; block scalars and flow sequences only for listed keys, folded `>`
-  scalars only for `if`) parsed by a stdlib reader. On the parsed structure it
-  refuses a job keyed or named like a required context outside that context's
-  own job (`REQUIRED_CHECK_WORKFLOWS`), computed job names and
-  `checks`/`statuses` write, and pins the parsed `security-cargo-audit` job
-  and `security.yml`'s reviewed `on:` triggers.
-  Keep new workflows inside that subset. An organization ruleset also
-  requires, by path at `main`, every workflow in `REQUIRED_CHECK_WORKFLOWS`
-  (`audit_settings.REQUIRED_RULESET_WORKFLOWS`; #470, #632,
-  `docs/github-launch-controls.md` §2a): a required check name alone accepts
-  a check run any `checks: write` job posts on a head no trusted run judged,
-  or after a writer deletes the failing run. `audit_settings.py` fails
-  without it, or when its bypass actors differ from the `main` ruleset's
-  (warns on user-owned repos). A listed workflow runs `main`'s definition
-  only on `opened`/`synchronize`/`reopened` and ignores `paths`, so edits to
-  `rust-ci.yml`, `security.yml` and `validate-pr.yml` first run after merge.
-  Every job of a listed workflow must pass, and GitHub refuses to start one
-  that uses a CodeQL action other than `upload-sarif`, so CodeQL and the
-  image scan live in the unlisted `code-scanning.yml`
+  base/.github/scripts/check_supply_chain.py --root candidate`. Rule families
+  (semantics in
+  [launch controls §4](docs/github-launch-controls.md#4-restrict-github-actions)):
+  - tree: symlinks that leave the judged tree and special files are refused;
+  - YAML subset, parsed by a stdlib reader: workflows end in exactly
+    `.yml`/`.yaml`; no anchors, aliases, tags, explicit or quoted keys, flow
+    mappings; block scalars and flow sequences only for listed keys, folded `>`
+    scalars only for `if`. Keep new workflows inside that subset;
+  - check names: no job keyed or named like a required context outside that
+    context's own job (`REQUIRED_CHECK_WORKFLOWS`), no computed job names, no
+    `checks`/`statuses` write;
+  - the parsed `security-cargo-audit` job and `security.yml`'s reviewed `on:`
+    triggers are pinned.
+- An organization ruleset requires, by path at `main`, every workflow in
+  `REQUIRED_CHECK_WORKFLOWS` (`audit_settings.REQUIRED_RULESET_WORKFLOWS`;
+  [launch controls §2a](docs/github-launch-controls.md#2a-require-the-trusted-workflows-by-path)).
+  `audit_settings.py` fails without it, or when its bypass actors differ from
+  the `main` ruleset's (warns on user-owned repos). A listed workflow runs
+  `main`'s definition only on `opened`/`synchronize`/`reopened` and ignores
+  `paths`, so edits to `rust-ci.yml`, `security.yml` and `validate-pr.yml`
+  first run after merge. Every job of a listed workflow must pass, and GitHub
+  refuses to start one that uses a CodeQL action other than `upload-sarif`, so
+  CodeQL and the image scan live in the unlisted `code-scanning.yml`
   (`ruleset_workflow_codeql_violations`). `security.yml`'s
   `security-supply-chain-policy` stays required until the ruleset switch and a
   later retire PR (`docs/github-launch-controls.md`, "Switching the
@@ -475,8 +434,9 @@ namespace payload is built before the first mutation.
   assertion, post-plugin proxy update, shared adoption claim, ambiguous-create
   and ambiguous-batch ownership assertions — goes through
   `api_target::Preconditions` (or the same steps inline):
-  1. `GET /<kind>/{id}` (`AdminClient::get_tagged`); released Edge v0.9.6
-     source includes `src/admin/preconditions.rs` for strong `ETag` support;
+  1. `GET /<kind>/{id}` (`AdminClient::get_tagged`); the Edge v0.9.6 tag
+     source (tagged, never published) includes `src/admin/preconditions.rs`
+     for strong `ETag` support;
   2. the row must still be the planned one (`Preconditions::confirm_content`):
      same `api_spec_id` (`ownership_refusal`), same content minus server
      timestamps, and for an update no nested field the typed mirror drops
@@ -542,11 +502,8 @@ namespace payload is built before the first mutation.
   ownership and representability before broker publication and changes only the
   authorized credential with row `If-Match`; post-delivery refusal does not record
   completion. `plan` retains ordinary `/backup` reads and explains runtime gates.
-  Conditional writes require a strong `ETag` and a gateway that honors
-  `If-Match`. The client probes only for the strong `ETag` and always sends
-  `If-Match`; operator qualification of the exact released gateway build must
-  establish server enforcement. Edge's released v0.9.6 source includes the
-  capability, with no minimum-version claim; it does not certify the full
+  Edge's v0.9.6 tag source (tagged, never published) includes the conditional
+  write capability, with no minimum-version claim; it does not certify the full
   backup/consumer wire contract. The namespace, ownership and credential
   checks still apply. Published Edge v0.9.11 source defines the complete consumer
   verification and coherent conditional backup/restore contracts; exact-byte
@@ -703,18 +660,15 @@ which the export lacks.
   count as managed modifications (`DriftVerdict::with_secret_changes`).
   Recording refuses a run with diffs or secret changes unless
   `--force-baseline`; a baseline path inside a git worktree is warned about.
-- Unverified secrets are non-authoritative: no "in sync"
-  text, JSON `in_sync: false`; `--exit-on-drift` exits 2 when drift was
-  found, otherwise 6 (`verdict::DiffExit::SecretsUnverified`) when no
-  `--fingerprint-baseline` was supplied, unless `--accept-unverified-secrets`
-  (0). A supplied baseline that cannot verify secrets — the file is missing, the
-  key changed, or a recorded namespace is incomplete — is
-  `DiffExit::BaselineInvalidated` (exit 1; `--accept-unverified-secrets` still
-  maps to 0); a namespace absent from the baseline or a resource not yet
-  recorded stays 6. Masked ancestors exit 1 with or without
-  the flag; a refused baseline write wins over 6 (exit 1). A cached read
-  exits 1 either way. The four export-only flags are refused on the
-  `/backup` path.
+- Unverified secrets are non-authoritative (no "in sync" text, JSON
+  `in_sync: false`). `--exit-on-drift` (`verdict::DiffExit`): drift 2;
+  otherwise `SecretsUnverified` 6 without `--fingerprint-baseline`, or when the
+  baseline only lacks a namespace or resource; `BaselineInvalidated` 1 when a
+  supplied baseline cannot verify (missing file, changed key, incomplete
+  recorded namespace). `--accept-unverified-secrets` maps both to 0. Masked
+  ancestors exit 1 with or without that flag, a refused baseline write wins
+  over 6 (exit 1), and a cached read exits 1 either way. The four export-only
+  flags are refused on the `/backup` path.
 - Cached export (`X-Data-Source: cached` or `source: cached`): same as a cached
   `/backup` — warning, no authoritative verdict, `--exit-on-drift` exits 1, and
   no baseline is written.
@@ -760,9 +714,9 @@ Fences on the reviewer-free environment:
   key and issuer/audience/TTL bindings, holds a write permission, omits the
   outcome classifier, or runs any subcommand other than `diff`.
 - `drift-check.yml` binds only the viewer signing key and no credential bundle;
-  `diff` excludes unresolved broker leaves per leaf. An operator must provision
-  that key in each bound environment and remove the admin key from each
-  `<env>-monitor` (see `docs/reference.md`, Scheduled monitoring). That is why
+  `diff` excludes unresolved broker leaves per leaf. An operator provisions
+  that key in each bound environment; `<env>-monitor` holds no admin key (see
+  `docs/reference.md`, Scheduled monitoring). That is why
   `CREDENTIAL_BUNDLE_WORKFLOWS` is a subset of `PRIVILEGED_WORKFLOWS`.
 
 Outcomes come from `.github/scripts/drift_report.py`: `in_sync`,
@@ -774,11 +728,7 @@ not. A matrix entry with no record becomes `not_completed`. The settings audit
 also fails when
 the newest successful `drift-check.yml` run is older than
 `--monitoring-max-age-hours` (48), so a `cron:` entry alone proves nothing.
-`drift-check.yml` binds only `FERRUM_ADMIN_JWT_VIEWER_SECRET` and its
-issuer/audience/TTL settings. The gateway caps that key at `viewer`, and `diff`
-uses it for `GET /config/export`; the protected supply-chain checker pins these
-step-local bindings and refuses the admin key. See
-[Viewer-credential drift reads](#viewer-credential-drift-reads) for the
+See [Viewer-credential drift reads](#viewer-credential-drift-reads) for the
 comparison limits and behavior.
 
 #### Freshness guard
@@ -939,34 +889,32 @@ Consumer plus every labelled Consumer, names only
   apply and promote Validate/Verify traffic steps and trusted live review,
   plus `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND: "true"` in Validate and live review.
   A protected name anywhere else (workflow/job env, other steps, `with:`, any
-  script or comment) is refused. `workflow_channel_violations` bans
-  `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STATE`, `BASH_ENV`, the runner's
-  file-command file names (`set_env_`, `add_path_`, `save_state_`,
-  `_runner_file_commands`), indirect expansion, ANSI-C quoting (any `$'`; no
-  rule decodes escapes, they are only stripped), computed env maps, shell
-  startup and loader env keys (`ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`,
-  `PS4`, `LD_*`), container and service `options:`, container images not
-  pinned by `@sha256:` digest, and writes to other GitHub file channels in every
-  workflow, and allows `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY`
-  only as a plain `>>` or `tee -a` target (or the summary as `--summary`); the
-  bundle loader's credential-file hand-off, pinned line for line, is the only
-  permitted env-file write. `run_expression_violations` allows a `run:`
-  interpolation, in every workflow and every local action it reaches, only
-  when it is exactly one of `RUN_TRUSTED_EXPRESSIONS` (`github.event_name`,
-  `github.sha`, `github.run_id`, `github.run_attempt`, `runner.os`,
-  `runner.arch`), or in an Environment-bound job one of its `RUN_EXPRESSIONS`
-  pins (their local actions interpolate nothing). Env, matrix, input, output,
-  `vars`/`secrets` and event values, functions and literals reach a script
-  only through step `env:`, read as `"$NAME"`.
+  script or comment) is refused. The workflow text rules below apply to every
+  workflow; semantics are in
+  [launch controls §4](docs/github-launch-controls.md#4-restrict-github-actions).
+- `workflow_channel_violations` bans `GITHUB_ENV`, `GITHUB_PATH`,
+  `GITHUB_STATE`, `BASH_ENV`, the runner's file-command file names
+  (`set_env_`, `add_path_`, `save_state_`, `_runner_file_commands`), indirect
+  expansion, ANSI-C quoting (any `$'`), computed env maps, shell startup and
+  loader env keys (`ENV`, `BASH_FUNC_*`, `SHELLOPTS`, `BASHOPTS`, `PS4`,
+  `LD_*`), container and service `options:`, container images not pinned by
+  `@sha256:` digest, and writes to other GitHub file channels.
+  `GITHUB_OUTPUT`/`GITHUB_STEP_SUMMARY` are allowed only as a plain `>>` or
+  `tee -a` target (or the summary as `--summary`); the bundle loader's pinned
+  credential-file hand-off is the only permitted env-file write.
+- `run_expression_violations` (every workflow and every local action it
+  reaches) allows a `run:` interpolation only when it is exactly one of
+  `RUN_TRUSTED_EXPRESSIONS` (`github.event_name`, `github.sha`,
+  `github.run_id`, `github.run_attempt`, `runner.os`, `runner.arch`) or, in an
+  Environment-bound job, one of its `RUN_EXPRESSIONS` pins. Everything else
+  reaches a script only through step `env:`, read as `"$NAME"`.
   `run_expression_source_violations` pins where each Environment-bound `run:`
-  interpolation comes from (job outputs, matrices and the producing step's
-  lines). `local_action_violations` refuses any `uses: ./` reference that is
-  not a parseable composite action under `.github/actions/` (local reusable
-  workflows included) and judges each one a workflow reaches by that
-  workflow's fences; `workspace_checkout_violations` refuses a local
-  action after a root checkout of another revision. These are text rules
-  (#476): a program a step runs can still write `$GITHUB_ENV`, and review of
-  every workflow change covers that.
+  interpolation comes from.
+- `local_action_violations` refuses any `uses: ./` reference that is not a
+  parseable composite action under `.github/actions/` and judges each one by
+  the reaching workflow's fences; `workspace_checkout_violations` refuses a
+  local action after a root checkout of another revision. These are text
+  rules (#476): a program a step runs can still write `$GITHUB_ENV`.
 - Only an ad-hoc `FERRUM_NAMESPACE` (not `namespace_filter_is_environment_scope`)
   makes an out-of-scope slot `OutsideNamespaceScope`, which does not refuse.
   Under the environment's own scope it is `NotAConsumerSecret`, as at verify.
@@ -1032,8 +980,9 @@ Option<&HashSet<String>>` of `namespace:Kind:id` keys from the state file:
 `Some` = shared, `None` = exclusive.
 
 - The large-prune guard refuses an apply that would delete more than
-  `ownership.large_prune_threshold_percent` (default 25) **of the managed set**
-  unless `--allow-large-prune`.
+  `ownership.large_prune_threshold_percent` (default 25) **of the in-scope
+  managed resources (shared) or prunable live resources (exclusive)** unless
+  `--allow-large-prune`.
 - Pending-create keys widen recovery namespace scope but are excluded from the
   managed set until an idempotent update asserts ownership.
 - Before computing the ratio, authoritative backup evidence removes managed keys
@@ -1102,12 +1051,8 @@ records reviewer, permission, review id, head, run ID and attempt.
   path-filtered required check never reports on non-matching PRs and stalls
   them.
 
-The guard runs on every PR through `pull_request_target`, without checking out
-PR content; the changed-file list, labels, reviews and permission come from
-`gh api`, and the only checkout is the default branch. It requires the override
-label and a qualifying `gitforgeops-state-override` review of the current head
-(above), and re-reads the PR's head, base and label immediately before
-reporting success. The workflow has no
+The guard re-reads the PR's head, base and label immediately before reporting
+success. The workflow has no
 concurrency group: every delivery runs to completion, though a manual cancel or
 runner failure can still interrupt one. On #407, branch protection read the
 newest check suite; the guard is safe under that selection and under a model
@@ -1947,41 +1892,29 @@ Only what the sections above do not already say.
 
 ## Key Environment Variables
 
-See `.env.example` for the full list. Absent or blank values use defaults; any
-present invalid enum, boolean or integer fails before loading resources or
-credentials. Booleans accept `true|false|1|0`.
+Variables, defaults and meanings are documented in
+[docs/reference.md](docs/reference.md#environment-variables) and
+`.env.example`. Code-level invariants:
 
-| Variable | Default | Notes |
-|---|---|---|
-| `FERRUM_GATEWAY_URL` | — (api mode: required) | `https://` only; `http://` needs `FERRUM_ALLOW_INSECURE_HTTP=true`; other schemes and embedded `user:password@` are refused, in `load_env_config` before any client exists. |
-| `FERRUM_ADMIN_JWT_SECRET` | — (api mode: required) | ≥32 chars, matching Edge. |
-| `FERRUM_ADMIN_JWT_VIEWER_SECRET` | unset | Edge's viewer-capped key (≥32, ≠ admin secret). Set → `diff` reads `/config/export` with it. |
-| `FERRUM_ADMIN_JWT_ISSUER` | `ferrum-edge` | Must equal the gateway's issuer or every call is 401. |
-| `FERRUM_ADMIN_JWT_ROLE` | `admin` | `viewer`/`operator`/`admin`. `/backup`, `/restore`, `/batch` and consumer CRUD are admin-only. |
-| `FERRUM_ADMIN_JWT_AUDIENCE` | unset | `aud` emitted only when set; a gateway with no audience rejects tokens carrying it. |
-| `FERRUM_ADMIN_JWT_TTL_SECS` | `3600` | Must be within the gateway's `FERRUM_ADMIN_JWT_MAX_TTL`. |
-| `FERRUM_ENV` | unset | Environment fallback when `--env` is absent. |
-| `FERRUM_NAMESPACE` | all namespaces | API import requires one. See [Namespace handling](#namespace-handling). |
-| `FERRUM_ALLOW_UNKNOWN_FIELDS` | `false` | Keep unknown top-level `spec` fields; nested stay fatal. Does not lift apply's refusal to rewrite rows with undeclared live top-level fields — declaring the field under the flag does. |
-| `FERRUM_GATEWAY_MODE` | `api` | `api` \| `file`. |
-| `FERRUM_APPLY_STRATEGY` | `incremental` | `incremental` \| `full_replace`. |
-| `GITFORGEOPS_ALLOW_NONTRANSACTIONAL_PLUGIN_ATTACH` | `false` | Same as `apply --allow-nontransactional-plugin-attach`. |
-| `GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS` | `false` | Same as `review --fail-on-blockers`; the PR comment is identical either way. |
-| `FERRUM_OVERLAY` | unset | `overlays/<name>/`. A configured missing directory is fatal; `resolved::validate_overlay_selection` names the environment, overlay and declaring file. |
-| `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` on `$PATH` | Validator binary. |
-| `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode gateway document. |
-| `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Standalone `{version, mesh}` document. File-mode `validate`/`plan`/`apply` and `export --output` refuse, before any publication, state or broker write, when it resolves to the same file as the gateway document (`apply::ensure_distinct_publication_paths`: `./`/`..` spellings, symlinked parents and existing file identity all count). |
-| `FERRUM_VERIFY_BASE_URL` | unset | Data-plane base URL for `verify`. `https://`, or `http://` only to a literal loopback IP with `FERRUM_ALLOW_INSECURE_HTTP=true`, in every context (no `localhost`). |
-| `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set by environment-bound workflow steps; makes an unset allowlist a refusal instead of "not visible". |
-| `FERRUM_VERIFY_PROBE_CONSUMERS` | unset | Operator allowlist of probe Consumers (`<ns>/<consumer-id>`, comma-separated); a GitHub Environment variable in CI. Unset: `verify` refuses every slot-sending check. See [Traffic verification](#traffic-verification-srcverify). |
-| `FERRUM_TLS_NO_VERIFY` | `false` | Dev only. TLS stays on but any certificate is accepted. |
-| `FERRUM_ALLOW_INSECURE_HTTP` | `false` | Dev only. Permits cleartext `http://` at load; the admin client still sends its token over `http://` only to a literal loopback IP (`AdminClient::authorize`). |
-| `FERRUM_GATEWAY_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY` | unset | Base64-encoded PEM. mTLS needs both cert and key. |
-| `FERRUM_GATEWAY_CONNECT_TIMEOUT_SECS` | `10` | TCP/TLS handshake cap. |
-| `FERRUM_GATEWAY_REQUEST_TIMEOUT_SECS` | `60` | End-to-end cap; raise for large `/backup` or slow `/restore`. |
-| `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` | `10` | GitHub API. |
-| `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` | `30` | GitHub API. |
-| `FERRUM_GATEWAY_MAX_RETRIES` | `3` | Retries connection failures and transient responses for reads and idempotent PUT/DELETE. Backoff 500 ms·2^n (jittered) capped at 8 s, or `Retry-After` capped at 30 s. Create/batch POST responses are never retried; restore retries only an explicit `503 failure_class=connectivity` pre-commit failure. |
+- Absent or blank values use defaults; any present invalid enum, boolean or
+  integer fails before loading resources or credentials.
+- `FERRUM_GATEWAY_URL` schemes other than `https://` (or `http://` with
+  `FERRUM_ALLOW_INSECURE_HTTP=true`) and embedded `user:password@` are refused
+  in `load_env_config`, before any client exists.
+- `FERRUM_ADMIN_JWT_ROLE`: `/backup`, `/restore`, `/batch` and consumer CRUD
+  are admin-only.
+- `FERRUM_ALLOW_UNKNOWN_FIELDS` keeps unknown top-level `spec` fields (nested
+  stay fatal). It does not lift apply's refusal to rewrite rows with undeclared
+  live top-level fields; declaring the field under the flag does.
+- A configured missing `FERRUM_OVERLAY` directory is fatal;
+  `resolved::validate_overlay_selection` names the environment, overlay and
+  declaring file.
+- `FERRUM_MESH_FILE_OUTPUT_PATH` must not resolve to the gateway document:
+  file-mode `validate`/`plan`/`apply` and `export --output` refuse before any
+  publication, state or broker write (`apply::ensure_distinct_publication_paths`:
+  `./`/`..` spellings, symlinked parents and existing file identity all count).
+- `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` is set by environment-bound workflow
+  steps; see [Traffic verification](#traffic-verification-srcverify).
 
 `FERRUM_TLS_NO_VERIFY` and `FERRUM_ALLOW_INSECURE_HTTP` are independent. Each
 prints a loud stderr banner once per process, and both are refused when
@@ -2083,7 +2016,8 @@ maintainer approval is required. Forks do not inherit repository settings.
 - Return `crate::error::Error` variants via `?`; prefer a descriptive variant
   over `Config(String)` when the category is clear.
 - New `FERRUM_*` env vars: add to `EnvConfig`, `load_env_config()`,
-  `.env.example` and the doc block in `env.rs`.
+  `.env.example`, the doc block in `env.rs` and the `docs/reference.md`
+  environment table.
 - Schema additions: mirror the Ferrum Edge struct; optional fields get
   `#[serde(default)]` + `#[serde(skip_serializing_if = "Option::is_none")]`.
   Don't validate — ferrum-edge does.

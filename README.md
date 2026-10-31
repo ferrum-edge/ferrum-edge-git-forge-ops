@@ -114,7 +114,9 @@ keep its schema in one initial baseline; see the
 | `settings-audit.yml` | weekly, manual | Checks GitHub protections against the baseline. |
 | `validator-pin-canary.yml` | daily, manual | Reports a stale validator digest pin. |
 | `base-image-pin-canary.yml` | daily, manual | Watches the Docker base image for fixes. |
-| `rust-ci.yml`, `security.yml` | pull request, push | Build, test, lint, dependency audit. |
+| `rust-ci.yml` | pull request, push | Build, test, lint. |
+| `security.yml` | pull request, push, weekly | Dependency audit and supply-chain policy. |
+| `supply-chain-policy.yml` | pull request (`pull_request_target`) | Trusted supply-chain policy (`trusted-supply-chain-policy`). |
 | `code-scanning.yml` | pull request, push, weekly | CodeQL and container image scan (not required). |
 | `alloy-consumer.yml` | consumer-surface pull requests, weekly, manual | Non-required Alloy consumer qualification. |
 | `lifecycle.yml` | push, daily, manual | End-to-end acceptance against a real gateway. |
@@ -391,7 +393,7 @@ default_environment: staging
 |---|---|---|
 | `overlay` | none | Directory under `overlays/`. Must exist, even if empty. |
 | `apply_strategy` | `incremental` | `incremental` or `full_replace` (exclusive mode only). |
-| `live_review` | `true` | Compare PRs with the live Admin API. Set `false` for file-mode environments. |
+| `live_review` | `true` | Compare PRs with the live Admin API. Set `false` for file-mode environments and any without a reachable Admin API, or live review waits for approval and then fails to connect. |
 | `namespace_filter` | none | Limit the environment to one namespace. |
 | `ownership.mode` | `shared` | `shared` or `exclusive`. |
 | `ownership.namespaces` | none | Required in exclusive mode. |
@@ -449,13 +451,9 @@ live resource, so only CI writes the ledger:
 - Keep `.state/*.json` tracked in Git. If it is ignored, the ledger never
   reaches `main` and shared mode stops deleting anything.
 
-The guard has no concurrency group, so each delivery runs to completion and
-cannot cancel another; manual cancellation and runner failure can still stop a
-run. This addresses the same-head cancellation observed on #407, where branch
-protection read the newest suite. Its final head, base and label recheck keeps
-authorization safe under that selection and under a rule requiring every
-suite's latest run to pass. The supply-chain checker enforces the no-group and
-recheck rules. See [GitHub launch controls](docs/github-launch-controls.md#protecting-the-ledger-path).
+The guard has no concurrency group and rechecks the head, base and label
+before reporting success; `check_supply_chain.py` enforces both (see
+[GitHub launch controls](docs/github-launch-controls.md#protecting-the-ledger-path)).
 
 Full rules: [State file trust model](docs/ownership.md#state-file-trust-model).
 
@@ -576,27 +574,14 @@ merge changed a deployment input (`Superseded deployment`). Rotation follows
 the same rules. See
 [Ordering between runs](docs/apply.md#ordering-between-runs).
 
-API consumer writes require credential-complete verification, and full replacement
-requires the original coherent conditional namespace snapshot. Rotation checks live
-ownership and field safety before broker publication and uses row `If-Match`.
-GET-only doctor probes report capability availability, while qualification must
-establish enforcement on the exact released gateway bytes. See
-[conditional apply behavior](docs/apply.md#changes-made-during-an-apply). The new
-owner contract was published in Edge v0.9.11. The candidate pairing now pins
-published Edge v0.9.19 at `510ce7121c3d9754110d330a30a3bd9b7a7b278e`, with its
-verified x86_64 validator and multi-platform gateway image. The existing
-conditional API implementation remains unchanged. The vendored Contracts pin
-adopts `contracts-edge-0.9.19`; its only implementation effect is the
-`ai_token_metrics` catalog priority. Edge v0.9.15
-also changes external identity headers and confines plugin-config environment
-references to `FERRUM_PLUGIN_SECRET_<NAME>`; affected deployments must follow the
-[Edge upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915).
-Edge v0.9.17 also requires the
-[namespace-aware client and operator changes](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917),
-and the v0.9.19 candidate refuses several plugin configurations v0.9.17 accepted; review its
-[upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919).
-Hosted GitForgeOps qualification against those exact bytes remains required; the
-[first-release record](release/README.md) stays pending.
+API writes are conditional: incremental overwrites require a strong `ETag` and
+send `If-Match`, consumer writes require credential-complete verification, and
+full replacement requires the original coherent conditional namespace snapshot.
+Rotation checks live ownership and field safety before broker publication and
+uses row `If-Match`. GET-only doctor probes report capability availability,
+while qualification must establish enforcement on the exact released gateway
+bytes. See [conditional apply behavior](docs/apply.md#changes-made-during-an-apply)
+and the [first-release record](release/README.md).
 
 ### What if apply fails after merge?
 
@@ -711,8 +696,8 @@ dedicated probe Consumer that a repository administrator lists in the
 Environment (comma-separated `<namespace>/<consumer-id>`) **and** that the
 resources label `gitforgeops/verify-probe: "true"`, and only on a `GET` or
 `HEAD` request. The variable is the authorization, because no change to
-`resources/` or `.gitforgeops/` can change it (the workflow lines that bind it
-are guarded by review of `.github/workflows/`); with it unset, every check that
+`resources/` or `.gitforgeops/` can change it (the protected supply-chain
+checker pins the workflow lines that bind it); with it unset, every check that
 sends a slot is refused. Any other slot
 refuses the run before a request is sent, and `validate`, `plan` and `review`
 report it before the merge (`smoke.yaml` `version: 2`; a `version: 1` file
@@ -751,56 +736,19 @@ admin credential as before. `plan`, `review` and `apply` always use
 `GET /backup`: they preview or perform writes and need raw values and API-spec
 ownership tags, which the export does not carry.
 
-What the export cannot tell you:
-
-- **Secrets are fingerprints.** Credential keys and secrets, plugin-config
-  secrets, credential-bearing URLs and the Consul token arrive as
-  `hmac-sha256:<64 hex>`, keyed from the gateway's *admin* secret. A viewer
-  credential cannot compute the fingerprint of the repository's value, so
-  those fields are not compared with the repository. `diff` says how many it
-  left unverified and does not print `Configuration is in sync.` while any
-  are; JSON `in_sync` is `false`. With `--exit-on-drift`, drift that was found
-  still exits `2`, but "no drift" exits `6` ("in sync, secrets unverified")
-  unless `--accept-unverified-secrets` is passed. Scheduled monitoring reports
-  `6` as a warning, not a failure. A
-  fingerprinted credential the repository does not declare, and a
-  fingerprint-shaped value in a non-secret field, are still reported.
-- **Fingerprints only show change between two exports.**
-  `--write-fingerprint-baseline PATH` records an export's fingerprints;
-  `--fingerprint-baseline PATH` reports every declared resource's secret that
-  changed, appeared or disappeared since, and counts them as managed drift. The
-  baseline cannot say whether a value matches the repository: record it from a
-  gateway you trust, ideally right after a successful apply. Recording is
-  refused when the same run found differences or secret changes, unless
-  `--force-baseline` is passed. If the drift check rewrites the baseline on
-  every run, a change alerts once. Rotating the gateway's
-  `FERRUM_ADMIN_JWT_SECRET`, or restarting a gateway that has none, changes
-  every fingerprint; `diff` then reports the baseline as not comparable, and
-  `--exit-on-drift` exits `1` — a supplied baseline that cannot verify secrets
-  is a failed check, unlike the no-baseline `6` warning. The baseline holds
-  keyed fingerprints only; keep it outside the repository (`diff` warns when it
-  is inside a git worktree).
-- **`basicauth` is hidden.** The export omits it (and custom types, and an
-  `mtls_auth` type with no identity Edge accepts) and gives each consumer one
-  fingerprint over all hidden credentials. Only a baseline can use it, so every
-  declared consumer, even one with no credentials, leaves that fingerprint
-  unverified until a baseline covers it. Invalid `mtls_auth` identities next
-  to a valid one are neither shown nor fingerprinted.
-- **Whole values around a secret.** When Edge fingerprints a whole value that
-  only contains a secret (a `headers` map holding an API key, say), its
-  non-secret contents cannot be compared either. Such a run is never
-  authoritative: without drift elsewhere, `--exit-on-drift` exits `1` even
-  with a baseline or `--accept-unverified-secrets`.
-- **No API-spec ownership.** The export strips `api_spec_id`, so spec-owned
-  rows look like any other live row and spec ownership conflicts are not
-  detected on this path.
-- **HTTPS only.** The viewer token goes only to an `https://` gateway, or over
-  `http://` to a literal loopback IP such as `127.0.0.1` (not `localhost`).
-- **Cached data is stale.** An export served with `X-Data-Source: cached`
-  (including when another export holds the gateway's database load) makes
-  `diff` warn, report no authoritative result, refuse `--exit-on-drift`
-  (exit 1) and refuse to write a baseline.
-
+The export returns secrets as keyed fingerprints the viewer key cannot
+reproduce, hides `basicauth` behind one per-consumer fingerprint, and strips
+API-spec ownership. So while any declared secret is unverified, `diff` does not
+report `in sync`. With `--exit-on-drift` and no fingerprint baseline, a fresh
+read with no drift exits `6` ("in sync, secrets unverified");
+`--accept-unverified-secrets` turns that into `0`. A supplied baseline that only
+lacks a namespace or resource it has not recorded yet also exits `6`. Without
+drift, a supplied baseline that cannot verify secrets (missing file, changed
+fingerprint key, incomplete recorded namespace) exits `1` (`0` with that flag),
+and a whole value fingerprinted around a secret or a refused baseline write
+exits `1` either way; a cached read always exits `1`. Baselines and the other
+limits are in
+[Viewer-credential drift reads](docs/reference.md#viewer-credential-drift-reads).
 The bundled `drift-check.yml` binds only the viewer secret. See
 [Scheduled monitoring](docs/reference.md#scheduled-monitoring).
 
@@ -826,12 +774,8 @@ environment opts in, the audit also requires a successful drift run in the
 last 48 hours.
 
 **Credential scope:** the bundled drift check binds only the viewer-capped
-key and reads `GET /config/export`; the protected checker forbids the admin
-key in that workflow. Existing monitor environments may still hold the older
-admin secret copy: delete `FERRUM_ADMIN_JWT_SECRET` from each
-`<env>-monitor` (keep it in `<env>` itself) — the viewer key is
-read-only by gateway enforcement, the admin key is not. Provisioning order is
-in [Scheduled monitoring](docs/reference.md#scheduled-monitoring); see also
+key, and `<env>-monitor` must not hold `FERRUM_ADMIN_JWT_SECRET`; see
+[Scheduled monitoring](docs/reference.md#scheduled-monitoring) and
 [GitHub launch controls §3.1](docs/github-launch-controls.md#31-unattended-drift-monitoring).
 
 ## Setup doctor
@@ -1110,10 +1054,6 @@ changed are kept; files both changed are conflicts you resolve (for example
 configuration, `.state/`, `assembled/` and CODEOWNERS are never touched. An
 engine update is a deployment input, so merging it schedules an apply. See
 [Adopting upstream updates](docs/template-updates.md).
-
-`live_review` defaults to `true`. Set `live_review: false` on file-mode
-environments and any environment without a reachable Admin API; otherwise live
-review waits for approval and then fails to connect.
 
 ## License
 

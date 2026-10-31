@@ -24,8 +24,9 @@ paths:
   `FERRUM_MESH_FILE_OUTPUT_PATH`; API-mode apply validates it and reports that no mesh admin API
   exists rather than attempting a push.
 - Publication reconciles. Removing the last fragment retracts the destination by rewriting it as
-  `{version: '1', mesh: {}}` — never by deleting it, and never on a path gitforgeops cannot
-  attribute to itself through the state ledger or its own renderer output. Retraction failures are
+  `{version: '1', mesh: {}}` — never by deleting it, never on a path the state ledger does not
+  attribute to this repository (`StateFile::mesh_document_path`), and never from a run narrower than
+  the environment's publication scope. Retraction failures are
   errors, never silent successes, and `plan`, `apply`, `export` and PR review all report it.
 - Validate rendered mesh bytes through `ferrum-edge validate -m mesh` with the same scrubbed child
   environment and private temporary-file handling as gateway validation.

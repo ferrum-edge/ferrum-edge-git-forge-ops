@@ -223,9 +223,9 @@ ownership assertion, adoption claim and ambiguous-create ownership assertion it:
 2. compares that row with the row it planned against; and
 3. sends the `PUT` or `DELETE` with `If-Match: <etag>`.
 
-Released Ferrum Edge v0.9.6 source includes this conditional-write capability,
-with no minimum-version claim
-([release source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
+The Ferrum Edge v0.9.6 tag source (tagged, never published) includes this
+conditional-write capability, with no minimum-version claim
+([tag source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
 [Edge PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)). Apply
 probes only for a strong `ETag` and always sends `If-Match`. The operator must
 qualify the exact released gateway build to establish that it honors
@@ -319,23 +319,24 @@ omitted under the existing server semantics. The former spec-document reread
 is not a concurrency guarantee and is no longer used.
 
 `doctor --scope gateway` probes complete verification and coherent snapshots
-using GET only. No consumer to probe means unknown, never pass. Ordinary diff,
-plan, review and viewer drift reads retain their current endpoints and explain
-these runtime requirements. The conditional API owner contract was published at
-Edge `c764084b3b51c3f7ffde268c039688d35e49c553`. The current candidate gateway is
-published v0.9.19 at `510ce7121c3d9754110d330a30a3bd9b7a7b278e`, with exact binary
-and image pins in the [pending release record](../release/baseline.json).
-GitForgeOps enforcement qualification against those bytes remains required before
-release acceptance. This pin refresh leaves the conditional API implementation
-unchanged. Edge v0.9.15 changes external identity header semantics and requires
-plugin-config environment references under `FERRUM_PLUGIN_SECRET_<NAME>`; see
-the [Edge 0.9.15 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915).
-Also review the
-[v0.9.17 operator changes](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917),
-including namespace-bounded admin tokens and cached admin misses that report
-unavailable rather than deleted, and the candidate's
-[v0.9.19 changes](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919), which refuse several plugin configurations v0.9.17
-accepted and require `expected_proxy_ids` on PluginConfig writes.
+using GET only. No consumer to probe means unknown, never pass. A missing
+capability refuses the operation that needs it. Ordinary diff, plan, review and
+viewer drift reads retain their current endpoints and explain these runtime
+requirements. The conditional API owner contract was published at Edge
+`c764084b3b51c3f7ffde268c039688d35e49c553`. The current candidate gateway is
+published v0.9.19, with exact binary and image pins in the
+[pending release record](../release/baseline.json); GitForgeOps enforcement
+qualification against those bytes remains required before release acceptance.
+Edge operator changes to review:
+[v0.9.15](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915)
+(external identity headers; plugin-config environment references only under
+`FERRUM_PLUGIN_SECRET_<NAME>`),
+[v0.9.17](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917)
+(namespace-bounded admin tokens; cached admin misses report unavailable rather
+than deleted) and
+[v0.9.19](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919)
+(refuses several plugin configurations v0.9.17 accepted; requires
+`expected_proxy_ids` on PluginConfig writes).
 
 **Proxies and their plugins.** Ferrum Edge rewrites a proxy's association list
 itself when a scoped plugin is created, retargeted or removed. A proxy this

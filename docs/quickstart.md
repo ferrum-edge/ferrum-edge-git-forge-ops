@@ -416,8 +416,9 @@ Open the pull request. You should see:
 
 - **`gitforgeops-required-static-validation`**: secretless assembly and schema
   validation, with no gateway contact.
-- **`rust-ci-check`**, **`security-*`**, **`trusted-supply-chain-policy`** and
-  **`state-guard-reject-state-edits`**: the other required checks.
+- **`rust-ci-check`**, **`security-*`**, **`trusted-supply-chain-policy`**,
+  **`state-guard-reject-state-edits`** and **`validate-trusted-policy`**: the
+  other required checks.
 - **`GitForgeOps Trusted PR Live Review`**, waiting for the environment
   reviewer. Once approved, it posts a review comment listing the resources that
   would be added, the credential slots awaiting allocation, and the verdict.
@@ -470,6 +471,12 @@ that the plugin's `proxy_id` matches the proxy's `id`.
 ```bash
 gitforgeops --env production diff --exit-on-drift   # exit 0: in sync
 ```
+
+That exit `0` is with the admin credential. If you exported
+`FERRUM_ADMIN_JWT_VIEWER_SECRET` locally, `diff` reads with the viewer key and
+exits `6`: no differences in the compared fields, but the Consumer's secrets
+are unverified until a
+[fingerprint baseline](reference.md#viewer-credential-drift-reads) covers it.
 
 Re-running the apply must also change nothing. If it does, part of the
 document normalizes differently from how the gateway stores it; open an issue

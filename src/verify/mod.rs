@@ -118,8 +118,8 @@ pub const VERIFY_PROBE_LABEL: &str = "gitforgeops/verify-probe";
 /// Bound from a GitHub Environment variable of the same name
 /// (`vars.FERRUM_VERIFY_PROBE_CONSUMERS`), which only a repository
 /// administrator can set and no change to `resources/` or `.gitforgeops/` can
-/// change; the workflow lines that bind it are guarded by review of
-/// `.github/workflows/`. `verify` refuses every check
+/// change; the protected supply-chain checker pins the workflow lines that
+/// bind it. `verify` refuses every check
 /// that sends a slot while it is unset or empty, and every slot whose Consumer
 /// it does not list. [`VERIFY_PROBE_LABEL`] is required as well, but a label
 /// is repository content and authorizes nothing by itself.

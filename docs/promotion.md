@@ -144,11 +144,12 @@ exits 1 before the bundle is read or any request is sent:
   variable of the environment's GitHub Environment, as
   `<namespace>/<consumer-id>`. This is the authorization. A GitHub Environment
   variable can be set only by a repository administrator, so no change to
-  `resources/` or `.gitforgeops/` can change it. The workflow lines that bind
-  it are guarded by review of `.github/workflows/`; a trusted-base checker
-  rule pinning them is tracked as a follow-up. Unset or empty, every check
-  that sends a slot is refused; a malformed entry (anything but exactly one
-  `/` per entry) is an error.
+  `resources/` or `.gitforgeops/` can change it. The protected supply-chain
+  checker (`probe_consumer_binding_violations`) pins the workflow lines that
+  bind it in the Validate and Verify traffic steps and the trusted live
+  review, and refuses the name anywhere else in those workflows. Unset or
+  empty, every check that sends a slot is refused; a malformed entry (anything
+  but exactly one `/` per entry) is an error.
 - The Consumer is in the environment's desired configuration (after overlays
   and namespace scope) and carries the label `gitforgeops/verify-probe: "true"`.
   The label is required too, but it lives in `resources/`, which the pull

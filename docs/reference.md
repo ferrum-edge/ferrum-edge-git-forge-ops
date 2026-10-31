@@ -13,7 +13,8 @@ Configuration comes from three places:
 
 ## Commands
 
-Global flags: `--env <name>`, `--allow-credential-slot-remap`,
+Global flags: `--env <name>` (falls back to `FERRUM_ENV`, then
+`default_environment`, then the only environment), `--allow-credential-slot-remap`,
 `--allow-empty-namespace`. `--version` / `-V` prints the package version.
 
 ```
@@ -50,7 +51,7 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 | `verify` | Runs the environment's declared traffic checks. See [Staged promotion](promotion.md). |
 | `doctor` | Read-only readiness diagnosis. See [Setup doctor](../README.md#setup-doctor). |
 | `envs` | Lists declared environments as JSON for CI matrices; `--include-scopes` adds each environment's namespace and monitoring scope. |
-| `version` | Package version and build-time Git metadata. |
+| `version` | Package version and build-time Git commit and `git describe` (`unknown` when built without `.git`). |
 | `rotate` | Rotates one Consumer credential slot. See [Rotation](credential-broker.md#rotation). |
 
 ### Exit codes
@@ -261,48 +262,38 @@ repository. See [GitHub launch controls](github-launch-controls.md).
 | `GITFORGEOPS_RELEASE_ENABLED` | unset | Set to `true` to let `release.yml` publish from a repository other than upstream. |
 | `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Docker Hub target for `release.yml`. |
 
-## Environment variables
+## Gateway write requirements
 
-Consumer writes additionally require `GET /consumers/{id}/verification` complete
-stored evidence. Full replacement and API import require coherent
-`GET /backup?conditional=true` snapshots; restore sends the original namespace
-`If-Match`. Missing capabilities refuse their operations. GET-only doctor probes
-report unavailable evidence as unknown and cannot establish write enforcement.
-Exact exports preserve hidden/custom/legacy credentials, while ordinary `/backup`
-canonicalizes some credential entries. Import refuses unsupported exact credentials
-before publishing the resource tree or private bundle; its manifest records the
-credential representation. A conditional export file without authenticated response
-headers is refused. Canonical archival/file imports do not claim exact provenance.
-
-Incremental API overwrites require a strong `ETag` and a gateway that honors
-`If-Match`. The client probes only for the tag and always sends the condition;
-it does not detect a server that returns tags but ignores `If-Match`. The
-operator must qualify the exact released gateway build to establish server
-enforcement. Released Ferrum Edge v0.9.6 source includes the capability, with
-no minimum-version claim. Apply preflight and `doctor --scope gateway` check
-for a strong tag; a version number alone does not prove backup or consumer
-compatibility. See
-[Changes made during an apply](apply.md#changes-made-during-an-apply) for the
-remaining checks and exact-build lifecycle qualification.
-
-PluginConfig updates and deletes additionally send `expected_proxy_ids`, the
-gateway's association precondition (issue #569). A gateway build that does
-not implement it ignores the parameter, and the client does not detect a
-server that accepts the parameter but does not enforce it. Released Ferrum
-Edge builds up to and including v0.9.17 ignore it. The pinned v0.9.19 is the
-first published release that includes ferrum-edge#6744, and it refuses a
-PluginConfig update or delete that omits the parameter. Apply still keeps
-its client-side `/backup` re-read of the plugin's referencing proxies before
-every PluginConfig delete and retarget, whatever the gateway build (issue
-#603). That re-read narrows the race but cannot close it; only a gateway
-that enforces the precondition does. The re-read stays until hosted
-lifecycle qualification of the exact v0.9.19 build is recorded, as for
-`If-Match`. See
+API writes need conditional-write support from the gateway: a strong `ETag`
+and `If-Match` for incremental overwrites, complete
+`GET /consumers/{id}/verification` evidence for Consumer writes, coherent
+`GET /backup?conditional=true` snapshots for full replacement and API import
+(restore sends the original namespace `If-Match`), and `expected_proxy_ids` on
+PluginConfig updates and deletes. A missing capability the client can detect
+(no strong `ETag`, incomplete verification evidence, no coherent snapshot)
+refuses its operation. A gateway without the association precondition ignores
+`expected_proxy_ids` and accepts the write, and the client cannot detect that.
+It re-reads the plugin's referencing proxies before every PluginConfig delete
+and before an update that changes the plan's `scope` or `proxy_id` to `proxy`
+or `global`; operator qualification of the exact gateway build must establish
+enforcement.
+GET-only doctor probes report unavailable evidence as unknown and
+cannot establish write enforcement. The client probes only for the strong
+`ETag` and always sends `If-Match`; it does not detect a server that returns
+tags but ignores the condition, so operator qualification of the exact released
+gateway build must establish enforcement. The Ferrum Edge v0.9.6 tag source
+(tagged, never published) includes the capability, with no minimum-version
+claim ([tag source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
+[Edge PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)). See
+[Changes made during an apply](apply.md#changes-made-during-an-apply) and
 [Plugin associations](apply.md#plugin-associations).
+
+## Environment variables
 
 Blank values count as unset. Present values are validated before anything else
 runs: unknown modes, bad booleans (accepted: `true`, `false`, `1`, `0`,
-case-insensitive), malformed or zero numbers, and bad URLs are errors. See
+case-insensitive), malformed numbers, zero for the timeout and TTL settings
+(retries accept `0`), and bad URLs are errors. See
 [`.env.example`](../.env.example) for a local starting point.
 
 | Variable | Default | Meaning |
@@ -430,7 +421,7 @@ applicable:
 |---|---|
 | `## Ferrum Edge Config Review` / `### Validation: PASSED` | Gateway and mesh validation (`PASSED`, `FAILED` or `ERROR`). |
 | `### Changes` | Add / Modify / Delete per resource, or `None (in sync)`. |
-| `### Breaking Changes` | Changes that can break live traffic (below). |
+| `### Breaking Changes` | Changes that can break live traffic ([below](#breaking-changes)). |
 | `### Security Findings` | Audit findings; blocking ones marked. |
 | `### Best Practice Recommendations` | Advisory notes. |
 | `### Ownership Adoption` | `ADOPT <Kind> <id>` entries. |
@@ -447,7 +438,34 @@ In live comparisons, `review`, `diff` and `plan` leave out only broker leaves
 that are still unresolved after loading the bundle, so unseeded slots do not
 show as permanent drift. Everything else, including resolved secret
 differences, is compared. A viewer-credential `diff` also cannot compare
-secrets the gateway fingerprints; see below.
+secrets the gateway fingerprints; see
+[Viewer-credential drift reads](#viewer-credential-drift-reads).
+
+### Breaking changes
+
+Also reported by `plan`:
+
+- a deleted Proxy or Consumer;
+- a Proxy whose `listen_path`, `hosts`, effective `backend_scheme`,
+  `upstream_subset`, `listen_port`, `frontend_tls` or `passthrough` changes;
+- an authentication plugin config that is deleted, disabled, or given a
+  different `plugin_name`;
+- a surviving proxy (declared or not) that stops running an authenticator it
+  runs live (`proxy <ns>/<id> loses authenticator <plugin_name>`), counting
+  only authenticators its listener runs. An authenticator with a `trigger`
+  still counts as running here, although it never satisfies
+  `require_auth_plugin`.
+
+"Authentication plugin" means the `require_auth_plugin` definition: the
+policy file's `auth_plugin_names` when present, otherwise the built-ins. Other
+plugin edits are not breaking.
+
+Intentionally public proxies that rely on conditional authenticators can be
+listed under `policies.require_auth_plugin.conditional_auth_exemptions` in the
+code-owned `.gitforgeops/policies.yaml`, using exact `<namespace>/<proxy_id>`
+identities. Their auth findings remain visible at `info`; missing or
+unnecessary entries are reported as informational stale findings. Wildcards,
+malformed identities and duplicates fail policy loading.
 
 ### Viewer-credential drift reads
 
@@ -540,18 +558,17 @@ sources, rebinding and environment-file injection. Namespace filters from the
 repository configuration and the gateway's `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`
 continue to limit the comparison; neither scope is widened by the key change.
 
-A repository administrator must configure the gateway's distinct viewer key
-(Ferrum Edge v0.9.9+) and, before deploying this workflow, provision the matching
+A repository administrator configures the gateway's distinct viewer key
+(Ferrum Edge v0.9.9+) and provisions the matching
 `FERRUM_ADMIN_JWT_VIEWER_SECRET` through GitHub's **Settings → Environments →
-selected environment → Environment secrets**. Do this for every API environment
-the drift matrix binds: `<env>-monitor` when `monitoring.unattended: true`,
-otherwise `<env>` itself. After the workflow switch, delete
-`FERRUM_ADMIN_JWT_SECRET` from each `<env>-monitor`; keep the admin key in
-deployment environments for apply, trusted review and rotate. The settings audit
-checks only secret names, requires the viewer name in `<env>-monitor`, and
-rejects an admin name there even alongside the viewer. No secret values are
-read, printed or copied by the migration tooling. An operator provisions the
-value through the protected secret-entry UI.
+selected environment → Environment secrets** in every API environment the drift
+matrix binds: `<env>-monitor` when `monitoring.unattended: true`, otherwise
+`<env>` itself. `<env>-monitor` must not hold `FERRUM_ADMIN_JWT_SECRET`;
+deployment environments keep the admin key for apply, trusted review and
+rotate. The settings audit checks only secret names, requires the viewer name
+in `<env>-monitor`, and rejects an admin name there even alongside the viewer.
+No tooling reads, prints or copies secret values; an operator enters the value
+through the protected secret-entry UI.
 
 The workflow keeps `diff --exit-on-drift` without
 `--accept-unverified-secrets` or automatic fingerprint-baseline storage. A fresh
@@ -567,30 +584,6 @@ while JSON remains `in_sync: false`; it cannot accept a cached read or masked
 ancestors. The settings-audit environment and secretless template mode are
 unchanged. File-mode drift jobs still skip before receiving gateway credentials.
 
-**Breaking changes** (also in `plan`):
-
-- a deleted Proxy or Consumer;
-- a Proxy whose `listen_path`, `hosts`, effective `backend_scheme`,
-  `upstream_subset`, `listen_port`, `frontend_tls` or `passthrough` changes;
-- an authentication plugin config that is deleted, disabled, or given a
-  different `plugin_name`;
-- a surviving proxy (declared or not) that stops running an authenticator it
-  runs live (`proxy <ns>/<id> loses authenticator <plugin_name>`), counting
-  only authenticators its listener runs. An authenticator with a `trigger`
-  still counts as running here, although it never satisfies
-  `require_auth_plugin`.
-
-"Authentication plugin" means the `require_auth_plugin` definition: the
-policy file's `auth_plugin_names` when present, otherwise the built-ins. Other
-plugin edits are not breaking.
-
-Intentionally public proxies that rely on conditional authenticators can be
-listed under `policies.require_auth_plugin.conditional_auth_exemptions` in the
-code-owned `.gitforgeops/policies.yaml`, using exact `<namespace>/<proxy_id>`
-identities. Their auth findings remain visible at `info`; missing or
-unnecessary entries are reported as informational stale findings. Wildcards,
-malformed identities and duplicates fail policy loading.
-
 ## Import details
 
 - `--output-dir` is required and must be empty. The tree is staged and
@@ -598,6 +591,12 @@ malformed identities and duplicates fail policy loading.
   machine-readable inventory of source metadata, validated counts, totals,
   namespaces and skipped sections. It holds no resource bodies or secrets.
 - API import refuses cached, cross-namespace or duplicate-row backups.
+- Exact exports preserve hidden/custom/legacy credentials, while ordinary
+  `/backup` canonicalizes some credential entries. Import refuses unsupported
+  exact credentials before publishing the resource tree or private bundle; its
+  manifest records the credential representation. A conditional export file
+  without authenticated response headers is refused. Canonical archival/file
+  imports do not claim exact provenance.
 - Every recognized secret becomes `${gh-env-secret:alloc=require}`: Consumer
   credential secrets, built-in plugin-config secrets covered by the broker
   rules, custom-plugin values the heuristics flag, and Consul tokens.
