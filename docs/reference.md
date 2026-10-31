@@ -269,8 +269,13 @@ and `If-Match` for incremental overwrites, complete
 `GET /consumers/{id}/verification` evidence for Consumer writes, coherent
 `GET /backup?conditional=true` snapshots for full replacement and API import
 (restore sends the original namespace `If-Match`), and `expected_proxy_ids` on
-PluginConfig updates and deletes. Missing capabilities refuse their
-operations. GET-only doctor probes report unavailable evidence as unknown and
+PluginConfig updates and deletes. A missing capability the client can detect
+(no strong `ETag`, incomplete verification evidence, no coherent snapshot)
+refuses its operation. A gateway without the association precondition ignores
+`expected_proxy_ids` and accepts the write; the client cannot detect that, so
+it re-reads the plugin's referencing proxies before every such write, and
+operator qualification of the exact gateway build must establish enforcement.
+GET-only doctor probes report unavailable evidence as unknown and
 cannot establish write enforcement. The client probes only for the strong
 `ETag` and always sends `If-Match`; it does not detect a server that returns
 tags but ignores the condition, so operator qualification of the exact released

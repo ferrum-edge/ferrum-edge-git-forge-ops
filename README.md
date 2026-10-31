@@ -741,11 +741,13 @@ reproduce, hides `basicauth` behind one per-consumer fingerprint, and strips
 API-spec ownership. So while any declared secret is unverified, `diff` does not
 report `in sync`. With `--exit-on-drift` and no fingerprint baseline, a fresh
 read with no drift exits `6` ("in sync, secrets unverified");
-`--accept-unverified-secrets` turns that into `0`. Without drift, a supplied
-baseline that cannot verify secrets exits `1` (`0` with that flag), and a whole
-value fingerprinted around a secret or a refused baseline write exits `1`
-either way; a cached read always exits `1`. Baselines and the other limits are
-in
+`--accept-unverified-secrets` turns that into `0`. A supplied baseline that only
+lacks a namespace or resource it has not recorded yet also exits `6`. Without
+drift, a supplied baseline that cannot verify secrets (missing file, changed
+fingerprint key, incomplete recorded namespace) exits `1` (`0` with that flag),
+and a whole value fingerprinted around a secret or a refused baseline write
+exits `1` either way; a cached read always exits `1`. Baselines and the other
+limits are in
 [Viewer-credential drift reads](docs/reference.md#viewer-credential-drift-reads).
 The bundled `drift-check.yml` binds only the viewer secret. See
 [Scheduled monitoring](docs/reference.md#scheduled-monitoring).

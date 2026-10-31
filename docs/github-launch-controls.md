@@ -907,7 +907,7 @@ What the checker enforces for this check:
   `supply-chain-policy.yml`, `state-guard-reject-state-edits` in
   `state-guard.yml`, and likewise `rust-ci-check`, `security-cargo-audit`,
   `security-supply-chain-policy`, `gitforgeops-required-static-validation`
-  and `validate-trusted-policy` in `agent-setup-policy.yml`
+  and `validate-trusted-policy` (`agent-setup-policy.yml`)
   (`REQUIRED_CHECK_WORKFLOWS`, kept equal to the bootstrap's
   `REQUIRED_STATUS_CHECKS` by a test). No job's `name:` may be computed with
   `${{ }}`. Mentioning a context in a script, a step title or an action input
