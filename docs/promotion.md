@@ -147,9 +147,9 @@ exits 1 before the bundle is read or any request is sent:
   `resources/` or `.gitforgeops/` can change it. The protected supply-chain
   checker (`probe_consumer_binding_violations`) pins the workflow lines that
   bind it in the Validate and Verify traffic steps and the trusted live
-  review, and refuses the name anywhere else. Unset or empty, every check
-  that sends a slot is refused; a malformed entry (anything but exactly one
-  `/` per entry) is an error.
+  review, and refuses the name anywhere else in those workflows. Unset or
+  empty, every check that sends a slot is refused; a malformed entry (anything
+  but exactly one `/` per entry) is an error.
 - The Consumer is in the environment's desired configuration (after overlays
   and namespace scope) and carries the label `gitforgeops/verify-probe: "true"`.
   The label is required too, but it lives in `resources/`, which the pull

@@ -14,9 +14,10 @@ checks run again after a policy-only merge. Validator compatibility is checked
 on pull requests and by the canary, not here.
 
 CI installs cargo-audit **0.22.1** with the `taiki-e/install-action` commit
-pinned in `security.yml`, using `checksum: true` and `fallback: none`. The
-action pin fixes the installer code. `check_supply_chain.py`'s
-`CARGO_AUDIT_ACTIONS` lists the reviewed commits it accepts: a Dependabot bump
+pinned in [`security.yml`](../.github/workflows/security.yml), using
+`checksum: true` and `fallback: none`. The action pin fixes the installer code.
+`CARGO_AUDIT_ACTIONS` in
+[`check_supply_chain.py`](../.github/scripts/check_supply_chain.py) lists the reviewed commits it accepts: a Dependabot bump
 adds the new commit, the workflow switches to it, and a follow-up retires the
 old one. The accepted commits share the same action source and cargo-audit
 manifest. The

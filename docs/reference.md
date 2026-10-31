@@ -51,7 +51,7 @@ gitforgeops rotate   --consumer ID --credential PATH [--namespace NS] [--recipie
 | `verify` | Runs the environment's declared traffic checks. See [Staged promotion](promotion.md). |
 | `doctor` | Read-only readiness diagnosis. See [Setup doctor](../README.md#setup-doctor). |
 | `envs` | Lists declared environments as JSON for CI matrices; `--include-scopes` adds each environment's namespace and monitoring scope. |
-| `version` | Package version and build-time Git metadata. |
+| `version` | Package version and build-time Git commit and `git describe` (`unknown` when built without `.git`). |
 | `rotate` | Rotates one Consumer credential slot. See [Rotation](credential-broker.md#rotation). |
 
 ### Exit codes
@@ -271,7 +271,13 @@ and `If-Match` for incremental overwrites, complete
 (restore sends the original namespace `If-Match`), and `expected_proxy_ids` on
 PluginConfig updates and deletes. Missing capabilities refuse their
 operations. GET-only doctor probes report unavailable evidence as unknown and
-cannot establish write enforcement. See
+cannot establish write enforcement. The client probes only for the strong
+`ETag` and always sends `If-Match`; it does not detect a server that returns
+tags but ignores the condition, so operator qualification of the exact released
+gateway build must establish enforcement. The Ferrum Edge v0.9.6 tag source
+(tagged, never published) includes the capability, with no minimum-version
+claim ([tag source](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.6/src/admin/preconditions.rs),
+[Edge PR 5661](https://github.com/ferrum-edge/ferrum-edge/pull/5661)). See
 [Changes made during an apply](apply.md#changes-made-during-an-apply) and
 [Plugin associations](apply.md#plugin-associations).
 

@@ -163,9 +163,9 @@ pub struct EnvConfig {
     /// A GitHub Environment *variable*, not repository content: no change to
     /// `resources/` or `.gitforgeops/` can change it, so it, not a label under
     /// `resources/`, decides which Consumer's credential a traffic check may
-    /// send. (The workflow lines that bind it are guarded by review of
-    /// `.github/workflows/`.) `verify` refuses every check that sends a slot
-    /// while it is unset.
+    /// send. (The protected supply-chain checker pins the workflow lines that
+    /// bind it.) `verify` refuses every check that sends a slot while it is
+    /// unset.
     pub verify_probe_consumers: Option<String>,
     /// This run is bound to the environment's GitHub Environment, so an unset
     /// or blank [`EnvConfig::verify_probe_consumers`] means the operator set

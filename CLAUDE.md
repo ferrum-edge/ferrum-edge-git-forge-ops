@@ -1894,9 +1894,7 @@ Only what the sections above do not already say.
 
 Variables, defaults and meanings are documented in
 [docs/reference.md](docs/reference.md#environment-variables) and
-`.env.example`. A new `FERRUM_*` variable goes into `EnvConfig`,
-`load_env_config()`, `.env.example`, the doc block in `env.rs` and that
-reference table. Code-level invariants:
+`.env.example`. Code-level invariants:
 
 - Absent or blank values use defaults; any present invalid enum, boolean or
   integer fails before loading resources or credentials.
@@ -2018,7 +2016,8 @@ maintainer approval is required. Forks do not inherit repository settings.
 - Return `crate::error::Error` variants via `?`; prefer a descriptive variant
   over `Config(String)` when the category is clear.
 - New `FERRUM_*` env vars: add to `EnvConfig`, `load_env_config()`,
-  `.env.example` and the doc block in `env.rs`.
+  `.env.example`, the doc block in `env.rs` and the `docs/reference.md`
+  environment table.
 - Schema additions: mirror the Ferrum Edge struct; optional fields get
   `#[serde(default)]` + `#[serde(skip_serializing_if = "Option::is_none")]`.
   Don't validate — ferrum-edge does.
