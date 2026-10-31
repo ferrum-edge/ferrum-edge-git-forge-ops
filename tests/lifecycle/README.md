@@ -190,9 +190,13 @@ converge:
 | lost `/batch` answer | a two-row `POST /batch` forwarded, then the connection closed unanswered | both rows are verified live and recorded; one `POST /batch`, one ownership PUT per row and no per-resource create are sent; both are later pruned as managed |
 | foreign row | `POST /upstreams` forwarded, another writer changes the row, then the connection closed | `AmbiguousMutation` stops the run: one POST, no write to the row, no ownership claim, and the later proxy write withheld; `diff` reports drift and a re-run recovers |
 
-A fault that never fired, a failing `after_commit` hook, or a proxy error fails
-the scenario as a harness failure before the exit code is judged, so a renamed
-endpoint or a broken harness cannot produce a vacuous pass. Process interruption (SIGKILL, runner loss) and
+Nothing is judged until every proxy handler, `after_commit` hooks included,
+has finished (`FaultProxy.drain`); the client can exit first. A fault that never
+fired, a failing hook, a proxy error or a handler that does not finish then
+fails the scenario as a harness failure before the exit code is judged, so a
+renamed endpoint or a broken harness cannot produce a vacuous pass. Files a
+case added are removed even when it fails, and the next scenario's apply prunes
+their rows. Process interruption (SIGKILL, runner loss) and
 its ledger recovery stay with `runner-interruption`, which needs the GitHub
 half.
 

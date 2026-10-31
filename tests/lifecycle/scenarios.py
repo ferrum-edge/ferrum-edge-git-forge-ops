@@ -703,19 +703,30 @@ def scenario_partial_failure_recovery(harness: Harness) -> str:
     # alone (`LIFECYCLE_ONLY`): failure details embed captured apply output.
     harness_key(harness)
     ensure_deployed(harness)
-    with fault_proxy.FaultProxy(harness.gateway_url) as proxy:
-        evidence = [
-            _cached_backup_blocks_every_write(harness, proxy),
-            _refused_write_keeps_completed_work(harness, proxy),
-            _committed_create_answered_500_is_adopted(harness, proxy),
-            _dropped_batch_is_verified_not_replayed(harness, proxy),
-            _foreign_row_behind_a_dropped_create_stops_the_run(harness, proxy),
-        ]
+    try:
+        with fault_proxy.FaultProxy(harness.gateway_url) as proxy:
+            evidence = [
+                _cached_backup_blocks_every_write(harness, proxy),
+                _refused_write_keeps_completed_work(harness, proxy),
+                _committed_create_answered_500_is_adopted(harness, proxy),
+                _dropped_batch_is_verified_not_replayed(harness, proxy),
+                _foreign_row_behind_a_dropped_create_stops_the_run(harness, proxy),
+            ]
+    finally:
+        # A case that failed midway leaves its extra file behind; the next
+        # scenario's `ensure_deployed` re-seeds only the base tree, so remove
+        # them here and let its apply prune whatever they created.
+        for name in CASE_UPSTREAMS:
+            harness.remove(f"resources/{NAMESPACE}/upstreams/{name}.yaml")
     # Every injected failure ends in the same place: the gateway holds exactly
     # what the repository declares, recovered by an ordinary re-run.
     ensure_deployed(harness)
     harness.run("diff", "--exit-on-drift")
     return "; ".join(evidence)
+
+
+# The upstream files the cases add beside the seeded tree.
+CASE_UPSTREAMS = ("retired", "shipping", "inventory", "catalog", "pricing", "billing")
 
 
 def _through(proxy: fault_proxy.FaultProxy) -> dict[str, str]:
@@ -730,9 +741,17 @@ def _through(proxy: fault_proxy.FaultProxy) -> dict[str, str]:
 
 def _fired(fault: fault_proxy.Fault, what: str) -> None:
     """A fault that never fired leaves the scenario having tested nothing."""
-    if fault.error is not None:
+    if isinstance(fault.error, ScenarioFailure):
         # Raised on the proxy's thread; the run it disturbed proves nothing.
         raise fault.error
+    if fault.error is not None:
+        # Any other type (NotImplementedError included, which the driver
+        # would record as `skipped`) is a harness failure.
+        raise ScenarioFailure(
+            f"the injected fault's ({what}) after_commit hook raised "
+            f"{type(fault.error).__name__}. This is a harness failure, not a "
+            "finding about gitforgeops."
+        )
     if fault.hits == 0:
         raise ScenarioFailure(
             f"the injected fault ({what}) never matched a request, so the "
@@ -748,6 +767,8 @@ def _faulted_apply(harness: Harness, proxy, fault, what: str, expect: int | None
     failed, makes any exit code meaningless.
     """
     completed = harness.run("apply", "--auto-approve", expect=None, **_through(proxy))
+    # The client may exit while a handler or its hook is still running.
+    proxy.drain()
     seen = proxy.requests()
     proxy.clear()
     if proxy.failures:
@@ -795,7 +816,11 @@ def _name(harness: Harness, path: str) -> str | None:
 
 
 def _owned(harness: Harness, kind: str, identifier: str) -> bool:
-    """Is the row in the ownership ledger the last run left behind?"""
+    """Is the row in the ownership ledger the last run left behind?
+
+    Matches `state_key`'s raw form, which holds for ids without `%` or `:`
+    (the ones this scenario uses); those two characters are encoded there.
+    """
     suffix = f":{NAMESPACE}:{kind}:{identifier}"
     return any(key.endswith(suffix) for key in harness.state().get("resources", {}))
 

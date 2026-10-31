@@ -74,6 +74,8 @@ class Fault:
     times: int | None = 1
     after_commit: Callable[[], None] | None = None
     hits: int = 0
+    # The gateway's own answers to the forwarded requests (never the
+    # injected 500, and nothing for `reject`, which forwards nothing).
     statuses: list[int] = field(default_factory=list)
     error: BaseException | None = None
 
@@ -126,6 +128,11 @@ class FaultProxy:
         self._seen: list[tuple[str, str]] = []
         self.failures: list[str] = []
         self._lock = threading.Lock()
+        # Handlers still running. The client can exit (say, on its own
+        # timeout) while a handler or its `after_commit` hook is still at
+        # work, so nothing may be judged until `drain` has seen them finish.
+        self._in_flight = 0
+        self._idle = threading.Condition(self._lock)
         proxy = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -134,6 +141,7 @@ class FaultProxy:
             protocol_version = "HTTP/1.0"
 
             def _handle(self) -> None:
+                proxy._begin()
                 try:
                     self._proxy()
                 except Exception as error:  # noqa: BLE001 - recorded, never printed
@@ -141,6 +149,8 @@ class FaultProxy:
                     # kept: a parser's message can quote a reflected secret.
                     proxy._fail(type(error).__name__)
                     self.close_connection = True
+                finally:
+                    proxy._end()
 
             def _proxy(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -148,7 +158,6 @@ class FaultProxy:
                 path = urllib.parse.urlsplit(self.path).path
                 fault = proxy._claim(self.command, path)
                 if fault is not None and fault.action == REJECT:
-                    fault.statuses.append(500)
                     self._reply(500, [("Content-Type", "application/json")], _INJECTED_500)
                     return
                 status, headers, payload = proxy._forward(
@@ -208,6 +217,25 @@ class FaultProxy:
         with self._lock:
             self._faults.clear()
             self._seen.clear()
+
+    def _begin(self) -> None:
+        with self._lock:
+            self._in_flight += 1
+
+    def _end(self) -> None:
+        with self._lock:
+            self._in_flight -= 1
+            self._idle.notify_all()
+
+    def drain(self, timeout: float = 30.0) -> None:
+        """Wait for every handler to finish; one that does not is a failure.
+
+        Call it before reading `requests()`, `failures` or any fault's
+        `error`: otherwise a hook can fail after its evidence was accepted.
+        """
+        with self._lock:
+            if not self._idle.wait_for(lambda: self._in_flight == 0, timeout):
+                self.failures.append("handler still running")
 
     def requests(self) -> list[tuple[str, str]]:
         with self._lock:

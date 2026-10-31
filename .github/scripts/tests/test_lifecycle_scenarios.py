@@ -818,6 +818,68 @@ class FaultProxyTests(unittest.TestCase):
         with self.assertRaises(scenarios.ScenarioFailure):
             scenarios._fired(fault, "hooked create")
 
+    def test_drain_waits_for_a_hook_that_outlives_its_client(self):
+        import http.client
+        import socket
+        import time
+
+        def slow_then_broken():
+            time.sleep(0.5)
+            raise scenarios.ScenarioFailure("the racing write failed late")
+
+        with loopback_server(201) as (target, _):
+            with self.fault_proxy.FaultProxy(target) as proxy:
+                fault = proxy.inject(
+                    self.fault_proxy.Fault(
+                        "POST",
+                        r"/upstreams",
+                        self.fault_proxy.COMMIT_THEN_DROP,
+                        after_commit=slow_then_broken,
+                    )
+                )
+                parsed = scenarios.urllib.parse.urlsplit(proxy.url)
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=0.1)
+                with self.assertRaises((socket.timeout, TimeoutError)):
+                    connection.request("POST", "/upstreams", body=b"{}")
+                    connection.getresponse()
+                connection.close()
+                # The client gave up; the hook has not failed yet.
+                self.assertIsNone(fault.error)
+                proxy.drain()
+                self.assertIsInstance(fault.error, scenarios.ScenarioFailure)
+                self.assertEqual(proxy.failures, [])
+
+    def test_drain_reports_a_handler_that_never_finishes(self):
+        import threading
+
+        release = threading.Event()
+        with loopback_server(201) as (target, _):
+            with self.fault_proxy.FaultProxy(target) as proxy:
+                proxy.inject(
+                    self.fault_proxy.Fault(
+                        "POST", r"/batch", self.fault_proxy.COMMIT_THEN_DROP, after_commit=release.wait
+                    )
+                )
+                worker = threading.Thread(
+                    target=lambda: self.assertRaises(
+                        Exception, self.exchange, proxy.url, "POST", "/batch", b"{}"
+                    ),
+                    daemon=True,
+                )
+                worker.start()
+                while not proxy.requests():
+                    release.wait(0.01)
+                proxy.drain(timeout=0.2)
+                self.assertEqual(proxy.failures, ["handler still running"])
+                release.set()
+                worker.join(timeout=5)
+
+    def test_a_hook_raising_another_type_is_a_failure_not_a_skip(self):
+        fault = self.fault_proxy.Fault("POST", r"/upstreams", self.fault_proxy.COMMIT_THEN_DROP)
+        fault.hits, fault.error = 1, NotImplementedError("would read as skipped")
+        with self.assertRaisesRegex(scenarios.ScenarioFailure, "NotImplementedError"):
+            scenarios._fired(fault, "hooked create")
+
     def test_a_fault_that_never_fired_fails_the_scenario(self):
         fault = self.fault_proxy.Fault("GET", r"/backup", self.fault_proxy.MARK_CACHED)
         with self.assertRaisesRegex(scenarios.ScenarioFailure, "never matched a request"):
@@ -895,6 +957,8 @@ class FaultProxyTests(unittest.TestCase):
         self.assertNotIn("FERRUM_GATEWAY_MAX_RETRIES", body)
         self.assertGreaterEqual(body.count("_expect_sent(seen,"), 6)
         self.assertIn("if proxy.failures:", helper)
+        # Nothing is judged until every handler (and hook) has finished.
+        self.assertLess(helper.index("proxy.drain()"), helper.index("proxy.requests()"))
 
 
 class RunbookTests(unittest.TestCase):
