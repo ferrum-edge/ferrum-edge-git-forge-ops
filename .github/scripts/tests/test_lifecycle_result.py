@@ -153,7 +153,6 @@ class CertificationTests(unittest.TestCase):
 
 GITHUB_HALF = (
     "credentials-generate-and-rotate",
-    "partial-failure-recovery",
     "ledger-publication-failure",
     "runner-interruption",
     "scheduling-and-attribution",

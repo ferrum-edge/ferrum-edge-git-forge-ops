@@ -1986,10 +1986,14 @@ traffic. Details: `tests/lifecycle/README.md`. Invariants:
   checksum allowlist.
 - Not a per-PR required check: it needs a gateway build, and an often-red check
   trains people to override it.
-- Six scenarios (`credentials-generate-and-rotate`, `partial-failure-recovery`,
+- `partial-failure-recovery` runs in CI through `tests/lifecycle/fault_proxy.py`,
+  a loopback reverse proxy that injects a cached `/backup`, a refused write, a
+  committed create answered 500, a lost `/batch` answer and a foreign row
+  behind a dropped create. A fault that never fires fails the scenario.
+- Five scenarios (`credentials-generate-and-rotate`,
   `ledger-publication-failure`, `runner-interruption`,
   `scheduling-and-attribution`, `staged-promotion`) need a disposable GitHub
-  repository or the fault-injecting proxy, so CI records them `skipped`. They
+  repository, so CI records them `skipped`. They
   count only through an attestation: `lifecycle.yml` dispatched on the release
   ref with the operator's sealed result as `github_acceptance`, merged by
   `lifecycle_result.py attest` only into scenarios the run recorded `skipped`,
