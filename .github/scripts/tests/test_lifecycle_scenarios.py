@@ -799,6 +799,58 @@ class FaultProxyTests(unittest.TestCase):
                 self.assertEqual(seen, [1])
                 self.assertEqual(fault.statuses, [201])
 
+    def test_a_failing_hook_is_kept_for_the_scenario_and_answers_nothing(self):
+        import http.client
+
+        def broken():
+            raise scenarios.ScenarioFailure("setup: the forwarded create did not commit")
+
+        with loopback_server(201) as (target, _):
+            with self.fault_proxy.FaultProxy(target) as proxy:
+                fault = proxy.inject(
+                    self.fault_proxy.Fault(
+                        "POST", r"/upstreams", self.fault_proxy.COMMIT_THEN_500, after_commit=broken
+                    )
+                )
+                with self.assertRaises((http.client.HTTPException, ConnectionError)):
+                    self.exchange(proxy.url, "POST", "/upstreams", b"{}")
+        self.assertIsInstance(fault.error, scenarios.ScenarioFailure)
+        with self.assertRaises(scenarios.ScenarioFailure):
+            scenarios._fired(fault, "hooked create")
+
+    def test_a_fault_that_never_fired_fails_the_scenario(self):
+        fault = self.fault_proxy.Fault("GET", r"/backup", self.fault_proxy.MARK_CACHED)
+        with self.assertRaisesRegex(scenarios.ScenarioFailure, "never matched a request"):
+            scenarios._fired(fault, "cached /backup")
+
+    def test_every_request_is_logged_without_query_or_headers(self):
+        with loopback_server(200) as (target, _):
+            with self.fault_proxy.FaultProxy(target) as proxy:
+                proxy.inject(self.fault_proxy.Fault("POST", r"/batch", self.fault_proxy.REJECT))
+                self.exchange(proxy.url, "POST", "/batch", b"{}")
+                # Past the fault's budget: still forwarded, still counted.
+                self.exchange(proxy.url, "POST", "/batch", b"{}")
+                self.exchange(
+                    proxy.url, "GET", f"/backup?token={SECRET}", headers={"Authorization": SECRET}
+                )
+                seen = proxy.requests()
+                proxy.clear()
+                self.assertEqual(proxy.requests(), [])
+        self.assertEqual(seen, [("POST", "/batch"), ("POST", "/batch"), ("GET", "/backup")])
+        self.assertNotIn(SECRET, repr(seen))
+
+    def test_a_proxy_failure_is_recorded_by_type_and_never_printed(self):
+        import http.client
+
+        with loopback_server(200) as (target, _):
+            pass  # the backend is gone: every forward now fails
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.fault_proxy.FaultProxy(target) as proxy:
+            with self.assertRaises((http.client.HTTPException, ConnectionError)):
+                self.exchange(proxy.url, "GET", f"/backup?token={SECRET}")
+        self.assertEqual(proxy.failures, ["ConnectionRefusedError"])
+        self.assertEqual(errors.getvalue(), "")
+
     def test_a_cached_mark_replaces_the_data_source(self):
         with loopback_server(200, body=b"{}") as (target, _):
             with self.fault_proxy.FaultProxy(target) as proxy:
@@ -829,11 +881,20 @@ class FaultProxyTests(unittest.TestCase):
         source = (ROOT / "tests/lifecycle/scenarios.py").read_text(encoding="utf-8")
         start = source.index("def scenario_partial_failure_recovery(")
         body = source[start : source.index("\n\n\nSCENARIOS", start)]
-        self.assertEqual(body.count("proxy.inject("), body.count("_fired(fault,"))
+        self.assertEqual(
+            body.count("proxy.inject("),
+            len(re.findall(r"_faulted_apply\(\s*harness, proxy, fault,", body)),
+        )
         self.assertGreaterEqual(body.count("proxy.inject("), 5)
+        helper = body[body.index("def _faulted_apply(") : body.index("def _row(")]
+        # The exit code means nothing until the fault is known to have fired.
+        self.assertLess(helper.index("_fired(fault, what)"), helper.index("completed.returncode"))
         self.assertIn("ensure_deployed(harness)", body)
-        # Retries would let a fault's budget absorb a re-sent request.
-        self.assertIn('"FERRUM_GATEWAY_MAX_RETRIES": "0"', body)
+        # A replay is judged from the request log, under the client's own
+        # retry budget, and a run through a failing proxy proves nothing.
+        self.assertNotIn("FERRUM_GATEWAY_MAX_RETRIES", body)
+        self.assertGreaterEqual(body.count("_expect_sent(seen,"), 6)
+        self.assertIn("if proxy.failures:", helper)
 
 
 class RunbookTests(unittest.TestCase):

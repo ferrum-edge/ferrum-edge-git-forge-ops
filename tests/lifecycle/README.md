@@ -174,23 +174,25 @@ keep that log off CI.
 [`fault_proxy.py`](fault_proxy.py) is a standard-library reverse proxy the
 scenario starts on loopback in front of the real gateway. It forwards every
 request unchanged except the ones a fault names, and it never logs a request
-line or header (forwarded requests carry the admin token). The scenario routes
-only its faulted `gitforgeops apply` runs through it, with
-`FERRUM_GATEWAY_MAX_RETRIES=0`, and reads the gateway directly to judge the
-outcome. Each case starts from `ensure_deployed` and ends with an ordinary
-re-run that must converge:
+line or header (forwarded requests carry the admin token) and records its own
+errors by exception type only. The scenario routes only its faulted
+`gitforgeops apply` runs through it, under the client's default retry budget,
+and judges the outcome from the gateway's rows and the ledger, read directly,
+and from the proxy's `(method, path)` log of what the client sent. Each case
+starts from `ensure_deployed` and ends with an ordinary re-run that must
+converge:
 
 | Case | Injected | Safeguard asserted |
 | --- | --- | --- |
 | cached view | every `GET /backup` flagged `X-Data-Source: cached` | apply exits 1 naming the cached view; no row or ledger entry changes |
-| refused write | `PUT /upstreams/orders-upstream` answered 500 without forwarding | the independent proxy write is kept, the namespace's delete is deferred with its ownership record intact, apply exits nonzero |
-| committed create, 500 | `POST /upstreams` forwarded, then answered 500 | the authoritative backup proves the exact row live; ownership is asserted without replaying the create, recorded, and later pruned as managed |
-| lost `/batch` answer | `POST /batch` forwarded, then the connection closed unanswered | the whole batch is verified live and recorded, never re-sent |
-| foreign row | `POST /upstreams` forwarded, another writer changes the row, then the connection closed | `AmbiguousMutation` stops the run: the row is neither overwritten nor claimed and later writes are withheld; `diff` reports drift and a re-run recovers |
+| refused write | `PUT /upstreams/orders-upstream` answered 500 without forwarding | the independent proxy update and a new upstream are kept, and the failing run records the new upstream's ownership; the namespace's delete is never sent and its ownership record stays; apply exits nonzero |
+| committed create, 500 | `POST /upstreams` forwarded, then answered 500 | the authoritative backup proves the exact row live; one POST and one ownership PUT are sent, and the row is recorded and later pruned as managed |
+| lost `/batch` answer | `POST /batch` forwarded, then the connection closed unanswered | the whole batch is verified live and recorded; one `POST /batch` and no per-resource create are sent |
+| foreign row | `POST /upstreams` forwarded, another writer changes the row, then the connection closed | `AmbiguousMutation` stops the run: one POST, no write to the row, no ownership claim, and the later proxy write withheld; `diff` reports drift and a re-run recovers |
 
-Each fault counts the requests it caught, and a fault that never fired fails
-the scenario as a harness failure, so a renamed endpoint cannot turn the
-scenario into a vacuous pass. Process interruption (SIGKILL, runner loss) and
+A fault that never fired, a failing `after_commit` hook, or a proxy error fails
+the scenario as a harness failure before the exit code is judged, so a renamed
+endpoint or a broken harness cannot produce a vacuous pass. Process interruption (SIGKILL, runner loss) and
 its ledger recovery stay with `runner-interruption`, which needs the GitHub
 half.
 

@@ -63,7 +63,9 @@ class Fault:
     `path` is matched (fullmatch) against the request path without its query.
     `times` bounds how many matching requests it applies to; `None` is every
     one. `after_commit` runs after the gateway answered and before the
-    injected response, standing in for another writer racing the client.
+    injected response, standing in for another writer racing the client. It
+    runs on the proxy's thread, so an exception it raises is kept in `error`
+    (and the connection is dropped) for the scenario to re-raise.
     """
 
     method: str
@@ -73,6 +75,7 @@ class Fault:
     after_commit: Callable[[], None] | None = None
     hits: int = 0
     statuses: list[int] = field(default_factory=list)
+    error: BaseException | None = None
 
     def __post_init__(self) -> None:
         if self.action not in ACTIONS:
@@ -94,12 +97,34 @@ def _loopback_http(target: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
+class _QuietServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        """Never print a handler traceback.
+
+        socketserver's default prints the exception to stderr, and an
+        `http.client` parse error can quote the bytes it choked on, which may
+        be a reflected bearer token. `_handle` already records the failure by
+        type name only; anything that still escapes is counted here.
+        """
+        self.proxy._fail("unhandled")  # type: ignore[attr-defined]
+
+
 class FaultProxy:
-    """Run as a context manager; `url` is the admin URL to hand gitforgeops."""
+    """Run as a context manager; `url` is the admin URL to hand gitforgeops.
+
+    `requests()` is every `(method, path)` the proxy saw, query and headers
+    left out, so a scenario can count what the client actually sent (a replay
+    included). `failures` holds the proxy's own errors, by exception type
+    only, and must be empty for a run through it to count as evidence.
+    """
 
     def __init__(self, target: str):
         self._target = _loopback_http(target)
         self._faults: list[Fault] = []
+        self._seen: list[tuple[str, str]] = []
+        self.failures: list[str] = []
         self._lock = threading.Lock()
         proxy = self
 
@@ -109,6 +134,15 @@ class FaultProxy:
             protocol_version = "HTTP/1.0"
 
             def _handle(self) -> None:
+                try:
+                    self._proxy()
+                except Exception as error:  # noqa: BLE001 - recorded, never printed
+                    # The connection closes unanswered. The type name alone is
+                    # kept: a parser's message can quote a reflected secret.
+                    proxy._fail(type(error).__name__)
+                    self.close_connection = True
+
+            def _proxy(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else None
                 path = urllib.parse.urlsplit(self.path).path
@@ -125,7 +159,12 @@ class FaultProxy:
                     return
                 fault.statuses.append(status)
                 if fault.after_commit is not None:
-                    fault.after_commit()
+                    try:
+                        fault.after_commit()
+                    except BaseException as error:  # noqa: BLE001 - re-raised by the scenario
+                        fault.error = error
+                        self.close_connection = True
+                        return
                 if fault.action == COMMIT_THEN_500:
                     self._reply(500, [("Content-Type", "application/json")], _INJECTED_500)
                 elif fault.action == COMMIT_THEN_DROP:
@@ -149,8 +188,8 @@ class FaultProxy:
             def log_message(self, *_args) -> None:
                 """Silence. Forwarded requests carry the admin bearer token."""
 
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._server.daemon_threads = True
+        self._server = _QuietServer(("127.0.0.1", 0), Handler)
+        self._server.proxy = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property
@@ -163,11 +202,22 @@ class FaultProxy:
         return fault
 
     def clear(self) -> None:
+        """Drop every fault and the request log; `failures` is kept."""
         with self._lock:
             self._faults.clear()
+            self._seen.clear()
+
+    def requests(self) -> list[tuple[str, str]]:
+        with self._lock:
+            return list(self._seen)
+
+    def _fail(self, reason: str) -> None:
+        with self._lock:
+            self.failures.append(reason)
 
     def _claim(self, method: str, path: str) -> Fault | None:
         with self._lock:
+            self._seen.append((method, path))
             for fault in self._faults:
                 if fault.matches(method, path):
                     fault.hits += 1
