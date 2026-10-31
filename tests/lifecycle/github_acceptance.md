@@ -194,16 +194,7 @@ python3 .github/scripts/lifecycle_result.py record \
   --status passed --detail "502 staging blocked production; mid-flight merge refused"
 ```
 
-## 7. `partial-failure-recovery`
-
-This one needs a fault-injecting proxy, not a GitHub repository; see
-[Injecting failures](README.md#injecting-failures). The harness always records
-it as `skipped`, so it must be attested like the others. Record it from
-whichever environment you actually used.
-
----
-
-## 8. Seal and publish
+## 7. Seal and publish
 
 Re-seal the record for the revision you actually tested (the upstream commit
 or release tag whose template you exercised, not the disposable repository's
@@ -255,7 +246,7 @@ the freshness window.
 
 ---
 
-## 9. Clean up
+## 8. Clean up
 
 - delete the repository
 - delete its Environments and their secrets

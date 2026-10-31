@@ -721,6 +721,121 @@ class IsolationTests(unittest.TestCase):
         self.assertNotIn("self.headers", source)
 
 
+class FaultProxyTests(unittest.TestCase):
+    """`partial-failure-recovery` is only as good as the faults it injects."""
+
+    fault_proxy = scenarios.fault_proxy
+
+    def exchange(self, url, method="GET", path="/probe", body=None, headers=None):
+        import http.client
+
+        parsed = scenarios.urllib.parse.urlsplit(url)
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    def test_unfaulted_requests_reach_the_gateway_unchanged(self):
+        with loopback_server(201, body=b'{"id":"x"}') as (target, requests):
+            with self.fault_proxy.FaultProxy(target) as proxy:
+                status, headers, body = self.exchange(
+                    proxy.url,
+                    "POST",
+                    "/upstreams?x=1",
+                    b'{"id":"x"}',
+                    {"Authorization": f"Bearer {SECRET}", "If-Match": '"t"'},
+                )
+        self.assertEqual((status, body), (201, b'{"id":"x"}'))
+        self.assertEqual(headers.get("ETag"), '"live-row"')
+        method, path, sent, payload = requests[0]
+        self.assertEqual((method, path, payload), ("POST", "/upstreams?x=1", b'{"id":"x"}'))
+        self.assertEqual(sent["Authorization"], f"Bearer {SECRET}")
+        self.assertEqual(sent["If-Match"], '"t"')
+
+    def test_a_rejected_request_never_reaches_the_gateway(self):
+        with loopback_server(200) as (target, requests):
+            with self.fault_proxy.FaultProxy(target) as proxy:
+                fault = proxy.inject(
+                    self.fault_proxy.Fault("PUT", r"/upstreams/u", self.fault_proxy.REJECT)
+                )
+                status, _, body = self.exchange(proxy.url, "PUT", "/upstreams/u", b"{}")
+                # `times=1`: the next one is forwarded.
+                again, _, _ = self.exchange(proxy.url, "PUT", "/upstreams/u", b"{}")
+        self.assertEqual(status, 500)
+        self.assertIn(b"injected", body)
+        self.assertEqual(again, 200)
+        self.assertEqual(fault.hits, 1)
+        self.assertEqual(len(requests), 1)
+
+    def test_a_committed_request_is_forwarded_before_the_failure(self):
+        for action in (self.fault_proxy.COMMIT_THEN_500, self.fault_proxy.COMMIT_THEN_DROP):
+            with self.subTest(action=action):
+                seen = []
+                with loopback_server(201) as (target, requests):
+                    with self.fault_proxy.FaultProxy(target) as proxy:
+                        fault = proxy.inject(
+                            self.fault_proxy.Fault(
+                                "POST",
+                                r"/batch",
+                                action,
+                                after_commit=lambda: seen.append(len(requests)),
+                            )
+                        )
+                        if action == self.fault_proxy.COMMIT_THEN_500:
+                            status, _, _ = self.exchange(proxy.url, "POST", "/batch", b"{}")
+                            self.assertEqual(status, 500)
+                        else:
+                            import http.client
+
+                            with self.assertRaises(
+                                (http.client.HTTPException, ConnectionError)
+                            ):
+                                self.exchange(proxy.url, "POST", "/batch", b"{}")
+                # The gateway committed first; the hook ran after it answered.
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(seen, [1])
+                self.assertEqual(fault.statuses, [201])
+
+    def test_a_cached_mark_replaces_the_data_source(self):
+        with loopback_server(200, body=b"{}") as (target, _):
+            with self.fault_proxy.FaultProxy(target) as proxy:
+                proxy.inject(
+                    self.fault_proxy.Fault(
+                        "GET", r"/backup", self.fault_proxy.MARK_CACHED, times=None
+                    )
+                )
+                first = self.exchange(proxy.url, "GET", "/backup?conditional=true")
+                second = self.exchange(proxy.url, "GET", "/backup")
+                other = self.exchange(proxy.url, "GET", "/proxies/p")
+        for status, headers, _ in (first, second):
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("X-Data-Source"), "cached")
+        self.assertNotIn("X-Data-Source", other[1])
+
+    def test_the_proxy_fronts_only_loopback_http(self):
+        for target in ("https://127.0.0.1:1", "http://example.com:80", "http://10.0.0.1:80"):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                self.fault_proxy.FaultProxy(target)
+
+    def test_the_proxy_never_logs_a_request(self):
+        source = (ROOT / "tests/lifecycle/fault_proxy.py").read_text(encoding="utf-8")
+        self.assertIn("def log_message", source)
+        self.assertNotIn("print(", source)
+
+    def test_every_fault_is_asserted_to_have_fired(self):
+        source = (ROOT / "tests/lifecycle/scenarios.py").read_text(encoding="utf-8")
+        start = source.index("def scenario_partial_failure_recovery(")
+        body = source[start : source.index("\n\n\nSCENARIOS", start)]
+        self.assertEqual(body.count("proxy.inject("), body.count("_fired(fault,"))
+        self.assertGreaterEqual(body.count("proxy.inject("), 5)
+        self.assertIn("ensure_deployed(harness)", body)
+        # Retries would let a fault's budget absorb a re-sent request.
+        self.assertIn('"FERRUM_GATEWAY_MAX_RETRIES": "0"', body)
+
+
 class RunbookTests(unittest.TestCase):
     def test_the_runner_fails_loudly_without_a_gateway(self):
         # A suite that silently certifies nothing is worse than one that is

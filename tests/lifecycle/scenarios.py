@@ -44,6 +44,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github" / "scripts"))
 import lifecycle_result  # noqa: E402  (path set above)
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fault_proxy  # noqa: E402  (path set above)
+
 
 NAMESPACE = "ferrum"
 ENVIRONMENT = "acceptance"
@@ -695,9 +698,237 @@ def scenario_credentials_generate_and_rotate(harness: Harness) -> str:
 
 
 def scenario_partial_failure_recovery(harness: Harness) -> str:
-    raise NotImplementedError(
-        "needs the fault-injecting proxy in front of the admin API; see "
-        "tests/lifecycle/README.md#injecting-failures"
+    ensure_deployed(harness)
+    with fault_proxy.FaultProxy(harness.gateway_url) as proxy:
+        evidence = [
+            _cached_backup_blocks_every_write(harness, proxy),
+            _refused_write_keeps_completed_work(harness, proxy),
+            _committed_create_answered_500_is_adopted(harness, proxy),
+            _dropped_batch_is_verified_not_replayed(harness, proxy),
+            _foreign_row_behind_a_dropped_create_stops_the_run(harness, proxy),
+        ]
+    # Every injected failure ends in the same place: the gateway holds exactly
+    # what the repository declares, recovered by an ordinary re-run.
+    ensure_deployed(harness)
+    harness.run("diff", "--exit-on-drift")
+    return "; ".join(evidence)
+
+
+def _through(proxy: fault_proxy.FaultProxy) -> dict[str, str]:
+    """`gitforgeops` overrides that route the admin API through the proxy."""
+    # No retries: a retried request would count against a fault's budget, and
+    # every safeguard asserted here must hold on the first answer.
+    return {"FERRUM_GATEWAY_URL": proxy.url, "FERRUM_GATEWAY_MAX_RETRIES": "0"}
+
+
+def _fired(fault: fault_proxy.Fault, what: str) -> None:
+    """A fault that never fired leaves the scenario having tested nothing."""
+    if fault.hits == 0:
+        raise ScenarioFailure(
+            f"the injected fault ({what}) never matched a request, so the "
+            "safeguard it targets was not exercised. This is a harness failure, "
+            "not a finding about gitforgeops."
+        )
+
+
+def _row(harness: Harness, path: str) -> dict | None:
+    """The gateway's row at `path`, read directly (never through the proxy)."""
+    status, _, body = _admin_exchange(harness, "GET", path)
+    if status == 404:
+        return None
+    if status != 200:
+        raise ScenarioFailure(
+            f"the harness's own GET {path} answered {status}. This is a harness "
+            "failure, not a finding about gitforgeops."
+        )
+    return json.loads(body)
+
+
+def _name(harness: Harness, path: str) -> str | None:
+    return (_row(harness, path) or {}).get("name")
+
+
+def _owned(harness: Harness, kind: str, identifier: str) -> bool:
+    """Is the row in the ownership ledger the last run left behind?"""
+    suffix = f":{NAMESPACE}:{kind}:{identifier}"
+    return any(key.endswith(suffix) for key in harness.state().get("resources", {}))
+
+
+def _upstream(identifier: str, name: str, harness: Harness) -> str:
+    backend = urllib.parse.urlsplit(harness.upstream_url)
+    return f"""
+        kind: Upstream
+        spec:
+          id: "{identifier}"
+          name: "{name}"
+          algorithm: round_robin
+          targets:
+            - host: "{backend.hostname}"
+              port: {backend.port}
+              weight: 1
+        """
+
+
+def _cached_backup_blocks_every_write(harness: Harness, proxy) -> str:
+    ensure_deployed(harness)
+    ledger = harness.state().get("resources")
+    edit_resource(harness, "proxies/orders.yaml", 'name: "Orders API"', 'name: "Orders API (cached)"')
+    fault = proxy.inject(
+        fault_proxy.Fault("GET", r"/backup", fault_proxy.MARK_CACHED, times=None)
+    )
+    refused = harness.run("apply", "--auto-approve", expect=1, **_through(proxy))
+    proxy.clear()
+    _fired(fault, "cached /backup")
+    if "cached" not in refused.stderr:
+        raise ScenarioFailure(
+            "apply against a cached /backup failed without naming the cached "
+            f"view\n{refused.stderr}"
+        )
+    if _name(harness, "/proxies/orders-proxy") != "Orders API":
+        raise ScenarioFailure("a plan read from a cached /backup still changed the proxy")
+    if harness.state().get("resources") != ledger:
+        raise ScenarioFailure("a refused cached-view apply changed the ownership ledger")
+    harness.run("apply", "--auto-approve")
+    if _name(harness, "/proxies/orders-proxy") != "Orders API (cached)":
+        raise ScenarioFailure("the re-run after a cached view did not apply the change")
+    return "a cached /backup blocked every write and the re-run applied it"
+
+
+def _refused_write_keeps_completed_work(harness: Harness, proxy) -> str:
+    # A fifth managed row to delete: one of five stays under the large-prune
+    # threshold, so the deferral below is the delete-deferral rule, not the guard.
+    ensure_deployed(harness)
+    retired = f"resources/{NAMESPACE}/upstreams/retired.yaml"
+    harness.write(retired, _upstream("retired-upstream", "Retired", harness))
+    harness.run("apply", "--auto-approve")
+    if not _owned(harness, "Upstream", "retired-upstream"):
+        raise ScenarioFailure("setup: the row to retire was not recorded as managed")
+
+    edit_resource(harness, "upstreams/orders.yaml", 'name: "Orders service"', 'name: "Orders service (refused)"')
+    edit_resource(harness, "proxies/orders.yaml", 'name: "Orders API"', 'name: "Orders API (partial)"')
+    harness.remove(retired)
+    fault = proxy.inject(
+        fault_proxy.Fault("PUT", r"/upstreams/orders-upstream", fault_proxy.REJECT, times=None)
+    )
+    failed = harness.run("apply", "--auto-approve", expect=None, **_through(proxy))
+    proxy.clear()
+    _fired(fault, "refused upstream PUT")
+    if failed.returncode == 0:
+        raise ScenarioFailure(f"apply reported success over a refused write\n{failed.stdout}")
+    if _name(harness, "/upstreams/orders-upstream") != "Orders service":
+        raise ScenarioFailure("a write the gateway refused is live anyway")
+    if _name(harness, "/proxies/orders-proxy") != "Orders API (partial)":
+        raise ScenarioFailure("an independent write that succeeded was not kept")
+    if _row(harness, "/upstreams/retired-upstream") is None:
+        raise ScenarioFailure("a delete ran in a namespace whose earlier write failed")
+    if not _owned(harness, "Upstream", "retired-upstream"):
+        raise ScenarioFailure("the deferred delete's row lost its ownership record")
+
+    harness.run("apply", "--auto-approve")
+    if _name(harness, "/upstreams/orders-upstream") != "Orders service (refused)":
+        raise ScenarioFailure("the re-run did not apply the write that was refused")
+    if _row(harness, "/upstreams/retired-upstream") is not None or _owned(
+        harness, "Upstream", "retired-upstream"
+    ):
+        raise ScenarioFailure("the re-run did not carry out the deferred delete")
+    return (
+        "a refused write kept the independent write that succeeded, deferred the "
+        "namespace's delete with its ownership intact, and the re-run finished both"
+    )
+
+
+def _committed_create_answered_500_is_adopted(harness: Harness, proxy) -> str:
+    # A Modify alongside the Add keeps the namespace mixed, so the create is a
+    # single POST rather than a `/batch`.
+    ensure_deployed(harness)
+    inventory = f"resources/{NAMESPACE}/upstreams/inventory.yaml"
+    harness.write(inventory, _upstream("inventory-upstream", "Inventory", harness))
+    edit_resource(harness, "proxies/orders.yaml", 'name: "Orders API"', 'name: "Orders API (mixed)"')
+    fault = proxy.inject(fault_proxy.Fault("POST", r"/upstreams", fault_proxy.COMMIT_THEN_500))
+    applied = harness.run("apply", "--auto-approve", **_through(proxy))
+    proxy.clear()
+    _fired(fault, "500 after a committed create")
+    if fault.statuses[0] not in (200, 201):
+        raise ScenarioFailure(
+            f"setup: the gateway answered the forwarded create {fault.statuses[0]}"
+        )
+    if "found the exact desired resource live" not in applied.stderr:
+        raise ScenarioFailure(f"the committed create was not verified as such\n{applied.stderr}")
+    if not _owned(harness, "Upstream", "inventory-upstream"):
+        raise ScenarioFailure("a create that committed behind a 500 was not recorded as managed")
+    if _name(harness, "/proxies/orders-proxy") != "Orders API (mixed)":
+        raise ScenarioFailure("the rest of the run did not continue after a verified create")
+    harness.remove(inventory)
+    harness.run("apply", "--auto-approve")
+    if _row(harness, "/upstreams/inventory-upstream") is not None:
+        raise ScenarioFailure("removing the adopted row's file did not delete it")
+    return (
+        "a create that committed behind a 500 was verified against an "
+        "authoritative backup, adopted without a replay and later pruned as managed"
+    )
+
+
+def _dropped_batch_is_verified_not_replayed(harness: Harness, proxy) -> str:
+    # Only additions: a pure-add namespace goes through one `POST /batch`.
+    ensure_deployed(harness)
+    catalog = f"resources/{NAMESPACE}/upstreams/catalog.yaml"
+    harness.write(catalog, _upstream("catalog-upstream", "Catalog", harness))
+    fault = proxy.inject(fault_proxy.Fault("POST", r"/batch", fault_proxy.COMMIT_THEN_DROP))
+    applied = harness.run("apply", "--auto-approve", **_through(proxy))
+    proxy.clear()
+    _fired(fault, "connection dropped after a committed /batch")
+    if "without replaying the batch" not in applied.stderr:
+        raise ScenarioFailure(f"the dropped batch was not verified as committed\n{applied.stderr}")
+    if not _owned(harness, "Upstream", "catalog-upstream"):
+        raise ScenarioFailure("a batch that committed behind a dropped connection was not recorded")
+    harness.run("diff", "--exit-on-drift")
+    harness.remove(catalog)
+    harness.run("apply", "--auto-approve")
+    return "a /batch whose answer was lost was verified live and recorded, never re-sent"
+
+
+def _foreign_row_behind_a_dropped_create_stops_the_run(harness: Harness, proxy) -> str:
+    ensure_deployed(harness)
+    billing = f"resources/{NAMESPACE}/upstreams/billing.yaml"
+    harness.write(billing, _upstream("billing-upstream", "Billing", harness))
+    edit_resource(harness, "proxies/orders.yaml", 'name: "Orders API"', 'name: "Orders API (withheld)"')
+    foreign = "Billing, as another writer left it"
+
+    def another_writer() -> None:
+        row = _row(harness, "/upstreams/billing-upstream")
+        if row is None:
+            raise ScenarioFailure("setup: the forwarded create did not commit")
+        _admin(harness, "PUT", "/upstreams/billing-upstream", {**row, "name": foreign})
+
+    fault = proxy.inject(
+        fault_proxy.Fault(
+            "POST", r"/upstreams", fault_proxy.COMMIT_THEN_DROP, after_commit=another_writer
+        )
+    )
+    stopped = harness.run("apply", "--auto-approve", expect=1, **_through(proxy))
+    proxy.clear()
+    _fired(fault, "connection dropped, row changed by another writer")
+    if "not the resource we sent" not in stopped.stderr:
+        raise ScenarioFailure(
+            f"an unprovable create did not stop the run as ambiguous\n{stopped.stderr}"
+        )
+    if _name(harness, "/upstreams/billing-upstream") != foreign:
+        raise ScenarioFailure("apply overwrote a row it could not prove it wrote")
+    if _owned(harness, "Upstream", "billing-upstream"):
+        raise ScenarioFailure("apply claimed ownership of a row it could not prove it wrote")
+    if _name(harness, "/proxies/orders-proxy") != "Orders API":
+        raise ScenarioFailure("writes after the ambiguous create were not withheld")
+
+    # The documented recovery: look at the diff, then re-run.
+    harness.run("diff", "--exit-on-drift", expect=2)
+    harness.run("apply", "--auto-approve")
+    if _name(harness, "/proxies/orders-proxy") != "Orders API (withheld)":
+        raise ScenarioFailure("the re-run did not apply the withheld write")
+    harness.remove(billing)
+    harness.run("apply", "--auto-approve")
+    return (
+        "a dropped create whose row another writer changed stopped the run "
+        "without overwriting or claiming it, and diff then re-run recovered"
     )
 
 

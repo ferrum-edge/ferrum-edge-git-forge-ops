@@ -17,11 +17,11 @@ revision can be published. The ids are declared once, in
 [`.github/scripts/lifecycle_result.py`](../../.github/scripts/lifecycle_result.py),
 and a test checks that this file lists each of them.
 
-The harness (`run.sh`) runs seven scenarios itself: `create-and-route`,
+The harness (`run.sh`) runs eight scenarios itself: `create-and-route`,
 `reapply-is-a-no-op`, `modify-and-delete-in-order`, `conditional-overwrite`,
-`conditional-full-replace`, `drift-monitoring` and `file-and-mesh-boundary`.
-The other six always record
-`skipped` and are exercised by hand (see below).
+`conditional-full-replace`, `partial-failure-recovery`, `drift-monitoring` and
+`file-and-mesh-boundary`. The other five always record `skipped` and are
+exercised by hand (see below).
 
 | Scenario | Question it answers |
 | --- | --- |
@@ -42,11 +42,10 @@ The other six always record
 ### `skipped` is not `passed`
 
 Five scenarios need a disposable GitHub repository, which the suite cannot
-create, and `partial-failure-recovery` needs a fault-injecting proxy. The
-harness records all six as `skipped` with the reason. **A skipped scenario
-never certifies anything**: the release gate refuses it exactly as it refuses a
-failure. Exercise them by hand ([GitHub half](#the-github-repository-half),
-[injecting failures](#injecting-failures)) and submit the outcomes as an
+create. The harness records them as `skipped` with the reason. **A skipped
+scenario never certifies anything**: the release gate refuses it exactly as it
+refuses a failure. Exercise them by hand
+([GitHub half](#the-github-repository-half)) and submit the outcomes as an
 attestation to a dispatched acceptance run for the release revision.
 
 ---
@@ -171,17 +170,29 @@ keep that log off CI.
 
 ## Injecting failures
 
-`partial-failure-recovery` needs the admin API to misbehave on demand: a 500
-after a commit, a connection dropped mid-response, an `X-Data-Source: cached`
-header on `/backup`. No fault injector ships with this repository, and the
-harness does not drive this scenario; it always records `skipped`.
+`partial-failure-recovery` needs the admin API to misbehave on demand.
+[`fault_proxy.py`](fault_proxy.py) is a standard-library reverse proxy the
+scenario starts on loopback in front of the real gateway. It forwards every
+request unchanged except the ones a fault names, and it never logs a request
+line or header (forwarded requests carry the admin token). The scenario routes
+only its faulted `gitforgeops apply` runs through it, with
+`FERRUM_GATEWAY_MAX_RETRIES=0`, and reads the gateway directly to judge the
+outcome. Each case starts from `ensure_deployed` and ends with an ordinary
+re-run that must converge:
 
-To exercise it, put your own fault-injecting reverse proxy between
-`gitforgeops` and a disposable gateway, and run `gitforgeops apply` through it
-by hand. Check the *safeguards*, not the fault: successful work is preserved,
-ownership is recorded for what actually committed, and an ambiguous outcome
-stops the run instead of being retried blindly. Record the outcome with
-`lifecycle_result.py record`, as for the GitHub scenarios below.
+| Case | Injected | Safeguard asserted |
+| --- | --- | --- |
+| cached view | every `GET /backup` flagged `X-Data-Source: cached` | apply exits 1 naming the cached view; no row or ledger entry changes |
+| refused write | `PUT /upstreams/orders-upstream` answered 500 without forwarding | the independent proxy write is kept, the namespace's delete is deferred with its ownership record intact, apply exits nonzero |
+| committed create, 500 | `POST /upstreams` forwarded, then answered 500 | the authoritative backup proves the exact row live; ownership is asserted without replaying the create, recorded, and later pruned as managed |
+| lost `/batch` answer | `POST /batch` forwarded, then the connection closed unanswered | the whole batch is verified live and recorded, never re-sent |
+| foreign row | `POST /upstreams` forwarded, another writer changes the row, then the connection closed | `AmbiguousMutation` stops the run: the row is neither overwritten nor claimed and later writes are withheld; `diff` reports drift and a re-run recovers |
+
+Each fault counts the requests it caught, and a fault that never fired fails
+the scenario as a harness failure, so a renamed endpoint cannot turn the
+scenario into a vacuous pass. Process interruption (SIGKILL, runner loss) and
+its ledger recovery stay with `runner-interruption`, which needs the GitHub
+half.
 
 ---
 
