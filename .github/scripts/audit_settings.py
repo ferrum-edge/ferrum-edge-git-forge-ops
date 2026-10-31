@@ -879,7 +879,8 @@ def main() -> int:
         action="store_true",
         help=(
             "audit the template repository customers copy: skip the state-writer "
-            "App bypass and protected-environment requirements, audit everything else"
+            "App bypass, the protected-environment requirement and unattended "
+            "drift monitoring coverage, audit everything else"
         ),
     )
     args = parser.parse_args()
