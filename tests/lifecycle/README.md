@@ -187,7 +187,7 @@ converge:
 | cached view | every `GET /backup` flagged `X-Data-Source: cached` | apply exits 1 naming the cached view; no row or ledger entry changes |
 | refused write | `PUT /upstreams/orders-upstream` answered 500 without forwarding | the independent proxy update and a new upstream are kept, and the failing run records the new upstream's ownership; the namespace's delete is never sent and its ownership record stays; apply exits nonzero |
 | committed create, 500 | `POST /upstreams` forwarded, then answered 500 | the authoritative backup proves the exact row live; one POST and one ownership PUT are sent, and the row is recorded and later pruned as managed |
-| lost `/batch` answer | `POST /batch` forwarded, then the connection closed unanswered | the whole batch is verified live and recorded; one `POST /batch` and no per-resource create are sent |
+| lost `/batch` answer | a two-row `POST /batch` forwarded, then the connection closed unanswered | both rows are verified live and recorded; one `POST /batch`, one ownership PUT per row and no per-resource create are sent; both are later pruned as managed |
 | foreign row | `POST /upstreams` forwarded, another writer changes the row, then the connection closed | `AmbiguousMutation` stops the run: one POST, no write to the row, no ownership claim, and the later proxy write withheld; `diff` reports drift and a re-run recovers |
 
 A fault that never fired, a failing `after_commit` hook, or a proxy error fails

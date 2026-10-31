@@ -190,7 +190,9 @@ class FaultProxy:
 
         self._server = _QuietServer(("127.0.0.1", 0), Handler)
         self._server.proxy = self  # type: ignore[attr-defined]
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
 
     @property
     def url(self) -> str:

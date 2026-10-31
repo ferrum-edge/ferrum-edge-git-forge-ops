@@ -699,6 +699,9 @@ def scenario_credentials_generate_and_rotate(harness: Harness) -> str:
 
 
 def scenario_partial_failure_recovery(harness: Harness) -> str:
+    # Register the consumer key for redaction even when this scenario runs
+    # alone (`LIFECYCLE_ONLY`): failure details embed captured apply output.
+    harness_key(harness)
     ensure_deployed(harness)
     with fault_proxy.FaultProxy(harness.gateway_url) as proxy:
         evidence = [
@@ -923,23 +926,39 @@ def _committed_create_answered_500_is_adopted(harness: Harness, proxy) -> str:
 
 
 def _dropped_batch_is_verified_not_replayed(harness: Harness, proxy) -> str:
-    # Only additions: a pure-add namespace goes through one `POST /batch`.
+    # Only additions: a pure-add namespace goes through one `POST /batch`. Two
+    # rows, so verifying or claiming only the first of a chunk cannot pass.
     ensure_deployed(harness)
-    catalog = f"resources/{NAMESPACE}/upstreams/catalog.yaml"
-    harness.write(catalog, _upstream("catalog-upstream", "Catalog", harness))
+    added = {
+        "catalog-upstream": f"resources/{NAMESPACE}/upstreams/catalog.yaml",
+        "pricing-upstream": f"resources/{NAMESPACE}/upstreams/pricing.yaml",
+    }
+    for identifier, relative in added.items():
+        harness.write(relative, _upstream(identifier, identifier, harness))
     fault = proxy.inject(fault_proxy.Fault("POST", r"/batch", fault_proxy.COMMIT_THEN_DROP))
     applied, seen = _faulted_apply(
         harness, proxy, fault, "connection dropped after a committed /batch", expect=0
     )
     _expect_sent(seen, "POST", r"/batch", 1, "an ambiguous batch is never replayed")
     _expect_sent(seen, "POST", r"/upstreams", 0, "nor replayed as individual creates")
+    for identifier in added:
+        _expect_sent(seen, "PUT", f"/upstreams/{identifier}", 1, "one ownership assertion per row")
     if "without replaying the batch" not in applied.stderr:
         raise ScenarioFailure(f"the dropped batch was not verified as committed\n{applied.stderr}")
-    if not _owned(harness, "Upstream", "catalog-upstream"):
-        raise ScenarioFailure("a batch that committed behind a dropped connection was not recorded")
+    for identifier in added:
+        if not _owned(harness, "Upstream", identifier):
+            raise ScenarioFailure(
+                f"{identifier}, committed in a batch behind a dropped connection, was not recorded"
+            )
     harness.run("diff", "--exit-on-drift")
-    harness.remove(catalog)
-    harness.run("apply", "--auto-approve")
+    # Two of six managed rows is over the large-prune threshold; the guard is
+    # asserted in `modify-and-delete-in-order`.
+    for relative in added.values():
+        harness.remove(relative)
+    harness.run("apply", "--auto-approve", "--allow-large-prune")
+    for identifier in added:
+        if _row(harness, f"/upstreams/{identifier}") is not None:
+            raise ScenarioFailure(f"removing {identifier}'s file did not delete the recorded row")
     return "a /batch whose answer was lost was verified live and recorded, never re-sent"
 
 
@@ -986,6 +1005,8 @@ def _foreign_row_behind_a_dropped_create_stops_the_run(harness: Harness, proxy) 
         raise ScenarioFailure("the re-run did not apply the withheld write")
     harness.remove(billing)
     harness.run("apply", "--auto-approve")
+    if _row(harness, "/upstreams/billing-upstream") is not None:
+        raise ScenarioFailure("the recovered row was not managed: removing its file did not delete it")
     return (
         "a dropped create whose row another writer changed stopped the run "
         "without overwriting or claiming it, and diff then re-run recovered"
