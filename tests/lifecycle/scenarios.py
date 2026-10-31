@@ -713,9 +713,11 @@ def scenario_partial_failure_recovery(harness: Harness) -> str:
                 _foreign_row_behind_a_dropped_create_stops_the_run(harness, proxy),
             ]
     finally:
-        # A case that failed midway leaves its extra file behind; the next
-        # scenario's `ensure_deployed` re-seeds only the base tree, so remove
-        # them here and let its apply prune whatever they created.
+        # A case that failed midway leaves its extra file behind, and the next
+        # scenario's `ensure_deployed` re-seeds only the base tree. Removing
+        # them lets that apply prune the rows the ledger owns; an unowned one
+        # (the foreign row, if its case failed early) stays, as shared mode
+        # requires, and the suite is already failed.
         for name in CASE_UPSTREAMS:
             harness.remove(f"resources/{NAMESPACE}/upstreams/{name}.yaml")
     # Every injected failure ends in the same place: the gateway holds exactly
@@ -842,7 +844,7 @@ def _upstream(identifier: str, name: str, harness: Harness) -> str:
 
 def _cached_backup_blocks_every_write(harness: Harness, proxy) -> str:
     ensure_deployed(harness)
-    ledger = harness.state().get("resources")
+    ledger = {key: harness.state().get(key) for key in ("resources", "pending_creates")}
     edit_resource(harness, "proxies/orders.yaml", 'name: "Orders API"', 'name: "Orders API (cached)"')
     fault = proxy.inject(
         fault_proxy.Fault("GET", r"/backup", fault_proxy.MARK_CACHED, times=None)
@@ -858,7 +860,7 @@ def _cached_backup_blocks_every_write(harness: Harness, proxy) -> str:
         )
     if _name(harness, "/proxies/orders-proxy") != "Orders API":
         raise ScenarioFailure("a plan read from a cached /backup still changed the proxy")
-    if harness.state().get("resources") != ledger:
+    if {key: harness.state().get(key) for key in ledger} != ledger:
         raise ScenarioFailure("a refused cached-view apply changed the ownership ledger")
     harness.run("apply", "--auto-approve")
     if _name(harness, "/proxies/orders-proxy") != "Orders API (cached)":
@@ -940,6 +942,8 @@ def _committed_create_answered_500_is_adopted(harness: Harness, proxy) -> str:
         raise ScenarioFailure("a create that committed behind a 500 was not recorded as managed")
     if _name(harness, "/proxies/orders-proxy") != "Orders API (mixed)":
         raise ScenarioFailure("the rest of the run did not continue after a verified create")
+    # The adopted row is the declared one, field for field.
+    harness.run("diff", "--exit-on-drift")
     harness.remove(inventory)
     harness.run("apply", "--auto-approve")
     if _row(harness, "/upstreams/inventory-upstream") is not None:

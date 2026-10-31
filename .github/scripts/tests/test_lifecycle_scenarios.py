@@ -860,19 +860,28 @@ class FaultProxyTests(unittest.TestCase):
                         "POST", r"/batch", self.fault_proxy.COMMIT_THEN_DROP, after_commit=release.wait
                     )
                 )
-                worker = threading.Thread(
-                    target=lambda: self.assertRaises(
-                        Exception, self.exchange, proxy.url, "POST", "/batch", b"{}"
-                    ),
-                    daemon=True,
-                )
+                outcome = []
+
+                def client():
+                    try:
+                        self.exchange(proxy.url, "POST", "/batch", b"{}")
+                        outcome.append("answered")
+                    except Exception:  # noqa: BLE001 - the dropped connection
+                        outcome.append("dropped")
+
+                worker = threading.Thread(target=client, daemon=True)
                 worker.start()
-                while not proxy.requests():
+                for _ in range(500):
+                    if proxy.requests():
+                        break
                     release.wait(0.01)
+                self.assertEqual(proxy.requests(), [("POST", "/batch")])
                 proxy.drain(timeout=0.2)
                 self.assertEqual(proxy.failures, ["handler still running"])
                 release.set()
                 worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(outcome, ["dropped"])
 
     def test_a_hook_raising_another_type_is_a_failure_not_a_skip(self):
         fault = self.fault_proxy.Fault("POST", r"/upstreams", self.fault_proxy.COMMIT_THEN_DROP)

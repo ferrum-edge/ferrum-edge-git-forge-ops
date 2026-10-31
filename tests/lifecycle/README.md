@@ -184,7 +184,7 @@ converge:
 
 | Case | Injected | Safeguard asserted |
 | --- | --- | --- |
-| cached view | every `GET /backup` flagged `X-Data-Source: cached` | apply exits 1 naming the cached view; no row or ledger entry changes |
+| cached view | every `GET /backup` flagged `X-Data-Source: cached` | apply exits 1 naming the cached view; only reads are sent; no row, ownership record or pending-create entry changes |
 | refused write | `PUT /upstreams/orders-upstream` answered 500 without forwarding | the independent proxy update and a new upstream are kept, and the failing run records the new upstream's ownership; the namespace's delete is never sent and its ownership record stays; apply exits nonzero |
 | committed create, 500 | `POST /upstreams` forwarded, then answered 500 | the authoritative backup proves the exact row live; one POST and one ownership PUT are sent, and the row is recorded and later pruned as managed |
 | lost `/batch` answer | a two-row `POST /batch` forwarded, then the connection closed unanswered | both rows are verified live and recorded; one `POST /batch`, one ownership PUT per row and no per-resource create are sent; both are later pruned as managed |
@@ -195,8 +195,8 @@ has finished (`FaultProxy.drain`); the client can exit first. A fault that never
 fired, a failing hook, a proxy error or a handler that does not finish then
 fails the scenario as a harness failure before the exit code is judged, so a
 renamed endpoint or a broken harness cannot produce a vacuous pass. Files a
-case added are removed even when it fails, and the next scenario's apply prunes
-their rows. Process interruption (SIGKILL, runner loss) and
+case added are removed even when it fails, so the next scenario's apply prunes
+the rows the ledger owns; shared mode leaves an unowned one in place. Process interruption (SIGKILL, runner loss) and
 its ledger recovery stay with `runner-interruption`, which needs the GitHub
 half.
 
