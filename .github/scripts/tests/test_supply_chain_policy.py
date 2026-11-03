@@ -23,6 +23,7 @@ SPEC.loader.exec_module(check_supply_chain)
 CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",  # v2.87.29
     "taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177",  # v2.87.30
+    "taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68",  # v2.88.1
 )
 REJECTED_CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",  # retired v2.87.27
@@ -8007,6 +8008,20 @@ class Issue562PinnedFormTests(unittest.TestCase):
         self.assertTrue(any("may not drop below" in item for item in violations), violations)
         raised = self._with_floor(check_supply_chain.COVERAGE_LINE_FLOOR + 5)
         self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(raised), [])
+
+    def test_coverage_install_action_release_comment_follows_the_pin(self):
+        reviewed = self._workflow("rust-ci.yml")
+        bumped = re.sub(
+            r"(taiki-e/install-action@)[0-9a-f]{40} # v\d+\.\d+\.\d+",
+            r"\g<1>68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1",
+            reviewed,
+        )
+        self.assertNotEqual(bumped, reviewed)
+        self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(bumped), [])
+        # Only a release tag is masked; other text after the pin still counts.
+        suffixed = bumped.replace("# v2.88.1", "# v2.88.1; run: true", 1)
+        self.assertNotEqual(suffixed, bumped)
+        self.assertTrue(check_supply_chain.rust_ci_test_scope_violations(suffixed))
 
     def test_coverage_job_is_pinned_against_decoys(self):
         reviewed = self._workflow("rust-ci.yml")

@@ -2,13 +2,13 @@
   "$schema": "https://github.com/ferrum-edge/ferrum-contracts/schemas/vocabulary-plugin-catalog/v1.schema.json",
   "vocabulary": "plugin-catalog",
   "version": 1,
-  "edge_release": "v0.9.19",
-  "description": "Index of every built-in Ferrum Edge plugin at v0.9.19: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
+  "edge_release": "v0.9.20",
+  "description": "Index of every built-in Ferrum Edge plugin at v0.9.20: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
   "provenance": [
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.19",
-      "commit": "510ce7121c3d9754110d330a30a3bd9b7a7b278e",
+      "ref": "v0.9.20",
+      "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
       "path": "src/plugins/mod.rs",
       "symbols": [
         "BUILTIN_PLUGIN_REGISTRATIONS",
@@ -23,8 +23,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.19",
-      "commit": "510ce7121c3d9754110d330a30a3bd9b7a7b278e",
+      "ref": "v0.9.20",
+      "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
       "path": "src/plugins/builtin_parity.rs",
       "symbols": [
         "BUILTIN_PLUGIN_PARITY_META",
@@ -43,8 +43,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.19",
-      "commit": "510ce7121c3d9754110d330a30a3bd9b7a7b278e",
+      "ref": "v0.9.20",
+      "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
       "path": "openapi.yaml",
       "symbols": [
         "components.schemas.PluginConfigBase"
@@ -52,15 +52,15 @@
       "fields": [
         "config_schema"
       ],
-      "note": "v0.9.19 retains the 82 registered types, removed names and PluginConfigBase pointers. Configuration components include the production-launch plugin hardening, multi-location key_auth, SPIFFE forwarding, external-identity access rules, telemetry redaction, resource bounds and plugin association preconditions documented in the owner upgrade guide. Registration failure policy and parity metadata are transcribed from the same tag; referenced config schemas are not copied here."
+      "note": "v0.9.19 retains the 82 registered types, removed names and PluginConfigBase pointers. Configuration components include the production-launch plugin hardening, multi-location key_auth, SPIFFE forwarding, external-identity access rules, telemetry redaction, resource bounds and plugin association preconditions documented in the owner upgrade guide. Registration failure policy and parity metadata are transcribed from the same tag; referenced config schemas are not copied here. v0.9.20 retains the 82 registered types, removed names, registration failure policies, parity metadata and every PluginConfigBase pointer, config-required and scope conditional; src/plugins/builtin_parity.rs and the PluginConfigBase block are byte-identical to v0.9.19. Referenced configuration components close nested objects (Edge #6967 and #6972, issue #6616): MeshAuthzPolicyScope variants and target_refs attachments reject unknown members, and each attachment requires name, plus namespace on service and gateway kinds and no namespace on gateway_class; MeshAuthzConfig node_waypoint_route_upstreams entries and targets are closed; WorkloadMetricsConfig metrics, tag_overrides entries and their operation, direction_emit and tracing provider envelopes and config are closed, with operation members exclusive to their type and set_expr requiring exactly one of cel and expression. Built-in plugins now declare the always-dispatched lifecycle hooks they implement (Edge #6975, issue #6615); the catalog's active_phases already agree with every declaration and gain no field."
     }
   ],
   "config_schema_document": {
     "repo": "ferrum-edge/ferrum-edge",
-    "ref": "v0.9.19",
-    "commit": "510ce7121c3d9754110d330a30a3bd9b7a7b278e",
+    "ref": "v0.9.20",
+    "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
     "path": "openapi.yaml",
-    "sha256": "610e2645961e7a5deca73468439be9c4a5b7070045099506c212a0a36b045e90",
+    "sha256": "8fa7232d96e1094578dee03cfa1966a4fdd9df77b8e027a9625f56ce6bfd355e",
     "openapi": "3.1.0",
     "note": "Each config_schema.pointer is a JSON Pointer into this exact file. The schemas are OpenAPI 3.1 (JSON Schema 2020-12 dialect) and may $ref other components in the same document. They apply to `config` only when the plugin config is enabled. They are referenced, not copied, in this release; see docs/adoption.md (follow-ups)."
   },

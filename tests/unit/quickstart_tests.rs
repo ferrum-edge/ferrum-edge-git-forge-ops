@@ -272,8 +272,8 @@ fn the_guide_names_shipped_doctor_commands_and_local_tool_prerequisites() {
     assert!(guide.contains("gitforgeops doctor --scope all --env production"));
     assert!(guide.contains("README: Setup doctor"));
     assert!(guide.contains("FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge"));
-    assert!(guide.contains("v0.9.19 binary"));
-    assert!(guide.contains("446e5aa4a85f03bc33a4cd2d618904a676ecf06f657954dca5b67a9563dec818"));
+    assert!(guide.contains("v0.9.20 binary"));
+    assert!(guide.contains("9d357a41ae61cf85d697f01c84beff15f2b8af8bcfd70dd1c50f32397fee66ac"));
     assert!(guide.contains("Install `age`"));
     assert!(guide.contains("install `python3`"));
     assert!(guide.contains("gitforgeops-required-static-validation"));

@@ -98,7 +98,7 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.write_record(record)
         issues = check_release_baseline.check(self.root)
         self.assertIn(
-            "the first baseline must name the verified v0.9.19 validator",
+            "the first baseline must name the verified v0.9.20 validator",
             issues,
         )
 
@@ -112,20 +112,20 @@ class ReleaseBaselineTests(unittest.TestCase):
 
     def test_former_allowlisted_pairing_does_not_certify_the_new_baseline(self):
         record = self.record()
-        previous_pin = "0540ba760639bea61b93d0ffb34055fb0df8e4cd6db4550064d12cda87782b9e"
-        previous_image = "sha256:f8942bed8d3b77c257d7266c9227450dd3d8c139759a07c47d060521a5fd41d1"
-        record["validator"]["version"] = "v0.9.17"
+        previous_pin = "446e5aa4a85f03bc33a4cd2d618904a676ecf06f657954dca5b67a9563dec818"
+        previous_image = "sha256:0e2ed6d720cbc474e29cfa6bcd3945db010674d69988e2bd795a26399c3cb80e"
+        record["validator"]["version"] = "v0.9.19"
         record["validator"]["sha256"] = previous_pin
-        record["tested_gateway"]["version"] = "v0.9.17"
+        record["tested_gateway"]["version"] = "v0.9.19"
         record["tested_gateway"]["binary_sha256"] = previous_pin
         record["tested_gateway"]["image_digest"] = previous_image
         self.write_record(record)
         (self.root / "Dockerfile").write_text(
-            f"FROM ferrumedge/ferrum-edge:v0.9.17@{previous_image} AS ferrum-edge\n"
+            f"FROM ferrumedge/ferrum-edge:v0.9.19@{previous_image} AS ferrum-edge\n"
         )
         self.assertEqual(
             check_release_baseline.check(self.root),
-            ["the first baseline must name the verified v0.9.19 validator"],
+            ["the first baseline must name the verified v0.9.20 validator"],
         )
 
     def test_quickstart_must_require_a_supported_record(self):
