@@ -17,9 +17,9 @@ live operations.
 Shared contracts live in [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts); see
 [README.md's Contracts section](README.md#contracts) for the vendored pin and update rule.
 
-The 13 adopted files are pinned to published `contracts-edge-0.9.19` at
-`d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`, with Edge v0.9.19 provenance at
-`510ce7121c3d9754110d330a30a3bd9b7a7b278e`. Adoption covers only the GitForgeOps
+The 13 adopted files are pinned to published `contracts-edge-0.9.20` at
+`39da322083044c2e92617209e62983c92387f0ad`, with Edge v0.9.20 provenance at
+`e4a606a00352674daaef08636e3e359e6c48ba18`. Adoption covers only the GitForgeOps
 resource-envelope schema, its ten fixtures, and the plugin-catalog and
 `provisioned-by` vocabularies. Retain upstream preparation prose verbatim; the
 [contracts guide](docs/contracts.md) distinguishes actual publication from metadata
@@ -463,7 +463,7 @@ namespace payload is built before the first mutation.
   proxies the plan accounts for referencing the plugin — and an Edge build
   with ferrum-edge#6744 checks it atomically with the write under the same
   lease (issue #569), answering `412` for a referencing proxy outside that set
-  (kept target aside). The pinned Edge v0.9.19 includes #6744 and refuses a
+  (kept target aside). The pinned Edge v0.9.20 includes #6744 and refuses a
   write without the parameter (`400`); released Edge up to v0.9.17 ignores it,
   so `refuse_unplanned_references` also stays (issue #603): before a plugin
   delete, and before an update changing the planned `scope`/`proxy_id` to
@@ -471,7 +471,7 @@ namespace payload is built before the first mutation.
   refuses when a referencing proxy is not in the plan's live view, not
   declared, and not the kept target. Both surface as
   `Error::UnplannedPluginReference` (withholds like `StalePlan`). Keep the
-  re-read until hosted lifecycle qualification of the exact v0.9.19 build
+  re-read until hosted lifecycle qualification of the exact v0.9.20 build
   (the intended minimum supported release) is recorded; the client cannot
   detect a gateway that ignores the parameter.
 
