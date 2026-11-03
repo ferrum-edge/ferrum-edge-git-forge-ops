@@ -8,15 +8,15 @@
     "image_digest": null
   },
   "validator": {
-    "version": "v0.9.19",
+    "version": "v0.9.20",
     "asset": "ferrum-edge-linux-x86_64",
-    "sha256": "446e5aa4a85f03bc33a4cd2d618904a676ecf06f657954dca5b67a9563dec818"
+    "sha256": "9d357a41ae61cf85d697f01c84beff15f2b8af8bcfd70dd1c50f32397fee66ac"
   },
   "tested_gateway": {
-    "version": "v0.9.19",
-    "binary_sha256": "446e5aa4a85f03bc33a4cd2d618904a676ecf06f657954dca5b67a9563dec818",
+    "version": "v0.9.20",
+    "binary_sha256": "9d357a41ae61cf85d697f01c84beff15f2b8af8bcfd70dd1c50f32397fee66ac",
     "image": "docker.io/ferrumedge/ferrum-edge",
-    "image_digest": "sha256:0e2ed6d720cbc474e29cfa6bcd3945db010674d69988e2bd795a26399c3cb80e"
+    "image_digest": "sha256:32a0b0574bb2ed105d315888fab12e33242e1cec3ae9f1ae34c1fb4d0c9a2689"
   },
   "lifecycle": {
     "run_url": null
