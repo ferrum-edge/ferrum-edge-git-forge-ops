@@ -3,38 +3,39 @@
 GitForgeOps pins the shared Ferrum contracts release in
 [`contracts/ferrum-contracts/PIN`](../contracts/ferrum-contracts/PIN). The vendored plugin
 catalog, `provisioned-by` vocabulary, GitForgeOps resource-envelope fixtures, and the
-GitForgeOps-owned resource schema are byte-for-byte copies from `contracts-edge-0.9.19`. The
+GitForgeOps-owned resource schema are byte-for-byte copies from `contracts-edge-0.9.20`. The
 contract test verifies every file's SHA-256, checks that the pinned Edge version maps to the
 contracts tag and appears in the validator checksum allowlist, compares plugin names and
 priorities plus retired and reserved names with the local catalog, checks the assembler's
 `provisioned-by` label, parses valid and invalid resource fixtures with the local `Resource` serde
 type, and checks the schema's top-level envelope against that type.
 
-The published [contracts-edge-0.9.19 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.19)
-resolves to `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`. It was published on
-2026-10-27 at 08:27:10 UTC. Its Edge vocabulary provenance identifies published
-Edge v0.9.19 at `510ce7121c3d9754110d330a30a3bd9b7a7b278e`; the plugin catalog
+The published [contracts-edge-0.9.20 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.20)
+is an annotated tag (`82b277b495e73cfadfacb6f3123de02a984658e4`) that resolves to commit
+`39da322083044c2e92617209e62983c92387f0ad`. It was published on
+2026-11-03 at 09:34:12 UTC. Its Edge vocabulary provenance identifies published
+Edge v0.9.20 at `e4a606a00352674daaef08636e3e359e6c48ba18`; the plugin catalog
 pins that source's `openapi.yaml` SHA-256 to
-`610e2645961e7a5deca73468439be9c4a5b7070045099506c212a0a36b045e90`.
-Edge v0.9.18 was tagged but never published, so there is no `contracts-edge-0.9.18`.
+`8fa7232d96e1094578dee03cfa1966a4fdd9df77b8e027a9625f56ce6bfd355e`.
 The resource schema and all ten fixtures are unchanged from the previous pin.
 
-The release does not change adopted schema wire rules. Only the two vocabularies change.
-In the plugin catalog, `ai_token_metrics` moves from priority 4100 to 4070, and the
-local catalog follows it. Other catalog changes are to fields GitForgeOps does not
-carry: `stdout_logging`'s registration failure policy, active phases,
-`request_transformer`'s WebSocket handshake protocol surface, and the
-`openapi_validator` proxy scope constraint. Operators should review the Edge
-[0.9.19 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919)
-before rollout; several plugin configurations that v0.9.17 accepted are now refused.
+The release does not change adopted schema wire rules. Only the two vocabularies change,
+and only in their Edge release, provenance refs and commits, the `openapi.yaml` digest and
+the catalog note. Every plugin entry, priority, phase, failure policy, retired and reserved
+name is unchanged, so the local catalog does not move. The note records that v0.9.20 closes
+nested plugin-config objects (`mesh_authz` scopes and attachments, `workload_metrics`
+providers, metrics and `tag_overrides`) and that built-in plugins now declare their
+lifecycle hooks; GitForgeOps carries none of those fields. Operators should review the Edge
+[0.9.20 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/e4a606a00352674daaef08636e3e359e6c48ba18/docs/upgrade_guide.md#upgrading-to-0920)
+before rollout; nested unknown keys that v0.9.19 ignored are now refused.
 Other new contract surfaces remain outside this repository's adopted scope.
 
-The previous pin was the published [contracts-edge-0.9.15 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.15),
-which resolves to `6fb64c5dc2e014204c17609fc717d976f3b4589e`, with Edge v0.9.15 provenance
-at `25b37395ff61bfea0f3ffd189d9011c4984fa755`. `contracts-edge-0.9.17` was never adopted.
+The previous pin was the published [contracts-edge-0.9.19 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.19),
+which resolves to `d96b0292a0f87647f7552f25e0e5ce1b4ae30f8b`, with Edge v0.9.19 provenance
+at `510ce7121c3d9754110d330a30a3bd9b7a7b278e`.
 
 The attribution vocabulary keeps its values from the prior pin; its Edge release and
-source metadata now identify v0.9.19. Attribution still grants no ownership or
+source metadata now identify v0.9.20. Attribution still grants no ownership or
 authorization.
 
 This repository vendors only the resource schema, its fixtures and the two

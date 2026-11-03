@@ -7,6 +7,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Move #266's pending first-release pairing to published Ferrum Edge v0.9.20
+  (`e4a606a00352674daaef08636e3e359e6c48ba18`), which became GitHub's latest
+  release and stopped every validating workflow at the checksum allowlist. The
+  verified x86_64 validator joins the allowlist (older lines stay), and the
+  release record, baseline check, Dockerfile gateway image index, quickstart,
+  example config and candidate documentation now name it together. Vendored
+  Contracts move to `contracts-edge-0.9.20`; only vocabulary provenance and the
+  catalog note change, so the local catalog does not move. v0.9.20 closes
+  nested plugin-config and mesh Telemetry objects and adds
+  `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS`; neither changes a resource or
+  admin surface GitForgeOps uses. The client-side reference re-read (#603)
+  stays until the exact v0.9.20 build is qualified. Supported status,
+  publication fields and all exact-revision lifecycle acceptance remain
+  pending.
 - Move #266's pending first-release pairing to published Ferrum Edge v0.9.19
   (`510ce7121c3d9754110d330a30a3bd9b7a7b278e`; v0.9.18 was tagged but never
   published), refreshing the stale-validator canary (#626) in the same change.

@@ -324,7 +324,7 @@ capability refuses the operation that needs it. Ordinary diff, plan, review and
 viewer drift reads retain their current endpoints and explain these runtime
 requirements. The conditional API owner contract was published at Edge
 `c764084b3b51c3f7ffde268c039688d35e49c553`. The current candidate gateway is
-published v0.9.19, with exact binary and image pins in the
+published v0.9.20, with exact binary and image pins in the
 [pending release record](../release/baseline.json); GitForgeOps enforcement
 qualification against those bytes remains required before release acceptance.
 Edge operator changes to review:
@@ -333,10 +333,13 @@ Edge operator changes to review:
 `FERRUM_PLUGIN_SECRET_<NAME>`),
 [v0.9.17](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917)
 (namespace-bounded admin tokens; cached admin misses report unavailable rather
-than deleted) and
+than deleted),
 [v0.9.19](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919)
 (refuses several plugin configurations v0.9.17 accepted; requires
-`expected_proxy_ids` on PluginConfig writes).
+`expected_proxy_ids` on PluginConfig writes) and
+[v0.9.20](https://github.com/ferrum-edge/ferrum-edge/blob/e4a606a00352674daaef08636e3e359e6c48ba18/docs/upgrade_guide.md#upgrading-to-0920)
+(plugin configs reject unknown keys in nested objects; stalled proxy clients
+are cut after `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS`).
 
 **Proxies and their plugins.** Ferrum Edge rewrites a proxy's association list
 itself when a scoped plugin is created, retargeted or removed. A proxy this
@@ -399,12 +402,12 @@ detaches it.
 The re-read alone only narrows the race: a proxy that attaches the plugin
 between that read and the write is detached unless the gateway enforces
 `expected_proxy_ids`, which closes the interval (issue #569). The pinned
-Ferrum Edge v0.9.19 includes ferrum-edge#6744 and refuses a PluginConfig
-update or delete that omits the parameter. Released builds up to and including
+Ferrum Edge v0.9.20 includes ferrum-edge#6744 (first published in v0.9.19)
+and refuses a PluginConfig update or delete that omits the parameter. Released builds up to and including
 v0.9.17 do not include that precondition and ignore the parameter. The client
 cannot tell whether the target gateway enforces it, so the re-read runs on
 every such write (issue #603). It stays until hosted lifecycle qualification
-of the exact v0.9.19 build is recorded.
+of the exact v0.9.20 build is recorded.
 
 ## Ordering between runs
 
