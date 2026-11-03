@@ -8011,15 +8011,18 @@ class Issue562PinnedFormTests(unittest.TestCase):
 
     def test_coverage_install_action_release_comment_follows_the_pin(self):
         reviewed = self._workflow("rust-ci.yml")
+        # A release no workflow pins, so the bump differs whatever the
+        # reviewed workflow currently uses. Only the masked form is compared;
+        # the pin itself is judged by other rules.
         bumped = re.sub(
             r"(taiki-e/install-action@)[0-9a-f]{40} # v\d+\.\d+\.\d+",
-            r"\g<1>68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1",
+            r"\g<1>" + "f" * 40 + " # v99.0.0",
             reviewed,
         )
         self.assertNotEqual(bumped, reviewed)
         self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(bumped), [])
         # Only a release tag is masked; other text after the pin still counts.
-        suffixed = bumped.replace("# v2.88.1", "# v2.88.1; run: true", 1)
+        suffixed = bumped.replace("# v99.0.0", "# v99.0.0; run: true", 1)
         self.assertNotEqual(suffixed, bumped)
         self.assertTrue(check_supply_chain.rust_ci_test_scope_violations(suffixed))
 
