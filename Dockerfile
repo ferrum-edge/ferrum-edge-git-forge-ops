@@ -75,7 +75,7 @@ RUN set -eu; \
 # the reviewed security fix is u2. Keep the exact-version, SHA-256-verified
 # package updates until the base's installed package metadata confirms it
 # already carries the fixes. Never `apt-get`.
-FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
 # Install only bytes the builder already verified against the reviewed digests.
 COPY --from=builder /opt/runtime-security-updates /tmp/runtime-security-updates
 RUN dpkg --install /tmp/runtime-security-updates/*.deb \
