@@ -47,14 +47,29 @@ python3 .github/scripts/bootstrap_repo_settings.py --repo "$REPO" \
 ```
 
 Follow [the quickstart](../../docs/quickstart.md) for the App, the repository
-configuration and the environment secrets. Finish with:
+configuration and the environment secrets.
+
+Use the unattended monitoring layout that adopters run. The upstream template
+has no gateway environment, so this is the only place viewer-capped drift
+monitoring (#440) runs end to end:
+
+- set `monitoring.unattended: true` for the environment;
+- configure the gateway's distinct `FERRUM_ADMIN_JWT_VIEWER_SECRET`;
+- put the same value only in `<env>-monitor`, which must not hold
+  `FERRUM_ADMIN_JWT_SECRET`
+  ([quickstart step 5](../../docs/quickstart.md#5-set-the-environment-secrets)).
+
+Dispatch `drift-check.yml` once and confirm it authenticates with the viewer
+key and completes. Finish with:
 
 ```bash
 python3 .github/scripts/audit_settings.py --repo "$REPO" \
   --state-writer-app-id <app-id>
 ```
 
-Everything below assumes a clean audit. If it is red, the scenarios would test
+Everything below assumes a clean audit, including its
+[monitoring-coverage check](../../docs/github-launch-controls.md#gateway-monitoring-coverage-is-audited-not-assumed),
+which needs that successful drift run. If it is red, the scenarios would test
 your misconfiguration rather than the product.
 
 ---

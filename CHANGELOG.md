@@ -7,6 +7,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The GitHub acceptance runbook now provisions and exercises viewer-capped
+  drift monitoring (#440) in its disposable repository. The upstream template
+  has no gateway environment, so that is the only place the step can run end
+  to end. The release record and v0.1.0 notes no longer list #440 provisioning
+  as a separate upstream step.
 - Move #266's pending first-release pairing to published Ferrum Edge v0.9.20
   (`e4a606a00352674daaef08636e3e359e6c48ba18`), which became GitHub's latest
   release and stopped every validating workflow at the checksum allowlist. The
