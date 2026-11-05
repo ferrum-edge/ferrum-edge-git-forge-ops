@@ -149,6 +149,8 @@ jobs:
       - name: Leave the tracking issue unchanged when the pool check is unknown
         if: steps.evaluate.outputs.state == 'unknown'
         run: |
+          set -euo pipefail
+          cat base-image-pin-report.md >>"$GITHUB_STEP_SUMMARY"
           echo "::warning::The Debian pool check did not complete for every pinned .deb; the tracking issue was left as it is. See the run summary report."
 
       # `repin` is follow-up, not breakage: it opens or updates the issue
