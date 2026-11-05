@@ -431,6 +431,11 @@ class PoolAvailabilityTests(unittest.TestCase):
 
         check_base_image_pin.check_pool(self.pin, self.report, fetch=fetch)
         self.assertIs(self.report.state, State.STALE)
+        # The issue is opened for the stale package, so the inconclusive ones
+        # must not claim that no issue action happens.
+        text = check_base_image_pin.render(self.report)
+        self.assertIn("Pool availability could not be confirmed", text)
+        self.assertNotIn("neither opened nor closed", text)
 
     def test_a_clean_scan_remains_ok_after_a_healthy_pool_check(self):
         report = check_base_image_pin.Report(has_pins=True)
@@ -622,10 +627,19 @@ class WorkflowRoutingTests(unittest.TestCase):
                 }
                 self.assertEqual(ran, steps)
 
-    def test_the_evaluate_step_refuses_a_state_outside_the_vocabulary(self):
+    def test_an_unrecognized_checker_state_is_refused_before_any_issue_action(self):
         text = WORKFLOW.read_text(encoding="utf-8")
-        match = re.search(r'^          case "\$state" in\n            ([a-z|]+)\) ;;$', text, re.MULTILINE)
-        self.assertIsNotNone(match, "the evaluate step must check the checker's state")
+        guard = "      - name: Refuse an unrecognized checker state\n"
+        self.assertIn(guard, text, "the checker's state must be checked")
+        # Before both issue actions, so an unknown value never reaches them.
+        self.assertLess(text.index(guard), text.index(f"      - name: {self.OPEN}\n"))
+        self.assertLess(text.index(guard), text.index(f"      - name: {self.CLOSE}\n"))
+        section = text.split(guard, 1)[1].split("\n      - name:", 1)[0]
+        # Read from the step output through env, never from the output file.
+        self.assertIn("STATE: ${{ steps.evaluate.outputs.state }}", section)
+        self.assertNotIn("GITHUB_OUTPUT", section)
+        match = re.search(r'^          case "\$STATE" in\n            ([a-z|]+)\) ;;$', section, re.MULTILINE)
+        self.assertIsNotNone(match, "the guard must enumerate the checker's states")
         self.assertEqual(set(match.group(1).split("|")), {state.value for state in State})
 
 

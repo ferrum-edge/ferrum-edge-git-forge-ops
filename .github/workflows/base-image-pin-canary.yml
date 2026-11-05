@@ -84,13 +84,19 @@ jobs:
             echo "::error::The base image pin checker could not run (exit $status)."
             exit "$status"
           fi
-          # The steps below branch on this vocabulary; anything else must not
-          # fall through to closing the issue.
-          state=$(sed -n 's/^state=//p' "$GITHUB_OUTPUT" | tail -n 1)
-          case "$state" in
+
+      # The steps below branch on this vocabulary; anything else must not fall
+      # through to closing the issue. The state arrives as a step output through
+      # env, never by reading the output file back.
+      - name: Refuse an unrecognized checker state
+        env:
+          STATE: ${{ steps.evaluate.outputs.state }}
+        run: |
+          set -euo pipefail
+          case "$STATE" in
             ok|repin|stale|unknown) ;;
             *)
-              echo "::error::The base image pin checker reported an unrecognized state '$state'."
+              echo "::error::The base image pin checker reported an unrecognized state '$STATE'."
               exit 1
               ;;
           esac

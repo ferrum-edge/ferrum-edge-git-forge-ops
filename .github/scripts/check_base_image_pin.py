@@ -543,9 +543,16 @@ def render(report: Report) -> str:
         lines += [f"- {entry}" for entry in report.covered_by_purge] + [""]
 
     if report.unverified_pool:
+        # Only an overall unknown leaves the issue alone; a stale verdict from
+        # another package still opens or updates it.
+        consequence = (
+            ", so a tracking issue is neither opened nor closed"
+            if report.state is State.UNKNOWN
+            else ""
+        )
         lines += [
             "Pool availability could not be confirmed for these (treated as neither",
-            "missing nor present, so a tracking issue is neither opened nor closed):",
+            f"missing nor present{consequence}):",
             "",
         ]
         lines += [f"- {entry}" for entry in report.unverified_pool] + [""]
