@@ -197,19 +197,17 @@ fn review_comment_shows_validation_fail() {
 
 #[test]
 fn verified_security_only_override_clears_only_its_verdict() {
-    use gitforgeops::policy::OverrideDecision;
+    use gitforgeops::policy::{OverrideDecision, VerifiedOverride};
     use gitforgeops::review::build_review_comment_v2_with_override;
 
-    let decision = OverrideDecision {
-        active: true,
-        approver: Some("maintainer".into()),
-        permission: Some("write".into()),
-        reason: "PR 7 review 42 authorized head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-        pr_number: Some(7),
-        authorized_head: Some("a".repeat(40)),
-        review_id: Some(42),
-        applied_revision: Some("b".repeat(40)),
-    };
+    let decision = OverrideDecision::Active(VerifiedOverride {
+        approver: "maintainer".into(),
+        permission: "write".into(),
+        pr_number: 7,
+        authorized_head: "a".repeat(40),
+        review_id: 42,
+        applied_revision: "b".repeat(40),
+    });
     let security = [SecurityFinding {
         severity: "error".into(),
         kind: "Consumer".into(),
@@ -239,7 +237,11 @@ fn verified_security_only_override_clears_only_its_verdict() {
     assert!(comment.contains("Security Findings: 1 total, 0 blocking, 1 overridden"));
     assert!(comment.contains("Security findings OVERRIDDEN by `maintainer`"));
     assert!(comment.contains("literal credential"));
-    assert!(comment.contains("PR 7 review 42 authorized head"));
+    // The evidence line is rendered from the verified override itself.
+    assert!(
+        comment.contains("PR \\#7, review 42, authorized head aaaaaaaa"),
+        "{comment}"
+    );
 }
 
 #[test]
@@ -1551,7 +1553,9 @@ fn offline_blocker_enforcement_is_opt_in() {
 
 #[test]
 fn review_security_verdict_uses_verified_override_without_hiding_findings() {
-    use gitforgeops::policy::{github_override::apply_override, OverrideDecision};
+    use gitforgeops::policy::{
+        github_override::apply_override, OverrideDecision, VerifiedOverride,
+    };
     use gitforgeops::review::build_review_comment_v2_with_override;
 
     let security = vec![SecurityFinding {
@@ -1561,18 +1565,17 @@ fn review_security_verdict_uses_verified_override_without_hiding_findings() {
         namespace: "ferrum".into(),
         message: "Literal credential in 'keyauth[0].key' on consumer app".into(),
     }];
-    let active = OverrideDecision {
-        active: true,
-        approver: Some("reviewer".into()),
-        permission: Some("write".into()),
-        reason: "Verified configured label and write permission".into(),
-        pr_number: Some(7),
-        authorized_head: Some("a".repeat(40)),
-        review_id: Some(10),
-        applied_revision: Some("b".repeat(40)),
-    };
+    let active = OverrideDecision::Active(VerifiedOverride {
+        approver: "reviewer".into(),
+        permission: "write".into(),
+        pr_number: 7,
+        authorized_head: "a".repeat(40),
+        review_id: 10,
+        applied_revision: "b".repeat(40),
+    });
     let inactive = OverrideDecision::inactive("label missing or verification unavailable");
     for decision in [None, Some(&inactive), Some(&active)] {
+        let reason = decision.map(OverrideDecision::reason);
         let mut policy = vec![PolicyFinding {
             rule_id: "backend_scheme".into(),
             severity: Severity::Error,
@@ -1596,7 +1599,7 @@ fn review_security_verdict_uses_verified_override_without_hiding_findings() {
             &policy,
             &[],
             &[],
-            decision.map(|decision| decision.reason.as_str()),
+            reason.as_deref(),
             None,
             None,
             None,
@@ -1604,7 +1607,7 @@ fn review_security_verdict_uses_verified_override_without_hiding_findings() {
             false,
             decision,
         );
-        let overridden = decision.is_some_and(|decision| decision.active);
+        let overridden = matches!(decision, Some(OverrideDecision::Active(_)));
         assert!(
             comment.contains("Apply is blocked"),
             "mesh still blocks: {comment}"

@@ -423,6 +423,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A policy override decision is now either inactive (with its reason) or active
+  with its complete verified evidence (approver, permission, PR, authorized
+  head, review and applied revision). An active override with a missing piece
+  is no longer representable, so the policy and security gates, `plan`,
+  `review` and the state-ledger audit row read the same evidence: apply can no
+  longer clear a finding "by unknown" while silently writing no audit row. No
+  reachable path produced that state before; the type now rules it out.
+- The base-image pin canary has an explicit `unknown` state. A Debian pool
+  check that did not complete (an unreachable mirror, or a pinned package with
+  no pool directory) used to leave the verdict at `ok`, so the workflow closed
+  the tracking issue with a comment claiming every pinned `.deb` was still in
+  the pool. `unknown` exits 0, warns, and leaves the issue as it is; `stale`
+  still wins over it. The workflow refuses a state outside `ok`, `repin`,
+  `stale` and `unknown`, and its comment no longer claims that redundant pins
+  open an issue.
 - `gitforgeops doctor` follow-ups from the #562 audit. The GitHub scope picks
   template mode from `GITFORGEOPS_TEMPLATE_REPO`, as `settings-audit.yml` does,
   passes the App id only outside template mode, fails an App id that is not a

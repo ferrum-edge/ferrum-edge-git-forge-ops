@@ -52,15 +52,15 @@ pub fn refuse_policy_violations(
     } else {
         output.push_str(&details);
     }
-    if let Some(decision) = override_decision {
-        if !decision.active {
+    match override_decision {
+        Some(github_override::OverrideDecision::Inactive { reason }) => {
             output.push_str(&format!(
                 "(override inactive: {})\n",
-                crate::diagnostics::safe_block(&decision.reason)
+                crate::diagnostics::safe_block(reason)
             ));
         }
-    } else {
-        output.push_str(&format!("({})\n", github_override::NO_PR_OVERRIDE_NOTE));
+        Some(github_override::OverrideDecision::Active(_)) => {}
+        None => output.push_str(&format!("({})\n", github_override::NO_PR_OVERRIDE_NOTE)),
     }
     Some(output)
 }

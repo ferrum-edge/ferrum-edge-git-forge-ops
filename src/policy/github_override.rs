@@ -12,29 +12,70 @@ use super::config::OverrideConfig;
 pub const NO_PR_OVERRIDE_NOTE: &str =
     "No PR is associated with this commit; overrides were not evaluated. Policy overrides are evaluated only on a GitHub pull request; see README.md#overrides-are-evaluated-only-on-a-github-pull-request.";
 
-#[derive(Debug, Clone)]
-pub struct OverrideDecision {
-    pub active: bool,
-    pub approver: Option<String>,
-    pub permission: Option<String>,
-    pub reason: String,
-    pub pr_number: Option<u64>,
-    pub authorized_head: Option<String>,
-    pub review_id: Option<u64>,
-    pub applied_revision: Option<String>,
+/// The outcome of override verification. An active override always carries
+/// its complete verified evidence, so every consumer (the policy and security
+/// gates, `plan`, `review` and the state-ledger audit row) reads one
+/// [`VerifiedOverride`] and none can treat a partly evidenced override as
+/// active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideDecision {
+    /// No override applies; every blocking finding stands.
+    Inactive { reason: String },
+    /// Every check in [`check_override`] passed, including the final re-read.
+    Active(VerifiedOverride),
+}
+
+/// The evidence a verified override is bound to. Only [`check_override`] and
+/// [`check_review_override`] produce one outside tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOverride {
+    /// The account that last added the override label and authored the review.
+    pub approver: String,
+    /// The approver's effective repository permission when verified.
+    pub permission: String,
+    pub pr_number: u64,
+    /// The PR head the override review authorized.
+    pub authorized_head: String,
+    pub review_id: u64,
+    /// The verified source revision this run applies.
+    pub applied_revision: String,
+}
+
+impl VerifiedOverride {
+    /// The evidence line `review` posts. The approver, permission and head are
+    /// GitHub's text, so only [`crate::display::peer_text`] copies are quoted.
+    pub fn evidence(&self) -> String {
+        format!(
+            "overridden by @{} ({}), PR #{}, review {}, authorized head {}",
+            crate::display::peer_text(&self.approver),
+            crate::display::peer_text(&self.permission),
+            self.pr_number,
+            self.review_id,
+            crate::display::peer_text(&self.authorized_head)
+        )
+    }
 }
 
 impl OverrideDecision {
     pub fn inactive(reason: &str) -> Self {
-        Self {
-            active: false,
-            approver: None,
-            permission: None,
+        Self::Inactive {
             reason: reason.to_string(),
-            pr_number: None,
-            authorized_head: None,
-            review_id: None,
-            applied_revision: None,
+        }
+    }
+
+    /// The verified evidence when the override is active.
+    pub fn verified(&self) -> Option<&VerifiedOverride> {
+        match self {
+            Self::Active(verified) => Some(verified),
+            Self::Inactive { .. } => None,
+        }
+    }
+
+    /// Why the override is inactive, or the evidence it is active on.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Inactive { reason } => reason.clone(),
+            Self::Active(verified) => verified.evidence(),
         }
     }
 }
@@ -42,13 +83,12 @@ impl OverrideDecision {
 /// The `=== Override ===` line `plan` prints for a decision. The approver is
 /// GitHub's text, so only a [`crate::display::peer_text`] copy is quoted.
 pub fn plan_override_note(decision: &OverrideDecision) -> String {
-    match (decision.active, &decision.approver) {
-        (true, Some(approver)) => format!(
+    match decision {
+        OverrideDecision::Active(verified) => format!(
             "Blocking findings overridden by @{}.",
-            crate::display::peer_text(approver)
+            crate::display::peer_text(&verified.approver)
         ),
-        (true, None) => "Blocking findings overridden.".to_string(),
-        (false, _) => format!("Override inactive: {}.", decision.reason),
+        OverrideDecision::Inactive { reason } => format!("Override inactive: {reason}."),
     }
 }
 
@@ -445,22 +485,14 @@ where
         ));
     }
 
-    Ok(OverrideDecision {
-        active: true,
-        approver: Some(approver.clone()),
-        permission: Some(permission.clone()),
-        reason: format!(
-            "overridden by @{} ({}), PR #{pr_number}, review {}, authorized head {}",
-            crate::display::peer_text(&approver),
-            crate::display::peer_text(&permission),
-            review.id,
-            crate::display::peer_text(&pr.head.sha)
-        ),
-        pr_number: Some(pr_number),
-        authorized_head: Some(pr.head.sha),
-        review_id: Some(review.id),
-        applied_revision: Some(applied_revision),
-    })
+    Ok(OverrideDecision::Active(VerifiedOverride {
+        approver,
+        permission,
+        pr_number,
+        authorized_head: pr.head.sha,
+        review_id: review.id,
+        applied_revision,
+    }))
 }
 
 /// Walk every page of `/issues/{pr}/events`, returning the login of the user
@@ -857,13 +889,10 @@ async fn fetch_permission_at(
 /// Apply an override decision to a set of findings: sets `overridden_by` on any
 /// finding whose severity currently blocks apply.
 pub fn apply_override(findings: &mut [super::PolicyFinding], decision: &OverrideDecision) {
-    if !decision.active {
+    let OverrideDecision::Active(verified) = decision else {
         return;
-    }
-    let by = decision
-        .approver
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+    };
+    let by = &verified.approver;
     for finding in findings.iter_mut() {
         if finding.severity.blocks_apply() {
             finding.overridden_by = Some(by.clone());
@@ -902,13 +931,10 @@ pub fn apply_override_to_reviewed(
     decision: &OverrideDecision,
     reviewed: &[super::PolicyFinding],
 ) -> usize {
-    if !decision.active {
+    let OverrideDecision::Active(verified) = decision else {
         return 0;
-    }
-    let by = decision
-        .approver
-        .clone()
-        .unwrap_or_else(|| "unknown".to_string());
+    };
+    let by = &verified.approver;
     // A multiset: one unresolved finding covers one identical resolved
     // finding, never several.
     let mut reviewed = identity_counts(
@@ -986,7 +1012,7 @@ pub fn preview_policy_findings(
     // same order `apply_override_to_reviewed` covers them; the rest are
     // resolution-only.
     let mut twins = identity_counts(unresolved.iter());
-    let active = decision.is_some_and(|decision| decision.active);
+    let active = matches!(decision, Some(OverrideDecision::Active(_)));
     let resolution_only: Vec<_> = resolved
         .into_iter()
         .filter(|finding| !take_identity(&mut twins, finding))

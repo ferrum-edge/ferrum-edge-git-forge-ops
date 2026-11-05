@@ -11,14 +11,21 @@ when the moving tag reports a fix the digest-pinned base does not carry, or
 when the digest should be refreshed.
 
 This checker reads the Dockerfile as the single source of truth and compares it
-with a Trivy report for the *moving* base tag. Three outcomes:
+with a Trivy report for the *moving* base tag. Four outcomes (`State`), in
+precedence order:
 
   stale   the base reports a fix this repository does not cover — a newer point
           release than the pinned version, a package that is neither pinned
           nor purged from the runtime image, or a pinned .deb has left the
           Debian pool, which fails the image build on a 404
+  unknown nothing is stale, but the pool check did not confirm every pinned
+          .deb (the mirror did not answer, or a package has no pool
+          directory). Unknown is never a pass: the canary leaves the tracking
+          issue as it is
+  repin   no stage is pinned and the clean moving tag no longer matches the
+          pinned digest
   ok      every reported fix is covered by a pinned package or by one the
-          runtime purges, every pinned .deb is still in the pool, and no
+          runtime purges, every pinned .deb is confirmed in the pool, and no
           uncovered fixed CRITICAL/HIGH finding remains
 
 Nothing here needs Docker: it consumes a Trivy JSON report produced by the
@@ -35,6 +42,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -305,9 +313,18 @@ def parse_trivy_report(document: dict) -> tuple[list[Finding], str]:
 # --------------------------------------------------------------------------
 
 
+class State(Enum):
+    """The canary's verdict. The workflow branches on `value`, so these strings
+    are its whole vocabulary."""
+
+    OK = "ok"
+    REPIN = "repin"
+    UNKNOWN = "unknown"
+    STALE = "stale"
+
+
 @dataclass
 class Report:
-    state: str = "ok"
     pinned_digest: str = ""
     current_digest: str = ""
     image: str = ""
@@ -323,6 +340,22 @@ class Report:
     @property
     def digest_moved(self) -> bool:
         return bool(self.current_digest) and self.current_digest != self.pinned_digest
+
+    @property
+    def has_findings(self) -> bool:
+        return bool(self.covered_by_pin or self.covered_by_purge or self.uncovered or self.stale_pins)
+
+    @property
+    def state(self) -> State:
+        """The one place the verdict is decided, from the evidence collected.
+        A pool check that did not complete is never read as a confirmed pool."""
+        if self.uncovered or self.stale_pins or self.missing_from_pool:
+            return State.STALE
+        if self.unverified_pool:
+            return State.UNKNOWN
+        if not self.has_pins and not self.has_findings and self.digest_moved:
+            return State.REPIN
+        return State.OK
 
 
 def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") -> Report:
@@ -362,10 +395,6 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
         if name not in reported:
             report.redundant_pins.append(name)
 
-    if report.uncovered or report.stale_pins:
-        report.state = "stale"
-    elif not pin.packages and not findings and report.digest_moved:
-        report.state = "repin"
     return report
 
 
@@ -407,8 +436,6 @@ def check_pool(pin: BasePin, report: Report, *, fetch=head_status) -> None:
             report.unverified_pool.append(f"{package.filename} (pool check did not complete)")
         else:
             report.missing_from_pool.append(f"{package.filename} (HTTP {status} at {url})")
-    if report.missing_from_pool:
-        report.state = "stale"
 
 
 # --------------------------------------------------------------------------
@@ -417,16 +444,17 @@ def check_pool(pin: BasePin, report: Report, *, fetch=head_status) -> None:
 
 
 HEADLINE = {
-    "ok": "No uncovered fixed CRITICAL/HIGH base-image findings were reported.",
-    "ok-retired": "The digest-pinned runtime base needs no point-release package stage.",
-    "repin": "The moving runtime base is clean, but the Dockerfile pins an older digest.",
-    "stale": "The pinned runtime security packages no longer cover the base image.",
+    State.OK: "No uncovered fixed CRITICAL/HIGH base-image findings were reported.",
+    State.REPIN: "The moving runtime base is clean, but the Dockerfile pins an older digest.",
+    State.UNKNOWN: "The pinned runtime packages could not all be confirmed in the Debian pool.",
+    State.STALE: "The pinned runtime security packages no longer cover the base image.",
 }
+RETIRED_HEADLINE = "The digest-pinned runtime base needs no point-release package stage."
 
 
 def headline(report: Report) -> str:
-    if report.state == "ok" and not report.has_pins:
-        return HEADLINE["ok-retired"]
+    if report.state is State.OK and not report.has_pins:
+        return RETIRED_HEADLINE
     return HEADLINE[report.state]
 
 
@@ -442,7 +470,7 @@ def render(report: Report) -> str:
     )
     lines.append("")
 
-    if report.state == "repin":
+    if report.state is State.REPIN:
         lines += [
             "The current base tag reports no fixed CRITICAL or HIGH vulnerability, but",
             "the runtime image still uses the older digest. Repin the runtime `FROM` to",
@@ -516,7 +544,8 @@ def render(report: Report) -> str:
 
     if report.unverified_pool:
         lines += [
-            "Pool availability could not be confirmed for (not treated as missing):",
+            "Pool availability could not be confirmed for these (treated as neither",
+            "missing nor present, so a tracking issue is neither opened nor closed):",
             "",
         ]
         lines += [f"- {entry}" for entry in report.unverified_pool] + [""]
@@ -529,7 +558,7 @@ def write_github_output(report: Report) -> None:
     if not destination:
         return
     with open(destination, "a", encoding="utf-8") as handle:
-        handle.write(f"state={report.state}\n")
+        handle.write(f"state={report.state.value}\n")
         handle.write(f"current_digest={report.current_digest}\n")
         handle.write(f"pinned_digest={report.pinned_digest}\n")
 
@@ -578,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.report_file:
         Path(args.report_file).write_text(rendered, encoding="utf-8")
     write_github_output(report)
-    return 1 if report.state == "stale" else 0
+    return 1 if report.state is State.STALE else 0
 
 
 if __name__ == "__main__":
