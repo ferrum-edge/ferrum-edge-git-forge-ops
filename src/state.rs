@@ -833,29 +833,23 @@ impl StateFile {
         });
     }
 
+    /// Record one audit row for a rule a verified override cleared. Taking the
+    /// [`crate::policy::VerifiedOverride`] itself, never an inactive decision,
+    /// means an override that cleared a gate always leaves its row.
     pub fn record_verified_override(
         &mut self,
         rule_id: &str,
-        decision: &crate::policy::OverrideDecision,
+        verified: &crate::policy::VerifiedOverride,
     ) {
-        if let (true, Some(approver), Some(commit), Some(pr), Some(head), Some(review)) = (
-            decision.active,
-            &decision.approver,
-            &decision.applied_revision,
-            decision.pr_number,
-            &decision.authorized_head,
-            decision.review_id,
-        ) {
-            self.overrides.push(OverrideRecord {
-                rule_id: rule_id.into(),
-                commit: commit.clone(),
-                approver: approver.clone(),
-                recorded_at: chrono::Utc::now().to_rfc3339(),
-                pr_number: Some(pr),
-                authorized_head: Some(head.clone()),
-                review_id: Some(review),
-            });
-        }
+        self.overrides.push(OverrideRecord {
+            rule_id: rule_id.into(),
+            commit: verified.applied_revision.clone(),
+            approver: verified.approver.clone(),
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+            pr_number: Some(verified.pr_number),
+            authorized_head: Some(verified.authorized_head.clone()),
+            review_id: Some(verified.review_id),
+        });
     }
 
     /// True when this repository is on record as the publisher of the mesh

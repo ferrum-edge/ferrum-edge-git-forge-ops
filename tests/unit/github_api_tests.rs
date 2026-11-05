@@ -1877,9 +1877,22 @@ async fn run_override_routes(
 #[tokio::test]
 async fn override_with_stable_evidence_is_active() {
     let (decision, permission_reads) = run_override_check(&[(200, "write")]).await;
-    assert!(decision.active, "{}", decision.reason);
-    assert_eq!(decision.approver.as_deref(), Some("maintainer"));
-    assert_eq!(decision.review_id, Some(42));
+    let Some(verified) = decision.verified() else {
+        panic!("{}", decision.reason());
+    };
+    // An active decision carries every piece of evidence the gates and the
+    // ledger audit row read; none of it is optional.
+    assert_eq!(
+        verified,
+        &gitforgeops::policy::VerifiedOverride {
+            approver: "maintainer".into(),
+            permission: "write".into(),
+            pr_number: 7,
+            authorized_head: "a".repeat(40),
+            review_id: 42,
+            applied_revision: "b".repeat(40),
+        }
+    );
     assert_eq!(permission_reads, 2);
 }
 
@@ -1888,11 +1901,11 @@ async fn override_with_stable_evidence_is_active() {
 #[tokio::test]
 async fn override_permission_demoted_during_verification_is_inactive() {
     let (decision, permission_reads) = run_override_check(&[(200, "write"), (200, "read")]).await;
-    assert!(!decision.active);
+    assert!(decision.verified().is_none());
     assert!(
-        decision.reason.contains("override evidence changed"),
+        decision.reason().contains("override evidence changed"),
         "{}",
-        decision.reason
+        decision.reason()
     );
     assert_eq!(permission_reads, 2);
 }
@@ -1901,7 +1914,7 @@ async fn override_permission_demoted_during_verification_is_inactive() {
 #[tokio::test]
 async fn override_permission_unreadable_during_final_pass_is_inactive() {
     let (decision, permission_reads) = run_override_check(&[(200, "write"), (500, "write")]).await;
-    assert!(!decision.active, "{}", decision.reason);
+    assert!(decision.verified().is_none(), "{}", decision.reason());
     assert_eq!(permission_reads, 2);
 }
 
@@ -2115,7 +2128,11 @@ async fn override_decision_ignores_link_headers() {
             routes[index].2 = line.to_string();
         }
         let (decision, _) = run_override_routes(routes).await;
-        assert!(decision.active, "{line:?}: {}", decision.reason);
+        assert!(
+            decision.verified().is_some(),
+            "{line:?}: {}",
+            decision.reason()
+        );
     }
 }
 
@@ -2139,11 +2156,11 @@ async fn a_revocation_after_a_short_page_with_a_malformed_link_is_read() {
         String::new(),
     ));
     let (decision, _) = run_override_routes(routes).await;
-    assert!(!decision.active);
+    assert!(decision.verified().is_none());
     assert!(
-        decision.reason.contains("no labeling event found"),
+        decision.reason().contains("no labeling event found"),
         "{}",
-        decision.reason
+        decision.reason()
     );
 
     let mut routes = override_routes(&[(200, "write")]);
@@ -2165,13 +2182,13 @@ async fn a_revocation_after_a_short_page_with_a_malformed_link_is_read() {
         String::new(),
     ));
     let (decision, _) = run_override_routes(routes).await;
-    assert!(!decision.active);
+    assert!(decision.verified().is_none());
     assert!(
         decision
-            .reason
+            .reason()
             .contains("labeler must submit a fresh review"),
         "{}",
-        decision.reason
+        decision.reason()
     );
 }
 

@@ -2,10 +2,14 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import re
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "check_base_image_pin.py"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -15,6 +19,8 @@ sys.modules[SPEC.name] = check_base_image_pin
 SPEC.loader.exec_module(check_base_image_pin)
 
 compare = check_base_image_pin.compare_debian_versions
+State = check_base_image_pin.State
+WORKFLOW = REPO_ROOT / ".github/workflows/base-image-pin-canary.yml"
 
 DOCKERFILE = """\
 FROM ferrumedge/ferrum-edge:latest@sha256:aaaa AS ferrum-edge
@@ -285,37 +291,37 @@ class ClassificationTests(unittest.TestCase):
 
     def test_a_clean_scan_does_not_prove_the_pinned_version_is_in_the_base(self):
         report = self.classify([])
-        self.assertEqual(report.state, "ok")
+        self.assertIs(report.state, State.OK)
         self.assertEqual(sorted(report.redundant_pins), ["gzip", "perl-base"])
 
     def test_a_pin_at_the_fixed_version_covers_the_finding(self):
         report = self.classify([vulnerability("perl-base", "5.40.1-6+deb13u1")])
-        self.assertEqual(report.state, "ok")
+        self.assertIs(report.state, State.OK)
         self.assertEqual(len(report.covered_by_pin), 1)
         self.assertEqual(report.redundant_pins, ["gzip"])
 
     def test_a_pin_newer_than_the_fixed_version_still_covers_it(self):
         report = self.classify([vulnerability("gzip", "1.13-1")])
-        self.assertEqual(report.state, "ok")
+        self.assertIs(report.state, State.OK)
         self.assertEqual(len(report.covered_by_pin), 1)
 
     def test_a_newer_point_release_than_the_pin_is_stale(self):
         # Exactly the shape of the perl-base gap that turned every pull request
         # red: the base reports a fix the pinned version does not reach.
         report = self.classify([vulnerability("perl-base", "5.40.1-6+deb13u2")])
-        self.assertEqual(report.state, "stale")
+        self.assertIs(report.state, State.STALE)
         self.assertEqual(len(report.stale_pins), 1)
         self.assertIn("amd64: pinned 5.40.1-6+deb13u1", report.stale_pins[0])
         self.assertIn("arm64: pinned 5.40.1-6+deb13u1", report.stale_pins[0])
 
     def test_a_package_that_is_neither_pinned_nor_purged_is_stale(self):
         report = self.classify([vulnerability("libsqlite3-0", "3.46.1-7+deb13u2")])
-        self.assertEqual(report.state, "stale")
+        self.assertIs(report.state, State.STALE)
         self.assertIn("neither pinned nor purged", report.uncovered[0])
 
     def test_a_purged_package_is_covered_without_a_pin(self):
         report = self.classify([vulnerability("libssl3t64", "3.5.7-1~deb13u2")])
-        self.assertEqual(report.state, "ok")
+        self.assertIs(report.state, State.OK)
         self.assertEqual(len(report.covered_by_purge), 1)
         self.assertEqual(report.uncovered, [])
 
@@ -323,7 +329,7 @@ class ClassificationTests(unittest.TestCase):
         pin = check_base_image_pin.parse_dockerfile(RETIRED_DOCKERFILE)
         findings, _ = check_base_image_pin.parse_trivy_report(report_document([]))
         report = check_base_image_pin.classify(findings, pin)
-        self.assertEqual(report.state, "ok")
+        self.assertIs(report.state, State.OK)
         self.assertFalse(report.has_pins)
         self.assertEqual(report.redundant_pins, [])
 
@@ -333,7 +339,7 @@ class ClassificationTests(unittest.TestCase):
             report_document([], "sha256:dddd")
         )
         report = check_base_image_pin.classify(findings, pin, digest)
-        self.assertEqual(report.state, "repin")
+        self.assertIs(report.state, State.REPIN)
         self.assertTrue(report.digest_moved)
 
     def test_a_retired_stage_still_covers_a_purged_package(self):
@@ -342,7 +348,7 @@ class ClassificationTests(unittest.TestCase):
             report_document([vulnerability("libssl3t64", "3.5.7-1~deb13u2")])
         )
         report = check_base_image_pin.classify(findings, pin)
-        self.assertEqual(report.state, "ok")
+        self.assertIs(report.state, State.OK)
         self.assertEqual(len(report.covered_by_purge), 1)
         self.assertEqual(report.uncovered, [])
 
@@ -352,7 +358,7 @@ class ClassificationTests(unittest.TestCase):
             report_document([vulnerability("perl-base", "5.40.1-6+deb13u2")])
         )
         report = check_base_image_pin.classify(findings, pin)
-        self.assertEqual(report.state, "stale")
+        self.assertIs(report.state, State.STALE)
         self.assertFalse(report.has_pins)
         self.assertIn("neither pinned nor purged", report.uncovered[0])
 
@@ -368,7 +374,7 @@ class ClassificationTests(unittest.TestCase):
             report_document([vulnerability("perl-base", "5.40.1-6+deb13u1")])
         )
         report = check_base_image_pin.classify(findings, pin)
-        self.assertEqual(report.state, "stale")
+        self.assertIs(report.state, State.STALE)
         self.assertIn("arm64: pinned 5.40.1-6", report.stale_pins[0])
         self.assertNotIn("amd64", report.stale_pins[0])
 
@@ -376,11 +382,11 @@ class ClassificationTests(unittest.TestCase):
 class PoolAvailabilityTests(unittest.TestCase):
     def setUp(self):
         self.pin = check_base_image_pin.parse_dockerfile(DOCKERFILE)
-        self.report = check_base_image_pin.Report(state="ok")
+        self.report = check_base_image_pin.Report(has_pins=True)
 
     def test_present_packages_leave_the_state_alone(self):
         check_base_image_pin.check_pool(self.pin, self.report, fetch=lambda url: 200)
-        self.assertEqual(self.report.state, "ok")
+        self.assertIs(self.report.state, State.OK)
         self.assertEqual(self.report.missing_from_pool, [])
 
     def test_a_package_dropped_from_the_pool_is_stale(self):
@@ -388,25 +394,58 @@ class PoolAvailabilityTests(unittest.TestCase):
             return 404 if "perl-base" in url else 200
 
         check_base_image_pin.check_pool(self.pin, self.report, fetch=fetch)
-        self.assertEqual(self.report.state, "stale")
+        self.assertIs(self.report.state, State.STALE)
         self.assertEqual(len(self.report.missing_from_pool), 2)  # both architectures
         self.assertIn("HTTP 404", self.report.missing_from_pool[0])
 
-    def test_an_unreachable_mirror_is_reported_without_failing(self):
+    def test_an_unreachable_mirror_is_unknown_never_ok(self):
+        # A pool check that never completed must not read as a confirmed pool:
+        # `ok` is what lets the workflow close the tracking issue.
         check_base_image_pin.check_pool(self.pin, self.report, fetch=lambda url: None)
-        self.assertEqual(self.report.state, "ok")
+        self.assertIs(self.report.state, State.UNKNOWN)
         self.assertEqual(len(self.report.unverified_pool), 4)
+        self.assertIn("could not all be confirmed", check_base_image_pin.headline(self.report))
+
+    def test_one_unanswered_package_makes_the_whole_pool_unknown(self):
+        def fetch(url):
+            return None if "gzip" in url and "arm64" in url else 200
+
+        check_base_image_pin.check_pool(self.pin, self.report, fetch=fetch)
+        self.assertIs(self.report.state, State.UNKNOWN)
+        self.assertEqual(len(self.report.unverified_pool), 1)
+
+    def test_a_package_without_a_pool_directory_is_unknown(self):
+        pin = check_base_image_pin.parse_dockerfile(
+            DOCKERFILE.replace("        gzip_*) pool=pool/main/g/gzip ;; \\\n", "")
+        )
+        check_base_image_pin.check_pool(pin, self.report, fetch=lambda url: 200)
+        self.assertIs(self.report.state, State.UNKNOWN)
+        self.assertTrue(
+            all("no pool directory" in entry for entry in self.report.unverified_pool),
+            self.report.unverified_pool,
+        )
+
+    def test_a_missing_package_stays_stale_when_others_are_unverified(self):
+        def fetch(url):
+            return 404 if "perl-base" in url else None
+
+        check_base_image_pin.check_pool(self.pin, self.report, fetch=fetch)
+        self.assertIs(self.report.state, State.STALE)
+        # The issue is opened for the stale package, so the inconclusive ones
+        # must not claim that no issue action happens.
+        text = check_base_image_pin.render(self.report)
+        self.assertIn("Pool availability could not be confirmed", text)
+        self.assertNotIn("neither opened nor closed", text)
 
     def test_a_clean_scan_remains_ok_after_a_healthy_pool_check(self):
-        report = check_base_image_pin.Report(state="ok")
+        report = check_base_image_pin.Report(has_pins=True)
         check_base_image_pin.check_pool(self.pin, report, fetch=lambda url: 200)
-        self.assertEqual(report.state, "ok")
+        self.assertIs(report.state, State.OK)
 
 
 class RenderTests(unittest.TestCase):
     def test_a_clean_report_keeps_redundant_pins_until_base_metadata_is_verified(self):
         report = check_base_image_pin.Report(
-            state="ok",
             image="debian:trixie-slim",
             pinned_digest="sha256:cccc",
             current_digest="sha256:dddd",
@@ -418,9 +457,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("metadata before dropping a pin", text)
 
     def test_the_stale_report_explains_how_to_refresh_a_pin(self):
-        report = check_base_image_pin.Report(
-            state="stale", image="debian:trixie-slim", has_pins=True
-        )
+        report = check_base_image_pin.Report(image="debian:trixie-slim", has_pins=True)
         report.stale_pins = ["CVE-2026-1 HIGH perl-base 5.40.1-6 -> 5.40.1-6+deb13u2 (amd64: pinned 5.40.1-6+deb13u1)"]
         text = check_base_image_pin.render(report)
         self.assertIn("every**", text)
@@ -429,7 +466,6 @@ class RenderTests(unittest.TestCase):
 
     def test_a_retired_ok_report_does_not_ask_to_delete_a_missing_stage(self):
         report = check_base_image_pin.Report(
-            state="ok",
             image="debian:trixie-slim",
             pinned_digest="sha256:cccc",
             current_digest="sha256:cccc",
@@ -441,9 +477,7 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("Delete the `runtime-security-updates`", text)
 
     def test_a_stale_report_without_pins_explains_how_to_reintroduce_the_stage(self):
-        report = check_base_image_pin.Report(
-            state="stale", image="debian:trixie-slim", has_pins=False
-        )
+        report = check_base_image_pin.Report(image="debian:trixie-slim", has_pins=False)
         report.uncovered = ["CVE-2026-1 HIGH perl-base 5.40.1-6 -> 5.40.1-6+deb13u2 (neither pinned nor purged)"]
         text = check_base_image_pin.render(report)
         self.assertIn("Reintroduce the reviewed `runtime-security-updates` builder stage", text)
@@ -452,7 +486,12 @@ class RenderTests(unittest.TestCase):
 
 class MainTests(unittest.TestCase):
     def run_main(
-        self, vulnerabilities, extra_args=(), dockerfile=DOCKERFILE, digest="sha256:cccc"
+        self,
+        vulnerabilities,
+        extra_args=(),
+        dockerfile=DOCKERFILE,
+        digest="sha256:cccc",
+        check_pool=False,
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -471,7 +510,7 @@ class MainTests(unittest.TestCase):
                         str(report_path),
                         "--report-file",
                         str(body),
-                        "--skip-pool-check",
+                        *([] if check_pool else ["--skip-pool-check"]),
                         *extra_args,
                     ]
                 )
@@ -505,6 +544,25 @@ class MainTests(unittest.TestCase):
         self.assertIn("pins an older digest", body)
         self.assertIn("debian:trixie-slim@sha256:dddd", body)
 
+    def test_an_unreachable_mirror_writes_state_unknown_and_exits_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "github-output"
+            output.write_text("", encoding="utf-8")
+            unreachable = mock.patch.object(
+                check_base_image_pin.urllib.request,
+                "urlopen",
+                side_effect=urllib.error.URLError("mirror unreachable"),
+            )
+            with unreachable, mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}):
+                code, body = self.run_main(
+                    [vulnerability("perl-base", "5.40.1-6+deb13u1")], check_pool=True
+                )
+            written = output.read_text(encoding="utf-8")
+        self.assertEqual(code, 0)
+        self.assertIn("state=unknown\n", written)
+        self.assertIn("could not all be confirmed", body)
+        self.assertIn("pool check did not complete", body)
+
     def test_print_base_ref_emits_the_tag_without_a_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -520,6 +578,69 @@ class MainTests(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 code = check_base_image_pin.main(["--root", directory, "--print-base-ref"])
         self.assertEqual(code, 2)
+
+
+def step_condition(name):
+    """The `if:` of the canary step called `name`."""
+    text = WORKFLOW.read_text(encoding="utf-8")
+    section = text.split(f"      - name: {name}\n", 1)[1].split("\n      - name:", 1)[0]
+    match = re.search(r"^        if: (.+)$", section, re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"missing if: for {name}")
+    return match.group(1)
+
+
+def runs_for(condition, state):
+    """Evaluate a disjunction of `steps.evaluate.outputs.state ==/!= '<x>'`
+    terms, the only form these step conditions take."""
+    terms = condition.split(" || ")
+    results = []
+    for term in terms:
+        match = re.fullmatch(r"steps\.evaluate\.outputs\.state (==|!=) '([a-z-]+)'", term)
+        if match is None:
+            raise AssertionError(f"unexpected condition term: {term!r}")
+        operator, value = match.groups()
+        results.append((state == value) if operator == "==" else (state != value))
+    return any(results)
+
+
+class WorkflowRoutingTests(unittest.TestCase):
+    OPEN = "Open or update the tracking issue"
+    CLOSE = "Close a resolved tracking issue"
+    FAIL = "Fail when the pinned packages no longer cover the base image"
+
+    def test_each_state_routes_to_exactly_its_issue_action(self):
+        expected = {
+            State.OK: {self.CLOSE},
+            State.REPIN: {self.OPEN},
+            State.STALE: {self.OPEN, self.FAIL},
+            # Unknown is never a pass: it neither closes the issue nor
+            # replaces the evidence it was opened for.
+            State.UNKNOWN: set(),
+        }
+        for state, steps in expected.items():
+            with self.subTest(state=state):
+                ran = {
+                    step
+                    for step in (self.OPEN, self.CLOSE, self.FAIL)
+                    if runs_for(step_condition(step), state.value)
+                }
+                self.assertEqual(ran, steps)
+
+    def test_an_unrecognized_checker_state_is_refused_before_any_issue_action(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        guard = "      - name: Refuse an unrecognized checker state\n"
+        self.assertIn(guard, text, "the checker's state must be checked")
+        # Before both issue actions, so an unknown value never reaches them.
+        self.assertLess(text.index(guard), text.index(f"      - name: {self.OPEN}\n"))
+        self.assertLess(text.index(guard), text.index(f"      - name: {self.CLOSE}\n"))
+        section = text.split(guard, 1)[1].split("\n      - name:", 1)[0]
+        # Read from the step output through env, never from the output file.
+        self.assertIn("STATE: ${{ steps.evaluate.outputs.state }}", section)
+        self.assertNotIn("GITHUB_OUTPUT", section)
+        match = re.search(r'^          case "\$STATE" in\n            ([a-z|]+)\) ;;$', section, re.MULTILINE)
+        self.assertIsNotNone(match, "the guard must enumerate the checker's states")
+        self.assertEqual(set(match.group(1).split("|")), {state.value for state in State})
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ pub mod rules;
 use serde::{Deserialize, Serialize};
 
 pub use config::{load_policies, OverrideConfig, PolicyConfig};
-pub use github_override::{check_override, OverrideDecision};
+pub use github_override::{check_override, OverrideDecision, VerifiedOverride};
 pub use registry::{build_registry, evaluate_policies};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]

@@ -77,16 +77,32 @@ jobs:
             --report-file base-image-pin-report.md
           status=$?
           echo "checker_status=$status" >>"$GITHUB_OUTPUT"
-          # 0 is "nothing to do" or "retirable", 1 is "the pins no longer cover
-          # the base". Anything else is the checker failing to run at all, and
+          # 0 is ok, repin or unknown, 1 is "the pins no longer cover the base"
+          # (stale). Anything else is the checker failing to run at all, and
           # then there is no report for the tracking issue to carry.
           if [ "$status" -gt 1 ]; then
             echo "::error::The base image pin checker could not run (exit $status)."
             exit "$status"
           fi
 
+      # The steps below branch on this vocabulary; anything else must not fall
+      # through to closing the issue. The state arrives as a step output through
+      # env, never by reading the output file back.
+      - name: Refuse an unrecognized checker state
+        env:
+          STATE: ${{ steps.evaluate.outputs.state }}
+        run: |
+          set -euo pipefail
+          case "$STATE" in
+            ok|repin|stale|unknown) ;;
+            *)
+              echo "::error::The base image pin checker reported an unrecognized state '$STATE'."
+              exit 1
+              ;;
+          esac
+
       - name: Open or update the tracking issue
-        if: steps.evaluate.outputs.state != 'ok'
+        if: steps.evaluate.outputs.state == 'stale' || steps.evaluate.outputs.state == 'repin'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -127,9 +143,22 @@ jobs:
             echo "::notice::Closed resolved tracking issue #$number."
           fi
 
-      # A redundant stage is cleanup, not breakage: it opens an issue without
-      # turning the canary red. Pins that no longer cover the base, or a .deb
-      # that has left the pool, break the image build and do fail the run.
+      # A pool check that did not complete proves nothing either way. Replacing
+      # the issue body would drop the evidence it was opened for, and closing it
+      # would claim a pool the run never saw, so the issue is left as it is.
+      - name: Leave the tracking issue unchanged when the pool check is unknown
+        if: steps.evaluate.outputs.state == 'unknown'
+        run: |
+          set -euo pipefail
+          cat base-image-pin-report.md >>"$GITHUB_STEP_SUMMARY"
+          echo "::warning::The Debian pool check did not complete for every pinned .deb; the tracking issue was left as it is. See the run summary report."
+
+      # `repin` is follow-up, not breakage: it opens or updates the issue
+      # without turning the canary red. Pins that no longer cover the base, or
+      # a .deb that has left the pool, break the image build and fail the run
+      # (`stale`). Pins Trivy reports no finding for are only listed in the
+      # report: a clean scan does not prove the base carries the pinned
+      # version, so they neither open nor keep an issue.
       - name: Fail when the pinned packages no longer cover the base image
         if: steps.evaluate.outputs.state == 'stale'
         run: |

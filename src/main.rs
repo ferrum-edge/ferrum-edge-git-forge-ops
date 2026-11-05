@@ -2655,7 +2655,7 @@ async fn cmd_plan(
                             resolved_policy_findings.as_deref(),
                             Some(&decision),
                         );
-                    security_overridden = decision.active;
+                    security_overridden = matches!(decision, policy::OverrideDecision::Active(_));
                     override_note = Some(policy::github_override::plan_override_note(&decision));
                 }
                 // Fail closed. An override that could not be verified is not
@@ -2950,25 +2950,27 @@ async fn cmd_apply(
     } else {
         None
     };
-    let override_approver = override_decision
+    // The one source every override consumer below reads: the gates clear
+    // findings only for a verified override, and the audit rows are written
+    // from the same evidence.
+    let verified_override = override_decision
         .as_ref()
-        .filter(|decision| decision.active)
-        .and_then(|decision| decision.approver.clone());
+        .and_then(policy::OverrideDecision::verified);
 
     // Overridden rule ids are captured as they are cleared and written into
     // state after apply, so an audit can see which blocking findings were
     // bypassed and by whom.
-    let mut overridden_for_audit: Vec<(String, String)> = Vec::new();
+    let mut overridden_for_audit: Vec<String> = Vec::new();
 
     if let Some(gate) = security_gate {
         let blocker_count = gate.count;
-        match &override_approver {
-            Some(approver) => {
+        match verified_override {
+            Some(verified) => {
                 eoutln!(
                     "{blocker_count} error-severity security finding(s) overridden by @{}; continuing.",
-                    safe(approver)
+                    safe(&verified.approver)
                 );
-                overridden_for_audit.push((SECURITY_AUDIT_RULE_ID.to_string(), approver.clone()));
+                overridden_for_audit.push(SECURITY_AUDIT_RULE_ID.to_string());
             }
             None => {
                 eoutln!(
@@ -2980,10 +2982,10 @@ async fn cmd_apply(
                     safe(&override_cfg.required_permission)
                 );
                 match &override_decision {
-                    Some(decision) if !decision.active => {
-                        eoutln!("(override inactive: {})", safe_block(&decision.reason))
+                    Some(policy::OverrideDecision::Inactive { reason }) => {
+                        eoutln!("(override inactive: {})", safe_block(reason))
                     }
-                    Some(_) => {}
+                    Some(policy::OverrideDecision::Active(_)) => {}
                     None => {
                         eoutln!("({})", policy::github_override::NO_PR_OVERRIDE_NOTE)
                     }
@@ -3011,11 +3013,9 @@ async fn cmd_apply(
             policy::github_override::apply_override(&mut findings, d);
         }
 
-        if let Some(approver) = &override_approver {
-            for f in &findings {
-                if f.overridden_by.is_some() {
-                    overridden_for_audit.push((f.rule_id.clone(), approver.clone()));
-                }
+        for f in &findings {
+            if f.overridden_by.is_some() {
+                overridden_for_audit.push(f.rule_id.clone());
             }
         }
 
@@ -3082,14 +3082,11 @@ async fn cmd_apply(
                 eout!("{message}");
                 return Err("unresolved policy violations".into());
             }
-            if let Some(approver) = &override_approver {
-                for finding in &findings {
-                    if finding.overridden_by.is_some() {
-                        let audit_entry = (finding.rule_id.clone(), approver.clone());
-                        if !overridden_for_audit.contains(&audit_entry) {
-                            overridden_for_audit.push(audit_entry);
-                        }
-                    }
+            for finding in &findings {
+                if finding.overridden_by.is_some()
+                    && !overridden_for_audit.contains(&finding.rule_id)
+                {
+                    overridden_for_audit.push(finding.rule_id.clone());
                 }
             }
         }
@@ -3912,11 +3909,13 @@ async fn cmd_apply(
         }
     }
     state.credential_shard_count = shard_count;
-    if let Some(decision) = &override_decision {
-        // The verified actual source revision and reviewed PR head are distinct
-        // for a merge and for later generated-state-only commits.
-        for (rule_id, _) in &overridden_for_audit {
-            state.record_verified_override(rule_id, decision);
+    // `overridden_by` is set only from a verified override, so every cleared
+    // rule has evidence to record. The verified actual source revision and
+    // reviewed PR head are distinct for a merge and for later
+    // generated-state-only commits.
+    if let Some(verified) = verified_override {
+        for rule_id in &overridden_for_audit {
+            state.record_verified_override(rule_id, verified);
         }
     }
     state.save()?;
@@ -4327,9 +4326,8 @@ async fn cmd_review(
         env_config.github_provisioner_token.is_some(),
         env_config.github_repository.is_some(),
     );
-    let security_overridden = override_decision
-        .as_ref()
-        .is_some_and(|decision| decision.active);
+    let security_overridden =
+        matches!(override_decision, Some(policy::OverrideDecision::Active(_)));
     // Same computation `plan` uses for its exit code. The comment below is
     // built from the findings themselves, not from this vec, so
     // `--fail-on-blockers` cannot change what the reviewer reads.
@@ -4348,6 +4346,9 @@ async fn cmd_review(
         probe_allowlist_invalid,
     });
 
+    let override_reason = override_decision
+        .as_ref()
+        .map(policy::OverrideDecision::reason);
     let comment = review::pr_comment::build_review_comment_with_preview(
         validation_status,
         &validation_output,
@@ -4358,9 +4359,7 @@ async fn cmd_review(
         &policy_findings,
         &unmanaged,
         &spec_owned,
-        override_decision
-            .as_ref()
-            .map(|decision| decision.reason.as_str()),
+        override_reason.as_deref(),
         Some(&override_cfg),
         comparison_error.as_deref(),
         Some(&ownership_note),

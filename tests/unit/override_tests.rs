@@ -5,7 +5,7 @@ use std::process::Command;
 use gitforgeops::policy::github_override::{authorized_review, OverrideReview, PermissionResponse};
 use gitforgeops::policy::override_input::verify_input;
 use gitforgeops::policy::OverrideConfig;
-use gitforgeops::policy::OverrideDecision;
+use gitforgeops::policy::{OverrideDecision, VerifiedOverride};
 use gitforgeops::state::{OverrideRecord, StateFile};
 use serde_json::{json, Value};
 
@@ -243,28 +243,95 @@ fn override_audit_distinguishes_reviewed_and_applied_revisions_and_loads_legacy(
     .unwrap();
     assert!(old.authorized_head.is_none());
     assert!(old.pr_number.is_none());
-    let decision = OverrideDecision {
-        active: true,
-        approver: Some("maintainer".into()),
-        permission: Some("write".into()),
-        reason: "verified".into(),
-        pr_number: Some(7),
-        authorized_head: Some("a".repeat(40)),
-        review_id: Some(42),
-        applied_revision: Some("b".repeat(40)),
+    let verified = VerifiedOverride {
+        applied_revision: "b".repeat(40),
+        ..verified_override()
     };
     let mut state = StateFile::default();
-    state.record_verified_override("diff.security", &decision);
-    state.record_verified_override("backend_scheme", &OverrideDecision::inactive("stale"));
+    state.record_verified_override("diff.security", &verified);
     let reloaded: StateFile = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
     assert_eq!(reloaded.overrides.len(), 1);
+    assert_eq!(reloaded.overrides[0].approver, "maintainer");
     assert_eq!(reloaded.overrides[0].pr_number, Some(7));
     assert_eq!(reloaded.overrides[0].review_id, Some(42));
     assert_eq!(
-        reloaded.overrides[0].authorized_head,
-        decision.authorized_head
+        reloaded.overrides[0].authorized_head.as_deref(),
+        Some(verified.authorized_head.as_str())
     );
     assert_eq!(reloaded.overrides[0].commit, "b".repeat(40));
+}
+
+/// One override decision, every consumer. An active decision carries its
+/// verified evidence non-optionally, so the policy gates, the `plan` note, the
+/// preview and the ledger audit row cannot disagree: whatever a gate clears is
+/// cleared by the approver the audit row names. The old `active` flag beside
+/// six Options let `apply_override` clear a finding "by unknown" while
+/// `record_verified_override` silently wrote no row.
+#[test]
+fn every_override_consumer_agrees_on_one_decision() {
+    use gitforgeops::policy::github_override::{
+        apply_override, apply_override_to_reviewed, plan_override_note, preview_policy_findings,
+    };
+    use gitforgeops::policy::refusal::refuse_policy_violations;
+
+    let reviewed = vec![policy_finding("backend_scheme", "proxy", "http")];
+    let active = active_decision();
+    let inactive = OverrideDecision::inactive("label missing");
+    for decision in [&active, &inactive] {
+        let verified = decision.verified();
+
+        let mut gate_one = reviewed.clone();
+        apply_override(&mut gate_one, decision);
+        let mut gate_two = reviewed.clone();
+        let uncovered = apply_override_to_reviewed(&mut gate_two, decision, &reviewed);
+        assert_eq!(uncovered, 0);
+        let approver = verified.map(|verified| verified.approver.clone());
+        assert_eq!(gate_one[0].overridden_by, approver, "{decision:?}");
+        assert_eq!(gate_two[0].overridden_by, approver, "{decision:?}");
+
+        let refusal = refuse_policy_violations(&gate_one, "", Some(decision), None);
+        assert_eq!(refusal.is_none(), verified.is_some(), "{refusal:?}");
+        let (preview, _) = preview_policy_findings(&reviewed, None, Some(decision));
+        assert_eq!(preview[0].overridden_by, approver);
+
+        let note = plan_override_note(decision);
+        match decision {
+            OverrideDecision::Active(verified) => {
+                assert_eq!(
+                    note,
+                    format!("Blocking findings overridden by @{}.", verified.approver)
+                );
+                assert!(
+                    decision.reason().contains("review 42"),
+                    "{}",
+                    decision.reason()
+                );
+            }
+            OverrideDecision::Inactive { reason } => {
+                assert_eq!(note, format!("Override inactive: {reason}."));
+                assert!(refusal.expect("inactive refuses").contains(reason));
+            }
+        }
+
+        // apply records one audit row per rule a gate cleared, from the same
+        // evidence; an inactive decision has nothing to record.
+        let mut state = StateFile::default();
+        if let Some(verified) = verified {
+            for finding in gate_one.iter().filter(|f| f.overridden_by.is_some()) {
+                state.record_verified_override(&finding.rule_id, verified);
+            }
+        }
+        let cleared = gate_one
+            .iter()
+            .filter(|f| f.overridden_by.is_some())
+            .count();
+        assert_eq!(state.overrides.len(), cleared, "{decision:?}");
+        for row in &state.overrides {
+            assert_eq!(Some(&row.approver), gate_one[0].overridden_by.as_ref());
+            assert_eq!(row.pr_number, Some(7));
+            assert_eq!(row.review_id, Some(42));
+        }
+    }
 }
 
 fn permission_response(body: Value) -> PermissionResponse {
@@ -427,17 +494,19 @@ fn policy_finding(rule_id: &str, id: &str, message: &str) -> gitforgeops::policy
     }
 }
 
-fn active_decision() -> OverrideDecision {
-    OverrideDecision {
-        active: true,
-        approver: Some("maintainer".into()),
-        permission: Some("write".into()),
-        reason: "verified".into(),
-        pr_number: Some(7),
-        authorized_head: Some("a".repeat(40)),
-        review_id: Some(42),
-        applied_revision: Some("a".repeat(40)),
+fn verified_override() -> VerifiedOverride {
+    VerifiedOverride {
+        approver: "maintainer".into(),
+        permission: "write".into(),
+        pr_number: 7,
+        authorized_head: "a".repeat(40),
+        review_id: 42,
+        applied_revision: "a".repeat(40),
     }
+}
+
+fn active_decision() -> OverrideDecision {
+    OverrideDecision::Active(verified_override())
 }
 
 /// #562: apply re-evaluates policy after credential resolution. The override
@@ -609,12 +678,14 @@ fn pr_number_override_must_be_a_positive_integer() {
 #[test]
 fn plan_override_note_quotes_the_approver_through_peer_text() {
     use gitforgeops::policy::github_override::plan_override_note;
-    let mut decision = active_decision();
     assert_eq!(
-        plan_override_note(&decision),
+        plan_override_note(&active_decision()),
         "Blocking findings overridden by @maintainer."
     );
-    decision.approver = Some("x".repeat(20 * 1024));
+    let decision = OverrideDecision::Active(VerifiedOverride {
+        approver: "x".repeat(20 * 1024),
+        ..verified_override()
+    });
     let note = plan_override_note(&decision);
     assert!(note.contains("[truncated]"), "{}", note.len());
     assert!(note.len() < 17 * 1024, "{}", note.len());
@@ -709,7 +780,7 @@ fn preview_and_apply_agree_on_a_resolution_only_policy_finding() {
         assert_eq!(plan_blocks, apply_refuses, "{decision:?}");
         assert!(plan_blocks, "{decision:?}");
 
-        if decision.is_some_and(|decision| decision.active) {
+        if matches!(decision, Some(OverrideDecision::Active(_))) {
             assert!(first.is_none());
             let message = second.expect("resolution-only finding refuses");
             assert!(message.contains("appeared only after credential resolution"));
