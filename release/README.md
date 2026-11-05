@@ -181,7 +181,9 @@ documents, trust preservation, ABA, empty namespaces and confirmed spec deletion
 exact-token/body precommit retry; and no replay after ambiguous commit, audit or
 fence refusal, unsupported topology or `applied:false`. Seal the exact client SHA
 and released server bytes. Source/parser evidence alone is not enforcement.
-Existing eight advisory fixes and #458/#440 provisioning remain required; #266
-still requires a second human reviewer, the state-writer GitHub App, a disposable
-customer template repository and an HTTPS gateway acceptance run. No GitForgeOps
-tag or supported release is established by this candidate.
+Existing eight advisory fixes remain required; #266 still requires a second
+human reviewer, the state-writer GitHub App, a disposable customer template
+repository and an HTTPS gateway acceptance run. That disposable repository is
+also where viewer-capped drift monitoring (#440) is provisioned and exercised,
+because the upstream template has no gateway environment. No GitForgeOps tag or
+supported release is established by this candidate.

@@ -97,6 +97,7 @@ for later fixes.
 
 The first supported release remains blocked by #266's second human reviewer,
 state-writer GitHub App, disposable template repository and HTTPS gateway
-acceptance run. The settings audit (#458) and viewer provisioning (#440) retain
-their operational steps. This candidate does not fill publication fields,
+acceptance run, which also provisions and exercises viewer-capped drift
+monitoring (#440) in that disposable repository; the upstream template has no
+gateway environment of its own. This candidate does not fill publication fields,
 publish a GitForgeOps tag or claim human acceptance.
