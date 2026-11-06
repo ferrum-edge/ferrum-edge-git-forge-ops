@@ -14,11 +14,14 @@ ROOT = Path(__file__).parents[3]
 WORKFLOW = ROOT / ".github/workflows/state-guard.yml"
 
 
+_RUN_BLOCK_RE = re.compile(r"        run: \|\n((?:          .*\n|\n)+)")
+
+
 def workflow_step(name):
     text = WORKFLOW.read_text(encoding="utf-8")
     section = text.split(f"      - name: {name}\n", 1)[1]
     section = section.split("\n      - name:", 1)[0]
-    match = re.search(r"        run: \|\n((?:          .*\n|\n)+)", section)
+    match = _RUN_BLOCK_RE.search(section)
     if match is None:
         raise AssertionError(f"missing run block for {name}")
     return textwrap.dedent(match.group(1))

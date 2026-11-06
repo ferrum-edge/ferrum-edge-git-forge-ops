@@ -454,6 +454,12 @@ class PrInputTests(unittest.TestCase):
                     )
 
 
+_QUOTED_STRING_RE = re.compile(r'"([^"]*)"')
+_PUB_FIELD_RE = re.compile(r"^    pub (\w+):", re.MULTILINE)
+_OPTIONAL_PUB_FIELD_RE = re.compile(r'#\[serde\(skip_serializing_if[^\]]*\]\s*\n\s*pub (\w+):')
+_IMPORT_MANIFEST_FILENAME_RE = re.compile(r'pub const IMPORT_MANIFEST_FILENAME: &str = "([^"]+)";')
+
+
 class AllowlistParityTests(unittest.TestCase):
     """The Rust loader and this gate guard the same `resources/` and
     `overlays/` trees on either side of the trusted-review boundary. A file one
@@ -467,7 +473,7 @@ class AllowlistParityTests(unittest.TestCase):
     def _rust_array(self, source: str, name: str) -> list[str]:
         start = source.index(f"const {name}:")
         body = source[start : source.index("];", start)]
-        return re.findall(r'"([^"]*)"', body[body.index("=") :])
+        return _QUOTED_STRING_RE.findall(body[body.index("=") :])
 
     def test_trusted_scope_keys_match_the_rust_environment_scope(self):
         """A field added to `EnvironmentScope` must be decided about here.
@@ -485,7 +491,7 @@ class AllowlistParityTests(unittest.TestCase):
         start = source.index("pub struct EnvironmentScope {")
         body = source[start : source.index("\n}", start)]
         # Field declarations only: skip doc comments and serde attributes.
-        fields = set(re.findall(r"^    pub (\w+):", body, re.MULTILINE))
+        fields = set(_PUB_FIELD_RE.findall(body))
         self.assertTrue(fields, body)
 
         declared = pr_input.TRUSTED_SCOPE_KEYS | pr_input.TRUSTED_SCOPE_OPTIONAL_KEYS
@@ -496,12 +502,7 @@ class AllowlistParityTests(unittest.TestCase):
         )
         # A `skip_serializing_if` field may be absent from the JSON, so it
         # belongs in the optional set and nowhere else.
-        skipped = set(
-            re.findall(
-                r'#\[serde\(skip_serializing_if[^\]]*\]\s*\n\s*pub (\w+):',
-                body,
-            )
-        )
+        skipped = set(_OPTIONAL_PUB_FIELD_RE.findall(body))
         self.assertEqual(skipped, set(pr_input.TRUSTED_SCOPE_OPTIONAL_KEYS))
 
     def test_non_config_allowlist_matches_the_rust_loader(self):
@@ -527,9 +528,7 @@ class AllowlistParityTests(unittest.TestCase):
 
     def _import_manifest_filename(self) -> str:
         source = (self.REPO_ROOT / "src/import/mod.rs").read_text()
-        match = re.search(
-            r'pub const IMPORT_MANIFEST_FILENAME: &str = "([^"]+)";', source
-        )
+        match = _IMPORT_MANIFEST_FILENAME_RE.search(source)
         assert match, "IMPORT_MANIFEST_FILENAME not found in src/import/mod.rs"
         return match.group(1)
 

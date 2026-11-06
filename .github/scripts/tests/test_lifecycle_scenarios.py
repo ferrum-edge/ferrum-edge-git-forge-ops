@@ -44,6 +44,7 @@ sys.modules[SCENARIO_SPEC.name] = scenarios
 SCENARIO_SPEC.loader.exec_module(scenarios)
 
 SECRET = "an-actual-consumer-key-value-here"
+_REDIRECT_HANDLER_RE = re.compile(r"http_error_3\d{2}")
 # Cover the known statuses and any other redirect supported by the interpreter.
 REDIRECT_CODES = tuple(
     sorted(
@@ -51,7 +52,7 @@ REDIRECT_CODES = tuple(
         | {
             int(name.removeprefix("http_error_"))
             for name in dir(scenarios.urllib.request.HTTPRedirectHandler)
-            if re.fullmatch(r"http_error_3\d{2}", name)
+            if _REDIRECT_HANDLER_RE.fullmatch(name)
         }
     )
 )
@@ -602,6 +603,10 @@ class StatusMappingTests(unittest.TestCase):
         self.assertIn("distinguishable", entry["detail"])
 
 
+_MINTED_CLAIM_RE = re.compile(r'"(iss|sub|role|iat|nbf|exp|jti)":')
+_CLAIMS_FIELD_RE = re.compile(r"^    (\w+): ", re.MULTILINE)
+
+
 class IsolationTests(unittest.TestCase):
     def test_the_child_environment_is_built_not_inherited(self):
         # An inherited FERRUM_* from the operator's shell is how a "passing"
@@ -699,14 +704,12 @@ class IsolationTests(unittest.TestCase):
         # A token missing `sub`, `nbf` or `jti` is rejected with a plain 401
         # that looks exactly like a wrong secret.
         minted = (ROOT / "tests/lifecycle/admin_token.py").read_text(encoding="utf-8")
-        claims = set(
-            re.findall(r'"(iss|sub|role|iat|nbf|exp|jti)":', minted)
-        )
+        claims = set(_MINTED_CLAIM_RE.findall(minted))
         rust = (ROOT / "src/jwt.rs").read_text(encoding="utf-8")
         body = rust[rust.index("struct Claims {") : rust.index("\n}", rust.index("struct Claims {"))]
         required = {
             name
-            for name in re.findall(r"^    (\w+): ", body, re.MULTILINE)
+            for name in _CLAIMS_FIELD_RE.findall(body)
             # `aud` and `ns` are `skip_serializing_if` — emitted only when
             # configured, and a stray one is itself a rejection.
             if name not in {"aud", "ns"}
@@ -719,6 +722,9 @@ class IsolationTests(unittest.TestCase):
         source = (ROOT / "tests/lifecycle/upstream.py").read_text(encoding="utf-8")
         self.assertIn("def log_message", source)
         self.assertNotIn("self.headers", source)
+
+
+_FAULTED_APPLY_CALL_RE = re.compile(r"_faulted_apply\(\s*harness, proxy, fault,")
 
 
 class FaultProxyTests(unittest.TestCase):
@@ -959,7 +965,7 @@ class FaultProxyTests(unittest.TestCase):
         body = source[start : source.index("\n\n\nSCENARIOS", start)]
         self.assertEqual(
             body.count("proxy.inject("),
-            len(re.findall(r"_faulted_apply\(\s*harness, proxy, fault,", body)),
+            len(_FAULTED_APPLY_CALL_RE.findall(body)),
         )
         self.assertGreaterEqual(body.count("proxy.inject("), 5)
         helper = body[body.index("def _faulted_apply(") : body.index("def _row(")]

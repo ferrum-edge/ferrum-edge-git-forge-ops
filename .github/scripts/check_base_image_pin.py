@@ -212,6 +212,9 @@ def logical_lines(text: str) -> list[str]:
     return [line for line in joined if line]
 
 
+_PACKAGE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9+.-]*")
+
+
 def parse_purged(text: str) -> list[str]:
     """Package names the runtime stage purges from the pinned base."""
     purged: list[str] = []
@@ -221,7 +224,7 @@ def parse_purged(text: str) -> list[str]:
         for token in line.split():
             if token in {"RUN", "dpkg"} or token.startswith("-"):
                 continue
-            if re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", token):
+            if _PACKAGE_NAME_RE.fullmatch(token):
                 purged.append(token)
     return purged
 

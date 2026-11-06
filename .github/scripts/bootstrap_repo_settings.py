@@ -302,6 +302,9 @@ def _mapping_entry(stripped: str) -> tuple[str, str] | None:
     return key, (match["value"] or "").strip()
 
 
+_YAML_ANCHOR_RE = re.compile(r"&[^\s{}\[\],]+")
+
+
 def _environment_entries(
     text: str,
 ) -> list[tuple[str, str, list[tuple[int, int, str]]]]:
@@ -389,7 +392,7 @@ def _environment_entries(
             )
         # Only an empty mapping (or none, or a bare anchor) can be read
         # inline; anything else could hide a setting such as monitoring.
-        if value not in ("", "{}", "~", "null") and not re.fullmatch(r"&[^\s{}\[\],]+", value):
+        if value not in ("", "{}", "~", "null") and not _YAML_ANCHOR_RE.fullmatch(value):
             raise ValueError(
                 f"config line {number}: write environment {name!r}'s settings as a "
                 "block mapping (one `key:` per line); bootstrap reads only "
