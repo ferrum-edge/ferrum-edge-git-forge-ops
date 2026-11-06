@@ -580,14 +580,20 @@ class MainTests(unittest.TestCase):
         self.assertEqual(code, 2)
 
 
+_STEP_IF_RE = re.compile(r"^        if: (.+)$", re.MULTILINE)
+
+
 def step_condition(name):
     """The `if:` of the canary step called `name`."""
     text = WORKFLOW.read_text(encoding="utf-8")
     section = text.split(f"      - name: {name}\n", 1)[1].split("\n      - name:", 1)[0]
-    match = re.search(r"^        if: (.+)$", section, re.MULTILINE)
+    match = _STEP_IF_RE.search(section)
     if match is None:
         raise AssertionError(f"missing if: for {name}")
     return match.group(1)
+
+
+_STATE_TERM_RE = re.compile(r"steps\.evaluate\.outputs\.state (==|!=) '([a-z-]+)'")
 
 
 def runs_for(condition, state):
@@ -596,12 +602,18 @@ def runs_for(condition, state):
     terms = condition.split(" || ")
     results = []
     for term in terms:
-        match = re.fullmatch(r"steps\.evaluate\.outputs\.state (==|!=) '([a-z-]+)'", term)
+        match = _STATE_TERM_RE.fullmatch(term)
         if match is None:
             raise AssertionError(f"unexpected condition term: {term!r}")
         operator, value = match.groups()
         results.append((state == value) if operator == "==" else (state != value))
     return any(results)
+
+
+_STATE_CASE_RE = re.compile(
+    r'^          case "\$STATE" in\n            ([a-z|]+)\) ;;$',
+    re.MULTILINE,
+)
 
 
 class WorkflowRoutingTests(unittest.TestCase):
@@ -638,7 +650,7 @@ class WorkflowRoutingTests(unittest.TestCase):
         # Read from the step output through env, never from the output file.
         self.assertIn("STATE: ${{ steps.evaluate.outputs.state }}", section)
         self.assertNotIn("GITHUB_OUTPUT", section)
-        match = re.search(r'^          case "\$STATE" in\n            ([a-z|]+)\) ;;$', section, re.MULTILINE)
+        match = _STATE_CASE_RE.search(section)
         self.assertIsNotNone(match, "the guard must enumerate the checker's states")
         self.assertEqual(set(match.group(1).split("|")), {state.value for state in State})
 

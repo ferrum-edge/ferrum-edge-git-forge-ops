@@ -18,6 +18,9 @@ RUN_URL = re.compile(
 )
 
 
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
+
 def check(root: Path) -> list[str]:
     issues: list[str] = []
     try:
@@ -65,7 +68,7 @@ def check(root: Path) -> list[str]:
     if (
         pin != gateway_binary
         or not isinstance(pin, str)
-        or not re.fullmatch(r"[0-9a-f]{64}", pin)
+        or not _SHA256_HEX_RE.fullmatch(pin)
     ):
         issues.append("tested gateway binary must match the validator SHA-256")
     asset = validator.get("asset")

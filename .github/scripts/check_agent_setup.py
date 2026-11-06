@@ -161,21 +161,28 @@ def frontmatter_name(path: Path, text: str) -> tuple[str | None, list[str]]:
     return name.group(1), errors
 
 
+_PATHS_KEY_RE = re.compile(r"paths:\s*")
+_PATHS_ITEM_RE = re.compile(r"\s+-\s+(.+?)\s*")
+
+
 def frontmatter_paths(body: str) -> list[str]:
     paths: list[str] = []
     in_paths = False
     for line in body.splitlines():
-        if re.fullmatch(r"paths:\s*", line):
+        if _PATHS_KEY_RE.fullmatch(line):
             in_paths = True
             continue
         if not in_paths:
             continue
         if line and not line[0].isspace():
             break
-        item = re.fullmatch(r"\s+-\s+(.+?)\s*", line)
+        item = _PATHS_ITEM_RE.fullmatch(line)
         if item is not None:
             paths.append(item.group(1).strip("'\""))
     return paths
+
+
+_BRACE_GROUP_RE = re.compile(r"\{([^{}]+)\}")
 
 
 def expand_braces(pattern: str) -> list[str]:
@@ -184,7 +191,7 @@ def expand_braces(pattern: str) -> list[str]:
         next_expanded: list[str] = []
         changed = False
         for candidate in expanded:
-            match = re.search(r"\{([^{}]+)\}", candidate)
+            match = _BRACE_GROUP_RE.search(candidate)
             if match is None:
                 next_expanded.append(candidate)
                 continue
@@ -260,13 +267,14 @@ def skill_directories(root: Path, parent: Path, label: str) -> tuple[list[Path],
     return directories, violations
 
 
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
 def validate_markdown_links(root: Path, source: Path, text: str) -> list[str]:
     violations: list[str] = []
     for match in MARKDOWN_LINK.finditer(text):
         target = match.group("target").strip("<>")
-        if target.startswith(("#", "//")) or re.match(
-            r"^[A-Za-z][A-Za-z0-9+.-]*:", target
-        ):
+        if target.startswith(("#", "//")) or _URL_SCHEME_RE.match(target):
             continue
         target = target.split("#", 1)[0].split("?", 1)[0]
         if not target:
@@ -336,6 +344,9 @@ def yaml_list(block: str, key: str, indent: int) -> set[str] | None:
     return None
 
 
+_BRANCHES_FILTER_RE = re.compile(r"(?m)^\s{4}branches(?:-ignore)?:")
+
+
 def validate_workflow_file(
     root: Path,
     name: str,
@@ -360,7 +371,7 @@ def validate_workflow_file(
             violations.append(
                 f"{relative}: {event} types must be exactly {sorted(PULL_REQUEST_TYPES)}"
             )
-        if re.search(r"(?m)^\s{4}branches(?:-ignore)?:", event_block):
+        if _BRANCHES_FILTER_RE.search(event_block):
             violations.append(
                 f"{relative}: {event} must cover non-main and stacked pull requests"
             )

@@ -56,6 +56,19 @@ STDIN_CLASSIFIER = (
 )
 
 
+_HEREDOC_OPERATOR_RE = re.compile(r"(?<!<)<<(?!<)")
+_ACTION_SHA_RE = re.compile(r"@[0-9a-f]{40}")
+_SECRETS_KEY_RE = re.compile(r"^\s*-?\s*secrets\s*:", re.MULTILINE | re.IGNORECASE)
+_FIXTURE_LOOP_RE = re.compile(r"^for fixture in ([^;]+); do$", re.MULTILINE)
+_SECRETS_EXPRESSION_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b")
+_LOADER_SHARD_LIMIT_RE = re.compile(r"^MAX_BUNDLE_SHARDS = (\d+)$", re.MULTILINE)
+_LOAD_BUNDLES_STEP_RE = re.compile(
+    r"      - name: Load credential bundles\n.*?(?=      - name: )",
+    re.DOTALL,
+)
+_CONCURRENCY_KEY_RE = re.compile(r"^\s*concurrency\s*:", re.MULTILINE)
+
+
 class SupplyChainPolicyTests(unittest.TestCase):
     def test_required_job_shapes_allow_pinned_rust_patch_release(self):
         for workflow, shape_check in (
@@ -526,7 +539,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 with self.subTest(entry=entry):
                     self.assertTrue(self._closes_its_quotes(entry))
                     self.assertFalse(entry.endswith("\\"))
-                    self.assertIsNone(re.search(r"(?<!<)<<(?!<)", entry))
+                    self.assertIsNone(_HEREDOC_OPERATOR_RE.search(entry))
                     for line in entry.split("\n"):
                         self.assertEqual(line, line.strip(" \t"))
                         self.assertNotEqual(line, "")
@@ -2551,7 +2564,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         )
         job = check_supply_chain.workflow_job(workflow, "security-cargo-audit")
         self.assertIn("toolchain: 1.99.1", job)
-        bumped_job = re.sub(r"@[0-9a-f]{40}", "@" + "a" * 40, job).replace(
+        bumped_job = _ACTION_SHA_RE.sub("@" + "a" * 40, job).replace(
             "toolchain: 1.99.1", "toolchain: 1.100.0"
         )
         self.assertNotEqual(bumped_job, job)
@@ -4317,7 +4330,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     yield from secret_keys(item, path + (index,))
 
         self.assertEqual(list(secret_keys(document)), [])
-        self.assertIsNone(re.search(r"^\s*-?\s*secrets\s*:", workflow, re.MULTILINE | re.IGNORECASE))
+        self.assertIsNone(_SECRETS_KEY_RE.search(workflow))
         self.assertEqual(check_supply_chain.installer_step_auth_violations(workflow_path, workflow), [])
         self.assertEqual(check_supply_chain.validator_locator_violations([workflow]), [])
         self.assertEqual(check_supply_chain.status_write_permission_violations(workflow_path, document), [])
@@ -4371,7 +4384,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
 
         # Every recorded producer input is generated, from the pinned checkout.
         generate = steps["Generate Alloy GitForgeOps fixture trees"]
-        loop = re.search(r"^for fixture in ([^;]+); do$", generate["run"], re.MULTILINE)
+        loop = _FIXTURE_LOOP_RE.search(generate["run"])
         self.assertIsNotNone(loop)
         self.assertEqual(
             loop.group(1).split(),
@@ -4803,7 +4816,6 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         # but the whole-context forms — which hand over EVERY environment
         # secret at once — were allowed everywhere else, which is where the
         # privileged workflows actually used them.
-        pattern = re.compile(r"\$\{\{[^}]*\bsecrets\b")
         for leak in (
             "${{ toJSON(secrets) }}",
             "${{ fromJSON(toJSON(secrets)) }}",
@@ -4811,13 +4823,15 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "${{ secrets.FERRUM_GATEWAY_URL }}",
             "${{ secrets['FERRUM_GATEWAY_URL'] }}",
         ):
-            self.assertRegex(leak, pattern, f"{leak} must be treated as a secret leak")
+            self.assertRegex(
+                leak, _SECRETS_EXPRESSION_RE, f"{leak} must be treated as a secret leak"
+            )
         for benign in (
             "# secrets never reach this job",
             "${{ github.token }}",
             "${{ vars.GITFORGEOPS_STATE_APP_ID }}",
         ):
-            self.assertNotRegex(benign, pattern)
+            self.assertNotRegex(benign, _SECRETS_EXPRESSION_RE)
 
     def test_only_named_secret_references_survive_in_any_workflow(self):
         # validate-pr.yml must receive NO secrets; every other workflow may
@@ -4932,9 +4946,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             root = self._mirror_repo(Path(directory))
             loader = root / ".github/scripts/credential_bundles.py"
             text = loader.read_text(encoding="utf-8")
-            limit = int(
-                re.search(r"^MAX_BUNDLE_SHARDS = (\d+)$", text, re.MULTILINE).group(1)
-            )
+            limit = int(_LOADER_SHARD_LIMIT_RE.search(text).group(1))
             loader.write_text(
                 text.replace(
                     f"MAX_BUNDLE_SHARDS = {limit}",
@@ -5088,11 +5100,9 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             root = self._mirror_repo(Path(directory))
             path = root / ".github/workflows/apply-on-merge.yml"
             text = path.read_text(encoding="utf-8")
-            text = re.sub(
-                r"      - name: Load credential bundles\n.*?(?=      - name: )",
+            text = _LOAD_BUNDLES_STEP_RE.sub(
                 "      - name: Load credential bundles\n        run: ':'\n",
                 text,
-                flags=re.DOTALL,
             )
             self.assertNotIn(check_supply_chain.BUNDLE_SECRET_BINDING, text)
             path.write_text(text, encoding="utf-8")
@@ -5255,7 +5265,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
         self.assertEqual(check_supply_chain.state_guard_trigger_violations(text), [])
         self.assertFalse(check_supply_chain.declares_concurrency(text))
-        self.assertNotRegex(text, re.compile(r"^\s*concurrency\s*:", re.MULTILINE))
+        self.assertNotRegex(text, _CONCURRENCY_KEY_RE)
 
     def test_shipped_state_guard_rechecks_before_recording_an_override(self):
         text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
@@ -7952,6 +7962,9 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         ]
 
 
+_INSTALL_ACTION_PIN_RE = re.compile(r"(taiki-e/install-action@)[0-9a-f]{40} # v\d+\.\d+\.\d+")
+
+
 class Issue562PinnedFormTests(unittest.TestCase):
     """#562: pinned jobs are bounded and isolated; the forms they replaced are refused."""
 
@@ -8014,11 +8027,7 @@ class Issue562PinnedFormTests(unittest.TestCase):
         # A release no workflow pins, so the bump differs whatever the
         # reviewed workflow currently uses. Only the masked form is compared;
         # the pin itself is judged by other rules.
-        bumped = re.sub(
-            r"(taiki-e/install-action@)[0-9a-f]{40} # v\d+\.\d+\.\d+",
-            r"\g<1>" + "f" * 40 + " # v99.0.0",
-            reviewed,
-        )
+        bumped = _INSTALL_ACTION_PIN_RE.sub(r"\g<1>" + "f" * 40 + " # v99.0.0", reviewed)
         self.assertNotEqual(bumped, reviewed)
         self.assertEqual(check_supply_chain.rust_ci_test_scope_violations(bumped), [])
         # Only a release tag is masked; other text after the pin still counts.

@@ -592,6 +592,9 @@ def secret_name_case_violations(workflow: str, text: str) -> list[str]:
     return violations
 
 
+_SECRETS_INHERIT_RE = re.compile(r"^\s*secrets\s*:\s*inherit\s*$", re.MULTILINE)
+
+
 def whole_secrets_context_violations(workflow: str, text: str) -> list[str]:
     """Every `secrets` reference must name exactly one secret.
 
@@ -619,7 +622,7 @@ def whole_secrets_context_violations(workflow: str, text: str) -> list[str]:
         violations.append(
             f"{workflow}: only `secrets.<NAME>` may be referenced, not {leak!r}"
         )
-    if re.search(r"^\s*secrets\s*:\s*inherit\s*$", text, re.MULTILINE):
+    if _SECRETS_INHERIT_RE.search(text):
         violations.append(
             f"{workflow}: a called workflow must not inherit the whole secrets context"
         )
@@ -665,6 +668,12 @@ def credential_shard_limit(root: Path) -> tuple[int | None, list[str]]:
     return (rust_limit if rust_limit == loader_limit else None), violations
 
 
+_IMPORT_SHARD_CEILING_RE = re.compile(
+    r'if\s+shard\s*>=\s*MAX_BUNDLE_SHARDS\s*\{\s*'
+    r'return\s+Err\(shard_ceiling_error\(slot,\s*"import"\)\);\s*\}'
+)
+
+
 def import_shard_ceiling_violations(root: Path) -> list[str]:
     """Keep import packing on the same named-shard ceiling as allocation."""
     path = root / "src/import/mod.rs"
@@ -672,11 +681,7 @@ def import_shard_ceiling_violations(root: Path) -> list[str]:
     start = source.find("fn render_migration_bundles(")
     end = source.find("\nfn ", start + 1) if start >= 0 else -1
     packing = source[start:end if end >= 0 else None] if start >= 0 else ""
-    if not re.search(
-        r'if\s+shard\s*>=\s*MAX_BUNDLE_SHARDS\s*\{\s*'
-        r'return\s+Err\(shard_ceiling_error\(slot,\s*"import"\)\);\s*\}',
-        packing,
-    ):
+    if not _IMPORT_SHARD_CEILING_RE.search(packing):
         return [
             "src/import/mod.rs: migration packing must refuse shard >= "
             "MAX_BUNDLE_SHARDS with the shared shard_ceiling_error"
@@ -971,11 +976,17 @@ def _contains_run(lines: list[str], family: tuple[str, ...]) -> bool:
     )
 
 
+_STEP_START_OR_CHECKOUT_RE = re.compile(
+    r"^      - (?:name:.*|uses: actions/checkout@)",
+    re.MULTILINE,
+)
+
+
 def _checkout_before(body: str, guard_index: int) -> str | None:
     """The last `actions/checkout` step in this job before the guard."""
     matches = [
         match
-        for match in re.finditer(r"^      - (?:name:.*|uses: actions/checkout@)", body, re.MULTILINE)
+        for match in _STEP_START_OR_CHECKOUT_RE.finditer(body)
         if match.start() < guard_index
     ]
     for match in reversed(matches):
@@ -1377,6 +1388,14 @@ def cache_trust_split_violations(root: Path) -> list[str]:
     return violations
 
 
+_GITFORGEOPS_COMMAND_RE = re.compile(r"gitforgeops [a-z-]+[^\n]*")
+_MONITORING_WRITE_PERMISSION_RE = re.compile(
+    r"^\s+(?:contents|packages|id-token|actions|pull-requests|deployments|"
+    r"issues|statuses|checks|security-events):\s*write\s*$",
+    re.MULTILINE,
+)
+
+
 def monitoring_workflow_violations(text: str) -> list[str]:
     """Unattended monitoring must be able to read a gateway and nothing else.
 
@@ -1400,7 +1419,7 @@ def monitoring_workflow_violations(text: str) -> list[str]:
                 f"{secret!r}; it runs in an environment with no required "
                 "reviewer, so its authority must stop at reading the gateway"
             )
-    for command in re.findall(r"gitforgeops [a-z-]+[^\n]*", text):
+    for command in _GITFORGEOPS_COMMAND_RE.findall(text):
         subcommand = command.split()[1]
         if subcommand in {"envs", "version"}:
             # Enumeration runs in the unprivileged job that binds no
@@ -1416,12 +1435,7 @@ def monitoring_workflow_violations(text: str) -> list[str]:
             f"{MONITORING_WORKFLOW}: the drift job must run "
             f"{MONITORING_ALLOWED_COMMAND!r}"
         )
-    write_permission = re.compile(
-        r"^\s+(?:contents|packages|id-token|actions|pull-requests|deployments|"
-        r"issues|statuses|checks|security-events):\s*write\s*$",
-        re.MULTILINE,
-    )
-    if write_permission.search(text):
+    if _MONITORING_WRITE_PERMISSION_RE.search(text):
         violations.append(
             f"{MONITORING_WORKFLOW}: monitoring must hold no write permission"
         )
@@ -1487,6 +1501,9 @@ def trusted_classifier_violations(
     return violations
 
 
+_EDITED_TYPE_RE = re.compile(r"^    types: \[[^\n]*\bedited\b", re.MULTILINE)
+
+
 def pull_request_trigger_violations(
     workflow: str, text: str, trigger: str = "pull_request"
 ) -> list[str]:
@@ -1499,7 +1516,7 @@ def pull_request_trigger_violations(
     if match is None:
         return [f"{workflow}: {trigger} trigger is missing"]
     body = match.group("body")
-    if not re.search(r"^    types: \[[^\n]*\bedited\b", body, re.MULTILINE):
+    if not _EDITED_TYPE_RE.search(body):
         violations.append(
             f"{workflow}: {trigger} trigger must rerun on base-retarget edits"
         )
@@ -1508,6 +1525,10 @@ def pull_request_trigger_violations(
             f"{workflow}: {trigger} trigger must target only protected main"
         )
     return violations
+
+
+_PULL_REQUEST_TRIGGER_RE = re.compile(r"^  pull_request:\s*$", re.MULTILINE)
+_CHECKOUT_USES_RE = re.compile(r"^\s*(?:-\s*)?uses:\s*actions/checkout@", re.MULTILINE)
 
 
 def state_guard_trigger_violations(text: str) -> list[str]:
@@ -1525,7 +1546,7 @@ def state_guard_trigger_violations(text: str) -> list[str]:
     violations = pull_request_trigger_violations(
         "state-guard.yml", text, "pull_request_target"
     )
-    if re.search(r"^  pull_request:\s*$", text, re.MULTILINE):
+    if _PULL_REQUEST_TRIGGER_RE.search(text):
         violations.append(
             "state-guard.yml: the guard must not also accept the head-loaded pull_request trigger"
         )
@@ -1538,7 +1559,7 @@ def state_guard_trigger_violations(text: str) -> list[str]:
             violations.append(
                 f"state-guard.yml: pull_request_target must never check out {untrusted_ref}"
             )
-    checkouts = re.findall(r"^\s*(?:-\s*)?uses:\s*actions/checkout@", text, re.MULTILINE)
+    checkouts = _CHECKOUT_USES_RE.findall(text)
     if len(checkouts) != 1:
         violations.append(
             "state-guard.yml: exactly one checkout is permitted, and it must name the default branch"
@@ -1625,6 +1646,10 @@ def state_guard_helper_violations(text: str) -> list[str]:
     return ["state-guard.yml: classifier execution must use the trusted helper variable"]
 
 
+_CONTINUE_ON_ERROR_RE = re.compile(r"^\s*continue-on-error\s*:", re.MULTILINE)
+_IF_CONDITION_RE = re.compile(r"^\s*if:\s*(.*?)\s*$", re.MULTILINE)
+
+
 def state_guard_override_recheck_violations(text: str) -> list[str]:
     """An authorized override must be re-confirmed right before it reports."""
     step = named_step(text, STATE_GUARD_RECORD_STEP)
@@ -1638,11 +1663,11 @@ def state_guard_override_recheck_violations(text: str) -> list[str]:
         violations.append(
             f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must run under set -euo pipefail"
         )
-    if re.search(r"^\s*continue-on-error\s*:", active_step, re.MULTILINE):
+    if _CONTINUE_ON_ERROR_RE.search(active_step):
         violations.append(
             f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must not use continue-on-error"
         )
-    conditions = re.findall(r"^\s*if:\s*(.*?)\s*$", active_step, re.MULTILINE)
+    conditions = _IF_CONDITION_RE.findall(active_step)
     if conditions != [STATE_GUARD_RECORD_IF]:
         violations.append(
             f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must keep its if: condition pinned"
@@ -1675,21 +1700,23 @@ def rust_toolchain_violations(workflow: str, text: str, channel: str) -> list[st
     install the action's floating default while the first step's pin keeps the
     workflow green. Match every step against the repository pin instead.
     """
+    toolchain_line = re.compile(rf"^\s*toolchain:\s*{re.escape(channel)}\s*$", re.MULTILINE)
     for step in STEP_SPLIT.split(text):
         if "dtolnay/rust-toolchain@" not in step:
             continue
-        if not re.search(
-            rf"^\s*toolchain:\s*{re.escape(channel)}\s*$", step, re.MULTILINE
-        ):
+        if not toolchain_line.search(step):
             return [
                 f"{workflow}: every dtolnay/rust-toolchain step must select exact toolchain {channel}"
             ]
     return []
 
 
+_CARGO_TOOLCHAIN_OVERRIDE_RE = re.compile(r"\bcargo\s+\+(\d+\.\d+\.\d+)(?=\s|$)")
+
+
 def cargo_toolchain_violations(workflow: str, text: str, channel: str) -> list[str]:
     """Keep explicit cargo toolchain overrides aligned with the repo channel."""
-    for match in re.finditer(r"\bcargo\s+\+(\d+\.\d+\.\d+)(?=\s|$)", text):
+    for match in _CARGO_TOOLCHAIN_OVERRIDE_RE.finditer(text):
         if match.group(1) != channel:
             return [
                 f"{workflow}: explicit cargo toolchain overrides must match "
@@ -1722,6 +1749,12 @@ def read_rust_toolchain_channel(path: Path) -> str | None:
     return channel
 
 
+_DOCKERFILE_PARSER_DIRECTIVE_RE = re.compile(r"^[ \t]*#[ \t]*(syntax|escape|check)[ \t]*=", re.I)
+_LINE_CONTINUATION_RE = re.compile(r"(?<!\\)\\[ \t]*$|^\\[ \t]*$")
+_TRAILING_CONTINUATION_RE = re.compile(r"\\[ \t]*$")
+_DOCKERFILE_INSTRUCTION_RE = re.compile(r"^([A-Za-z]+)(?:\s+(.*))?$")
+
+
 def dockerfile_instructions(text: str) -> list[str] | None:
     """Return Dockerfile logical instructions, refusing ambiguous syntax.
 
@@ -1748,7 +1781,7 @@ def dockerfile_instructions(text: str) -> list[str] | None:
         return None
 
     for line in lines:
-        directive = re.match(r"^[ \t]*#[ \t]*(syntax|escape|check)[ \t]*=", line, re.I)
+        directive = _DOCKERFILE_PARSER_DIRECTIVE_RE.match(line)
         if directive is None:
             continue
         return None
@@ -1784,9 +1817,9 @@ def dockerfile_instructions(text: str) -> list[str] | None:
 
         logical = stripped.rstrip(" \t")
         while True:
-            if not re.search(r"(?<!\\)\\[ \t]*$|^\\[ \t]*$", logical):
+            if not _LINE_CONTINUATION_RE.search(logical):
                 break
-            logical = re.sub(r"\\[ \t]*$", "", logical)
+            logical = _TRAILING_CONTINUATION_RE.sub("", logical)
             if index >= len(lines):
                 return None
             continuation = lines[index]
@@ -1796,12 +1829,20 @@ def dockerfile_instructions(text: str) -> list[str] | None:
                 continue
             logical += " " + continuation.rstrip(" \t")
 
-        instruction = re.match(r"^([A-Za-z]+)(?:\s+(.*))?$", logical)
+        instruction = _DOCKERFILE_INSTRUCTION_RE.match(logical)
         if instruction is None or instruction.group(1).upper() not in supported_instructions:
             return None
         instructions.append(logical)
 
     return instructions
+
+
+_FROM_KEYWORD_RE = re.compile(r"^FROM\b", re.IGNORECASE)
+_FROM_ARGUMENTS_RE = re.compile(
+    r"(?:--platform=\S+[ \t]+)?(\S+)(?:[ \t]+AS[ \t]+([A-Za-z0-9_.-]+))?",
+    re.IGNORECASE,
+)
+_FROM_LINE_RE = re.compile(r"^FROM[ \t]+(.*)$", re.IGNORECASE)
 
 
 def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
@@ -1818,24 +1859,20 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
         if physical_line.endswith("\r"):
             physical_line = physical_line[:-1]
         candidate = physical_line.lstrip(" \t")
-        if re.match(r"^FROM\b", candidate, re.IGNORECASE):
+        if _FROM_KEYWORD_RE.match(candidate):
             physical_froms.append(candidate)
 
     def check_from(arguments: str) -> tuple[str, str | None] | None:
         if arguments.endswith("\\"):
             return None
-        match = re.fullmatch(
-            r"(?:--platform=\S+[ \t]+)?(\S+)(?:[ \t]+AS[ \t]+([A-Za-z0-9_.-]+))?",
-            arguments,
-            re.IGNORECASE,
-        )
+        match = _FROM_ARGUMENTS_RE.fullmatch(arguments)
         if match is None or "$" in match.group(1):
             return None
         return match.group(1), match.group(2)
 
     checked_physical_froms: list[tuple[str, str | None]] = []
     for line in physical_froms:
-        parsed = re.match(r"^FROM[ \t]+(.*)$", line, re.IGNORECASE)
+        parsed = _FROM_LINE_RE.match(line)
         checked = check_from(parsed.group(1)) if parsed else None
         if checked is None:
             return ["Dockerfile: could not parse FROM instruction"]
@@ -1844,7 +1881,7 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
     checked_logical_froms: list[tuple[str, str | None]] = []
     builder_count = 0
     for instruction in instructions:
-        parsed_instruction = re.match(r"^([A-Za-z]+)(?:\s+(.*))?$", instruction)
+        parsed_instruction = _DOCKERFILE_INSTRUCTION_RE.match(instruction)
         if parsed_instruction is None:
             return ["Dockerfile: could not parse Dockerfile instructions"]
         if parsed_instruction.group(1).upper() != "FROM":
@@ -1861,6 +1898,7 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
 
     builder_uses_rust = False
     rust_image_found = False
+    channel_tag = re.compile(rf"{re.escape(channel)}(?:-[A-Za-z0-9_.-]+)?")
     # Physical lines can be shell text or heredoc data. They still must not
     # contain a Rust image on a different channel. Logical instructions are
     # also checked because a continued FROM can hide its image from the
@@ -1875,9 +1913,7 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
         tagged = image_name.startswith("rust:")
         tag_and_digest = image_name[len("rust:") :] if tagged else ""
         tag = tag_and_digest.split("@", 1)[0]
-        if not tagged or not re.fullmatch(
-            rf"{re.escape(channel)}(?:-[A-Za-z0-9_.-]+)?", tag
-        ):
+        if not tagged or not channel_tag.fullmatch(tag):
             violations.append(
                 "Dockerfile: every Rust base image version must match "
                 f"rust-toolchain.toml channel {channel}"
@@ -1888,6 +1924,12 @@ def docker_builder_toolchain_violations(text: str, channel: str) -> list[str]:
     if not rust_image_found or not builder_uses_rust:
         violations.append("Dockerfile: builder stage must use a Rust base image")
     return violations
+
+
+_ACTION_SHA_SUFFIX_RE = re.compile(r"@[0-9a-f]{40}\b")
+_INSTALL_ACTION_RELEASE_RE = re.compile(r"(taiki-e/install-action@<sha> # )v\d+\.\d+\.\d+$")
+_PINNED_RUST_COMMENT_RE = re.compile(r"(# pinned action; Rust )\d+\.\d+\.\d+$")
+_TOOLCHAIN_VERSION_LINE_RE = re.compile(r"^(\s+toolchain: )\d+\.\d+\.\d+$")
 
 
 def _verbatim_job_lines(block: str) -> list[str]:
@@ -1907,24 +1949,16 @@ def _verbatim_job_lines(block: str) -> list[str]:
     for raw_line in block.splitlines():
         if not raw_line.strip():
             continue
-        line = re.sub(r"@[0-9a-f]{40}\b", "@<sha>", raw_line.rstrip())
-        line = re.sub(
-            r"(taiki-e/install-action@<sha> # )v\d+\.\d+\.\d+$",
-            r"\g<1><install-action release>",
-            line,
-        )
-        line = re.sub(
-            r"(# pinned action; Rust )\d+\.\d+\.\d+$",
-            r"\g<1><rust toolchain>",
-            line,
-        )
-        line = re.sub(
-            r"^(\s+toolchain: )\d+\.\d+\.\d+$",
-            r"\g<1><rust toolchain>",
-            line,
-        )
+        line = _ACTION_SHA_SUFFIX_RE.sub("@<sha>", raw_line.rstrip())
+        line = _INSTALL_ACTION_RELEASE_RE.sub(r"\g<1><install-action release>", line)
+        line = _PINNED_RUST_COMMENT_RE.sub(r"\g<1><rust toolchain>", line)
+        line = _TOOLCHAIN_VERSION_LINE_RE.sub(r"\g<1><rust toolchain>", line)
         lines.append(line)
     return lines
+
+
+_WORKFLOW_ENV_RE = re.compile(r"^env\s*:", re.MULTILINE)
+_DEFAULTS_KEY_RE = re.compile(r"^\s*defaults\s*:", re.MULTILINE)
 
 
 def _workflow_level_gate_violations(label: str, text: str) -> list[str]:
@@ -1935,12 +1969,12 @@ def _workflow_level_gate_violations(label: str, text: str) -> list[str]:
     changing a byte of the pinned job text.
     """
     violations: list[str] = []
-    if re.search(r"^env\s*:", text, re.MULTILINE):
+    if _WORKFLOW_ENV_RE.search(text):
         violations.append(
             f"{label}: workflow-level env: would reach the pinned "
             "required gate jobs; keep environment inside the reviewed jobs"
         )
-    if re.search(r"^\s*defaults\s*:", text, re.MULTILINE):
+    if _DEFAULTS_KEY_RE.search(text):
         violations.append(
             f"{label}: defaults: at workflow or job level would reach the "
             "pinned required gate jobs' run steps (a bypass shell skips "
@@ -2601,6 +2635,12 @@ def installer_step_auth_violations(workflow: str, text: str) -> list[str]:
     return []
 
 
+_TRUSTED_INSTALLER_COMMAND_RE = re.compile(
+    r"bash trusted-validator/\.github/scripts/install-ferrum-edge\.sh "
+    r"\S+ \.github/ferrum-edge-checksums\.txt"
+)
+
+
 def untrusted_pr_installer_violations(text: str) -> list[str]:
     """Keep the PR token out of scripts supplied by the candidate checkout.
 
@@ -2648,11 +2688,7 @@ def untrusted_pr_installer_violations(text: str) -> list[str]:
     # step actually runs rather than the way it happens to be wrapped. A
     # prose mention of the allowlist in a comment cannot satisfy it.
     command = " ".join(install.replace("\\\n", " ").split())
-    if not re.search(
-        r"bash trusted-validator/\.github/scripts/install-ferrum-edge\.sh "
-        r"\S+ \.github/ferrum-edge-checksums\.txt",
-        command,
-    ):
+    if not _TRUSTED_INSTALLER_COMMAND_RE.search(command):
         violations.append(
             "validate-pr.yml: the trusted installer must run with the candidate's "
             "reviewed digest allowlist as its second argument"
@@ -2662,6 +2698,9 @@ def untrusted_pr_installer_violations(text: str) -> list[str]:
             "validate-pr.yml: candidate-checkout installer must not receive the GitHub token"
         )
     return violations
+
+
+_JOB_BOUNDARY_RE = re.compile(r"^ {0,2}(?!#)\S", re.MULTILINE)
 
 
 def workflow_job(text: str, job: str) -> str:
@@ -2676,9 +2715,10 @@ def workflow_job(text: str, job: str) -> str:
     matches = list(re.finditer(rf"^  {re.escape(job)}:\n", text, re.MULTILINE))
     if len(matches) != 1:
         return ""
-    return re.split(
-        r"^ {0,2}(?!#)\S", text[matches[0].end():], maxsplit=1, flags=re.MULTILINE
-    )[0]
+    return _JOB_BOUNDARY_RE.split(text[matches[0].end():], maxsplit=1)[0]
+
+
+_STEP_BOUNDARY_RE = re.compile(r"^      - ", re.MULTILINE)
 
 
 def policy_step(job: str, name: str) -> list[str]:
@@ -2690,7 +2730,7 @@ def policy_step(job: str, name: str) -> list[str]:
     """
     steps = [
         step
-        for step in re.split(r"^      - ", job, flags=re.MULTILINE)[1:]
+        for step in _STEP_BOUNDARY_RE.split(job)[1:]
         if step.startswith(f"name: {name}\n")
     ]
     if len(steps) != 1:
@@ -2765,6 +2805,9 @@ def trusted_validator_probe_violations(text: str) -> list[str]:
     return violations
 
 
+_CARGO_INSTALL_RE = re.compile(r"\bcargo\s+(?:install|binstall)\b")
+
+
 def cargo_audit_install_violations(text: str) -> list[str]:
     """Pin the installer and manifest-backed tool; never restore an executable."""
     job = workflow_job(text, "security-cargo-audit")
@@ -2788,7 +2831,7 @@ def cargo_audit_install_violations(text: str) -> list[str]:
         )
     if any("cache" in reference.lower() for reference in USES.findall(job)):
         violations.append("security.yml: cargo-audit must not restore the old executable cache")
-    if re.search(r"\bcargo\s+(?:install|binstall)\b", job):
+    if _CARGO_INSTALL_RE.search(job):
         violations.append("security.yml: cargo-audit must not use a registry install fallback")
     if not (
         0 <= job.find("- name: Install cargo-audit")
@@ -2798,16 +2841,20 @@ def cargo_audit_install_violations(text: str) -> list[str]:
     return violations
 
 
+_PUSH_TRIGGER_BLOCK_RE = re.compile(r"^  push:\n((?:^    .*\n)*)", re.MULTILINE)
+_PUSH_PATHS_LIST_RE = re.compile(r"^    paths:\n((?:^      - .*\n)*)", re.MULTILINE)
+
+
 def security_push_trigger_violations(text: str) -> list[str]:
     """Keep post-merge checks for policy-only changes, independently of PRs."""
-    match = re.search(r"^  push:\n((?:^    .*\n)*)", text, re.MULTILINE)
+    match = _PUSH_TRIGGER_BLOCK_RE.search(text)
     if match is None:
         return ["security.yml: push trigger is missing"]
     body = match.group(1)
     violations: list[str] = []
     if "    branches: [main]\n" not in body:
         violations.append("security.yml: push trigger must target protected main")
-    paths = re.search(r"^    paths:\n((?:^      - .*\n)*)", body, re.MULTILINE)
+    paths = _PUSH_PATHS_LIST_RE.search(body)
     entries = (
         [] if paths is None else [
             line[8:].split("#", 1)[0].strip().strip("'\"")
@@ -3857,6 +3904,12 @@ def _credential_handoff_refusal(workflow: str, document: dict, job: dict, step: 
     return None
 
 
+_GITHUB_WORD_RE = re.compile(r"\bgithub\b", re.IGNORECASE)
+_RUN_SENTINEL_ADJACENT_RE = re.compile(
+    f"[a-z0-9_${{}}{_RUN_SENTINEL}]{_RUN_SENTINEL}|{_RUN_SENTINEL}[a-z0-9_{{}}]"
+)
+
+
 def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
     """No workflow may write or rebind an env-file channel, except the pinned hand-off.
 
@@ -3916,7 +3969,7 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
         if key.casefold() == "if" and not bodies:
             bodies = [value]  # `if:` is an expression without delimiters.
         if any(
-            re.search(r"\bgithub\b", _NAMED_GITHUB.sub("", body), re.IGNORECASE)
+            _GITHUB_WORD_RE.search(_NAMED_GITHUB.sub("", body))
             or _INDEXED_GITHUB.search(body)
             for body in bodies
         ):
@@ -3928,10 +3981,7 @@ def workflow_channel_violations(workflow: str, document: dict) -> list[str]:
         # `"${{ a }}""${{ b }}"` into one word; each interpolation is a
         # sentinel, which also counts as a name character beside another.
         spliced = _scan_text(WORKFLOW_EXPRESSION.sub(_RUN_SENTINEL, value))
-        if key.casefold() == "run" and re.search(
-            f"[a-z0-9_${{}}{_RUN_SENTINEL}]{_RUN_SENTINEL}|{_RUN_SENTINEL}[a-z0-9_{{}}]",
-            spliced,
-        ):
+        if key.casefold() == "run" and _RUN_SENTINEL_ADJACENT_RE.search(spliced):
             violations.append(
                 f"{label}: a run interpolation may not adjoin a name character; "
                 "GitHub renders it before Bash reads the name"
@@ -4388,6 +4438,10 @@ def _producer_step(job: dict, step_id: str):
     return found[0] if len(found) == 1 else None
 
 
+_EVENT_HEAD_SHA_WORD_RE = re.compile(r"event_head_sha")
+_EVENT_HEAD_SHA_READ_RE = re.compile(r"\$(?:event_head_sha\b|\{event_head_sha\})")
+
+
 def _metadata_line_violations(label: str, script: str) -> list[str]:
     """The metadata step writes the SHAs only through its pinned lines."""
     violations: list[str] = []
@@ -4397,17 +4451,16 @@ def _metadata_line_violations(label: str, script: str) -> list[str]:
         line.strip(" \t") for line in _strip_shell_quotes_and_escapes(script).split("\n")
     ]
     lines = [line.casefold() for line in exact_lines]
-    if re.search(r"event_head_sha", re.sub(
-        r"\$(?:event_head_sha\b|\{event_head_sha\})", "", "\n".join(lines)
-    )):
+    if _EVENT_HEAD_SHA_WORD_RE.search(_EVENT_HEAD_SHA_READ_RE.sub("", "\n".join(lines))):
         violations.append(f"{label}: EVENT_HEAD_SHA may only be read, never reassigned")
     for name, allowed in REVIEW_METADATA_LINES.items():
         permitted = {_strip_shell_quotes_and_escapes(line) for line in allowed}
         reads = re.compile(r"\$(?:" + name + r"\b|\{" + name + r"\})")
+        word = re.compile(r"\b" + name + r"\b")
         named = [
             exact_lines[index]
             for index, line in enumerate(lines)
-            if re.search(r"\b" + name + r"\b", reads.sub("", line))
+            if word.search(reads.sub("", line))
         ]
         if any(line not in permitted for line in named):
             violations.append(f"{label}: {name} may only be produced by its pinned lines")
@@ -4499,6 +4552,9 @@ def run_expression_source_violations(workflow: str, document: dict) -> list[str]
     return violations
 
 
+_FERRUM_ENV_WORD_RE = re.compile(r"\bferrum_env\b")
+
+
 def guarded_environment_violations(
     workflow: str, document: dict, required_steps: tuple, protected: tuple[str, ...]
 ) -> list[str]:
@@ -4546,7 +4602,7 @@ def guarded_environment_violations(
             violations.append(f"{label}: {_ANSI_C_QUOTING_REFUSAL}")
         scan = _scan_text(value)
         if verify_run:
-            scan = re.sub(r"\bferrum_env\b", "", scan)
+            scan = _FERRUM_ENV_WORD_RE.sub("", scan)
         if protected_reference.search(scan):
             violations.append(
                 f"{label}: protected variable references/rebinding outside step env are forbidden"
@@ -4582,14 +4638,16 @@ def guarded_environment_violations(
     return violations
 
 
+_QUOTED_OR_WHITESPACE_RE = re.compile(r"'(?:[^']|'')*'|\s+")
+
+
 def _workflow_condition(value) -> str | None:
     """Compare a pinned expression with optional delimiters and whitespace."""
     if not isinstance(value, str):
         return None
     expression = EXPRESSION.fullmatch(value.strip())
     body = expression.group(1) if expression else value
-    return re.sub(
-        r"'(?:[^']|'')*'|\s+",
+    return _QUOTED_OR_WHITESPACE_RE.sub(
         lambda match: match.group(0) if match.group(0).startswith("'") else "",
         body,
     )
@@ -5548,6 +5606,11 @@ def trusted_cargo_audit_policy_violations(text: str) -> list[str]:
 MINT_STEP = "- name: Mint narrowly scoped state-writer token"
 
 
+_JOBS_KEY_RE = re.compile(r"^jobs:\s*$", re.MULTILINE)
+_TOP_LEVEL_KEY_RE = re.compile(r"^(?!#)\S", re.MULTILINE)
+_JOB_HEADER_RE = re.compile(r"^  (?P<name>[A-Za-z0-9_-]+):\n", re.MULTILINE)
+
+
 def workflow_jobs(text: str) -> list[tuple[str, str]]:
     """Every job under `jobs:`, with its own body.
 
@@ -5556,24 +5619,18 @@ def workflow_jobs(text: str) -> list[tuple[str, str]]:
     `schedule` — as "jobs", and a per-job security rule that silently runs
     against a trigger block is a rule nobody can reason about.
     """
-    start = re.search(r"^jobs:\s*$", text, re.MULTILINE)
+    start = _JOBS_KEY_RE.search(text)
     if start is None:
         return []
-    section = re.split(
-        r"^(?!#)\S", text[start.end():], maxsplit=1, flags=re.MULTILINE
-    )[0]
+    section = _TOP_LEVEL_KEY_RE.split(text[start.end():], maxsplit=1)[0]
     jobs: list[tuple[str, str]] = []
-    for match in re.finditer(
-        r"^  (?P<name>[A-Za-z0-9_-]+):\n", section, re.MULTILINE
-    ):
+    for match in _JOB_HEADER_RE.finditer(section):
         # A job's body ends at the next line indented two spaces or less that
         # is not a comment. Bounding it at the next *recognized* header instead
         # would fold a job whose header this parser does not recognize (a
         # quoted key, a trailing comment) into the preceding job, hiding it
         # from the per-job checks that count what each job does.
-        body = re.split(
-            r"^ {0,2}(?!#)\S", section[match.end():], maxsplit=1, flags=re.MULTILINE
-        )[0]
+        body = _JOB_BOUNDARY_RE.split(section[match.end():], maxsplit=1)[0]
         jobs.append((match.group("name"), body))
     return jobs
 
@@ -5645,6 +5702,9 @@ STATE_PUSH_RETRY_FORBIDDEN = (
 )
 
 
+_NEXT_STEP_RE = re.compile(r"\n      - (?:name|uses):")
+
+
 def state_push_retry_violations(workflow: str, text: str, commit_step: str) -> list[str]:
     """State commits must rebase and push against the repository default branch.
 
@@ -5657,7 +5717,7 @@ def state_push_retry_violations(workflow: str, text: str, commit_step: str) -> l
     if commit_index < 0:
         return [f"{workflow}: a {commit_step!r} step is required"]
     commit_block = text[commit_index:]
-    next_step = re.search(r"\n      - (?:name|uses):", commit_block[1:])
+    next_step = _NEXT_STEP_RE.search(commit_block[1:])
     if next_step is not None:
         commit_block = commit_block[: next_step.start() + 1]
     for forbidden in STATE_PUSH_RETRY_FORBIDDEN:
@@ -6117,6 +6177,17 @@ def release_gate_violations(root: Path, document: dict) -> list[str]:
     return violations + release_gate_helper_violations(root)
 
 
+_PACKAGE_MANAGER_RE = re.compile(r"\b(?:apt-get|apk|dnf|yum)\b")
+_RELEASE_PUSH_TRIGGER_RE = re.compile(
+    r"^  push:\s*$\n(?P<body>(?:^    .*\n|^      .*\n)*)",
+    re.MULTILINE,
+)
+_FORK_GUARD_RE = re.compile(r"^\s*if: .*repository\.fork", re.MULTILINE)
+_JOB_ENVIRONMENT_RE = re.compile(r"^ {4}environment\s*:", re.MULTILINE)
+_SECRETS_EXPRESSION_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b", re.IGNORECASE)
+_PATHS_FILTER_RE = re.compile(r"^\s+paths\s*:", re.MULTILINE)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -6310,7 +6381,7 @@ def main(argv: list[str] | None = None) -> int:
     docker_instructions = "\n".join(
         line for line in dockerfile.splitlines() if not line.lstrip().startswith("#")
     )
-    if re.search(r"\b(?:apt-get|apk|dnf|yum)\b", docker_instructions):
+    if _PACKAGE_MANAGER_RE.search(docker_instructions):
         violations.append(
             "Dockerfile: release stages must not install from mutable package repositories"
         )
@@ -6357,9 +6428,7 @@ def main(argv: list[str] | None = None) -> int:
     # `main` contain no build input. They used to carry `[skip ci]`, which
     # suppressed the required checks along with everything else; excluding the
     # paths from the image build is the narrower control.
-    release_push = re.search(
-        r"^  push:\s*$\n(?P<body>(?:^    .*\n|^      .*\n)*)", release, re.MULTILINE
-    )
+    release_push = _RELEASE_PUSH_TRIGGER_RE.search(release)
     release_push_body = release_push.group("body") if release_push else ""
     for ignored in ("- '.state/**'", "- 'assembled/**'"):
         if ignored not in release_push_body:
@@ -6382,7 +6451,7 @@ def main(argv: list[str] | None = None) -> int:
             "release.yml: both release jobs must be gated on the upstream repository "
             "or GITFORGEOPS_RELEASE_ENABLED, so a template copy never publishes"
         )
-    if re.search(r"^\s*if: .*repository\.fork", release, re.MULTILINE):
+    if _FORK_GUARD_RE.search(release):
         violations.append(
             "release.yml: a fork test does not distinguish a template copy from upstream"
         )
@@ -6617,7 +6686,7 @@ def main(argv: list[str] | None = None) -> int:
 
     static_review = (workflows / "validate-pr.yml").read_text(encoding="utf-8")
     violations.extend(trusted_validator_probe_violations(static_review))
-    if re.search(r"^ {4}environment\s*:", static_review, re.MULTILINE):
+    if _JOB_ENVIRONMENT_RE.search(static_review):
         violations.append("validate-pr.yml: PR-built code must not bind an Environment")
     # Match the whole `secrets` context, not just `secrets.NAME` /
     # `secrets['NAME']`. `${{ toJSON(secrets) }}`,
@@ -6625,9 +6694,9 @@ def main(argv: list[str] | None = None) -> int:
     # every environment secret at once and are exactly what the privileged
     # workflows use to load credential bundles — the form most worth catching
     # in the workflow that must never receive one.
-    if re.search(r"\$\{\{[^}]*\bsecrets\b", static_review, re.IGNORECASE):
+    if _SECRETS_EXPRESSION_RE.search(static_review):
         violations.append("validate-pr.yml: PR-built code must not receive any secrets")
-    if re.search(r"^\s+paths\s*:", static_review, re.MULTILINE):
+    if _PATHS_FILTER_RE.search(static_review):
         violations.append(
             "validate-pr.yml: a path-filtered workflow cannot provide a stable required check"
         )

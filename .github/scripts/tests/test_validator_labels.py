@@ -11,6 +11,13 @@ ROOT = Path(__file__).parents[3]
 CHECK = ROOT / ".github/scripts/check-validator-resource-labels.sh"
 
 
+_JOB_KEY_BOUNDARY_RE = re.compile(r"^  \S", re.MULTILINE)
+_LABEL_CHECK_COMMAND_RE = re.compile(
+    r"^          bash (\S*check-validator-resource-labels\.sh) ",
+    re.MULTILINE,
+)
+
+
 class ValidatorLabelsTests(unittest.TestCase):
     def run_check(self, code):
         with tempfile.TemporaryDirectory() as temporary:
@@ -125,12 +132,8 @@ class ValidatorLabelsTests(unittest.TestCase):
                 )
                 binary.chmod(0o755)
                 job = workflow.split(f"\n  {job_name}:\n", 1)[1]
-                job = re.split(r"^  \S", job, maxsplit=1, flags=re.MULTILINE)[0]
-                invocation = re.search(
-                    r"^          bash (\S*check-validator-resource-labels\.sh) ",
-                    job,
-                    re.MULTILINE,
-                )
+                job = _JOB_KEY_BOUNDARY_RE.split(job, maxsplit=1)[0]
+                invocation = _LABEL_CHECK_COMMAND_RE.search(job)
                 self.assertIsNotNone(invocation)
                 result = subprocess.run(
                     ["bash", invocation.group(1), str(binary)],

@@ -791,7 +791,8 @@ def _faulted_apply(harness: Harness, proxy, fault, what: str, expect: int | None
 
 def _sent(seen: list[tuple[str, str]], method: str, path: str) -> int:
     """How many `method` requests for `path` (a fullmatch regex) the client sent."""
-    return sum(1 for m, p in seen if m == method and re.fullmatch(path, p))
+    pattern = re.compile(path)
+    return sum(1 for m, p in seen if m == method and pattern.fullmatch(p))
 
 
 def _expect_sent(seen, method: str, path: str, count: int, why: str) -> None:

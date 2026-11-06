@@ -17,6 +17,12 @@ credential_bundles = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(credential_bundles)
 
 
+_RUST_SHARD_CEILING_RE = re.compile(
+    r"^pub const MAX_BUNDLE_SHARDS\s*:\s*u32\s*=\s*(\d+)\s*;",
+    re.MULTILINE,
+)
+
+
 class CredentialBundleTests(unittest.TestCase):
     def test_enumerated_bundle_vars_are_collected_into_a_private_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -124,11 +130,7 @@ class CredentialBundleTests(unittest.TestCase):
 
     def test_shard_ceiling_matches_the_rust_constant(self):
         source = (ROOT / "src/secrets/bundle.rs").read_text(encoding="utf-8")
-        match = re.search(
-            r"^pub const MAX_BUNDLE_SHARDS\s*:\s*u32\s*=\s*(\d+)\s*;",
-            source,
-            re.MULTILINE,
-        )
+        match = _RUST_SHARD_CEILING_RE.search(source)
         self.assertIsNotNone(match, "src/secrets/bundle.rs must declare the ceiling")
         self.assertEqual(int(match.group(1)), credential_bundles.MAX_BUNDLE_SHARDS)
         self.assertEqual(

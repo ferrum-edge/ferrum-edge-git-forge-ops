@@ -1401,6 +1401,9 @@ class RequiredWorkflowRuleTests(unittest.TestCase):
         self.assertEqual(len(self.run_audit(responses).violations), 1)
 
 
+_REQUIRED_CHECK_ARG_RE = re.compile(r"--required-check '([^']+)'")
+
+
 class SharedConstantTests(unittest.TestCase):
     def test_required_status_checks_match_the_settings_audit_workflow(self):
         workflow = (
@@ -1409,9 +1412,7 @@ class SharedConstantTests(unittest.TestCase):
             / "workflows"
             / "settings-audit.yml"
         ).read_text(encoding="utf-8")
-        declared = set(
-            re.findall(r"--required-check '([^']+)'", workflow)
-        )
+        declared = set(_REQUIRED_CHECK_ARG_RE.findall(workflow))
         self.assertEqual(declared, set(audit_settings.REQUIRED_STATUS_CHECKS))
 
     def test_release_tag_pattern_is_the_documented_default(self):

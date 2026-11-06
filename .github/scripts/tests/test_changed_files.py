@@ -13,6 +13,13 @@ sys.modules[SPEC.name] = changed_files
 SPEC.loader.exec_module(changed_files)
 
 
+_PUSH_PATHS_BLOCK_RE = re.compile(
+    r"^  push:\n(?:^    .*\n)*?^    paths:\n((?:^      .*\n)*)",
+    re.MULTILINE,
+)
+_QUOTED_PATH_ITEM_RE = re.compile(r"^      - '([^']+)'$", re.MULTILINE)
+
+
 class ChangedFilesTests(unittest.TestCase):
     def test_pr_workflows_use_head_stable_api_snapshots(self):
         workflows = {
@@ -180,13 +187,9 @@ class ChangedFilesTests(unittest.TestCase):
         text = (SCRIPT.parents[1] / "workflows" / "rust-ci.yml").read_text(
             encoding="utf-8"
         )
-        block = re.search(
-            r"^  push:\n(?:^    .*\n)*?^    paths:\n((?:^      .*\n)*)",
-            text,
-            re.MULTILINE,
-        )
+        block = _PUSH_PATHS_BLOCK_RE.search(text)
         self.assertIsNotNone(block)
-        entries = re.findall(r"^      - '([^']+)'$", block.group(1), re.MULTILINE)
+        entries = _QUOTED_PATH_ITEM_RE.findall(block.group(1))
         self.assertIn("docs/quickstart.md", entries)
         self.assertIn(".gitforgeops/*.example.yaml", entries)
         self.assertIn(".github/scripts/audit_settings.py", entries)

@@ -718,6 +718,10 @@ def _read_dependency_tree(
     return result.stdout
 
 
+_AGE_USE_RE = re.compile(r"^\s*use\s+(?:::)?age(?:\s|::).*?;\s*$", re.MULTILINE)
+_AGE_EXTERN_OR_GROUP_RE = re.compile(r"\bextern\s+crate\s+age\b|\bage\s*::\s*\{")
+
+
 def verify_age_encryption_only(
     exception: dict[str, Any], snapshot: CandidateSnapshot, dependency_tree_path: Path | None
 ) -> None:
@@ -760,9 +764,7 @@ def verify_age_encryption_only(
                     f"RSA exception encountered an unreviewed age API reference: "
                     f"{reference}"
                 )
-        age_use_statements = re.findall(
-            r"^\s*use\s+(?:::)?age(?:\s|::).*?;\s*$", text, re.MULTILINE
-        )
+        age_use_statements = _AGE_USE_RE.findall(text)
         if age_use_statements and (
             relative != REVIEWED_AGE_MODULE
             or [statement.strip() for statement in age_use_statements]
@@ -771,7 +773,7 @@ def verify_age_encryption_only(
             raise PolicyError(
                 "RSA exception permits only the reviewed age::ssh::Recipient import"
             )
-        if re.search(r"\bextern\s+crate\s+age\b|\bage\s*::\s*\{", text):
+        if _AGE_EXTERN_OR_GROUP_RE.search(text):
             raise PolicyError("RSA exception forbids alternate age import forms")
 
     dependency_tree = _read_dependency_tree(
