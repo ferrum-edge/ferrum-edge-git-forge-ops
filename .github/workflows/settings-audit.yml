@@ -67,11 +67,13 @@ jobs:
       # by name, or `GITFORGEOPS_RELEASE_ENABLED=true`), `--release-publishing`
       # also requires the `release` environment that fences the Docker Hub
       # push credentials and fails on a DOCKERHUB_* repository or organization
-      # secret. Listing secret names needs Secrets: read on the audit token.
+      # secret. Listing secret names needs Secrets: read and Environments:
+      # read on the audit token.
       - name: Audit repository and deployment protections
         env:
           # Fine-grained PAT or GitHub App token with Administration: read
-          # (and Secrets: read where release publishing is enabled).
+          # (and Secrets: read plus Environments: read where release
+          # publishing is enabled).
           # GITHUB_TOKEN cannot read every repository-settings endpoint.
           GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}
           REPO: ${{ github.repository }}

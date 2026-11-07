@@ -559,6 +559,15 @@ def is_release_environment_name(name: str) -> bool:
     return name.strip().casefold() == RELEASE_ENVIRONMENT
 
 
+# The fine-grained token permission each secret-name listing needs. A refused
+# read names it, so the operator sees which permission the audit token lacks.
+SECRET_LISTING_PERMISSIONS = {
+    "repository": "Secrets: read",
+    "organization": "Secrets: read",
+    "environment": "Environments: read",
+}
+
+
 def listed_secret_names(path: str, scope: str) -> set[str]:
     """The secret names a paginated listing returns; values are never requested.
 
@@ -569,7 +578,13 @@ def listed_secret_names(path: str, scope: str) -> set[str]:
     it completeness cannot be shown. A silently skipped entry could be exactly
     the secret the caller is looking for.
     """
-    pages = gh_json(path, paginate=True)
+    try:
+        pages = gh_json(path, paginate=True)
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"{error}; listing {scope} secret names needs "
+            f"{SECRET_LISTING_PERMISSIONS[scope]} on the audit token"
+        ) from error
     if not isinstance(pages, list) or not pages:
         raise RuntimeError(f"{scope} secret listing had an unexpected shape")
     names: set[str] = set()

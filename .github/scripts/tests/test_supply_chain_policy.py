@@ -8577,7 +8577,6 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             )
 
 
-
 class RegistrySecretEnvironmentTests(unittest.TestCase):
     """Only release.yml's `docker` job reads `secrets.DOCKERHUB_*`, bound to `release`."""
 

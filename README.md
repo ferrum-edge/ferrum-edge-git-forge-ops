@@ -277,7 +277,8 @@ environment through to a first apply and authenticated traffic.
    `policies.example.yaml`. See [Policy framework](#policy-framework-gitforgeopspoliciesyaml).
 
 10. **Add `SETTINGS_AUDIT_TOKEN`** (a token with **Administration: read** only;
-    add **Secrets: read** if this repository publishes its own image, see
+    add **Secrets: read** and **Environments: read** if this repository
+    publishes its own image, see
     [Publishing your own image](#publishing-your-own-image))
     to the `settings-audit` environment, never as a repository secret. The
     environment has no reviewer, because it deploys nothing, and is limited to
@@ -796,7 +797,7 @@ gitforgeops doctor --format json
 | Scope | Needs | Checks |
 | --- | --- | --- |
 | `local` (default) | nothing | config and overlays (including `FERRUM_OVERLAY`), template vs deployment repository, resource tree and whether it loads and assembles for each environment (offline, as every command does first), policy file, validator binary (present and executable) and digest, per-mode requirements (file mode: the output location is writable), environment variables |
-| `github` (default) | `GH_TOKEN` with Administration: read | runs `audit_settings.py` (the same audit the bootstrap and `settings-audit.yml` use): rulesets, App bypass, environments, labels, required checks. Template mode follows `GITFORGEOPS_TEMPLATE_REPO=true`, as the scheduled audit does; otherwise export `GITFORGEOPS_STATE_APP_ID`. Export `GITFORGEOPS_RELEASE_ENABLED=true` on a repository that publishes its own image to audit the `release` environment too (the token then needs Secrets: read) |
+| `github` (default) | `GH_TOKEN` with Administration: read | runs `audit_settings.py` (the same audit the bootstrap and `settings-audit.yml` use): rulesets, App bypass, environments, labels, required checks. Template mode follows `GITFORGEOPS_TEMPLATE_REPO=true`, as the scheduled audit does; otherwise export `GITFORGEOPS_STATE_APP_ID`. Export `GITFORGEOPS_RELEASE_ENABLED=true` on a repository that publishes its own image to audit the `release` environment too (the token then needs Secrets: read and Environments: read) |
 | `gateway` (opt-in) | the environment's credentials | `GET /health` (connectivity, TLS, writes enabled) and `GET /cluster` (proves the JWT secret and claims are accepted). On Ferrum Edge v0.9.16 and later, `GET /cluster` refuses a namespace-scoped token. The token is then proven on `GET /namespaces`, and the cluster view is skipped; see [Namespace-scoped admin tokens](docs/reference.md#namespace-scoped-admin-tokens). Skipped in file mode and on a template |
 
 Each check is `PASS`, `FAIL`, `WARN`, `UNKNOWN` (could not be performed, for
@@ -996,8 +997,9 @@ publish anyway:
    `--release-publishing`, which `settings-audit.yml` passes when the variable
    is set) fails on a `DOCKERHUB_*` repository or organization secret and on a
    wider deployment policy, and on any other secret in `release`; its token
-   then also needs **Secrets: read**. `release` (in any letter case) is
-   reserved: it cannot be a deployment environment in `.gitforgeops/config.yaml`.
+   then also needs **Secrets: read** and **Environments: read**. `release`
+   (in any letter case) is reserved: it cannot be a deployment environment in
+   `.gitforgeops/config.yaml`.
 4. Keep default workflow permissions read-only; `release.yml` grants
    `packages: write` to its own job.
 

@@ -874,6 +874,61 @@ class ReleaseEnvironmentTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "repeats"):
                     self.run_audit(responses)
 
+    def test_a_refused_secret_listing_fails_closed_naming_the_permission(self):
+        # Listing the `release` environment's secret names needs
+        # Environments: read; repository and organization names need
+        # Secrets: read. A token without one is refused (403, or 404 where
+        # GitHub hides the resource), and the audit stops, naming it.
+        import contextlib
+        import io
+        import os
+
+        environment_key = (
+            f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"
+            "/secrets?per_page=100"
+        )
+        for key, permission in (
+            (environment_key, "Environments: read"),
+            ("repos/acme/repo/actions/secrets?per_page=100", "Secrets: read"),
+            ("repos/acme/repo/actions/organization-secrets?per_page=100", "Secrets: read"),
+        ):
+            for status in ("HTTP 403", "HTTP 404"):
+                with self.subTest(key=key, status=status):
+                    responses = release_responses()
+
+                    def refused(path, paginate=False, key=key, status=status):
+                        if path == key:
+                            raise RuntimeError(
+                                f"GitHub API request failed for {path}: gh: "
+                                f"Resource not accessible by personal access token ({status})"
+                            )
+                        return responses[path]
+
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with patch.object(audit_settings, "gh_json", side_effect=refused), patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "audit_settings.py",
+                            "--repo",
+                            "acme/repo",
+                            "--branch",
+                            "main",
+                            "--state-writer-app-id",
+                            "99",
+                            "--release-publishing",
+                        ],
+                    ), patch.dict(os.environ, {"GH_TOKEN": "test-token"}), contextlib.redirect_stdout(
+                        stdout
+                    ), contextlib.redirect_stderr(stderr):
+                        status_code = audit_settings.main()
+                    self.assertEqual(status_code, 1)
+                    message = stderr.getvalue()
+                    self.assertIn("settings audit failed closed", message)
+                    self.assertIn(status, message)
+                    self.assertIn(f"needs {permission} on the audit token", message)
+                    self.assertNotIn(audit_settings.AUDIT_SUCCESS_LINE, stdout.getvalue())
+
     def test_metadata_without_an_owner_type_fails_closed(self):
         # Without it the organization-secret listing could be skipped on an
         # organization repository.

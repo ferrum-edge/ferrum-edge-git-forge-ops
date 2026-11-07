@@ -1098,9 +1098,11 @@ security.
 Create a GitHub Environment named **`settings-audit`** with deployment branches
 limited to **protected branches** (or an exact custom rule for `main`) and
 **no required reviewer**. Create a fine-grained PAT or read-only GitHub App
-token with **Administration: read** (plus **Secrets: read** where release
-publishing is enabled, to list secret names), and store it as a secret *of
-that environment*:
+token with **Administration: read** (plus **Secrets: read** and
+**Environments: read** where release publishing is enabled: the first lists
+repository and organization secret names, the second the `release`
+environment's secret names), and store it as a secret *of that
+environment*:
 
 ```bash
 gh secret set SETTINGS_AUDIT_TOKEN --repo owner/repo --env settings-audit
@@ -1138,7 +1140,9 @@ included.
   `DOCKERHUB_*` secrets, and that no `DOCKERHUB_*` secret is a repository or
   organization secret (section 2). A secret listing that cannot be read in
   full fails the audit. Listing secret names needs
-  **Secrets: read** on the audit token there; values are never read;
+  **Secrets: read** (repository and organization secrets) and
+  **Environments: read** (the `release` environment's secrets) on the audit
+  token there; values are never read;
 - every environment's reviewer, self-review and branch policy;
 - gateway monitoring coverage, once any environment opts into unattended drift
   monitoring (below).

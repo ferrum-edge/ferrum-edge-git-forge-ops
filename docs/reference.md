@@ -249,8 +249,8 @@ intermediary that blocks `/cluster` both answer that way: the token is proven
 on `GET /namespaces`, and `gateway-cluster-view` is `SKIP` with the reason. To read cluster state, use a separate operator
 credential outside GitForgeOps. Do not widen the environment's token.
 
-`SETTINGS_AUDIT_TOKEN` (Administration: read; also Secrets: read where
-release publishing is enabled) belongs to the separate `settings-audit`
+`SETTINGS_AUDIT_TOKEN` (Administration: read; also Secrets: read and
+Environments: read where release publishing is enabled) belongs to the separate `settings-audit`
 environment, never to a deployment environment or the repository.
 `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` belong to the `release`
 environment, never to the repository or organization. See [GitHub launch controls](github-launch-controls.md).

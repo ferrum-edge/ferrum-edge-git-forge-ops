@@ -1627,7 +1627,8 @@ def secret_remainder(
             "environment's policy keeps the push token on the default branch and "
             "release tags. Delete any DOCKERHUB_* repository secret (gh secret "
             f"delete NAME --repo {repo}) and rotate a token that was ever one. "
-            "The settings audit token also needs Secrets: read to check this."
+            "The settings audit token also needs Secrets: read and Environments: "
+            "read to check this."
         )
     if template_repo:
         lines.append(

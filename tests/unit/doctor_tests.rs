@@ -817,6 +817,24 @@ fn an_auditor_that_could_not_run_is_unknown_not_a_failed_control() {
 }
 
 #[test]
+fn a_release_secret_permission_failure_names_the_extra_token_permissions() {
+    // The release audit lists the `release` environment's secret names, which
+    // a token without Environments: read is refused; the remedy says so.
+    let checks = doctor::github::audit_checks(
+        false,
+        "",
+        "settings audit failed closed: GitHub API request failed for \
+         repos/acme/repo/environments/release/secrets?per_page=100: \
+         gh: Resource not accessible by personal access token (HTTP 403)\n",
+    );
+    let check = find(&checks, "settings-audit");
+    assert_eq!(check.status, Status::Unknown, "{check:?}");
+    let remedy = check.remediation.as_deref().expect("remediation");
+    assert!(remedy.contains("Secrets: read"), "{check:?}");
+    assert!(remedy.contains("Environments: read"), "{check:?}");
+}
+
+#[test]
 fn github_doctor_uses_its_bundled_auditor_when_checkout_copy_is_missing() {
     let dir = repo(&[]);
     let checks = doctor::github::run(

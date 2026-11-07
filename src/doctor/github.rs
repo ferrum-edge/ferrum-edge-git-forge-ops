@@ -292,7 +292,9 @@ pub fn audit_checks(success: bool, stdout: &str, stderr: &str) -> Vec<Check> {
         let remedy = if reason.is_some_and(looks_like_token_failure) {
             "This is not a finding about the repository — the audit did not \
              run. Check that GH_TOKEN carries Administration: read for this \
-             repository, then re-run."
+             repository, plus Secrets: read and Environments: read where \
+             release.yml publishes (the upstream repository, or \
+             GITFORGEOPS_RELEASE_ENABLED=true), then re-run."
         } else {
             "This is not a finding about the repository — the audit did not \
              run. The auditor's own message is above; fix that input or the \

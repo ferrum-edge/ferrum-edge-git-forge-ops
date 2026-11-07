@@ -620,7 +620,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `GITFORGEOPS_RELEASE_ENABLED=true` through the new `--release-publishing`,
   which `settings-audit.yml` and `doctor` pass), the settings audit requires
   the environment and its exact ref rules and fails on a `DOCKERHUB_*`
-  repository or organization secret (its token needs Secrets: read there),
+  repository or organization secret (its token needs Secrets: read and
+  Environments: read there),
   and the bootstrap creates the environment. Only `release.yml`'s `docker`
   job may read the credentials or bind `release`, and it reads no other
   secret but `GITHUB_TOKEN`; the audit also fails when `release` holds any
