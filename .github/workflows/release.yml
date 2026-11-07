@@ -189,6 +189,17 @@ jobs:
     # derives from `github.repository`, so no override needed there).
     needs: authorize-release
     if: github.repository == 'ferrum-edge/ferrum-edge-git-forge-ops' || vars.GITFORGEOPS_RELEASE_ENABLED == 'true'
+    # DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are secrets of this environment,
+    # never of the repository or organization. GitHub releases a repository
+    # secret to the workflow file any pushed branch carries, so a
+    # branch-defined job could read the push token without this job's
+    # authorize-release gate, the tag-ancestry check or the `v*` tag ruleset.
+    # The environment's deployment policy admits only the default branch and
+    # `v*` tags, and GitHub withholds its secrets from a job on any other ref
+    # before a step runs. `audit_settings.py` audits that policy and fails on a
+    # DOCKERHUB_* repository or organization secret; `check_supply_chain.py`
+    # refuses a job that reads DOCKERHUB_* without this binding.
+    environment: release
     runs-on: ubuntu-26.04
     timeout-minutes: 120
     permissions:

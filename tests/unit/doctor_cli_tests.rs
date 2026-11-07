@@ -199,6 +199,25 @@ fn a_template_variable_that_is_not_true_is_a_deployment_audit() {
     assert_eq!(arg_value(&argv, "--state-writer-app-id"), Some("42"));
 }
 
+#[test]
+fn the_release_variable_adds_the_release_audit_like_the_workflow() {
+    // settings-audit.yml passes `--release-publishing` when
+    // GITFORGEOPS_RELEASE_ENABLED lowercases to `true`; the auditor recognizes
+    // the upstream repository by itself.
+    let doctor = Doctor::new(&[]);
+    doctor.run(&["--scope", "github"], GITHUB_READY);
+    let argv = doctor.auditor_argv().expect("the auditor ran");
+    assert!(!has_arg(&argv, "--release-publishing"), "{argv:?}");
+
+    let doctor = Doctor::new(&[]);
+    let mut env = GITHUB_READY.to_vec();
+    env.push(("GITFORGEOPS_RELEASE_ENABLED", "True"));
+    doctor.run(&["--scope", "github"], &env);
+    let argv = doctor.auditor_argv().expect("the auditor ran");
+    assert!(has_arg(&argv, "--release-publishing"), "{argv:?}");
+    assert_eq!(arg_value(&argv, "--state-writer-app-id"), Some("42"));
+}
+
 // -- 4: process-env is a local check ----------------------------------------
 
 #[test]

@@ -333,7 +333,13 @@ Adopting an update does not make your repository publish anything.
 `release.yml` publishes only from the upstream repository, or where repository
 variable `GITFORGEOPS_RELEASE_ENABLED=true` opts in. That variable is yours and
 no update sets it. If you publish your own images, point `DOCKERHUB_IMAGE` at a
-namespace you control; an update never changes where you push.
+namespace you control; an update never changes where you push. `release.yml`'s
+`docker` job binds the `release` environment, so keep `DOCKERHUB_USERNAME` and
+`DOCKERHUB_TOKEN` there rather than as repository secrets; if you still have
+repository secrets, follow the migration in
+[Publishing your own image](../README.md#publishing-your-own-image) before
+adopting an update that carries the binding. A copy that does not publish
+skips the job, and its settings audit requires nothing new.
 
 ## What a supported baseline means
 

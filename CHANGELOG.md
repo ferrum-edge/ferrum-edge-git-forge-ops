@@ -588,6 +588,24 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- `release.yml`'s `docker` job now binds the `release` GitHub Environment,
+  and the Docker Hub push credentials (`DOCKERHUB_USERNAME`,
+  `DOCKERHUB_TOKEN`) belong there instead of in repository secrets. GitHub
+  releases a repository secret to the workflow file any pushed branch
+  carries, so a write principal who was not a `v*` tag bypass actor could
+  read the push token from a branch workflow and publish outside
+  `authorize-release`, the tag-ancestry check and the tag ruleset. The
+  environment admits exactly the default branch and `v*` tags.
+  `check_supply_chain.py` refuses a job that reads `secrets.DOCKERHUB_*`
+  without `environment: release`; where publishing is enabled (upstream, or
+  `GITFORGEOPS_RELEASE_ENABLED=true` through the new `--release-publishing`,
+  which `settings-audit.yml` and `doctor` pass), the settings audit requires
+  the environment and its exact ref rules and fails on a `DOCKERHUB_*`
+  repository or organization secret (its token needs Secrets: read there),
+  and the bootstrap creates the environment. Existing publishers move the
+  secrets into the environment, delete the repository secrets and rotate the
+  token (README, Publishing your own image).
+
 - The PR comment that `review` posts, and that credential delivery posts with
   ciphertext, now goes through the same GitHub client as every other GitHub
   call: HTTPS only, in addition to the timeouts and refused redirects it

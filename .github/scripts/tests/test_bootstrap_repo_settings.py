@@ -1190,6 +1190,156 @@ class AuditTokenEnvironmentTests(unittest.TestCase):
         )
 
 
+class ReleaseEnvironmentPlanTests(unittest.TestCase):
+    """Docker Hub credentials are fenced to `main` and `v*` by `release`."""
+
+    RELEASE_PATH = f"repos/{REPO}/environments/{bootstrap.RELEASE_ENVIRONMENT}"
+    POLICY_PATH = f"{RELEASE_PATH}/deployment-branch-policies"
+
+    def publishing_responses(self) -> dict:
+        responses = configured_responses()
+        responses[f"repos/{REPO}/actions/variables/{bootstrap.RELEASE_VARIABLE}"] = {
+            "name": bootstrap.RELEASE_VARIABLE,
+            "value": "TRUE",
+        }
+        return responses
+
+    def fenced(self, responses: dict) -> dict:
+        responses[self.RELEASE_PATH] = {
+            "name": bootstrap.RELEASE_ENVIRONMENT,
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
+        }
+        responses[f"{self.POLICY_PATH}?per_page=100"] = [
+            {
+                "branch_policies": [
+                    {"id": 31, "name": "main", "type": "branch"},
+                    {"id": 32, "name": "v*", "type": "tag"},
+                ]
+            }
+        ]
+        return responses
+
+    def release_step(self, plan):
+        return next(
+            step
+            for step in plan.steps
+            if step.target == f"environment {bootstrap.RELEASE_ENVIRONMENT}"
+        )
+
+    def test_an_opted_in_repository_creates_it_with_an_exact_ref_policy(self):
+        plan = bootstrap.build_plan(FakeApi(self.publishing_responses()), namespace())
+        step = self.release_step(plan)
+        self.assertEqual(step.action, bootstrap.CREATE)
+        self.assertEqual(
+            step.writes,
+            [
+                (
+                    "PUT",
+                    self.RELEASE_PATH,
+                    {
+                        "wait_timer": 0,
+                        "reviewers": [],
+                        "deployment_branch_policy": {
+                            "protected_branches": False,
+                            "custom_branch_policies": True,
+                        },
+                    },
+                ),
+                ("POST", self.POLICY_PATH, {"name": "main", "type": "branch"}),
+                ("POST", self.POLICY_PATH, {"name": "v*", "type": "tag"}),
+            ],
+        )
+        remainder = "\n".join(plan.notes)
+        for name, _ in bootstrap.RELEASE_ENVIRONMENT_SECRETS:
+            self.assertIn(
+                f"gh secret set {name} --repo {REPO} --env {bootstrap.RELEASE_ENVIRONMENT}",
+                remainder,
+            )
+        self.assertIn("Delete any DOCKERHUB_* repository secret", remainder)
+
+    def test_an_exactly_fenced_environment_is_unchanged(self):
+        responses = self.fenced(self.publishing_responses())
+        step = self.release_step(bootstrap.build_plan(FakeApi(responses), namespace()))
+        self.assertEqual(step.action, bootstrap.UNCHANGED)
+        self.assertEqual(step.writes, [])
+
+    def test_a_protected_branches_or_wider_policy_is_replaced(self):
+        responses = self.fenced(self.publishing_responses())
+        responses[self.RELEASE_PATH]["deployment_branch_policy"] = {
+            "protected_branches": True,
+            "custom_branch_policies": False,
+        }
+        step = self.release_step(bootstrap.build_plan(FakeApi(responses), namespace()))
+        self.assertEqual(step.action, bootstrap.UPDATE)
+        self.assertEqual(step.writes[-2:], [
+            ("POST", self.POLICY_PATH, {"name": "main", "type": "branch"}),
+            ("POST", self.POLICY_PATH, {"name": "v*", "type": "tag"}),
+        ])
+
+        responses = self.fenced(self.publishing_responses())
+        responses[f"{self.POLICY_PATH}?per_page=100"] = [
+            {
+                "branch_policies": [
+                    {"id": 31, "name": "main", "type": "branch"},
+                    {"id": 32, "name": "*", "type": "tag"},
+                ]
+            }
+        ]
+        step = self.release_step(bootstrap.build_plan(FakeApi(responses), namespace()))
+        self.assertEqual(step.action, bootstrap.UPDATE)
+        self.assertIn(("DELETE", f"{self.POLICY_PATH}/32", None), step.writes)
+
+    def test_a_hand_added_reviewer_is_kept(self):
+        responses = self.fenced(self.publishing_responses())
+        responses[self.RELEASE_PATH]["protection_rules"] = [
+            {
+                "type": "required_reviewers",
+                "prevent_self_review": True,
+                "reviewers": [
+                    {"type": "User", "reviewer": {"id": REVIEWER_ID, "login": "octocat"}}
+                ],
+            }
+        ]
+        responses[self.RELEASE_PATH]["deployment_branch_policy"] = None
+        step = self.release_step(bootstrap.build_plan(FakeApi(responses), namespace()))
+        body = step.writes[0][2]
+        self.assertEqual(body["reviewers"], [{"type": "User", "id": REVIEWER_ID}])
+        self.assertTrue(body["prevent_self_review"])
+
+    def test_a_repository_that_does_not_publish_gets_nothing(self):
+        plan = bootstrap.build_plan(FakeApi(configured_responses()), namespace())
+        self.assertFalse(
+            any(step.target.endswith(bootstrap.RELEASE_ENVIRONMENT) for step in plan.steps)
+        )
+        self.assertNotIn("DOCKERHUB_TOKEN", "\n".join(plan.notes))
+
+    def test_upstream_publishes_without_the_variable(self):
+        self.assertTrue(
+            bootstrap.release_publishing(FakeApi({}), audit_settings.UPSTREAM_REPOSITORY)
+        )
+        self.assertFalse(bootstrap.release_publishing(FakeApi({}), REPO))
+
+    def test_a_colliding_deployment_environment_name_is_warned_about(self):
+        plan = bootstrap.build_plan(
+            FakeApi(self.publishing_responses()),
+            namespace(environment=[bootstrap.RELEASE_ENVIRONMENT], reviewer=["octocat"]),
+        )
+        self.assertTrue(
+            any("registry credentials" in warning for warning in plan.warnings),
+            plan.warnings,
+        )
+
+    def test_the_policy_matches_the_audited_tag_pattern(self):
+        self.assertEqual(bootstrap.release_tag_policy(), "v*")
+        self.assertEqual(
+            bootstrap.RELEASE_ENVIRONMENT, audit_settings.RELEASE_ENVIRONMENT
+        )
+
+
 class WriteGuardTests(unittest.TestCase):
     def test_planning_alone_never_writes(self):
         api = FakeApi({f"repos/{REPO}": {}, f"repos/{REPO}/rulesets?per_page=100": [[]]})

@@ -411,6 +411,14 @@ SECURITY_PUSH_POLICY_PATHS = (
 # audit_settings.SETTINGS_AUDIT_ENVIRONMENT and bootstrap_repo_settings.py.
 SETTINGS_AUDIT_ENVIRONMENT_BINDING = "\n    environment: settings-audit\n"
 SETTINGS_AUDIT_TOKEN_REFERENCE = "secrets.SETTINGS_AUDIT_TOKEN"
+# The Docker Hub push credentials are secrets of the `release` environment,
+# whose deployment policy admits only the default branch and `v*` tags. A job
+# reads an environment secret only through its `environment:` binding; without
+# it the same reference resolves to a repository or organization secret, which
+# GitHub releases to the workflow file any pushed branch carries. Kept in step
+# with audit_settings.RELEASE_ENVIRONMENT and bootstrap_repo_settings.py.
+RELEASE_ENVIRONMENT = "release"
+REGISTRY_SECRET_REFERENCE = re.compile(r"\bsecrets\s*\.\s*DOCKERHUB_", re.IGNORECASE)
 FRESH_HEAD_STEP = "Refresh protected branch and reject stale deployments"
 # The checkout that feeds a privileged reconcile has to name the branch, not
 # the triggering event's commit, and has to carry enough history for the
@@ -4872,6 +4880,50 @@ def monitoring_jwt_binding_violations(workflow: str, document: dict) -> list[str
     )
 
 
+def _bound_environment(job: dict):
+    """A job's literal environment name, from either `environment:` form."""
+    environment = job.get("environment")
+    if isinstance(environment, dict):
+        environment = environment.get("name")
+    return environment if isinstance(environment, str) else None
+
+
+def registry_secret_environment_violations(workflow: str, document: dict) -> list[str]:
+    """`secrets.DOCKERHUB_*` is read only by a job bound to `environment: release`.
+
+    The parsed tree is read, with quoted scalars decoded, so a spelling cannot
+    hide the reference; anchors, aliases and flow mappings never reach here
+    because the strict reader refuses them. A reference outside `jobs:` (a
+    workflow-level `env:`) or in a reusable-workflow call job (which GitHub
+    refuses an `environment:`) can only reach a repository or organization
+    secret, so both are refused.
+    """
+    violations: list[str] = []
+    jobs = document.get("jobs")
+    if isinstance(jobs, dict):
+        outside = {key: value for key, value in document.items() if key != "jobs"}
+    else:
+        outside, jobs = document, {}
+    if REGISTRY_SECRET_REFERENCE.search(json.dumps(outside, ensure_ascii=False)):
+        violations.append(
+            f"{workflow}: secrets.DOCKERHUB_* may be read only inside a job bound to "
+            f"`environment: {RELEASE_ENVIRONMENT}`, never at workflow level"
+        )
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if not REGISTRY_SECRET_REFERENCE.search(json.dumps(job, ensure_ascii=False)):
+            continue
+        if "uses" in job or _bound_environment(job) != RELEASE_ENVIRONMENT:
+            violations.append(
+                f"{workflow}: jobs.{job_name}: reads secrets.DOCKERHUB_*, so it must "
+                f"bind `environment: {RELEASE_ENVIRONMENT}`; without it the registry "
+                "push token is a repository or organization secret released to any "
+                "pushed branch"
+            )
+    return violations
+
+
 # -- Local actions --------------------------------------------------------------
 #
 # A step's `uses: ./path` runs an action from the checked-out tree, which no
@@ -6328,6 +6380,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             violations.extend(
+                registry_secret_environment_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
                 workflow_allowlist_violations(
                     workflow.relative_to(root).as_posix(), document
                 )
@@ -6463,6 +6520,14 @@ def main(argv: list[str] | None = None) -> int:
     release_document = workflow_documents.get(RELEASE_GATE_WORKFLOW)
     if release_document is not None:
         violations.extend(release_gate_violations(root, release_document))
+        release_jobs = release_document.get("jobs")
+        docker_job = release_jobs.get("docker") if isinstance(release_jobs, dict) else None
+        if not isinstance(docker_job, dict) or _bound_environment(docker_job) != RELEASE_ENVIRONMENT:
+            violations.append(
+                "release.yml: the docker job must bind "
+                f"`environment: {RELEASE_ENVIRONMENT}` so the registry push token is "
+                "released only to the default branch and protected release tags"
+            )
 
     apply_workflow = (workflows / "apply-on-merge.yml").read_text(encoding="utf-8")
     if "vars.FERRUM_GATEWAY_MODE != 'file'" in apply_workflow:

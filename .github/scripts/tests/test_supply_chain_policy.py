@@ -7313,6 +7313,30 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
         self.assertEqual(workflow.count("secrets.SETTINGS_AUDIT_TOKEN"), 1)
 
+    def test_registry_credentials_are_fenced_by_the_release_environment(self):
+        # As repository secrets the Docker Hub credentials were released to
+        # whatever workflow file any pushed branch carried, outside
+        # authorize-release and the `v*` tag ruleset.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/release.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.count("    environment: release\n"), 1)
+            path.write_text(
+                text.replace("    environment: release\n", "", 1), encoding="utf-8"
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "release.yml: jobs.docker: reads secrets.DOCKERHUB_*" in item
+                for item in violations
+            ),
+            violations,
+        )
+        self.assertTrue(
+            any("the docker job must bind" in item for item in violations), violations
+        )
+
     def test_trusted_review_pins_the_triggering_workflow_definition(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
@@ -8360,6 +8384,135 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
             self.assertEqual(
                 check_supply_chain.python_isolation_violations("x.yml", document), [], script
             )
+
+
+
+class RegistrySecretEnvironmentTests(unittest.TestCase):
+    """`secrets.DOCKERHUB_*` is read only by a job bound to `environment: release`."""
+
+    @staticmethod
+    def _violations(text: str) -> list[str]:
+        return check_supply_chain.registry_secret_environment_violations(
+            "x.yml", check_supply_chain.parse_workflow(text)
+        )
+
+    @staticmethod
+    def _workflow(job_header: str, secret: str = "DOCKERHUB_TOKEN") -> str:
+        return (
+            "on: push\n"
+            "jobs:\n"
+            "  publish:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    timeout-minutes: 30\n"
+            f"{job_header}"
+            "    steps:\n"
+            "      - name: Log in\n"
+            "        env:\n"
+            f"          TOKEN: ${{{{ secrets.{secret} }}}}\n"
+            "        run: true\n"
+        )
+
+    def test_the_shipped_workflows_are_fenced(self):
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            document = check_supply_chain.parse_workflow(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                check_supply_chain.registry_secret_environment_violations(
+                    path.name, document
+                ),
+                [],
+                path.name,
+            )
+
+    def test_a_job_reading_the_token_without_the_environment_is_refused(self):
+        for header in (
+            "",
+            "    environment: production\n",
+            "    environment: ${{ inputs.target }}\n",
+            "    environment: release-candidate\n",
+            "    environment:\n      name: staging\n",
+        ):
+            with self.subTest(header=header):
+                violations = self._violations(self._workflow(header))
+                self.assertTrue(
+                    any(
+                        "jobs.publish: reads secrets.DOCKERHUB_*" in item
+                        for item in violations
+                    ),
+                    violations,
+                )
+
+    def test_a_job_bound_to_the_release_environment_is_accepted(self):
+        for header in (
+            "    environment: release\n",
+            "    environment: 'release'\n",
+            "    environment:\n      name: release\n",
+        ):
+            with self.subTest(header=header):
+                self.assertEqual(self._violations(self._workflow(header)), [])
+
+    def test_every_registry_secret_name_and_spelling_counts(self):
+        for secret in ("DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN", "DOCKERHUB_ORG_TOKEN"):
+            with self.subTest(secret=secret):
+                self.assertTrue(self._violations(self._workflow("", secret)))
+        # A lower-case or spaced spelling resolves to the same secret.
+        spaced = self._workflow("").replace(
+            "secrets.DOCKERHUB_TOKEN", "secrets . dockerhub_token"
+        )
+        self.assertTrue(self._violations(spaced))
+        # A double-quoted scalar with an escape is read decoded.
+        escaped = self._workflow("").replace(
+            "TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}",
+            'TOKEN: "${{ secrets.\\x44OCKERHUB_TOKEN }}"',
+        )
+        self.assertTrue(self._violations(escaped))
+
+    def test_unrelated_secrets_and_the_image_variable_are_not_registry_credentials(self):
+        self.assertEqual(self._violations(self._workflow("", "GITHUB_TOKEN")), [])
+        text = self._workflow("").replace(
+            "secrets.DOCKERHUB_TOKEN", "vars.DOCKERHUB_IMAGE"
+        )
+        self.assertEqual(self._violations(text), [])
+
+    def test_a_workflow_level_reference_is_refused(self):
+        text = (
+            "on: push\n"
+            "env:\n"
+            "  TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}\n"
+            "jobs:\n"
+            "  publish:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    timeout-minutes: 30\n"
+            "    environment: release\n"
+            "    steps:\n"
+            "      - run: true\n"
+        )
+        self.assertTrue(
+            any("never at workflow level" in item for item in self._violations(text))
+        )
+
+    def test_a_reusable_workflow_call_cannot_carry_the_token(self):
+        # GitHub refuses `environment:` on a call job, so a secret passed
+        # through one can only be a repository or organization secret.
+        text = (
+            "on: push\n"
+            "jobs:\n"
+            "  publish:\n"
+            "    uses: acme/release/.github/workflows/push.yml@" + "a" * 40 + "\n"
+            "    secrets:\n"
+            "      token: ${{ secrets.DOCKERHUB_TOKEN }}\n"
+        )
+        self.assertTrue(self._violations(text))
+
+    def test_anchors_and_flow_mappings_cannot_share_a_binding(self):
+        # The strict reader refuses both before this rule runs, so an alias
+        # cannot make one job's `environment:` look like another's.
+        for text in (
+            self._workflow("    environment: &env release\n"),
+            self._workflow("    environment: {name: release}\n"),
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(check_supply_chain.WorkflowSyntaxError):
+                    check_supply_chain.parse_workflow(text)
 
 
 if __name__ == "__main__":

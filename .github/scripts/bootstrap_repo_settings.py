@@ -39,10 +39,12 @@ if str(SCRIPT_DIR) not in sys.path:
 from audit_settings import (  # noqa: E402  (the path bootstrap above must run first)
     ALLOWED_ACTION_PATTERNS,
     GITHUB_ACTIONS_APP_ID,
+    RELEASE_ENVIRONMENT,
     RELEASE_TAG_PATTERN,
     REQUIRED_RULESET_WORKFLOWS,
     REQUIRED_STATUS_CHECKS,
     SETTINGS_AUDIT_ENVIRONMENT,
+    release_publishing_enabled,
 )
 
 CREATE = "CREATE"
@@ -58,6 +60,9 @@ RELEASE_TAG_RULESET_NAME = "release-tags"
 REPOSITORY_ADMIN_ROLE_ID = 5
 STATE_APP_VARIABLE = "GITFORGEOPS_STATE_APP_ID"
 TEMPLATE_VARIABLE = "GITFORGEOPS_TEMPLATE_REPO"
+# `release.yml` publishes from the upstream repository or where this variable
+# is `true`. Read, never written: opting in to publishing is the owner's call.
+RELEASE_VARIABLE = "GITFORGEOPS_RELEASE_ENABLED"
 DEFAULT_CONFIG_PATH = Path(".gitforgeops/config.yaml")
 
 OVERRIDE_LABELS = (
@@ -83,6 +88,13 @@ OVERRIDE_LABELS = (
 AUDIT_TOKEN_SECRET = (
     "SETTINGS_AUDIT_TOKEN",
     "fine-grained PAT or App token with Administration: read",
+)
+# Registry push credentials for `release.yml`'s docker job. Secrets of the
+# `release` environment, never of the repository or organization: those are
+# released to the workflow file any pushed branch carries.
+RELEASE_ENVIRONMENT_SECRETS = (
+    ("DOCKERHUB_USERNAME", "Docker Hub account that pushes the image"),
+    ("DOCKERHUB_TOKEN", "Docker Hub access token with push scope on DOCKERHUB_IMAGE"),
 )
 VIEWER_JWT_ENVIRONMENT_SECRET = (
     "FERRUM_ADMIN_JWT_VIEWER_SECRET",
@@ -1119,6 +1131,106 @@ def step_audit_token_environment(api: GitHubApi, repo: str) -> list[Step]:
     ]
 
 
+def release_publishing(api: GitHubApi, repo: str) -> bool:
+    """`release.yml`'s gate: the upstream repository or the opt-in variable."""
+    current = optional_get(api, f"repos/{repo}/actions/variables/{RELEASE_VARIABLE}")
+    opted_in = (
+        isinstance(current, dict) and str(current.get("value", "")).lower() == "true"
+    )
+    return release_publishing_enabled(repo, opted_in)
+
+
+def release_tag_policy() -> str:
+    """The `v*` deployment tag policy matching the release-tag ruleset."""
+    prefix = "refs/tags/"
+    if RELEASE_TAG_PATTERN.startswith(prefix):
+        return RELEASE_TAG_PATTERN[len(prefix) :]
+    return RELEASE_TAG_PATTERN
+
+
+def step_release_environment(api: GitHubApi, repo: str, default_branch: str) -> list[Step]:
+    """Create the environment that fences the Docker Hub push credentials.
+
+    `release.yml`'s docker job binds it, so GitHub releases its secrets only to
+    a job on a ref the deployment policy admits: exactly the default branch and
+    the `v*` tags the release-tag ruleset protects. `protected_branches` would
+    admit no tag, so the policy is custom. No reviewer is required (each push
+    to the default branch publishes, and `authorize-release` is the gate), but
+    a reviewer added by hand is kept: it only makes publication stricter.
+    """
+    encoded = quote(RELEASE_ENVIRONMENT, safe="")
+    detail = optional_get(api, f"repos/{repo}/environments/{encoded}")
+    tag = release_tag_policy()
+    wanted = {("branch", default_branch), ("tag", tag)}
+    policy_path = f"repos/{repo}/environments/{encoded}/deployment-branch-policies"
+    create_policies = [
+        ("POST", policy_path, {"name": default_branch, "type": "branch"}),
+        ("POST", policy_path, {"name": tag, "type": "tag"}),
+    ]
+    target = f"environment {RELEASE_ENVIRONMENT}"
+    summary = f"registry credentials only, exact {default_branch!r} branch and {tag!r} tags"
+    current_reviewers, prevents = environment_reviewers(detail or {})
+    body = {
+        "wait_timer": 0,
+        "reviewers": current_reviewers,
+        "deployment_branch_policy": {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        },
+    }
+    if current_reviewers:
+        body["prevent_self_review"] = prevents
+    if detail is None:
+        return [
+            Step(
+                CREATE,
+                target,
+                summary,
+                ["environment: <absent> -> present"],
+                [("PUT", f"repos/{repo}/environments/{encoded}", body), *create_policies],
+            )
+        ]
+    policy = detail.get("deployment_branch_policy") or {}
+    current_policies = []
+    if policy.get("custom_branch_policies") is True:
+        pages = api.get(f"{policy_path}?per_page=100", paginate=True)
+        if isinstance(pages, list):
+            current_policies = [
+                item
+                for page in pages
+                if isinstance(page, dict)
+                for item in page.get("branch_policies", [])
+                if isinstance(item, dict)
+            ]
+    refs = [(item.get("type", "branch"), item.get("name")) for item in current_policies]
+    policy_is_exact = (
+        policy.get("protected_branches") is False
+        and policy.get("custom_branch_policies") is True
+        and len(refs) == len(wanted)
+        and set(refs) == wanted
+    )
+    details = field_differences(
+        {"deployment_branch_policy.exact_branch_and_release_tags": policy_is_exact},
+        {"deployment_branch_policy.exact_branch_and_release_tags": True},
+    )
+    writes: list[tuple[str, str, dict | None]] = []
+    if details:
+        writes.append(("PUT", f"repos/{repo}/environments/{encoded}", body))
+        for item in current_policies:
+            if item.get("id") is not None:
+                writes.append(("DELETE", f"{policy_path}/{item['id']}", None))
+        writes.extend(create_policies)
+    return [
+        Step(
+            UNCHANGED if not details else UPDATE,
+            target,
+            summary,
+            details,
+            writes,
+        )
+    ]
+
+
 def step_monitoring_environments(
     api: GitHubApi, repo: str, environments: list[str], default_branch: str
 ) -> list[Step]:
@@ -1367,6 +1479,22 @@ def build_plan(api: GitHubApi, args) -> Plan:
             "The settings audit waives the reviewer requirement for that name, "
             "so rename the deployment environment in .gitforgeops/config.yaml."
         )
+    publishes = release_publishing(api, repo)
+    if publishes:
+        # Template included: upstream is a template and publishes the image.
+        plan.steps.extend(
+            step_release_environment(
+                api, repo, repository.get("default_branch") or "main"
+            )
+        )
+        if RELEASE_ENVIRONMENT in environments:
+            plan.warnings.append(
+                f"A deployment environment is named {RELEASE_ENVIRONMENT!r}, which "
+                "collides with the environment that fences the registry "
+                "credentials. With release publishing enabled the settings audit "
+                "waives the reviewer requirement for that name, so rename the "
+                "deployment environment in .gitforgeops/config.yaml."
+            )
 
     if args.template_repo:
         plan.notes.append("")
@@ -1443,6 +1571,7 @@ def build_plan(api: GitHubApi, args) -> Plan:
             environments,
             args.template_repo,
             resolve_monitoring_environments(args, environments),
+            publishes,
         )
     )
     return plan
@@ -1453,6 +1582,7 @@ def secret_remainder(
     environments: list[str],
     template_repo: bool,
     monitoring: list[str] | None = None,
+    publishes: bool = False,
 ) -> list[str]:
     monitoring = monitoring or []
     lines = [
@@ -1472,6 +1602,19 @@ def secret_remainder(
         f"{SETTINGS_AUDIT_ENVIRONMENT} environment's branch policy is what keeps "
         "the administration-read token on the protected default branch."
     )
+    if publishes:
+        lines.append(f"  # environment {RELEASE_ENVIRONMENT} (release.yml image publishing)")
+        for name, note in RELEASE_ENVIRONMENT_SECRETS:
+            lines.append(
+                f"  gh secret set {name} --repo {repo} --env {RELEASE_ENVIRONMENT}   # {note}"
+            )
+        lines.append(
+            f"  # Not repository or organization secrets: the {RELEASE_ENVIRONMENT} "
+            "environment's policy keeps the push token on the default branch and "
+            "release tags. Delete any DOCKERHUB_* repository secret (gh secret "
+            f"delete NAME --repo {repo}) and rotate a token that was ever one. "
+            "The settings audit token also needs Secrets: read to check this."
+        )
     if template_repo:
         lines.append(
             "  (a template repository needs no other environment secrets: nothing "

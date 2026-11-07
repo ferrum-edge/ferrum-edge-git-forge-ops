@@ -249,9 +249,11 @@ intermediary that blocks `/cluster` both answer that way: the token is proven
 on `GET /namespaces`, and `gateway-cluster-view` is `SKIP` with the reason. To read cluster state, use a separate operator
 credential outside GitForgeOps. Do not widen the environment's token.
 
-`SETTINGS_AUDIT_TOKEN` (Administration: read) belongs to the separate
-`settings-audit` environment, never to a deployment environment or the
-repository. See [GitHub launch controls](github-launch-controls.md).
+`SETTINGS_AUDIT_TOKEN` (Administration: read; also Secrets: read where
+release publishing is enabled) belongs to the separate `settings-audit`
+environment, never to a deployment environment or the repository.
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` belong to the `release`
+environment, never to the repository or organization. See [GitHub launch controls](github-launch-controls.md).
 
 ## GitHub Actions variables
 
@@ -259,7 +261,7 @@ repository. See [GitHub launch controls](github-launch-controls.md).
 |---|---|---|
 | `GITFORGEOPS_STATE_APP_ID` | — | Numeric id of the state-writer App. Required for apply and rotate. |
 | `FERRUM_GATEWAY_MODE` | `api` | `api` pushes through the Admin API; `file` writes assembled YAML. Other values fail the workflow preflight. |
-| `GITFORGEOPS_RELEASE_ENABLED` | unset | Set to `true` to let `release.yml` publish from a repository other than upstream. |
+| `GITFORGEOPS_RELEASE_ENABLED` | unset | Set to `true` to let `release.yml` publish from a repository other than upstream. Its Docker Hub credentials are then secrets of the `release` environment, never repository secrets, and the settings audit checks that. |
 | `DOCKERHUB_IMAGE` | `ferrumedge/ferrum-edge-git-forge-ops` | Docker Hub target for `release.yml`. |
 
 ## Gateway write requirements

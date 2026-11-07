@@ -537,6 +537,242 @@ class AuditTokenEnvironmentTests(unittest.TestCase):
         )
 
 
+def release_responses():
+    """Release publishing enabled, Docker Hub credentials fenced correctly."""
+    responses = secure_responses()
+    responses["repos/acme/repo/environments?per_page=100"] = [
+        {
+            "total_count": 3,
+            "environments": [
+                {"name": "production"},
+                {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT},
+                {"name": audit_settings.RELEASE_ENVIRONMENT},
+            ],
+        }
+    ]
+    responses[f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"] = {
+        "protection_rules": [],
+        "deployment_branch_policy": {
+            "protected_branches": False,
+            "custom_branch_policies": True,
+        },
+    }
+    responses[
+        f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"
+        "/deployment-branch-policies?per_page=100"
+    ] = [
+        {
+            "branch_policies": [
+                {"id": 21, "name": "main", "type": "branch"},
+                {"id": 22, "name": "v*", "type": "tag"},
+            ]
+        }
+    ]
+    responses["repos/acme/repo/actions/secrets?per_page=100"] = [
+        {"total_count": 1, "secrets": [{"name": "UNRELATED_SECRET"}]}
+    ]
+    responses["repos/acme/repo/actions/organization-secrets?per_page=100"] = [
+        {"total_count": 0, "secrets": []}
+    ]
+    return responses
+
+
+class ReleaseEnvironmentTests(unittest.TestCase):
+    """Docker Hub push credentials are fenced to `main` and `v*` by `release`."""
+
+    def run_audit(self, responses, *, release_publishing=True, template_repo=False):
+        with patch.object(
+            audit_settings,
+            "gh_json",
+            side_effect=lambda path, paginate=False: responses[path],
+        ):
+            return audit_settings.run(
+                "acme/repo",
+                "main",
+                REQUIRED_CHECKS,
+                None if template_repo else 99,
+                "refs/tags/v*",
+                template_repo,
+                release_publishing=release_publishing,
+            )
+
+    def assert_violation(self, audit, *fragments):
+        self.assertTrue(
+            any(all(fragment in item for fragment in fragments) for item in audit.violations),
+            audit.violations,
+        )
+
+    def test_a_correctly_fenced_release_environment_passes(self):
+        audit = self.run_audit(release_responses())
+        self.assertEqual(audit.violations, [])
+        rendered = "\n".join(audit.evidence)
+        self.assertIn("registry publication credentials", rendered)
+        self.assertIn("no DOCKERHUB_* repository secret", rendered)
+        self.assertIn("no DOCKERHUB_* organization secret", rendered)
+
+    def test_repository_scoped_registry_credentials_fail(self):
+        # A repository secret is released to the workflow file any pushed
+        # branch carries, so a branch-defined job could read the push token.
+        responses = release_responses()
+        responses["repos/acme/repo/actions/secrets?per_page=100"] = [
+            {
+                "total_count": 2,
+                "secrets": [{"name": "DOCKERHUB_USERNAME"}, {"name": "DOCKERHUB_TOKEN"}],
+            }
+        ]
+        audit = self.run_audit(responses)
+        self.assert_violation(
+            audit, "DOCKERHUB_TOKEN, DOCKERHUB_USERNAME", "are repository secrets"
+        )
+
+    def test_organization_scoped_registry_credentials_fail(self):
+        responses = release_responses()
+        responses["repos/acme/repo/actions/organization-secrets?per_page=100"] = [
+            {"total_count": 1, "secrets": [{"name": "DOCKERHUB_TOKEN"}]}
+        ]
+        audit = self.run_audit(responses)
+        self.assert_violation(audit, "DOCKERHUB_TOKEN", "are organization secrets")
+
+    def test_a_user_owned_repository_lists_no_organization_secrets(self):
+        responses = release_responses()
+        responses["repos/acme/repo"]["owner"] = {"type": "User"}
+        del responses["repos/acme/repo/actions/organization-secrets?per_page=100"]
+        # The deleted listing would raise KeyError if it were requested.
+        audit = self.run_audit(responses)
+        self.assertFalse(
+            any("organization secrets" in item for item in audit.violations),
+            audit.violations,
+        )
+        self.assertIn("no DOCKERHUB_* repository secret", "\n".join(audit.evidence))
+
+    def test_an_unreadable_secret_listing_fails_closed(self):
+        responses = release_responses()
+        responses["repos/acme/repo/actions/secrets?per_page=100"] = {"message": "x"}
+        with self.assertRaisesRegex(RuntimeError, "repository secret listing"):
+            self.run_audit(responses)
+
+    def test_a_missing_release_environment_fails(self):
+        responses = release_responses()
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {
+                "total_count": 2,
+                "environments": [
+                    {"name": "production"},
+                    {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT},
+                ],
+            }
+        ]
+        audit = self.run_audit(responses)
+        self.assert_violation(audit, "must define the 'release' environment")
+
+    def test_an_unrestricted_release_environment_fails(self):
+        # An auto-created environment (a workflow named it before anyone
+        # configured it) has no deployment policy at all.
+        responses = release_responses()
+        responses[
+            f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"
+        ]["deployment_branch_policy"] = None
+        audit = self.run_audit(responses)
+        self.assert_violation(
+            audit, "'release' must restrict deployments to exactly branch 'main' and tag 'v*'"
+        )
+
+    def test_protected_branches_alone_do_not_fence_the_release_environment(self):
+        responses = release_responses()
+        responses[
+            f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"
+        ]["deployment_branch_policy"] = {
+            "protected_branches": True,
+            "custom_branch_policies": False,
+        }
+        audit = self.run_audit(responses)
+        self.assert_violation(audit, "'release' must restrict deployments")
+
+    def test_a_wider_or_mistyped_release_policy_fails(self):
+        key = (
+            f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"
+            "/deployment-branch-policies?per_page=100"
+        )
+        for policies in (
+            [{"name": "*", "type": "branch"}, {"name": "v*", "type": "tag"}],
+            [{"name": "main", "type": "branch"}, {"name": "*", "type": "tag"}],
+            [{"name": "main", "type": "branch"}, {"name": "v*", "type": "branch"}],
+            [
+                {"name": "main", "type": "branch"},
+                {"name": "v*", "type": "tag"},
+                {"name": "release/*", "type": "branch"},
+            ],
+            [{"name": "main", "type": "branch"}],
+        ):
+            with self.subTest(policies=policies):
+                responses = release_responses()
+                responses[key] = [{"branch_policies": policies}]
+                audit = self.run_audit(responses)
+                self.assert_violation(audit, "'release' must restrict deployments")
+
+    def test_the_release_environment_is_not_a_deployment_environment(self):
+        responses = release_responses()
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {
+                "total_count": 2,
+                "environments": [
+                    {"name": audit_settings.SETTINGS_AUDIT_ENVIRONMENT},
+                    {"name": audit_settings.RELEASE_ENVIRONMENT},
+                ],
+            }
+        ]
+        audit = self.run_audit(responses)
+        self.assert_violation(audit, "at least one protected environment")
+
+    def test_template_mode_still_fences_registry_credentials(self):
+        responses = release_responses()
+        for ruleset in ("7", "9"):
+            responses[f"repos/acme/repo/rulesets/{ruleset}"]["bypass_actors"] = [
+                {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "pull_request"}
+            ]
+        responses["repos/acme/repo/actions/secrets?per_page=100"] = [
+            {"total_count": 1, "secrets": [{"name": "DOCKERHUB_TOKEN"}]}
+        ]
+        audit = self.run_audit(responses, template_repo=True)
+        self.assert_violation(audit, "DOCKERHUB_TOKEN", "are repository secrets")
+
+    def test_without_release_publishing_nothing_new_is_required(self):
+        # A copy that does not publish needs no release environment and no
+        # Secrets: read on its audit token; an environment named `release`
+        # there is audited like any other.
+        responses = secure_responses()
+        audit = self.run_audit(responses, release_publishing=False)
+        self.assertEqual(audit.violations, [])
+        responses = release_responses()
+        audit = self.run_audit(responses, release_publishing=False)
+        self.assert_violation(audit, "'release' must require at least one reviewer")
+
+    def test_upstream_or_the_opt_in_enables_release_publishing(self):
+        self.assertTrue(
+            audit_settings.release_publishing_enabled(
+                "Ferrum-Edge/Ferrum-Edge-Git-Forge-Ops", False
+            )
+        )
+        self.assertTrue(audit_settings.release_publishing_enabled("acme/repo", True))
+        self.assertFalse(audit_settings.release_publishing_enabled("acme/repo", False))
+
+    def test_the_release_workflow_binds_the_environment_it_audits(self):
+        workflow = (
+            Path(__file__).parents[2] / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(f"    environment: {audit_settings.RELEASE_ENVIRONMENT}\n", workflow)
+        self.assertIn(
+            f"'{audit_settings.UPSTREAM_REPOSITORY}'", workflow
+        )
+
+    def test_the_settings_audit_passes_the_release_opt_in(self):
+        workflow = (
+            Path(__file__).parents[2] / "workflows" / "settings-audit.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("RELEASE_ENABLED: ${{ vars.GITFORGEOPS_RELEASE_ENABLED }}", workflow)
+        self.assertIn("args+=(--release-publishing)", workflow)
+
+
 def monitoring_responses():
     """`production` opted into unattended monitoring."""
     responses = secure_responses()
@@ -1464,6 +1700,37 @@ class MainEntryPointTests(unittest.TestCase):
         )
         self.assertEqual(status, 0)
         self.assertEqual(calls, ["main"])
+
+    def test_release_publishing_follows_the_flag_or_the_upstream_repository(self):
+        import contextlib
+        import io
+        import os
+
+        for argv, expected in (
+            (["--repo", "acme/repo"], False),
+            (["--repo", "acme/repo", "--release-publishing"], True),
+            (["--repo", audit_settings.UPSTREAM_REPOSITORY], True),
+        ):
+            with self.subTest(argv=argv):
+                seen = []
+
+                def fake_run(repo, branch, *rest, **kwargs):
+                    seen.append(kwargs.get("release_publishing"))
+                    return audit_settings.Audit()
+
+                with patch.object(audit_settings, "run", fake_run), patch.object(
+                    sys,
+                    "argv",
+                    ["audit_settings.py", *argv, "--branch", "main", "--template-repo"],
+                ), patch.dict(
+                    os.environ, {"GH_TOKEN": "test-token"}
+                ), contextlib.redirect_stdout(
+                    io.StringIO()
+                ), contextlib.redirect_stderr(
+                    io.StringIO()
+                ):
+                    self.assertEqual(audit_settings.main(), 0)
+                self.assertEqual(seen, [expected])
 
     def test_metadata_without_a_default_branch_fails_closed(self):
         status, calls, stdout, stderr = self.invoke(

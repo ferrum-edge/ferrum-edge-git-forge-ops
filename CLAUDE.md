@@ -1392,7 +1392,11 @@ misconfigured?" without provisioning anything.
    `true` (never from a missing `config.yaml`), otherwise
    `--state-writer-app-id`, refused as a `Fail` unless it is a canonical
    numeric App id (ASCII digits; stricter than Python's `int()`, so a refusal
-   does not imply the scheduled audit fails); no `--branch`, so the auditor reads the repository's default
+   does not imply the scheduled audit fails); `--release-publishing` exactly
+   when `GITFORGEOPS_RELEASE_ENABLED` lowercases to `true` (the auditor turns
+   it on for the upstream repository itself: the `release` environment must
+   admit exactly the default branch and `v*` tags, and no `DOCKERHUB_*` secret
+   may be repository- or organization-scoped); no `--branch`, so the auditor reads the repository's default
    branch. A pass needs exit 0 **and** the auditor's `AUDIT_SUCCESS_LINE`
    (shared constant, pinned by a test); a failed run's `Unknown` quotes its
    last meaningful stderr line and blames `GH_TOKEN` only for token failures.

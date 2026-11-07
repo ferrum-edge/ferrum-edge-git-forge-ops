@@ -544,6 +544,7 @@ fn github_checks_without_a_token_are_unknown_rather_than_passed() {
             token: None,
             state_writer_app_id: Some("99".to_string()),
             template_repo: false,
+            release_publishing: false,
         },
     );
     let check = find(&checks, "settings-audit");
@@ -568,6 +569,7 @@ fn github_checks_without_the_state_writer_app_id_are_unknown() {
             token: Some("token".to_string()),
             state_writer_app_id: None,
             template_repo: false,
+            release_publishing: false,
         },
     );
     assert_eq!(find(&checks, "settings-audit").status, Status::Unknown);
@@ -587,6 +589,7 @@ fn a_non_integer_state_writer_app_id_fails_before_the_auditor_runs() {
                 token: Some("token".to_string()),
                 state_writer_app_id: Some(app_id.to_string()),
                 template_repo: false,
+                release_publishing: false,
             },
         );
         let check = find(&checks, "settings-audit");
@@ -697,6 +700,7 @@ fn the_github_context_reads_blank_variables_as_unset() {
     assert_eq!(ctx.repository, None);
     assert_eq!(ctx.state_writer_app_id, None);
     assert!(!ctx.template_repo);
+    assert!(!ctx.release_publishing);
 
     let ctx = context(
         &[
@@ -704,6 +708,7 @@ fn the_github_context_reads_blank_variables_as_unset() {
             ("GITHUB_TOKEN", "fallback"),
             ("GITHUB_REPOSITORY", "acme/env"),
             ("GITFORGEOPS_TEMPLATE_REPO", "True"),
+            ("GITFORGEOPS_RELEASE_ENABLED", "TRUE"),
         ],
         Some("acme/flag"),
         Some("7"),
@@ -712,11 +717,14 @@ fn the_github_context_reads_blank_variables_as_unset() {
     assert_eq!(ctx.repository.as_deref(), Some("acme/flag"));
     assert_eq!(ctx.state_writer_app_id.as_deref(), Some("7"));
     assert!(ctx.template_repo);
+    assert!(ctx.release_publishing);
 
     // The workflow compares the lowercased value byte for byte: surrounding
     // space is not "true".
     let ctx = context(&[("GITFORGEOPS_TEMPLATE_REPO", " true")], None, None);
     assert!(!ctx.template_repo);
+    let ctx = context(&[("GITFORGEOPS_RELEASE_ENABLED", "yes")], None, None);
+    assert!(!ctx.release_publishing);
 }
 
 #[test]
@@ -740,6 +748,7 @@ fn github_doctor_does_not_execute_the_checkout_auditor() {
             token: Some("token".to_string()),
             state_writer_app_id: Some("99".to_string()),
             template_repo: false,
+            release_publishing: false,
         },
     );
     assert!(!dir.path().join("checkout-auditor-ran").exists());
@@ -817,6 +826,7 @@ fn github_doctor_uses_its_bundled_auditor_when_checkout_copy_is_missing() {
             token: Some("token".to_string()),
             state_writer_app_id: Some("99".to_string()),
             template_repo: false,
+            release_publishing: false,
         },
     );
     let check = find(&checks, "settings-audit");

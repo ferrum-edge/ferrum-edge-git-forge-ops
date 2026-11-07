@@ -105,6 +105,23 @@ RELEASE_TAG_PATTERN = "refs/tags/v*"
 # point of moving the token here.
 SETTINGS_AUDIT_ENVIRONMENT = "settings-audit"
 
+# `release.yml` publishes from the upstream repository, or wherever repository
+# variable `GITFORGEOPS_RELEASE_ENABLED` is `true`. Its `docker` job binds this
+# environment, and the Docker Hub push credentials (`DOCKERHUB_*`) are secrets
+# of it, never of the repository or organization: GitHub releases those to the
+# workflow file any pushed branch carries, which would reach the push token
+# without `authorize-release`, the tag-ancestry check or the `v*` tag ruleset.
+# The environment's deployment policy admits exactly the default branch and the
+# protected release tags. Like `settings-audit` it deploys to no gateway, so it
+# is exempt from the reviewer rules (a reviewer would park every publication;
+# `authorize-release` is the publication gate) and does not count as the
+# protected deployment environment. These rules apply only where release
+# publishing is enabled; elsewhere an environment of this name is audited like
+# any other.
+RELEASE_ENVIRONMENT = "release"
+UPSTREAM_REPOSITORY = "ferrum-edge/ferrum-edge-git-forge-ops"
+REGISTRY_SECRET_PREFIX = "DOCKERHUB_"
+
 # A deployment environment that opted into unattended drift monitoring gets a
 # second GitHub Environment named `<deployment-env>-monitor`. It exists only so
 # a nightly `gitforgeops diff` can read the gateway without parking in "waiting
@@ -532,6 +549,19 @@ def is_monitoring_environment(name: str, all_names: set[str]) -> bool:
     return bool(base) and base in all_names
 
 
+def listed_secret_names(path: str, scope: str) -> set[str]:
+    """The secret names a paginated listing returns; values are never requested."""
+    pages = gh_json(path, paginate=True)
+    if not isinstance(pages, list) or not all(isinstance(page, dict) for page in pages):
+        raise RuntimeError(f"{scope} secret listing had an unexpected shape")
+    return {
+        item.get("name")
+        for page in pages
+        for item in page.get("secrets", [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
+
+
 def audit_monitoring_secrets(audit: Audit, repo: str, name: str) -> None:
     """A monitoring environment may hold gateway read material and nothing else.
 
@@ -540,18 +570,10 @@ def audit_monitoring_secrets(audit: Audit, repo: str, name: str) -> None:
     why this check proves only presence and absence, never key validity.
     """
     encoded_name = quote(name, safe="")
-    pages = gh_json(
+    secret_names = listed_secret_names(
         f"repos/{repo}/environments/{encoded_name}/secrets?per_page=100",
-        paginate=True,
+        "environment",
     )
-    if not isinstance(pages, list) or not all(isinstance(page, dict) for page in pages):
-        raise RuntimeError("environment secret listing had an unexpected shape")
-    secret_names = {
-        item.get("name")
-        for page in pages
-        for item in page.get("secrets", [])
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
     forbidden = sorted(
         secret
         for secret in secret_names
@@ -576,6 +598,42 @@ def audit_monitoring_jwt_keys(audit: Audit, name: str, secret_names: set[str]) -
         "a repository administrator must provision the gateway's viewer-capped key",
         f"environment {name}: holds the viewer-capped {MONITORING_VIEWER_JWT_SECRET}",
     )
+
+
+def audit_registry_secret_scope(audit: Audit, repo: str, metadata) -> None:
+    """Registry push credentials must not be repository or organization secrets.
+
+    GitHub releases those to the workflow file any pushed branch carries, so a
+    branch-defined job would reach the push token without `authorize-release`,
+    the tag-ancestry check or the tag ruleset. Only names are read, never
+    values. Organization secrets are listed only on an organization repository.
+    """
+    scopes = [("repository", f"repos/{repo}/actions/secrets?per_page=100")]
+    owner = metadata.get("owner") if isinstance(metadata, dict) else None
+    if isinstance(owner, dict) and owner.get("type") == "Organization":
+        scopes.append(
+            ("organization", f"repos/{repo}/actions/organization-secrets?per_page=100")
+        )
+    for scope, path in scopes:
+        exposed = sorted(
+            name
+            for name in listed_secret_names(path, scope)
+            if name.upper().startswith(REGISTRY_SECRET_PREFIX)
+        )
+        audit.require(
+            not exposed,
+            f"registry credentials {', '.join(exposed)} are {scope} secrets; "
+            "GitHub releases those to a workflow on any pushed branch. Move them "
+            f"into the {RELEASE_ENVIRONMENT!r} environment, delete the {scope} "
+            "secrets and rotate the token",
+            f"no {REGISTRY_SECRET_PREFIX}* {scope} secret: registry credentials "
+            f"reach only the {RELEASE_ENVIRONMENT!r} environment",
+        )
+
+
+def release_publishing_enabled(repo: str, opted_in: bool) -> bool:
+    """`release.yml`'s own gate: the upstream repository or an explicit opt-in."""
+    return opted_in or repo.casefold() == UPSTREAM_REPOSITORY
 
 
 def audit_monitoring_coverage(
@@ -647,7 +705,14 @@ def audit_environment(
     environment: dict,
     branch: str,
     all_names: set[str] | None = None,
+    release_tag: str | None = None,
 ) -> None:
+    """Audit one environment's reviewer and deployment-ref policy.
+
+    `release_tag` is the protected release tag policy (`v*`) when release
+    publishing is enabled; only then does the `release` environment get the
+    registry-credential rules instead of a deployment environment's.
+    """
     name = environment.get("name")
     if not isinstance(name, str) or not name:
         audit.violations.append("environment listing contained an unnamed environment")
@@ -666,6 +731,16 @@ def audit_environment(
         audit.evidence.append(
             f"environment {name}: reviewer rules waived (gates the "
             "administration-read audit token, deploys nothing)"
+        )
+        has_reviewers = True
+    elif name == RELEASE_ENVIRONMENT and release_tag is not None:
+        # Holds only the registry push credentials and deploys to no gateway.
+        # `authorize-release` gates every publication, and a reviewer would
+        # park each push to the default branch. Its ref policy is the fence
+        # and is audited exactly below.
+        audit.evidence.append(
+            f"environment {name}: reviewer rules waived (holds only registry "
+            "publication credentials; authorize-release gates publication)"
         )
         has_reviewers = True
     elif is_monitoring_environment(name, all_names):
@@ -694,8 +769,10 @@ def audit_environment(
 
     policy = detail.get("deployment_branch_policy") or {}
     monitoring_environment = is_monitoring_environment(name, all_names)
+    release_environment = name == RELEASE_ENVIRONMENT and release_tag is not None
     branch_limited = policy.get("protected_branches") is True
     policy_names: list[object] = []
+    policy_refs: list[tuple[object, object]] = []
     if policy.get("custom_branch_policies") is True:
         pages = gh_json(
             f"repos/{repo}/environments/{encoded_name}/deployment-branch-policies?per_page=100",
@@ -710,6 +787,8 @@ def audit_environment(
             if isinstance(item, dict)
         ]
         policy_names = [item.get("name") for item in policies]
+        # A policy without `type` is a branch policy, GitHub's default.
+        policy_refs = [(item.get("type", "branch"), item.get("name")) for item in policies]
         branch_limited = policy_names == [branch]
     if monitoring_environment:
         branch_limited = (
@@ -717,10 +796,25 @@ def audit_environment(
             and policy.get("custom_branch_policies") is True
             and policy_names == [branch]
         )
+        scope = f"exact {branch!r}"
+    elif release_environment:
+        # Exactly the default branch and the protected release tags. GitHub's
+        # `protected_branches` option admits no tag at all, and any other
+        # branch or tag pattern would release the push token to a ref the
+        # release gate and tag ruleset do not cover.
+        wanted = {("branch", branch), ("tag", release_tag)}
+        branch_limited = (
+            policy.get("protected_branches") is False
+            and policy.get("custom_branch_policies") is True
+            and len(policy_refs) == len(wanted)
+            and set(policy_refs) == wanted
+        )
+        scope = f"exactly branch {branch!r} and tag {release_tag!r}"
+    else:
+        scope = f"protected branches or exact {branch!r}"
     audit.require(
         branch_limited,
-        f"environment {name!r} must restrict deployments to "
-        + (f"exact {branch!r}" if monitoring_environment else f"protected branches or exact {branch!r}"),
+        f"environment {name!r} must restrict deployments to {scope}",
     )
     if has_reviewers and branch_limited:
         audit.evidence.append(f"environment {name}: reviewer + branch policy present")
@@ -735,6 +829,7 @@ def run(
     template_repo: bool = False,
     monitoring_max_age_hours: int = MONITORING_MAX_AGE_HOURS,
     now: datetime | None = None,
+    release_publishing: bool = False,
 ) -> Audit:
     audit = Audit()
     if template_repo:
@@ -769,9 +864,10 @@ def run(
             paginate=True,
         )
     )
+    metadata = gh_json(f"repos/{repo}")
     audit_required_workflows(
         audit,
-        gh_json(f"repos/{repo}"),
+        metadata,
         branch_rules,
         branch,
         {item.get("id"): item for item in rulesets},
@@ -816,19 +912,38 @@ def run(
         "released only to the protected default branch",
         f"audit-token environment {SETTINGS_AUDIT_ENVIRONMENT} present",
     )
+    # Where release.yml publishes, its registry credentials must be fenced to
+    # the protected refs by the `release` environment, in both modes.
+    release_tag = None
+    non_deployment = {SETTINGS_AUDIT_ENVIRONMENT}
+    if release_publishing:
+        release_tag = release_tag_pattern
+        if release_tag.startswith("refs/tags/"):
+            release_tag = release_tag[len("refs/tags/") :]
+        non_deployment.add(RELEASE_ENVIRONMENT)
+        audit.require(
+            RELEASE_ENVIRONMENT in names,
+            f"release publishing is enabled, so the repository must define the "
+            f"{RELEASE_ENVIRONMENT!r} environment; release.yml's docker job binds "
+            "it so the registry credentials are released only to the default "
+            "branch and protected release tags",
+            f"registry-credential environment {RELEASE_ENVIRONMENT} present",
+        )
+        audit_registry_secret_scope(audit, repo, metadata)
     monitoring_names = {
         name for name in names if is_monitoring_environment(name, names)
     }
     if not template_repo:
-        # Neither the audit-token environment nor a read-only monitoring
-        # environment is a deployment target, so neither can be the one
-        # protected environment a deployment repository is required to have.
+        # Neither the audit-token environment, the registry-credential
+        # environment nor a read-only monitoring environment is a deployment
+        # target, so none can be the one protected environment a deployment
+        # repository is required to have.
         audit.require(
-            bool(names - {SETTINGS_AUDIT_ENVIRONMENT} - monitoring_names),
+            bool(names - non_deployment - monitoring_names),
             "repository must define at least one protected environment",
         )
     for environment in listed:
-        audit_environment(audit, repo, environment, branch, names)
+        audit_environment(audit, repo, environment, branch, names, release_tag)
     if not template_repo:
         audit_monitoring_coverage(
             audit,
@@ -875,6 +990,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--release-publishing",
+        action="store_true",
+        help=(
+            "release.yml publishes from this repository (repository variable "
+            "GITFORGEOPS_RELEASE_ENABLED=true): require the release environment "
+            "and no DOCKERHUB_* repository or organization secret. Always on for "
+            "the upstream repository"
+        ),
+    )
+    parser.add_argument(
         "--template-repo",
         action="store_true",
         help=(
@@ -907,6 +1032,9 @@ def main() -> int:
             args.release_tag_pattern,
             args.template_repo,
             args.monitoring_max_age_hours,
+            release_publishing=release_publishing_enabled(
+                args.repo, args.release_publishing
+            ),
         )
     except (
         RuntimeError,
