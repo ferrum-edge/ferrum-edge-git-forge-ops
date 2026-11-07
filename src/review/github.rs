@@ -99,7 +99,6 @@ async fn post_comment_to(
             .post(&url)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "gitforgeops")
             .bearer_auth(token)
             .json(&body)
             .send()
