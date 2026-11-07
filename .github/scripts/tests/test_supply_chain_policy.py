@@ -5281,6 +5281,10 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             "EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
             "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
             "OVERRIDE_LABEL: gitforgeops/state-override",
+            "OVERRIDE_REVIEW: gitforgeops-state-override",
+            "ACTOR: ${{ steps.authorize.outputs.actor }}",
+            "REVIEW_ID: ${{ steps.authorize.outputs.review_id }}",
+            "AUTHORIZED_HEAD: ${{ steps.authorize.outputs.head_sha }}",
         ):
             self.assertIn(binding, step)
 
@@ -5376,6 +5380,144 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         violations = check_supply_chain.state_guard_override_recheck_violations(weakened)
         self.assertTrue(
             any("if: condition pinned" in item for item in violations), violations
+        )
+
+    def test_shipped_state_guard_authorizes_through_the_trusted_helper(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        self.assertEqual(
+            check_supply_chain.state_guard_override_authorize_violations(text), []
+        )
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_AUTHORIZE_STEP
+        )
+        self.assertIsNotNone(step)
+        # The decision lives in one helper; no inline review or permission
+        # reading, and no `--paginate`, remains in either override step.
+        record = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        # The record step may still carry the transitional inline PR re-read
+        # the previous checker pins; that is its only GitHub call.
+        transitional = 'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")'
+        for override_step, allowed_calls in ((step, []), (record, [transitional])):
+            active = [
+                line.strip() for line in override_step.splitlines()
+                if not line.lstrip().startswith("#")
+            ]
+            self.assertEqual(
+                [line for line in active if "gh api" in line], allowed_calls
+            )
+            for line in active:
+                self.assertNotIn("--paginate", line)
+                self.assertNotIn("/permission", line)
+                self.assertNotIn("/reviews", line)
+
+    def test_state_guard_transitional_inline_recheck_is_allowed_not_required(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        # The previous checker's seven pins are still present, before any report,
+        # so the checker on `main` accepts this file during the transition.
+        previous_pins = (
+            'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")',
+            "final_head=$(jq -r '.head.sha' <<< \"$final\")",
+            "final_ref=$(jq -r '.base.ref' <<< \"$final\")",
+            "final_labels=$(jq -r '.labels[].name' <<< \"$final\")",
+            '[ "$final_head" = "$EXPECTED_HEAD_SHA" ] || {',
+            '[ "$final_ref" = "$DEFAULT_BRANCH" ] || {',
+            'grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {',
+        )
+        report = step.index("::warning::")
+        for pin in previous_pins:
+            self.assertIn(pin, step)
+            self.assertLess(step.index(pin), report)
+        # The helper decides first; the inline block can only add refusals.
+        self.assertLess(
+            step.index(check_supply_chain.STATE_GUARD_FINAL_RECHECK[2]),
+            step.index(previous_pins[0]),
+        )
+        start = step.index(previous_pins[0])
+        end = step.index(previous_pins[-1])
+        end = step.index("          }\n", end) + len("          }\n")
+        without_block = text.replace(step, step[:start] + step[end:].lstrip(), 1)
+        self.assertNotIn(previous_pins[0], without_block)
+        self.assertEqual(
+            check_supply_chain.state_guard_override_recheck_violations(without_block), []
+        )
+
+    def test_state_guard_authorize_step_cannot_drop_the_trusted_helper(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_AUTHORIZE_STEP
+        )
+        self.assertIsNotNone(step)
+        for required in check_supply_chain.STATE_GUARD_AUTHORIZE_CALL:
+            with self.subTest(removed=required):
+                weakened = text.replace(step, step.replace(required, "true", 1), 1)
+                violations = check_supply_chain.state_guard_override_authorize_violations(
+                    weakened
+                )
+                self.assertTrue(
+                    any("trusted override helper" in item for item in violations),
+                    violations,
+                )
+            with self.subTest(commented=required):
+                weakened = text.replace(step, step.replace(required, "# " + required, 1), 1)
+                violations = check_supply_chain.state_guard_override_authorize_violations(
+                    weakened
+                )
+                self.assertTrue(
+                    any("trusted override helper" in item for item in violations),
+                    violations,
+                )
+
+        unguarded = text.replace(step, step.replace("set -euo pipefail", "set -e", 1), 1)
+        violations = check_supply_chain.state_guard_override_authorize_violations(unguarded)
+        self.assertTrue(any("set -euo pipefail" in item for item in violations), violations)
+
+        for candidate in (
+            ".github/scripts/state_override.py",
+            "./.github/scripts/state_override.py",
+            '"$GITHUB_WORKSPACE/.github/scripts/state_override.py"',
+            "foo/trusted-guard/.github/scripts/state_override.py",
+        ):
+            with self.subTest(candidate=candidate):
+                weakened = text.replace(
+                    step,
+                    step.replace(
+                        'python3 -I "$override" authorize >> "$GITHUB_OUTPUT"',
+                        'python3 -I "$override" authorize >> "$GITHUB_OUTPUT"\n'
+                        f"          python3 -I {candidate} recheck",
+                        1,
+                    ),
+                    1,
+                )
+                violations = check_supply_chain.state_guard_override_authorize_violations(
+                    weakened
+                )
+                self.assertTrue(
+                    any("trusted-guard checkout" in item for item in violations),
+                    violations,
+                )
+
+        missing = text.replace(
+            "      - name: Verify state-override authority\n",
+            "      - name: Verify override\n",
+            1,
+        )
+        violations = check_supply_chain.state_guard_override_authorize_violations(missing)
+        self.assertTrue(any("step is missing" in item for item in violations), violations)
+
+    def test_state_guard_override_helper_must_remain_in_the_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            (root / ".github/scripts/state_override.py").unlink()
+            violations = self._violations(root)
+        self.assertTrue(
+            any("state_override.py must remain a regular file" in item for item in violations),
+            violations,
         )
 
     def test_every_rust_toolchain_step_must_pin_the_version(self):
@@ -7930,6 +8072,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             ".github/scripts/install-ferrum-edge.sh",
             ".github/scripts/release_gate.py",
             ".github/scripts/refresh-ferrum-edge-pin.sh",
+            ".github/scripts/state_override.py",
             ".github/ferrum-edge-checksums.txt",
             ".github/CODEOWNERS",
             "Dockerfile",
