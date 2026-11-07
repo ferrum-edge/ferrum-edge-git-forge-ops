@@ -60,21 +60,10 @@ async fn post_rendered_pr_comment(
         .map_err(|_| crate::error::Error::Config("GITHUB_TOKEN not set".to_string()))?;
     let repo = env::var("GITHUB_REPOSITORY")
         .map_err(|_| crate::error::Error::Config("GITHUB_REPOSITORY not set".to_string()))?;
-
-    // Same-shape bounds as the admin client: connect + total request.
-    // Keeps `gitforgeops review --pr N` from hanging forever if GitHub's
-    // API is slow or unreachable.
-    //
-    // Redirects are refused outright: `reqwest` replays the `Authorization`
-    // header on a same-host redirect, and a 3xx off `POST .../comments` is
-    // never a legitimate GitHub response, so following one would only ever
-    // hand the token somewhere it was not minted for.
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
-        .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+    // The shared GitHub client: timeouts, no redirects (a 3xx off
+    // `POST .../comments` is never legitimate and would replay the token),
+    // HTTPS only.
+    let client = crate::secrets::github_api_client(env_config)?;
     post_comment_to(
         &client,
         GITHUB_API_ORIGIN,
@@ -109,6 +98,7 @@ async fn post_comment_to(
         let resp = client
             .post(&url)
             .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", "gitforgeops")
             .bearer_auth(token)
             .json(&body)
@@ -183,6 +173,57 @@ mod comment_error_tests {
             .expect_err("a 403 is not delivery");
         server.abort();
         error.to_string()
+    }
+
+    /// The comment POST pins the REST API version like every other GitHub
+    /// call, so a change of GitHub's default version cannot change it.
+    #[tokio::test]
+    async fn a_comment_post_pins_the_github_api_version() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..read]);
+            }
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        post_comment_to(&client, &origin, "synthetic-token", "acme/repo", 7, "hi")
+            .await
+            .expect("a 201 is delivery");
+        let head = server.await.unwrap();
+        assert!(
+            head.starts_with("post /repos/acme/repo/issues/7/comments "),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nx-github-api-version: 2022-11-28\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\naccept: application/vnd.github+json\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nauthorization: bearer synthetic-token\r\n"),
+            "{head}"
+        );
     }
 
     #[tokio::test]
