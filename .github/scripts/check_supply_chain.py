@@ -1616,23 +1616,35 @@ def decoded_workflow_content(text: str) -> str:
     return _YAML_HEX_ESCAPE.sub(_decode_yaml_escape, content)
 
 
-# The last step before the guard reports an authorized override re-reads the
-# pull request, so an override label removed, a head pushed, or a base
-# retargeted while the run was in flight fails that run instead of leaving a
-# success behind it.
+# The override decision is one default-branch helper, the rule
+# `src/policy/github_override.rs` applies: the authorize step runs it, and the
+# last step before the guard reports an authorized override runs it again, so
+# an override label removed or re-applied, a head pushed, a base retargeted, a
+# labeler demoted or a later review while the run was in flight fails that run
+# instead of leaving a success behind it.
+STATE_GUARD_OVERRIDE_HELPER = "override=trusted-guard/.github/scripts/state_override.py"
+STATE_GUARD_AUTHORIZE_STEP = "Verify state-override authority"
+STATE_GUARD_AUTHORIZE_CALL = (
+    STATE_GUARD_OVERRIDE_HELPER,
+    '[ -f "$override" ] || {',
+    'python3 -I "$override" authorize >> "$GITHUB_OUTPUT"',
+)
 STATE_GUARD_RECORD_STEP = "Record authorized override"
 STATE_GUARD_RECORD_IF = (
     "${{ steps.detect.outputs.requires_override == 'true' "
     "&& steps.authorize.outcome == 'success' }}"
 )
 STATE_GUARD_FINAL_RECHECK = (
-    'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")',
-    "final_head=$(jq -r '.head.sha' <<< \"$final\")",
-    "final_ref=$(jq -r '.base.ref' <<< \"$final\")",
-    "final_labels=$(jq -r '.labels[].name' <<< \"$final\")",
-    '[ "$final_head" = "$EXPECTED_HEAD_SHA" ] || {',
-    '[ "$final_ref" = "$DEFAULT_BRANCH" ] || {',
-    'grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {',
+    STATE_GUARD_OVERRIDE_HELPER,
+    '[ -f "$override" ] || {',
+    'python3 -I "$override" recheck',
+)
+# Any whole path token naming `state_override.py` whose directory prefix is not
+# exactly the protected `trusted-guard/` checkout is the candidate's helper.
+_OVERRIDE_HELPER_PATH = re.compile(
+    r"(?:(?<=^)|(?<=[\s\"'=();|&<>`]))(?P<prefix>[^\s\"'=();|&<>`]*?)"
+    r"\.github/scripts/state_override\.py",
+    re.MULTILINE,
 )
 
 
@@ -1650,14 +1662,46 @@ _CONTINUE_ON_ERROR_RE = re.compile(r"^\s*continue-on-error\s*:", re.MULTILINE)
 _IF_CONDITION_RE = re.compile(r"^\s*if:\s*(.*?)\s*$", re.MULTILINE)
 
 
-def state_guard_override_recheck_violations(text: str) -> list[str]:
-    """An authorized override must be re-confirmed right before it reports."""
-    step = named_step(text, STATE_GUARD_RECORD_STEP)
+def _active_step(text: str, name: str) -> str | None:
+    step = named_step(text, name)
     if step is None:
-        return [f"state-guard.yml: the {STATE_GUARD_RECORD_STEP!r} step is missing"]
-    active_step = "\n".join(
+        return None
+    return "\n".join(
         "" if line.lstrip().startswith("#") else line for line in step.splitlines()
     )
+
+
+def state_guard_override_authorize_violations(text: str) -> list[str]:
+    """The authorize step decides only through the default-branch helper."""
+    active_step = _active_step(text, STATE_GUARD_AUTHORIZE_STEP)
+    if active_step is None:
+        return [f"state-guard.yml: the {STATE_GUARD_AUTHORIZE_STEP!r} step is missing"]
+    violations: list[str] = []
+    if "set -euo pipefail" not in active_step:
+        violations.append(
+            f"state-guard.yml: {STATE_GUARD_AUTHORIZE_STEP!r} must run under set -euo pipefail"
+        )
+    for required in STATE_GUARD_AUTHORIZE_CALL:
+        if required not in active_step:
+            violations.append(
+                f"state-guard.yml: {STATE_GUARD_AUTHORIZE_STEP!r} must decide through "
+                f"the trusted override helper; missing {required!r}"
+            )
+    if any(
+        match.group("prefix") != "trusted-guard/"
+        for match in _OVERRIDE_HELPER_PATH.finditer(decoded_workflow_content(text))
+    ):
+        violations.append(
+            "state-guard.yml: the override helper must come from the trusted-guard checkout"
+        )
+    return violations
+
+
+def state_guard_override_recheck_violations(text: str) -> list[str]:
+    """An authorized override must be re-decided right before it reports."""
+    active_step = _active_step(text, STATE_GUARD_RECORD_STEP)
+    if active_step is None:
+        return [f"state-guard.yml: the {STATE_GUARD_RECORD_STEP!r} step is missing"]
     violations: list[str] = []
     if "set -euo pipefail" not in active_step:
         violations.append(
@@ -6670,7 +6714,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     violations.extend(state_guard_helper_violations(state_guard))
+    violations.extend(state_guard_override_authorize_violations(state_guard))
     violations.extend(state_guard_override_recheck_violations(state_guard))
+    override_helper = root / ".github" / "scripts" / "state_override.py"
+    if override_helper.is_symlink() or not override_helper.is_file():
+        violations.append(
+            "state-guard.yml: .github/scripts/state_override.py must remain a "
+            "regular file; the guard cannot authorize an override without it"
+        )
 
     for state_workflow, commit_step in (
         ("apply-on-merge.yml", "- name: Commit state + assembled (if changed)"),

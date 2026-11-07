@@ -1030,10 +1030,19 @@ only locks and temp files.
 `state-guard.yml` fails any PR touching `.state/**` (including rename sources)
 unless:
 
-- the `gitforgeops/state-override` label is applied, and
-- a user with current `write`, `maintain` or `admin` permission has, as their
-  latest submitted review, an approve or comment whose body is exactly
-  `gitforgeops-state-override` and whose `commit_id` is the current head.
+- the `gitforgeops/state-override` label is applied;
+- the account that last added it currently holds `write`, `maintain` or
+  `admin` (`role_name` first, so Maintain is `maintain`); and
+- that account's latest submitted review is an approve or comment whose body
+  is exactly `gitforgeops-state-override` and whose `commit_id` is the current
+  head.
+
+This is the [policy-override](#policy-overrides) predicate of
+`src/policy/github_override.rs`, decided by one default-branch helper,
+`.github/scripts/state_override.py` (`authorize`, then `recheck`): label
+events and reviews are numbered pages read until one is empty (never
+`--paginate` or `Link`), and the decision ends with a re-read of the PR,
+labeler, permission and reviews.
 
 Authority is read from the PR at run time, never from the triggering event:
 the workflow is required by path (launch controls §2a), so it runs only on
@@ -1045,19 +1054,23 @@ records reviewer, permission, review id, head, run ID and attempt.
 - It uses `pull_request_target`, never `pull_request` (which would load the guard
   from the PR head, letting one commit forge a ledger entry and delete the
   check). That is safe only because the job never checks out the PR: files,
-  labels, reviews and permission come from `gh api`, and `changed_files.py`
-  from an explicit default-branch checkout.
+  labels, label events, reviews and permission come from `gh api`, and
+  `changed_files.py` and `state_override.py` from an explicit default-branch
+  checkout.
 - It runs on **every** PR with no `paths:` filter and decides internally. A
   path-filtered required check never reports on non-matching PRs and stalls
   them.
 
-The guard re-reads the PR's head, base and label immediately before reporting
-success. The workflow has no
+Immediately before reporting success, the guard runs the whole override
+decision again (head, base, labels, labeler, permission and reviews) and
+requires the labeler, review and head the authorize step recorded. The workflow has no
 concurrency group: every delivery runs to completion, though a manual cancel or
 runner failure can still interrupt one. On #407, branch protection read the
 newest check suite; the guard is safe under that selection and under a model
 that requires every suite's latest run to pass. `check_supply_chain.py` enforces
-the trigger, checkout, no-concurrency and final-recheck requirements.
+the trigger, checkout, no-concurrency, trusted-helper (both override steps run
+`trusted-guard/.github/scripts/state_override.py`, which must stay in the tree)
+and final-recheck requirements.
 The launch baseline requires the check and gives only the dedicated App an
 always-on `main` ruleset bypass. Repository variable `GITFORGEOPS_STATE_APP_ID`
 (public; read the same way by workflows and the settings audit) and environment
