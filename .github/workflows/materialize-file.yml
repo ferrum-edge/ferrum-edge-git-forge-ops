@@ -56,8 +56,10 @@ jobs:
       # in a job it `needs`: a safe path component, and never `release`, the
       # reviewer-free environment that holds only release.yml's registry
       # credentials (any letter case; GitHub compares environment names
-      # case-insensitively). check_supply_chain.py pins this step.
+      # case-insensitively). check_supply_chain.py pins this step, its
+      # explicit shell, and the absence of any defaults or env around it.
       - name: Refuse an unsafe or reserved environment input
+        shell: bash
         env:
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
         run: |

@@ -631,9 +631,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and are refused after YAML decoding too, so a double-quoted escape no
   longer hides one from the text rule. A computed `environment:` binding is
   refused unless it is one of the pinned matrix or dispatch-input bindings
-  whose source cannot name `release`; `rotate.yml` and `materialize-file.yml`
-  now refuse an unsafe or reserved environment input in their `preflight`
-  job, before the binding is evaluated.
+  whose source cannot name `release`. Each matrix's producing job output and
+  step script are pinned too, and the pinned steps run with no `defaults:`,
+  workflow or job `env:`, `container:` or `continue-on-error` around them.
+  `rotate.yml` and `materialize-file.yml` now refuse an unsafe or reserved
+  environment input in their `preflight` job, with an explicit
+  `shell: bash`, before the binding is evaluated. Reusable-workflow call jobs
+  are refused (a called workflow could bind `release` unseen), workflow keys
+  are read in any letter case, and job ids differing only in case are
+  refused. The audit also refuses a secret listing that repeats a name and
+  repository metadata without an owner type.
   Existing publishers move the secrets into the environment, delete the
   repository secrets and rotate the token (README, Publishing your own
   image).

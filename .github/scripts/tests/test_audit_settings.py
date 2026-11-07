@@ -857,6 +857,38 @@ class ReleaseEnvironmentTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, message):
                     self.run_audit(responses)
 
+    def test_overlapping_pages_cannot_make_a_short_listing_look_complete(self):
+        # Two pages that repeat a name advertise 2 and return 2 entries, but
+        # only one distinct secret: DOCKERHUB_TOKEN could be the one missing.
+        key = "repos/acme/repo/actions/secrets?per_page=100"
+        for pages in (
+            [
+                {"total_count": 2, "secrets": [{"name": "A"}]},
+                {"total_count": 2, "secrets": [{"name": "A"}]},
+            ],
+            [{"total_count": 2, "secrets": [{"name": "A"}, {"name": "a"}]}],
+        ):
+            with self.subTest(pages=pages):
+                responses = release_responses()
+                responses[key] = pages
+                with self.assertRaisesRegex(RuntimeError, "repeats"):
+                    self.run_audit(responses)
+
+    def test_metadata_without_an_owner_type_fails_closed(self):
+        # Without it the organization-secret listing could be skipped on an
+        # organization repository.
+        for metadata in (
+            {"id": 1234},
+            {"id": 1234, "owner": None},
+            {"id": 1234, "owner": {}},
+            {"id": 1234, "owner": {"type": 7}},
+        ):
+            with self.subTest(metadata=metadata):
+                responses = release_responses()
+                responses["repos/acme/repo"] = metadata
+                with self.assertRaisesRegex(RuntimeError, "no owner type"):
+                    self.run_audit(responses)
+
     def test_a_complete_multi_page_listing_is_read(self):
         responses = release_responses()
         responses["repos/acme/repo/actions/secrets?per_page=100"] = [

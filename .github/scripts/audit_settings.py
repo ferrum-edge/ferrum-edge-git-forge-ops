@@ -564,8 +564,8 @@ def listed_secret_names(path: str, scope: str) -> set[str]:
 
     Fails closed on anything it cannot read in full: a missing or non-list
     `secrets` array, an entry without a string `name`, or a missing
-    `total_count`, or one that disagrees across pages or with the entries
-    actually returned. GitHub sends `total_count` on every page, and without
+    `total_count`, or one that disagrees across pages or with the number of
+    distinct names returned (a name repeated in any case is refused). GitHub sends `total_count` on every page, and without
     it completeness cannot be shown. A silently skipped entry could be exactly
     the secret the caller is looking for.
     """
@@ -573,6 +573,7 @@ def listed_secret_names(path: str, scope: str) -> set[str]:
     if not isinstance(pages, list) or not pages:
         raise RuntimeError(f"{scope} secret listing had an unexpected shape")
     names: set[str] = set()
+    canonical: set[str] = set()
     returned = 0
     totals: set[int] = set()
     for page in pages:
@@ -585,6 +586,14 @@ def listed_secret_names(path: str, scope: str) -> set[str]:
         for item in page["secrets"]:
             if not isinstance(item, dict) or not isinstance(item.get("name"), str):
                 raise RuntimeError(f"{scope} secret listing had an unexpected shape")
+            # Secret names are case-insensitive on GitHub. A name listed twice
+            # (overlapping pages) would let a short count look complete.
+            if item["name"].upper() in canonical:
+                raise RuntimeError(
+                    f"{scope} secret listing repeats {item['name']!r}; it cannot be "
+                    "shown complete"
+                )
+            canonical.add(item["name"].upper())
             names.add(item["name"])
             returned += 1
     if len(totals) != 1 or next(iter(totals)) != returned:
@@ -643,7 +652,12 @@ def audit_registry_secret_scope(audit: Audit, repo: str, metadata) -> None:
     """
     scopes = [("repository", f"repos/{repo}/actions/secrets?per_page=100")]
     owner = metadata.get("owner") if isinstance(metadata, dict) else None
-    if isinstance(owner, dict) and owner.get("type") == "Organization":
+    owner_type = owner.get("type") if isinstance(owner, dict) else None
+    if not isinstance(owner_type, str):
+        # Without the owner type the organization listing could be skipped
+        # for an organization repository; fail closed instead of guessing.
+        raise RuntimeError(f"repository metadata for {repo} has no owner type")
+    if owner_type == "Organization":
         scopes.append(
             ("organization", f"repos/{repo}/actions/organization-secrets?per_page=100")
         )

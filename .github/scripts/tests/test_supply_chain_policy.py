@@ -8922,6 +8922,184 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
         self._refused(violations, "jobs.sibling: a computed `environment:` binding")
         self._refused(violations, "only `secrets.<NAME>` may be referenced", "secrets[format(")
 
+    def test_the_full_checker_refuses_a_substituted_environment_producer(self):
+        # The matrix pin names `needs.<job>.outputs.<name>`; replacing that
+        # output with a literal array would bind any name, `release` included.
+        harness = SupplyChainPolicyTests()
+        literal = "'[{\"environment\":\"x\",\"monitoring_environment\":\"release\"}]'"
+        for name, old, output in (
+            (
+                "drift-check.yml",
+                "      scopes: ${{ steps.list.outputs.scopes }}\n",
+                "list-envs.outputs.scopes",
+            ),
+            (
+                "apply-on-merge.yml",
+                "      envs: ${{ steps.list.outputs.envs }}\n",
+                "list-envs.outputs.envs",
+            ),
+            (
+                "trusted-pr-review.yml",
+                "      targets: ${{ steps.targets.outputs.targets }}\n",
+                "prepare.outputs.targets",
+            ),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = harness._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / name
+                text = path.read_text(encoding="utf-8")
+                self.assertEqual(text.count(old), 1)
+                key = old.split(":", 1)[0]
+                path.write_text(text.replace(old, f"{key}: {literal}\n"), encoding="utf-8")
+                violations = harness._violations(root)
+                self._refused(violations, f"jobs.{output} must be exactly")
+
+    def test_a_producer_step_runs_only_its_pinned_script_as_written(self):
+        label = ".github/workflows/drift-check.yml"
+        shipped = self._shipped("drift-check.yml")
+        step = "      - name: Enumerate environments\n        id: list\n"
+        self.assertEqual(shipped.count(step), 1)
+        for changed, fragment in (
+            (
+                shipped.replace(
+                    '          echo "scopes=$scopes" >> "$GITHUB_OUTPUT"\n',
+                    "          echo 'scopes=[{\"monitoring_environment\":\"release\"}]'"
+                    ' >> "$GITHUB_OUTPUT"\n',
+                ),
+                "must match its pinned script",
+            ),
+            (shipped.replace(step, step + "        shell: true {0}\n"), "may set only"),
+            (
+                shipped.replace(
+                    "  list-envs:\n    needs: preflight\n",
+                    "  list-envs:\n    needs: preflight\n    env:\n      PATH: /tmp/evil\n",
+                ),
+                "no workflow or job `env:`",
+            ),
+            (
+                shipped.replace(
+                    "permissions:\n  contents: read\n",
+                    "permissions:\n  contents: read\ndefaults:\n  run:\n    shell: true {0}\n",
+                    1,
+                ),
+                "no `defaults:`",
+            ),
+            # A second step with the same id in another case is two producers.
+            (
+                shipped.replace(step, step.replace("id: list", "id: List") + "        run: true\n"
+                                + step),
+                "must exist exactly once",
+            ),
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertNotEqual(changed, shipped)
+                self._refused(self._violations(changed, label), fragment)
+
+    def test_a_no_op_shell_cannot_neuter_the_dispatch_guard(self):
+        for name, job in (("rotate.yml", "rotate"), ("materialize-file.yml", "materialize")):
+            shipped = self._shipped(name)
+            label = f".github/workflows/{name}"
+            guard = "      - name: Refuse an unsafe or reserved environment input\n"
+            for changed, fragment in (
+                # Workflow-level and job-level `defaults.run.shell`.
+                (
+                    shipped.replace(
+                        "permissions:\n  contents: read\n",
+                        "permissions:\n  contents: read\ndefaults:\n  run:\n    shell: true {0}\n",
+                        1,
+                    ),
+                    "no `defaults:`",
+                ),
+                (
+                    shipped.replace(
+                        "  preflight:\n    runs-on: ubuntu-26.04\n",
+                        "  preflight:\n    runs-on: ubuntu-26.04\n    defaults:\n"
+                        "      run:\n        shell: true {0}\n",
+                    ),
+                    "no `defaults:`",
+                ),
+                (
+                    shipped.replace(
+                        "  preflight:\n    runs-on: ubuntu-26.04\n",
+                        "  preflight:\n    runs-on: ubuntu-26.04\n    Defaults:\n"
+                        "      run:\n        working-directory: /tmp\n",
+                    ),
+                    "no `defaults:`",
+                ),
+                # The guard's own shell must be the pinned `bash`.
+                (shipped.replace(guard + "        shell: bash\n", guard), "runs the pinned guard"),
+                (
+                    shipped.replace(guard + "        shell: bash\n", guard + "        shell: true {0}\n"),
+                    "runs the pinned guard",
+                ),
+                (
+                    shipped.replace(
+                        "  preflight:\n    runs-on: ubuntu-26.04\n",
+                        "  preflight:\n    runs-on: ubuntu-26.04\n    env:\n      PATH: /tmp/evil\n",
+                    ),
+                    "no workflow or job `env:`",
+                ),
+                (
+                    shipped.replace(
+                        "  preflight:\n    runs-on: ubuntu-26.04\n",
+                        "  preflight:\n    runs-on: ubuntu-26.04\n    continue-on-error: true\n",
+                    ),
+                    "continue-on-error",
+                ),
+                # `Needs:` is not taken as the `needs:` the pin requires.
+                (
+                    shipped.replace(f"  {job}:\n    needs: preflight\n", f"  {job}:\n    Needs: preflight\n"),
+                    "runs the pinned guard",
+                ),
+            ):
+                with self.subTest(name=name, fragment=fragment):
+                    self.assertNotEqual(changed, shipped)
+                    self._refused(self._violations(changed, label), f"jobs.{job}", fragment)
+
+    def test_key_case_variants_cannot_hide_a_binding(self):
+        # GitHub reads these keys case-insensitively, so the rules do too.
+        variants = (
+            # A non-publisher binding `Environment: release`.
+            (
+                self._workflow("    Environment: release\n", secret="GITHUB_TOKEN", job="other"),
+                ".github/workflows/other.yml",
+                "jobs.other: only",
+            ),
+            # The publisher must spell its binding canonically.
+            (self._workflow("    Environment: release\n"), self.RELEASE, "so it must bind"),
+            # Two spellings of one binding.
+            (
+                self._workflow("    environment: release\n    Environment: production\n"),
+                self.RELEASE,
+                "`environment:` is spelled more than once",
+            ),
+            # A computed `Environment:` is held to the pins too.
+            (
+                self._workflow(
+                    "    Environment: ${{ inputs.environment }}\n", secret="GITHUB_TOKEN", job="x"
+                ),
+                ".github/workflows/x.yml",
+                "jobs.x: a computed `environment:` binding",
+            ),
+            # A reusable call in any case.
+            (
+                "on: push\njobs:\n  call:\n    Uses: acme/r/.github/workflows/x.yml@"
+                + "a" * 40
+                + "\n",
+                ".github/workflows/x.yml",
+                "jobs.call: a reusable-workflow call is refused",
+            ),
+        )
+        for text, workflow, fragment in variants:
+            with self.subTest(fragment=fragment):
+                self._refused(self._violations(text, workflow), fragment)
+        # A `Docker:` job beside the publisher.
+        text = self._workflow("    environment: release\n") + (
+            "  Docker:\n    runs-on: ubuntu-26.04\n    timeout-minutes: 5\n"
+            "    steps:\n      - run: true\n"
+        )
+        self._refused(self._violations(text), "job ids Docker, docker differ only in case")
+
     def test_anchors_and_flow_mappings_cannot_share_a_binding(self):
         # The strict reader refuses both before this rule runs, so an alias
         # cannot make one job's `environment:` look like another's.
