@@ -23,8 +23,8 @@ pub use delivery::{
     is_valid_github_login, DeliveryRecipient, DeliveryResult,
 };
 pub use github_api::{
-    fetch_public_key, fetch_public_key_at, put_environment_secret, put_environment_secret_at,
-    EnvSecretPublicKey, DEFAULT_GITHUB_API_BASE,
+    fetch_public_key, fetch_public_key_at, github_api_client, put_environment_secret,
+    put_environment_secret_at, EnvSecretPublicKey, DEFAULT_GITHUB_API_BASE, GITHUB_API_USER_AGENT,
 };
 pub use placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
 pub use resolver::{

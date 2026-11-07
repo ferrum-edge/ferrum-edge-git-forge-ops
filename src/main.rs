@@ -536,8 +536,11 @@ async fn associated_pr_number(env_config: &EnvConfig) -> Option<u64> {
     let token = env_config.github_token.as_deref()?;
     let repo = env_config.github_repository.as_deref()?;
     let sha = std::env::var("GITHUB_SHA").ok()?;
-    let client = build_github_api_client(env_config).ok()?;
-    let url = format!("https://api.github.com/repos/{repo}/commits/{sha}/pulls");
+    let client = secrets::github_api_client(env_config).ok()?;
+    let url = format!(
+        "{}/repos/{repo}/commits/{sha}/pulls",
+        secrets::DEFAULT_GITHUB_API_BASE
+    );
     let resp = client
         .get(&url)
         .bearer_auth(token)
@@ -553,31 +556,6 @@ async fn associated_pr_number(env_config: &EnvConfig) -> Option<u64> {
     prs.first()
         .and_then(|pr| pr.get("number"))
         .and_then(|n| n.as_u64())
-}
-
-/// Build a reqwest::Client configured to hit api.github.com with the
-/// `FERRUM_GITHUB_*_TIMEOUT_SECS` bounds applied. Every GitHub-API call
-/// site in the binary (PR lookup, override check, secret provisioning,
-/// SSH-key fetch, review comment post) must use this — a bare client
-/// with no timeouts can hang an apply indefinitely on a stalled endpoint
-/// and block deployment. The admin-gateway client has its own timeouts
-/// (see `http_client.rs`) and uses a different env-var pair.
-fn build_github_api_client(
-    env_config: &EnvConfig,
-) -> Result<reqwest::Client, gitforgeops::error::Error> {
-    use std::time::Duration;
-    reqwest::Client::builder()
-        .user_agent("gitforgeops/0.1")
-        .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
-        .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
-        // These calls carry a bearer token to api.github.com only. Never
-        // follow a redirect (a same-host 3xx keeps the Authorization header,
-        // and no endpoint used here legitimately redirects) and never let
-        // a downgraded http:// URL carry the token.
-        .redirect(reqwest::redirect::Policy::none())
-        .https_only(true)
-        .build()
-        .map_err(|e| gitforgeops::error::Error::HttpClient(e.to_string()))
 }
 
 /// Append `comment` to `$GITHUB_STEP_SUMMARY` when running under GitHub
@@ -778,7 +756,7 @@ async fn allocate_if_needed(
     // Deliver to the same normalized recipient the allocation journal records,
     // so delivery and the retry binding can never disagree about who holds
     // the values.
-    let client = build_github_api_client(env_config)?;
+    let client = secrets::github_api_client(env_config)?;
 
     let outcome = match secrets::allocate_and_deliver(
         &client,
@@ -1612,7 +1590,7 @@ async fn cmd_export(
     // behind as its only effect.
     let plaintext_materialized = materialize && encrypt_to.is_none();
     let payload: Vec<u8> = if let Some(login) = encrypt_to {
-        let client = build_github_api_client(&env_config)?;
+        let client = secrets::github_api_client(&env_config)?;
         match secrets::deliver_to_author(&client, login, yaml.as_bytes()).await? {
             Some(delivery) => {
                 eoutln!(
@@ -4937,7 +4915,7 @@ async fn cmd_rotate(
 
     let mut shard_count = state.credential_shard_count.max(1);
 
-    let client = build_github_api_client(&env_config)?;
+    let client = secrets::github_api_client(&env_config)?;
     // Construct the gateway client before replacing the write-only secret:
     // invalid JWT/TLS configuration is a preflight error too.
     let gateway_client = AdminClient::new_scoped(&env_config, [ns])?;

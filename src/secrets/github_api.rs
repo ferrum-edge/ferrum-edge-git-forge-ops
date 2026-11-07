@@ -10,6 +10,43 @@ use serde_json::json;
 /// origin to [`fetch_public_key_at`] / [`put_environment_secret_at`].
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 
+/// User-Agent every GitHub API request carries.
+pub const GITHUB_API_USER_AGENT: &str = "gitforgeops/0.1";
+
+/// The one `reqwest::Client` for GitHub API calls carrying a bearer token:
+/// PR lookup, override check, secret provisioning, SSH-key fetch and the
+/// review comment post. Every production GitHub call site builds its client
+/// here, so the transport policy has one owner:
+///
+/// * `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` / `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`
+///   bound every call — a client without them can hang an apply or a review
+///   indefinitely on a stalled endpoint;
+/// * redirects are never followed — a same-host 3xx keeps the
+///   `Authorization` header, and no endpoint used here legitimately
+///   redirects, so a 3xx arrives at the caller as a non-2xx failure;
+/// * `https_only` — a downgraded `http://` URL never carries the token.
+///
+/// The admin-gateway client has its own timeouts (see `http_client.rs`) and
+/// a different env-var pair. Tests that need a loopback `http://` stub build
+/// their own client and call the `*_at` variants.
+pub fn github_api_client(env_config: &crate::config::EnvConfig) -> crate::error::Result<Client> {
+    github_api_client_builder(env_config)
+        .https_only(true)
+        .build()
+        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))
+}
+
+/// [`github_api_client`] before its scheme guard, so the inline tests can
+/// check the rest of the policy against a loopback `http://` stub.
+fn github_api_client_builder(env_config: &crate::config::EnvConfig) -> reqwest::ClientBuilder {
+    use std::time::Duration;
+    Client::builder()
+        .user_agent(GITHUB_API_USER_AGENT)
+        .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
+        .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnvSecretPublicKey {
     pub key_id: String,
@@ -176,4 +213,88 @@ pub async fn put_environment_secret_at(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod client_policy_tests {
+    use super::*;
+    use crate::config::EnvConfig;
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+
+    fn env_config() -> EnvConfig {
+        EnvConfig {
+            github_connect_timeout_secs: 5,
+            github_request_timeout_secs: 30,
+            ..Default::default()
+        }
+    }
+
+    /// The production client refuses a cleartext URL before it opens any
+    /// connection, so a bearer token can never travel over `http://`.
+    #[tokio::test]
+    async fn the_production_client_refuses_http_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/repos/acme/repo", listener.local_addr().unwrap());
+
+        let client = github_api_client(&env_config()).unwrap();
+        let error = client
+            .get(&url)
+            .bearer_auth("synthetic-token")
+            .send()
+            .await
+            .expect_err("an http:// URL must be refused");
+
+        assert!(error.is_builder(), "{error}");
+        assert!(
+            matches!(listener.accept(), Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "no connection may be attempted"
+        );
+    }
+
+    /// Everything but the scheme guard, against a loopback stub: a 3xx is
+    /// handed back un-followed (the redirect target never sees a request,
+    /// let alone the token) and the shared User-Agent is sent.
+    #[tokio::test]
+    async fn the_shared_policy_never_follows_a_redirect_and_names_itself() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let location = format!("http://{}/stolen", target.local_addr().unwrap());
+
+        let stub = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", stub.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = stub.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let read = socket.read(&mut request).unwrap();
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(head.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request[..read]).to_ascii_lowercase()
+        });
+
+        let client = github_api_client_builder(&env_config()).build().unwrap();
+        let response = client
+            .get(format!("{origin}/repos/acme/repo"))
+            .bearer_auth("synthetic-token")
+            .send()
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+
+        assert_eq!(response.status().as_u16(), 302);
+        assert!(
+            matches!(target.accept(), Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "the redirect target must never be contacted"
+        );
+        assert!(
+            request.contains(&format!(
+                "user-agent: {}\r\n",
+                GITHUB_API_USER_AGENT.to_ascii_lowercase()
+            )),
+            "{request}"
+        );
+    }
 }

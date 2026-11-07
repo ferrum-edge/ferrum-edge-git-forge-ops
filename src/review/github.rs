@@ -1,6 +1,8 @@
 use std::env;
 use std::time::Duration;
 
+use reqwest::Client;
+
 use crate::config::EnvConfig;
 
 const MAX_COMMENT_RETRIES: u32 = 2;
@@ -60,9 +62,10 @@ async fn post_rendered_pr_comment(
         .map_err(|_| crate::error::Error::Config("GITHUB_TOKEN not set".to_string()))?;
     let repo = env::var("GITHUB_REPOSITORY")
         .map_err(|_| crate::error::Error::Config("GITHUB_REPOSITORY not set".to_string()))?;
+    let client = crate::secrets::github_api_client(env_config)?;
     post_comment_to(
-        env_config,
-        GITHUB_API_ORIGIN,
+        &client,
+        crate::secrets::DEFAULT_GITHUB_API_BASE,
         &token,
         &repo,
         pr_number,
@@ -71,13 +74,15 @@ async fn post_rendered_pr_comment(
     .await
 }
 
-/// The only origin production comments are posted to.
-const GITHUB_API_ORIGIN: &str = "https://api.github.com";
-
-/// [`post_pr_comment`] against `api_origin`, so tests can point it at a
-/// loopback server. Production always passes [`GITHUB_API_ORIGIN`].
+/// [`post_pr_comment`] against `api_origin` with `client`, so tests can point
+/// it at a loopback server. Production always passes
+/// [`crate::secrets::DEFAULT_GITHUB_API_BASE`] and
+/// [`crate::secrets::github_api_client`], whose policy also refuses
+/// redirects: `reqwest` replays the `Authorization` header on a same-host
+/// redirect, and a 3xx off `POST .../comments` is never a legitimate GitHub
+/// response.
 async fn post_comment_to(
-    env_config: &EnvConfig,
+    client: &Client,
     api_origin: &str,
     token: &str,
     repo: &str,
@@ -89,26 +94,10 @@ async fn post_comment_to(
     // Callers hand in a body that already went through the display sink.
     let body = serde_json::json!({ "body": comment });
 
-    // Same-shape bounds as the admin client: connect + total request.
-    // Keeps `gitforgeops review --pr N` from hanging forever if GitHub's
-    // API is slow or unreachable.
-    //
-    // Redirects are refused outright: `reqwest` replays the `Authorization`
-    // header on a same-host redirect, and a 3xx off `POST .../comments` is
-    // never a legitimate GitHub response, so following one would only ever
-    // hand the token somewhere it was not minted for.
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
-        .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
-
     for attempt in 0..=MAX_COMMENT_RETRIES {
         let resp = client
             .post(&url)
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "gitforgeops")
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -171,12 +160,13 @@ mod comment_error_tests {
             // The client stops at its cap; the peer closing early is fine.
             let _ = socket.write_all(&body).await;
         });
-        let config = EnvConfig {
-            github_connect_timeout_secs: 5,
-            github_request_timeout_secs: 30,
-            ..Default::default()
-        };
-        let error = post_comment_to(&config, &origin, "synthetic-token", "acme/repo", 7, "hi")
+        // Loopback http:// stub, so not the https-only production client.
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let error = post_comment_to(&client, &origin, "synthetic-token", "acme/repo", 7, "hi")
             .await
             .expect_err("a 403 is not delivery");
         server.abort();
