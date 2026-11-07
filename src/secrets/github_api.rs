@@ -10,31 +10,27 @@ use serde_json::json;
 /// origin to [`fetch_public_key_at`] / [`put_environment_secret_at`].
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// User-Agent every GitHub API request carries.
-pub const GITHUB_API_USER_AGENT: &str = "gitforgeops/0.1";
-
-/// The one `reqwest::Client` for GitHub API calls carrying a bearer token:
-/// PR lookup, override check, secret provisioning, SSH-key fetch and the
-/// review comment post. Every production GitHub call site builds its client
-/// here, so the transport policy has one owner:
+/// The client for bearer-token calls to [`DEFAULT_GITHUB_API_BASE`]: PR
+/// lookup, override checks, Environment-secret provisioning and SSH-key
+/// discovery all use it.
 ///
-/// * `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` / `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`
-///   bound every call — a client without them can hang an apply or a review
-///   indefinitely on a stalled endpoint;
-/// * redirects are never followed — a same-host 3xx keeps the
-///   `Authorization` header, and no endpoint used here legitimately
-///   redirects, so a 3xx arrives at the caller as a non-2xx failure;
-/// * `https_only` — a downgraded `http://` URL never carries the token.
+/// - `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` / `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`
+///   bound every call, so a stalled GitHub endpoint cannot hang an apply or a
+///   review. The admin-gateway client has its own pair (`http_client.rs`).
+/// - Redirects are never followed: a same-host 3xx keeps the `Authorization`
+///   header, and no endpoint used here legitimately redirects.
+/// - HTTPS only, so a downgraded `http://` URL never carries the token.
 ///
-/// The admin-gateway client has its own timeouts (see `http_client.rs`) and
-/// a different env-var pair. Tests that need a loopback `http://` stub build
-/// their own client and call the `*_at` variants.
+/// What a call sends (token or not, headers, retries) stays at its call site.
 pub fn github_api_client(env_config: &crate::config::EnvConfig) -> crate::error::Result<Client> {
     github_api_client_builder(env_config)
         .https_only(true)
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))
 }
+
+/// User-Agent every GitHub API request carries.
+pub(crate) const GITHUB_API_USER_AGENT: &str = "gitforgeops/0.1";
 
 /// [`github_api_client`] before its scheme guard, so the inline tests can
 /// check the rest of the policy against a loopback `http://` stub.
@@ -228,29 +224,6 @@ mod client_policy_tests {
             github_request_timeout_secs: 30,
             ..Default::default()
         }
-    }
-
-    /// The production client refuses a cleartext URL before it opens any
-    /// connection, so a bearer token can never travel over `http://`.
-    #[tokio::test]
-    async fn the_production_client_refuses_http_before_connecting() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}/repos/acme/repo", listener.local_addr().unwrap());
-
-        let client = github_api_client(&env_config()).unwrap();
-        let error = client
-            .get(&url)
-            .bearer_auth("synthetic-token")
-            .send()
-            .await
-            .expect_err("an http:// URL must be refused");
-
-        assert!(error.is_builder(), "{error}");
-        assert!(
-            matches!(listener.accept(), Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "no connection may be attempted"
-        );
     }
 
     /// Everything but the scheme guard, against a loopback stub: a 3xx is

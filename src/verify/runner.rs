@@ -100,23 +100,12 @@ fn check_target(url: &str) -> Result<url::Url, String> {
          embedded in the URL; the data-plane URL is an environment secret and is withheld"
             .to_string()
     };
+    use crate::config::env::{credential_transport, CredentialTransport};
     let parsed = url::Url::parse(url).map_err(|_| refused())?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(refused());
-    }
-    let allowed = match parsed.scheme() {
-        "https" => parsed.host().is_some(),
-        "http" => match parsed.host() {
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            _ => false,
-        },
-        _ => false,
-    };
-    if allowed {
-        Ok(parsed)
-    } else {
-        Err(refused())
+    // Embedded credentials and a refused transport get the same message.
+    match credential_transport(&parsed) {
+        CredentialTransport::Allowed => Ok(parsed),
+        CredentialTransport::EmbeddedCredentials | CredentialTransport::Refused => Err(refused()),
     }
 }
 

@@ -935,6 +935,23 @@ fn the_viewer_token_is_sent_only_over_https_or_to_a_loopback_ip() {
     }
     let error = ExportEndpoint::from_gateway_url("http://localhost:9000").unwrap_err();
     assert!(error.to_string().contains("literal loopback IP"), "{error}");
+    // The export endpoint's own refusals: the scheme is named, embedded
+    // credentials get their own message, and neither echoes the URL.
+    let error = ExportEndpoint::from_gateway_url("ftp://127.0.0.1:9000")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("viewer token to a ftp:// gateway URL"),
+        "{error}"
+    );
+    let error = ExportEndpoint::from_gateway_url("https://user:pass@gateway.example:9000")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must not embed credentials"), "{error}");
+    assert!(
+        !error.contains("pass") && !error.contains("gateway.example"),
+        "{error}"
+    );
 }
 
 /// The endpoint embeds `FERRUM_GATEWAY_URL`, an environment secret, so its

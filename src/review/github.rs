@@ -1,8 +1,6 @@
 use std::env;
 use std::time::Duration;
 
-use reqwest::Client;
-
 use crate::config::EnvConfig;
 
 const MAX_COMMENT_RETRIES: u32 = 2;
@@ -62,10 +60,13 @@ async fn post_rendered_pr_comment(
         .map_err(|_| crate::error::Error::Config("GITHUB_TOKEN not set".to_string()))?;
     let repo = env::var("GITHUB_REPOSITORY")
         .map_err(|_| crate::error::Error::Config("GITHUB_REPOSITORY not set".to_string()))?;
+    // The shared GitHub client: timeouts, no redirects (a 3xx off
+    // `POST .../comments` is never legitimate and would replay the token),
+    // HTTPS only.
     let client = crate::secrets::github_api_client(env_config)?;
     post_comment_to(
         &client,
-        crate::secrets::DEFAULT_GITHUB_API_BASE,
+        GITHUB_API_ORIGIN,
         &token,
         &repo,
         pr_number,
@@ -74,15 +75,14 @@ async fn post_rendered_pr_comment(
     .await
 }
 
-/// [`post_pr_comment`] against `api_origin` with `client`, so tests can point
-/// it at a loopback server. Production always passes
-/// [`crate::secrets::DEFAULT_GITHUB_API_BASE`] and
-/// [`crate::secrets::github_api_client`], whose policy also refuses
-/// redirects: `reqwest` replays the `Authorization` header on a same-host
-/// redirect, and a 3xx off `POST .../comments` is never a legitimate GitHub
-/// response.
+/// The only origin production comments are posted to.
+const GITHUB_API_ORIGIN: &str = "https://api.github.com";
+
+/// [`post_pr_comment`] through `client` against `api_origin`, so tests can
+/// point it at a loopback server. Production always passes
+/// [`GITHUB_API_ORIGIN`].
 async fn post_comment_to(
-    client: &Client,
+    client: &reqwest::Client,
     api_origin: &str,
     token: &str,
     repo: &str,
@@ -98,6 +98,7 @@ async fn post_comment_to(
         let resp = client
             .post(&url)
             .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -160,10 +161,10 @@ mod comment_error_tests {
             // The client stops at its cap; the peer closing early is fine.
             let _ = socket.write_all(&body).await;
         });
-        // Loopback http:// stub, so not the https-only production client.
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+        // A loopback stub speaks http://, so the test brings its own client.
+        let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
             .build()
             .unwrap();
         let error = post_comment_to(&client, &origin, "synthetic-token", "acme/repo", 7, "hi")
@@ -171,6 +172,57 @@ mod comment_error_tests {
             .expect_err("a 403 is not delivery");
         server.abort();
         error.to_string()
+    }
+
+    /// The comment POST pins the REST API version like every other GitHub
+    /// call, so a change of GitHub's default version cannot change it.
+    #[tokio::test]
+    async fn a_comment_post_pins_the_github_api_version() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..read]);
+            }
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        post_comment_to(&client, &origin, "synthetic-token", "acme/repo", 7, "hi")
+            .await
+            .expect("a 201 is delivery");
+        let head = server.await.unwrap();
+        assert!(
+            head.starts_with("post /repos/acme/repo/issues/7/comments "),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nx-github-api-version: 2022-11-28\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\naccept: application/vnd.github+json\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nauthorization: bearer synthetic-token\r\n"),
+            "{head}"
+        );
     }
 
     #[tokio::test]

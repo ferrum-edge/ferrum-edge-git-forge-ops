@@ -24,7 +24,7 @@ pub use delivery::{
 };
 pub use github_api::{
     fetch_public_key, fetch_public_key_at, github_api_client, put_environment_secret,
-    put_environment_secret_at, EnvSecretPublicKey, DEFAULT_GITHUB_API_BASE, GITHUB_API_USER_AGENT,
+    put_environment_secret_at, EnvSecretPublicKey, DEFAULT_GITHUB_API_BASE,
 };
 pub use placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
 pub use resolver::{

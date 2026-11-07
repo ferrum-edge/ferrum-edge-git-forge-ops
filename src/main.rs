@@ -537,10 +537,7 @@ async fn associated_pr_number(env_config: &EnvConfig) -> Option<u64> {
     let repo = env_config.github_repository.as_deref()?;
     let sha = std::env::var("GITHUB_SHA").ok()?;
     let client = secrets::github_api_client(env_config).ok()?;
-    let url = format!(
-        "{}/repos/{repo}/commits/{sha}/pulls",
-        secrets::DEFAULT_GITHUB_API_BASE
-    );
+    let url = format!("https://api.github.com/repos/{repo}/commits/{sha}/pulls");
     let resp = client
         .get(&url)
         .bearer_auth(token)

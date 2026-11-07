@@ -588,6 +588,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- The PR comment that `review` posts, and that credential delivery posts with
+  ciphertext, now goes through the same GitHub client as every other GitHub
+  call: HTTPS only, in addition to the timeouts and refused redirects it
+  already had, so a cleartext URL can never carry `GITHUB_TOKEN`. The POST
+  also pins `X-GitHub-Api-Version: 2022-11-28` like the other calls. The
+  origin was already the compiled-in `https://api.github.com`, so no token
+  was exposed.
+
 - A required status check is now also enforced by workflow path (#470). In
   sandbox repositories a same-repository pull request's own job pushed a head
   with `GITHUB_TOKEN`, which starts no workflow, and posted a successful

@@ -276,9 +276,9 @@ async fn check_override_context(
         None => return Ok(OverrideDecision::inactive("GITHUB_REPOSITORY not set")),
     };
 
-    // The shared GitHub client: FERRUM_GITHUB_*_TIMEOUT_SECS bounds, no
-    // redirects, https only. Pagination requests numbered pages from the
-    // fixed origin until one is empty, never a `Link` URL or a 3xx target.
+    // Timeouts, no redirects, HTTPS only. Pagination requests numbered pages
+    // from the fixed origin until one is empty, never a `Link` URL or a 3xx
+    // target.
     let client = crate::secrets::github_api_client(env_config)?;
 
     check_override_at(

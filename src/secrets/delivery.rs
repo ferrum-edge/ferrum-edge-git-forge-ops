@@ -188,7 +188,7 @@ pub async fn fetch_ssh_recipient(
         let resp = client
             .get(url.clone())
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "gitforgeops/0.1")
+            .header("User-Agent", super::github_api::GITHUB_API_USER_AGENT)
             .send()
             .await
             .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
