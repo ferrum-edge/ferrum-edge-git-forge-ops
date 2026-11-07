@@ -1581,25 +1581,15 @@ impl Authorized<'_> {
 /// `FERRUM_ALLOW_INSECURE_HTTP=true` admits a cleartext gateway URL at
 /// configuration time; it does not extend this to a remote host.
 fn credential_target(target: &str) -> crate::error::Result<url::Url> {
+    use crate::config::env::{credential_transport, CredentialTransport};
     let parsed = url::Url::parse(target).map_err(|_| unusable_gateway_url())?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(crate::error::Error::Config(
+    match credential_transport(&parsed) {
+        CredentialTransport::Allowed => Ok(parsed),
+        CredentialTransport::EmbeddedCredentials => Err(crate::error::Error::Config(
             "FERRUM_GATEWAY_URL must not embed credentials (value withheld)".to_string(),
-        ));
+        )),
+        CredentialTransport::Refused => Err(cleartext_credential_refused()),
     }
-    let allowed = match parsed.scheme() {
-        "https" => true,
-        "http" => match parsed.host() {
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            _ => false,
-        },
-        _ => false,
-    };
-    if !allowed {
-        return Err(cleartext_credential_refused());
-    }
-    Ok(parsed)
 }
 
 fn unusable_gateway_url() -> crate::error::Error {
@@ -2026,25 +2016,21 @@ impl ExportEndpoint {
     /// other scheme are refused. The admin client enforces the same transport
     /// rule for both credential tiers, independently of insecure opt-ins.
     pub fn from_gateway_url(gateway_url: &str) -> crate::error::Result<Self> {
+        use crate::config::env::{credential_transport, CredentialTransport};
         let parsed = url::Url::parse(gateway_url).map_err(invalid_gateway_url)?;
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(crate::error::Error::Config(
-                "FERRUM_GATEWAY_URL must not embed credentials".to_string(),
-            ));
-        }
-        let loopback = match parsed.host() {
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            _ => false,
-        };
-        match parsed.scheme() {
-            "https" => {}
-            "http" if loopback => {}
-            scheme => {
+        match credential_transport(&parsed) {
+            CredentialTransport::Allowed => {}
+            CredentialTransport::EmbeddedCredentials => {
+                return Err(crate::error::Error::Config(
+                    "FERRUM_GATEWAY_URL must not embed credentials".to_string(),
+                ));
+            }
+            CredentialTransport::Refused => {
                 return Err(crate::error::Error::Config(format!(
                     "refusing to send the viewer token to a {scheme}:// gateway URL: \
                      GET /config/export needs https://, or http:// to a literal loopback IP \
-                     address (127.0.0.1 or [::1])"
+                     address (127.0.0.1 or [::1])",
+                    scheme = parsed.scheme()
                 )));
             }
         }

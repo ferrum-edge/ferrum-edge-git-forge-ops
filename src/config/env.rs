@@ -727,11 +727,48 @@ pub fn validate_verify_transport(
     )])
 }
 
+/// Whether a URL may carry a credential (admin JWT, viewer token, a traffic
+/// check's header) on the request about to be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialTransport {
+    /// `https://`, or cleartext `http://` to a literal loopback IP.
+    Allowed,
+    /// `user:password@` is embedded in the URL, whatever the scheme.
+    EmbeddedCredentials,
+    /// Any other scheme, or cleartext to anything but a literal loopback IP
+    /// (a hostname never qualifies, `localhost` included).
+    Refused,
+}
+
+/// The send-time credential-transport rule, applied to the exact parsed URL a
+/// request uses: by the admin client (`http_client::credential_target`), the
+/// viewer export endpoint (`ExportEndpoint::from_gateway_url`) and traffic
+/// verification (`verify::runner::check_target`). Each caller maps a refusal
+/// to its own withheld-URL message.
+///
+/// Independent of `FERRUM_ALLOW_INSECURE_HTTP`: that opt-in admits a cleartext
+/// URL at load ([`validate_gateway_transport`], [`validate_verify_transport`]),
+/// never cleartext to a remote host at send time. The gateway URL's load-time
+/// CI rule ([`host_is_loopback`]) also accepts the name `localhost`; this rule
+/// does not.
+pub(crate) fn credential_transport(url: &Url) -> CredentialTransport {
+    if !url.username().is_empty() || url.password().is_some() {
+        return CredentialTransport::EmbeddedCredentials;
+    }
+    match url.scheme() {
+        "https" => CredentialTransport::Allowed,
+        "http" if url.host().is_some_and(|host| host_is_loopback_ip(&host)) => {
+            CredentialTransport::Allowed
+        }
+        _ => CredentialTransport::Refused,
+    }
+}
+
 /// Is the host a literal loopback IP (`127.0.0.0/8` or `::1`)?
 ///
 /// Stricter than [`host_is_loopback`], which also accepts the name
-/// `localhost` for the gateway URL's CI rule. This is the admin client's
-/// send-time rule, which `FERRUM_VERIFY_BASE_URL` is held to at load.
+/// `localhost` for the gateway URL's CI rule. This is the cleartext half of
+/// [`credential_transport`], which `FERRUM_VERIFY_BASE_URL` is held to at load.
 fn host_is_loopback_ip(host: &Host<&str>) -> bool {
     match host {
         Host::Domain(_) => false,
@@ -896,4 +933,62 @@ fn invalid_secret_env(var: &str, accepted: &str) -> crate::error::Error {
         "invalid {var}: the value is an environment secret and is withheld; expected {accepted} \
          (unset or blank uses the documented default)"
     ))
+}
+
+#[cfg(test)]
+mod credential_transport_tests {
+    use super::*;
+
+    fn verdict(url: &str) -> CredentialTransport {
+        credential_transport(&Url::parse(url).unwrap())
+    }
+
+    /// The shared send-time rule every credential-bearing request is held to.
+    #[test]
+    fn credentials_travel_only_over_https_or_cleartext_to_a_literal_loopback_ip() {
+        use CredentialTransport::*;
+        for (url, expected) in [
+            ("https://gateway.example:9000", Allowed),
+            ("HTTPS://gateway.example:9000/admin/", Allowed),
+            ("https://localhost:9000", Allowed),
+            ("http://127.0.0.1:9000", Allowed),
+            ("http://127.0.0.2:9000", Allowed),
+            ("http://127.255.255.254:9000", Allowed),
+            ("http://[::1]:9000", Allowed),
+            ("http://localhost:9000", Refused),
+            ("http://LOCALHOST:9000", Refused),
+            ("http://localhost.:9000", Refused),
+            ("http://127.0.0.1.example:9000", Refused),
+            ("http://[::ffff:127.0.0.1]:9000", Refused),
+            ("http://[::]:9000", Refused),
+            ("http://10.0.0.5:9000", Refused),
+            ("http://gateway.example:9000", Refused),
+            ("ftp://127.0.0.1:9000", Refused),
+            ("ws://127.0.0.1:9000", Refused),
+            (
+                "https://user:pass@gateway.example:9000",
+                EmbeddedCredentials,
+            ),
+            ("https://user@gateway.example:9000", EmbeddedCredentials),
+            ("http://user:pass@127.0.0.1:9000", EmbeddedCredentials),
+            ("ftp://user:pass@gateway.example:9000", EmbeddedCredentials),
+        ] {
+            assert_eq!(verdict(url), expected, "{url}");
+        }
+    }
+
+    /// The gateway URL's load-time CI rule is a different policy: it accepts
+    /// the name `localhost` (the runner's own machine), which the send-time
+    /// rule never does. Folding one into the other would change either the
+    /// CI refusal or what a request may carry.
+    #[test]
+    fn the_load_time_gateway_rule_still_accepts_localhost_the_send_time_rule_refuses() {
+        for url in ["http://localhost:9000", "http://LOCALHOST:9000"] {
+            assert!(
+                validate_gateway_transport(Some(url), true, false, true).is_ok(),
+                "{url}: load-time CI rule"
+            );
+            assert_eq!(verdict(url), CredentialTransport::Refused, "{url}");
+        }
+    }
 }

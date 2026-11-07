@@ -10,6 +10,30 @@ use serde_json::json;
 /// origin to [`fetch_public_key_at`] / [`put_environment_secret_at`].
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 
+/// The client for bearer-token calls to [`DEFAULT_GITHUB_API_BASE`]: PR
+/// lookup, override checks, Environment-secret provisioning and SSH-key
+/// discovery all use it.
+///
+/// - `FERRUM_GITHUB_CONNECT_TIMEOUT_SECS` / `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS`
+///   bound every call, so a stalled GitHub endpoint cannot hang an apply or a
+///   review. The admin-gateway client has its own pair (`http_client.rs`).
+/// - Redirects are never followed: a same-host 3xx keeps the `Authorization`
+///   header, and no endpoint used here legitimately redirects.
+/// - HTTPS only, so a downgraded `http://` URL never carries the token.
+///
+/// What a call sends (token or not, headers, retries) stays at its call site.
+pub fn github_api_client(env_config: &crate::config::EnvConfig) -> crate::error::Result<Client> {
+    use std::time::Duration;
+    Client::builder()
+        .user_agent("gitforgeops/0.1")
+        .connect_timeout(Duration::from_secs(env_config.github_connect_timeout_secs))
+        .timeout(Duration::from_secs(env_config.github_request_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .build()
+        .map_err(|e| crate::error::Error::HttpClient(e.to_string()))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EnvSecretPublicKey {
     pub key_id: String,
