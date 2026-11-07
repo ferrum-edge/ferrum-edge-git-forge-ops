@@ -1642,9 +1642,19 @@ STATE_GUARD_FINAL_RECHECK = (
 )
 # Neither override step reads GitHub itself: the helper is the only decision,
 # so an inline re-read (or a second, divergent rule) is refused rather than
-# allowed beside it. Matched on active (non-comment) lines only.
+# allowed beside it. Matched on active (non-comment) lines only. A command word
+# starts a line or follows whitespace, a shell operator, a quote, `=`, `{` or a
+# backslash (`\gh` runs `gh`), so `env gh`, `command gh` and `exec gh` count
+# too. It may carry any directory prefix (`/usr/bin/gh`, `./jq`,
+# `"$HOME/bin/curl"`); its basename must be exactly one of the four and end
+# the word, so `github`, `jquery`, `gh-pages` and `$gh_token` do not.
 _OVERRIDE_STEP_DIRECT_READ = re.compile(
-    r"(?<![\w./-])(?:gh|curl|wget|jq)(?![\w./-])|--paginate"
+    r"(?:^|(?<=[\s;|&()`\"'=!{\\]))"
+    r"(?:[^\s;|&()`\"'<>/]*/)*"
+    r"(?:gh|curl|wget|jq)"
+    r"(?=[\s;|&()`\"'}<>]|$)"
+    r"|--paginate",
+    re.MULTILINE,
 )
 # Any whole path token naming `state_override.py` whose directory prefix is not
 # exactly the protected `trusted-guard/` checkout is the candidate's helper.

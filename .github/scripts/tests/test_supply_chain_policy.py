@@ -5434,6 +5434,34 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             'curl -fsS "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}"',
             "wget -qO- https://api.github.com/",
             'x=$(command gh api "repos/${REPO}")',
+            # A directory prefix, absolute or relative, is the same command.
+            'final=$(/usr/bin/gh api "repos/${REPO}/pulls/${PR_NUMBER}")',
+            "final_head=$(./jq -r '.head.sha' <<< \"$final\")",
+            '"$HOME/bin/curl" -fsS "https://api.github.com/repos/${REPO}"',
+            "/usr/local/bin/wget -qO- https://api.github.com/",
+            '../tools/gh api "repos/${REPO}"',
+            '${TOOLS}/jq -r .head.sha <<< "$final"',
+            # Wrappers and an escaped command word still run it.
+            'env gh api "repos/${REPO}"',
+            'exec gh api "repos/${REPO}"',
+            'command /usr/bin/gh api "repos/${REPO}"',
+            '\\gh api "repos/${REPO}"',
+            'labels=`gh pr view "$PR_NUMBER"`',
+            'true && gh api "repos/${REPO}"',
+            'true | jq .',
+        )
+        # Identifiers that merely contain those letters are not commands.
+        unrelated = (
+            'echo "github.com"',
+            "jquery_version=1",
+            'echo "${{ github.repository }}"',
+            'x="$gh_token"',
+            "echo gh-pages",
+            "ghost=1",
+            "curly=1",
+            "wgetter=1",
+            'echo "repos/gh/pulls"',
+            "echo jq.json",
         )
         for name, call, violations_of in cases:
             step = check_supply_chain.named_step(text, name)
@@ -5448,6 +5476,16 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     self.assertTrue(
                         any("must not read GitHub" in item for item in violations),
                         violations,
+                    )
+            for line in unrelated:
+                with self.subTest(step=name, unrelated=line):
+                    harmless = text.replace(
+                        step, step.replace(call, call + "\n          " + line, 1), 1
+                    )
+                    self.assertNotEqual(harmless, text)
+                    self.assertFalse(
+                        any("must not read GitHub" in item for item in violations_of(harmless)),
+                        violations_of(harmless),
                     )
             # A comment that mentions them is not a read.
             commented = text.replace(
