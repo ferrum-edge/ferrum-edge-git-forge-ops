@@ -51,6 +51,28 @@ jobs:
             exit 1
           }
 
+      # The next job binds its environment from the dispatch input. GitHub
+      # resolves that binding before any of its steps run, so the name is checked here,
+      # in a job it `needs`: a safe path component, and never `release`, the
+      # reviewer-free environment that holds only release.yml's registry
+      # credentials (any letter case; GitHub compares environment names
+      # case-insensitively). check_supply_chain.py pins this step, its
+      # explicit shell, and the absence of any defaults or env around it.
+      - name: Refuse an unsafe or reserved environment input
+        shell: bash
+        env:
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          set -euo pipefail
+          [[ "$INPUT_ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || {
+            echo "::error::Environment must be a single safe path component."
+            exit 1
+          }
+          if [ "$(printf '%s' "$INPUT_ENVIRONMENT" | tr '[:upper:]' '[:lower:]')" = release ]; then
+            echo "::error::release holds the registry credentials and is not a deployment environment."
+            exit 1
+          fi
+
   materialize:
     needs: preflight
     runs-on: ubuntu-26.04

@@ -699,7 +699,9 @@ one environment from interleaving.
 `false` keeps the check on the deployment environment, where GitHub withholds
 secrets until a reviewer approves; that is reported as `not_completed`, never
 in sync. A deployment environment may not use the suffix (the settings audit
-waives its required-reviewer rule for that shape).
+waives its required-reviewer rule for that shape). Nor may one be named `release` in any case
+(`RELEASE_ENVIRONMENT`): that reviewer-free GitHub Environment holds only
+`release.yml`'s registry credentials.
 
 Fences on the reviewer-free environment:
 
@@ -1409,7 +1411,11 @@ misconfigured?" without provisioning anything.
    `true` (never from a missing `config.yaml`), otherwise
    `--state-writer-app-id`, refused as a `Fail` unless it is a canonical
    numeric App id (ASCII digits; stricter than Python's `int()`, so a refusal
-   does not imply the scheduled audit fails); no `--branch`, so the auditor reads the repository's default
+   does not imply the scheduled audit fails); `--release-publishing` exactly
+   when `GITFORGEOPS_RELEASE_ENABLED` lowercases to `true` (the auditor turns
+   it on for the upstream repository itself: the `release` environment must
+   admit exactly the default branch and `v*` tags, and no `DOCKERHUB_*` secret
+   may be repository- or organization-scoped); no `--branch`, so the auditor reads the repository's default
    branch. A pass needs exit 0 **and** the auditor's `AUDIT_SUCCESS_LINE`
    (shared constant, pinned by a test); a failed run's `Unknown` quotes its
    last meaningful stderr line and blames `GH_TOKEN` only for token failures.

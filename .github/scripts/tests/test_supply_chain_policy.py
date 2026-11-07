@@ -7503,6 +7503,30 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         )
         self.assertEqual(workflow.count("secrets.SETTINGS_AUDIT_TOKEN"), 1)
 
+    def test_registry_credentials_are_fenced_by_the_release_environment(self):
+        # As repository secrets the Docker Hub credentials were released to
+        # whatever workflow file any pushed branch carried, outside
+        # authorize-release and the `v*` tag ruleset.
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            path = root / ".github/workflows/release.yml"
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(text.count("    environment: release\n"), 1)
+            path.write_text(
+                text.replace("    environment: release\n", "", 1), encoding="utf-8"
+            )
+            violations = self._violations(root)
+        self.assertTrue(
+            any(
+                "release.yml: jobs.docker: reads secrets.DOCKERHUB_*" in item
+                for item in violations
+            ),
+            violations,
+        )
+        self.assertTrue(
+            any("the docker job must bind" in item for item in violations), violations
+        )
+
     def test_trusted_review_pins_the_triggering_workflow_definition(self):
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
@@ -8552,6 +8576,540 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
                 check_supply_chain.python_isolation_violations("x.yml", document), [], script
             )
 
+
+
+class RegistrySecretEnvironmentTests(unittest.TestCase):
+    """Only release.yml's `docker` job reads `secrets.DOCKERHUB_*`, bound to `release`."""
+
+    RELEASE = ".github/workflows/release.yml"
+
+    @staticmethod
+    def _violations(text: str, workflow: str = RELEASE) -> list[str]:
+        return check_supply_chain.registry_secret_environment_violations(
+            workflow, check_supply_chain.parse_workflow(text)
+        )
+
+    @staticmethod
+    def _workflow(
+        job_header: str,
+        secret: str = "DOCKERHUB_TOKEN",
+        job: str = "docker",
+        reference: str | None = None,
+    ) -> str:
+        reference = reference or f"${{{{ secrets.{secret} }}}}"
+        return (
+            "on: push\n"
+            "jobs:\n"
+            f"  {job}:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    timeout-minutes: 30\n"
+            f"{job_header}"
+            "    steps:\n"
+            "      - name: Log in\n"
+            "        env:\n"
+            f"          TOKEN: {reference}\n"
+            "        run: true\n"
+        )
+
+    def _refused(self, violations, *fragments):
+        self.assertTrue(
+            any(all(fragment in item for fragment in fragments) for item in violations),
+            violations,
+        )
+
+    def test_the_shipped_workflows_are_fenced(self):
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            label = path.relative_to(ROOT).as_posix()
+            document = check_supply_chain.parse_workflow(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                check_supply_chain.registry_secret_environment_violations(label, document),
+                [],
+                label,
+            )
+            self.assertEqual(
+                check_supply_chain.decoded_secret_context_violations(label, document),
+                [],
+                label,
+            )
+
+    def test_the_docker_job_without_the_environment_is_refused(self):
+        for header in (
+            "",
+            "    environment: production\n",
+            "    environment: ${{ inputs.target }}\n",
+            "    environment: release-candidate\n",
+            "    environment:\n      name: staging\n",
+        ):
+            with self.subTest(header=header):
+                self._refused(
+                    self._violations(self._workflow(header)),
+                    "jobs.docker: reads secrets.DOCKERHUB_*",
+                )
+
+    def test_the_docker_job_bound_to_the_release_environment_is_accepted(self):
+        for header in (
+            "    environment: release\n",
+            "    environment: 'release'\n",
+            "    environment:\n      name: release\n",
+        ):
+            with self.subTest(header=header):
+                self.assertEqual(self._violations(self._workflow(header)), [])
+
+    def test_another_job_bound_to_release_may_not_read_the_token(self):
+        # Binding the environment is not enough: only the reviewed publisher
+        # may hold the push token, so a second workflow (or a second job in
+        # release.yml) that binds `release` and reads it is refused.
+        bound = "    environment: release\n"
+        for workflow, job in (
+            (".github/workflows/publish-extra.yml", "docker"),
+            (".github/workflows/release.yml", "mirror"),
+            ("x.yml", "publish"),
+        ):
+            with self.subTest(workflow=workflow, job=job):
+                violations = self._violations(self._workflow(bound, job=job), workflow)
+                self._refused(violations, f"jobs.{job}: secrets.DOCKERHUB_* may be read only by")
+                self._refused(violations, f"jobs.{job}: only", "may bind the reviewer-free")
+
+    def test_no_other_job_may_bind_the_release_environment(self):
+        # GitHub compares environment names case-insensitively.
+        for header in (
+            "    environment: release\n",
+            "    environment: Release\n",
+            "    environment:\n      name: RELEASE\n",
+        ):
+            with self.subTest(header=header):
+                violations = self._violations(
+                    self._workflow(header, secret="GITHUB_TOKEN", job="other"),
+                    ".github/workflows/other.yml",
+                )
+                self._refused(violations, "jobs.other: only", "may bind the reviewer-free")
+
+    def test_the_publisher_reads_no_other_secret(self):
+        for secret in ("FERRUM_ADMIN_JWT_SECRET", "GITFORGEOPS_STATE_APP_PRIVATE_KEY"):
+            with self.subTest(secret=secret):
+                text = self._workflow("    environment: release\n").replace(
+                    "        run: true\n",
+                    f"          OTHER: ${{{{ secrets.{secret} }}}}\n        run: true\n",
+                )
+                self._refused(self._violations(text), "may read only DOCKERHUB_*", secret)
+        text = self._workflow("    environment: release\n").replace(
+            "        run: true\n",
+            "          GHCR: ${{ secrets.GITHUB_TOKEN }}\n        run: true\n",
+        )
+        self.assertEqual(self._violations(text), [])
+
+    def test_every_registry_secret_name_and_spelling_counts(self):
+        for secret in ("DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN", "DOCKERHUB_ORG_TOKEN"):
+            with self.subTest(secret=secret):
+                self.assertTrue(self._violations(self._workflow("", secret)))
+        for reference in (
+            # A lower-case or spaced spelling resolves to the same secret.
+            "${{ secrets . dockerhub_token }}",
+            # A double-quoted scalar with an escape is read decoded.
+            '"${{ secrets.\\x44OCKERHUB_TOKEN }}"',
+            # Indexed spellings are refused here as well as by the
+            # whole-context rule.
+            "${{ secrets['DOCKERHUB_TOKEN'] }}",
+            "\"${{ secrets[\\x27DOCKERHUB_TOKEN\\x27] }}\"",
+        ):
+            with self.subTest(reference=reference):
+                self._refused(
+                    self._violations(self._workflow("", reference=reference), "x.yml"),
+                    "jobs.docker: secrets.DOCKERHUB_* may be read only by",
+                )
+
+    def test_indexed_dynamic_and_whole_context_references_are_refused(self):
+        # Every form that names a secret other than `secrets.<NAME>` is refused
+        # in the file text and, after YAML decoding, in the parsed tree, so a
+        # double-quoted escape cannot hide one from the text rule.
+        for reference, raw_refuses in (
+            ("${{ secrets['DOCKERHUB_TOKEN'] }}", True),
+            ("${{ secrets[format('{0}TOKEN', 'DOCKERHUB_')] }}", True),
+            ("${{ toJSON(secrets) }}", True),
+            ("${{ fromJSON(toJSON(secrets)).DOCKERHUB_TOKEN }}", True),
+            ("${{ secrets }}", True),
+            ("\"${{ \\x73ecrets['DOCKERHUB_TOKEN'] }}\"", False),
+            ("\"${{ toJSON(\\x73ecrets) }}\"", False),
+            ("\"\\x24{{ secrets['DOCKERHUB_TOKEN'] }}\"", False),
+        ):
+            with self.subTest(reference=reference):
+                text = self._workflow("", reference=reference)
+                raw = check_supply_chain.whole_secrets_context_violations("x.yml", text)
+                self.assertEqual(bool(raw), raw_refuses, raw)
+                decoded = check_supply_chain.decoded_secret_context_violations(
+                    "x.yml", check_supply_chain.parse_workflow(text)
+                )
+                self._refused(decoded, "only `secrets.<NAME>` may be referenced")
+
+    def test_unrelated_secrets_and_the_image_variable_are_not_registry_credentials(self):
+        self.assertEqual(
+            self._violations(self._workflow("", "GITHUB_TOKEN", job="build"), "x.yml"), []
+        )
+        text = self._workflow("", job="build").replace(
+            "secrets.DOCKERHUB_TOKEN", "vars.DOCKERHUB_IMAGE"
+        )
+        self.assertEqual(self._violations(text, "x.yml"), [])
+
+    def test_a_workflow_level_reference_is_refused(self):
+        text = (
+            "on: push\n"
+            "env:\n"
+            "  TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}\n"
+            "jobs:\n"
+            "  docker:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    timeout-minutes: 30\n"
+            "    environment: release\n"
+            "    steps:\n"
+            "      - run: true\n"
+        )
+        self._refused(self._violations(text), "never at workflow level")
+
+    def test_a_reusable_workflow_call_cannot_carry_the_token(self):
+        # GitHub refuses `environment:` on a call job, so a secret passed
+        # through one can only be a repository or organization secret.
+        text = (
+            "on: push\n"
+            "jobs:\n"
+            "  docker:\n"
+            "    uses: acme/release/.github/workflows/push.yml@" + "a" * 40 + "\n"
+            "    secrets:\n"
+            "      token: ${{ secrets.DOCKERHUB_TOKEN }}\n"
+        )
+        self._refused(self._violations(text), "jobs.docker: reads secrets.DOCKERHUB_*")
+
+    def test_quoted_closing_delimiters_do_not_end_a_secret_expression(self):
+        # GitHub ends an expression at a `}}` outside single-quoted literals
+        # only, so the scan must too, raw and after decoding.
+        refused = (
+            "${{ contains('}}', '}') && secrets[format('DOCKER{0}_TOKEN', 'HUB')] }}",
+            "${{ 'it''s }}' && toJSON(secrets) }}",
+            "${{ format('{0}', fromJSON(toJSON(secrets))) }}",
+            "${{ '}}' || secrets }}",
+            # An opener that never closes is scanned to the end.
+            "${{ secrets['DOCKERHUB_TOKEN']",
+        )
+        for reference in refused:
+            with self.subTest(reference=reference):
+                self.assertTrue(
+                    check_supply_chain.whole_secrets_context_violations("x.yml", reference)
+                )
+        sol = refused[0]
+        self.assertFalse(
+            any(
+                "secrets[" in match.group(1)
+                for match in check_supply_chain.EXPRESSION.finditer(sol)
+            ),
+            "the old non-greedy scan stopped at the quoted '}}'",
+        )
+        text = self._workflow("", reference=sol, job="sibling")
+        self._refused(
+            check_supply_chain.decoded_secret_context_violations(
+                "x.yml", check_supply_chain.parse_workflow(text)
+            ),
+            "only `secrets.<NAME>` may be referenced",
+        )
+        for allowed in (
+            "${{ contains('}}', '}') && secrets.GITHUB_TOKEN }}",
+            "${{ 'secrets.X }}' }}",
+        ):
+            with self.subTest(allowed=allowed):
+                self.assertEqual(
+                    check_supply_chain.whole_secrets_context_violations("x.yml", allowed),
+                    [],
+                )
+
+    def test_unpinned_computed_environment_bindings_are_refused(self):
+        # A computed name is resolved at run time and could be `release`.
+        for workflow, job, header in (
+            (self.RELEASE, "sibling", "    environment: ${{ 'release' }}\n"),
+            (".github/workflows/x.yml", "deploy", "    environment: ${{ matrix.environment }}\n"),
+            (".github/workflows/x.yml", "deploy", "    environment: ${{ inputs.environment }}\n"),
+            (
+                ".github/workflows/x.yml",
+                "deploy",
+                "    environment:\n      name: ${{ inputs.environment }}\n",
+            ),
+            # A pinned job may not swap its binding for another expression.
+            (
+                ".github/workflows/rotate.yml",
+                "rotate",
+                "    environment: ${{ format('{0}', 'release') }}\n",
+            ),
+        ):
+            with self.subTest(workflow=workflow, header=header):
+                violations = self._violations(
+                    self._workflow(header, secret="GITHUB_TOKEN", job=job), workflow
+                )
+                self._refused(violations, f"jobs.{job}: a computed `environment:` binding")
+
+    def _shipped(self, name: str) -> str:
+        return (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+
+    def test_the_pinned_dynamic_bindings_are_accepted_and_held_to_their_source(self):
+        for name in (
+            "apply-on-merge.yml",
+            "drift-check.yml",
+            "trusted-pr-review.yml",
+            "rotate.yml",
+            "materialize-file.yml",
+            "release.yml",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._violations(self._shipped(name), f".github/workflows/{name}"), []
+                )
+        # A pinned matrix binding fed from another matrix source is refused.
+        text = self._shipped("drift-check.yml").replace(
+            "scope: ${{ fromJson(needs.list-envs.outputs.scopes) }}",
+            "scope: ${{ fromJson(inputs.scopes) }}",
+        )
+        self._refused(
+            self._violations(text, ".github/workflows/drift-check.yml"),
+            "jobs.drift: strategy.matrix must be exactly",
+        )
+
+    def test_a_dispatch_binding_needs_the_pinned_preflight_guard(self):
+        for name, job in (("rotate.yml", "rotate"), ("materialize-file.yml", "materialize")):
+            shipped = self._shipped(name)
+            label = f".github/workflows/{name}"
+            step = "      - name: Refuse an unsafe or reserved environment input\n"
+            self.assertEqual(shipped.count(step), 1)
+            for changed in (
+                # No guard at all.
+                shipped.replace(step, "      - name: Something else\n"),
+                # The guard no longer refuses `release`.
+                shipped.replace("= release ]; then", "= other ]; then"),
+                # The bound job no longer waits for the preflight.
+                shipped.replace(
+                    f"  {job}:\n    needs: preflight\n", f"  {job}:\n", 1
+                ),
+                # It would run even after a failed preflight.
+                shipped.replace(
+                    f"  {job}:\n    needs: preflight\n",
+                    f"  {job}:\n    needs: preflight\n    if: always()\n",
+                    1,
+                ),
+            ):
+                with self.subTest(name=name):
+                    self.assertNotEqual(changed, shipped)
+                    self._refused(
+                        self._violations(changed, label),
+                        f"jobs.{job}: binds ${{{{ inputs.environment }}}}",
+                    )
+
+    def test_the_full_checker_refuses_a_sibling_release_job(self):
+        # Exactly the reported bypass: a sibling job outside authorize-release
+        # that computes the reserved binding and indexes the token by a
+        # computed name behind a quoted `}}`.
+        sibling = (
+            "\n"
+            "  sibling:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    timeout-minutes: 10\n"
+            "    environment: ${{ 'release' }}\n"
+            "    steps:\n"
+            "      - env:\n"
+            "          TOKEN: ${{ contains('}}', '}') && secrets[format('DOCKER{0}_TOKEN', 'HUB')] }}\n"
+            "        run: true\n"
+        )
+        harness = SupplyChainPolicyTests()
+        with tempfile.TemporaryDirectory() as directory:
+            root = harness._mirror_repo(Path(directory))
+            path = root / ".github/workflows/release.yml"
+            path.write_text(path.read_text(encoding="utf-8") + sibling, encoding="utf-8")
+            violations = harness._violations(root)
+        self._refused(violations, "jobs.sibling: a computed `environment:` binding")
+        self._refused(violations, "only `secrets.<NAME>` may be referenced", "secrets[format(")
+
+    def test_the_full_checker_refuses_a_substituted_environment_producer(self):
+        # The matrix pin names `needs.<job>.outputs.<name>`; replacing that
+        # output with a literal array would bind any name, `release` included.
+        harness = SupplyChainPolicyTests()
+        literal = "'[{\"environment\":\"x\",\"monitoring_environment\":\"release\"}]'"
+        for name, old, output in (
+            (
+                "drift-check.yml",
+                "      scopes: ${{ steps.list.outputs.scopes }}\n",
+                "list-envs.outputs.scopes",
+            ),
+            (
+                "apply-on-merge.yml",
+                "      envs: ${{ steps.list.outputs.envs }}\n",
+                "list-envs.outputs.envs",
+            ),
+            (
+                "trusted-pr-review.yml",
+                "      targets: ${{ steps.targets.outputs.targets }}\n",
+                "prepare.outputs.targets",
+            ),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = harness._mirror_repo(Path(directory))
+                path = root / ".github/workflows" / name
+                text = path.read_text(encoding="utf-8")
+                self.assertEqual(text.count(old), 1)
+                key = old.split(":", 1)[0]
+                path.write_text(text.replace(old, f"{key}: {literal}\n"), encoding="utf-8")
+                violations = harness._violations(root)
+                self._refused(violations, f"jobs.{output} must be exactly")
+
+    def test_a_producer_step_runs_only_its_pinned_script_as_written(self):
+        label = ".github/workflows/drift-check.yml"
+        shipped = self._shipped("drift-check.yml")
+        step = "      - name: Enumerate environments\n        id: list\n"
+        self.assertEqual(shipped.count(step), 1)
+        for changed, fragment in (
+            (
+                shipped.replace(
+                    '          echo "scopes=$scopes" >> "$GITHUB_OUTPUT"\n',
+                    "          echo 'scopes=[{\"monitoring_environment\":\"release\"}]'"
+                    ' >> "$GITHUB_OUTPUT"\n',
+                ),
+                "must match its pinned script",
+            ),
+            (shipped.replace(step, step + "        shell: true {0}\n"), "may set only"),
+            (
+                shipped.replace(
+                    "  list-envs:\n    needs: preflight\n",
+                    "  list-envs:\n    needs: preflight\n    env:\n      PATH: /tmp/evil\n",
+                ),
+                "no workflow or job `env:`",
+            ),
+            (
+                shipped.replace(
+                    "permissions:\n  contents: read\n",
+                    "permissions:\n  contents: read\ndefaults:\n  run:\n    shell: true {0}\n",
+                    1,
+                ),
+                "no `defaults:`",
+            ),
+            # A second step with the same id in another case is two producers.
+            (
+                shipped.replace(step, step.replace("id: list", "id: List") + "        run: true\n"
+                                + step),
+                "must exist exactly once",
+            ),
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertNotEqual(changed, shipped)
+                self._refused(self._violations(changed, label), fragment)
+
+    def test_a_no_op_shell_cannot_neuter_the_dispatch_guard(self):
+        for name, job in (("rotate.yml", "rotate"), ("materialize-file.yml", "materialize")):
+            shipped = self._shipped(name)
+            label = f".github/workflows/{name}"
+            guard = "      - name: Refuse an unsafe or reserved environment input\n"
+            for changed, fragment in (
+                # Workflow-level and job-level `defaults.run.shell`.
+                (
+                    shipped.replace(
+                        "permissions:\n  contents: read\n",
+                        "permissions:\n  contents: read\ndefaults:\n  run:\n    shell: true {0}\n",
+                        1,
+                    ),
+                    "no `defaults:`",
+                ),
+                (
+                    shipped.replace(
+                        "  preflight:\n    runs-on: ubuntu-26.04\n",
+                        "  preflight:\n    runs-on: ubuntu-26.04\n    defaults:\n"
+                        "      run:\n        shell: true {0}\n",
+                    ),
+                    "no `defaults:`",
+                ),
+                (
+                    shipped.replace(
+                        "  preflight:\n    runs-on: ubuntu-26.04\n",
+                        "  preflight:\n    runs-on: ubuntu-26.04\n    Defaults:\n"
+                        "      run:\n        working-directory: /tmp\n",
+                    ),
+                    "no `defaults:`",
+                ),
+                # The guard's own shell must be the pinned `bash`.
+                (shipped.replace(guard + "        shell: bash\n", guard), "runs the pinned guard"),
+                (
+                    shipped.replace(guard + "        shell: bash\n", guard + "        shell: true {0}\n"),
+                    "runs the pinned guard",
+                ),
+                (
+                    shipped.replace(
+                        "  preflight:\n    runs-on: ubuntu-26.04\n",
+                        "  preflight:\n    runs-on: ubuntu-26.04\n    env:\n      PATH: /tmp/evil\n",
+                    ),
+                    "no workflow or job `env:`",
+                ),
+                (
+                    shipped.replace(
+                        "  preflight:\n    runs-on: ubuntu-26.04\n",
+                        "  preflight:\n    runs-on: ubuntu-26.04\n    continue-on-error: true\n",
+                    ),
+                    "continue-on-error",
+                ),
+                # `Needs:` is not taken as the `needs:` the pin requires.
+                (
+                    shipped.replace(f"  {job}:\n    needs: preflight\n", f"  {job}:\n    Needs: preflight\n"),
+                    "runs the pinned guard",
+                ),
+            ):
+                with self.subTest(name=name, fragment=fragment):
+                    self.assertNotEqual(changed, shipped)
+                    self._refused(self._violations(changed, label), f"jobs.{job}", fragment)
+
+    def test_key_case_variants_cannot_hide_a_binding(self):
+        # GitHub reads these keys case-insensitively, so the rules do too.
+        variants = (
+            # A non-publisher binding `Environment: release`.
+            (
+                self._workflow("    Environment: release\n", secret="GITHUB_TOKEN", job="other"),
+                ".github/workflows/other.yml",
+                "jobs.other: only",
+            ),
+            # The publisher must spell its binding canonically.
+            (self._workflow("    Environment: release\n"), self.RELEASE, "so it must bind"),
+            # Two spellings of one binding.
+            (
+                self._workflow("    environment: release\n    Environment: production\n"),
+                self.RELEASE,
+                "`environment:` is spelled more than once",
+            ),
+            # A computed `Environment:` is held to the pins too.
+            (
+                self._workflow(
+                    "    Environment: ${{ inputs.environment }}\n", secret="GITHUB_TOKEN", job="x"
+                ),
+                ".github/workflows/x.yml",
+                "jobs.x: a computed `environment:` binding",
+            ),
+            # A reusable call in any case.
+            (
+                "on: push\njobs:\n  call:\n    Uses: acme/r/.github/workflows/x.yml@"
+                + "a" * 40
+                + "\n",
+                ".github/workflows/x.yml",
+                "jobs.call: a reusable-workflow call is refused",
+            ),
+        )
+        for text, workflow, fragment in variants:
+            with self.subTest(fragment=fragment):
+                self._refused(self._violations(text, workflow), fragment)
+        # A `Docker:` job beside the publisher.
+        text = self._workflow("    environment: release\n") + (
+            "  Docker:\n    runs-on: ubuntu-26.04\n    timeout-minutes: 5\n"
+            "    steps:\n      - run: true\n"
+        )
+        self._refused(self._violations(text), "job ids Docker, docker differ only in case")
+
+    def test_anchors_and_flow_mappings_cannot_share_a_binding(self):
+        # The strict reader refuses both before this rule runs, so an alias
+        # cannot make one job's `environment:` look like another's.
+        for text in (
+            self._workflow("    environment: &env release\n"),
+            self._workflow("    environment: {name: release}\n"),
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(check_supply_chain.WorkflowSyntaxError):
+                    check_supply_chain.parse_workflow(text)
 
 if __name__ == "__main__":
     unittest.main()

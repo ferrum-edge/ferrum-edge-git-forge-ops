@@ -607,6 +607,48 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `wget`, `jq` or `--paginate` outside comments), so the transitional inline
   head, base and label recheck the previous checker required is gone.
 
+- `release.yml`'s `docker` job now binds the `release` GitHub Environment,
+  and the Docker Hub push credentials (`DOCKERHUB_USERNAME`,
+  `DOCKERHUB_TOKEN`) belong there instead of in repository secrets. GitHub
+  releases a repository secret to the workflow file any pushed branch
+  carries, so a write principal who was not a `v*` tag bypass actor could
+  read the push token from a branch workflow and publish outside
+  `authorize-release`, the tag-ancestry check and the tag ruleset. The
+  environment admits exactly the default branch and `v*` tags.
+  `check_supply_chain.py` refuses a job that reads `secrets.DOCKERHUB_*`
+  without `environment: release`; where publishing is enabled (upstream, or
+  `GITFORGEOPS_RELEASE_ENABLED=true` through the new `--release-publishing`,
+  which `settings-audit.yml` and `doctor` pass), the settings audit requires
+  the environment and its exact ref rules and fails on a `DOCKERHUB_*`
+  repository or organization secret (its token needs Secrets: read there),
+  and the bootstrap creates the environment. Only `release.yml`'s `docker`
+  job may read the credentials or bind `release`, and it reads no other
+  secret but `GITHUB_TOKEN`; the audit also fails when `release` holds any
+  other secret or a secret listing cannot be read in full (every page must
+  carry a consistent `total_count`). Indexed and whole-context `secrets`
+  references are now found with the quote-aware expression scanner, so a
+  `}}` inside a quoted literal or an unclosed `${{` no longer ends the scan,
+  and are refused after YAML decoding too, so a double-quoted escape no
+  longer hides one from the text rule. A computed `environment:` binding is
+  refused unless it is one of the pinned matrix or dispatch-input bindings
+  whose source cannot name `release`. Each matrix's producing job output and
+  step script are pinned too, and the pinned steps run with no `defaults:`,
+  workflow or job `env:`, `container:` or `continue-on-error` around them.
+  `rotate.yml` and `materialize-file.yml` now refuse an unsafe or reserved
+  environment input in their `preflight` job, with an explicit
+  `shell: bash`, before the binding is evaluated. Reusable-workflow call jobs
+  are refused (a called workflow could bind `release` unseen), workflow keys
+  are read in any letter case, and job ids differing only in case are
+  refused. The audit also refuses a secret listing that repeats a name and
+  repository metadata without an owner type.
+  Existing publishers move the secrets into the environment, delete the
+  repository secrets and rotate the token (README, Publishing your own
+  image).
+- **Breaking:** `release` (in any letter case) is reserved and refused as a
+  deployment environment name in `.gitforgeops/config.yaml` and by the
+  bootstrap. A repository with such an environment renames it and its GitHub
+  Environment (and secrets) before upgrading.
+
 - The PR comment that `review` posts, and that credential delivery posts with
   ciphertext, now goes through the same GitHub client as every other GitHub
   call: HTTPS only, in addition to the timeouts and refused redirects it

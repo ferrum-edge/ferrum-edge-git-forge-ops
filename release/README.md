@@ -136,7 +136,13 @@ record; the committed record and release notes are.
 
 The protected `release.yml` is the only packaging path. Before building, it
 checks the merged PR's required checks and a sealed lifecycle result for the
-exact commit. It then publishes to both registries, attests provenance under
+exact commit. Its `docker` job binds the `release` GitHub Environment, which
+holds `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as environment secrets and
+admits only the default branch and `v*` tags, so a workflow on any other
+branch cannot read the push token. They must never be repository or
+organization secrets; see
+[GitHub launch controls](../docs/github-launch-controls.md) for the setting
+and the migration of an existing install. It then publishes to both registries, attests provenance under
 each name, and uploads the `supply-chain-inputs` artifact with the resulting
 digest. Finalize `baseline.json` with that digest and the exact source SHA
 **after** the image exists. `release.yml` ignores changes under `release/`, so

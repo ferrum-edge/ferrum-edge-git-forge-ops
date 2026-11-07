@@ -62,15 +62,23 @@ jobs:
       # monitoring. The rest of the baseline stays enforced; the audit names
       # each skip in its own evidence output. A deployment repository must not
       # set it.
+      #
+      # Where release.yml publishes (upstream, which the auditor recognizes
+      # by name, or `GITFORGEOPS_RELEASE_ENABLED=true`), `--release-publishing`
+      # also requires the `release` environment that fences the Docker Hub
+      # push credentials and fails on a DOCKERHUB_* repository or organization
+      # secret. Listing secret names needs Secrets: read on the audit token.
       - name: Audit repository and deployment protections
         env:
-          # Fine-grained PAT or GitHub App token with Administration: read.
+          # Fine-grained PAT or GitHub App token with Administration: read
+          # (and Secrets: read where release publishing is enabled).
           # GITHUB_TOKEN cannot read every repository-settings endpoint.
           GH_TOKEN: ${{ secrets.SETTINGS_AUDIT_TOKEN }}
           REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           STATE_WRITER_APP_ID: ${{ vars.GITFORGEOPS_STATE_APP_ID }}
           TEMPLATE_REPO: ${{ vars.GITFORGEOPS_TEMPLATE_REPO }}
+          RELEASE_ENABLED: ${{ vars.GITFORGEOPS_RELEASE_ENABLED }}
         run: |
           set -euo pipefail
           args=(
@@ -88,5 +96,8 @@ jobs:
             args+=(--template-repo)
           else
             args+=(--state-writer-app-id "$STATE_WRITER_APP_ID")
+          fi
+          if [ "$(printf '%s' "${RELEASE_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+            args+=(--release-publishing)
           fi
           python3 -I .github/scripts/audit_settings.py "${args[@]}"
