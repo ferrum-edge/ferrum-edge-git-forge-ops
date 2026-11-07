@@ -323,28 +323,6 @@ jobs:
               ;;
           esac
 
-          # TRANSITIONAL: the inline head, base and label recheck below is the
-          # block the supply-chain checker on `main` pins, which judges this
-          # file until the helper-aware checker merges. It only adds refusals
-          # (any failure exits under set -e, after the helper already had to
-          # pass). Remove it in the follow-up once that checker is on `main`.
-          final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
-          final_head=$(jq -r '.head.sha' <<< "$final")
-          final_ref=$(jq -r '.base.ref' <<< "$final")
-          final_labels=$(jq -r '.labels[].name' <<< "$final")
-          [ "$final_head" = "$EXPECTED_HEAD_SHA" ] || {
-            echo "::error::PR head changed before the state override was recorded; wait for the new run."
-            exit 1
-          }
-          [ "$final_ref" = "$DEFAULT_BRANCH" ] || {
-            echo "::error::PR no longer targets the protected default branch; state override is not recorded."
-            exit 1
-          }
-          grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {
-            echo "::error::State override label was removed before the override was recorded."
-            exit 1
-          }
-
           echo "::warning::Protected state scope authorized by @${ACTOR} (${current_permission}) in review ${REVIEW_ID} for head ${AUTHORIZED_HEAD}."
           {
             echo "## Authorized protected-state override"

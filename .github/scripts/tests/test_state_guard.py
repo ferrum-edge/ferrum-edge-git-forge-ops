@@ -416,9 +416,9 @@ class StateGuardTests(unittest.TestCase):
             self.assertIn("repos/example/repo/collaborators/maintainer/permission", routes)
             self.assertIn("repos/example/repo/pulls/1/reviews?per_page=100&page=1", routes)
             self.assertIn("repos/example/repo/issues/1/events?per_page=100&page=1", routes)
-            # Two PR reads by the helper, then the transitional inline re-read.
-            self.assertEqual(routes.count("repos/example/repo/pulls/1"), 3, routes)
-            self.assertEqual(routes[-1], "repos/example/repo/pulls/1", routes)
+            # The helper's two PR reads are the only ones: the step itself
+            # reads nothing.
+            self.assertEqual(routes.count("repos/example/repo/pulls/1"), 2, routes)
 
             # The report names the permission found now, not the one the
             # authorize step recorded (the step no longer reads PERMISSION).
@@ -491,9 +491,9 @@ class StateGuardTests(unittest.TestCase):
                 self.assertEqual(guard.summary.read_text(encoding="utf-8"), "")
                 self.assertNotIn("::warning::Protected state scope", result.stdout)
 
-    def test_transitional_inline_recheck_only_adds_refusals(self):
-        # A helper that passes cannot outvote the inline head, base and label
-        # checks, and those checks cannot pass a run the helper refused.
+    def test_record_step_makes_no_github_call_of_its_own(self):
+        # A helper that passes is the whole decision: the step adds no read of
+        # its own, and a helper that refuses stops it before any report.
         record = workflow_step("Record authorized override")
         with tempfile.TemporaryDirectory() as temporary:
             guard = GuardHarness(Path(temporary), override_helper=False)
@@ -502,21 +502,13 @@ class StateGuardTests(unittest.TestCase):
             guard.env.update({"ACTOR": "maintainer", "REVIEW_ID": "7", "AUTHORIZED_HEAD": HEAD})
             result = guard.run(record)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            for overrides in (
-                {"TEST_HEAD": "c" * 40},
-                {"TEST_BASE_REF": "release"},
-                {"TEST_LABELS": json.dumps(["bug"])},
-            ):
-                with self.subTest(overrides=overrides):
-                    result = guard.run(record, **overrides)
-                    self.assertNotEqual(result.returncode, 0, result.stdout)
-                    self.assertEqual(guard.summary.read_text(encoding="utf-8"), "")
+            self.assertEqual(guard.recorded_calls(), [])
 
             helper.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
             result = guard.run(record)
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertEqual(guard.summary.read_text(encoding="utf-8"), "")
-            # The helper refused first; the inline block never ran.
+            self.assertNotIn("::warning::Protected state scope", result.stdout)
             self.assertEqual(guard.recorded_calls(), [])
 
     def test_record_fails_closed_without_the_trusted_helper(self):
