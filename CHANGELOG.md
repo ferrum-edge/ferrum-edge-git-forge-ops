@@ -603,9 +603,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `issues: read` for the label events, and `check_supply_chain.py` pins both
   helper calls and requires the helper in the tree. The recorded summary
   names the permission the final decision found, not the one authorization
-  recorded. Until this checker is on `main`, the record step also keeps the
-  previous inline head, base and label recheck that the old checker pins; it
-  runs after the helper and only adds refusals, and a follow-up removes it.
+  recorded. Neither override step reads GitHub itself (no `gh`, `curl`,
+  `wget`, `jq` or `--paginate` outside comments), so the transitional inline
+  head, base and label recheck the previous checker required is gone.
 
 - `release.yml`'s `docker` job now binds the `release` GitHub Environment,
   and the Docker Hub push credentials (`DOCKERHUB_USERNAME`,

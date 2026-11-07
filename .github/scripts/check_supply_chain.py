@@ -1722,10 +1722,22 @@ STATE_GUARD_FINAL_RECHECK = (
     'current_permission=$(python3 -I "$override" recheck)',
     'case "$current_permission" in',
 )
-# The record step still carries the inline head, base and label recheck the
-# previous checker pinned, so the checker on `main` accepts this file while the
-# helper-aware one is under review. It is allowed, never required, and only
-# adds refusals after the helper; a follow-up removes it.
+# Neither override step reads GitHub itself: the helper is the only decision,
+# so an inline re-read (or a second, divergent rule) is refused rather than
+# allowed beside it. Matched on active (non-comment) lines only. A command word
+# starts a line or follows whitespace, a shell operator, a quote, `=`, `{` or a
+# backslash (`\gh` runs `gh`), so `env gh`, `command gh` and `exec gh` count
+# too. It may carry any directory prefix (`/usr/bin/gh`, `./jq`,
+# `"$HOME/bin/curl"`); its basename must be exactly one of the four and end
+# the word, so `github`, `jquery`, `gh-pages` and `$gh_token` do not.
+_OVERRIDE_STEP_DIRECT_READ = re.compile(
+    r"(?:^|(?<=[\s;|&()`\"'=!{\\]))"
+    r"(?:[^\s;|&()`\"'<>/]*/)*"
+    r"(?:gh|curl|wget|jq)"
+    r"(?=[\s;|&()`\"'}<>]|$)"
+    r"|--paginate",
+    re.MULTILINE,
+)
 # Any whole path token naming `state_override.py` whose directory prefix is not
 # exactly the protected `trusted-guard/` checkout is the candidate's helper.
 _OVERRIDE_HELPER_PATH = re.compile(
@@ -1781,7 +1793,19 @@ def state_guard_override_authorize_violations(text: str) -> list[str]:
         violations.append(
             "state-guard.yml: the override helper must come from the trusted-guard checkout"
         )
+    violations.extend(
+        _override_step_direct_read_violations(STATE_GUARD_AUTHORIZE_STEP, active_step)
+    )
     return violations
+
+
+def _override_step_direct_read_violations(name: str, active_step: str) -> list[str]:
+    if _OVERRIDE_STEP_DIRECT_READ.search(active_step):
+        return [
+            f"state-guard.yml: {name!r} must not read GitHub or parse responses "
+            "itself; the state_override.py helper is the only decision"
+        ]
+    return []
 
 
 def state_guard_override_recheck_violations(text: str) -> list[str]:
@@ -1803,6 +1827,9 @@ def state_guard_override_recheck_violations(text: str) -> list[str]:
         violations.append(
             f"state-guard.yml: {STATE_GUARD_RECORD_STEP!r} must keep its if: condition pinned"
         )
+    violations.extend(
+        _override_step_direct_read_violations(STATE_GUARD_RECORD_STEP, active_step)
+    )
     positions = []
     for required in STATE_GUARD_FINAL_RECHECK:
         position = active_step.find(required)

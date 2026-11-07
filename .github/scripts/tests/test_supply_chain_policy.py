@@ -5396,56 +5396,104 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         record = check_supply_chain.named_step(
             text, check_supply_chain.STATE_GUARD_RECORD_STEP
         )
-        # The record step may still carry the transitional inline PR re-read
-        # the previous checker pins; that is its only GitHub call.
-        transitional = 'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")'
-        for override_step, allowed_calls in ((step, []), (record, [transitional])):
+        self.assertIsNotNone(record)
+        for override_step in (step, record):
             active = [
                 line.strip() for line in override_step.splitlines()
                 if not line.lstrip().startswith("#")
             ]
-            self.assertEqual(
-                [line for line in active if "gh api" in line], allowed_calls
-            )
             for line in active:
+                self.assertNotIn("gh api", line)
                 self.assertNotIn("--paginate", line)
                 self.assertNotIn("/permission", line)
                 self.assertNotIn("/reviews", line)
 
-    def test_state_guard_transitional_inline_recheck_is_allowed_not_required(self):
+    def test_state_guard_override_steps_cannot_read_github_themselves(self):
         text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
-        step = check_supply_chain.named_step(
-            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        self.assertEqual(check_supply_chain.state_guard_override_authorize_violations(text), [])
+        self.assertEqual(check_supply_chain.state_guard_override_recheck_violations(text), [])
+        cases = (
+            (
+                check_supply_chain.STATE_GUARD_AUTHORIZE_STEP,
+                'python3 -I "$override" authorize >> "$GITHUB_OUTPUT"',
+                check_supply_chain.state_guard_override_authorize_violations,
+            ),
+            (
+                check_supply_chain.STATE_GUARD_RECORD_STEP,
+                'current_permission=$(python3 -I "$override" recheck)',
+                check_supply_chain.state_guard_override_recheck_violations,
+            ),
         )
-        self.assertIsNotNone(step)
-        # The previous checker's seven pins are still present, before any report,
-        # so the checker on `main` accepts this file during the transition.
-        previous_pins = (
+        # The removed transitional block, and other direct reads, are refused
+        # in either step, after the helper call as well as before it.
+        injected = (
             'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")',
             "final_head=$(jq -r '.head.sha' <<< \"$final\")",
-            "final_ref=$(jq -r '.base.ref' <<< \"$final\")",
-            "final_labels=$(jq -r '.labels[].name' <<< \"$final\")",
-            '[ "$final_head" = "$EXPECTED_HEAD_SHA" ] || {',
-            '[ "$final_ref" = "$DEFAULT_BRANCH" ] || {',
-            'grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {',
+            'gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate --slurp',
+            'gh pr view "$PR_NUMBER" --json labels',
+            'curl -fsS "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}"',
+            "wget -qO- https://api.github.com/",
+            'x=$(command gh api "repos/${REPO}")',
+            # A directory prefix, absolute or relative, is the same command.
+            'final=$(/usr/bin/gh api "repos/${REPO}/pulls/${PR_NUMBER}")',
+            "final_head=$(./jq -r '.head.sha' <<< \"$final\")",
+            '"$HOME/bin/curl" -fsS "https://api.github.com/repos/${REPO}"',
+            "/usr/local/bin/wget -qO- https://api.github.com/",
+            '../tools/gh api "repos/${REPO}"',
+            '${TOOLS}/jq -r .head.sha <<< "$final"',
+            # Wrappers and an escaped command word still run it.
+            'env gh api "repos/${REPO}"',
+            'exec gh api "repos/${REPO}"',
+            'command /usr/bin/gh api "repos/${REPO}"',
+            '\\gh api "repos/${REPO}"',
+            'labels=`gh pr view "$PR_NUMBER"`',
+            'true && gh api "repos/${REPO}"',
+            'true | jq .',
         )
-        report = step.index("::warning::")
-        for pin in previous_pins:
-            self.assertIn(pin, step)
-            self.assertLess(step.index(pin), report)
-        # The helper decides first; the inline block can only add refusals.
-        self.assertLess(
-            step.index(check_supply_chain.STATE_GUARD_FINAL_RECHECK[2]),
-            step.index(previous_pins[0]),
+        # Identifiers that merely contain those letters are not commands.
+        unrelated = (
+            'echo "github.com"',
+            "jquery_version=1",
+            'echo "${{ github.repository }}"',
+            'x="$gh_token"',
+            "echo gh-pages",
+            "ghost=1",
+            "curly=1",
+            "wgetter=1",
+            'echo "repos/gh/pulls"',
+            "echo jq.json",
         )
-        start = step.index(previous_pins[0])
-        end = step.index(previous_pins[-1])
-        end = step.index("          }\n", end) + len("          }\n")
-        without_block = text.replace(step, step[:start] + step[end:].lstrip(), 1)
-        self.assertNotIn(previous_pins[0], without_block)
-        self.assertEqual(
-            check_supply_chain.state_guard_override_recheck_violations(without_block), []
-        )
+        for name, call, violations_of in cases:
+            step = check_supply_chain.named_step(text, name)
+            self.assertIsNotNone(step)
+            for line in injected:
+                with self.subTest(step=name, line=line):
+                    weakened = text.replace(
+                        step, step.replace(call, call + "\n          " + line, 1), 1
+                    )
+                    self.assertNotEqual(weakened, text)
+                    violations = violations_of(weakened)
+                    self.assertTrue(
+                        any("must not read GitHub" in item for item in violations),
+                        violations,
+                    )
+            for line in unrelated:
+                with self.subTest(step=name, unrelated=line):
+                    harmless = text.replace(
+                        step, step.replace(call, call + "\n          " + line, 1), 1
+                    )
+                    self.assertNotEqual(harmless, text)
+                    self.assertFalse(
+                        any("must not read GitHub" in item for item in violations_of(harmless)),
+                        violations_of(harmless),
+                    )
+            # A comment that mentions them is not a read.
+            commented = text.replace(
+                step, step.replace(call, call + "\n          # gh api, jq, curl", 1), 1
+            )
+            self.assertFalse(
+                any("must not read GitHub" in item for item in violations_of(commented))
+            )
 
     def test_state_guard_authorize_step_cannot_drop_the_trusted_helper(self):
         text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")

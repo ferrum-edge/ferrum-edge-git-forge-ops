@@ -1066,9 +1066,10 @@ records reviewer, permission, review id, head, run ID and attempt.
 Immediately before reporting success, the guard runs the whole override
 decision again (head, base, labels, labeler, permission and reviews) and
 requires the labeler, review and head the authorize step recorded; the summary
-names the permission that decision found. The step also keeps, transitionally,
-the inline head/base/label recheck the previous checker pins (it only adds
-refusals; a follow-up removes it). The workflow has no
+names the permission that decision found. Neither override step reads GitHub
+itself (`check_supply_chain.py` refuses `gh`, `curl`, `wget`, `jq` and
+`--paginate` on their active lines), so the helper is the only decision. The
+workflow has no
 concurrency group: every delivery runs to completion, though a manual cancel or
 runner failure can still interrupt one. On #407, branch protection read the
 newest check suite; the guard is safe under that selection and under a model
