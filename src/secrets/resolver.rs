@@ -2337,24 +2337,8 @@ fn walk_and_report(
     report: &mut ResolveReport,
 ) -> crate::error::Result<()> {
     match value {
-        serde_json::Value::String(s) => {
-            if let Some(res) = parse_placeholder(s) {
-                let placeholder = res?;
-                let slot = join_slot_components(components);
-                let existing = lookup_slot_value(components, &slot, s, bundle)?;
-                let status = classify_status(&placeholder, existing);
-                check_generation_constraints(components, &placeholder, &status, mode, constraints)?;
-                let (namespace, consumer_id, cred_key) = decompose_components(components);
-                record_credential_type(report, &slot, components);
-                report.results.push(ResolveResult {
-                    consumer_id,
-                    namespace,
-                    cred_key,
-                    slot,
-                    placeholder,
-                    status,
-                });
-            }
+        serde_json::Value::String(text) => {
+            report_credential_leaf(text, components, bundle, mode, constraints, report)?;
         }
         serde_json::Value::Object(map) => {
             for (child_key, child_val) in map {
@@ -2381,6 +2365,46 @@ fn walk_and_report(
         _ => {}
     }
     Ok(())
+}
+
+/// Report one Consumer-credential string leaf. Returns the bundle value when
+/// the leaf is a placeholder with a stored value, so the mutating walk can
+/// write it back; a literal (non-placeholder) leaf is left alone and reported
+/// by the security audit instead.
+///
+/// Shared by [`walk_and_report`] and [`walk_report_and_replace`] so the slot
+/// (including the legacy-spelling lookup and the placeholder-text refusal in
+/// [`lookup_slot_value`]), the status, the generation verdict and the
+/// recorded credential type cannot differ between `plan` and `apply`. The
+/// caller chooses `constraints`: the read-only walk passes its own
+/// [`ConstraintMode`], the mutating walk always enforces.
+fn report_credential_leaf(
+    text: &str,
+    components: &[SlotComponent<'_>],
+    bundle: &CredentialBundle,
+    mode: &GatewayMode,
+    constraints: ConstraintMode,
+    report: &mut ResolveReport,
+) -> crate::error::Result<Option<String>> {
+    let Some(parsed) = parse_placeholder(text) else {
+        return Ok(None);
+    };
+    let placeholder = parsed?;
+    let slot = join_slot_components(components);
+    let existing = lookup_slot_value(components, &slot, text, bundle)?;
+    let status = classify_status(&placeholder, existing);
+    check_generation_constraints(components, &placeholder, &status, mode, constraints)?;
+    let (namespace, consumer_id, cred_key) = decompose_components(components);
+    record_credential_type(report, &slot, components);
+    report.results.push(ResolveResult {
+        consumer_id,
+        namespace,
+        cred_key,
+        slot,
+        placeholder,
+        status,
+    });
+    Ok(existing.cloned())
 }
 
 /// Report (and optionally resolve) one modeled service-discovery secret leaf.
@@ -2641,34 +2665,17 @@ fn walk_report_and_replace<'a>(
     report: &mut ResolveReport,
 ) -> crate::error::Result<()> {
     match value {
-        serde_json::Value::String(s) => {
-            if let Some(res) = parse_placeholder(s) {
-                let placeholder = res?;
-                let slot = join_slot_components(components);
-                let existing = lookup_slot_value(components, &slot, s, bundle)?;
-                let status = classify_status(&placeholder, existing);
-                check_generation_constraints(
-                    components,
-                    &placeholder,
-                    &status,
-                    mode,
-                    ConstraintMode::Enforce,
-                )?;
-                let (namespace, consumer_id, cred_key) = decompose_components(components);
-                let replacement = existing.cloned();
-                record_credential_type(report, &slot, components);
-                report_push(
-                    report,
-                    placeholder,
-                    status,
-                    &slot,
-                    namespace,
-                    consumer_id,
-                    cred_key,
-                );
-                if let Some(v) = replacement {
-                    *s = v;
-                }
+        serde_json::Value::String(text) => {
+            // Always `Enforce`: this walk feeds allocation and the write.
+            if let Some(replacement) = report_credential_leaf(
+                text,
+                components,
+                bundle,
+                mode,
+                ConstraintMode::Enforce,
+                report,
+            )? {
+                *text = replacement;
             }
         }
         serde_json::Value::Object(map) => {
@@ -2721,25 +2728,6 @@ fn walk_plugin_report_and_replace(
         _ => {}
     }
     Ok(())
-}
-
-fn report_push(
-    report: &mut ResolveReport,
-    placeholder: SecretPlaceholder,
-    status: SlotStatus,
-    slot: &str,
-    namespace: String,
-    consumer_id: String,
-    cred_key: String,
-) {
-    report.results.push(ResolveResult {
-        consumer_id,
-        namespace,
-        cred_key,
-        slot: slot.to_string(),
-        placeholder,
-        status,
-    });
 }
 
 /// Split a component slice back into (namespace, consumer_id, joined_cred_key)

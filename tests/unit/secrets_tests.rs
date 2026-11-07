@@ -2272,6 +2272,160 @@ fn lenient_and_strict_agree_when_no_constraint_is_violated() {
     assert_eq!(strict.results[0].status, lenient.results[0].status);
 }
 
+/// Every field of a [`ResolveResult`] that `plan` and `apply` must agree on.
+fn comparable_results(
+    report: &gitforgeops::secrets::ResolveReport,
+) -> Vec<(
+    String,
+    String,
+    String,
+    String,
+    SlotStatus,
+    PlaceholderAlloc,
+    usize,
+)> {
+    report
+        .results
+        .iter()
+        .map(|r| {
+            (
+                r.namespace.clone(),
+                r.consumer_id.clone(),
+                r.cred_key.clone(),
+                r.slot.clone(),
+                r.status.clone(),
+                r.placeholder.alloc,
+                r.placeholder.length_bytes,
+            )
+        })
+        .collect()
+}
+
+/// The read-only Consumer walk (`plan`/`diff`/`review`) and the mutating one
+/// (`apply`) share one leaf decision, so the same config and bundle produce
+/// the same slot, status, placeholder and recorded credential type for every
+/// leaf, including a legacy dotted slot. Only the mutating walk writes values
+/// back, and only where the bundle has one.
+#[test]
+fn consumer_credential_report_and_resolve_classify_every_leaf_identically() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{
+        report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options, ResolveOptions,
+    };
+
+    const KEY: &str = "q7Zr-synthetic-resolved-keyauth-key";
+    const LEGACY: &str = "q7Zr-synthetic-legacy-basicauth-password";
+    let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [{
+            "id": "app",
+            "username": "app",
+            "namespace": "ferrum",
+            "credentials": {
+                "keyauth": [{"key": REQUIRE}],
+                "hmac_auth": [{"secret": REQUIRE}],
+                "jwt": [{"secret": GENERATE}],
+                "basicauth": {"password": GENERATE}
+            }
+        }]
+    }))
+    .unwrap();
+    let bundle: BTreeMap<String, String> = [
+        ("ferrum/app/keyauth/key", KEY),
+        // Legacy dotted spelling of the nested basicauth slot.
+        ("ferrum/app/basicauth.password", LEGACY),
+    ]
+    .into_iter()
+    .map(|(slot, value)| (slot.to_string(), value.to_string()))
+    .collect();
+
+    let reported =
+        report_secrets_with_mode_and_options(&cfg, &bundle, GatewayMode::Api, Default::default())
+            .unwrap();
+    let mut resolved_cfg = cfg.clone();
+    let resolved = resolve_secrets_with_mode_and_options(
+        &mut resolved_cfg,
+        &bundle,
+        GatewayMode::Api,
+        ResolveOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(comparable_results(&reported), comparable_results(&resolved));
+    assert_eq!(
+        reported.slot_credential_types,
+        resolved.slot_credential_types
+    );
+    let statuses: BTreeMap<&str, &SlotStatus> = reported
+        .results
+        .iter()
+        .map(|r| (r.slot.as_str(), &r.status))
+        .collect();
+    assert_eq!(
+        statuses,
+        BTreeMap::from([
+            ("ferrum/app/basicauth/password", &SlotStatus::Resolved),
+            ("ferrum/app/hmac_auth/secret", &SlotStatus::MissingRequired),
+            ("ferrum/app/jwt/secret", &SlotStatus::NeedsAllocation),
+            ("ferrum/app/keyauth/key", &SlotStatus::Resolved),
+        ])
+    );
+    assert_eq!(
+        reported
+            .slot_credential_types
+            .get("ferrum/app/basicauth/password"),
+        Some(&"basicauth".to_string())
+    );
+
+    // Only the mutating walk rewrites leaves, and only those with a value.
+    assert_eq!(
+        serde_json::to_value(&cfg.consumers[0].credentials).unwrap(),
+        serde_json::json!({
+            "keyauth": [{"key": REQUIRE}],
+            "hmac_auth": [{"secret": REQUIRE}],
+            "jwt": [{"secret": GENERATE}],
+            "basicauth": {"password": GENERATE}
+        }),
+        "the read-only walk must leave the config untouched"
+    );
+    assert_eq!(
+        serde_json::to_value(&resolved_cfg.consumers[0].credentials).unwrap(),
+        serde_json::json!({
+            "keyauth": [{"key": KEY}],
+            "hmac_auth": [{"secret": REQUIRE}],
+            "jwt": [{"secret": GENERATE}],
+            "basicauth": {"password": LEGACY}
+        })
+    );
+}
+
+/// The read-only walk takes its caller's constraint mode (the `rotate`
+/// preflight reports an unsatisfiable `alloc=generate`), but the mutating
+/// walk feeds allocation and always enforces, so `resolve_secrets` refuses
+/// the slot `report_secrets_lenient` merely reports.
+#[test]
+fn resolve_always_enforces_the_generation_constraint_the_lenient_report_skips() {
+    use gitforgeops::secrets::report_secrets_lenient;
+
+    let cfg = consumer_with(
+        "jwt",
+        serde_json::Value::Array(vec![entry(
+            "secret",
+            "${gh-env-secret:alloc=generate|len=16}",
+        )]),
+    );
+
+    let lenient = report_secrets_lenient(&cfg, &BTreeMap::new())
+        .expect("the lenient report must not fail on a generation constraint");
+    assert_eq!(lenient.results[0].status, SlotStatus::NeedsAllocation);
+
+    let mut resolved = cfg.clone();
+    let err = resolve_secrets(&mut resolved, &BTreeMap::new())
+        .expect_err("resolve must enforce the generation constraint")
+        .to_string();
+    assert!(err.contains("at least 32 characters"), "{err}");
+}
+
 // --- Array slot-identity hazards (G3) ---------------------------------------
 
 /// Entry *position* is the slot identity, so a multi-entry credential array is
