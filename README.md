@@ -995,7 +995,9 @@ publish anyway:
    a job on any other ref. The settings audit (run with
    `--release-publishing`, which `settings-audit.yml` passes when the variable
    is set) fails on a `DOCKERHUB_*` repository or organization secret and on a
-   wider deployment policy; its token then also needs **Secrets: read**.
+   wider deployment policy, and on any other secret in `release`; its token
+   then also needs **Secrets: read**. `release` (in any letter case) is
+   reserved: it cannot be a deployment environment in `.gitforgeops/config.yaml`.
 4. Keep default workflow permissions read-only; `release.yml` grants
    `packages: write` to its own job.
 

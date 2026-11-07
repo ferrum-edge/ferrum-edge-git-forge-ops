@@ -568,12 +568,34 @@ def release_responses():
             ]
         }
     ]
+    responses[
+        f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"
+        "/secrets?per_page=100"
+    ] = [
+        {
+            "total_count": 2,
+            "secrets": [{"name": "DOCKERHUB_USERNAME"}, {"name": "DOCKERHUB_TOKEN"}],
+        }
+    ]
     responses["repos/acme/repo/actions/secrets?per_page=100"] = [
         {"total_count": 1, "secrets": [{"name": "UNRELATED_SECRET"}]}
     ]
     responses["repos/acme/repo/actions/organization-secrets?per_page=100"] = [
         {"total_count": 0, "secrets": []}
     ]
+    return responses
+
+
+def renamed_release_responses(name):
+    """The same fenced setup with the environment spelled `name`."""
+    responses = release_responses()
+    old = f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"
+    for key in [key for key in responses if key.startswith(old)]:
+        responses[f"repos/acme/repo/environments/{name}" + key[len(old):]] = responses.pop(key)
+    listing = responses["repos/acme/repo/environments?per_page=100"][0]["environments"]
+    for item in listing:
+        if item["name"] == audit_settings.RELEASE_ENVIRONMENT:
+            item["name"] = name
     return responses
 
 
@@ -736,6 +758,48 @@ class ReleaseEnvironmentTests(unittest.TestCase):
         audit = self.run_audit(responses, template_repo=True)
         self.assert_violation(audit, "DOCKERHUB_TOKEN", "are repository secrets")
 
+    def test_the_release_environment_may_hold_only_registry_credentials(self):
+        # It has no reviewer, so a gateway, broker or state secret placed there
+        # would reach every default-branch job that binds it unreviewed.
+        for secret in (
+            "FERRUM_ADMIN_JWT_SECRET",
+            "GITFORGEOPS_STATE_APP_PRIVATE_KEY",
+            "FERRUM_GH_PROVISIONER_TOKEN",
+            "FERRUM_CREDS_BUNDLE",
+            "SETTINGS_AUDIT_TOKEN",
+            "FERRUM_GATEWAY_URL",
+        ):
+            with self.subTest(secret=secret):
+                responses = release_responses()
+                responses[
+                    f"repos/acme/repo/environments/{audit_settings.RELEASE_ENVIRONMENT}"
+                    "/secrets?per_page=100"
+                ] = [
+                    {
+                        "total_count": 2,
+                        "secrets": [{"name": "DOCKERHUB_TOKEN"}, {"name": secret}],
+                    }
+                ]
+                audit = self.run_audit(responses)
+                self.assert_violation(audit, "must hold only DOCKERHUB_* secrets", secret)
+
+    def test_environment_names_match_case_insensitively(self):
+        # GitHub treats `Release` and `release` as one environment.
+        audit = self.run_audit(renamed_release_responses("Release"))
+        self.assertEqual(audit.violations, [])
+        self.assertIn(
+            "environment Release: holds only DOCKERHUB_* secrets", audit.evidence
+        )
+        self.assertTrue(audit_settings.is_release_environment_name(" RELEASE "))
+        self.assertFalse(audit_settings.is_release_environment_name("pre-release"))
+
+    def test_release_has_no_monitoring_environment(self):
+        self.assertFalse(
+            audit_settings.is_monitoring_environment(
+                "release-monitor", {"release", "release-monitor"}
+            )
+        )
+
     def test_without_release_publishing_nothing_new_is_required(self):
         # A copy that does not publish needs no release environment and no
         # Secrets: read on its audit token; an environment named `release`
@@ -755,6 +819,41 @@ class ReleaseEnvironmentTests(unittest.TestCase):
         )
         self.assertTrue(audit_settings.release_publishing_enabled("acme/repo", True))
         self.assertFalse(audit_settings.release_publishing_enabled("acme/repo", False))
+
+    def test_a_secret_listing_that_cannot_be_read_in_full_fails_closed(self):
+        key = "repos/acme/repo/actions/secrets?per_page=100"
+        for pages, message in (
+            ([], "unexpected shape"),
+            ([{"total_count": 0}], "unexpected shape"),
+            ([{"secrets": {"name": "DOCKERHUB_TOKEN"}}], "unexpected shape"),
+            ([{"secrets": ["DOCKERHUB_TOKEN"]}], "unexpected shape"),
+            ([{"secrets": [{"name": 7}]}], "unexpected shape"),
+            ([{"secrets": [{}]}], "unexpected shape"),
+            ([{"total_count": "1", "secrets": [{"name": "A"}]}], "unexpected shape"),
+            ([{"total_count": True, "secrets": [{"name": "A"}]}], "unexpected shape"),
+            ([{"total_count": 2, "secrets": [{"name": "A"}]}], "incomplete"),
+            (
+                [
+                    {"total_count": 2, "secrets": [{"name": "A"}]},
+                    {"total_count": 3, "secrets": [{"name": "B"}]},
+                ],
+                "incomplete",
+            ),
+        ):
+            with self.subTest(pages=pages):
+                responses = release_responses()
+                responses[key] = pages
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.run_audit(responses)
+
+    def test_a_complete_multi_page_listing_is_read(self):
+        responses = release_responses()
+        responses["repos/acme/repo/actions/secrets?per_page=100"] = [
+            {"total_count": 2, "secrets": [{"name": "A"}]},
+            {"total_count": 2, "secrets": [{"name": "DOCKERHUB_TOKEN"}]},
+        ]
+        audit = self.run_audit(responses)
+        self.assert_violation(audit, "DOCKERHUB_TOKEN", "are repository secrets")
 
     def test_the_release_workflow_binds_the_environment_it_audits(self):
         workflow = (
@@ -886,7 +985,7 @@ class MonitoringEnvironmentTests(unittest.TestCase):
                     "repos/acme/repo/environments/production-monitor/secrets?per_page=100"
                 ] = [
                     {
-                        "total_count": 1,
+                        "total_count": 2,
                         "secrets": [
                             {"name": "FERRUM_GATEWAY_URL"},
                             {"name": secret},

@@ -500,6 +500,26 @@ def unattended_environments_from_config(text: str) -> list[str]:
     return names
 
 
+def refuse_reserved_environments(names: list[str]) -> list[str]:
+    """A deployment environment may not be the registry-credential environment.
+
+    `release` holds only release.yml's registry push credentials and, where
+    publishing is enabled, has no required reviewer. GitHub compares
+    environment names case-insensitively, so `Release` is the same
+    environment. `src/config/repo_config.rs` refuses the same names, so the
+    bootstrap never plans a reviewed deployment environment and the reviewer-
+    free registry environment as one.
+    """
+    for name in names:
+        if name.strip().casefold() == RELEASE_ENVIRONMENT:
+            raise ValueError(
+                f"environment {name!r} is reserved for the {RELEASE_ENVIRONMENT!r} "
+                "GitHub Environment that holds release.yml's registry credentials; "
+                "rename the deployment environment"
+            )
+    return names
+
+
 def resolve_environments(args) -> list[str]:
     if args.environment:
         for name in args.environment:
@@ -508,11 +528,13 @@ def resolve_environments(args) -> list[str]:
                     f"--environment {name!r} must be 1-64 ASCII letters, digits, "
                     "'-' or '_', starting with a letter or digit"
                 )
-        return list(dict.fromkeys(args.environment))
+        return refuse_reserved_environments(list(dict.fromkeys(args.environment)))
     config = Path(args.config)
     if not config.is_file():
         return []
-    return environment_names_from_config(config.read_text(encoding="utf-8"))
+    return refuse_reserved_environments(
+        environment_names_from_config(config.read_text(encoding="utf-8"))
+    )
 
 
 def resolve_monitoring_environments(args, environments: list[str]) -> list[str]:
@@ -1487,14 +1509,6 @@ def build_plan(api: GitHubApi, args) -> Plan:
                 api, repo, repository.get("default_branch") or "main"
             )
         )
-        if RELEASE_ENVIRONMENT in environments:
-            plan.warnings.append(
-                f"A deployment environment is named {RELEASE_ENVIRONMENT!r}, which "
-                "collides with the environment that fences the registry "
-                "credentials. With release publishing enabled the settings audit "
-                "waives the reviewer requirement for that name, so rename the "
-                "deployment environment in .gitforgeops/config.yaml."
-            )
 
     if args.template_repo:
         plan.notes.append("")

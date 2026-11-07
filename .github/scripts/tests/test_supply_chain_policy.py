@@ -8531,42 +8531,60 @@ class JobBudgetAndIsolationTests(unittest.TestCase):
 
 
 class RegistrySecretEnvironmentTests(unittest.TestCase):
-    """`secrets.DOCKERHUB_*` is read only by a job bound to `environment: release`."""
+    """Only release.yml's `docker` job reads `secrets.DOCKERHUB_*`, bound to `release`."""
+
+    RELEASE = ".github/workflows/release.yml"
 
     @staticmethod
-    def _violations(text: str) -> list[str]:
+    def _violations(text: str, workflow: str = RELEASE) -> list[str]:
         return check_supply_chain.registry_secret_environment_violations(
-            "x.yml", check_supply_chain.parse_workflow(text)
+            workflow, check_supply_chain.parse_workflow(text)
         )
 
     @staticmethod
-    def _workflow(job_header: str, secret: str = "DOCKERHUB_TOKEN") -> str:
+    def _workflow(
+        job_header: str,
+        secret: str = "DOCKERHUB_TOKEN",
+        job: str = "docker",
+        reference: str | None = None,
+    ) -> str:
+        reference = reference or f"${{{{ secrets.{secret} }}}}"
         return (
             "on: push\n"
             "jobs:\n"
-            "  publish:\n"
+            f"  {job}:\n"
             "    runs-on: ubuntu-26.04\n"
             "    timeout-minutes: 30\n"
             f"{job_header}"
             "    steps:\n"
             "      - name: Log in\n"
             "        env:\n"
-            f"          TOKEN: ${{{{ secrets.{secret} }}}}\n"
+            f"          TOKEN: {reference}\n"
             "        run: true\n"
+        )
+
+    def _refused(self, violations, *fragments):
+        self.assertTrue(
+            any(all(fragment in item for fragment in fragments) for item in violations),
+            violations,
         )
 
     def test_the_shipped_workflows_are_fenced(self):
         for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            label = path.relative_to(ROOT).as_posix()
             document = check_supply_chain.parse_workflow(path.read_text(encoding="utf-8"))
             self.assertEqual(
-                check_supply_chain.registry_secret_environment_violations(
-                    path.name, document
-                ),
+                check_supply_chain.registry_secret_environment_violations(label, document),
                 [],
-                path.name,
+                label,
+            )
+            self.assertEqual(
+                check_supply_chain.decoded_secret_context_violations(label, document),
+                [],
+                label,
             )
 
-    def test_a_job_reading_the_token_without_the_environment_is_refused(self):
+    def test_the_docker_job_without_the_environment_is_refused(self):
         for header in (
             "",
             "    environment: production\n",
@@ -8575,16 +8593,12 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
             "    environment:\n      name: staging\n",
         ):
             with self.subTest(header=header):
-                violations = self._violations(self._workflow(header))
-                self.assertTrue(
-                    any(
-                        "jobs.publish: reads secrets.DOCKERHUB_*" in item
-                        for item in violations
-                    ),
-                    violations,
+                self._refused(
+                    self._violations(self._workflow(header)),
+                    "jobs.docker: reads secrets.DOCKERHUB_*",
                 )
 
-    def test_a_job_bound_to_the_release_environment_is_accepted(self):
+    def test_the_docker_job_bound_to_the_release_environment_is_accepted(self):
         for header in (
             "    environment: release\n",
             "    environment: 'release'\n",
@@ -8593,28 +8607,100 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
             with self.subTest(header=header):
                 self.assertEqual(self._violations(self._workflow(header)), [])
 
+    def test_another_job_bound_to_release_may_not_read_the_token(self):
+        # Binding the environment is not enough: only the reviewed publisher
+        # may hold the push token, so a second workflow (or a second job in
+        # release.yml) that binds `release` and reads it is refused.
+        bound = "    environment: release\n"
+        for workflow, job in (
+            (".github/workflows/publish-extra.yml", "docker"),
+            (".github/workflows/release.yml", "mirror"),
+            ("x.yml", "publish"),
+        ):
+            with self.subTest(workflow=workflow, job=job):
+                violations = self._violations(self._workflow(bound, job=job), workflow)
+                self._refused(violations, f"jobs.{job}: secrets.DOCKERHUB_* may be read only by")
+                self._refused(violations, f"jobs.{job}: only", "may bind the reviewer-free")
+
+    def test_no_other_job_may_bind_the_release_environment(self):
+        # GitHub compares environment names case-insensitively.
+        for header in (
+            "    environment: release\n",
+            "    environment: Release\n",
+            "    environment:\n      name: RELEASE\n",
+        ):
+            with self.subTest(header=header):
+                violations = self._violations(
+                    self._workflow(header, secret="GITHUB_TOKEN", job="other"),
+                    ".github/workflows/other.yml",
+                )
+                self._refused(violations, "jobs.other: only", "may bind the reviewer-free")
+
+    def test_the_publisher_reads_no_other_secret(self):
+        for secret in ("FERRUM_ADMIN_JWT_SECRET", "GITFORGEOPS_STATE_APP_PRIVATE_KEY"):
+            with self.subTest(secret=secret):
+                text = self._workflow("    environment: release\n").replace(
+                    "        run: true\n",
+                    f"          OTHER: ${{{{ secrets.{secret} }}}}\n        run: true\n",
+                )
+                self._refused(self._violations(text), "may read only DOCKERHUB_*", secret)
+        text = self._workflow("    environment: release\n").replace(
+            "        run: true\n",
+            "          GHCR: ${{ secrets.GITHUB_TOKEN }}\n        run: true\n",
+        )
+        self.assertEqual(self._violations(text), [])
+
     def test_every_registry_secret_name_and_spelling_counts(self):
         for secret in ("DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN", "DOCKERHUB_ORG_TOKEN"):
             with self.subTest(secret=secret):
                 self.assertTrue(self._violations(self._workflow("", secret)))
-        # A lower-case or spaced spelling resolves to the same secret.
-        spaced = self._workflow("").replace(
-            "secrets.DOCKERHUB_TOKEN", "secrets . dockerhub_token"
-        )
-        self.assertTrue(self._violations(spaced))
-        # A double-quoted scalar with an escape is read decoded.
-        escaped = self._workflow("").replace(
-            "TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}",
-            'TOKEN: "${{ secrets.\\x44OCKERHUB_TOKEN }}"',
-        )
-        self.assertTrue(self._violations(escaped))
+        for reference in (
+            # A lower-case or spaced spelling resolves to the same secret.
+            "${{ secrets . dockerhub_token }}",
+            # A double-quoted scalar with an escape is read decoded.
+            '"${{ secrets.\\x44OCKERHUB_TOKEN }}"',
+            # Indexed spellings are refused here as well as by the
+            # whole-context rule.
+            "${{ secrets['DOCKERHUB_TOKEN'] }}",
+            "\"${{ secrets[\\x27DOCKERHUB_TOKEN\\x27] }}\"",
+        ):
+            with self.subTest(reference=reference):
+                self._refused(
+                    self._violations(self._workflow("", reference=reference), "x.yml"),
+                    "jobs.docker: secrets.DOCKERHUB_* may be read only by",
+                )
+
+    def test_indexed_dynamic_and_whole_context_references_are_refused(self):
+        # Every form that names a secret other than `secrets.<NAME>` is refused
+        # in the file text and, after YAML decoding, in the parsed tree, so a
+        # double-quoted escape cannot hide one from the text rule.
+        for reference, raw_refuses in (
+            ("${{ secrets['DOCKERHUB_TOKEN'] }}", True),
+            ("${{ secrets[format('{0}TOKEN', 'DOCKERHUB_')] }}", True),
+            ("${{ toJSON(secrets) }}", True),
+            ("${{ fromJSON(toJSON(secrets)).DOCKERHUB_TOKEN }}", True),
+            ("${{ secrets }}", True),
+            ("\"${{ \\x73ecrets['DOCKERHUB_TOKEN'] }}\"", False),
+            ("\"${{ toJSON(\\x73ecrets) }}\"", False),
+            ("\"\\x24{{ secrets['DOCKERHUB_TOKEN'] }}\"", False),
+        ):
+            with self.subTest(reference=reference):
+                text = self._workflow("", reference=reference)
+                raw = check_supply_chain.whole_secrets_context_violations("x.yml", text)
+                self.assertEqual(bool(raw), raw_refuses, raw)
+                decoded = check_supply_chain.decoded_secret_context_violations(
+                    "x.yml", check_supply_chain.parse_workflow(text)
+                )
+                self._refused(decoded, "only `secrets.<NAME>` may be referenced")
 
     def test_unrelated_secrets_and_the_image_variable_are_not_registry_credentials(self):
-        self.assertEqual(self._violations(self._workflow("", "GITHUB_TOKEN")), [])
-        text = self._workflow("").replace(
+        self.assertEqual(
+            self._violations(self._workflow("", "GITHUB_TOKEN", job="build"), "x.yml"), []
+        )
+        text = self._workflow("", job="build").replace(
             "secrets.DOCKERHUB_TOKEN", "vars.DOCKERHUB_IMAGE"
         )
-        self.assertEqual(self._violations(text), [])
+        self.assertEqual(self._violations(text, "x.yml"), [])
 
     def test_a_workflow_level_reference_is_refused(self):
         text = (
@@ -8622,16 +8708,14 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
             "env:\n"
             "  TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}\n"
             "jobs:\n"
-            "  publish:\n"
+            "  docker:\n"
             "    runs-on: ubuntu-26.04\n"
             "    timeout-minutes: 30\n"
             "    environment: release\n"
             "    steps:\n"
             "      - run: true\n"
         )
-        self.assertTrue(
-            any("never at workflow level" in item for item in self._violations(text))
-        )
+        self._refused(self._violations(text), "never at workflow level")
 
     def test_a_reusable_workflow_call_cannot_carry_the_token(self):
         # GitHub refuses `environment:` on a call job, so a secret passed
@@ -8639,12 +8723,12 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
         text = (
             "on: push\n"
             "jobs:\n"
-            "  publish:\n"
+            "  docker:\n"
             "    uses: acme/release/.github/workflows/push.yml@" + "a" * 40 + "\n"
             "    secrets:\n"
             "      token: ${{ secrets.DOCKERHUB_TOKEN }}\n"
         )
-        self.assertTrue(self._violations(text))
+        self._refused(self._violations(text), "jobs.docker: reads secrets.DOCKERHUB_*")
 
     def test_anchors_and_flow_mappings_cannot_share_a_binding(self):
         # The strict reader refuses both before this rule runs, so an alias
@@ -8656,7 +8740,6 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(check_supply_chain.WorkflowSyntaxError):
                     check_supply_chain.parse_workflow(text)
-
 
 if __name__ == "__main__":
     unittest.main()

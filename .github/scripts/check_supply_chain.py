@@ -415,10 +415,18 @@ SETTINGS_AUDIT_TOKEN_REFERENCE = "secrets.SETTINGS_AUDIT_TOKEN"
 # whose deployment policy admits only the default branch and `v*` tags. A job
 # reads an environment secret only through its `environment:` binding; without
 # it the same reference resolves to a repository or organization secret, which
-# GitHub releases to the workflow file any pushed branch carries. Kept in step
-# with audit_settings.RELEASE_ENVIRONMENT and bootstrap_repo_settings.py.
+# GitHub releases to the workflow file any pushed branch carries. Only
+# release.yml's `docker` job reads them or binds the environment, and that job
+# reads no other secret but GITHUB_TOKEN. Kept in step with
+# audit_settings.RELEASE_ENVIRONMENT and bootstrap_repo_settings.py.
 RELEASE_ENVIRONMENT = "release"
-REGISTRY_SECRET_REFERENCE = re.compile(r"\bsecrets\s*\.\s*DOCKERHUB_", re.IGNORECASE)
+REGISTRY_SECRET_WORKFLOW = ".github/workflows/release.yml"
+REGISTRY_SECRET_JOB = "docker"
+REGISTRY_SECRET_PREFIX = "DOCKERHUB_"
+REGISTRY_JOB_OTHER_SECRETS = frozenset({"GITHUB_TOKEN"})
+REGISTRY_SECRET_REFERENCE = re.compile(
+    r"\bsecrets\s*(?:\.\s*|\[\s*['\"]\s*)DOCKERHUB_", re.IGNORECASE
+)
 FRESH_HEAD_STEP = "Refresh protected branch and reject stale deployments"
 # The checkout that feeds a privileged reconcile has to name the branch, not
 # the triggering event's commit, and has to carry enough history for the
@@ -4937,15 +4945,48 @@ def _bound_environment(job: dict):
     return environment if isinstance(environment, str) else None
 
 
+def _decoded_scalars(node):
+    """Every key and string value of a parsed document, as GitHub decodes it."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(key, str):
+                yield key
+            yield from _decoded_scalars(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _decoded_scalars(item)
+    elif isinstance(node, str):
+        yield node
+
+
+def decoded_secret_context_violations(workflow: str, document: dict) -> list[str]:
+    """The whole-context and indexed-secret refusal, over decoded scalars.
+
+    `whole_secrets_context_violations` reads the file's text, so a
+    double-quoted escape (`"${{ \\x73ecrets['NAME'] }}"`) hides an indexed or
+    whole-context reference from it; GitHub decodes the YAML scalar before it
+    evaluates the expression. The parsed tree holds the decoded text.
+    """
+    violations: list[str] = []
+    for scalar in _decoded_scalars(document):
+        for violation in whole_secrets_context_violations(workflow, scalar):
+            if violation not in violations:
+                violations.append(violation)
+    return violations
+
+
 def registry_secret_environment_violations(workflow: str, document: dict) -> list[str]:
-    """`secrets.DOCKERHUB_*` is read only by a job bound to `environment: release`.
+    """Only release.yml's `docker` job reads `secrets.DOCKERHUB_*`, bound to `release`.
 
     The parsed tree is read, with quoted scalars decoded, so a spelling cannot
-    hide the reference; anchors, aliases and flow mappings never reach here
-    because the strict reader refuses them. A reference outside `jobs:` (a
-    workflow-level `env:`) or in a reusable-workflow call job (which GitHub
-    refuses an `environment:`) can only reach a repository or organization
-    secret, so both are refused.
+    hide a `secrets.DOCKERHUB_*` or `secrets['DOCKERHUB_*']` reference
+    (`decoded_secret_context_violations` refuses every indexed or whole-context
+    form anyway); anchors, aliases and flow mappings never reach here because
+    the strict reader refuses them. Any other job, even one bound to
+    `release`, a workflow-level `env:` and a reusable-workflow call job (which
+    GitHub refuses an `environment:`) are refused. Only the `docker` job may
+    bind the reviewer-free `release` environment, in any letter case, and it
+    reads no secret but the registry credentials and GITHUB_TOKEN.
     """
     violations: list[str] = []
     jobs = document.get("jobs")
@@ -4955,21 +4996,53 @@ def registry_secret_environment_violations(workflow: str, document: dict) -> lis
         outside, jobs = document, {}
     if REGISTRY_SECRET_REFERENCE.search(json.dumps(outside, ensure_ascii=False)):
         violations.append(
-            f"{workflow}: secrets.DOCKERHUB_* may be read only inside a job bound to "
-            f"`environment: {RELEASE_ENVIRONMENT}`, never at workflow level"
+            f"{workflow}: secrets.DOCKERHUB_* may be read only by "
+            f"{REGISTRY_SECRET_WORKFLOW} jobs.{REGISTRY_SECRET_JOB}, never at workflow level"
         )
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        if not REGISTRY_SECRET_REFERENCE.search(json.dumps(job, ensure_ascii=False)):
-            continue
-        if "uses" in job or _bound_environment(job) != RELEASE_ENVIRONMENT:
+        text = json.dumps(job, ensure_ascii=False)
+        publisher = workflow == REGISTRY_SECRET_WORKFLOW and job_name == REGISTRY_SECRET_JOB
+        bound = _bound_environment(job)
+        if REGISTRY_SECRET_REFERENCE.search(text):
+            if not publisher:
+                violations.append(
+                    f"{workflow}: jobs.{job_name}: secrets.DOCKERHUB_* may be read only by "
+                    f"{REGISTRY_SECRET_WORKFLOW} jobs.{REGISTRY_SECRET_JOB}"
+                )
+            elif "uses" in job or bound != RELEASE_ENVIRONMENT:
+                violations.append(
+                    f"{workflow}: jobs.{job_name}: reads secrets.DOCKERHUB_*, so it must "
+                    f"bind `environment: {RELEASE_ENVIRONMENT}`; without it the registry "
+                    "push token is a repository or organization secret released to any "
+                    "pushed branch"
+                )
+        if (
+            not publisher
+            and bound is not None
+            and bound.strip().casefold() == RELEASE_ENVIRONMENT
+        ):
             violations.append(
-                f"{workflow}: jobs.{job_name}: reads secrets.DOCKERHUB_*, so it must "
-                f"bind `environment: {RELEASE_ENVIRONMENT}`; without it the registry "
-                "push token is a repository or organization secret released to any "
-                "pushed branch"
+                f"{workflow}: jobs.{job_name}: only {REGISTRY_SECRET_WORKFLOW} "
+                f"jobs.{REGISTRY_SECRET_JOB} may bind the reviewer-free "
+                f"`{RELEASE_ENVIRONMENT}` environment"
             )
+        if publisher:
+            others = sorted(
+                {
+                    match.group(0).split(".", 1)[1].strip().upper()
+                    for match in NAMED_SECRET.finditer(text)
+                }
+                - REGISTRY_JOB_OTHER_SECRETS
+            )
+            others = [name for name in others if not name.startswith(REGISTRY_SECRET_PREFIX)]
+            if others:
+                violations.append(
+                    f"{workflow}: jobs.{job_name}: the registry publishing job may read "
+                    f"only {REGISTRY_SECRET_PREFIX}* and GITHUB_TOKEN; found "
+                    + ", ".join(others)
+                )
     return violations
 
 
@@ -6393,9 +6466,10 @@ def main(argv: list[str] | None = None) -> int:
                 str(workflow.relative_to(root)), text, rust_channel or "<invalid>"
             )
         )
-        violations.extend(
-            whole_secrets_context_violations(str(workflow.relative_to(root)), text)
+        raw_secret_context = whole_secrets_context_violations(
+            str(workflow.relative_to(root)), text
         )
+        violations.extend(raw_secret_context)
         violations.extend(
             secret_name_case_violations(str(workflow.relative_to(root)), text)
         )
@@ -6432,6 +6506,13 @@ def main(argv: list[str] | None = None) -> int:
                 registry_secret_environment_violations(
                     workflow.relative_to(root).as_posix(), document
                 )
+            )
+            violations.extend(
+                violation
+                for violation in decoded_secret_context_violations(
+                    str(workflow.relative_to(root)), document
+                )
+                if violation not in raw_secret_context
             )
             violations.extend(
                 workflow_allowlist_violations(

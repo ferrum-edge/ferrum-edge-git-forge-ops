@@ -621,9 +621,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   which `settings-audit.yml` and `doctor` pass), the settings audit requires
   the environment and its exact ref rules and fails on a `DOCKERHUB_*`
   repository or organization secret (its token needs Secrets: read there),
-  and the bootstrap creates the environment. Existing publishers move the
-  secrets into the environment, delete the repository secrets and rotate the
-  token (README, Publishing your own image).
+  and the bootstrap creates the environment. Only `release.yml`'s `docker`
+  job may read the credentials or bind `release`, and it reads no other
+  secret but `GITHUB_TOKEN`; the audit also fails when `release` holds any
+  other secret or a secret listing cannot be read in full. Indexed and
+  whole-context `secrets` references are now refused after YAML decoding
+  too, so a double-quoted escape no longer hides one from the text rule.
+  Existing publishers move the secrets into the environment, delete the
+  repository secrets and rotate the token (README, Publishing your own
+  image).
+- **Breaking:** `release` (in any letter case) is reserved and refused as a
+  deployment environment name in `.gitforgeops/config.yaml` and by the
+  bootstrap. A repository with such an environment renames it and its GitHub
+  Environment (and secrets) before upgrading.
 
 - The PR comment that `review` posts, and that credential delivery posts with
   ciphertext, now goes through the same GitHub client as every other GitHub

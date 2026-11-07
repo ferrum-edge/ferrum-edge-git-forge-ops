@@ -115,9 +115,12 @@ SETTINGS_AUDIT_ENVIRONMENT = "settings-audit"
 # protected release tags. Like `settings-audit` it deploys to no gateway, so it
 # is exempt from the reviewer rules (a reviewer would park every publication;
 # `authorize-release` is the publication gate) and does not count as the
-# protected deployment environment. These rules apply only where release
+# protected deployment environment. Because it has no reviewer it may hold
+# nothing but `DOCKERHUB_*` secrets. These rules apply only where release
 # publishing is enabled; elsewhere an environment of this name is audited like
-# any other.
+# any other. GitHub compares environment names case-insensitively, so every
+# match here is on the stripped, case-folded name, and
+# `src/config/repo_config.rs` refuses the name for a deployment environment.
 RELEASE_ENVIRONMENT = "release"
 UPSTREAM_REPOSITORY = "ferrum-edge/ferrum-edge-git-forge-ops"
 REGISTRY_SECRET_PREFIX = "DOCKERHUB_"
@@ -546,20 +549,49 @@ def is_monitoring_environment(name: str, all_names: set[str]) -> bool:
     if not name.endswith(MONITORING_ENVIRONMENT_SUFFIX):
         return False
     base = name[: -len(MONITORING_ENVIRONMENT_SUFFIX)]
-    return bool(base) and base in all_names
+    # `release` is reserved and never a deployment environment, so it has no
+    # monitoring environment either.
+    return bool(base) and base in all_names and not is_release_environment_name(base)
+
+
+def is_release_environment_name(name: str) -> bool:
+    """GitHub environment names compare case-insensitively."""
+    return name.strip().casefold() == RELEASE_ENVIRONMENT
 
 
 def listed_secret_names(path: str, scope: str) -> set[str]:
-    """The secret names a paginated listing returns; values are never requested."""
+    """The secret names a paginated listing returns; values are never requested.
+
+    Fails closed on anything it cannot read in full: a missing or non-list
+    `secrets` array, an entry without a string `name`, or a `total_count` that
+    disagrees across pages or with the entries actually returned. A silently
+    skipped entry could be exactly the secret the caller is looking for.
+    """
     pages = gh_json(path, paginate=True)
-    if not isinstance(pages, list) or not all(isinstance(page, dict) for page in pages):
+    if not isinstance(pages, list) or not pages:
         raise RuntimeError(f"{scope} secret listing had an unexpected shape")
-    return {
-        item.get("name")
-        for page in pages
-        for item in page.get("secrets", [])
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
+    names: set[str] = set()
+    returned = 0
+    totals: set[int] = set()
+    for page in pages:
+        if not isinstance(page, dict) or not isinstance(page.get("secrets"), list):
+            raise RuntimeError(f"{scope} secret listing had an unexpected shape")
+        if "total_count" in page:
+            total = page["total_count"]
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise RuntimeError(f"{scope} secret listing had an unexpected shape")
+            totals.add(total)
+        for item in page["secrets"]:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                raise RuntimeError(f"{scope} secret listing had an unexpected shape")
+            names.add(item["name"])
+            returned += 1
+    if len(totals) > 1 or (totals and next(iter(totals)) != returned):
+        raise RuntimeError(
+            f"{scope} secret listing is incomplete: total_count {sorted(totals)} "
+            f"but {returned} entries were returned"
+        )
+    return names
 
 
 def audit_monitoring_secrets(audit: Audit, repo: str, name: str) -> None:
@@ -629,6 +661,33 @@ def audit_registry_secret_scope(audit: Audit, repo: str, metadata) -> None:
             f"no {REGISTRY_SECRET_PREFIX}* {scope} secret: registry credentials "
             f"reach only the {RELEASE_ENVIRONMENT!r} environment",
         )
+
+
+def audit_release_secrets(audit: Audit, repo: str, name: str) -> None:
+    """The reviewer-free registry environment holds registry credentials only.
+
+    A gateway, credential-broker or state-writer secret here would be released
+    without a reviewer to every job on the default branch that binds it. Only
+    names are read, never values.
+    """
+    encoded_name = quote(name, safe="")
+    secret_names = listed_secret_names(
+        f"repos/{repo}/environments/{encoded_name}/secrets?per_page=100",
+        "environment",
+    )
+    foreign = sorted(
+        secret
+        for secret in secret_names
+        if not secret.upper().startswith(REGISTRY_SECRET_PREFIX)
+    )
+    audit.require(
+        not foreign,
+        f"registry-credential environment {name!r} must hold only "
+        f"{REGISTRY_SECRET_PREFIX}* secrets; found {', '.join(foreign)}. It has no "
+        "required reviewer, so deployment, credential-broker or state-writing "
+        "authority must never live there",
+        f"environment {name}: holds only {REGISTRY_SECRET_PREFIX}* secrets",
+    )
 
 
 def release_publishing_enabled(repo: str, opted_in: bool) -> bool:
@@ -733,7 +792,7 @@ def audit_environment(
             "administration-read audit token, deploys nothing)"
         )
         has_reviewers = True
-    elif name == RELEASE_ENVIRONMENT and release_tag is not None:
+    elif is_release_environment_name(name) and release_tag is not None:
         # Holds only the registry push credentials and deploys to no gateway.
         # `authorize-release` gates every publication, and a reviewer would
         # park each push to the default branch. Its ref policy is the fence
@@ -743,6 +802,7 @@ def audit_environment(
             "publication credentials; authorize-release gates publication)"
         )
         has_reviewers = True
+        audit_release_secrets(audit, repo, name)
     elif is_monitoring_environment(name, all_names):
         # Same shape of exception, same reason: a required reviewer on an
         # environment whose only job is a scheduled read produces a check that
@@ -769,7 +829,7 @@ def audit_environment(
 
     policy = detail.get("deployment_branch_policy") or {}
     monitoring_environment = is_monitoring_environment(name, all_names)
-    release_environment = name == RELEASE_ENVIRONMENT and release_tag is not None
+    release_environment = is_release_environment_name(name) and release_tag is not None
     branch_limited = policy.get("protected_branches") is True
     policy_names: list[object] = []
     policy_refs: list[tuple[object, object]] = []
@@ -920,9 +980,10 @@ def run(
         release_tag = release_tag_pattern
         if release_tag.startswith("refs/tags/"):
             release_tag = release_tag[len("refs/tags/") :]
-        non_deployment.add(RELEASE_ENVIRONMENT)
+        release_names = {name for name in names if is_release_environment_name(name)}
+        non_deployment |= release_names
         audit.require(
-            RELEASE_ENVIRONMENT in names,
+            bool(release_names),
             f"release publishing is enabled, so the repository must define the "
             f"{RELEASE_ENVIRONMENT!r} environment; release.yml's docker job binds "
             "it so the registry credentials are released only to the default "

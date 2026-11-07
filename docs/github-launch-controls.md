@@ -220,13 +220,23 @@ secrets of a **`release`** GitHub Environment, which the `docker` job binds:
   repository or organization secret;
 - no required reviewer is needed: every push to the default branch publishes,
   and `authorize-release` is the publication gate. A reviewer you add is kept
-  by the bootstrap and accepted by the audit.
+  by the bootstrap and accepted by the audit;
+- nothing but `DOCKERHUB_*` secrets: without a reviewer, a gateway,
+  credential-broker or state-writer secret there would reach any
+  default-branch job that binds it.
+
+The name `release` is reserved in any letter case (GitHub compares
+environment names case-insensitively): `.gitforgeops/config.yaml` and the
+bootstrap refuse a deployment environment of that name.
 
 `bootstrap_repo_settings.py` creates the environment and its two ref rules
-when publishing is enabled. `check_supply_chain.py` refuses any job that reads
-`secrets.DOCKERHUB_*` without `environment: release` (including a
-workflow-level `env:` or a reusable-workflow call), and the settings audit
-checks the environment and the secret scope (section 5).
+when publishing is enabled. `check_supply_chain.py` lets only `release.yml`'s
+`docker` job read `secrets.DOCKERHUB_*` or bind `release`, requires that job to
+bind it and to read no other secret but `GITHUB_TOKEN`, and refuses a
+workflow-level reference, a reusable-workflow call, and any indexed or
+whole-context secrets reference even when a YAML escape hides it from the file
+text. The settings audit checks the environment, its secrets and the secret
+scope (section 5).
 
 **Migrating an existing install.** Create the `release` environment with the
 two ref rules before the `release.yml` change reaches the default branch (a
@@ -1114,9 +1124,11 @@ included.
 - that the `settings-audit` environment exists;
 - where release publishing is enabled (upstream, or `--release-publishing`,
   which `settings-audit.yml` passes when `GITFORGEOPS_RELEASE_ENABLED` is
-  `true`): that the `release` environment exists with exactly the
-  default-branch and `v*` tag rules, and that no `DOCKERHUB_*` secret is a
-  repository or organization secret (section 2). Listing secret names needs
+  `true`): that the `release` environment (matched case-insensitively)
+  exists with exactly the default-branch and `v*` tag rules and holds only
+  `DOCKERHUB_*` secrets, and that no `DOCKERHUB_*` secret is a repository or
+  organization secret (section 2). A secret listing that cannot be read in
+  full fails the audit. Listing secret names needs
   **Secrets: read** on the audit token there; values are never read;
 - every environment's reviewer, self-review and branch policy;
 - gateway monitoring coverage, once any environment opts into unattended drift

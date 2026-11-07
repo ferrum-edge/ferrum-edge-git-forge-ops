@@ -1323,15 +1323,42 @@ class ReleaseEnvironmentPlanTests(unittest.TestCase):
         )
         self.assertFalse(bootstrap.release_publishing(FakeApi({}), REPO))
 
-    def test_a_colliding_deployment_environment_name_is_warned_about(self):
-        plan = bootstrap.build_plan(
-            FakeApi(self.publishing_responses()),
-            namespace(environment=[bootstrap.RELEASE_ENVIRONMENT], reviewer=["octocat"]),
-        )
-        self.assertTrue(
-            any("registry credentials" in warning for warning in plan.warnings),
-            plan.warnings,
-        )
+    def test_a_deployment_environment_may_not_take_the_release_name(self):
+        # Refused, not warned: a reviewed deployment environment and the
+        # reviewer-free registry environment can never be planned as one.
+        # GitHub compares environment names case-insensitively.
+        for name in ("release", "Release", "RELEASE"):
+            for responses in (self.publishing_responses(), configured_responses()):
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(ValueError, "is reserved"):
+                        bootstrap.build_plan(
+                            FakeApi(responses),
+                            namespace(environment=[name], reviewer=["octocat"]),
+                        )
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "version: 1\nenvironments:\n  Release:\n    overlay: production\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "is reserved"):
+                bootstrap.build_plan(
+                    FakeApi(self.publishing_responses()),
+                    namespace(config=str(config), reviewer=["octocat"]),
+                )
+
+    def test_main_refuses_the_collision_before_any_call(self):
+        api = FakeApi(self.publishing_responses())
+        stderr = io.StringIO()
+        with patch.object(bootstrap, "GitHubApi", return_value=api), patch.dict(
+            "os.environ", {"GH_TOKEN": "test-token"}
+        ), contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            status = bootstrap.main(
+                ["--repo", REPO, "--environment", "release", "--reviewer", "octocat"]
+            )
+        self.assertEqual(status, 1)
+        self.assertIn("is reserved", stderr.getvalue())
+        self.assertEqual(api.writes, [])
 
     def test_the_policy_matches_the_audited_tag_pattern(self):
         self.assertEqual(bootstrap.release_tag_policy(), "v*")
