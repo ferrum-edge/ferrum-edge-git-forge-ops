@@ -444,8 +444,9 @@ live resource, so only CI writes the ledger:
 - `apply-on-merge.yml` and `rotate.yml` commit it with the state-writer App.
 - `state-guard.yml` fails any PR that touches `.state/`, unless an actor with
   current `write`, `maintain` or `admin` permission authorizes the current head
-  with the `gitforgeops/state-override` label and a review whose body is
-  exactly `gitforgeops-state-override`. Make it a required status check, and
+  by adding the `gitforgeops/state-override` label and submitting a review
+  whose body is exactly `gitforgeops-state-override` (the policy-override rule:
+  the last labeler must be the reviewer). Make it a required status check, and
   require the workflow by path
   ([launch controls §2a](docs/github-launch-controls.md#2a-require-the-trusted-workflows-by-path)).
 - The binary rejects a `.state` that is not a real directory or holds
@@ -453,8 +454,9 @@ live resource, so only CI writes the ledger:
 - Keep `.state/*.json` tracked in Git. If it is ignored, the ledger never
   reaches `main` and shared mode stops deleting anything.
 
-The guard has no concurrency group and rechecks the head, base and label
-before reporting success; `check_supply_chain.py` enforces both (see
+The guard has no concurrency group and re-runs the whole override decision
+(head, base, labels, labeler, permission and reviews) before reporting
+success; `check_supply_chain.py` enforces both (see
 [GitHub launch controls](docs/github-launch-controls.md#protecting-the-ledger-path)).
 
 Full rules: [State file trust model](docs/ownership.md#state-file-trust-model).

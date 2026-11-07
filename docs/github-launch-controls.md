@@ -124,23 +124,27 @@ The required `state-guard-reject-state-edits` check protects the path `.state`
 and everything under it, including old and new rename paths, whatever the file
 type. A PR may change it only with the `gitforgeops/state-override` label
 applied and a review whose body is exactly `gitforgeops-state-override`, on the
-current head, from a user with current write, maintain or admin permission.
-That user's latest submitted review must be the authorizing one, so a later
-review of theirs revokes it, and a push needs a fresh review. A label or review
-starts no run of the required workflow
+current head, from the account that last added the label, which must hold
+current write, maintain or admin permission (read from `role_name`, so a
+Maintain user counts as `maintain`). This is the policy-override rule of
+`src/policy/github_override.rs`, decided by the default-branch helper
+`.github/scripts/state_override.py`. That user's latest submitted review must
+be the authorizing one, so a later review of theirs revokes it, and a push
+needs a fresh review. A label or review starts no run of the required workflow
 ([section 2a](#2a-require-the-trusted-workflows-by-path)): re-run the failed
-job, or close and reopen the PR. The review and the reviewer's permission are
-checked when the job runs; the last step re-reads only the head, base and
-label. Revoking after a run has passed takes effect at the next run. A failed
-permission lookup (an App's bot account answers 404) only disqualifies that
-reviewer. The same authorization is required when the file list cannot
+job, or close and reopen the PR. Label events and reviews are read as numbered
+pages until one is empty, never through `Link` headers; a longer history than
+the 20-page cap, or a failed permission lookup (an App's bot account answers
+404), refuses the override. The last step runs the whole decision again,
+re-reading the head, base, labels, labeler, permission and reviews. Revoking
+after a run has passed takes effect at the next run. The same authorization is required when the file list cannot
 be fully enumerated. Keep both `/.state` and `/.state/` in CODEOWNERS;
 the trusted static-validation classifier must cover both as well.
 
 The guard has no concurrency group, so every delivery runs to completion and
 cannot cancel another delivery; a manual cancellation or runner failure can
 still interrupt a run. Each run is bound to its delivered head, and an
-authorized run re-reads the head, base and label just before reporting
+authorized run re-runs the whole override decision just before reporting
 success, so the guard is safe whether branch protection reads the newest check
 suite or requires every suite's latest run to pass. `check_supply_chain.py`
 enforces the `pull_request_target` trigger, a single default-branch checkout

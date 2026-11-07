@@ -588,6 +588,25 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- `state-guard.yml` now decides a protected-state override with the
+  policy-override rule of `src/policy/github_override.rs` (#657), through one
+  default-branch helper, `.github/scripts/state_override.py`, that both the
+  authorize step and the final `Record authorized override` step run. The
+  account that last added `gitforgeops/state-override` must hold current
+  `write`, `maintain` or `admin` and author the authorizing review; the
+  permission is read from `role_name`, so a Maintain user is `maintain`
+  rather than the legacy `write`. Label events and reviews are numbered
+  pages read until one is empty, never `--paginate`, so no `Link` header
+  decides completeness. The final step previously re-read only the head,
+  base and labels; it now re-runs the whole decision, reviews, labeler and
+  permission included, and requires the review it authorized. The job gains
+  `issues: read` for the label events, and `check_supply_chain.py` pins both
+  helper calls and requires the helper in the tree. The recorded summary
+  names the permission the final decision found, not the one authorization
+  recorded. Until this checker is on `main`, the record step also keeps the
+  previous inline head, base and label recheck that the old checker pins; it
+  runs after the helper and only adds refusals, and a follow-up removes it.
+
 - `release.yml`'s `docker` job now binds the `release` GitHub Environment,
   and the Docker Hub push credentials (`DOCKERHUB_USERNAME`,
   `DOCKERHUB_TOKEN`) belong there instead of in repository secrets. GitHub
