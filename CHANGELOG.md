@@ -624,9 +624,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and the bootstrap creates the environment. Only `release.yml`'s `docker`
   job may read the credentials or bind `release`, and it reads no other
   secret but `GITHUB_TOKEN`; the audit also fails when `release` holds any
-  other secret or a secret listing cannot be read in full. Indexed and
-  whole-context `secrets` references are now refused after YAML decoding
-  too, so a double-quoted escape no longer hides one from the text rule.
+  other secret or a secret listing cannot be read in full (every page must
+  carry a consistent `total_count`). Indexed and whole-context `secrets`
+  references are now found with the quote-aware expression scanner, so a
+  `}}` inside a quoted literal or an unclosed `${{` no longer ends the scan,
+  and are refused after YAML decoding too, so a double-quoted escape no
+  longer hides one from the text rule. A computed `environment:` binding is
+  refused unless it is one of the pinned matrix or dispatch-input bindings
+  whose source cannot name `release`; `rotate.yml` and `materialize-file.yml`
+  now refuse an unsafe or reserved environment input in their `preflight`
+  job, before the binding is evaluated.
   Existing publishers move the secrets into the environment, delete the
   repository secrets and rotate the token (README, Publishing your own
   image).

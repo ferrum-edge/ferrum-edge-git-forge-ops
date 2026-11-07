@@ -563,9 +563,11 @@ def listed_secret_names(path: str, scope: str) -> set[str]:
     """The secret names a paginated listing returns; values are never requested.
 
     Fails closed on anything it cannot read in full: a missing or non-list
-    `secrets` array, an entry without a string `name`, or a `total_count` that
-    disagrees across pages or with the entries actually returned. A silently
-    skipped entry could be exactly the secret the caller is looking for.
+    `secrets` array, an entry without a string `name`, or a missing
+    `total_count`, or one that disagrees across pages or with the entries
+    actually returned. GitHub sends `total_count` on every page, and without
+    it completeness cannot be shown. A silently skipped entry could be exactly
+    the secret the caller is looking for.
     """
     pages = gh_json(path, paginate=True)
     if not isinstance(pages, list) or not pages:
@@ -576,17 +578,16 @@ def listed_secret_names(path: str, scope: str) -> set[str]:
     for page in pages:
         if not isinstance(page, dict) or not isinstance(page.get("secrets"), list):
             raise RuntimeError(f"{scope} secret listing had an unexpected shape")
-        if "total_count" in page:
-            total = page["total_count"]
-            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-                raise RuntimeError(f"{scope} secret listing had an unexpected shape")
-            totals.add(total)
+        total = page.get("total_count")
+        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+            raise RuntimeError(f"{scope} secret listing had an unexpected shape")
+        totals.add(total)
         for item in page["secrets"]:
             if not isinstance(item, dict) or not isinstance(item.get("name"), str):
                 raise RuntimeError(f"{scope} secret listing had an unexpected shape")
             names.add(item["name"])
             returned += 1
-    if len(totals) > 1 or (totals and next(iter(totals)) != returned):
+    if len(totals) != 1 or next(iter(totals)) != returned:
         raise RuntimeError(
             f"{scope} secret listing is incomplete: total_count {sorted(totals)} "
             f"but {returned} entries were returned"

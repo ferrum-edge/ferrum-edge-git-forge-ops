@@ -829,6 +829,17 @@ class ReleaseEnvironmentTests(unittest.TestCase):
             ([{"secrets": ["DOCKERHUB_TOKEN"]}], "unexpected shape"),
             ([{"secrets": [{"name": 7}]}], "unexpected shape"),
             ([{"secrets": [{}]}], "unexpected shape"),
+            # Without total_count on every page completeness cannot be shown.
+            ([{"secrets": [{"name": "A"}]}], "unexpected shape"),
+            (
+                [
+                    {"total_count": 2, "secrets": [{"name": "A"}]},
+                    {"secrets": [{"name": "DOCKERHUB_TOKEN"}]},
+                ],
+                "unexpected shape",
+            ),
+            ([{"total_count": None, "secrets": []}], "unexpected shape"),
+            ([{"total_count": -1, "secrets": []}], "unexpected shape"),
             ([{"total_count": "1", "secrets": [{"name": "A"}]}], "unexpected shape"),
             ([{"total_count": True, "secrets": [{"name": "A"}]}], "unexpected shape"),
             ([{"total_count": 2, "secrets": [{"name": "A"}]}], "incomplete"),

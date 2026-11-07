@@ -8730,6 +8730,150 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
         )
         self._refused(self._violations(text), "jobs.docker: reads secrets.DOCKERHUB_*")
 
+    def test_quoted_closing_delimiters_do_not_end_a_secret_expression(self):
+        # GitHub ends an expression at a `}}` outside single-quoted literals
+        # only, so the scan must too, raw and after decoding.
+        refused = (
+            "${{ contains('}}', '}') && secrets[format('DOCKER{0}_TOKEN', 'HUB')] }}",
+            "${{ 'it''s }}' && toJSON(secrets) }}",
+            "${{ format('{0}', fromJSON(toJSON(secrets))) }}",
+            "${{ '}}' || secrets }}",
+            # An opener that never closes is scanned to the end.
+            "${{ secrets['DOCKERHUB_TOKEN']",
+        )
+        for reference in refused:
+            with self.subTest(reference=reference):
+                self.assertTrue(
+                    check_supply_chain.whole_secrets_context_violations("x.yml", reference)
+                )
+        sol = refused[0]
+        self.assertFalse(
+            any(
+                "secrets[" in match.group(1)
+                for match in check_supply_chain.EXPRESSION.finditer(sol)
+            ),
+            "the old non-greedy scan stopped at the quoted '}}'",
+        )
+        text = self._workflow("", reference=sol, job="sibling")
+        self._refused(
+            check_supply_chain.decoded_secret_context_violations(
+                "x.yml", check_supply_chain.parse_workflow(text)
+            ),
+            "only `secrets.<NAME>` may be referenced",
+        )
+        for allowed in (
+            "${{ contains('}}', '}') && secrets.GITHUB_TOKEN }}",
+            "${{ 'secrets.X }}' }}",
+        ):
+            with self.subTest(allowed=allowed):
+                self.assertEqual(
+                    check_supply_chain.whole_secrets_context_violations("x.yml", allowed),
+                    [],
+                )
+
+    def test_unpinned_computed_environment_bindings_are_refused(self):
+        # A computed name is resolved at run time and could be `release`.
+        for workflow, job, header in (
+            (self.RELEASE, "sibling", "    environment: ${{ 'release' }}\n"),
+            (".github/workflows/x.yml", "deploy", "    environment: ${{ matrix.environment }}\n"),
+            (".github/workflows/x.yml", "deploy", "    environment: ${{ inputs.environment }}\n"),
+            (
+                ".github/workflows/x.yml",
+                "deploy",
+                "    environment:\n      name: ${{ inputs.environment }}\n",
+            ),
+            # A pinned job may not swap its binding for another expression.
+            (
+                ".github/workflows/rotate.yml",
+                "rotate",
+                "    environment: ${{ format('{0}', 'release') }}\n",
+            ),
+        ):
+            with self.subTest(workflow=workflow, header=header):
+                violations = self._violations(
+                    self._workflow(header, secret="GITHUB_TOKEN", job=job), workflow
+                )
+                self._refused(violations, f"jobs.{job}: a computed `environment:` binding")
+
+    def _shipped(self, name: str) -> str:
+        return (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+
+    def test_the_pinned_dynamic_bindings_are_accepted_and_held_to_their_source(self):
+        for name in (
+            "apply-on-merge.yml",
+            "drift-check.yml",
+            "trusted-pr-review.yml",
+            "rotate.yml",
+            "materialize-file.yml",
+            "release.yml",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._violations(self._shipped(name), f".github/workflows/{name}"), []
+                )
+        # A pinned matrix binding fed from another matrix source is refused.
+        text = self._shipped("drift-check.yml").replace(
+            "scope: ${{ fromJson(needs.list-envs.outputs.scopes) }}",
+            "scope: ${{ fromJson(inputs.scopes) }}",
+        )
+        self._refused(
+            self._violations(text, ".github/workflows/drift-check.yml"),
+            "jobs.drift: strategy.matrix must be exactly",
+        )
+
+    def test_a_dispatch_binding_needs_the_pinned_preflight_guard(self):
+        for name, job in (("rotate.yml", "rotate"), ("materialize-file.yml", "materialize")):
+            shipped = self._shipped(name)
+            label = f".github/workflows/{name}"
+            step = "      - name: Refuse an unsafe or reserved environment input\n"
+            self.assertEqual(shipped.count(step), 1)
+            for changed in (
+                # No guard at all.
+                shipped.replace(step, "      - name: Something else\n"),
+                # The guard no longer refuses `release`.
+                shipped.replace("= release ]; then", "= other ]; then"),
+                # The bound job no longer waits for the preflight.
+                shipped.replace(
+                    f"  {job}:\n    needs: preflight\n", f"  {job}:\n", 1
+                ),
+                # It would run even after a failed preflight.
+                shipped.replace(
+                    f"  {job}:\n    needs: preflight\n",
+                    f"  {job}:\n    needs: preflight\n    if: always()\n",
+                    1,
+                ),
+            ):
+                with self.subTest(name=name):
+                    self.assertNotEqual(changed, shipped)
+                    self._refused(
+                        self._violations(changed, label),
+                        f"jobs.{job}: binds ${{{{ inputs.environment }}}}",
+                    )
+
+    def test_the_full_checker_refuses_a_sibling_release_job(self):
+        # Exactly the reported bypass: a sibling job outside authorize-release
+        # that computes the reserved binding and indexes the token by a
+        # computed name behind a quoted `}}`.
+        sibling = (
+            "\n"
+            "  sibling:\n"
+            "    runs-on: ubuntu-26.04\n"
+            "    timeout-minutes: 10\n"
+            "    environment: ${{ 'release' }}\n"
+            "    steps:\n"
+            "      - env:\n"
+            "          TOKEN: ${{ contains('}}', '}') && secrets[format('DOCKER{0}_TOKEN', 'HUB')] }}\n"
+            "        run: true\n"
+        )
+        harness = SupplyChainPolicyTests()
+        with tempfile.TemporaryDirectory() as directory:
+            root = harness._mirror_repo(Path(directory))
+            path = root / ".github/workflows/release.yml"
+            path.write_text(path.read_text(encoding="utf-8") + sibling, encoding="utf-8")
+            violations = harness._violations(root)
+        self._refused(violations, "jobs.sibling: a computed `environment:` binding")
+        self._refused(violations, "only `secrets.<NAME>` may be referenced", "secrets[format(")
+
     def test_anchors_and_flow_mappings_cannot_share_a_binding(self):
         # The strict reader refuses both before this rule runs, so an alias
         # cannot make one job's `environment:` look like another's.

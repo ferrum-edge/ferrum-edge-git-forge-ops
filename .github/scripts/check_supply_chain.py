@@ -424,6 +424,56 @@ REGISTRY_SECRET_WORKFLOW = ".github/workflows/release.yml"
 REGISTRY_SECRET_JOB = "docker"
 REGISTRY_SECRET_PREFIX = "DOCKERHUB_"
 REGISTRY_JOB_OTHER_SECRETS = frozenset({"GITHUB_TOKEN"})
+# Every job whose `environment:` is computed. GitHub resolves the expression at
+# run time, so a computed name (`${{ 'release' }}`, a matrix or input value)
+# could bind the reviewer-free `release` environment where the literal check
+# below cannot see it. Each pinned value is provably never `release`:
+# - the matrix values come from `gitforgeops envs` over the protected branch's
+#   `.gitforgeops/config.yaml` (apply-on-merge's `list-envs`, drift-check's
+#   `list-envs`, trusted-pr-review's trusted `prepare` targets), whose loader
+#   refuses `release` in any case (`src/config/repo_config.rs`); drift-check's
+#   `<env>-monitor` derivation cannot produce it either;
+# - the dispatch inputs of rotate.yml and materialize-file.yml are refused by
+#   the `preflight` job the bound job `needs`, before any binding, unless they
+#   are a safe path component other than `release` (`DISPATCH_ENVIRONMENT_GUARD`).
+# Any other computed binding is refused. The matrix pin is the job's whole
+# `strategy.matrix`.
+COMPUTED_ENVIRONMENT_BINDINGS = {
+    (".github/workflows/apply-on-merge.yml", "apply"): (
+        "${{ matrix.environment }}",
+        {"environment": "${{ fromJson(needs.list-envs.outputs.envs) }}"},
+    ),
+    (".github/workflows/apply-on-merge.yml", "promote"): (
+        "${{ matrix.scope.environment }}",
+        {"scope": "${{ fromJson(needs.list-envs.outputs.promotions) }}"},
+    ),
+    (".github/workflows/drift-check.yml", "drift"): (
+        "${{ matrix.scope.monitoring_environment }}",
+        {"scope": "${{ fromJson(needs.list-envs.outputs.scopes) }}"},
+    ),
+    (".github/workflows/trusted-pr-review.yml", "live-review"): (
+        "${{ matrix.environment }}",
+        {"include": "${{ fromJson(needs.prepare.outputs.targets) }}"},
+    ),
+    (".github/workflows/rotate.yml", "rotate"): ("${{ inputs.environment }}", None),
+    (".github/workflows/materialize-file.yml", "materialize"): (
+        "${{ inputs.environment }}",
+        None,
+    ),
+}
+DISPATCH_ENVIRONMENT_GUARD_STEP = "Refuse an unsafe or reserved environment input"
+DISPATCH_ENVIRONMENT_GUARD_ENV = {"INPUT_ENVIRONMENT": "${{ inputs.environment }}"}
+DISPATCH_ENVIRONMENT_GUARD = (
+    "set -euo pipefail",
+    '[[ "$INPUT_ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || {\n'
+    'echo "::error::Environment must be a single safe path component."\n'
+    "exit 1\n"
+    "}",
+    "if [ \"$(printf '%s' \"$INPUT_ENVIRONMENT\" | tr '[:upper:]' '[:lower:]')\" = release ]; then\n"
+    'echo "::error::release holds the registry credentials and is not a deployment environment."\n'
+    "exit 1\n"
+    "fi",
+)
 REGISTRY_SECRET_REFERENCE = re.compile(
     r"\bsecrets\s*(?:\.\s*|\[\s*['\"]\s*)DOCKERHUB_", re.IGNORECASE
 )
@@ -611,6 +661,16 @@ def secret_name_case_violations(workflow: str, text: str) -> list[str]:
 _SECRETS_INHERIT_RE = re.compile(r"^\s*secrets\s*:\s*inherit\s*$", re.MULTILINE)
 
 
+def _expression_bodies(text: str) -> list[str]:
+    """Every `${{ ... }}` body, quote-aware, plus the tail after an unclosed opener."""
+    bodies = [match.group(1) for match in WORKFLOW_EXPRESSION.finditer(text)]
+    remainder = WORKFLOW_EXPRESSION.sub("", text)
+    opener = remainder.find("${{")
+    if opener >= 0:
+        bodies.append(remainder[opener + 3 :])
+    return bodies
+
+
 def whole_secrets_context_violations(workflow: str, text: str) -> list[str]:
     """Every `secrets` reference must name exactly one secret.
 
@@ -625,13 +685,19 @@ def whole_secrets_context_violations(workflow: str, text: str) -> list[str]:
     `secrets['NAME']` is rejected with them: it is one variable substitution
     away from an indexed walk over the whole context, and no workflow here
     needs a dynamic secret name.
+
+    Expressions are delimited by the quote-aware `WORKFLOW_EXPRESSION`, as
+    GitHub delimits them: a `}}` inside a single-quoted literal
+    (`${{ contains('}}', '}') && secrets[...] }}`) does not end the
+    expression. An opener that never closes is scanned to the end of the text,
+    so an unterminated expression cannot hide a reference either.
     """
     violations: list[str] = []
     seen: set[str] = set()
-    for expression in EXPRESSION.finditer(text):
-        if not WHOLE_SECRETS.search(NAMED_SECRET.sub("", expression.group(1))):
+    for body in _expression_bodies(text):
+        if not WHOLE_SECRETS.search(NAMED_SECRET.sub("", body)):
             continue
-        leak = " ".join(expression.group(0).split())
+        leak = " ".join(("${{" + body + "}}").split())
         if leak in seen:
             continue
         seen.add(leak)
@@ -4975,6 +5041,74 @@ def decoded_secret_context_violations(workflow: str, document: dict) -> list[str
     return violations
 
 
+def computed_environment_binding_violations(
+    workflow: str, job_name: str, job: dict, document: dict
+) -> list[str]:
+    """A computed `environment:` is allowed only as a pinned binding.
+
+    See `COMPUTED_ENVIRONMENT_BINDINGS`: every pinned value comes from a source
+    that cannot yield the reserved `release` name, and every other computed
+    binding is refused, because GitHub would resolve it at run time.
+    """
+    if "environment" not in job:
+        return []
+    value = job["environment"]
+    name = value.get("name") if isinstance(value, dict) else value
+    if isinstance(name, str) and "${{" not in name:
+        return []
+    label = f"{workflow}: jobs.{job_name}"
+    pin = COMPUTED_ENVIRONMENT_BINDINGS.get((workflow, job_name))
+    if pin is None or value != pin[0]:
+        return [
+            f"{label}: a computed `environment:` binding is allowed only as a pinned "
+            "binding whose value source cannot name the reserved "
+            f"`{RELEASE_ENVIRONMENT}` environment (COMPUTED_ENVIRONMENT_BINDINGS)"
+        ]
+    binding, matrix = pin
+    if matrix is not None:
+        strategy = job.get("strategy")
+        if not isinstance(strategy, dict) or strategy.get("matrix") != matrix:
+            return [f"{label}: strategy.matrix must be exactly {matrix} for {binding}"]
+        return []
+    # A dispatch input: the bound job must wait for a preflight job that
+    # refuses an unsafe or reserved name before the binding is evaluated.
+    needs = job.get("needs")
+    needs = [needs] if isinstance(needs, str) else needs
+    jobs = document.get("jobs")
+    preflight = jobs.get("preflight") if isinstance(jobs, dict) else None
+    steps = preflight.get("steps") if isinstance(preflight, dict) else None
+    guard = next(
+        (
+            step
+            for step in (steps if isinstance(steps, list) else [])
+            if isinstance(step, dict) and step.get("name") == DISPATCH_ENVIRONMENT_GUARD_STEP
+        ),
+        None,
+    )
+    # No job condition on either side: `if: always()` on the bound job would
+    # run it after a failed preflight, and a preflight that can be skipped or
+    # soft-fail guards nothing.
+    if (
+        not isinstance(needs, list)
+        or "preflight" not in needs
+        or "if" in job
+        or not isinstance(preflight, dict)
+        or "if" in preflight
+        or "continue-on-error" in preflight
+        or guard is None
+        or guard.get("env") != DISPATCH_ENVIRONMENT_GUARD_ENV
+        or not isinstance(guard.get("run"), str)
+        or not pinned_run_matches(guard["run"], DISPATCH_ENVIRONMENT_GUARD)
+        or any(key not in {"name", "env", "run"} for key in guard)
+    ):
+        return [
+            f"{label}: binds {binding}, so it must need a `preflight` job whose step "
+            f"{DISPATCH_ENVIRONMENT_GUARD_STEP!r} runs the pinned guard that refuses "
+            f"an unsafe name or `{RELEASE_ENVIRONMENT}` before the binding"
+        ]
+    return []
+
+
 def registry_secret_environment_violations(workflow: str, document: dict) -> list[str]:
     """Only release.yml's `docker` job reads `secrets.DOCKERHUB_*`, bound to `release`.
 
@@ -5028,6 +5162,9 @@ def registry_secret_environment_violations(workflow: str, document: dict) -> lis
                 f"jobs.{REGISTRY_SECRET_JOB} may bind the reviewer-free "
                 f"`{RELEASE_ENVIRONMENT}` environment"
             )
+        violations.extend(
+            computed_environment_binding_violations(workflow, job_name, job, document)
+        )
         if publisher:
             others = sorted(
                 {

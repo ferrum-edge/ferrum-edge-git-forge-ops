@@ -234,8 +234,12 @@ when publishing is enabled. `check_supply_chain.py` lets only `release.yml`'s
 `docker` job read `secrets.DOCKERHUB_*` or bind `release`, requires that job to
 bind it and to read no other secret but `GITHUB_TOKEN`, and refuses a
 workflow-level reference, a reusable-workflow call, and any indexed or
-whole-context secrets reference even when a YAML escape hides it from the file
-text. The settings audit checks the environment, its secrets and the secret
+whole-context secrets reference, even behind a quoted `}}` or a YAML escape.
+A computed `environment:` (resolved only at run time) is allowed only as one
+of the pinned bindings in `COMPUTED_ENVIRONMENT_BINDINGS`: the matrix values
+`gitforgeops envs` enumerates from the protected configuration, and the
+`rotate.yml` / `materialize-file.yml` dispatch input, which their `preflight`
+job refuses when it is not a safe name or is `release`. The settings audit checks the environment, its secrets and the secret
 scope (section 5).
 
 **Migrating an existing install.** Create the `release` environment with the
