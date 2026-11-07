@@ -292,7 +292,6 @@ jobs:
           OVERRIDE_LABEL: gitforgeops/state-override
           OVERRIDE_REVIEW: gitforgeops-state-override
           ACTOR: ${{ steps.authorize.outputs.actor }}
-          PERMISSION: ${{ steps.authorize.outputs.permission }}
           REVIEW_ID: ${{ steps.authorize.outputs.review_id }}
           AUTHORIZED_HEAD: ${{ steps.authorize.outputs.head_sha }}
           RUN_ID: ${{ steps.authorize.outputs.run_id }}
@@ -304,23 +303,54 @@ jobs:
           # head, base, label, labeler, the labeler's permission and the
           # reviews may all have changed since authorization; a push, a
           # retarget, a label removed or re-applied by someone else, a
-          # demotion or a later review must fail this run rather than leave a success on the head.
-          # The helper runs the whole decision again and requires the same
-          # labeler, review and head the authorize step recorded.
+          # demotion or a later review must fail this run rather than leave a
+          # success on the head.
+          # The helper runs the whole decision again, requires the same
+          # labeler, review and head the authorize step recorded, and prints
+          # the permission it found now, which the report below uses.
           # `check_supply_chain.py` requires this block.
           override=trusted-guard/.github/scripts/state_override.py
           [ -f "$override" ] || {
             echo "::error::The trusted state-override helper is missing; the override is not recorded."
             exit 1
           }
-          python3 -I "$override" recheck
+          current_permission=$(python3 -I "$override" recheck)
+          case "$current_permission" in
+            write|maintain|admin) ;;
+            *)
+              echo "::error::The state-override helper reported no sufficient current permission; the override is not recorded."
+              exit 1
+              ;;
+          esac
 
-          echo "::warning::Protected state scope authorized by @${ACTOR} (${PERMISSION}) in review ${REVIEW_ID} for head ${AUTHORIZED_HEAD}."
+          # TRANSITIONAL: the inline head, base and label recheck below is the
+          # block the supply-chain checker on `main` pins, which judges this
+          # file until the helper-aware checker merges. It only adds refusals
+          # (any failure exits under set -e, after the helper already had to
+          # pass). Remove it in the follow-up once that checker is on `main`.
+          final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          final_head=$(jq -r '.head.sha' <<< "$final")
+          final_ref=$(jq -r '.base.ref' <<< "$final")
+          final_labels=$(jq -r '.labels[].name' <<< "$final")
+          [ "$final_head" = "$EXPECTED_HEAD_SHA" ] || {
+            echo "::error::PR head changed before the state override was recorded; wait for the new run."
+            exit 1
+          }
+          [ "$final_ref" = "$DEFAULT_BRANCH" ] || {
+            echo "::error::PR no longer targets the protected default branch; state override is not recorded."
+            exit 1
+          }
+          grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {
+            echo "::error::State override label was removed before the override was recorded."
+            exit 1
+          }
+
+          echo "::warning::Protected state scope authorized by @${ACTOR} (${current_permission}) in review ${REVIEW_ID} for head ${AUTHORIZED_HEAD}."
           {
             echo "## Authorized protected-state override"
             echo
             echo "- Reviewer: \`@${ACTOR}\`"
-            echo "- Current permission: \`${PERMISSION}\`"
+            echo "- Current permission: \`${current_permission}\`"
             echo "- Review: \`${REVIEW_ID}\`"
             echo "- Authorized head: \`${AUTHORIZED_HEAD}\`"
             echo "- Workflow run: \`${RUN_ID}\` (attempt \`${RUN_ATTEMPT}\`)"

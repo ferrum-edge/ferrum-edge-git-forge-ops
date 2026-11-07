@@ -288,7 +288,13 @@ class DecisionTests(unittest.TestCase):
         evidence = decide(github)
         self.assertEqual(
             evidence,
-            state_override.Evidence(actor="maintainer", permission="write", review_id=7, head=HEAD),
+            state_override.Evidence(
+                actor="maintainer",
+                permission="write",
+                review_id=7,
+                head=HEAD,
+                current_permission="write",
+            ),
         )
         self.assertEqual(github.pr_reads, 2)
         for route in (
@@ -356,8 +362,10 @@ class DecisionTests(unittest.TestCase):
             final={"permissions": {"maintainer": {"permission": "admin", "role_name": "admin"}}}
         )
         # The final pass requires a sufficient permission, as Rust does; the
-        # evidence records the permission verified first.
-        self.assertEqual(decide(github).permission, "write")
+        # evidence records the permission verified first and the one found last.
+        evidence = decide(github)
+        self.assertEqual(evidence.permission, "write")
+        self.assertEqual(evidence.current_permission, "admin")
 
     def test_initial_refusals_never_read_permission(self):
         for pr in (
@@ -413,11 +421,54 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertTrue(stderr.startswith("::error::"), stderr)
 
+    def test_recheck_reports_the_current_permission_not_the_recorded_one(self):
+        # The authorize step recorded `write`; the permission is not bound, so
+        # a change that stays sufficient passes and the step reports it.
+        recorded = {**ENV, "ACTOR": "maintainer", "REVIEW_ID": "7", "AUTHORIZED_HEAD": HEAD}
+        for response, expected in (
+            ({"permission": "write", "role_name": "maintain"}, "maintain\n"),
+            ({"permission": "admin", "role_name": "admin"}, "admin\n"),
+            ({"permission": "admin", "role_name": "security-reviewer"}, "admin\n"),
+        ):
+            with self.subTest(response=response):
+                code, stdout, stderr = self.run_main(
+                    "recheck", FakeGitHub(permissions={"maintainer": response}), recorded
+                )
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(stdout, expected)
+
+        # A promotion found only by the final re-read is the one reported.
+        code, stdout, stderr = self.run_main(
+            "recheck",
+            FakeGitHub(
+                final={"permissions": {"maintainer": {"permission": "admin", "role_name": "admin"}}}
+            ),
+            recorded,
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, "admin\n")
+
+        # An insufficient permission is refused and reports nothing.
+        for response in (
+            {"permission": "read", "role_name": "triage"},
+            {"permission": "read"},
+            {"permission": "none"},
+        ):
+            with self.subTest(response=response):
+                code, stdout, stderr = self.run_main(
+                    "recheck", FakeGitHub(permissions={"maintainer": response}), recorded
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertIn("::error::", stderr)
+        self.assertEqual(state_override.SUFFICIENT_PERMISSIONS, ("write", "maintain", "admin"))
+
     def test_recheck_requires_the_recorded_evidence(self):
         recorded = {**ENV, "ACTOR": "maintainer", "REVIEW_ID": "7", "AUTHORIZED_HEAD": HEAD}
         code, stdout, stderr = self.run_main("recheck", FakeGitHub(), recorded)
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(stdout, "")
+        # Only the current permission, which the step reports.
+        self.assertEqual(stdout, "write\n")
 
         for changes in (
             {"ACTOR": "other"},

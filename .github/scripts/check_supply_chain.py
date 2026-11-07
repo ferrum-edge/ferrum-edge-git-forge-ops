@@ -1637,8 +1637,13 @@ STATE_GUARD_RECORD_IF = (
 STATE_GUARD_FINAL_RECHECK = (
     STATE_GUARD_OVERRIDE_HELPER,
     '[ -f "$override" ] || {',
-    'python3 -I "$override" recheck',
+    'current_permission=$(python3 -I "$override" recheck)',
+    'case "$current_permission" in',
 )
+# The record step still carries the inline head, base and label recheck the
+# previous checker pinned, so the checker on `main` accepts this file while the
+# helper-aware one is under review. It is allowed, never required, and only
+# adds refusals after the helper; a follow-up removes it.
 # Any whole path token naming `state_override.py` whose directory prefix is not
 # exactly the protected `trusted-guard/` checkout is the candidate's helper.
 _OVERRIDE_HELPER_PATH = re.compile(

@@ -5396,15 +5396,56 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         record = check_supply_chain.named_step(
             text, check_supply_chain.STATE_GUARD_RECORD_STEP
         )
-        for override_step in (step, record):
-            active = "\n".join(
-                line for line in override_step.splitlines()
+        # The record step may still carry the transitional inline PR re-read
+        # the previous checker pins; that is its only GitHub call.
+        transitional = 'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")'
+        for override_step, allowed_calls in ((step, []), (record, [transitional])):
+            active = [
+                line.strip() for line in override_step.splitlines()
                 if not line.lstrip().startswith("#")
+            ]
+            self.assertEqual(
+                [line for line in active if "gh api" in line], allowed_calls
             )
-            self.assertNotIn("--paginate", active)
-            self.assertNotIn("gh api", active)
-            self.assertNotIn("/permission", active)
-            self.assertNotIn("/reviews", active)
+            for line in active:
+                self.assertNotIn("--paginate", line)
+                self.assertNotIn("/permission", line)
+                self.assertNotIn("/reviews", line)
+
+    def test_state_guard_transitional_inline_recheck_is_allowed_not_required(self):
+        text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")
+        step = check_supply_chain.named_step(
+            text, check_supply_chain.STATE_GUARD_RECORD_STEP
+        )
+        self.assertIsNotNone(step)
+        # The previous checker's seven pins are still present, before any report,
+        # so the checker on `main` accepts this file during the transition.
+        previous_pins = (
+            'final=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")',
+            "final_head=$(jq -r '.head.sha' <<< \"$final\")",
+            "final_ref=$(jq -r '.base.ref' <<< \"$final\")",
+            "final_labels=$(jq -r '.labels[].name' <<< \"$final\")",
+            '[ "$final_head" = "$EXPECTED_HEAD_SHA" ] || {',
+            '[ "$final_ref" = "$DEFAULT_BRANCH" ] || {',
+            'grep -Fxq "$OVERRIDE_LABEL" <<< "$final_labels" || {',
+        )
+        report = step.index("::warning::")
+        for pin in previous_pins:
+            self.assertIn(pin, step)
+            self.assertLess(step.index(pin), report)
+        # The helper decides first; the inline block can only add refusals.
+        self.assertLess(
+            step.index(check_supply_chain.STATE_GUARD_FINAL_RECHECK[2]),
+            step.index(previous_pins[0]),
+        )
+        start = step.index(previous_pins[0])
+        end = step.index(previous_pins[-1])
+        end = step.index("          }\n", end) + len("          }\n")
+        without_block = text.replace(step, step[:start] + step[end:].lstrip(), 1)
+        self.assertNotIn(previous_pins[0], without_block)
+        self.assertEqual(
+            check_supply_chain.state_guard_override_recheck_violations(without_block), []
+        )
 
     def test_state_guard_authorize_step_cannot_drop_the_trusted_helper(self):
         text = (ROOT / ".github/workflows/state-guard.yml").read_text(encoding="utf-8")

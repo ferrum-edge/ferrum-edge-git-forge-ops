@@ -114,9 +114,12 @@ class Review:
 @dataclass(frozen=True)
 class Evidence:
     actor: str
+    # The permission verified first, as `VerifiedOverride::permission` records.
     permission: str
     review_id: int
     head: str
+    # The permission the final re-read found (also sufficient).
+    current_permission: str
 
 
 def _object(value: Any, what: str) -> dict[str, Any]:
@@ -208,6 +211,11 @@ def is_sufficient(permission: str) -> bool:
     return VALID_PERMISSIONS.index(permission) >= VALID_PERMISSIONS.index(
         REQUIRED_PERMISSION
     )
+
+
+SUFFICIENT_PERMISSIONS = tuple(
+    permission for permission in VALID_PERMISSIONS if is_sufficient(permission)
+)
 
 
 def reviews(records: list[Any]) -> list[Review]:
@@ -326,7 +334,7 @@ def decide(fetch: Fetch, context: Context) -> Evidence:
         current_labeler = override_labeler(
             numbered_pages(fetch, events_route, "issue event"), context.label
         )
-        still_sufficient = is_sufficient(effective_permission(fetch(permission_route)))
+        current_permission = effective_permission(fetch(permission_route))
         current_review = authorized_review(
             reviews(numbered_pages(fetch, reviews_route, "review")),
             labeler,
@@ -335,10 +343,20 @@ def decide(fetch: Fetch, context: Context) -> Evidence:
         )
     except OverrideRefused as error:
         raise OverrideRefused("Override evidence changed during verification.") from error
-    if current_labeler != labeler or not still_sufficient or current_review != review:
+    if (
+        current_labeler != labeler
+        or not is_sufficient(current_permission)
+        or current_review != review
+    ):
         raise OverrideRefused("Override evidence changed during verification.")
 
-    return Evidence(actor=labeler, permission=permission, review_id=review.id, head=pr.head)
+    return Evidence(
+        actor=labeler,
+        permission=permission,
+        review_id=review.id,
+        head=pr.head,
+        current_permission=current_permission,
+    )
 
 
 def _required(environ: dict[str, str], name: str, pattern: re.Pattern[str] | None = None) -> str:
@@ -374,7 +392,11 @@ def output_lines(evidence: Evidence) -> str:
 
 
 def recheck(fetch: Fetch, environ: dict[str, str]) -> Evidence:
-    """Decide again and require the evidence the authorize step recorded."""
+    """Decide again and require the evidence the authorize step recorded.
+
+    The permission is not bound: it may change between the steps as long as it
+    stays sufficient, and the step reports the one this decision found.
+    """
     actor = _required(environ, "ACTOR", LOGIN_RE)
     review_id = int(_required(environ, "REVIEW_ID", REVIEW_ID_RE))
     authorized_head = _required(environ, "AUTHORIZED_HEAD", REVISION_RE)
@@ -387,11 +409,17 @@ def recheck(fetch: Fetch, environ: dict[str, str]) -> Evidence:
         raise OverrideRefused(
             "Override evidence changed after authorization; the override is not recorded."
         )
+    if evidence.current_permission not in SUFFICIENT_PERMISSIONS:
+        raise OverrideRefused("The labeler's current permission is not sufficient.")
     return evidence
 
 
 def main(argv: list[str] | None = None, fetch: Fetch = gh_api) -> int:
-    """Diagnostics go to stderr; `authorize` prints only its outputs to stdout."""
+    """Diagnostics go to stderr.
+
+    On success `authorize` prints only its step outputs to stdout, and
+    `recheck` only the current permission, so the step can report it.
+    """
     parser = argparse.ArgumentParser(description="Decide a protected-state override.")
     parser.add_argument("command", choices=("authorize", "recheck"))
     args = parser.parse_args(argv)
@@ -411,6 +439,8 @@ def main(argv: list[str] | None = None, fetch: Fetch = gh_api) -> int:
     )
     if args.command == "authorize":
         sys.stdout.write(output_lines(evidence))
+    else:
+        sys.stdout.write(f"{evidence.current_permission}\n")
     return 0
 
 

@@ -391,7 +391,6 @@ class StateGuardTests(unittest.TestCase):
             guard.env.update(
                 {
                     "ACTOR": "maintainer",
-                    "PERMISSION": "write",
                     "REVIEW_ID": "7",
                     "AUTHORIZED_HEAD": HEAD,
                     "TEST_PERMISSIONS": json.dumps(
@@ -405,16 +404,34 @@ class StateGuardTests(unittest.TestCase):
 
             result = guard.run(record)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn(
-                "Authorized protected-state override",
-                guard.summary.read_text(encoding="utf-8"),
-            )
+            summary = guard.summary.read_text(encoding="utf-8")
+            self.assertIn("Authorized protected-state override", summary)
+            self.assertIn("- Current permission: `write`", summary)
+            self.assertIn("@maintainer (write) in review 7", result.stdout)
             # The final recheck re-reads the labeler, permission and reviews,
-            # not only the pull request.
-            routes = [call[1] for call in guard.recorded_calls()]
+            # not only the pull request; every call is a bare numbered route.
+            calls = guard.recorded_calls()
+            self.assertTrue(all(len(call) == 2 for call in calls), calls)
+            routes = [call[1] for call in calls]
             self.assertIn("repos/example/repo/collaborators/maintainer/permission", routes)
             self.assertIn("repos/example/repo/pulls/1/reviews?per_page=100&page=1", routes)
             self.assertIn("repos/example/repo/issues/1/events?per_page=100&page=1", routes)
+            # Two PR reads by the helper, then the transitional inline re-read.
+            self.assertEqual(routes.count("repos/example/repo/pulls/1"), 3, routes)
+            self.assertEqual(routes[-1], "repos/example/repo/pulls/1", routes)
+
+            # The report names the permission found now, not the one the
+            # authorize step recorded (the step no longer reads PERMISSION).
+            result = guard.run(
+                record,
+                PERMISSION="admin",
+                TEST_PERMISSIONS=json.dumps({"maintainer": permission("write", "maintain")}),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            summary = guard.summary.read_text(encoding="utf-8")
+            self.assertIn("- Current permission: `maintain`", summary)
+            self.assertNotIn("admin", summary)
+            self.assertIn("@maintainer (maintain) in review 7", result.stdout)
 
             for overrides in (
                 {"TEST_HEAD": "c" * 40},
@@ -455,13 +472,59 @@ class StateGuardTests(unittest.TestCase):
                     self.assertEqual(guard.summary.read_text(encoding="utf-8"), "")
                     self.assertNotIn("::warning::Protected state scope", result.stdout)
 
+    def test_record_refuses_an_insufficient_reported_permission(self):
+        # Defence in depth: whatever the helper prints must be a sufficient
+        # permission before anything is reported.
+        record = workflow_step("Record authorized override")
+        for printed in ("", "read\n", "triage\n", "none\n", "write\nadmin\n", "Write\n"):
+            with self.subTest(printed=printed), tempfile.TemporaryDirectory() as temporary:
+                guard = GuardHarness(Path(temporary), override_helper=False)
+                helper = guard.root / "trusted-guard/.github/scripts/state_override.py"
+                helper.write_text(
+                    f"import sys\nsys.stdout.write({printed!r})\n", encoding="utf-8"
+                )
+                guard.env.update(
+                    {"ACTOR": "maintainer", "REVIEW_ID": "7", "AUTHORIZED_HEAD": HEAD}
+                )
+                result = guard.run(record)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(guard.summary.read_text(encoding="utf-8"), "")
+                self.assertNotIn("::warning::Protected state scope", result.stdout)
+
+    def test_transitional_inline_recheck_only_adds_refusals(self):
+        # A helper that passes cannot outvote the inline head, base and label
+        # checks, and those checks cannot pass a run the helper refused.
+        record = workflow_step("Record authorized override")
+        with tempfile.TemporaryDirectory() as temporary:
+            guard = GuardHarness(Path(temporary), override_helper=False)
+            helper = guard.root / "trusted-guard/.github/scripts/state_override.py"
+            helper.write_text("import sys\nsys.stdout.write('write\\n')\n", encoding="utf-8")
+            guard.env.update({"ACTOR": "maintainer", "REVIEW_ID": "7", "AUTHORIZED_HEAD": HEAD})
+            result = guard.run(record)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for overrides in (
+                {"TEST_HEAD": "c" * 40},
+                {"TEST_BASE_REF": "release"},
+                {"TEST_LABELS": json.dumps(["bug"])},
+            ):
+                with self.subTest(overrides=overrides):
+                    result = guard.run(record, **overrides)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertEqual(guard.summary.read_text(encoding="utf-8"), "")
+
+            helper.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+            result = guard.run(record)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(guard.summary.read_text(encoding="utf-8"), "")
+            # The helper refused first; the inline block never ran.
+            self.assertEqual(guard.recorded_calls(), [])
+
     def test_record_fails_closed_without_the_trusted_helper(self):
         record = workflow_step("Record authorized override")
         with tempfile.TemporaryDirectory() as temporary:
             guard = GuardHarness(Path(temporary), override_helper=False)
             guard.env.update(
-                {"ACTOR": "maintainer", "PERMISSION": "write", "REVIEW_ID": "7",
-                 "AUTHORIZED_HEAD": HEAD}
+                {"ACTOR": "maintainer", "REVIEW_ID": "7", "AUTHORIZED_HEAD": HEAD}
             )
             result = guard.run(record)
             self.assertNotEqual(result.returncode, 0, result.stdout)

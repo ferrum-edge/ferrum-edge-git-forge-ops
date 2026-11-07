@@ -601,7 +601,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   base and labels; it now re-runs the whole decision, reviews, labeler and
   permission included, and requires the review it authorized. The job gains
   `issues: read` for the label events, and `check_supply_chain.py` pins both
-  helper calls and requires the helper in the tree.
+  helper calls and requires the helper in the tree. The recorded summary
+  names the permission the final decision found, not the one authorization
+  recorded. Until this checker is on `main`, the record step also keeps the
+  previous inline head, base and label recheck that the old checker pins; it
+  runs after the helper and only adds refusals, and a follow-up removes it.
 
 - The PR comment that `review` posts, and that credential delivery posts with
   ciphertext, now goes through the same GitHub client as every other GitHub
