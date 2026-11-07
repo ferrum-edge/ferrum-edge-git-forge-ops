@@ -54,6 +54,45 @@ fn test_client() -> reqwest::Client {
         .expect("test client")
 }
 
+/// The production GitHub client (`secrets::github_api_client`, shared by PR
+/// lookup, override checks, provisioning and key discovery) refuses a
+/// cleartext URL before connecting, so a downgraded `http://` origin never
+/// receives the token. The loopback stubs below therefore use [`test_client`].
+#[tokio::test]
+async fn the_production_github_client_refuses_cleartext_before_connecting() {
+    use gitforgeops::config::EnvConfig;
+    use gitforgeops::secrets::github_api_client;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let origin = format!("http://{}", listener.local_addr().expect("addr"));
+    let env = EnvConfig {
+        github_connect_timeout_secs: 5,
+        github_request_timeout_secs: 5,
+        ..Default::default()
+    };
+    let client = github_api_client(&env).expect("client");
+
+    let error = client
+        .get(format!("{origin}/repos/{REPO}/pulls"))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect_err("https_only must refuse an http:// URL");
+    assert!(error.is_builder(), "refused before any connection: {error}");
+
+    let error = fetch_public_key_at(&client, &origin, REPO, ENVIRONMENT, TOKEN)
+        .await
+        .expect_err("the adapter inherits the refusal");
+    assert!(matches!(error, Error::HttpClient(_)), "{error}");
+
+    assert_eq!(
+        listener.accept().map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "nothing may reach a cleartext origin"
+    );
+}
+
 fn public_key_path() -> String {
     format!("GET /repos/{REPO}/environments/{ENVIRONMENT}/secrets/public-key")
 }

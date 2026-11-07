@@ -60,34 +60,6 @@ async fn post_rendered_pr_comment(
         .map_err(|_| crate::error::Error::Config("GITHUB_TOKEN not set".to_string()))?;
     let repo = env::var("GITHUB_REPOSITORY")
         .map_err(|_| crate::error::Error::Config("GITHUB_REPOSITORY not set".to_string()))?;
-    post_comment_to(
-        env_config,
-        GITHUB_API_ORIGIN,
-        &token,
-        &repo,
-        pr_number,
-        comment,
-    )
-    .await
-}
-
-/// The only origin production comments are posted to.
-const GITHUB_API_ORIGIN: &str = "https://api.github.com";
-
-/// [`post_pr_comment`] against `api_origin`, so tests can point it at a
-/// loopback server. Production always passes [`GITHUB_API_ORIGIN`].
-async fn post_comment_to(
-    env_config: &EnvConfig,
-    api_origin: &str,
-    token: &str,
-    repo: &str,
-    pr_number: u64,
-    comment: &str,
-) -> crate::error::Result<()> {
-    let url = format!("{api_origin}/repos/{repo}/issues/{pr_number}/comments");
-
-    // Callers hand in a body that already went through the display sink.
-    let body = serde_json::json!({ "body": comment });
 
     // Same-shape bounds as the admin client: connect + total request.
     // Keeps `gitforgeops review --pr N` from hanging forever if GitHub's
@@ -103,6 +75,35 @@ async fn post_comment_to(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| crate::error::Error::HttpClient(e.to_string()))?;
+    post_comment_to(
+        &client,
+        GITHUB_API_ORIGIN,
+        &token,
+        &repo,
+        pr_number,
+        comment,
+    )
+    .await
+}
+
+/// The only origin production comments are posted to.
+const GITHUB_API_ORIGIN: &str = "https://api.github.com";
+
+/// [`post_pr_comment`] through `client` against `api_origin`, so tests can
+/// point it at a loopback server. Production always passes
+/// [`GITHUB_API_ORIGIN`].
+async fn post_comment_to(
+    client: &reqwest::Client,
+    api_origin: &str,
+    token: &str,
+    repo: &str,
+    pr_number: u64,
+    comment: &str,
+) -> crate::error::Result<()> {
+    let url = format!("{api_origin}/repos/{repo}/issues/{pr_number}/comments");
+
+    // Callers hand in a body that already went through the display sink.
+    let body = serde_json::json!({ "body": comment });
 
     for attempt in 0..=MAX_COMMENT_RETRIES {
         let resp = client
@@ -171,12 +172,13 @@ mod comment_error_tests {
             // The client stops at its cap; the peer closing early is fine.
             let _ = socket.write_all(&body).await;
         });
-        let config = EnvConfig {
-            github_connect_timeout_secs: 5,
-            github_request_timeout_secs: 30,
-            ..Default::default()
-        };
-        let error = post_comment_to(&config, &origin, "synthetic-token", "acme/repo", 7, "hi")
+        // A loopback stub speaks http://, so the test brings its own client.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let error = post_comment_to(&client, &origin, "synthetic-token", "acme/repo", 7, "hi")
             .await
             .expect_err("a 403 is not delivery");
         server.abort();
