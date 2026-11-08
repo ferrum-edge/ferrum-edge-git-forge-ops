@@ -423,6 +423,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `bootstrap_repo_settings.py` fails closed on a ruleset listing it cannot
+  read (#665). It used to read a non-array listing, an empty `gh` answer or a
+  non-array page as zero rulesets, and skipped a summary without an `id` or a
+  non-object detail. Each of those planned a `CREATE` (with `--apply`, a
+  duplicate `POST`) for a ruleset that exists. The listing now goes through
+  the settings audit's `flatten_pages`, and every one of those shapes stops
+  the run with an error that names the ruleset. A monitor environment's
+  branch-policy listing gets the same strict reader, so an unreadable listing
+  no longer plans a second policy beside ones it could not see.
 - A policy override decision is now either inactive (with its reason) or active
   with its complete verified evidence (approver, permission, PR, authorized
   head, review and applied revision). An active override with a missing piece
