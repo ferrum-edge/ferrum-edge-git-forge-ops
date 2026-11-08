@@ -2405,3 +2405,254 @@ async fn ssh_key_discovery_reads_every_link_header() {
     );
     assert_eq!(count_requests(&requests, &second_page), 0);
 }
+
+// --- #664: the post-merge PR fallback of `plan` / `apply` ---------------------
+
+const MERGE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn associated_page(page: usize) -> String {
+    format!("GET /repos/{REPO}/commits/{MERGE_SHA}/pulls?per_page=100&page={page} ")
+}
+
+fn associated_pull(number: u64, state: &str, merge_sha: &str, base: &str) -> serde_json::Value {
+    serde_json::json!({
+        "number": number,
+        "state": state,
+        "merged_at": (state == "closed").then_some("2026-08-30T00:00:00Z"),
+        "merge_commit_sha": merge_sha,
+        "base": {"ref": base},
+        "user": {"login": format!("author-{number}")},
+    })
+}
+
+fn count_matching(requests: &Arc<Mutex<Vec<String>>>, needle: &str) -> usize {
+    requests
+        .lock()
+        .expect("recorded")
+        .iter()
+        .filter(|request| request.contains(needle))
+        .count()
+}
+
+/// The Rust fallback and `.github/scripts/merge_context.py` (which the
+/// bundled apply runs before it sets `GITFORGEOPS_PR_NUMBER`) answer every
+/// shared case alike; `test_merge_context.py` runs the same file.
+#[test]
+fn the_pr_fallback_matches_merge_context_on_the_shared_cases() {
+    use gitforgeops::policy::github_override::select_merged_pr;
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/merge-context-cases.json");
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("shared cases"))
+            .expect("shared cases are JSON");
+    assert!(cases.len() > 10);
+    for case in cases {
+        let name = case["name"].as_str().expect("name");
+        let items: Vec<serde_json::Value> = case["pages"]
+            .as_array()
+            .expect("pages")
+            .iter()
+            .flat_map(|page| page.as_array().expect("page").iter().cloned())
+            .collect();
+        let selected = select_merged_pr(
+            &items,
+            case["sha"].as_str().expect("sha"),
+            case["base"].as_str().expect("base"),
+        );
+        assert_eq!(selected.ok(), case["expected"].as_u64(), "{name}");
+    }
+}
+
+/// An open PR listed first no longer wins: the merged PR into the base is
+/// chosen, and a two-page listing is read until the empty third page.
+#[tokio::test]
+async fn the_pr_fallback_walks_every_page_and_skips_open_prs() {
+    use gitforgeops::policy::github_override::{associated_merged_pr_at, OverridePr};
+    let routes = vec![
+        (
+            associated_page(1),
+            200,
+            serde_json::json!([
+                associated_pull(9, "open", "", "main"),
+                associated_pull(7, "closed", MERGE_SHA, "release"),
+            ])
+            .to_string(),
+        ),
+        (
+            associated_page(2),
+            200,
+            serde_json::json!([associated_pull(4, "closed", MERGE_SHA, "main")]).to_string(),
+        ),
+        (associated_page(3), 200, "[]".to_string()),
+    ];
+    let (api_base, requests) = spawn_github_stub(routes);
+    let resolved = associated_merged_pr_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        TOKEN,
+        MERGE_SHA,
+        Some("main"),
+    )
+    .await;
+    assert_eq!(resolved, OverridePr::Pr(4));
+    for page in 1..=3 {
+        assert_eq!(
+            count_matching(&requests, &associated_page(page)),
+            1,
+            "page {page}"
+        );
+    }
+    let recorded = requests.lock().expect("recorded").clone();
+    assert_eq!(recorded.len(), 3, "{recorded:?}");
+    for request in &recorded {
+        assert_github_headers(request);
+    }
+}
+
+/// Two merged candidates with no exact merge-commit match are ambiguous.
+#[tokio::test]
+async fn the_pr_fallback_refuses_an_ambiguous_association() {
+    use gitforgeops::policy::github_override::{associated_merged_pr_at, OverridePr};
+    let other = "b".repeat(40);
+    let third = "c".repeat(40);
+    let routes = vec![
+        (
+            associated_page(1),
+            200,
+            serde_json::json!([
+                associated_pull(1, "closed", &other, "main"),
+                associated_pull(2, "closed", &third, "main"),
+            ])
+            .to_string(),
+        ),
+        (associated_page(2), 200, "[]".to_string()),
+    ];
+    let (api_base, _) = spawn_github_stub(routes);
+    let resolved = associated_merged_pr_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        TOKEN,
+        MERGE_SHA,
+        Some("main"),
+    )
+    .await;
+    let OverridePr::None { reason } = resolved else {
+        panic!("an ambiguous association must not pick a PR: {resolved:?}");
+    };
+    assert!(
+        reason.contains("expected exactly one merged pull request"),
+        "{reason}"
+    );
+    assert!(reason.contains("found 2"), "{reason}");
+}
+
+/// A failed read is "no PR" with a reason that names the failure, never a
+/// silent "no PR" and never a guess.
+#[tokio::test]
+async fn the_pr_fallback_names_a_failed_or_malformed_read() {
+    use gitforgeops::policy::github_override::{associated_merged_pr_at, OverridePr};
+    let reason_for = |routes: Vec<(String, u16, String)>| async move {
+        let (api_base, _) = spawn_github_stub(routes);
+        match associated_merged_pr_at(
+            &test_client(),
+            &api_base,
+            REPO,
+            TOKEN,
+            MERGE_SHA,
+            Some("main"),
+        )
+        .await
+        {
+            OverridePr::None { reason } => reason,
+            other => panic!("expected no PR, got {other:?}"),
+        }
+    };
+
+    let reason = reason_for(vec![(
+        associated_page(1),
+        503,
+        r#"{"message":"Service Unavailable"}"#.to_string(),
+    )])
+    .await;
+    assert!(reason.contains("could not be read"), "{reason}");
+    assert!(reason.contains("503"), "{reason}");
+    assert!(reason.contains("Service Unavailable"), "{reason}");
+
+    let reason = reason_for(vec![(
+        associated_page(1),
+        200,
+        r#"{"message":"not a list"}"#.to_string(),
+    )])
+    .await;
+    assert!(reason.contains("page 1"), "{reason}");
+    assert!(reason.contains("is not an array"), "{reason}");
+
+    // The second page fails after a merged PR on the first: still no PR.
+    let reason = reason_for(vec![
+        (
+            associated_page(1),
+            200,
+            serde_json::json!([associated_pull(4, "closed", MERGE_SHA, "main")]).to_string(),
+        ),
+        (associated_page(2), 500, r#"{"message":"boom"}"#.to_string()),
+    ])
+    .await;
+    assert!(reason.contains("500"), "{reason}");
+}
+
+/// Without a branch name the base is the repository's default branch, and a
+/// SHA that is not 40 lowercase hex characters is refused before any request.
+#[tokio::test]
+async fn the_pr_fallback_reads_the_default_branch_and_checks_the_sha() {
+    use gitforgeops::policy::github_override::{associated_merged_pr_at, OverridePr};
+    let routes = vec![
+        (
+            format!("GET /repos/{REPO} "),
+            200,
+            serde_json::json!({"default_branch": "trunk"}).to_string(),
+        ),
+        (
+            associated_page(1),
+            200,
+            serde_json::json!([
+                associated_pull(4, "closed", MERGE_SHA, "main"),
+                associated_pull(5, "closed", MERGE_SHA, "trunk"),
+            ])
+            .to_string(),
+        ),
+        (associated_page(2), 200, "[]".to_string()),
+    ];
+    let (api_base, requests) = spawn_github_stub(routes);
+    let resolved =
+        associated_merged_pr_at(&test_client(), &api_base, REPO, TOKEN, MERGE_SHA, None).await;
+    assert_eq!(resolved, OverridePr::Pr(5));
+    assert_eq!(count_matching(&requests, &format!("GET /repos/{REPO} ")), 1);
+
+    for sha in [
+        "A".repeat(40),
+        "a".repeat(39),
+        format!("{}/x", "a".repeat(38)),
+    ] {
+        let (api_base, requests) = spawn_github_stub(vec![]);
+        let resolved =
+            associated_merged_pr_at(&test_client(), &api_base, REPO, TOKEN, &sha, Some("main"))
+                .await;
+        let OverridePr::None { reason } = resolved else {
+            panic!("an invalid SHA must not resolve: {resolved:?}");
+        };
+        assert!(reason.contains("GITHUB_SHA"), "{reason}");
+        assert!(requests.lock().expect("recorded").is_empty());
+    }
+}
+
+/// The note `plan` and `apply` print keeps the CI/PR-only text the docs and
+/// `apply_gate_tests` quote, followed by the reason.
+#[test]
+fn the_no_pr_note_keeps_the_documented_text_and_adds_the_reason() {
+    use gitforgeops::policy::github_override::{no_pr_override_note, NO_PR_OVERRIDE_NOTE};
+    let note = no_pr_override_note("GITHUB_SHA is not set, so there is no commit to look up");
+    assert!(note.starts_with(NO_PR_OVERRIDE_NOTE), "{note}");
+    assert!(note.ends_with("(GITHUB_SHA is not set, so there is no commit to look up)"));
+}

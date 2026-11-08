@@ -1,0 +1,596 @@
+[
+  {
+    "name": "an exact merge commit wins over an indirect association",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 1,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "indirect"
+          }
+        },
+        {
+          "number": 2,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "author"
+          }
+        }
+      ]
+    ],
+    "expected": 2
+  },
+  {
+    "name": "a single rebase-style association is accepted",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 3,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "rebased"
+          }
+        }
+      ]
+    ],
+    "expected": 3
+  },
+  {
+    "name": "an open PR listed first is skipped for the merged one",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 9,
+          "state": "open",
+          "merged_at": null,
+          "merge_commit_sha": null,
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "opener"
+          }
+        },
+        {
+          "number": 4,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "author"
+          }
+        }
+      ]
+    ],
+    "expected": 4
+  },
+  {
+    "name": "pages are flattened in order",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 9,
+          "state": "open",
+          "merged_at": null,
+          "merge_commit_sha": null,
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "opener"
+          }
+        }
+      ],
+      [
+        {
+          "number": 4,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "author"
+          }
+        }
+      ]
+    ],
+    "expected": 4
+  },
+  {
+    "name": "a merged PR into another base is ignored",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 7,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "release"
+          },
+          "user": {
+            "login": "release"
+          }
+        },
+        {
+          "number": 8,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "author"
+          }
+        }
+      ]
+    ],
+    "expected": 8
+  },
+  {
+    "name": "only a merged PR into another base resolves to none",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 7,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "release"
+          },
+          "user": {
+            "login": "release"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "two merged candidates without an exact match resolve to none",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 1,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "one"
+          }
+        },
+        {
+          "number": 2,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "two"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "two exact matches resolve to none",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 1,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "one"
+          }
+        },
+        {
+          "number": 2,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "two"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "no association resolves to none",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [],
+    "expected": null
+  },
+  {
+    "name": "an empty page resolves to none",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      []
+    ],
+    "expected": null
+  },
+  {
+    "name": "an open PR alone resolves to none",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 1,
+          "state": "open",
+          "merged_at": null,
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "open"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a closed unmerged PR resolves to none",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 1,
+          "state": "closed",
+          "merged_at": null,
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "closed"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a PR without merged_at resolves to none",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 6,
+          "state": "closed",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "nomerge"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a missing author is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 2,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": null
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a login with a line break is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 3,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "line\nbreak"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a login starting with a hyphen is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 3,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "-leading"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a 39-character login is accepted",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 3,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ]
+    ],
+    "expected": 3
+  },
+  {
+    "name": "a 40-character login is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 3,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a bot login is accepted",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 3,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "dependabot[bot]"
+          }
+        }
+      ]
+    ],
+    "expected": 3
+  },
+  {
+    "name": "a bot login with a 35-character name is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 3,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa[bot]"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a non-ASCII login is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 3,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "\u00e9t\u00e9"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "PR number zero is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 0,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "zero"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a string PR number is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": "5",
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "text"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a non-object entry refuses the listing",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 4,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "author"
+          }
+        },
+        "4"
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "the base must match exactly",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 4,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "Main"
+          },
+          "user": {
+            "login": "author"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  }
+]

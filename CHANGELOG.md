@@ -423,6 +423,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Without `GITFORGEOPS_PR_NUMBER`, `plan` and `apply` now pick the PR whose
+  override they evaluate by the bundled workflow's own rule (#664). That rule
+  is `merge_context.py`'s: the one closed PR with `merged_at` into the
+  applied branch (`GITHUB_REF_NAME`, else the default branch) associated with
+  `GITHUB_SHA`, preferring an exact `merge_commit_sha` and reading every page.
+  The fallback used to take the first PR GitHub listed, from one unpaginated
+  page. That could be an open PR, a PR into another branch, or an arbitrary
+  one of several. A wrong PR could not clear findings, but it could refuse a
+  correctly overridden apply or record the wrong PR in the ledger. An
+  ambiguous, failed or malformed lookup still means "no PR" (every finding
+  stands), and the note now says why. A shared case file,
+  `tests/fixtures/merge-context-cases.json`, keeps the Rust and Python copies
+  of the rule in step.
 - A policy override decision is now either inactive (with its reason) or active
   with its complete verified evidence (approver, permission, PR, authorized
   head, review and applied revision). An active override with a missing piece
