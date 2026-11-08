@@ -81,6 +81,17 @@ impl Default for OwnershipConfig {
 /// environment may never carry it.
 pub const MONITORING_ENVIRONMENT_SUFFIX: &str = "-monitor";
 
+/// Reserved name of the GitHub Environment `release.yml`'s `docker` job binds.
+///
+/// It holds only the registry push credentials and admits only the default
+/// branch and `v*` tags. Where release publishing is enabled the settings audit
+/// waives its required-reviewer rule, so a deployment environment of this name
+/// (GitHub compares environment names case-insensitively) would become an
+/// unreviewed gateway *write* target and would share its secrets with the
+/// image publisher. `audit_settings.RELEASE_ENVIRONMENT` and
+/// `bootstrap_repo_settings.py` use the same name.
+pub const RELEASE_ENVIRONMENT: &str = "release";
+
 /// Derive the monitoring environment name for a deployment environment.
 pub fn monitoring_environment_name(environment: &str) -> String {
     format!("{environment}{MONITORING_ENVIRONMENT_SUFFIX}")
@@ -319,6 +330,15 @@ impl RepoConfig {
                      environment of the same base name. Rename this environment; set \
                      `monitoring.unattended: true` on the deployment environment to create \
                      its monitoring target."
+                )));
+            }
+
+            if name.eq_ignore_ascii_case(RELEASE_ENVIRONMENT) {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': the name '{RELEASE_ENVIRONMENT}' (in any case) is \
+                     reserved for the GitHub Environment that holds release.yml's registry \
+                     credentials, whose reviewer rule the settings audit waives. Rename this \
+                     deployment environment and its GitHub Environment."
                 )));
             }
 

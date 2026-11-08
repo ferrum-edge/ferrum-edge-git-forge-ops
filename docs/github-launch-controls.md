@@ -211,6 +211,58 @@ The release workflow also checks that a tag's commit is reachable from the
 protected default branch. Tag protection stops a branch-controlled workflow
 from removing that check before secrets are used.
 
+That only holds for secrets a branch-controlled workflow cannot read at all.
+A repository or organization secret is released to the workflow file any
+pushed branch carries, so a write principal who is not a tag bypass actor
+could add a workflow on a branch, read a repository-scoped Docker Hub token
+and publish without `authorize-release`, the ancestry check or the tag
+ruleset. Where `release.yml` publishes (upstream, or
+`GITFORGEOPS_RELEASE_ENABLED=true`), the Docker Hub credentials are therefore
+secrets of a **`release`** GitHub Environment, which the `docker` job binds:
+
+- deployment branches and tags: custom rules for exactly the default branch
+  and tag `v*` (the "protected branches" option admits no tag, and any wider
+  rule releases the token to an unprotected ref);
+- `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` set with
+  `gh secret set NAME --repo owner/repo --env release`, and no `DOCKERHUB_*`
+  repository or organization secret;
+- no required reviewer is needed: every push to the default branch publishes,
+  and `authorize-release` is the publication gate. A reviewer you add is kept
+  by the bootstrap and accepted by the audit;
+- nothing but `DOCKERHUB_*` secrets: without a reviewer, a gateway,
+  credential-broker or state-writer secret there would reach any
+  default-branch job that binds it.
+
+The name `release` is reserved in any letter case (GitHub compares
+environment names case-insensitively): `.gitforgeops/config.yaml` and the
+bootstrap refuse a deployment environment of that name.
+
+`bootstrap_repo_settings.py` creates the environment and its two ref rules
+when publishing is enabled. `check_supply_chain.py` lets only `release.yml`'s
+`docker` job read `secrets.DOCKERHUB_*` or bind `release`, requires that job to
+bind it and to read no other secret but `GITHUB_TOKEN`, and refuses a
+workflow-level reference, a reusable-workflow call, and any indexed or
+whole-context secrets reference, even behind a quoted `}}` or a YAML escape.
+A computed `environment:` (resolved only at run time) is allowed only as one
+of the pinned bindings in `COMPUTED_ENVIRONMENT_BINDINGS`: the matrix values
+`gitforgeops envs` enumerates from the protected configuration, and the
+`rotate.yml` / `materialize-file.yml` dispatch input, which their `preflight`
+job refuses (in a pinned `shell: bash` step) when it is not a safe name or is
+`release`. Each matrix's producer (job output and step script) is pinned as
+well, and no `defaults:`, `env:`, `container:` or `continue-on-error` may
+apply to a pinned producer or guard. Reusable-workflow call jobs are refused,
+because a called workflow could bind `release` where the policy cannot read
+it. The settings audit checks the environment, its secrets and the secret
+scope (section 5).
+
+**Migrating an existing install.** Create the `release` environment with the
+two ref rules before the `release.yml` change reaches the default branch (a
+run that binds a missing environment creates it with no rules), set both
+secrets in it, delete the repository secrets with
+`gh secret delete DOCKERHUB_USERNAME --repo owner/repo` and the same for
+`DOCKERHUB_TOKEN`, then rotate the Docker Hub token, which any branch
+workflow could read until now.
+
 ### Switching the supply-chain policy check
 
 The supply-chain verdict is moving from `security-supply-chain-policy` (in
@@ -1054,7 +1106,10 @@ security.
 Create a GitHub Environment named **`settings-audit`** with deployment branches
 limited to **protected branches** (or an exact custom rule for `main`) and
 **no required reviewer**. Create a fine-grained PAT or read-only GitHub App
-token with **Administration: read**, and store it as a secret *of that
+token with **Administration: read** (plus **Secrets: read** and
+**Environments: read** where release publishing is enabled: the first lists
+repository and organization secret names, the second the `release`
+environment's secret names), and store it as a secret *of that
 environment*:
 
 ```bash
@@ -1086,6 +1141,16 @@ included.
   the `main` ruleset's bypass actors (§2a; a warning on a user-owned
   repository);
 - that the `settings-audit` environment exists;
+- where release publishing is enabled (upstream, or `--release-publishing`,
+  which `settings-audit.yml` passes when `GITFORGEOPS_RELEASE_ENABLED` is
+  `true`): that the `release` environment (matched case-insensitively)
+  exists with exactly the default-branch and `v*` tag rules and holds only
+  `DOCKERHUB_*` secrets, and that no `DOCKERHUB_*` secret is a repository or
+  organization secret (section 2). A secret listing that cannot be read in
+  full fails the audit. Listing secret names needs
+  **Secrets: read** (repository and organization secrets) and
+  **Environments: read** (the `release` environment's secrets) on the audit
+  token there; values are never read;
 - every environment's reviewer, self-review and branch policy;
 - gateway monitoring coverage, once any environment opts into unattended drift
   monitoring (below).

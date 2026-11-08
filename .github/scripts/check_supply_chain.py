@@ -411,6 +411,134 @@ SECURITY_PUSH_POLICY_PATHS = (
 # audit_settings.SETTINGS_AUDIT_ENVIRONMENT and bootstrap_repo_settings.py.
 SETTINGS_AUDIT_ENVIRONMENT_BINDING = "\n    environment: settings-audit\n"
 SETTINGS_AUDIT_TOKEN_REFERENCE = "secrets.SETTINGS_AUDIT_TOKEN"
+# The Docker Hub push credentials are secrets of the `release` environment,
+# whose deployment policy admits only the default branch and `v*` tags. A job
+# reads an environment secret only through its `environment:` binding; without
+# it the same reference resolves to a repository or organization secret, which
+# GitHub releases to the workflow file any pushed branch carries. Only
+# release.yml's `docker` job reads them or binds the environment, and that job
+# reads no other secret but GITHUB_TOKEN. Kept in step with
+# audit_settings.RELEASE_ENVIRONMENT and bootstrap_repo_settings.py.
+RELEASE_ENVIRONMENT = "release"
+REGISTRY_SECRET_WORKFLOW = ".github/workflows/release.yml"
+REGISTRY_SECRET_JOB = "docker"
+REGISTRY_SECRET_PREFIX = "DOCKERHUB_"
+REGISTRY_JOB_OTHER_SECRETS = frozenset({"GITHUB_TOKEN"})
+# Every job whose `environment:` is computed. GitHub resolves the expression at
+# run time, so a computed name (`${{ 'release' }}`, a matrix or input value)
+# could bind the reviewer-free `release` environment where the literal check
+# below cannot see it. Each pinned value is provably never `release`:
+# - the matrix values come from `gitforgeops envs` over the protected branch's
+#   `.gitforgeops/config.yaml` (apply-on-merge's `list-envs`, drift-check's
+#   `list-envs`, trusted-pr-review's trusted `prepare` targets), whose loader
+#   refuses `release` in any case (`src/config/repo_config.rs`); drift-check's
+#   `<env>-monitor` derivation cannot produce it either;
+# - the dispatch inputs of rotate.yml and materialize-file.yml are refused by
+#   the `preflight` job the bound job `needs`, before any binding, unless they
+#   are a safe path component other than `release` (`DISPATCH_ENVIRONMENT_GUARD`).
+# Any other computed binding is refused. The matrix pin is the job's whole
+# `strategy.matrix`.
+COMPUTED_ENVIRONMENT_BINDINGS = {
+    (".github/workflows/apply-on-merge.yml", "apply"): (
+        "${{ matrix.environment }}",
+        {"environment": "${{ fromJson(needs.list-envs.outputs.envs) }}"},
+    ),
+    (".github/workflows/apply-on-merge.yml", "promote"): (
+        "${{ matrix.scope.environment }}",
+        {"scope": "${{ fromJson(needs.list-envs.outputs.promotions) }}"},
+    ),
+    (".github/workflows/drift-check.yml", "drift"): (
+        "${{ matrix.scope.monitoring_environment }}",
+        {"scope": "${{ fromJson(needs.list-envs.outputs.scopes) }}"},
+    ),
+    (".github/workflows/trusted-pr-review.yml", "live-review"): (
+        "${{ matrix.environment }}",
+        {"include": "${{ fromJson(needs.prepare.outputs.targets) }}"},
+    ),
+    (".github/workflows/rotate.yml", "rotate"): ("${{ inputs.environment }}", None),
+    (".github/workflows/materialize-file.yml", "materialize"): (
+        "${{ inputs.environment }}",
+        None,
+    ),
+}
+# The producer of each pinned matrix: (job, its outputs, the step that writes
+# them, that step's whole script). `environment_producer_violations` holds
+# the wiring to these, so a producer cannot be swapped for a literal JSON array
+# (`[{"monitoring_environment": "release"}]`) or another step.
+DRIFT_ENVIRONMENT_LIST_RUN = (
+    "set -euo pipefail",
+    "[[ -f .gitforgeops/config.yaml ]] || {\n"
+    'echo "::error::Repository configuration is required before binding a deployment environment."\n'
+    "exit 1\n"
+    "}",
+    "scopes=$(gitforgeops envs --format json --include-scopes | jq -c '\n"
+    "[ .[] | {\n"
+    "environment,\n"
+    "monitoring_environment,\n"
+    "unattended_monitoring\n"
+    "} ]\n"
+    "')",
+    "jq -e '\n"
+    'type == "array" and\n'
+    "all(.[]; .environment as $e | .monitoring_environment as $m |\n"
+    '($e | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")) and\n'
+    '($m | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}(-monitor)?$")))\n'
+    "' <<< \"$scopes\" >/dev/null || {\n"
+    'echo "::error::Every environment must be a single safe path component."\n'
+    "exit 1\n"
+    "}",
+    'echo "scopes=$scopes" >> "$GITHUB_OUTPUT"',
+)
+REVIEW_TARGETS_RUN = (
+    "set -euo pipefail",
+    "scopes=$(cd trusted && ./target/release/gitforgeops envs \\\n"
+    "--format json --include-scopes | jq -c .)",
+    "targets=$(python3 -I trusted/.github/scripts/pr_input.py targets \\\n"
+    'trusted "$scopes" "$RUNNER_TEMP/trusted-changed-paths.json")',
+    'echo "Trusted source SHA: ${{ steps.metadata.outputs.trusted_sha }}"',
+    'echo "Live-review targets: $targets"',
+    'echo "targets=$targets" >> "$GITHUB_OUTPUT"',
+)
+ENVIRONMENT_PRODUCERS = {
+    ".github/workflows/apply-on-merge.yml": (
+        "list-envs",
+        {
+            "envs": "${{ steps.list.outputs.envs }}",
+            "promotions": "${{ steps.list.outputs.promotions }}",
+        },
+        "list",
+        APPLY_ENVIRONMENT_LIST_RUN,
+    ),
+    ".github/workflows/drift-check.yml": (
+        "list-envs",
+        {"scopes": "${{ steps.list.outputs.scopes }}"},
+        "list",
+        DRIFT_ENVIRONMENT_LIST_RUN,
+    ),
+    ".github/workflows/trusted-pr-review.yml": (
+        "prepare",
+        {"targets": "${{ steps.targets.outputs.targets }}"},
+        "targets",
+        REVIEW_TARGETS_RUN,
+    ),
+}
+DISPATCH_ENVIRONMENT_GUARD_STEP = "Refuse an unsafe or reserved environment input"
+DISPATCH_ENVIRONMENT_GUARD_SHELL = "bash"
+DISPATCH_ENVIRONMENT_GUARD_ENV = {"INPUT_ENVIRONMENT": "${{ inputs.environment }}"}
+DISPATCH_ENVIRONMENT_GUARD = (
+    "set -euo pipefail",
+    '[[ "$INPUT_ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || {\n'
+    'echo "::error::Environment must be a single safe path component."\n'
+    "exit 1\n"
+    "}",
+    "if [ \"$(printf '%s' \"$INPUT_ENVIRONMENT\" | tr '[:upper:]' '[:lower:]')\" = release ]; then\n"
+    'echo "::error::release holds the registry credentials and is not a deployment environment."\n'
+    "exit 1\n"
+    "fi",
+)
+REGISTRY_SECRET_REFERENCE = re.compile(
+    r"\bsecrets\s*(?:\.\s*|\[\s*['\"]\s*)DOCKERHUB_", re.IGNORECASE
+)
 FRESH_HEAD_STEP = "Refresh protected branch and reject stale deployments"
 # The checkout that feeds a privileged reconcile has to name the branch, not
 # the triggering event's commit, and has to carry enough history for the
@@ -595,6 +723,16 @@ def secret_name_case_violations(workflow: str, text: str) -> list[str]:
 _SECRETS_INHERIT_RE = re.compile(r"^\s*secrets\s*:\s*inherit\s*$", re.MULTILINE)
 
 
+def _expression_bodies(text: str) -> list[str]:
+    """Every `${{ ... }}` body, quote-aware, plus the tail after an unclosed opener."""
+    bodies = [match.group(1) for match in WORKFLOW_EXPRESSION.finditer(text)]
+    remainder = WORKFLOW_EXPRESSION.sub("", text)
+    opener = remainder.find("${{")
+    if opener >= 0:
+        bodies.append(remainder[opener + 3 :])
+    return bodies
+
+
 def whole_secrets_context_violations(workflow: str, text: str) -> list[str]:
     """Every `secrets` reference must name exactly one secret.
 
@@ -609,13 +747,19 @@ def whole_secrets_context_violations(workflow: str, text: str) -> list[str]:
     `secrets['NAME']` is rejected with them: it is one variable substitution
     away from an indexed walk over the whole context, and no workflow here
     needs a dynamic secret name.
+
+    Expressions are delimited by the quote-aware `WORKFLOW_EXPRESSION`, as
+    GitHub delimits them: a `}}` inside a single-quoted literal
+    (`${{ contains('}}', '}') && secrets[...] }}`) does not end the
+    expression. An opener that never closes is scanned to the end of the text,
+    so an unterminated expression cannot hide a reference either.
     """
     violations: list[str] = []
     seen: set[str] = set()
-    for expression in EXPRESSION.finditer(text):
-        if not WHOLE_SECRETS.search(NAMED_SECRET.sub("", expression.group(1))):
+    for body in _expression_bodies(text):
+        if not WHOLE_SECRETS.search(NAMED_SECRET.sub("", body)):
             continue
-        leak = " ".join(expression.group(0).split())
+        leak = " ".join(("${{" + body + "}}").split())
         if leak in seen:
             continue
         seen.add(leak)
@@ -4948,6 +5092,340 @@ def monitoring_jwt_binding_violations(workflow: str, document: dict) -> list[str
     )
 
 
+_AMBIGUOUS = object()
+
+
+def _folded(node, key: str):
+    """The one value under `key` in any letter case; `_AMBIGUOUS` for several.
+
+    The sibling rules read workflow keys casefolded, so these do too: a
+    `Jobs:`, `Environment:` or `Needs:` spelling is the same key here, and two
+    spellings of one key are refused rather than one of them picked.
+    """
+    if not isinstance(node, dict):
+        return None
+    found = [
+        value for name, value in node.items() if isinstance(name, str) and name.casefold() == key
+    ]
+    if not found:
+        return None
+    return found[0] if len(found) == 1 else _AMBIGUOUS
+
+
+def _exact(node, key: str):
+    """`node[key]` when that exact spelling is the only one in any letter case.
+
+    Used where a key must be present for a pin to hold (`needs`, `strategy`,
+    `matrix`, `outputs`, `jobs`): a spelling GitHub might not read is never
+    taken as satisfying the pin. Keys a rule refuses are found with `_folded`.
+    """
+    if not isinstance(node, dict) or key not in node:
+        return None
+    return node[key] if _folded(node, key) is node[key] else None
+
+
+def _bound_environment(job: dict):
+    """A job's literal environment name, from either `environment:` form."""
+    environment = job.get("environment")
+    if isinstance(environment, dict):
+        environment = environment.get("name")
+    return environment if isinstance(environment, str) else None
+
+
+def _environment_name(value):
+    """The name an `environment:` value binds: a string, or a mapping's `name:`."""
+    if isinstance(value, dict):
+        value = _folded(value, "name")
+    return value
+
+
+def _decoded_scalars(node):
+    """Every key and string value of a parsed document, as GitHub decodes it."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(key, str):
+                yield key
+            yield from _decoded_scalars(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _decoded_scalars(item)
+    elif isinstance(node, str):
+        yield node
+
+
+def decoded_secret_context_violations(workflow: str, document: dict) -> list[str]:
+    """The whole-context and indexed-secret refusal, over decoded scalars.
+
+    `whole_secrets_context_violations` reads the file's text, so a
+    double-quoted escape (`"${{ \\x73ecrets['NAME'] }}"`) hides an indexed or
+    whole-context reference from it; GitHub decodes the YAML scalar before it
+    evaluates the expression. The parsed tree holds the decoded text.
+    """
+    violations: list[str] = []
+    for scalar in _decoded_scalars(document):
+        for violation in whole_secrets_context_violations(workflow, scalar):
+            if violation not in violations:
+                violations.append(violation)
+    return violations
+
+
+def _unconditioned_step_violations(label: str, document: dict, job: dict, step: dict) -> list[str]:
+    """A pinned step runs as written: no shell, directory or env it did not pin.
+
+    `defaults.run.shell` at workflow or job level (`true {0}` turns every
+    script into a no-op), `defaults.run.working-directory`, an `env:` that
+    could rebind `PATH` and so the commands the script names, and a job
+    `container:` that would supply other commands, are refused around the
+    step in every letter case; `continue-on-error` on the step or its job
+    would turn a failed check into a pass.
+    """
+    violations: list[str] = []
+    if any(_folded(node, "defaults") is not None for node in (document, job)):
+        violations.append(f"{label}: no `defaults:` may apply to it (shell, working-directory)")
+    if any(_folded(node, "env") is not None for node in (document, job)):
+        violations.append(f"{label}: no workflow or job `env:` may apply to it")
+    if any(_folded(node, "continue-on-error") is not None for node in (job, step)):
+        violations.append(f"{label}: neither it nor its job may `continue-on-error`")
+    if _folded(job, "container") is not None:
+        violations.append(f"{label}: its job may not run in a `container:` image")
+    return violations
+
+
+def environment_producer_violations(workflow: str, document: dict) -> list[str]:
+    """The job output a pinned matrix binding reads is written by its pinned step.
+
+    The matrix pin alone names `needs.<job>.outputs.<name>`; the producing job
+    could map that output to a literal (`[{"monitoring_environment":
+    "release"}]`) or another step. So the output mapping, the producing step
+    (unique id, in any case) and its whole script are pinned, and the step runs
+    with the default shell, in the workspace, with no `env:` of its own or
+    around it. The commands the script runs come from the protected
+    configuration and the binary built from the same revision.
+    """
+    pin = ENVIRONMENT_PRODUCERS.get(workflow)
+    if pin is None:
+        return []
+    job_name, outputs, step_id, shape = pin
+    label = f"{workflow}: jobs.{job_name}"
+    jobs = _exact(document, "jobs")
+    jobs = jobs if isinstance(jobs, dict) else {}
+    job = _exact(jobs, job_name)
+    if not isinstance(job, dict):
+        return [f"{label} must exist exactly once and produce the bound environment names"]
+    violations: list[str] = []
+    declared = _exact(job, "outputs")
+    declared = declared if isinstance(declared, dict) else {}
+    for name, expected in outputs.items():
+        spellings = [key for key in declared if isinstance(key, str) and key.casefold() == name]
+        if spellings != [name] or declared[name] != expected:
+            violations.append(f"{label}.outputs.{name} must be exactly {expected}")
+    step = _producer_step(job, step_id)
+    step_label = f"{label}, step {step_id!r}"
+    if step is None or not isinstance(step.get("run"), str):
+        return violations + [f"{step_label} must exist exactly once and run the pinned script"]
+    if any(
+        not isinstance(key, str) or key.casefold() not in {"name", "id", "if", "run"}
+        for key in step
+    ):
+        violations.append(
+            f"{step_label} may set only name, id, if and run (no uses, shell, "
+            "working-directory, env or continue-on-error)"
+        )
+    violations.extend(_unconditioned_step_violations(step_label, document, job, step))
+    if not pinned_run_matches(step["run"], shape):
+        violations.append(f"{step_label} must match its pinned script")
+    return violations
+
+
+def computed_environment_binding_violations(
+    workflow: str, job_name: str, job: dict, document: dict
+) -> list[str]:
+    """A computed `environment:` is allowed only as a pinned binding.
+
+    See `COMPUTED_ENVIRONMENT_BINDINGS`: every pinned value comes from a source
+    that cannot yield the reserved `release` name, and every other computed
+    binding is refused, because GitHub would resolve it at run time.
+    """
+    value = _folded(job, "environment")
+    if value is None:
+        return []
+    label = f"{workflow}: jobs.{job_name}"
+    name = _environment_name(value)
+    if isinstance(name, str) and "${{" not in name:
+        return []
+    pin = COMPUTED_ENVIRONMENT_BINDINGS.get((workflow, job_name))
+    if pin is None or value != pin[0] or job.get("environment") != pin[0]:
+        return [
+            f"{label}: a computed `environment:` binding is allowed only as a pinned "
+            "binding whose value source cannot name the reserved "
+            f"`{RELEASE_ENVIRONMENT}` environment (COMPUTED_ENVIRONMENT_BINDINGS)"
+        ]
+    binding, matrix = pin
+    if matrix is not None:
+        strategy = _exact(job, "strategy")
+        if not isinstance(strategy, dict) or _exact(strategy, "matrix") != matrix:
+            return [f"{label}: strategy.matrix must be exactly {matrix} for {binding}"]
+        producer = ENVIRONMENT_PRODUCERS[workflow][0]
+        needs = _exact(job, "needs")
+        needs = [needs] if isinstance(needs, str) else needs
+        if not isinstance(needs, list) or producer not in needs:
+            return [f"{label}: binds {binding}, so it must need {producer!r}"]
+        return environment_producer_violations(workflow, document)
+    # A dispatch input: the bound job must wait for a preflight job that
+    # refuses an unsafe or reserved name before the binding is evaluated.
+    needs = _exact(job, "needs")
+    needs = [needs] if isinstance(needs, str) else needs
+    jobs = _exact(document, "jobs")
+    preflight = _exact(jobs, "preflight") if isinstance(jobs, dict) else None
+    steps = _exact(preflight, "steps") if isinstance(preflight, dict) else None
+    guards = [
+        step
+        for step in (steps if isinstance(steps, list) else [])
+        if isinstance(step, dict) and _folded(step, "name") == DISPATCH_ENVIRONMENT_GUARD_STEP
+    ]
+    guard = guards[0] if len(guards) == 1 else None
+    refusal = (
+        f"{label}: binds {binding}, so it must need a `preflight` job whose step "
+        f"{DISPATCH_ENVIRONMENT_GUARD_STEP!r} runs the pinned guard (`shell: bash`) "
+        f"that refuses an unsafe name or `{RELEASE_ENVIRONMENT}` before the binding"
+    )
+    # No job condition on either side: `if: always()` on the bound job would
+    # run it after a failed preflight, and a preflight that can be skipped or
+    # soft-fail guards nothing.
+    if (
+        not isinstance(needs, list)
+        or "preflight" not in needs
+        or _folded(job, "if") is not None
+        or not isinstance(preflight, dict)
+        or _folded(preflight, "if") is not None
+        or guard is None
+        or set(guard) != {"name", "shell", "env", "run"}
+        or guard.get("shell") != DISPATCH_ENVIRONMENT_GUARD_SHELL
+        or guard.get("env") != DISPATCH_ENVIRONMENT_GUARD_ENV
+        or not isinstance(guard.get("run"), str)
+        or not pinned_run_matches(guard["run"], DISPATCH_ENVIRONMENT_GUARD)
+    ):
+        return [refusal]
+    return [
+        f"{label}: {violation}"
+        for violation in _unconditioned_step_violations(
+            f"preflight step {DISPATCH_ENVIRONMENT_GUARD_STEP!r}", document, preflight, guard
+        )
+    ]
+
+
+def registry_secret_environment_violations(workflow: str, document: dict) -> list[str]:
+    """Only release.yml's `docker` job reads `secrets.DOCKERHUB_*`, bound to `release`.
+
+    The parsed tree is read, with quoted scalars decoded, so a spelling cannot
+    hide a `secrets.DOCKERHUB_*` or `secrets['DOCKERHUB_*']` reference
+    (`decoded_secret_context_violations` refuses every indexed or whole-context
+    form anyway); anchors, aliases and merge keys never reach here because the
+    strict reader refuses them, and every key is read in any letter case.
+
+    - Any other job, even one bound to `release`, and a workflow-level `env:`
+      are refused.
+    - Only the `docker` job may bind the reviewer-free `release` environment,
+      in any letter case, and it reads no secret but the registry credentials
+      and GITHUB_TOKEN. A computed binding must be pinned
+      (`computed_environment_binding_violations`).
+    - A reusable-workflow call job is refused outright: the called workflow's
+      jobs can bind this repository's `release` environment and read its
+      secrets, and the policy cannot read them.
+    - Two spellings of one job id are refused, so the publisher cannot be
+      shadowed by a `Docker:` job.
+    """
+    violations: list[str] = []
+    jobs = _folded(document, "jobs")
+    if jobs is _AMBIGUOUS:
+        return [f"{workflow}: `jobs:` is spelled more than once"]
+    if isinstance(jobs, dict):
+        outside = {
+            key: value
+            for key, value in document.items()
+            if not (isinstance(key, str) and key.casefold() == "jobs")
+        }
+    else:
+        outside, jobs = document, {}
+    if REGISTRY_SECRET_REFERENCE.search(json.dumps(outside, ensure_ascii=False)):
+        violations.append(
+            f"{workflow}: secrets.DOCKERHUB_* may be read only by "
+            f"{REGISTRY_SECRET_WORKFLOW} jobs.{REGISTRY_SECRET_JOB}, never at workflow level"
+        )
+    folded_ids: dict[str, list[str]] = {}
+    for job_name in jobs:
+        if isinstance(job_name, str):
+            folded_ids.setdefault(job_name.casefold(), []).append(job_name)
+    for spellings in folded_ids.values():
+        if len(spellings) > 1:
+            violations.append(
+                f"{workflow}: job ids {', '.join(sorted(spellings))} differ only in case"
+            )
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        text = json.dumps(job, ensure_ascii=False)
+        publisher = workflow == REGISTRY_SECRET_WORKFLOW and job_name == REGISTRY_SECRET_JOB
+        label = f"{workflow}: jobs.{job_name}"
+        if _folded(job, "uses") is not None:
+            violations.append(
+                f"{label}: a reusable-workflow call is refused; the called workflow's "
+                f"jobs could bind the reviewer-free `{RELEASE_ENVIRONMENT}` environment "
+                "and read its secrets where this policy cannot read them"
+            )
+        value = _folded(job, "environment")
+        name = _environment_name(value) if value is not _AMBIGUOUS else None
+        if value is _AMBIGUOUS or name is _AMBIGUOUS:
+            violations.append(f"{label}: `environment:` is spelled more than once")
+        if REGISTRY_SECRET_REFERENCE.search(text):
+            if not publisher:
+                violations.append(
+                    f"{label}: secrets.DOCKERHUB_* may be read only by "
+                    f"{REGISTRY_SECRET_WORKFLOW} jobs.{REGISTRY_SECRET_JOB}"
+                )
+            elif value is not job.get("environment") or _bound_environment(job) != RELEASE_ENVIRONMENT:
+                violations.append(
+                    f"{label}: reads secrets.DOCKERHUB_*, so it must "
+                    f"bind `environment: {RELEASE_ENVIRONMENT}`; without it the registry "
+                    "push token is a repository or organization secret released to any "
+                    "pushed branch"
+                )
+        if (
+            not publisher
+            and isinstance(name, str)
+            and name.strip().casefold() == RELEASE_ENVIRONMENT
+        ):
+            violations.append(
+                f"{label}: only {REGISTRY_SECRET_WORKFLOW} "
+                f"jobs.{REGISTRY_SECRET_JOB} may bind the reviewer-free "
+                f"`{RELEASE_ENVIRONMENT}` environment"
+            )
+        if value is not _AMBIGUOUS:
+            violations.extend(
+                computed_environment_binding_violations(workflow, job_name, job, document)
+            )
+        if publisher:
+            others = sorted(
+                {
+                    match.group(0).split(".", 1)[1].strip().upper()
+                    for match in NAMED_SECRET.finditer(text)
+                }
+                - REGISTRY_JOB_OTHER_SECRETS
+            )
+            others = [name for name in others if not name.startswith(REGISTRY_SECRET_PREFIX)]
+            if others:
+                violations.append(
+                    f"{label}: the registry publishing job may read "
+                    f"only {REGISTRY_SECRET_PREFIX}* and GITHUB_TOKEN; found "
+                    + ", ".join(others)
+                )
+    deduplicated: list[str] = []
+    for violation in violations:
+        if violation not in deduplicated:
+            deduplicated.append(violation)
+    return deduplicated
+
+
 # -- Local actions --------------------------------------------------------------
 #
 # A step's `uses: ./path` runs an action from the checked-out tree, which no
@@ -6368,9 +6846,10 @@ def main(argv: list[str] | None = None) -> int:
                 str(workflow.relative_to(root)), text, rust_channel or "<invalid>"
             )
         )
-        violations.extend(
-            whole_secrets_context_violations(str(workflow.relative_to(root)), text)
+        raw_secret_context = whole_secrets_context_violations(
+            str(workflow.relative_to(root)), text
         )
+        violations.extend(raw_secret_context)
         violations.extend(
             secret_name_case_violations(str(workflow.relative_to(root)), text)
         )
@@ -6402,6 +6881,18 @@ def main(argv: list[str] | None = None) -> int:
                 monitoring_jwt_binding_violations(
                     workflow.relative_to(root).as_posix(), document
                 )
+            )
+            violations.extend(
+                registry_secret_environment_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
+            violations.extend(
+                violation
+                for violation in decoded_secret_context_violations(
+                    str(workflow.relative_to(root)), document
+                )
+                if violation not in raw_secret_context
             )
             violations.extend(
                 workflow_allowlist_violations(
@@ -6539,6 +7030,14 @@ def main(argv: list[str] | None = None) -> int:
     release_document = workflow_documents.get(RELEASE_GATE_WORKFLOW)
     if release_document is not None:
         violations.extend(release_gate_violations(root, release_document))
+        release_jobs = release_document.get("jobs")
+        docker_job = release_jobs.get("docker") if isinstance(release_jobs, dict) else None
+        if not isinstance(docker_job, dict) or _bound_environment(docker_job) != RELEASE_ENVIRONMENT:
+            violations.append(
+                "release.yml: the docker job must bind "
+                f"`environment: {RELEASE_ENVIRONMENT}` so the registry push token is "
+                "released only to the default branch and protected release tags"
+            )
 
     apply_workflow = (workflows / "apply-on-merge.yml").read_text(encoding="utf-8")
     if "vars.FERRUM_GATEWAY_MODE != 'file'" in apply_workflow:

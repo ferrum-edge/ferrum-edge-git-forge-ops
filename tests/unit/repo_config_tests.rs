@@ -208,6 +208,27 @@ environments:
 }
 
 #[test]
+fn a_deployment_environment_may_not_take_the_release_name() {
+    // The `release` GitHub Environment holds the registry push credentials and
+    // the settings audit waives its required reviewer where publishing is
+    // enabled. GitHub compares environment names case-insensitively, so every
+    // spelling is refused.
+    for name in ["release", "Release", "RELEASE"] {
+        let yaml = format!("environments:\n  {name}:\n    ownership:\n      mode: shared\n");
+        let file = write_repo_config(&yaml);
+        let error = RepoConfig::load_from_path(file.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("environment '{name}'")), "{error}");
+        assert!(error.contains("reserved"), "{error}");
+    }
+    // A name that only contains it is an ordinary deployment environment.
+    let yaml = "environments:\n  pre-release:\n    ownership:\n      mode: shared\n";
+    let file = write_repo_config(yaml);
+    assert!(RepoConfig::load_from_path(file.path()).unwrap().is_some());
+}
+
+#[test]
 fn repo_config_rejects_prune_threshold_above_100() {
     // delete_pct in cmd_apply is 0..=100. A YAML value > 100 would make the
     // guard `delete_pct > threshold` never fire — mass deletions would

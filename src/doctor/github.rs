@@ -51,6 +51,11 @@ pub struct GithubContext {
     pub state_writer_app_id: Option<String>,
     /// Audit the template baseline instead of the deployment one.
     pub template_repo: bool,
+    /// `release.yml` publishes from this repository (repository variable
+    /// `GITFORGEOPS_RELEASE_ENABLED`): also audit the `release` environment
+    /// that fences the registry credentials. The auditor turns this on by
+    /// itself for the upstream repository.
+    pub release_publishing: bool,
 }
 
 /// The line the auditor prints, last, when the whole baseline holds
@@ -61,6 +66,11 @@ pub const AUDIT_SUCCESS_LINE: &str = "All launch protection controls are active.
 /// Repository variable that marks the template customers copy. `settings-audit.yml`
 /// passes `--template-repo` exactly when its lowercased value is `true`.
 pub const TEMPLATE_REPO_VARIABLE: &str = "GITFORGEOPS_TEMPLATE_REPO";
+
+/// Repository variable that opts a repository into `release.yml` publishing.
+/// `settings-audit.yml` passes `--release-publishing` exactly when its
+/// lowercased value is `true`, the same test as the template variable.
+pub const RELEASE_ENABLED_VARIABLE: &str = "GITFORGEOPS_RELEASE_ENABLED";
 
 /// Repository variable holding the state-writer App id.
 pub const STATE_APP_ID_VARIABLE: &str = "GITFORGEOPS_STATE_APP_ID";
@@ -89,6 +99,8 @@ impl GithubContext {
             state_writer_app_id: present(state_writer_app_id.map(str::to_string))
                 .or_else(|| present(lookup(STATE_APP_ID_VARIABLE))),
             template_repo: lookup(TEMPLATE_REPO_VARIABLE)
+                .is_some_and(|value| is_template_repo_value(&value)),
+            release_publishing: lookup(RELEASE_ENABLED_VARIABLE)
                 .is_some_and(|value| is_template_repo_value(&value)),
         }
     }
@@ -211,6 +223,9 @@ pub fn run(root: &Path, context: &GithubContext) -> Vec<Check> {
     } else if let Some(app_id) = app_id {
         command.arg("--state-writer-app-id").arg(app_id);
     }
+    if context.release_publishing {
+        command.arg("--release-publishing");
+    }
     if let Some(token) = &context.token {
         command.env("GH_TOKEN", token);
     }
@@ -277,7 +292,9 @@ pub fn audit_checks(success: bool, stdout: &str, stderr: &str) -> Vec<Check> {
         let remedy = if reason.is_some_and(looks_like_token_failure) {
             "This is not a finding about the repository — the audit did not \
              run. Check that GH_TOKEN carries Administration: read for this \
-             repository, then re-run."
+             repository, plus Secrets: read and Environments: read where \
+             release.yml publishes (the upstream repository, or \
+             GITFORGEOPS_RELEASE_ENABLED=true), then re-run."
         } else {
             "This is not a finding about the repository — the audit did not \
              run. The auditor's own message is above; fix that input or the \
