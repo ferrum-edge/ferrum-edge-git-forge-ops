@@ -935,3 +935,62 @@ fn env_config_debug_redacts_every_secret() {
     assert!(rendered.contains("<redacted>"), "{rendered}");
     assert!(rendered.contains("admin_jwt_issuer"), "{rendered}");
 }
+
+/// The PR-comment post reads `GITHUB_TOKEN` / `GITHUB_REPOSITORY` through
+/// `EnvConfig`, like every other GitHub caller and the `can_post_pr` gate:
+/// blank is unset, so a blank value is refused as "not set" before any
+/// request is built, and a padded value is trimmed rather than becoming an
+/// invalid header.
+#[test]
+fn pr_comment_reads_github_credentials_through_env_config() {
+    let _guard = env_guard();
+    clear_env();
+    let saved: Vec<_> = ["GITHUB_TOKEN", "GITHUB_REPOSITORY"]
+        .into_iter()
+        .map(|var| (var, std::env::var_os(var)))
+        .collect();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let refusal = |config: &EnvConfig| {
+        runtime
+            .block_on(gitforgeops::review::post_pr_comment(config, 7, "hi"))
+            .expect_err("a missing credential is refused before any request")
+    };
+
+    std::env::set_var("GITHUB_REPOSITORY", "acme/repo");
+    for blank in ["", "  ", "\n"] {
+        std::env::set_var("GITHUB_TOKEN", blank);
+        let config = load_env_config().unwrap();
+        assert!(config.github_token.is_none(), "{blank:?}");
+        let error = refusal(&config);
+        assert!(
+            matches!(error, gitforgeops::error::Error::Config(ref m) if m == "GITHUB_TOKEN not set"),
+            "{blank:?}: {error}"
+        );
+    }
+
+    std::env::set_var("GITHUB_TOKEN", "synthetic-token");
+    std::env::set_var("GITHUB_REPOSITORY", " ");
+    let config = load_env_config().unwrap();
+    let error = refusal(&config);
+    assert!(
+        matches!(error, gitforgeops::error::Error::Config(ref m) if m == "GITHUB_REPOSITORY not set"),
+        "{error}"
+    );
+
+    std::env::set_var("GITHUB_TOKEN", "  synthetic-token\n");
+    std::env::set_var("GITHUB_REPOSITORY", " acme/repo\n");
+    let config = load_env_config().unwrap();
+    assert_eq!(config.github_token.as_deref(), Some("synthetic-token"));
+    assert_eq!(config.github_repository.as_deref(), Some("acme/repo"));
+
+    for (var, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(var, value),
+            None => std::env::remove_var(var),
+        }
+    }
+    clear_env();
+}

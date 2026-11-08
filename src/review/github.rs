@@ -1,4 +1,3 @@
-use std::env;
 use std::time::Duration;
 
 use crate::config::EnvConfig;
@@ -56,31 +55,35 @@ async fn post_rendered_pr_comment(
     pr_number: u64,
     comment: &str,
 ) -> crate::error::Result<()> {
-    let token = env::var("GITHUB_TOKEN")
-        .map_err(|_| crate::error::Error::Config("GITHUB_TOKEN not set".to_string()))?;
-    let repo = env::var("GITHUB_REPOSITORY")
-        .map_err(|_| crate::error::Error::Config("GITHUB_REPOSITORY not set".to_string()))?;
+    // The same trimmed, blank-is-unset values every other GitHub caller (and
+    // the `can_post_pr` gate) reads, so a blank token fails here, before any
+    // request, instead of as a 401 for `Authorization: Bearer `.
+    let token = env_config
+        .github_token
+        .as_deref()
+        .ok_or_else(|| crate::error::Error::Config("GITHUB_TOKEN not set".to_string()))?;
+    let repo = env_config
+        .github_repository
+        .as_deref()
+        .ok_or_else(|| crate::error::Error::Config("GITHUB_REPOSITORY not set".to_string()))?;
     // The shared GitHub client: timeouts, no redirects (a 3xx off
     // `POST .../comments` is never legitimate and would replay the token),
     // HTTPS only.
     let client = crate::secrets::github_api_client(env_config)?;
     post_comment_to(
         &client,
-        GITHUB_API_ORIGIN,
-        &token,
-        &repo,
+        crate::secrets::DEFAULT_GITHUB_API_BASE,
+        token,
+        repo,
         pr_number,
         comment,
     )
     .await
 }
 
-/// The only origin production comments are posted to.
-const GITHUB_API_ORIGIN: &str = "https://api.github.com";
-
 /// [`post_pr_comment`] through `client` against `api_origin`, so tests can
 /// point it at a loopback server. Production always passes
-/// [`GITHUB_API_ORIGIN`].
+/// [`crate::secrets::DEFAULT_GITHUB_API_BASE`].
 async fn post_comment_to(
     client: &reqwest::Client,
     api_origin: &str,
