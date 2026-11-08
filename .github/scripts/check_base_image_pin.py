@@ -135,6 +135,24 @@ def split_version(version: str) -> tuple[int, str, str]:
     return epoch, upstream, revision
 
 
+def pinned_version_with_epoch(pinned: str, installed: str) -> str:
+    """The Debian version a pinned .deb installs, for comparison with Trivy's.
+
+    A pool file name never carries the epoch (`zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_amd64.deb`
+    installs `1:1.3.dfsg+really1.3.1-1+deb13u1`), while Trivy reports
+    installed and fixed versions with it. Read without one, the pin compares as
+    epoch 0 and is always older than an epoch-1 fix. An epoch belongs to the
+    package, so take the one the base image's installed copy carries. If a fix
+    ever raised the epoch, the pin still compares older and reads as stale:
+    this can hide nothing, only surface a pin for review.
+    """
+    epoch, _, _ = split_version(pinned)
+    if epoch or ":" in pinned:
+        return pinned
+    installed_epoch, _, _ = split_version(installed)
+    return f"{installed_epoch}:{pinned.strip()}" if installed_epoch else pinned
+
+
 def compare_debian_versions(left: str, right: str) -> int:
     """-1, 0 or 1 as `left` sorts before, with, or after `right`."""
     epoch_left, upstream_left, revision_left = split_version(left)
@@ -387,7 +405,10 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
         behind = sorted(
             f"{arch}: pinned {version}"
             for arch, version in versions.items()
-            if compare_debian_versions(version, finding.fixed) < 0
+            if compare_debian_versions(
+                pinned_version_with_epoch(version, finding.installed), finding.fixed
+            )
+            < 0
         )
         if behind:
             report.stale_pins.append(f"{label} ({'; '.join(behind)})")
