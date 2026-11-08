@@ -436,6 +436,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stands), and the note now says why. A shared case file,
   `tests/fixtures/merge-context-cases.json`, keeps the Rust and Python copies
   of the rule in step.
+- The PR-comment post reads `GITHUB_TOKEN` and `GITHUB_REPOSITORY` through
+  `EnvConfig` (#666), like every other GitHub caller and the `can_post_pr`
+  gate that decides whether to post. A blank value now fails as
+  `GITHUB_TOKEN not set` before any request, not as a 401 for
+  `Authorization: Bearer `, and a padded value (a trailing newline from
+  `$(cat token)`) is trimmed instead of failing as an invalid header.
 - A policy override decision is now either inactive (with its reason) or active
   with its complete verified evidence (approver, permission, PR, authorized
   head, review and applied revision). An active override with a missing piece
