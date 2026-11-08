@@ -202,6 +202,10 @@ class RealDockerfileTests(unittest.TestCase):
                     "amd64": "5.8.1-1+deb13u2",
                     "arm64": "5.8.1-1+deb13u2",
                 },
+                "zlib1g": {
+                    "amd64": "1.3.dfsg+really1.3.1-1+deb13u1",
+                    "arm64": "1.3.dfsg+really1.3.1-1+deb13u1",
+                },
             },
         )
         self.assertEqual(
@@ -211,6 +215,8 @@ class RealDockerfileTests(unittest.TestCase):
                 ("libpcre2-8-0", "arm64"): "1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7",
                 ("liblzma5", "amd64"): "b38acab30f295bf1066a6632e31cbd0a1980f2924b38040cda131d5dea5384ec",
                 ("liblzma5", "arm64"): "88f3aa499dc30edf01b9209ab40f11e37edfbecef971f84f4721de1874ed4827",
+                ("zlib1g", "amd64"): "8c27c342230503b73dfde629642c3b352e87b554e06d60cf58772f236a305ceb",
+                ("zlib1g", "arm64"): "0e41b3d7ad8ad7fcd36dd4d61ca91a70018478fc4af652e044f4be770784ddff",
             },
         )
         self.assertEqual(
@@ -218,8 +224,10 @@ class RealDockerfileTests(unittest.TestCase):
             {
                 "libpcre2-8-0": "pool/updates/main/p/pcre2",
                 "liblzma5": "pool/updates/main/x/xz-utils",
+                "zlib1g": "pool/updates/main/z/zlib",
             },
         )
+        self.assertEqual(self.pin.epochs, {"zlib1g": 1})
         self.assertEqual(self.pin.mirror, "https://deb.debian.org/debian-security/")
         instructions = "\n".join(
             line
@@ -304,6 +312,51 @@ class ClassificationTests(unittest.TestCase):
         report = self.classify([vulnerability("gzip", "1.13-1")])
         self.assertIs(report.state, State.OK)
         self.assertEqual(len(report.covered_by_pin), 1)
+
+    ZLIB_DOCKERFILE = (
+        DOCKERFILE.replace("gzip_1.13-1+deb13u1_amd64.deb", "zlib1g_1.3.1-1+deb13u1_amd64.deb")
+        .replace("gzip_1.13-1+deb13u1_arm64.deb", "zlib1g_1.3.1-1+deb13u1_arm64.deb")
+        .replace("gzip_*) pool=pool/main/g/gzip ;;", "zlib1g_*) pool=pool/main/z/zlib epoch=1 ;;")
+    )
+
+    def classify_zlib(self, dockerfile, fixed, installed):
+        findings, _ = check_base_image_pin.parse_trivy_report(
+            report_document([vulnerability("zlib1g", fixed, installed=installed)])
+        )
+        return check_base_image_pin.classify(
+            findings, check_base_image_pin.parse_dockerfile(dockerfile)
+        )
+
+    def test_a_declared_epoch_lets_the_pin_cover_its_fix(self):
+        # zlib1g ships with epoch 1, which its pool file name omits.
+        report = self.classify_zlib(self.ZLIB_DOCKERFILE, "1:1.3.1-1+deb13u1", "1:1.3.1-1+b1")
+        self.assertIs(report.state, State.OK)
+        self.assertEqual(len(report.covered_by_pin), 1)
+
+        report = self.classify_zlib(self.ZLIB_DOCKERFILE, "1:1.3.1-1+deb13u2", "1:1.3.1-1+b1")
+        self.assertIs(report.state, State.STALE)
+        self.assertIn("amd64: pinned 1:1.3.1-1+deb13u1", report.stale_pins[0])
+
+    def test_an_undeclared_epoch_is_never_borrowed_from_the_scan(self):
+        # The moving base tag's epoch says nothing about the pinned bytes, so
+        # an epoch-bearing fix stays stale until the epoch is declared.
+        undeclared = self.ZLIB_DOCKERFILE.replace(" epoch=1 ;;", " ;;")
+        report = self.classify_zlib(undeclared, "1:1.3.1-1+deb13u1", "1:1.3.1-1+b1")
+        self.assertIs(report.state, State.STALE)
+        self.assertIn("amd64: pinned 1.3.1-1+deb13u1", report.stale_pins[0])
+
+    def test_a_base_that_crossed_to_a_higher_epoch_leaves_the_pin_stale(self):
+        # The epoch-1 pin sorts below every epoch-2 version, however low its
+        # upstream part: borrowing the scanned epoch would certify it.
+        report = self.classify_zlib(self.ZLIB_DOCKERFILE, "2:1.1-1", "2:1.0-1")
+        self.assertIs(report.state, State.STALE)
+        self.assertIn("amd64: pinned 1:1.3.1-1+deb13u1", report.stale_pins[0])
+
+    def test_declared_epochs_are_read_beside_their_pool(self):
+        pin = check_base_image_pin.parse_dockerfile(self.ZLIB_DOCKERFILE)
+        self.assertEqual(pin.epochs, {"zlib1g": 1})
+        self.assertEqual(pin.pools["zlib1g"], "pool/main/z/zlib")
+        self.assertEqual(pin.debian_version("perl-base", "5.40.1-6+deb13u1"), "5.40.1-6+deb13u1")
 
     def test_a_newer_point_release_than_the_pin_is_stale(self):
         # Exactly the shape of the perl-base gap that turned every pull request

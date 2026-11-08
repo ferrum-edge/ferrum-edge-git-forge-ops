@@ -60,6 +60,12 @@ PACKAGE_ENTRY = re.compile(
 # the alternation form `libc6_*|libc-bin_*)` where one source package ships
 # several binary packages.
 POOL_ENTRY = re.compile(r"(?P<patterns>[A-Za-z0-9_*.|+-]+)\)\s*pool=(?P<pool>\S+)")
+# `<name>_*) pool=<path> epoch=<N> ;;`: the reviewed Debian epoch of a pinned
+# package. Pool file names omit it, so it is declared beside the pool and the
+# builder refuses a .deb whose control `Version` differs from `<N>:<version>`.
+EPOCH_ENTRY = re.compile(
+    r"(?P<patterns>[A-Za-z0-9_*.|+-]+)\)\s*pool=\S+\s+epoch=(?P<epoch>[0-9]+)\s*;;"
+)
 # The mirror the stage fetches from, e.g. "https://deb.debian.org/debian/".
 MIRROR = re.compile(r'"(?P<mirror>https://[^"]*?)\$pool/\$file"')
 
@@ -173,6 +179,7 @@ class BasePin:
     packages: list[PinnedPackage] = field(default_factory=list)
     purged: list[str] = field(default_factory=list)
     pools: dict[str, str] = field(default_factory=dict)
+    epochs: dict[str, int] = field(default_factory=dict)
     mirror: str = ""
 
     @property
@@ -186,6 +193,15 @@ class BasePin:
         for package in self.packages:
             by_name.setdefault(package.name, {})[package.arch] = package.version
         return by_name
+
+    def debian_version(self, name: str, version: str) -> str:
+        """The version a pinned file installs: its file-name version with the
+        declared epoch. Never borrowed from a scan of the moving base tag,
+        whose epoch says nothing about these immutable bytes. Without a
+        declaration the pin compares as epoch 0, so an epoch-bearing fix reads
+        as stale until the epoch is reviewed and declared."""
+        epoch = self.epochs.get(name)
+        return f"{epoch}:{version}" if epoch else version
 
     def url_for(self, package: PinnedPackage) -> str | None:
         pool = self.pools.get(package.name)
@@ -252,6 +268,12 @@ def parse_dockerfile(text: str) -> BasePin:
             name = pattern.strip().rstrip("*").rstrip("_")
             if name:
                 pools[name] = match.group("pool")
+    epochs: dict[str, int] = {}
+    for match in EPOCH_ENTRY.finditer(text):
+        for pattern in match.group("patterns").split("|"):
+            name = pattern.strip().rstrip("*").rstrip("_")
+            if name:
+                epochs[name] = int(match.group("epoch"))
     mirror_match = MIRROR.search(text)
     return BasePin(
         image=image,
@@ -259,6 +281,7 @@ def parse_dockerfile(text: str) -> BasePin:
         packages=packages,
         purged=parse_purged(text),
         pools=pools,
+        epochs=epochs,
         mirror=mirror_match.group("mirror") if mirror_match else "",
     )
 
@@ -384,10 +407,14 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
         if not versions:
             report.uncovered.append(f"{label} (neither pinned nor purged)")
             continue
-        behind = sorted(
-            f"{arch}: pinned {version}"
+        installs = {
+            arch: pin.debian_version(finding.package, version)
             for arch, version in versions.items()
-            if compare_debian_versions(version, finding.fixed) < 0
+        }
+        behind = sorted(
+            f"{arch}: pinned {installed}"
+            for arch, installed in installs.items()
+            if compare_debian_versions(installed, finding.fixed) < 0
         )
         if behind:
             report.stale_pins.append(f"{label} ({'; '.join(behind)})")

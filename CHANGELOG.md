@@ -618,6 +618,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Cover the Trivy image findings CVE-2026-76844 and CVE-2026-85091 (HIGH,
+  zlib) with checksum-pinned Debian Trixie `zlib1g`
+  `1:1.3.dfsg+really1.3.1-1+deb13u1` updates for amd64 and arm64 from the
+  security pool. The base image and other pins are unchanged.
+  Pool file names omit a Debian epoch, so the `Dockerfile` declares zlib1g's
+  reviewed epoch beside its pool (`epoch=1`), the builder refuses any pinned
+  `.deb` whose control `Version` is not exactly the reviewed version, and
+  `check_base_image_pin.py` compares the declared version with Trivy's fixed
+  version. An undeclared epoch is never taken from the scanned base tag: such
+  a pin compares as epoch 0 and is reported stale.
 - `state-guard.yml` now decides a protected-state override with the
   policy-override rule of `src/policy/github_override.rs` (#657), through one
   default-branch helper, `.github/scripts/state_override.py`, that both the
