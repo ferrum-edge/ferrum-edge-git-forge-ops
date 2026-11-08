@@ -435,7 +435,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ambiguous, failed or malformed lookup still means "no PR" (every finding
   stands), and the note now says why. A shared case file,
   `tests/fixtures/merge-context-cases.json`, keeps the Rust and Python copies
-  of the rule in step.
+  of the rule in step. `merge_context.py` now also refuses a boolean `number`
+  or one outside 1 to 2^64-1. Its `int` check used to let those through,
+  because Python's `bool` is an `int`.
 - `bootstrap_repo_settings.py` fails closed on a ruleset listing it cannot
   read (#665). It used to read a non-array listing, an empty `gh` answer or a
   non-array page as zero rulesets, and skipped a summary without an `id` or a

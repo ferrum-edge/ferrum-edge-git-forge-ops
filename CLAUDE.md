@@ -1499,7 +1499,7 @@ Rules that must not drift:
   (`missing_required()` is; `needs_allocation()` alone is not).
 - `policy_findings` are fed **post-override** (`PolicyFinding::is_blocking`
   reads `overridden_by`). `plan` resolves the override through the same
-  `resolve_pr_number` + `check_override` path as `apply` and fails closed: no
+  `resolve_override_pr` + `check_override` path as `apply` and fails closed: no
   PR, an inactive decision, or a GitHub error leaves every blocking finding.
 - Gateway-dependent gates (large-prune, stale view, stale plan / `412`,
   missing `ETag`, per-resource write failures) are excluded; a preview cannot

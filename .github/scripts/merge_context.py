@@ -13,6 +13,14 @@ from typing import Any
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}|[A-Za-z0-9-]{0,33}\[bot\])$")
+# A PR number is a JSON integer in 1..=u64::MAX. `bool` is excluded explicitly
+# (it subclasses `int`), so this matches the Rust copy of the rule
+# (`github_override::select_merged_pr`, which reads it with `as_u64`).
+MAX_PR_NUMBER = 2**64 - 1
+
+
+def is_pr_number(value: Any) -> bool:
+    return type(value) is int and 0 < value <= MAX_PR_NUMBER
 
 
 class MergeContextError(RuntimeError):
@@ -38,8 +46,7 @@ def resolve(pages: Any, sha: str, base_branch: str) -> dict[str, object]:
             and isinstance(item.get("merged_at"), str)
             and isinstance(base, dict)
             and base.get("ref") == base_branch
-            and isinstance(item.get("number"), int)
-            and item["number"] > 0
+            and is_pr_number(item.get("number"))
             and isinstance(user, dict)
             and isinstance(user.get("login"), str)
             and LOGIN_RE.fullmatch(user["login"])

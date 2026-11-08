@@ -592,5 +592,193 @@
       ]
     ],
     "expected": null
+  },
+  {
+    "name": "a boolean true PR number is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": true,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "flag"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a boolean PR number beside a valid one does not make it ambiguous",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": true,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "flag"
+          }
+        },
+        {
+          "number": 4,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "author"
+          }
+        }
+      ]
+    ],
+    "expected": 4
+  },
+  {
+    "name": "a boolean false PR number is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": false,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "flag"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a negative PR number is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": -4,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "neg"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "a fractional PR number is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 4.5,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "frac"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "an integral float PR number is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 4.0,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "float"
+          }
+        }
+      ]
+    ],
+    "expected": null
+  },
+  {
+    "name": "the largest u64 PR number is accepted",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 18446744073709551615,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "big"
+          }
+        }
+      ]
+    ],
+    "expected": 18446744073709551615
+  },
+  {
+    "name": "a PR number above u64 is not a candidate",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "base": "main",
+    "pages": [
+      [
+        {
+          "number": 18446744073709551616,
+          "state": "closed",
+          "merged_at": "2026-08-30T00:00:00Z",
+          "merge_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "base": {
+            "ref": "main"
+          },
+          "user": {
+            "login": "huge"
+          }
+        }
+      ]
+    ],
+    "expected": null
   }
 ]

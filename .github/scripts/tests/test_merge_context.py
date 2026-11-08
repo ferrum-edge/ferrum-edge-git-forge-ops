@@ -84,6 +84,9 @@ class SharedCaseTests(unittest.TestCase):
                 except merge_context.MergeContextError:
                     number = None
                 self.assertEqual(number, case["expected"])
+                # `True == 1`: the outcome must also be an integer, never a bool.
+                if number is not None:
+                    self.assertIs(type(number), int)
 
 
 if __name__ == "__main__":
