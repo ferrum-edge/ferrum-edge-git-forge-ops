@@ -436,6 +436,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   stands), and the note now says why. A shared case file,
   `tests/fixtures/merge-context-cases.json`, keeps the Rust and Python copies
   of the rule in step.
+- `bootstrap_repo_settings.py` fails closed on a ruleset listing it cannot
+  read (#665). It used to read a non-array listing, an empty `gh` answer or a
+  non-array page as zero rulesets, and skipped a summary without an `id` or a
+  non-object detail. Each of those planned a `CREATE` (with `--apply`, a
+  duplicate `POST`) for a ruleset that exists. The listing now goes through
+  the settings audit's `flatten_pages`, and every one of those shapes stops
+  the run with an error that names the ruleset. A monitor environment's
+  branch-policy listing gets the same strict reader, so an unreadable listing
+  no longer plans a second policy beside ones it could not see.
 - The PR-comment post reads `GITHUB_TOKEN` and `GITHUB_REPOSITORY` through
   `EnvConfig` (#666), like every other GitHub caller and the `can_post_pr`
   gate that decides whether to post. A blank value now fails as

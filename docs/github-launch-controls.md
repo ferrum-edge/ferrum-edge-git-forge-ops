@@ -34,6 +34,14 @@ Useful flags:
 The script never accepts or prints a secret value. It finishes by listing the
 `gh secret set` commands you still need to run.
 
+The script reads the repository's rulesets, and each monitor environment's
+branch policies, strictly, with the settings audit's page rule. If it cannot
+read a listing, a page or an entry, the run stops before anything is written.
+An unreadable answer is never treated as "absent", because that would plan a
+duplicate ruleset or branch policy. A ruleset counts as the baseline's only
+when its name, target, repository source and ref all match. A same-name
+ruleset for another ref is left alone, and a new one is planned.
+
 For the order of operations, follow the [quickstart](quickstart.md). It takes
 one gateway, one namespace and one environment from an empty template to a
 first apply, and links back here for the rest.
