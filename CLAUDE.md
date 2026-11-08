@@ -1375,7 +1375,15 @@ applied revision.
   malformed value is an error in `plan` when it evaluates an override (`review`
   takes its PR from `--pr`), and in `apply` unconditionally, right after the allocation
   binding and before any state, bundle, gateway or GitHub access; it never
-  falls back to the commit's associated PR. Credential delivery
+  falls back to the commit's associated PR. Unset, `plan`/`apply` fall back
+  (`github_override::resolve_override_pr`) to the one merged PR into
+  `GITHUB_REF_NAME` (else the default branch) associated with `GITHUB_SHA`,
+  by `select_merged_pr`, the rule of `.github/scripts/merge_context.py`:
+  closed with `merged_at`, base matches, valid author login, exact
+  `merge_commit_sha` preferred, exactly one. Numbered pages until an empty
+  one. A failure or ambiguity is "no PR" with its reason (every finding
+  stands). `tests/fixtures/merge-context-cases.json` pins both copies.
+  Credential delivery
   (`surface_delivered_credentials`) uses the same parse; values are already
   committed there, so a malformed value (unreachable through `apply`) posts
   nothing, warns and delivers on stdout rather than stranding them.
@@ -1491,7 +1499,7 @@ Rules that must not drift:
   (`missing_required()` is; `needs_allocation()` alone is not).
 - `policy_findings` are fed **post-override** (`PolicyFinding::is_blocking`
   reads `overridden_by`). `plan` resolves the override through the same
-  `resolve_pr_number` + `check_override` path as `apply` and fails closed: no
+  `resolve_override_pr` + `check_override` path as `apply` and fails closed: no
   PR, an inactive decision, or a GitHub error leaves every blocking finding.
 - Gateway-dependent gates (large-prune, stale view, stale plan / `412`,
   missing `ETag`, per-resource write failures) are excluded; a preview cannot

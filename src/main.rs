@@ -516,45 +516,6 @@ fn enforce_exclusive_scope(
     )?)
 }
 
-/// Resolve the active PR number for the current command invocation.
-///
-/// Order:
-///   1. `GITFORGEOPS_PR_NUMBER` env var (set explicitly by review workflows).
-///      Set but not a positive integer is an error, never a silent fallback
-///      to step 2, which could attribute the run to a different PR.
-///   2. For post-merge applies: the PR associated with `GITHUB_SHA` via the
-///      `/repos/{repo}/commits/{sha}/pulls` endpoint. Requires GITHUB_TOKEN.
-async fn resolve_pr_number(env_config: &EnvConfig) -> gitforgeops::error::Result<Option<u64>> {
-    if let Some(n) = policy::github_override::pr_number_from_env()? {
-        return Ok(Some(n));
-    }
-    Ok(associated_pr_number(env_config).await)
-}
-
-/// Step 2 of [`resolve_pr_number`]: best effort, `None` when unavailable.
-async fn associated_pr_number(env_config: &EnvConfig) -> Option<u64> {
-    let token = env_config.github_token.as_deref()?;
-    let repo = env_config.github_repository.as_deref()?;
-    let sha = std::env::var("GITHUB_SHA").ok()?;
-    let client = secrets::github_api_client(env_config).ok()?;
-    let url = format!("https://api.github.com/repos/{repo}/commits/{sha}/pulls");
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let prs: Vec<serde_json::Value> = resp.json().await.ok()?;
-    prs.first()
-        .and_then(|pr| pr.get("number"))
-        .and_then(|n| n.as_u64())
-}
-
 /// Append `comment` to `$GITHUB_STEP_SUMMARY` when running under GitHub
 /// Actions. The step summary is always writable, so this is a reliable
 /// fallback when PR comment posting is blocked (fork PRs, read-only
@@ -2621,30 +2582,34 @@ async fn cmd_plan(
             .as_ref()
             .map(|cfg| cfg.overrides.clone())
             .unwrap_or_default();
-        match resolve_pr_number(&env_config).await? {
-            Some(pr) => match policy::check_override(&env_config, &override_cfg, pr).await {
-                Ok(decision) => {
-                    (policy_findings, resolution_only_uncovered) =
-                        policy::github_override::preview_policy_findings(
-                            &unresolved_policy_findings,
-                            resolved_policy_findings.as_deref(),
-                            Some(&decision),
-                        );
-                    security_overridden = matches!(decision, policy::OverrideDecision::Active(_));
-                    override_note = Some(policy::github_override::plan_override_note(&decision));
+        match policy::github_override::resolve_override_pr(&env_config).await? {
+            policy::github_override::OverridePr::Pr(pr) => {
+                match policy::check_override(&env_config, &override_cfg, pr).await {
+                    Ok(decision) => {
+                        (policy_findings, resolution_only_uncovered) =
+                            policy::github_override::preview_policy_findings(
+                                &unresolved_policy_findings,
+                                resolved_policy_findings.as_deref(),
+                                Some(&decision),
+                            );
+                        security_overridden =
+                            matches!(decision, policy::OverrideDecision::Active(_));
+                        override_note =
+                            Some(policy::github_override::plan_override_note(&decision));
+                    }
+                    // Fail closed. An override that could not be verified is not
+                    // an override, and turning an unreachable GitHub API into a
+                    // clean plan is exactly the drift this verdict exists to
+                    // prevent.
+                    Err(e) => {
+                        override_note = Some(format!(
+                            "Override could not be evaluated ({e}); every blocking finding stands."
+                        ));
+                    }
                 }
-                // Fail closed. An override that could not be verified is not
-                // an override, and turning an unreachable GitHub API into a
-                // clean plan is exactly the drift this verdict exists to
-                // prevent.
-                Err(e) => {
-                    override_note = Some(format!(
-                        "Override could not be evaluated ({e}); every blocking finding stands."
-                    ));
-                }
-            },
-            None => {
-                override_note = Some(policy::github_override::NO_PR_OVERRIDE_NOTE.to_string());
+            }
+            policy::github_override::OverridePr::None { reason } => {
+                override_note = Some(policy::github_override::no_pr_override_note(&reason));
             }
         }
     }
@@ -2918,9 +2883,17 @@ async fn cmd_apply(
         .map(|cfg| cfg.overrides.clone())
         .unwrap_or_default();
     let override_decision = if security_blocked || policy_cfg.is_some() {
-        match resolve_pr_number(&env_config).await? {
-            Some(pr) => Some(policy::check_override(&env_config, &override_cfg, pr).await?),
-            None => None,
+        // No PR is an inactive override that says why, so both refusals
+        // below print the reason with the CI/PR-only note.
+        match policy::github_override::resolve_override_pr(&env_config).await? {
+            policy::github_override::OverridePr::Pr(pr) => {
+                Some(policy::check_override(&env_config, &override_cfg, pr).await?)
+            }
+            policy::github_override::OverridePr::None { reason } => {
+                Some(policy::OverrideDecision::inactive(
+                    &policy::github_override::no_pr_override_note(&reason),
+                ))
+            }
         }
     } else {
         None
