@@ -1230,6 +1230,25 @@ class ReleaseEnvironmentPlanTests(unittest.TestCase):
             if step.target == f"environment {bootstrap.RELEASE_ENVIRONMENT}"
         )
 
+    def test_an_unreadable_release_policy_listing_raises(self):
+        # Read as empty, an unreadable listing would plan duplicate `main` and
+        # `v*` policies and leave an unknown wider rule admitting other refs.
+        for listing, reason in (
+            (None, "was not an array"),
+            ([{"total_count": 2}], "no branch_policies array"),
+            ([{"branch_policies": [{"name": "main", "type": "branch"}]}], "has no id"),
+        ):
+            with self.subTest(listing=listing):
+                responses = self.fenced(self.publishing_responses())
+                responses[f"{self.POLICY_PATH}?per_page=100"] = listing
+                with self.assertRaises(bootstrap.ApiError) as raised:
+                    bootstrap.build_plan(FakeApi(responses), namespace())
+                self.assertIn(
+                    f"environment {bootstrap.RELEASE_ENVIRONMENT!r}",
+                    raised.exception.message,
+                )
+                self.assertIn(reason, raised.exception.message)
+
     def test_an_opted_in_repository_creates_it_with_an_exact_ref_policy(self):
         plan = bootstrap.build_plan(FakeApi(self.publishing_responses()), namespace())
         step = self.release_step(plan)
@@ -1526,6 +1545,165 @@ class SharedConstantTests(unittest.TestCase):
         )
         self.assertIn("trusted-supply-chain-policy (any source)", detail)
         self.assertIn("trusted-supply-chain-policy (app 15368)", detail)
+
+
+class RulesetListingTests(unittest.TestCase):
+    """A ruleset listing that cannot be read never plans a CREATE (#665).
+
+    `None` from `find_ruleset` means "absent" and plans a POST, so every
+    unreadable shape must raise instead, using the auditor's page rule.
+    """
+
+    LISTING = f"repos/{REPO}/rulesets?per_page=100"
+
+    def _desired(self) -> dict:
+        return bootstrap.main_ruleset_body(
+            [{"actor_type": "Integration", "actor_id": APP_ID, "bypass_mode": "always"}]
+        )
+
+    def _refused(self, responses: dict, reason: str) -> None:
+        api = FakeApi(responses)
+        with self.assertRaises(bootstrap.ApiError) as raised:
+            bootstrap.find_ruleset(api, REPO, self._desired())
+        self.assertIn("ruleset 'main'", raised.exception.message)
+        self.assertIn(reason, raised.exception.message)
+        self.assertEqual(api.writes, [])
+
+    def test_a_listing_that_is_not_an_array_raises(self):
+        for listing in (None, {"id": 7}, "rulesets"):
+            with self.subTest(listing=listing):
+                self._refused({self.LISTING: listing}, "was not an array")
+
+    def test_a_page_that_is_not_an_array_raises(self):
+        for page in ({"id": 7}, None, 7):
+            with self.subTest(page=page):
+                self._refused({self.LISTING: [[], page]}, "page was not an array")
+
+    def test_a_summary_without_an_id_raises(self):
+        for summary in ({"name": "main"}, {"id": None}, "7"):
+            with self.subTest(summary=summary):
+                self._refused({self.LISTING: [[summary]]}, "has no id")
+
+    def test_a_detail_that_is_not_an_object_raises(self):
+        for detail in (None, [], "main"):
+            with self.subTest(detail=detail):
+                self._refused(
+                    {self.LISTING: [[{"id": 7}]], f"repos/{REPO}/rulesets/7": detail},
+                    "ruleset 7 detail was not an object",
+                )
+
+    def test_an_unreadable_listing_stops_the_whole_run(self):
+        responses = configured_responses()
+        responses[self.LISTING] = [{"id": 7}, {"id": 8}]
+        api = FakeApi(responses, dry_run=False)
+        stderr = io.StringIO()
+        with patch.object(bootstrap, "GitHubApi", return_value=api), patch.dict(
+            "os.environ", {"GH_TOKEN": "synthetic"}
+        ), contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            status = bootstrap.main(
+                [
+                    "--repo",
+                    REPO,
+                    "--apply",
+                    "--state-writer-app-id",
+                    str(APP_ID),
+                    "--release-tag-bypass",
+                    "app:1234",
+                    "--config",
+                    "/nonexistent/config.yaml",
+                ]
+            )
+        self.assertEqual(status, 1)
+        self.assertIn("bootstrap failed closed", stderr.getvalue())
+        self.assertIn("ruleset 'main'", stderr.getvalue())
+        self.assertEqual(api.writes, [])
+
+    def test_well_formed_one_and_two_page_listings_still_find_the_ruleset(self):
+        desired = self._desired()
+        responses = configured_responses()
+        for listing in ([[{"id": 7}, {"id": 8}]], [[{"id": 8}], [{"id": 7}]]):
+            with self.subTest(listing=listing):
+                responses[self.LISTING] = listing
+                found = bootstrap.find_ruleset(FakeApi(responses), REPO, desired)
+                self.assertIsNotNone(found)
+                self.assertEqual(found["id"], 7)
+        # An empty listing is the one answer that means "absent".
+        responses[self.LISTING] = [[]]
+        self.assertIsNone(bootstrap.find_ruleset(FakeApi(responses), REPO, desired))
+
+
+class BranchPolicyListingTests(unittest.TestCase):
+    """The monitor's branch-policy listing fails closed like the ruleset one.
+
+    Read as empty, an unreadable listing would plan a second `main` policy and
+    leave the unknown ones in place.
+    """
+
+    POLICIES = (
+        "repos/acme/repo/environments/staging-monitor/deployment-branch-policies"
+        "?per_page=100"
+    )
+
+    def _plan(self, listing):
+        responses = configured_responses(environments=("staging", "staging-monitor"))
+        responses["repos/acme/repo/environments/staging-monitor"] = {
+            "protection_rules": [],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
+        }
+        responses[self.POLICIES] = listing
+        api = FakeApi(responses)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "version: 1\nenvironments:\n  staging:\n    monitoring:\n"
+                "      unattended: true\n",
+                encoding="utf-8",
+            )
+            return bootstrap.build_plan(
+                api, namespace(config=str(config), reviewer=["octocat"])
+            )
+
+    def test_an_unreadable_listing_raises(self):
+        for listing, reason in (
+            (None, "was not an array"),
+            ({"branch_policies": []}, "was not an array"),
+            ([[{"id": 17, "name": "main"}]], "no branch_policies array"),
+            ([{"total_count": 1}], "no branch_policies array"),
+            ([{"branch_policies": {"id": 17}}], "no branch_policies array"),
+            ([{"branch_policies": [{"name": "main"}]}], "has no id"),
+            ([{"branch_policies": ["main"]}], "has no id"),
+        ):
+            with self.subTest(listing=listing):
+                with self.assertRaises(bootstrap.ApiError) as raised:
+                    self._plan(listing)
+                self.assertIn("environment 'staging-monitor'", raised.exception.message)
+                self.assertIn(reason, raised.exception.message)
+
+    def test_a_two_page_listing_with_a_stray_policy_is_replaced(self):
+        plan = self._plan(
+            [
+                {"branch_policies": [{"id": 17, "name": "main", "type": "branch"}]},
+                {"branch_policies": [{"id": 18, "name": "release/*", "type": "branch"}]},
+            ]
+        )
+        step = next(
+            item for item in plan.steps if item.target == "environment staging-monitor"
+        )
+        self.assertEqual(step.action, bootstrap.UPDATE)
+        policy_path = (
+            "repos/acme/repo/environments/staging-monitor/deployment-branch-policies"
+        )
+        self.assertEqual(
+            [write[:2] for write in step.writes[1:]],
+            [
+                ("DELETE", f"{policy_path}/17"),
+                ("DELETE", f"{policy_path}/18"),
+                ("POST", policy_path),
+            ],
+        )
 
 
 if __name__ == "__main__":

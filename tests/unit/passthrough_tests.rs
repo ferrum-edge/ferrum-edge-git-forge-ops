@@ -425,14 +425,21 @@ fn the_passthrough_warning_goes_to_stderr_and_never_into_exported_yaml() {
         PROXY_WITH_UNKNOWN_TOP_LEVEL,
     );
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_gitforgeops"))
+    // A clean environment, like every other binary spawn in this suite: the
+    // env tests briefly set process-global variables (a blank `GITHUB_TOKEN`
+    // among them) that the binary would otherwise inherit and refuse.
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
+    command.env_clear();
+    for name in ["PATH", "HOME", "TMPDIR", "LLVM_PROFILE_FILE"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command
         .arg("export")
         .current_dir(repo.path())
         .env("FERRUM_ALLOW_UNKNOWN_FIELDS", "true")
         .env("FERRUM_GATEWAY_MODE", "file")
-        .env_remove("FERRUM_OVERLAY")
-        .env_remove("FERRUM_ENV")
-        .env_remove("FERRUM_NAMESPACE")
         .output()
         .expect("run gitforgeops export");
     assert!(

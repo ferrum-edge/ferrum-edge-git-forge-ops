@@ -44,6 +44,7 @@ from audit_settings import (  # noqa: E402  (the path bootstrap above must run f
     REQUIRED_RULESET_WORKFLOWS,
     REQUIRED_STATUS_CHECKS,
     SETTINGS_AUDIT_ENVIRONMENT,
+    flatten_pages,
     release_publishing_enabled,
 )
 
@@ -987,21 +988,41 @@ def step_dependabot(api: GitHubApi, repo: str) -> list[Step]:
 
 
 def find_ruleset(api: GitHubApi, repo: str, desired: dict):
-    summaries = api.get(f"repos/{repo}/rulesets?per_page=100", paginate=True)
-    flattened = []
-    for page in summaries if isinstance(summaries, list) else []:
-        if isinstance(page, list):
-            flattened.extend(page)
-        elif isinstance(page, dict):
-            flattened.append(page)
-    for summary in flattened:
+    """Return the repository's own copy of the desired ruleset, or None.
+
+    `None` plans a CREATE, so it must mean "the listing was read and holds no
+    such ruleset". A listing, page, summary or detail of an unexpected shape is
+    an error that names the ruleset, read with the same page rule as the
+    scheduled auditor (`audit_settings.flatten_pages`): a ruleset that exists
+    is never planned as a duplicate POST because one response was unreadable.
+
+    The match is narrow on purpose: a same-name ruleset for another target,
+    source or ref is not repurposed.
+    """
+    name = desired["name"]
+    listing = api.get(f"repos/{repo}/rulesets?per_page=100", paginate=True)
+    try:
+        summaries = flatten_pages(listing)
+    except RuntimeError as error:
+        raise ApiError(
+            None, f"cannot tell whether ruleset {name!r} exists: {error}"
+        ) from error
+    for summary in summaries:
         if not isinstance(summary, dict) or summary.get("id") is None:
-            continue
+            raise ApiError(
+                None,
+                f"cannot tell whether ruleset {name!r} exists: a ruleset summary "
+                "has no id",
+            )
         detail = api.get(f"repos/{repo}/rulesets/{summary['id']}")
         if not isinstance(detail, dict):
-            continue
+            raise ApiError(
+                None,
+                f"cannot tell whether ruleset {name!r} exists: ruleset "
+                f"{summary['id']} detail was not an object",
+            )
         if (
-            detail.get("name") == desired["name"]
+            detail.get("name") == name
             and detail.get("target") == desired["target"]
             and detail.get("source_type") == "Repository"
             and str(detail.get("source", "")).casefold() == repo.casefold()
@@ -1153,6 +1174,37 @@ def step_audit_token_environment(api: GitHubApi, repo: str) -> list[Step]:
     ]
 
 
+def branch_policies(pages, environment: str) -> list[dict]:
+    """Flatten a `--paginate --slurp` deployment-branch-policy listing.
+
+    Its pages are objects (`{"branch_policies": [...]}`), not arrays, so this
+    is the strict counterpart of `audit_settings.flatten_pages` for them. An
+    unreadable listing fails closed: read as empty, it would plan a duplicate
+    policy and leave the unknown ones in place.
+    """
+
+    def unreadable(reason: str) -> ApiError:
+        return ApiError(
+            None,
+            f"cannot read the deployment branch policies of environment "
+            f"{environment!r}: {reason}",
+        )
+
+    if not isinstance(pages, list):
+        raise unreadable("paginated GitHub response was not an array")
+    policies = []
+    for page in pages:
+        if not isinstance(page, dict) or not isinstance(
+            page.get("branch_policies"), list
+        ):
+            raise unreadable("a page has no branch_policies array")
+        for item in page["branch_policies"]:
+            if not isinstance(item, dict) or item.get("id") is None:
+                raise unreadable("a branch policy has no id")
+            policies.append(item)
+    return policies
+
+
 def release_publishing(api: GitHubApi, repo: str) -> bool:
     """`release.yml`'s gate: the upstream repository or the opt-in variable."""
     current = optional_get(api, f"repos/{repo}/actions/variables/{RELEASE_VARIABLE}")
@@ -1215,15 +1267,9 @@ def step_release_environment(api: GitHubApi, repo: str, default_branch: str) -> 
     policy = detail.get("deployment_branch_policy") or {}
     current_policies = []
     if policy.get("custom_branch_policies") is True:
-        pages = api.get(f"{policy_path}?per_page=100", paginate=True)
-        if isinstance(pages, list):
-            current_policies = [
-                item
-                for page in pages
-                if isinstance(page, dict)
-                for item in page.get("branch_policies", [])
-                if isinstance(item, dict)
-            ]
+        current_policies = branch_policies(
+            api.get(f"{policy_path}?per_page=100", paginate=True), RELEASE_ENVIRONMENT
+        )
     refs = [(item.get("type", "branch"), item.get("name")) for item in current_policies]
     policy_is_exact = (
         policy.get("protected_branches") is False
@@ -1239,8 +1285,7 @@ def step_release_environment(api: GitHubApi, repo: str, default_branch: str) -> 
     if details:
         writes.append(("PUT", f"repos/{repo}/environments/{encoded}", body))
         for item in current_policies:
-            if item.get("id") is not None:
-                writes.append(("DELETE", f"{policy_path}/{item['id']}", None))
+            writes.append(("DELETE", f"{policy_path}/{item['id']}", None))
         writes.extend(create_policies)
     return [
         Step(
@@ -1302,15 +1347,9 @@ def step_monitoring_environments(
         current_reviewers, _ = environment_reviewers(detail)
         current_policies = []
         if policy.get("custom_branch_policies") is True:
-            pages = api.get(f"{policy_path}?per_page=100", paginate=True)
-            if isinstance(pages, list):
-                current_policies = [
-                    item
-                    for page in pages
-                    if isinstance(page, dict)
-                    for item in page.get("branch_policies", [])
-                    if isinstance(item, dict)
-                ]
+            current_policies = branch_policies(
+                api.get(f"{policy_path}?per_page=100", paginate=True), name
+            )
         policy_is_exact = (
             policy.get("protected_branches") is False
             and policy.get("custom_branch_policies") is True

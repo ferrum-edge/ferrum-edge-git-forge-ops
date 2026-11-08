@@ -123,6 +123,221 @@ pub fn pr_number_from_env() -> crate::error::Result<Option<u64>> {
     }
 }
 
+/// The pull request `plan` and `apply` evaluate an override on, or why there
+/// is none. Without a PR every blocking finding stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverridePr {
+    Pr(u64),
+    None { reason: String },
+}
+
+/// [`NO_PR_OVERRIDE_NOTE`] followed by why no PR was found.
+pub fn no_pr_override_note(reason: &str) -> String {
+    format!("{NO_PR_OVERRIDE_NOTE} ({reason})")
+}
+
+/// Resolve the PR whose override `plan` and `apply` evaluate.
+///
+/// 1. [`PR_NUMBER_ENV`], parsed strictly ([`pr_number_from_env`]); the bundled
+///    workflows always set it. A malformed value is an error, never a fallback.
+/// 2. Otherwise (local runs, custom workflows) the one merged PR GitHub
+///    associates with `GITHUB_SHA`, chosen by [`select_merged_pr`], the rule
+///    `.github/scripts/merge_context.py` applies before the bundled apply
+///    sets [`PR_NUMBER_ENV`]. The base branch is `GITHUB_REF_NAME`, else the
+///    repository's default branch. Best effort: anything that does not
+///    resolve to exactly one PR is [`OverridePr::None`] with the reason, which
+///    keeps every blocking finding.
+pub async fn resolve_override_pr(env_config: &EnvConfig) -> crate::error::Result<OverridePr> {
+    if let Some(number) = pr_number_from_env()? {
+        return Ok(OverridePr::Pr(number));
+    }
+    let none = |reason: &str| -> crate::error::Result<OverridePr> {
+        Ok(OverridePr::None {
+            reason: reason.to_string(),
+        })
+    };
+    let non_blank = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let Some(sha) = non_blank("GITHUB_SHA") else {
+        return none("GITHUB_SHA is not set, so there is no commit to look up");
+    };
+    let Some(repo) = env_config.github_repository.as_deref() else {
+        return none("GITHUB_REPOSITORY is not set");
+    };
+    let Some(token) = env_config.github_token.as_deref() else {
+        return none("GITHUB_TOKEN is not set");
+    };
+    let client = match crate::secrets::github_api_client(env_config) {
+        Ok(client) => client,
+        Err(e) => return none(&format!("the GitHub client could not be built: {e}")),
+    };
+    Ok(associated_merged_pr_at(
+        &client,
+        crate::secrets::DEFAULT_GITHUB_API_BASE,
+        repo,
+        token,
+        &sha,
+        non_blank("GITHUB_REF_NAME").as_deref(),
+    )
+    .await)
+}
+
+/// Step 2 of [`resolve_override_pr`] against an explicit API origin.
+///
+/// Production passes [`crate::secrets::DEFAULT_GITHUB_API_BASE`]; tests pass a
+/// loopback stub. `base_branch` `None` reads the repository's default branch.
+/// The associated PRs are read as numbered pages from the fixed origin until
+/// one is empty, like the override evidence ([`MAX_ISSUE_EVENT_PAGES`]); no
+/// `Link` header is consulted. A failed or malformed read, the page cap, or
+/// anything but exactly one selected PR is [`OverridePr::None`] naming why.
+pub async fn associated_merged_pr_at(
+    client: &Client,
+    api_base: &str,
+    repo: &str,
+    token: &str,
+    sha: &str,
+    base_branch: Option<&str>,
+) -> OverridePr {
+    match associated_merged_pr(client, api_base, repo, token, sha, base_branch).await {
+        Ok(number) => OverridePr::Pr(number),
+        Err(reason) => OverridePr::None { reason },
+    }
+}
+
+async fn associated_merged_pr(
+    client: &Client,
+    api_base: &str,
+    repo: &str,
+    token: &str,
+    sha: &str,
+    base_branch: Option<&str>,
+) -> Result<u64, String> {
+    if !is_commit_sha(sha) {
+        return Err("GITHUB_SHA is not a 40-character lowercase hexadecimal commit SHA".into());
+    }
+    let api_base = api_base.trim_end_matches('/');
+    let base_branch = match base_branch {
+        Some(branch) => branch.to_string(),
+        None => {
+            let url = format!("{api_base}/repos/{repo}");
+            let repository = fetch_json(client, &url, token)
+                .await
+                .map_err(|e| format!("the repository's default branch could not be read: {e}"))?;
+            repository
+                .get("default_branch")
+                .and_then(serde_json::Value::as_str)
+                .filter(|branch| !branch.is_empty())
+                .map(str::to_string)
+                .ok_or("the repository response names no default branch")?
+        }
+    };
+    let mut items = Vec::new();
+    for page in 1..=MAX_ISSUE_EVENT_PAGES {
+        let url = format!("{api_base}/repos/{repo}/commits/{sha}/pulls?per_page=100&page={page}");
+        let batch = fetch_json(client, &url, token).await.map_err(|e| {
+            format!("the pull requests associated with {sha} could not be read: {e}")
+        })?;
+        let serde_json::Value::Array(batch) = batch else {
+            return Err(format!(
+                "page {page} of the pull requests associated with {sha} is not an array"
+            ));
+        };
+        if batch.is_empty() {
+            return select_merged_pr(&items, sha, &base_branch);
+        }
+        items.extend(batch);
+    }
+    Err(format!(
+        "the pull requests associated with {sha} exceed {MAX_ISSUE_EVENT_PAGES} pages"
+    ))
+}
+
+/// The merged-PR rule of `.github/scripts/merge_context.py` (`resolve`), over
+/// the flattened associated-PR listing: keep closed PRs with a string
+/// `merged_at`, `base.ref == base_branch`, a positive `number` and a
+/// `user.login` GitHub could have issued; prefer those whose
+/// `merge_commit_sha` is `sha`; exactly one must remain. A non-object entry
+/// refuses the whole listing. `tests/fixtures/merge-context-cases.json` pins
+/// both implementations to the same answers.
+pub fn select_merged_pr(
+    items: &[serde_json::Value],
+    sha: &str,
+    base_branch: &str,
+) -> Result<u64, String> {
+    let mut candidates: Vec<(u64, bool)> = Vec::new();
+    for item in items {
+        let Some(pr) = item.as_object() else {
+            return Err("an associated pull-request entry is not an object".into());
+        };
+        let Some(number) = pr
+            .get("number")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|number| *number > 0)
+        else {
+            continue;
+        };
+        let merged = json_str(pr.get("state")) == Some("closed")
+            && pr
+                .get("merged_at")
+                .is_some_and(serde_json::Value::is_string);
+        let on_base =
+            json_str(pr.get("base").and_then(|base| base.get("ref"))) == Some(base_branch);
+        let author = json_str(pr.get("user").and_then(|user| user.get("login")));
+        if merged && on_base && author.is_some_and(is_github_login) {
+            candidates.push((number, json_str(pr.get("merge_commit_sha")) == Some(sha)));
+        }
+    }
+    let exact: Vec<u64> = candidates
+        .iter()
+        .filter(|(_, exact)| *exact)
+        .map(|(number, _)| *number)
+        .collect();
+    let selected = if exact.is_empty() {
+        candidates.iter().map(|(number, _)| *number).collect()
+    } else {
+        exact
+    };
+    match selected.as_slice() {
+        [number] => Ok(*number),
+        _ => Err(format!(
+            "expected exactly one merged pull request for {sha} on {base_branch:?}; found {}",
+            selected.len()
+        )),
+    }
+}
+
+fn json_str(value: Option<&serde_json::Value>) -> Option<&str> {
+    value.and_then(serde_json::Value::as_str)
+}
+
+/// `merge_context.SHA_RE`: 40 lowercase hexadecimal characters.
+fn is_commit_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `merge_context.LOGIN_RE`: an ASCII alphanumeric, then up to 38 ASCII
+/// alphanumerics or hyphens, or up to 33 of them followed by `[bot]`.
+fn is_github_login(login: &str) -> bool {
+    let Some((first, rest)) = login.as_bytes().split_first() else {
+        return false;
+    };
+    let body = |bytes: &[u8], max: usize| {
+        bytes.len() <= max
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+    };
+    first.is_ascii_alphanumeric()
+        && (body(rest, 38)
+            || rest
+                .strip_suffix(b"[bot]")
+                .is_some_and(|rest| body(rest, 33)))
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct Label {
     name: String,

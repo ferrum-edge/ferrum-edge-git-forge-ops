@@ -511,9 +511,13 @@ Validation, credential and ownership gates are never overridable. More detail:
 ### Overrides are evaluated only on a GitHub pull request
 
 Overrides work only when GitForgeOps can associate a pull request with the
-commit: `GITFORGEOPS_PR_NUMBER` in CI, or the PR GitHub links to the merge
-commit on a post-merge apply. Local `plan` and `apply` runs, and any other run
-without that association, keep every blocking finding and print:
+commit. The bundled workflows set `GITFORGEOPS_PR_NUMBER`. Without it, `plan`
+and `apply` look for the one merged PR into the applied branch
+(`GITHUB_REF_NAME`, otherwise the default branch) that GitHub links to
+`GITHUB_SHA`. They use the same rule as the bundled workflow and prefer the PR
+whose merge commit is `GITHUB_SHA`. Local runs, and any run where that does not
+find exactly one PR, keep every blocking finding and print the note below,
+followed by the reason:
 
 > No PR is associated with this commit; overrides were not evaluated. Policy overrides are evaluated only on a GitHub pull request; see README.md#overrides-are-evaluated-only-on-a-github-pull-request.
 
