@@ -227,6 +227,7 @@ class RealDockerfileTests(unittest.TestCase):
                 "zlib1g": "pool/updates/main/z/zlib",
             },
         )
+        self.assertEqual(self.pin.epochs, {"zlib1g": 1})
         self.assertEqual(self.pin.mirror, "https://deb.debian.org/debian-security/")
         instructions = "\n".join(
             line
@@ -312,46 +313,50 @@ class ClassificationTests(unittest.TestCase):
         self.assertIs(report.state, State.OK)
         self.assertEqual(len(report.covered_by_pin), 1)
 
-    def test_a_pin_borrows_the_installed_epoch_its_file_name_omits(self):
-        # zlib1g ships with epoch 1; its pool file name drops it. Read as epoch
-        # 0, the reviewed fix would compare older than Trivy's `1:` version.
-        pin = check_base_image_pin.parse_dockerfile(
-            DOCKERFILE.replace(
-                "gzip_1.13-1+deb13u1_amd64.deb", "zlib1g_1.3.1-1+deb13u1_amd64.deb"
-            ).replace("gzip_1.13-1+deb13u1_arm64.deb", "zlib1g_1.3.1-1+deb13u1_arm64.deb")
-        )
+    ZLIB_DOCKERFILE = (
+        DOCKERFILE.replace("gzip_1.13-1+deb13u1_amd64.deb", "zlib1g_1.3.1-1+deb13u1_amd64.deb")
+        .replace("gzip_1.13-1+deb13u1_arm64.deb", "zlib1g_1.3.1-1+deb13u1_arm64.deb")
+        .replace("gzip_*) pool=pool/main/g/gzip ;;", "zlib1g_*) pool=pool/main/z/zlib epoch=1 ;;")
+    )
+
+    def classify_zlib(self, dockerfile, fixed, installed):
         findings, _ = check_base_image_pin.parse_trivy_report(
-            report_document(
-                [vulnerability("zlib1g", "1:1.3.1-1+deb13u1", installed="1:1.3.1-1+b1")]
-            )
+            report_document([vulnerability("zlib1g", fixed, installed=installed)])
         )
-        report = check_base_image_pin.classify(findings, pin)
-        self.assertEqual(report.stale_pins, [])
+        return check_base_image_pin.classify(
+            findings, check_base_image_pin.parse_dockerfile(dockerfile)
+        )
+
+    def test_a_declared_epoch_lets_the_pin_cover_its_fix(self):
+        # zlib1g ships with epoch 1, which its pool file name omits.
+        report = self.classify_zlib(self.ZLIB_DOCKERFILE, "1:1.3.1-1+deb13u1", "1:1.3.1-1+b1")
+        self.assertIs(report.state, State.OK)
         self.assertEqual(len(report.covered_by_pin), 1)
 
-        findings, _ = check_base_image_pin.parse_trivy_report(
-            report_document(
-                [vulnerability("zlib1g", "1:1.3.1-1+deb13u2", installed="1:1.3.1-1+b1")]
-            )
-        )
-        self.assertEqual(len(check_base_image_pin.classify(findings, pin).stale_pins), 1)
+        report = self.classify_zlib(self.ZLIB_DOCKERFILE, "1:1.3.1-1+deb13u2", "1:1.3.1-1+b1")
+        self.assertIs(report.state, State.STALE)
+        self.assertIn("amd64: pinned 1:1.3.1-1+deb13u1", report.stale_pins[0])
 
-    def test_a_fix_that_raises_the_epoch_leaves_the_pin_stale(self):
-        self.assertEqual(
-            check_base_image_pin.pinned_version_with_epoch("1.3.1-1+deb13u1", "1:1.3.1-1"),
-            "1:1.3.1-1+deb13u1",
-        )
-        self.assertEqual(
-            check_base_image_pin.compare_debian_versions(
-                check_base_image_pin.pinned_version_with_epoch("1.3.1-1+deb13u1", "1:1.3.1-1"),
-                "2:1.0-1",
-            ),
-            -1,
-        )
-        self.assertEqual(
-            check_base_image_pin.pinned_version_with_epoch("5.40.1-6+deb13u1", "5.40.1-6"),
-            "5.40.1-6+deb13u1",
-        )
+    def test_an_undeclared_epoch_is_never_borrowed_from_the_scan(self):
+        # The moving base tag's epoch says nothing about the pinned bytes, so
+        # an epoch-bearing fix stays stale until the epoch is declared.
+        undeclared = self.ZLIB_DOCKERFILE.replace(" epoch=1 ;;", " ;;")
+        report = self.classify_zlib(undeclared, "1:1.3.1-1+deb13u1", "1:1.3.1-1+b1")
+        self.assertIs(report.state, State.STALE)
+        self.assertIn("amd64: pinned 1.3.1-1+deb13u1", report.stale_pins[0])
+
+    def test_a_base_that_crossed_to_a_higher_epoch_leaves_the_pin_stale(self):
+        # The epoch-1 pin sorts below every epoch-2 version, however low its
+        # upstream part: borrowing the scanned epoch would certify it.
+        report = self.classify_zlib(self.ZLIB_DOCKERFILE, "2:1.1-1", "2:1.0-1")
+        self.assertIs(report.state, State.STALE)
+        self.assertIn("amd64: pinned 1:1.3.1-1+deb13u1", report.stale_pins[0])
+
+    def test_declared_epochs_are_read_beside_their_pool(self):
+        pin = check_base_image_pin.parse_dockerfile(self.ZLIB_DOCKERFILE)
+        self.assertEqual(pin.epochs, {"zlib1g": 1})
+        self.assertEqual(pin.pools["zlib1g"], "pool/main/z/zlib")
+        self.assertEqual(pin.debian_version("perl-base", "5.40.1-6+deb13u1"), "5.40.1-6+deb13u1")
 
     def test_a_newer_point_release_than_the_pin_is_stale(self):
         # Exactly the shape of the perl-base gap that turned every pull request

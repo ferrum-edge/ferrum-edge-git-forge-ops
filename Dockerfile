@@ -36,6 +36,10 @@ RUN cargo build --release --locked
 # its content-immutable security pool path; never consult a mutable package
 # index here. The security pool drops a version once a newer update supersedes
 # it; the build then fails closed (404) and the base-image pin canary reports it.
+# Pool file names omit a Debian epoch, so a package that has one declares it
+# beside its pool (`epoch=N`), and the build refuses a .deb whose control
+# `Version` is not exactly the reviewed `N:<file-name version>`. The canary
+# compares that declared version with Trivy's fixed version.
 ARG TARGETARCH
 RUN set -eu; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
@@ -55,18 +59,27 @@ RUN set -eu; \
       *) echo "unsupported target architecture: $arch" >&2; exit 1 ;; \
     esac; \
     while read -r digest file; do \
+      epoch=''; \
       case "$file" in \
         libpcre2-8-0_*) pool=pool/updates/main/p/pcre2 ;; \
         liblzma5_*) pool=pool/updates/main/x/xz-utils ;; \
-        zlib1g_*) pool=pool/updates/main/z/zlib ;; \
+        zlib1g_*) pool=pool/updates/main/z/zlib epoch=1 ;; \
         *) echo "unexpected package: $file" >&2; exit 1 ;; \
       esac; \
+      version="${file#*_}"; version="${version%_*}"; \
+      printf '%s %s\n' "$file" "${epoch:+$epoch:}$version" >> VERSIONS; \
       curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
         --retry 3 --retry-connrefused \
         "https://deb.debian.org/debian-security/$pool/$file" --output "$file"; \
     done < SHA256SUMS; \
     sha256sum --check --strict SHA256SUMS; \
-    rm SHA256SUMS
+    while read -r file version; do \
+      actual=$(dpkg-deb --field "$file" Version); \
+      if [ "$actual" != "$version" ]; then \
+        echo "unexpected Debian version in $file: $actual (reviewed $version)" >&2; exit 1; \
+      fi; \
+    done < VERSIONS; \
+    rm SHA256SUMS VERSIONS
 
 # Slim Debian runtime rather than distroless: the image is meant to be run
 # directly (`docker run ... gitforgeops plan`) and in contexts that expect a
