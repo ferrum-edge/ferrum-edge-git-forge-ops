@@ -16,6 +16,7 @@ mod doctor_tests;
 mod env_tests;
 mod exit_code_matrix_tests;
 mod file_target_tests;
+mod git_invocation_tests;
 mod github_api_tests;
 mod http_client_tests;
 mod import_tests;

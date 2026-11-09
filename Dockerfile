@@ -5,6 +5,36 @@ FROM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91
 # Reuse the reviewed builder's Git and its complete ELF dependency closure,
 # including its loader, so Bookworm libraries never mix with Trixie's libc.
 # No network helpers, templates, package installs, or new image inputs.
+# The copied libraries have no dpkg record in the runtime image, so its Trivy
+# scan cannot see them. Libraries in the copy with an open Debian advisory are
+# assessed here by hand; the rest (glibc and the loader included) track the
+# builder digest that Dependabot bumps. Revisit on every builder bump and
+# whenever bookworm-security ships a listed fix.
+# - zlib1g 1:1.2.13.dfsg-1: CVE-2026-76844 and CVE-2026-85091 (DSA-6613-1,
+#   fixed for Trixie only) are in zlib's gzFile write layer (gz_write and
+#   gz_vacate, reached through gzwrite/gzprintf). Git 2.39.5 calls no gz* file
+#   function; it compresses only through deflate/inflate streams, so the
+#   flawed code is unreachable, and no fixed Bookworm build exists to copy.
+# - libpcre2-8-0: CVE-2026-103111 (DLA-4816-1, fixed in Bookworm
+#   10.42-1+deb12u2) needs an attacker-controlled pattern compiled with JIT
+#   (`git grep -P`, `--perl-regexp`). Whether the pinned builder already
+#   carries deb12u2 is not recorded; it does not change the verdict.
+# Both verdicts hold only while the CLI's Git calls compile no regular
+# expression and write no gzFile: fixed `rev-parse`, `merge-base`, `ls-tree`,
+# `ls-files` and `hash-object` calls (src/policy/override_input.rs,
+# src/state.rs), whose variable operands are hex-validated revisions or file
+# paths after `--`. tests/unit/git_invocation_tests.rs is a tripwire, not a
+# proof: it pins this builder's FROM line (so a digest bump fails until the
+# assessment is redone), each process's construction chain and every Git call
+# in src/ as exact text, and the hex check on the merge-base operands, and it
+# checks that doctor runs exactly the bundled settings auditor and that it
+# runs only `gh`. Its header lists what it cannot see and is reviewed by hand:
+# arguments the validator launch adds in later statements, spawns hidden
+# behind an alias or macro, build.rs (the build host's Git; the image build
+# context excludes .git), and code-scanning.yml's fixed CI uses of this Git
+# (`config` and `rev-parse HEAD` probes, and the override regression
+# fixtures' `init`, `config`, `add`, `commit`, `ls-tree`, `rev-parse`,
+# `status` and `update-index`).
 RUN set -eu; \
     mkdir -p /opt/override-git/lib; \
     cp /usr/bin/git /opt/override-git/git; \
