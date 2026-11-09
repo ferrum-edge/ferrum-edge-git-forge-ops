@@ -12,15 +12,26 @@
 //! unassessed global options or `-c` settings, regex options, revision regex
 //! searches, and arguments chained after the literal list.
 //!
+//! The assessment names the copied Git and zlib versions, which come from the
+//! builder image digest, so `the_assessment_names_the_pinned_builder` fails
+//! when that digest changes until the assessment is redone. The validation
+//! `is_revision` performs on the variable `merge-base` operands is pinned too.
+//!
 //! What it does not see, reviewed by hand instead:
 //! - arguments added to a command in later statements. Two launches do this:
 //!   the validator (`validate/runner.rs`, the operator-configured
 //!   `ferrum-edge` binary with `build_validate_args_for_mode`) and doctor's
 //!   `python3` (`doctor/github.rs`), which runs the bundled settings auditor;
 //!   `the_bundled_auditor_runs_only_gh` pins that auditor's one subprocess;
+//! - a spawn hidden from the text scan: a type alias or macro that expands to
+//!   `Command::new`, or code included from outside `src/`. None exists today;
 //! - `build.rs`, which runs the build host's Git at compile time (the image
-//!   build context excludes `.git`), and `code-scanning.yml`, which runs the
-//!   image's Git as a fixed `config` command.
+//!   build context excludes `.git`);
+//! - `code-scanning.yml`, which runs the image's Git as fixed `config` and
+//!   `rev-parse HEAD` probes and runs the override regression binary inside
+//!   the image, whose fixtures call `init`, `config`, `add` and `commit`
+//!   (`tests/unit/override_tests.rs`). All are fixed CI inputs; none compiles
+//!   a pattern or writes a gzFile.
 
 use std::path::{Path, PathBuf};
 
@@ -481,4 +492,38 @@ fn the_bundled_auditor_runs_only_gh() {
     }
     assert_eq!(source.matches("subprocess.run(").count(), 1);
     assert!(source.contains(r#"command = ["gh", "api", path]"#));
+}
+
+/// The builder whose Git and libraries the Dockerfile's override Git
+/// assessment describes (Git 2.39.5, zlib1g 1:1.2.13.dfsg-1).
+const ASSESSED_BUILDER: &str = "FROM rust:1.99.1-bookworm@sha256:\
+9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS builder";
+
+#[test]
+fn the_assessment_names_the_pinned_builder() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Dockerfile");
+    let dockerfile = std::fs::read_to_string(path).unwrap();
+    assert!(
+        dockerfile.lines().any(|line| line == ASSESSED_BUILDER),
+        "the builder image changed: redo the Dockerfile's override Git CVE \
+         assessment for the new Git and library versions, then update \
+         ASSESSED_BUILDER"
+    );
+}
+
+#[test]
+fn the_merge_base_operands_stay_hex_validated() {
+    // The pinned `merge-base` call passes `merge` and `revision`; they are safe
+    // revision operands only because this check admits 40 hex digits alone.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/policy/override_input.rs");
+    let compact: String = std::fs::read_to_string(path)
+        .unwrap()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(compact.contains(
+        "pubfnis_revision(value:&str)->bool{value.len()==40&&value.bytes().all(|b|b.is_ascii_hexdigit())}"
+    ));
+    assert!(compact.contains("if!is_revision(revision){"));
+    assert!(compact.contains("letmerge=merge_revision.filter(|sha|is_revision(sha))"));
 }
