@@ -3,17 +3,24 @@
 //! only while the CLI's Git calls compile no regular expression and never
 //! write through zlib's gzFile layer.
 //!
-//! Scope: the runtime CLI in `src/`. `build.rs` runs the build host's Git at
-//! compile time (the image build context excludes `.git`), and
-//! `code-scanning.yml` runs the image's Git as a fixed `config` command; both
-//! are outside this scan.
+//! This is a tripwire, not a proof. It pins, as exact whitespace-free text,
+//! every `Command::new(` builder chain in `src/` up to its first terminator
+//! and every call of the override `git()` helper, so a new or changed spawn
+//! chain or Git call fails until someone re-checks that assessment and updates
+//! the pins. On its own, it also refuses Git argument lists with a computed
+//! item before the subcommand, a subcommand outside the assessed set,
+//! unassessed global options or `-c` settings, regex options, revision regex
+//! searches, and arguments chained after the literal list.
 //!
-//! This scan pins every process the CLI can start and every Git call exactly.
-//! Any new or changed spawn, including one that resolves Git by variable,
-//! constant or shell, fails until the pins are updated, which sends the change
-//! back to that assessment. The Git rules below also refuse, on their own, a
-//! computed subcommand, a subcommand outside the assessed set, regex-taking
-//! options, revision regex searches and unassessed `-c` settings.
+//! What it does not see, reviewed by hand instead:
+//! - arguments added to a command in later statements. Two launches do this:
+//!   the validator (`validate/runner.rs`, the operator-configured
+//!   `ferrum-edge` binary with `build_validate_args_for_mode`) and doctor's
+//!   `python3` (`doctor/github.rs`), which runs the bundled settings auditor;
+//!   `the_bundled_auditor_runs_only_gh` pins that auditor's one subprocess;
+//! - `build.rs`, which runs the build host's Git at compile time (the image
+//!   build context excludes `.git`), and `code-scanning.yml`, which runs the
+//!   image's Git as a fixed `config` command.
 
 use std::path::{Path, PathBuf};
 
@@ -55,8 +62,9 @@ const REGEX_OPTIONS: &[&str] = &[
 /// Revision syntax that searches commit messages or the reflog by regex.
 const REGEX_REVISIONS: &[&str] = &[":/", "@{/", "^{/"];
 
-/// Every process the CLI can start: file under `src/`, then the
-/// whitespace-free builder chain from `Command::new(` to its terminator.
+/// Every process construction in `src/`: the file, then the whitespace-free
+/// builder chain from `Command::new(` to its first terminator. Arguments added
+/// in later statements are not part of the chain.
 const PINNED_SPAWNS: &[(&str, &str)] = &[
     ("doctor/github.rs", r#"Command::new("python3")"#),
     (
@@ -444,4 +452,33 @@ fn the_rules_refuse_unassessed_git_use_on_their_own() {
     assert!(scan.violations.is_empty(), "{:?}", scan.violations);
     assert_eq!(scan.helper_spawns, 1);
     assert_eq!(scan.subcommands, ["merge-base", "hash-object"]);
+}
+
+#[test]
+fn the_bundled_auditor_runs_only_gh() {
+    // Doctor runs this script with `python3 -I -c`; the spawn pin above sees
+    // only `Command::new("python3")`, so the script's own subprocess use is
+    // pinned here.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/audit_settings.py");
+    let source = std::fs::read_to_string(path).unwrap();
+    for api in [
+        "os.system",
+        "os.popen",
+        "os.exec",
+        "os.spawn",
+        "os.posix_spawn",
+        "subprocess.Popen",
+        "subprocess.call",
+        "subprocess.check_",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
+        "pty.",
+        "create_subprocess",
+        "\"git\"",
+        "'git'",
+    ] {
+        assert!(!source.contains(api), "the bundled auditor uses {api}");
+    }
+    assert_eq!(source.matches("subprocess.run(").count(), 1);
+    assert!(source.contains(r#"command = ["gh", "api", path]"#));
 }

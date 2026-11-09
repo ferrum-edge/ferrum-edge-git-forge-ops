@@ -23,11 +23,13 @@ FROM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91
 # expression and write no gzFile: fixed `rev-parse`, `merge-base`, `ls-tree`,
 # `ls-files` and `hash-object` calls (src/policy/override_input.rs,
 # src/state.rs), whose variable operands are hex-validated revisions or file
-# paths after `--`. tests/unit/git_invocation_tests.rs pins every process the
-# CLI in src/ can start and every Git call exactly, so any new or changed
-# spawn sends the change back here. Outside that scan: build.rs runs the build
-# host's Git (the image build context excludes .git), and code-scanning.yml
-# runs this Git as a fixed `config` command.
+# paths after `--`. tests/unit/git_invocation_tests.rs is a tripwire, not a
+# proof: it pins each process's construction chain and every Git call in src/
+# as exact text, and checks that the bundled settings auditor runs only `gh`,
+# so a changed spawn or Git call sends the change back here. Arguments added in
+# later statements (the validator and doctor launches) are outside it and
+# reviewed by hand, as are build.rs (the build host's Git; the image build
+# context excludes .git) and code-scanning.yml's fixed `git config` run.
 RUN set -eu; \
     mkdir -p /opt/override-git/lib; \
     cp /usr/bin/git /opt/override-git/git; \
