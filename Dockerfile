@@ -124,7 +124,7 @@ RUN set -eu; \
 # exact-version, SHA-256-verified
 # package updates until the base's installed package metadata confirms it
 # already carries the fixes. Never `apt-get`.
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 # Install only bytes the builder already verified against the reviewed digests.
 COPY --from=builder /opt/runtime-security-updates /tmp/runtime-security-updates
 RUN dpkg --install /tmp/runtime-security-updates/*.deb \
