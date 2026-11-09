@@ -475,9 +475,14 @@ fn the_rules_refuse_unassessed_git_use_on_their_own() {
 /// `Command::new("python3")`, so this binding is what makes
 /// `the_bundled_auditor_runs_only_gh` describe what doctor executes.
 fn doctor_runs_the_bundled_auditor(doctor_source: &str) -> bool {
-    let compact: String = doctor_source.chars().filter(|c| !c.is_whitespace()).collect();
+    let compact: String = doctor_source
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     compact
-        .matches(r#"constBUNDLED_AUDITOR:&str=include_str!("../../.github/scripts/audit_settings.py");"#)
+        .matches(
+            r#"constBUNDLED_AUDITOR:&str=include_str!("../../.github/scripts/audit_settings.py");"#,
+        )
         .count()
         == 1
         && compact
