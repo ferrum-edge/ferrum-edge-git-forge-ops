@@ -19,11 +19,15 @@ FROM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91
 #   10.42-1+deb12u2) needs an attacker-controlled pattern compiled with JIT
 #   (`git grep -P`, `--perl-regexp`). Whether the pinned builder already
 #   carries deb12u2 is not recorded; it does not change the verdict.
-# Both verdicts hold only while the CLI runs Git subcommands that compile no
-# regular expression and write no gzFile: `rev-parse`, `merge-base`,
-# `ls-tree`, `ls-files` and `hash-object` (src/policy/override_input.rs,
-# src/state.rs). tests/unit/git_invocation_tests.rs scans src/ and fails on
-# any other subcommand, so adding one sends the change back here.
+# Both verdicts hold only while the CLI's Git calls compile no regular
+# expression and write no gzFile: fixed `rev-parse`, `merge-base`, `ls-tree`,
+# `ls-files` and `hash-object` calls (src/policy/override_input.rs,
+# src/state.rs), whose variable operands are hex-validated revisions or file
+# paths after `--`. tests/unit/git_invocation_tests.rs pins every process the
+# CLI in src/ can start and every Git call exactly, so any new or changed
+# spawn sends the change back here. Outside that scan: build.rs runs the build
+# host's Git (the image build context excludes .git), and code-scanning.yml
+# runs this Git as a fixed `config` command.
 RUN set -eu; \
     mkdir -p /opt/override-git/lib; \
     cp /usr/bin/git /opt/override-git/git; \
