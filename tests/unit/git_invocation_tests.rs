@@ -67,7 +67,10 @@ const PINNED_SPAWNS: &[(&str, &str)] = &[
         "policy/override_input.rs",
         r#"Command::new("git").args(["-c","core.hooksPath=/dev/null","hash-object","--stdin"]).current_dir(source).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())"#,
     ),
-    ("state.rs", r#"Command::new("git").args(["rev-parse","HEAD"])"#),
+    (
+        "state.rs",
+        r#"Command::new("git").args(["rev-parse","HEAD"])"#,
+    ),
     ("validate/runner.rs", r#"Command::new("/bin/sh")"#),
     ("validate/runner.rs", r#"Command::new("/bin/sh")"#),
     ("validate/runner.rs", r#"Command::new("/bin/sh")"#),
@@ -80,20 +83,50 @@ const PINNED_SPAWNS: &[(&str, &str)] = &[
         "validate/runner.rs",
         r#"Command::new("/bin/sh").args(["-c","kill-sKILL--\"-$1\"","sh"]).arg(child.id().to_string()).env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())"#,
     ),
-    ("validate/runner.rs", r#"Command::new("which").arg("--").arg(binary_path)"#),
+    (
+        "validate/runner.rs",
+        r#"Command::new("which").arg("--").arg(binary_path)"#,
+    ),
     ("validate/runner.rs", r#"Command::new(binary_path)"#),
-    ("validate/runner.rs", r#"Command::new(binary_path).arg("--help")"#),
+    (
+        "validate/runner.rs",
+        r#"Command::new(binary_path).arg("--help")"#,
+    ),
 ];
 
 const PINNED_GIT_CALLS: &[(&str, &str)] = &[
-    ("policy/override_input.rs", r#"source,&["hash-object","--no-filters","--",file]"#),
-    ("policy/override_input.rs", r#"source,&["hash-object","--no-filters","--",path]"#),
-    ("policy/override_input.rs", r#"source,&["ls-files","--cached","-z"]"#),
-    ("policy/override_input.rs", r#"source,&["ls-files","--others","--exclude-standard","-z"],"#),
-    ("policy/override_input.rs", r#"source,&["ls-tree","-rz","--full-tree","HEAD"]"#),
-    ("policy/override_input.rs", r#"source,&["merge-base","--is-ancestor",merge,revision]"#),
-    ("policy/override_input.rs", r#"source,&["rev-parse","--show-toplevel"]"#),
-    ("policy/override_input.rs", r#"source,&["rev-parse","HEAD"]"#),
+    (
+        "policy/override_input.rs",
+        r#"source,&["hash-object","--no-filters","--",file]"#,
+    ),
+    (
+        "policy/override_input.rs",
+        r#"source,&["hash-object","--no-filters","--",path]"#,
+    ),
+    (
+        "policy/override_input.rs",
+        r#"source,&["ls-files","--cached","-z"]"#,
+    ),
+    (
+        "policy/override_input.rs",
+        r#"source,&["ls-files","--others","--exclude-standard","-z"],"#,
+    ),
+    (
+        "policy/override_input.rs",
+        r#"source,&["ls-tree","-rz","--full-tree","HEAD"]"#,
+    ),
+    (
+        "policy/override_input.rs",
+        r#"source,&["merge-base","--is-ancestor",merge,revision]"#,
+    ),
+    (
+        "policy/override_input.rs",
+        r#"source,&["rev-parse","--show-toplevel"]"#,
+    ),
+    (
+        "policy/override_input.rs",
+        r#"source,&["rev-parse","HEAD"]"#,
+    ),
 ];
 
 const TERMINATORS: &[&str] = &[".output()", ".spawn()", ".status()"];
@@ -365,7 +398,10 @@ fn the_cli_starts_only_the_pinned_processes_and_git_calls() {
          assessment, then update PINNED_GIT_CALLS"
     );
     // Not vacuous: the helper and every assessed subcommand are still seen.
-    assert_eq!(scan.helper_spawns, 1, "the override Git helper was not found");
+    assert_eq!(
+        scan.helper_spawns, 1,
+        "the override Git helper was not found"
+    );
     let mut seen = scan.subcommands.clone();
     seen.sort();
     seen.dedup();
