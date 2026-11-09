@@ -21,17 +21,21 @@
 //! - arguments added to a command in later statements. Two launches do this:
 //!   the validator (`validate/runner.rs`, the operator-configured
 //!   `ferrum-edge` binary with `build_validate_args_for_mode`) and doctor's
-//!   `python3` (`doctor/github.rs`), which runs the bundled settings auditor;
-//!   `the_bundled_auditor_runs_only_gh` pins that auditor's one subprocess;
+//!   `python3` (`doctor/github.rs`). For doctor this is covered:
+//!   `doctor_runs_only_the_bundled_auditor` pins that it runs the embedded
+//!   `audit_settings.py`, and `the_bundled_auditor_runs_only_gh` pins that
+//!   script's one subprocess. The validator launch stays reviewed by hand;
 //! - a spawn hidden from the text scan: a type alias or macro that expands to
 //!   `Command::new`, or code included from outside `src/`. None exists today;
 //! - `build.rs`, which runs the build host's Git at compile time (the image
 //!   build context excludes `.git`);
 //! - `code-scanning.yml`, which runs the image's Git as fixed `config` and
 //!   `rev-parse HEAD` probes and runs the override regression binary inside
-//!   the image, whose fixtures call `init`, `config`, `add` and `commit`
+//!   the image, whose fixtures call `init`, `config`, `add`, `commit`,
+//!   `ls-tree`, `rev-parse`, `status` and `update-index`
 //!   (`tests/unit/override_tests.rs`). All are fixed CI inputs; none compiles
-//!   a pattern or writes a gzFile.
+//!   a pattern (`status` matches with wildmatch) or writes a gzFile, though
+//!   `status` and `update-index` may rewrite the uncompressed index.
 
 use std::path::{Path, PathBuf};
 
@@ -465,10 +469,52 @@ fn the_rules_refuse_unassessed_git_use_on_their_own() {
     assert_eq!(scan.subcommands, ["merge-base", "hash-object"]);
 }
 
+/// Doctor's `python3` launch runs exactly the bundled settings auditor: the
+/// constant embeds `audit_settings.py`, the launch passes it as `-I -c`'s
+/// program, and nothing else reads or rebinds it. The spawn pin sees only
+/// `Command::new("python3")`, so this binding is what makes
+/// `the_bundled_auditor_runs_only_gh` describe what doctor executes.
+fn doctor_runs_the_bundled_auditor(doctor_source: &str) -> bool {
+    let compact: String = doctor_source.chars().filter(|c| !c.is_whitespace()).collect();
+    compact
+        .matches(r#"constBUNDLED_AUDITOR:&str=include_str!("../../.github/scripts/audit_settings.py");"#)
+        .count()
+        == 1
+        && compact
+            .matches(r#".arg("-I").arg("-c").arg(BUNDLED_AUDITOR).arg("--repo")"#)
+            .count()
+            == 1
+        && compact.matches("BUNDLED_AUDITOR").count() == 2
+}
+
+#[test]
+fn doctor_runs_only_the_bundled_auditor() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/doctor/github.rs");
+    let source = std::fs::read_to_string(path).unwrap();
+    assert!(
+        doctor_runs_the_bundled_auditor(&source),
+        "doctor's python3 launch no longer runs exactly the bundled \
+         audit_settings.py: re-check it for Git use, then update this pin"
+    );
+    for (from, to) in [
+        ("audit_settings.py", "other_script.py"),
+        (".arg(BUNDLED_AUDITOR)", ".arg(OTHER_SCRIPT)"),
+        (".arg(\"-c\")", ".arg(\"-m\")"),
+    ] {
+        assert!(source.contains(from), "{from}");
+        assert!(
+            !doctor_runs_the_bundled_auditor(&source.replace(from, to)),
+            "accepted a rebinding of {from}"
+        );
+    }
+    let rebound = format!("{source}\nconst BUNDLED_AUDITOR_COPY: &str = BUNDLED_AUDITOR;\n");
+    assert!(!doctor_runs_the_bundled_auditor(&rebound));
+}
+
 #[test]
 fn the_bundled_auditor_runs_only_gh() {
-    // Doctor runs this script with `python3 -I -c`; the spawn pin above sees
-    // only `Command::new("python3")`, so the script's own subprocess use is
+    // Doctor runs this script with `python3 -I -c` (pinned by
+    // `doctor_runs_only_the_bundled_auditor`); its own subprocess use is
     // pinned here.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/audit_settings.py");
     let source = std::fs::read_to_string(path).unwrap();

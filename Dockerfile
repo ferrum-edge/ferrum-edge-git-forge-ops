@@ -27,13 +27,14 @@ FROM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91
 # proof: it pins this builder's FROM line (so a digest bump fails until the
 # assessment is redone), each process's construction chain and every Git call
 # in src/ as exact text, and the hex check on the merge-base operands, and it
-# checks that the bundled settings auditor runs only `gh`. Its header lists
-# what it cannot see and is reviewed by hand: arguments added in later
-# statements (the validator and doctor launches), spawns hidden behind an
-# alias or macro, build.rs (the build host's Git; the image build context
-# excludes .git), and code-scanning.yml's fixed CI uses of this Git (`config`
-# and `rev-parse HEAD` probes, and the override regression fixtures' `init`,
-# `config`, `add` and `commit`).
+# checks that doctor runs exactly the bundled settings auditor and that it
+# runs only `gh`. Its header lists what it cannot see and is reviewed by hand:
+# arguments the validator launch adds in later statements, spawns hidden
+# behind an alias or macro, build.rs (the build host's Git; the image build
+# context excludes .git), and code-scanning.yml's fixed CI uses of this Git
+# (`config` and `rev-parse HEAD` probes, and the override regression
+# fixtures' `init`, `config`, `add`, `commit`, `ls-tree`, `rev-parse`,
+# `status` and `update-index`).
 RUN set -eu; \
     mkdir -p /opt/override-git/lib; \
     cp /usr/bin/git /opt/override-git/git; \
