@@ -5,6 +5,18 @@ FROM rust:1.99.1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91
 # Reuse the reviewed builder's Git and its complete ELF dependency closure,
 # including its loader, so Bookworm libraries never mix with Trixie's libc.
 # No network helpers, templates, package installs, or new image inputs.
+# The copied libraries have no dpkg record in the runtime image, so its Trivy
+# scan cannot see them; their known CVEs are assessed here by hand. Revisit on
+# every builder bump and whenever bookworm-security ships one of them.
+# - zlib1g 1:1.2.13.dfsg-1, no fixed Bookworm build: CVE-2026-76844 and
+#   CVE-2026-85091 are in zlib's gzFile write layer (gz_write, gz_vacate via
+#   gzwrite/gzprintf). Git 2.39.5 calls no gz* file function; it compresses
+#   only through deflate/inflate streams, so the flawed code is unreachable.
+# - libpcre2-8-0 (CVE-2026-103111, fixed in Bookworm 10.42-1+deb12u2) needs an
+#   attacker-controlled pattern compiled with JIT (`git grep -P`,
+#   `--perl-regexp`). The CLI runs only `rev-parse`, `merge-base`, `ls-tree`,
+#   `ls-files` and `hash-object` (src/policy/override_input.rs), none of which
+#   compiles a regular expression.
 RUN set -eu; \
     mkdir -p /opt/override-git/lib; \
     cp /usr/bin/git /opt/override-git/git; \
