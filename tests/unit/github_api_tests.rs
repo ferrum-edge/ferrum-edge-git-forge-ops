@@ -128,6 +128,9 @@ fn spawn_github_stub_with_headers(
     let thread_requests = Arc::clone(&requests);
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
+            // Each response is written in several pieces; without this, Nagle
+            // holds the rest until the client's delayed ACK (~40 ms each).
+            let _ = stream.set_nodelay(true);
             let routes = routes.clone();
             let requests = Arc::clone(&thread_requests);
             std::thread::spawn(move || loop {
@@ -1759,6 +1762,9 @@ fn spawn_sequenced_github_stub(routes: Vec<SequencedRoute>) -> (String, Arc<Mute
     let thread_requests = Arc::clone(&requests);
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
+            // See `spawn_github_stub_with_headers`: unbatched writes need
+            // TCP_NODELAY or each keep-alive response waits a delayed ACK.
+            let _ = stream.set_nodelay(true);
             let routes = Arc::clone(&routes);
             let requests = Arc::clone(&thread_requests);
             std::thread::spawn(move || loop {
