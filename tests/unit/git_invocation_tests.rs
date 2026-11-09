@@ -63,13 +63,16 @@ fn scan_source(name: &str, source: &str, scan: &mut Scan) {
 
     for (at, _) in compact.match_indices("Command::new(\"") {
         let rest = &compact[at + "Command::new(\"".len()..];
-        let Some(end) = rest.find("\")") else { continue };
+        let Some(end) = rest.find("\")") else {
+            continue;
+        };
         let program = &rest[..end];
         if program != "git" && !program.ends_with("/git") {
             continue;
         }
         if program != "git" {
-            scan.violations.push(format!("{name}: spawns Git by path {program:?}"));
+            scan.violations
+                .push(format!("{name}: spawns Git by path {program:?}"));
             continue;
         }
         let chain = &rest[end + 2..];
@@ -77,8 +80,9 @@ fn scan_source(name: &str, source: &str, scan: &mut Scan) {
             .strip_prefix(".args([")
             .and_then(|list| list.find("])").map(|close| &list[..close]))
         else {
-            scan.violations
-                .push(format!("{name}: Git spawn without a literal leading argument list"));
+            scan.violations.push(format!(
+                "{name}: Git spawn without a literal leading argument list"
+            ));
             continue;
         };
         match subcommand(&literals(list)) {
@@ -88,9 +92,9 @@ fn scan_source(name: &str, source: &str, scan: &mut Scan) {
             {
                 scan.helper_spawns += 1;
             }
-            None => scan
-                .violations
-                .push(format!("{name}: Git spawn whose subcommand is not a literal")),
+            None => scan.violations.push(format!(
+                "{name}: Git spawn whose subcommand is not a literal"
+            )),
         }
     }
 
@@ -112,9 +116,9 @@ fn scan_source(name: &str, source: &str, scan: &mut Scan) {
             Some(found) if list_starts_with_literal(literal_list) => {
                 scan.subcommands.push((name.to_string(), found.to_string()));
             }
-            _ => scan
-                .violations
-                .push(format!("{name}: `git(` call whose subcommand is not a literal")),
+            _ => scan.violations.push(format!(
+                "{name}: `git(` call whose subcommand is not a literal"
+            )),
         }
     }
 }
@@ -147,7 +151,10 @@ fn the_cli_runs_only_the_assessed_git_subcommands() {
     }
     assert!(scan.violations.is_empty(), "{}", scan.violations.join("\n"));
     // Not vacuous: the scan still sees the known call sites.
-    assert_eq!(scan.helper_spawns, 1, "the override Git helper was not found");
+    assert_eq!(
+        scan.helper_spawns, 1,
+        "the override Git helper was not found"
+    );
     let mut seen: Vec<&str> = scan.subcommands.iter().map(|(_, s)| s.as_str()).collect();
     seen.sort_unstable();
     seen.dedup();
