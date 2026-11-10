@@ -38,8 +38,10 @@ reuse that verified PR worktree. Never launch a write-enabled worker in the orch
 or another worker's worktree.
 
 Append `--fast` only when the user explicitly requests fast mode for that dispatch or fleet. Never
-infer it from urgency, deadlines, task size, or available credits. Omit it otherwise; the launcher
-pins `service_tier="default"` without the flag and the model's Fast `priority` tier with it.
+infer it from urgency, deadlines, task size, or available credits. Use `--no-fast` for an explicit
+standard-mode request; never pass both flags. Omit both otherwise; the launcher pins
+`service_tier="default"` without `--fast`, and `service_tier="fast"` with `features.fast_mode=true`
+with it.
 
 Non-negotiables:
 - Go through the launcher, not a bare `codex exec`. It resolves the binary, verifies the worktree
@@ -50,7 +52,7 @@ Non-negotiables:
   `com.conductor.app` is refused — Conductor's bundle lags the standalone release.
 - The launcher clears inherited `CODEX_HOME` and OpenAI endpoint/auth overrides, then runs
   `codex exec --model gpt-6-luna --ignore-user-config --ignore-rules --config
-  model_reasoning_effort="<effort>" --config service_tier="<default|priority>" --sandbox
+  model_reasoning_effort="<effort>" --config service_tier="<default|fast>" --sandbox
   danger-full-access --cd <worktree> -`. Worktree isolation prevents git collisions; it is not a
   host sandbox.
 - Run each dispatch as a **background task** (`run_in_background`); prefer one task

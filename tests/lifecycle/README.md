@@ -75,8 +75,8 @@ qualification also covers the gateway's backup and consumer representations.
 The consumer-verification and coherent replacement scenarios target published
 Edge v0.9.20 at `e4a606a00352674daaef08636e3e359e6c48ba18`, with the exact approved
 x86_64 binary recorded in `release/baseline.json`. Hosted qualification of this
-client revision against those bytes remains required. The old v0.9.10 fixture
-cannot certify these endpoints; no scenario is skipped to make an older pin pass.
+client revision against those bytes remains required. No scenario is skipped to
+make an older pin pass.
 The first-release record stays pending until its lifecycle and external acceptance
 gates are complete.
 

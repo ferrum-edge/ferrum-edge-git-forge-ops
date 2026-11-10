@@ -77,7 +77,11 @@ publishing.
 Once the upstream record is `supported`, copy its `gitforgeops.source_sha` into
 `GFO_SHA` and check that the protected tag resolves to that commit. GitHub's
 **Use this template** button always copies the current default branch, so
-start a clean repository from the verified source archive instead:
+start a clean repository from the verified source archive instead. Choose
+repository visibility and GitHub plan with the
+[quickstart prerequisites](../docs/quickstart.md#0-before-you-start) first:
+environments on a private repository need Pro, Team or Enterprise, and required
+reviewers on one need Enterprise.
 
 ```bash
 GFO_SHA='PASTE_40_HEX_SOURCE_SHA_FROM_RELEASE_RECORD'
@@ -89,16 +93,14 @@ cd gateway-config
 git init -b main
 git add -A
 git commit -m 'Adopt GitForgeOps v0.1.0 baseline'
-gh repo create OWNER/REPO --private --source . --push
+gh repo create OWNER/REPO --private --source . --push  # or --public; see the quickstart prerequisites
 python3 .github/scripts/template_update.py detect-baseline --write
 git add .gitforgeops/baseline.json
 git commit -m 'Record upstream template baseline'
 git push
 ```
 
-Choose repository visibility and GitHub plan with the
-[quickstart prerequisites](../docs/quickstart.md#0-before-you-start), then
-follow the rest of the quickstart.
+Then follow the rest of the quickstart.
 
 Your copy builds the GitForgeOps engine from its own checkout. The validator
 installer fetches Ferrum Edge's newest published release, checks the
@@ -177,19 +179,18 @@ adoption scope and authority limits.
 Hosted qualification must exercise complete consumer verification, hidden
 credential conflicts, rotation conflicts before and after broker delivery, and
 the required `conditional-full-replace` lifecycle scenario against these exact
-released bytes. The old v0.9.10 fixture cannot qualify these endpoints and must
-not be made green by skipping the new scenario. This pin update does not record
-passing lifecycle evidence or first-release acceptance: `baseline.json` remains
-`pending`, with GitForgeOps source SHA, image digest and lifecycle URL unset.
+released bytes; that scenario must not be made green by skipping it. No passing
+lifecycle evidence or first-release acceptance is recorded yet: `baseline.json`
+remains `pending`, with GitForgeOps source SHA, image digest and lifecycle URL
+unset.
 
 Qualification must cover original-token restore, spec-owned graph and verbatim
 documents, trust preservation, ABA, empty namespaces and confirmed spec deletion;
 exact-token/body precommit retry; and no replay after ambiguous commit, audit or
 fence refusal, unsupported topology or `applied:false`. Seal the exact client SHA
 and released server bytes. Source/parser evidence alone is not enforcement.
-Existing eight advisory fixes remain required; #266 still requires a second
-human reviewer, the state-writer GitHub App, a disposable customer template
-repository and an HTTPS gateway acceptance run. That disposable repository is
-also where viewer-capped drift monitoring (#440) is provisioned and exercised,
-because the upstream template has no gateway environment. No GitForgeOps tag or
-supported release is established by this candidate.
+Issue #266 still requires a second human reviewer, the state-writer GitHub App,
+a disposable customer template repository and an HTTPS gateway acceptance run.
+That disposable repository is also where viewer-capped drift monitoring (#440)
+is provisioned and exercised, because the upstream template has no gateway
+environment. No GitForgeOps tag or supported release is established yet.
