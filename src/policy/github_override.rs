@@ -847,16 +847,6 @@ pub fn next_link(header: &str) -> NextLink {
     next.map_or(NextLink::Absent, NextLink::Next)
 }
 
-/// The `next` target of a `Link` header value, or `None` when it names none
-/// or does not parse unambiguously. Callers that must prove a listing
-/// complete use [`next_link`] and treat [`NextLink::Ambiguous`] as more.
-pub fn parse_next_link(header: &str) -> Option<String> {
-    match next_link(header) {
-        NextLink::Next(target) => Some(target),
-        NextLink::Absent | NextLink::Ambiguous => None,
-    }
-}
-
 /// An RFC 8288 `relation-type`: a `reg-rel-type` (`LOALPHA *( LOALPHA / DIGIT
 /// / "." / "-" )`, compared case-insensitively, so either case is accepted) or
 /// an `ext-rel-type` (an absolute URI: a scheme, `:`, then RFC 3986 URI

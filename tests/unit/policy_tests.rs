@@ -3390,19 +3390,19 @@ fn forbid_tls_verify_disabled_triggers_on_false() {
 }
 
 #[test]
-fn parse_next_link_extracts_next_page_url() {
-    // Verifies the Link header parser used by SSH key discovery pagination.
-    use gitforgeops::policy::github_override::parse_next_link;
+fn next_link_extracts_next_page_url() {
+    // The Link header parser SSH key discovery pagination uses.
+    use gitforgeops::policy::github_override::{next_link, NextLink};
 
     let header = r#"<https://api.github.com/repos/x/y/issues/1/events?page=2>; rel="next", <https://api.github.com/repos/x/y/issues/1/events?page=5>; rel="last""#;
     assert_eq!(
-        parse_next_link(header).as_deref(),
-        Some("https://api.github.com/repos/x/y/issues/1/events?page=2")
+        next_link(header),
+        NextLink::Next("https://api.github.com/repos/x/y/issues/1/events?page=2".into())
     );
 
     // Last page: only `prev` + `first`, no `next`.
-    let last_page = r#"<...?page=4>; rel="prev", <...?page=1>; rel="first""#;
-    assert_eq!(parse_next_link(last_page), None);
+    let last_page = r#"<https://h/p4>; rel="prev", <https://h/p1>; rel="first""#;
+    assert_eq!(next_link(last_page), NextLink::Absent);
 }
 
 #[test]

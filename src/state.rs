@@ -812,18 +812,6 @@ impl StateFile {
         }
     }
 
-    pub fn record_override(&mut self, rule_id: &str, commit: &str, approver: &str) {
-        self.overrides.push(OverrideRecord {
-            rule_id: rule_id.to_string(),
-            commit: commit.to_string(),
-            approver: approver.to_string(),
-            recorded_at: chrono::Utc::now().to_rfc3339(),
-            pr_number: None,
-            authorized_head: None,
-            review_id: None,
-        });
-    }
-
     /// Record one audit row for a rule a verified override cleared. Taking the
     /// [`crate::policy::VerifiedOverride`] itself, never an inactive decision,
     /// means an override that cleared a gate always leaves its row.

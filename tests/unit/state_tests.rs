@@ -735,17 +735,32 @@ fn state_load_rejects_raw_resource_keys() {
 fn state_file_persists_override_records_for_audit() {
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
+        let verified = gitforgeops::policy::VerifiedOverride {
+            approver: "alice".to_string(),
+            permission: "maintain".to_string(),
+            pr_number: 7,
+            authorized_head: "a".repeat(40),
+            review_id: 42,
+            applied_revision: "b".repeat(40),
+        };
         let mut state = StateFile::load("production").unwrap();
-        state.record_override("backend_scheme", "abc123", "alice");
-        state.record_override("proxy_timeout_bands", "abc123", "alice");
+        state.record_verified_override("backend_scheme", &verified);
+        state.record_verified_override("proxy_timeout_bands", &verified);
         state.save().unwrap();
 
         let reloaded = StateFile::load("production").unwrap();
         assert_eq!(reloaded.overrides.len(), 2);
         assert_eq!(reloaded.overrides[0].rule_id, "backend_scheme");
         assert_eq!(reloaded.overrides[0].approver, "alice");
-        assert_eq!(reloaded.overrides[0].commit, "abc123");
+        assert_eq!(reloaded.overrides[0].commit, "b".repeat(40));
+        assert_eq!(reloaded.overrides[0].pr_number, Some(7));
+        assert_eq!(reloaded.overrides[0].review_id, Some(42));
+        assert_eq!(
+            reloaded.overrides[0].authorized_head.as_deref(),
+            Some("a".repeat(40).as_str())
+        );
         assert!(!reloaded.overrides[0].recorded_at.is_empty());
+        assert_eq!(reloaded.overrides[1].rule_id, "proxy_timeout_bands");
     });
 }
 

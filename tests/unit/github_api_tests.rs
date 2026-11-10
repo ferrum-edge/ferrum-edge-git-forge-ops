@@ -2241,15 +2241,11 @@ async fn a_revocation_after_a_short_page_with_a_malformed_link_is_read() {
 /// later one, and makes the whole value ambiguous rather than "no next".
 #[test]
 fn next_link_reads_every_link_value_and_flags_malformed_entries() {
-    use gitforgeops::policy::github_override::{next_link, parse_next_link, NextLink};
+    use gitforgeops::policy::github_override::{next_link, NextLink};
     // An entry without parameters is a valid link-value with no relation.
     assert_eq!(
         next_link("<https://h/p1>, <https://h/p2>; rel=\"next\""),
         NextLink::Next("https://h/p2".into())
-    );
-    assert_eq!(
-        parse_next_link("<https://h/p1>, <https://h/p2>; rel=\"next\"").as_deref(),
-        Some("https://h/p2")
     );
     assert_eq!(
         next_link("<https://h/p0>; rel=\"prev\"; title=\"a, b\", <https://h/p2>; rel=next"),
@@ -2261,7 +2257,6 @@ fn next_link_reads_every_link_value_and_flags_malformed_entries() {
         "<https://h/p1>; rel=\"prev\", not-a-link",
     ] {
         assert_eq!(next_link(malformed), NextLink::Ambiguous, "{malformed}");
-        assert_eq!(parse_next_link(malformed), None, "{malformed}");
     }
     assert_eq!(next_link("<https://h/p1>; rel=\"prev\""), NextLink::Absent);
 }
