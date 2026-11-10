@@ -50,8 +50,9 @@ ROOT = Path(__file__).resolve().parents[2]
 # `FROM <ref>` optionally followed by `AS <stage>`. The final stage is the
 # runtime image, and every ref is digest-pinned (check_supply_chain.py).
 FROM_LINE = re.compile(r"^FROM\s+(\S+)(?:\s+AS\s+(\S+))?\s*$", re.MULTILINE | re.IGNORECASE)
-# `<sha256>  <name>_<version>_<arch>.deb`, as written into the SHA256SUMS
-# heredoc, one reviewed package per line.
+# `<sha256>  <name>_<version>_<arch>.deb`, as the Dockerfile's `printf` writes
+# into SHA256SUMS, one reviewed package per line. (check_supply_chain.py
+# refuses any `<<` in the Dockerfile, so it is never a heredoc.)
 PACKAGE_ENTRY = re.compile(
     r"(?P<digest>[0-9a-f]{64})\s+(?P<name>[a-z0-9][a-z0-9+.-]*)"
     r"_(?P<version>[^_\s]+)_(?P<arch>[a-z0-9]+)\.deb"

@@ -305,8 +305,9 @@ jobs:
         # MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and in
         # .github/scripts/credential_bundles.py (16 x ~440 ~= 7,000 slots).
         # Adding capacity means raising both constants and extending this block
-        # in all four privileged workflows; check_supply_chain.py fails the
-        # build when they drift apart.
+        # in all four loader steps (two here, one each in materialize-file.yml
+        # and rotate.yml); check_supply_chain.py fails the build when they
+        # drift apart.
         #
         # The loader writes the filtered payload to a file and the binary reads
         # the PATH from FERRUM_CREDS_JSON_FILE: $GITHUB_ENV materializes into
@@ -963,8 +964,9 @@ jobs:
         # MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and in
         # .github/scripts/credential_bundles.py (16 x ~440 ~= 7,000 slots).
         # Adding capacity means raising both constants and extending this block
-        # in all four privileged workflows; check_supply_chain.py fails the
-        # build when they drift apart.
+        # in all four loader steps (two here, one each in materialize-file.yml
+        # and rotate.yml); check_supply_chain.py fails the build when they
+        # drift apart.
         #
         # The loader writes the filtered payload to a file and the binary reads
         # the PATH from FERRUM_CREDS_JSON_FILE: $GITHUB_ENV materializes into
