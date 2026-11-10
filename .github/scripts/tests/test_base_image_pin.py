@@ -238,7 +238,7 @@ class RealDockerfileTests(unittest.TestCase):
         self.assertIn("dpkg --install", instructions)
         self.assertEqual(
             self.pin.digest,
-            "sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4",
+            "sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2",
         )
         self.assertIn(
             "installed package metadata confirms it\n# already carries the fixes",
