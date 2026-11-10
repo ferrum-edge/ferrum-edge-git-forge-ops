@@ -5682,7 +5682,6 @@ def local_action_violations(
 REQUIRED_CHECK_WORKFLOWS = {
     "rust-ci-check": ".github/workflows/rust-ci.yml",
     "security-cargo-audit": ".github/workflows/security.yml",
-    "security-supply-chain-policy": ".github/workflows/security.yml",
     SUPPLY_CHAIN_POLICY_JOB: SUPPLY_CHAIN_POLICY_PATH,
     "state-guard-reject-state-edits": ".github/workflows/state-guard.yml",
     "gitforgeops-required-static-validation": ".github/workflows/validate-pr.yml",
@@ -6323,17 +6322,14 @@ RELEASE_GATE_WORKFLOW = ".github/workflows/release.yml"
 RELEASE_GATE_HELPER = ".github/scripts/release_gate.py"
 RELEASE_GATE_JOB = "authorize-release"
 RELEASE_GATE_STEP = "Verify the published commit passed every required check"
-# The contexts `bootstrap_repo_settings.py` requires on `main`, plus the one
-# being added to the ruleset (GHSA-x5m2-4555-q4cr), as `<workflow> / <job>`.
+# The contexts `bootstrap_repo_settings.py` requires on `main`, as
+# `<workflow> / <job>`.
 RELEASE_GATE_REQUIRED_CHECKS = (
     "Rust CI / rust-ci-check",
     "Security / security-cargo-audit",
-    "Security / security-supply-chain-policy",
+    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "GitForgeOps State Guard / state-guard-reject-state-edits",
     "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-)
-RELEASE_GATE_ACCEPTED_CHECKS = (
-    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "Agent Setup Policy / validate-trusted-policy",
 )
 RELEASE_GATE_APP_ID = 15368
@@ -6355,7 +6351,27 @@ RELEASE_GATE_MARKERS = (
 # Module constants of the helper, each bound exactly once, to exactly this.
 RELEASE_GATE_PINS = {
     "REQUIRED_CHECKS": RELEASE_GATE_REQUIRED_CHECKS,
-    "ACCEPTED_CHECKS": RELEASE_GATE_ACCEPTED_CHECKS,
+    "ACTIONS_APP_ID": RELEASE_GATE_APP_ID,
+    "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
+}
+# EXPAND STEP (#701, retiring `security-supply-chain-policy`). release_gate.py
+# still requires the retired context and tolerates the two protected-definition
+# checks while absent (`ACCEPTED_CHECKS`). The trusted check judges a helper
+# edit with `main`'s checker, so the helper moves to the pins above in a
+# follow-up, which also deletes this older shape. A helper that binds
+# `ACCEPTED_CHECKS` is held to it.
+RELEASE_GATE_PINS_BEFORE_RETIRE = {
+    "REQUIRED_CHECKS": (
+        "Rust CI / rust-ci-check",
+        "Security / security-cargo-audit",
+        "Security / security-supply-chain-policy",
+        "GitForgeOps State Guard / state-guard-reject-state-edits",
+        "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
+    ),
+    "ACCEPTED_CHECKS": (
+        "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
+        "Agent Setup Policy / validate-trusted-policy",
+    ),
     "ACTIONS_APP_ID": RELEASE_GATE_APP_ID,
     "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
 }
@@ -6562,7 +6578,12 @@ def release_gate_helper_violations(root: Path) -> list[str]:
     except (SyntaxError, UnicodeDecodeError, ValueError) as error:
         return [f"{label}: the helper must parse as Python: {error}"]
     violations: list[str] = []
-    for name, expected in RELEASE_GATE_PINS.items():
+    pins = (
+        RELEASE_GATE_PINS_BEFORE_RETIRE
+        if _python_bindings(tree, "ACCEPTED_CHECKS")
+        else RELEASE_GATE_PINS
+    )
+    for name, expected in pins.items():
         value = _module_constant(tree, name)
         if type(value) is not type(expected) or value != expected:
             violations.append(f"{label}: {name} must be assigned exactly {expected!r}")
@@ -7247,7 +7268,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     security_workflow = (workflows / "security.yml").read_text(encoding="utf-8")
-    violations.extend(trusted_supply_chain_policy_violations(security_workflow))
+    # EXPAND STEP (#701). `security-supply-chain-policy` is no longer a
+    # required context; while security.yml still defines the job, it keeps
+    # running the trusted checker. The follow-up that deletes the job also
+    # deletes this pin.
+    if "\n  security-supply-chain-policy:\n" in security_workflow:
+        violations.extend(trusted_supply_chain_policy_violations(security_workflow))
     violations.extend(supply_chain_policy_workflow_violations(root))
     violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
     violations.extend(cargo_audit_install_violations(security_workflow))

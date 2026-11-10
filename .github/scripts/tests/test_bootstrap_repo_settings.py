@@ -1493,8 +1493,6 @@ class SharedConstantTests(unittest.TestCase):
             audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), APP_ID
         )
         self.assertEqual(audit.violations, [])
-        # Including the transitional context: running the bootstrap is the
-        # documented way to add it, so what it writes draws no warning.
         self.assertEqual(audit.warnings, [])
         # The audit reads GitHub's copy, which adds `source_type` to the body
         # the bootstrap writes; it matches only repository-sourced rulesets.
@@ -1516,10 +1514,9 @@ class SharedConstantTests(unittest.TestCase):
             )
         )
 
-    def test_the_ruleset_adds_the_trusted_policy_check_beside_the_retiring_one(self):
-        # GHSA-x5m2-4555-q4cr expand step: the bootstrap writes the
-        # protected-definition check and keeps the in-tree job's context,
-        # which still runs the workflow-script unit tests.
+    def test_the_ruleset_requires_the_trusted_policy_check_not_the_retired_one(self):
+        # GHSA-x5m2-4555-q4cr retire step: the bootstrap writes the
+        # protected-definition check and no longer the in-tree job's context.
         ruleset = bootstrap.main_ruleset_body(
             [{"actor_type": "Integration", "actor_id": APP_ID, "bypass_mode": "always"}]
         )
@@ -1530,7 +1527,7 @@ class SharedConstantTests(unittest.TestCase):
             check["context"] for check in rule["parameters"]["required_status_checks"]
         ]
         self.assertIn("trusted-supply-chain-policy", contexts)
-        self.assertIn("security-supply-chain-policy", contexts)
+        self.assertNotIn("security-supply-chain-policy", contexts)
         self.assertEqual(len(contexts), len(set(contexts)))
         # Every context is bound to the GitHub Actions app, as the manual
         # ruleset method does, so a status from another source cannot satisfy it.

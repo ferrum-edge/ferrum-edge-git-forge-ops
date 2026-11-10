@@ -7884,18 +7884,53 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertEqual(check_supply_chain.release_gate_helper_violations(ROOT), [])
 
     def test_release_gate_pins_match_the_ruleset_contexts(self):
-        # The launch list is REQUIRED_CHECK_WORKFLOWS minus the job being added
-        # to the ruleset, which the gate tolerates while absent.
+        # The launch list is exactly REQUIRED_CHECK_WORKFLOWS: the retired
+        # `security-supply-chain-policy` is gone and nothing is tolerated
+        # while absent.
         jobs = [
             context.split(" / ")[-1]
             for context in check_supply_chain.RELEASE_GATE_REQUIRED_CHECKS
-            + check_supply_chain.RELEASE_GATE_ACCEPTED_CHECKS
         ]
         self.assertEqual(sorted(jobs), sorted(check_supply_chain.REQUIRED_CHECK_WORKFLOWS))
-        self.assertEqual(
-            [context.split(" / ")[-1] for context in check_supply_chain.RELEASE_GATE_ACCEPTED_CHECKS],
-            [check_supply_chain.SUPPLY_CHAIN_POLICY_JOB, "validate-trusted-policy"],
+        self.assertNotIn("security-supply-chain-policy", jobs)
+        self.assertNotIn("ACCEPTED_CHECKS", check_supply_chain.RELEASE_GATE_PINS)
+
+    def test_the_helper_may_move_to_the_retired_shape(self):
+        # #701 expand step: the shipped helper still binds ACCEPTED_CHECKS and
+        # requires the retired context; a helper without ACCEPTED_CHECKS that
+        # requires exactly the launch list is accepted too, and each shape is
+        # held to its own lists.
+        source = (ROOT / check_supply_chain.RELEASE_GATE_HELPER).read_text(encoding="utf-8")
+        before = check_supply_chain.RELEASE_GATE_PINS_BEFORE_RETIRE
+        old_required = "REQUIRED_CHECKS = (\n" + "".join(
+            f'    "{context}",\n' for context in before["REQUIRED_CHECKS"]
+        ) + ")"
+        new_required = "REQUIRED_CHECKS = (\n" + "".join(
+            f'    "{context}",\n' for context in check_supply_chain.RELEASE_GATE_REQUIRED_CHECKS
+        ) + ")"
+        accepted = "ACCEPTED_CHECKS = (\n" + "".join(
+            f'    "{context}",\n' for context in before["ACCEPTED_CHECKS"]
+        ) + ")"
+        self.assertEqual(source.count(old_required), 1)
+        self.assertEqual(source.count(accepted), 1)
+        retired = (
+            source.replace(old_required, new_required)
+            .replace(accepted, "")
+            .replace("ACCEPTED_CHECKS", "()")
         )
+        self.assertEqual(self._helper_violations(retired), [])
+        for name, changed in (
+            ("dropped check", retired.replace('    "Security / security-cargo-audit",\n', "", 1)),
+            ("retired context kept", source.replace(accepted, "").replace("ACCEPTED_CHECKS", "()")),
+            ("new list with old tolerance", source.replace(old_required, new_required)),
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    any(
+                        "REQUIRED_CHECKS must be assigned exactly" in item
+                        for item in self._helper_violations(changed)
+                    )
+                )
 
     def test_helper_invocation_is_pinned(self):
         step = self.RELEASE_HELPER_STEP

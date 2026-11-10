@@ -182,14 +182,11 @@ no other include or exclude patterns. It must:
   name, not the `Workflow / job` label shown on a PR:
   - `rust-ci-check`
   - `security-cargo-audit`
-  - `security-supply-chain-policy`
-  - `trusted-supply-chain-policy` (being added; see
+  - `trusted-supply-chain-policy` (see
     [Switching the supply-chain policy check](#switching-the-supply-chain-policy-check))
   - `state-guard-reject-state-edits`
   - `gitforgeops-required-static-validation`
-  - `validate-trusted-policy` (being added; until an operator adds it to the
-    ruleset the settings audit reports its absence as a `WARN`, like the
-    transitional supply-chain context above)
+  - `validate-trusted-policy`
 - have exactly one bypass actor in any mode: the state-writer App, as an
   always-on bypass. Pull-request-only human or team bypasses are not allowed.
 
@@ -282,11 +279,15 @@ unless the organization ruleset in section 2a lists it) to
 2. **Ruleset switch (operator).** Add `trusted-supply-chain-policy` to the
    `main` ruleset and bind the required contexts to GitHub Actions, as
    described below.
-3. **Retire (a later pull request).** The workflow-script unit tests move out
-   of `security-supply-chain-policy`, the candidate-run policy runner is
-   removed, and the audit, bootstrap and release gate require only the new
-   context. That pull request says when to remove the old context from the
-   ruleset.
+3. **Retire (in progress, #701).** The audit and bootstrap require only the
+   new context (merged): a ruleset that still lists
+   `security-supply-chain-policy` passes the audit, so an administrator can
+   remove that context from the `main` ruleset at any time, by hand or by
+   re-running the bootstrap. The checker no longer treats it as a required
+   context and accepts a release gate without it. A follow-up pull request
+   moves the workflow-script unit tests out of `security-supply-chain-policy`
+   into their own `security.yml` job, removes the candidate-run policy
+   runner, and makes the release gate require only the new contexts.
 
 Take step 2 after step 1 has merged, as an administrator:
 
@@ -392,8 +393,7 @@ workflows in `check_supply_chain.REQUIRED_CHECK_WORKFLOWS`:
 - `.github/workflows/state-guard.yml` (`state-guard-reject-state-edits`)
 - `.github/workflows/agent-setup-policy.yml` (`validate-trusted-policy`)
 - `.github/workflows/rust-ci.yml` (`rust-ci-check`)
-- `.github/workflows/security.yml` (`security-cargo-audit`,
-  `security-supply-chain-policy`)
+- `.github/workflows/security.yml` (`security-cargo-audit`)
 - `.github/workflows/validate-pr.yml` (`gitforgeops-required-static-validation`)
 
 As an organization owner, after section 2, and only once `main` carries this
@@ -974,8 +974,8 @@ What the checker enforces for this check:
   by that context in its own workflow: `trusted-supply-chain-policy` in
   `supply-chain-policy.yml`, `state-guard-reject-state-edits` in
   `state-guard.yml`, and likewise `rust-ci-check`, `security-cargo-audit`,
-  `security-supply-chain-policy`, `gitforgeops-required-static-validation`
-  and `validate-trusted-policy` (`agent-setup-policy.yml`)
+  `gitforgeops-required-static-validation` and `validate-trusted-policy`
+  (`agent-setup-policy.yml`)
   (`REQUIRED_CHECK_WORKFLOWS`, kept equal to the bootstrap's
   `REQUIRED_STATUS_CHECKS` by a test). No job's `name:` may be computed with
   `${{ }}`. Mentioning a context in a script, a step title or an action input
@@ -1199,14 +1199,13 @@ GH_TOKEN=<administration-read-token> python3 .github/scripts/audit_settings.py \
   --state-writer-app-id 123456 \
   --required-check 'rust-ci-check' \
   --required-check 'security-cargo-audit' \
-  --required-check 'security-supply-chain-policy' \
   --required-check 'trusted-supply-chain-policy' \
   --required-check 'state-guard-reject-state-edits' \
   --required-check 'gitforgeops-required-static-validation' \
   --required-check 'validate-trusted-policy'
 ```
 
-`--required-check` may be omitted; those seven contexts are the default.
+`--required-check` may be omitted; those six contexts are the default.
 `--branch` may be omitted too: the audit then reads the repository's default
 branch from its metadata, the same value `settings-audit.yml` passes. Until
 the [ruleset switch](#switching-the-supply-chain-policy-check), a ruleset
