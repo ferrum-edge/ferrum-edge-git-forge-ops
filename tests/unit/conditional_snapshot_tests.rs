@@ -214,15 +214,61 @@ fn coherent_snapshot_requires_all_maps_exact_coverage_seals_and_header_agreement
 }
 
 type Reply = (u16, String, Vec<(String, String)>);
-type Requests = Arc<Mutex<Vec<String>>>;
+
+/// What the stub gateway received, and a guard over its reply closure.
+///
+/// A `panic!` in a reply runs on the stub's thread, where it never reached
+/// the test: the client saw a dropped connection, so a test that expected an
+/// error passed while the "must not" guard fired. The stub catches the panic,
+/// records it and answers 500, and dropping this handle fails the test
+/// (#697). Keep it bound (`_requests`, not `_`) for the whole test.
+struct Requests {
+    seen: Arc<Mutex<Vec<String>>>,
+    panics: Arc<Mutex<Vec<String>>>,
+}
+
+impl Requests {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Vec<String>>> {
+        self.seen.lock()
+    }
+}
+
+impl Drop for Requests {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let panics = self
+            .panics
+            .lock()
+            .map(|panics| panics.to_vec())
+            .unwrap_or_default();
+        assert!(
+            panics.is_empty(),
+            "the stub gateway's reply panicked: {panics:?}"
+        );
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| message.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
 
 fn gateway_env(
     reply: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
 ) -> (EnvConfig, Requests) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&requests);
+    let requests = Requests {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        panics: Arc::new(Mutex::new(Vec::new())),
+    };
+    let recorded = Arc::clone(&requests.seen);
+    let panics = Arc::clone(&requests.panics);
     let reply = Arc::new(reply);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -255,7 +301,13 @@ fn gateway_env(
             let position = seen.len();
             seen.push(request.clone());
             drop(seen);
-            let (status, body, headers) = reply(&request, position);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reply(&request, position)
+            }));
+            let (status, body, headers) = outcome.unwrap_or_else(|payload| {
+                panics.lock().unwrap().push(panic_message(&*payload));
+                (500, String::new(), vec![])
+            });
             let headers = headers
                 .iter()
                 .map(|(key, value)| format!("{key}: {value}\r\n"))
@@ -696,7 +748,7 @@ async fn preallocation_capture_checks_archival_projection_but_retains_exact_hidd
 #[tokio::test]
 async fn sensitive_http_reads_refuse_duplicate_headers_and_cached_evidence_stays_sticky() {
     let raw = serde_json::to_value(consumer()).unwrap();
-    let (client, _) = gateway(move |_, _| {
+    let (client, _requests) = gateway(move |_, _| {
         let (status, body, mut headers) = verified(&raw, ROW_TAG);
         headers.push(("ETag".to_string(), ROW_TAG.to_string()));
         (status, body, headers)
@@ -708,7 +760,7 @@ async fn sensitive_http_reads_refuse_duplicate_headers_and_cached_evidence_stays
     assert!(!format!("{error:?} {error}").contains(ROW_TAG));
     let mut raw = envelope(&config(), &BackupExtras::default(), NS_TAG);
     raw["source"] = json!("cached");
-    let (client, _) = gateway(move |_, _| verified(&raw, NS_TAG));
+    let (client, _requests) = gateway(move |_, _| verified(&raw, NS_TAG));
     assert!(client.get_conditional_backup(NS).await.is_err());
     assert!(client.served_from_cache());
 }
@@ -1650,7 +1702,7 @@ async fn doctor_is_get_only_and_reports_missing_consumer_capability_as_unknown()
 async fn exact_import_refuses_unsupported_credentials_before_tree_or_bundle_publication() {
     let mut raw = envelope(&config(), &BackupExtras::default(), NS_TAG);
     raw["consumers"][0]["credentials"]["custom"] = json!([{"hidden": SECRET}]);
-    let (client, _) = gateway(move |_, _| verified(&raw, NS_TAG));
+    let (client, _requests) = gateway(move |_, _| verified(&raw, NS_TAG));
     let output = tempfile::tempdir().unwrap();
     let private = tempfile::tempdir().unwrap();
     let bundle = private.path().join("credentials.json");
@@ -1673,7 +1725,7 @@ async fn exact_import_refuses_unsupported_credentials_before_tree_or_bundle_publ
 async fn exact_api_import_records_provenance_and_conditional_file_import_refuses_headers_absent() {
     let raw = envelope(&config(), &BackupExtras::default(), NS_TAG);
     let served = raw.clone();
-    let (client, _) = gateway(move |_, _| verified(&served, NS_TAG));
+    let (client, _requests) = gateway(move |_, _| verified(&served, NS_TAG));
     let output = tempfile::tempdir().unwrap();
     let private = tempfile::tempdir().unwrap();
     let bundle = private.path().join("credentials.json");
