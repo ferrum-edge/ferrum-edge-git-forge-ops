@@ -275,11 +275,15 @@ fn output_bounded_with(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Both readers ended without reporting (thread panic): fill
-                // whatever is missing so the child-status path can finish
-                // instead of waiting for reports that will never arrive.
+                // Both readers are gone: either both reported, or one ended
+                // without reporting (thread panic). Fill whatever is missing
+                // so the child-status path can finish instead of waiting for
+                // reports that will never arrive. `recv_timeout` now returns
+                // at once, so keep polling the child at the same 10 ms pace
+                // instead of spinning a core until it exits or times out.
                 stdout.get_or_insert_with(Vec::new);
                 stderr.get_or_insert_with(Vec::new);
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
@@ -434,12 +438,16 @@ fn run_gateway_validation(
         stderr: String::new(),
         exit_code: 0,
     };
+    // One binary lookup and one private spec/settings pair serve every pass;
+    // only `FERRUM_NAMESPACE` differs between them. The files are removed
+    // when `prepared` drops, on every path including an early error return.
+    let prepared = prepare_validation(&yaml, binary_path)?;
     for namespace in namespaces {
         // Keep the full document: Edge owns both pre-filter field validation
         // and post-filter graph validation. Never opt out of its empty filter gate.
-        let result = run_validate_command(
+        let result = run_validate_pass(
+            &prepared,
             GATEWAY_VALIDATE_MODE,
-            &yaml,
             binary_path,
             scrubber,
             Some(&namespace),
@@ -481,9 +489,10 @@ pub fn run_mesh_validation(
     // gh-env-secret broker walks consumer credentials and plugin config, and
     // neither exists in a mesh slice — so there is nothing to redact and
     // every diagnostic is printed verbatim.
-    run_validate_command(
+    let prepared = prepare_validation(&yaml, binary_path)?;
+    run_validate_pass(
+        &prepared,
         MESH_VALIDATE_MODE,
-        &yaml,
         binary_path,
         &SecretScrubber::default(),
         None,
@@ -491,23 +500,18 @@ pub fn run_mesh_validation(
     )
 }
 
-/// Shared body of [`run_validation`] and [`run_mesh_validation`]: locate the
-/// binary, write `yaml` to a private temp file, and run `validate` in `mode`
-/// with a scrubbed environment and pinned settings.
-///
-/// `scrubber` holds the secret byte sequences to remove from the child's
-/// stdout and stderr before either is returned. Everything else the validator
-/// said — schema errors on proxies, upstreams, plugins, the lot — survives,
-/// which is the whole point: a bundle-loaded apply run must still be able to
-/// report a proxy typo.
-fn run_validate_command(
-    mode: &str,
-    yaml: &str,
-    binary_path: &str,
-    scrubber: &SecretScrubber,
-    namespace: Option<&str>,
-    annotate_namespace: bool,
-) -> crate::error::Result<ValidationResult> {
+/// The located validator binary and the private temp files that every pass
+/// of one validation run shares. Both files are removed when this drops.
+struct PreparedValidation {
+    /// The `which` resolution of the binary, for diagnostics only.
+    binary_in_use: String,
+    spec_file: tempfile::NamedTempFile<std::fs::File>,
+    settings_file: tempfile::NamedTempFile<std::fs::File>,
+}
+
+/// First half of [`run_validation`] and [`run_mesh_validation`]: locate the
+/// binary and write `yaml` and an empty settings file to private temp files.
+fn prepare_validation(yaml: &str, binary_path: &str) -> crate::error::Result<PreparedValidation> {
     // Check that the binary exists / is callable
     // Bounded like every other subprocess here: a PATH-resolved `which`
     // wrapper must not stall or flood validation either. A limit failure is
@@ -522,7 +526,8 @@ fn run_validate_command(
         .and_then(|output| std::str::from_utf8(&output.stdout).ok())
         .map(str::trim)
         .filter(|path| !path.is_empty())
-        .unwrap_or(binary_path);
+        .unwrap_or(binary_path)
+        .to_string();
     let binary_exists = match &which_result {
         Ok(output) => output.status.success(),
         Err(_) => {
@@ -553,11 +558,35 @@ fn run_validate_command(
     // up whatever happens to sit in the working directory or /etc/ferrum.
     let settings_file = private_temp_file("gitforgeops-settings-", ".conf")?;
 
+    Ok(PreparedValidation {
+        binary_in_use,
+        spec_file,
+        settings_file,
+    })
+}
+
+/// Second half of [`run_validation`] and [`run_mesh_validation`]: run
+/// `validate` in `mode` over the prepared spec with a scrubbed environment
+/// and pinned settings.
+///
+/// `scrubber` holds the secret byte sequences to remove from the child's
+/// stdout and stderr before either is returned. Everything else the validator
+/// said — schema errors on proxies, upstreams, plugins, the lot — survives,
+/// which is the whole point: a bundle-loaded apply run must still be able to
+/// report a proxy typo.
+fn run_validate_pass(
+    prepared: &PreparedValidation,
+    mode: &str,
+    binary_path: &str,
+    scrubber: &SecretScrubber,
+    namespace: Option<&str>,
+    annotate_namespace: bool,
+) -> crate::error::Result<ValidationResult> {
     let mut command = Command::new(binary_path);
     command.args(build_validate_args_for_mode(
         mode,
-        settings_file.path(),
-        spec_file.path(),
+        prepared.settings_file.path(),
+        prepared.spec_file.path(),
     ));
     for name in scrubbed_env_names(std::env::vars_os().map(|(name, _)| name)) {
         command.env_remove(name);
@@ -572,14 +601,7 @@ fn run_validate_command(
         command.env("FERRUM_NAMESPACE", namespace);
     }
 
-    let output = output_retrying_busy_executable(&mut command);
-
-    // Both temp files are removed when the handles drop, on every path
-    // including the error return below.
-    drop(spec_file);
-    drop(settings_file);
-
-    let output = output?;
+    let output = output_retrying_busy_executable(&mut command)?;
 
     let exit_code = output.status.code().unwrap_or(-1);
     // One decision point for scrub-or-withhold: a secret that cannot be
@@ -613,9 +635,11 @@ fn run_validate_command(
     }
 
     if mode == GATEWAY_VALIDATE_MODE && exit_code == 1 {
-        if let Some(diagnostic) =
-            super::compatibility::resource_labels_diagnostic(&stdout, &stderr, binary_in_use)
-        {
+        if let Some(diagnostic) = super::compatibility::resource_labels_diagnostic(
+            &stdout,
+            &stderr,
+            &prepared.binary_in_use,
+        ) {
             stderr = diagnostic;
         }
     }
@@ -715,6 +739,41 @@ mod bounded_output_tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(!alive(), "descendant {descendant} survived the deadline");
+    }
+
+    /// A child that closes both pipes and keeps running must be waited for
+    /// at the poll pace, not by spinning on the disconnected channel (#693).
+    /// Linux reports the calling thread's own CPU time, which the wait loop
+    /// runs on, so parallel tests do not disturb the measurement.
+    #[test]
+    fn validator_that_closes_its_pipes_early_is_awaited_without_spinning() {
+        #[cfg(target_os = "linux")]
+        fn thread_cpu_ticks() -> u64 {
+            let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+            // Fields after the parenthesised command name start at `state`;
+            // `utime` and `stime` are the 12th and 13th of those.
+            let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 1..]
+                .split_whitespace()
+                .collect();
+            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec >&- 2>&-; sleep 1; exit 3"]);
+        #[cfg(target_os = "linux")]
+        let before = thread_cpu_ticks();
+        let output = output_bounded_with(&mut command, Duration::from_secs(30), 1024)
+            .expect("a child that outlives its pipes is still awaited");
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        #[cfg(target_os = "linux")]
+        {
+            // A spinning loop burns about 100 ticks (USER_HZ is 100) over
+            // the one-second wait; polling every 10 ms costs almost none.
+            let spent = thread_cpu_ticks() - before;
+            assert!(spent < 30, "waiting spent {spent} CPU ticks");
+        }
     }
 
     #[test]

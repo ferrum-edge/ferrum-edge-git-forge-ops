@@ -536,6 +536,32 @@ fn namespace_labels_do_not_change_annotation_severity() {
     );
 }
 
+/// One run writes the spec and empty settings file once; every namespace pass
+/// reads the same private pair and only `FERRUM_NAMESPACE` differs (#693).
+#[test]
+fn namespace_passes_share_one_spec_and_settings_file() {
+    let repo = Repo::new(&[], None, None);
+    repo.write(
+        "validator",
+        "#!/bin/sh\nprintf '%s %s %s\\n' \"$FERRUM_NAMESPACE\" \"$5\" \"$7\" >> \"$(dirname \"$0\")/files\"\n",
+    );
+    let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "proxies": [
+            {"id": "a", "namespace": "alpha"},
+            {"id": "z", "namespace": "zeta"}
+        ]
+    }))
+    .unwrap();
+    let result = run_validation(&config, repo.validator.to_str().unwrap()).unwrap();
+    assert!(result.success, "{result:?}");
+    let log = std::fs::read_to_string(repo.dir.path().join("files")).unwrap();
+    let passes: Vec<Vec<&str>> = log.lines().map(|line| line.split(' ').collect()).collect();
+    assert_eq!(passes.len(), 2, "{log}");
+    assert_eq!(passes[0][0], "alpha", "{log}");
+    assert_eq!(passes[1][0], "zeta", "{log}");
+    assert_eq!(passes[0][1..], passes[1][1..], "{log}");
+}
+
 /// `api_spec_id` is admin-generated. The shared load boundary refuses a
 /// repository-authored tag before any validator pass or publication.
 #[test]
