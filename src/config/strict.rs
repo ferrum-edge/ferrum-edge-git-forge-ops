@@ -192,25 +192,12 @@ pub(crate) fn resource_kind(resource: &Resource) -> &'static str {
     }
 }
 
-/// Largest YAML document accepted from a resource or overlay file. A
-/// per-resource file is small by design; the parsed shape (depth, nodes and
-/// scalar bytes, alias copies included) is bounded while composing, by
-/// [`crate::yaml::RESOURCE_LIMITS`].
-pub(crate) const MAX_YAML_INPUT_BYTES: usize = 16 * 1024 * 1024;
-
-pub(crate) fn check_yaml_input_bytes(contents: &str, path: &Path) -> crate::error::Result<()> {
-    if contents.len() > MAX_YAML_INPUT_BYTES {
-        return Err(crate::error::Error::Config(format!(
-            "YAML file {} is {} bytes, over the {MAX_YAML_INPUT_BYTES}-byte limit; \
-             split it into per-resource files",
-            path.display(),
-            contents.len()
-        )));
-    }
-    Ok(())
-}
-
 /// Compose a resource or overlay file into its JSON-shaped value.
+///
+/// Both callers read `contents` through `repo_file::read_tree_file`, which
+/// refuses a file over [`super::MAX_REPO_CONFIG_FILE_BYTES`]; the parsed
+/// shape (depth, nodes and scalar bytes, alias copies included) is bounded
+/// while composing, by [`crate::yaml::RESOURCE_LIMITS`].
 ///
 /// The composer refuses whatever would not survive as JSON unchanged —
 /// non-string keys, application tags, non-finite floats — instead of
@@ -221,7 +208,6 @@ pub(crate) fn yaml_file_value(
     contents: &str,
     path: &Path,
 ) -> crate::error::Result<serde_json::Value> {
-    check_yaml_input_bytes(contents, path)?;
     crate::yaml::parse_value(contents, crate::yaml::RESOURCE_LIMITS).map_err(|source| {
         crate::error::Error::YamlParse {
             path: path.to_path_buf(),

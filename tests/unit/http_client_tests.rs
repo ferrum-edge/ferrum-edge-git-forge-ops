@@ -1974,6 +1974,18 @@ fn write_block_reason_tolerates_a_sparse_health_body() {
     assert!(write_block_reason(&health).is_none());
 }
 
+#[test]
+fn health_fields_gitforgeops_does_not_act_on_never_fail_the_preflight() {
+    // Only the fields the write gate reads are modeled (#695): an unmodeled
+    // field of an unexpected shape must not turn a writable gateway into a
+    // health-parse failure.
+    let health = serde_json::from_str::<HealthStatus>(
+        r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true,"config_rejected":{"reason":"older document"}}"#,
+    )
+    .unwrap();
+    assert!(write_block_reason(&health).is_none());
+}
+
 // --- Namespace-bounded tokens (Ferrum Edge v0.9.16) -------------------------
 //
 // Edge v0.9.16 bounds an admin JWT carrying an `ns` claim to the
