@@ -401,9 +401,9 @@ gets a fake value of the right shape:
 | other credentials, and token/header/secret plugin config | `gitforgeops-validation-standin-<64 hex>` |
 | endpoint plugin config (`ldap_url`, `redis_url`, `jwks_uri`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
 
-The scheme follows the field (`ldaps://`, `redis://`, `kafka://`, otherwise
-`https://`). Resolved values are always validated unchanged. Stand-ins are
-never exported, applied, delivered or stored.
+The scheme follows the field (`ldaps://`, `redis://`, otherwise `https://`).
+Resolved values are always validated unchanged. Stand-ins are never exported,
+applied, delivered or stored.
 
 **Workflow-command injection is blocked.** Resource ids, namespaces and
 gateway responses can be attacker-controlled. All diagnostics pass through one
