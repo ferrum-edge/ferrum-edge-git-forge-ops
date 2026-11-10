@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashSet};
 use crate::config::schema::PluginConfig;
 use crate::config::GatewayConfig;
 use crate::plugin_catalog::{
-    auth_coverage, effective_scheme, protocol_list, AuthAllowlist, AuthCoverage,
+    auth_coverage, effective_scheme, protocol_list, AuthAllowlist, AuthCoverage, EnabledPlugins,
 };
 use crate::policy::config::effective_auth_allowlist;
 use crate::policy::PolicyConfig;
@@ -215,6 +215,8 @@ fn check_proxy_auth_coverage(
         plugin_configs: projected_plugin_configs(diffs, desired, actual),
         ..GatewayConfig::default()
     };
+    let live_plugins = EnabledPlugins::new(actual);
+    let projected_plugins = EnabledPlugins::new(&projected);
 
     for live_proxy in &actual.proxies {
         let after_proxy = match diff_action(diffs, "Proxy", &live_proxy.namespace, &live_proxy.id) {
@@ -227,8 +229,8 @@ fn check_proxy_auth_coverage(
             _ => live_proxy,
         };
 
-        let before_coverage = auth_coverage(actual, live_proxy, auth);
-        let after_coverage = auth_coverage(&projected, after_proxy, auth);
+        let before_coverage = auth_coverage(&live_plugins, live_proxy, auth);
+        let after_coverage = auth_coverage(&projected_plugins, after_proxy, auth);
         let after: BTreeSet<String> = running_authenticators(&after_coverage)
             .into_iter()
             .map(|(name, _)| name)

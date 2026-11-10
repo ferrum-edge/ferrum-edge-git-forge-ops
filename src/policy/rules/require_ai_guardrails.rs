@@ -1,7 +1,7 @@
 use crate::config::schema::PluginConfig;
 use crate::config::GatewayConfig;
 use crate::plugin_catalog::{
-    allows_uninspectable_body, cfg_bool, cfg_str, effective_plugins, is_ai_plugin,
+    allows_uninspectable_body, cfg_bool, cfg_str, effective_plugins, is_ai_plugin, EnabledPlugins,
 };
 use crate::policy::config::RequireAiGuardrailsRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
@@ -88,9 +88,10 @@ impl PolicyCheck for RequireAiGuardrailsRule {
             .filter(|name| !name.is_empty())
             .collect();
         let guardrail_list = guardrails.join(", ");
+        let enabled = EnabledPlugins::new(cfg);
 
         for proxy in &cfg.proxies {
-            let effective = effective_plugins(cfg, proxy);
+            let effective = effective_plugins(&enabled, proxy);
             if !effective
                 .iter()
                 .any(|plugin| is_ai_plugin(&plugin.plugin_name))
