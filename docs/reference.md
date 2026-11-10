@@ -135,7 +135,9 @@ without a PR every blocker stands.
 
 `review` computes the same verdict and always shows it, but exits `0` by
 default. `review --fail-on-blockers` (or
-`GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`) makes it exit `1` on blockers;
+`GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`) makes it exit `1` on blockers
+(without a credential bundle, `alloc=require` slots are left to `apply`, as
+the verdict says);
 `--require-live` makes it exit non-zero when the live comparison or the PR
 comment fails. The bundled workflows use `--require-live` for trusted live
 review and leave static review as comment output.

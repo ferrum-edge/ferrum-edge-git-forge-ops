@@ -1491,7 +1491,9 @@ gateway, as `Vec<ApplyBlocker>` over eleven `BlockerKind`s:
   class (provisioning, narrowed or colliding publication, smoke checks, probe
   allowlist) from the same `apply_blockers` result with its remedy, so it
   blocks whenever one of them would fail the flag. The flag changes only the
-  exit code.
+  exit code. Without a credential bundle the verdict cannot decide
+  `alloc=require` slots ("bundle unavailable"), so `review` drops
+  `RequiredCredentials` from the flag's gate too; `plan` and `apply` keep it.
 - `cmd_apply` calls the *same per-class predicates* (`security_blocker`,
   `policy_blocker`, `required_credentials_blocker`, `validation_blocker`,
   `credential_provisioning_blockers`) at its own gate points, because order

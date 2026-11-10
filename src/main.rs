@@ -4264,7 +4264,7 @@ async fn cmd_review(
     // counts the findings classes from the findings themselves and lists every
     // other class from this vec, so it blocks whenever `--fail-on-blockers`
     // would fail on one of them, and the flag only changes the exit code.
-    let blockers = verdict::apply_blockers(ApplyGateInputs {
+    let mut blockers = verdict::apply_blockers(ApplyGateInputs {
         validation_ok: matches!(validation_status, review::ReviewValidationStatus::Passed),
         security_findings: &security_findings,
         security_overridden,
@@ -4278,6 +4278,14 @@ async fn cmd_review(
         smoke_checks_invalid: smoke_invalid,
         probe_allowlist_invalid,
     });
+    // Without a bundle every `alloc=require` slot reads as missing, which is
+    // no evidence either way: the verdict says the bundle is unavailable and
+    // that apply checks those slots, and does not count them. The flag must
+    // not fail on what the verdict cannot decide (#688). `plan` and `apply`
+    // keep the blocker.
+    if !bundle_loaded {
+        blockers.retain(|blocker| blocker.kind != verdict::BlockerKind::RequiredCredentials);
+    }
     // The classes with no findings section or count line of their own. Their
     // remedies are fixed text, so nothing from the environment or the smoke
     // file reaches the PR.
