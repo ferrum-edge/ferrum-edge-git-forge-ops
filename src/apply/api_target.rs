@@ -407,42 +407,7 @@ pub fn incremental_prune_notice(
     }
 }
 
-/// Apply configuration to the gateway via the admin API.
-///
-/// Iterates `namespaces` explicitly rather than inferring them from `desired`.
-/// This matters for `exclusive` ownership: a namespace the repo manages but no
-/// longer declares resources in still needs to be reconciled (to prune the
-/// resources that were removed). The caller decides the scope (typically
-/// `ownership.namespaces` for exclusive, or the namespaces present in
-/// `desired` for shared).
-///
-/// In shared ownership mode, only resources in the caller-provided managed set
-/// can be deleted; admin-added resources are reported in `unmanaged_skipped`
-/// but not touched. Exclusive mode treats every live resource in scope as owned.
-///
-/// **Preflight:** an authenticated `GET /health` runs before the first
-/// mutation. A gateway that reports `admin_writes_enabled: false` (or runs in
-/// file/dp/mesh/node_agent mode) fails the whole run with one clear error
-/// instead of N per-resource 403s.
-///
-/// **Atomicity:** both strategies are **per-namespace**, not environment-wide.
-/// `full_replace` delegates to the gateway's `/restore?confirm=true` endpoint
-/// which is atomic for the single namespace it targets, but when the scope
-/// spans multiple namespaces each namespace is restored in its own API call;
-/// a failure on namespace N leaves namespaces 0..N already restored. To make
-/// the per-namespace failure visible rather than swallowing subsequent
-/// namespaces, a restore error is recorded in `ApplyResult::errors` and the
-/// loop continues to the next namespace. The overall call still returns Err
-/// via `into_result()` so the workflow fails, but the error message now
-/// enumerates every namespace that failed (and implicitly, every one that
-/// succeeded). Operators running cross-namespace full_replace should
-/// understand this: partial restores need manual remediation.
-///
-/// **Fatal errors** (see [`is_fatal`]) stop the loop but do *not* discard the
-/// aggregate: they are recorded in [`ApplyResult::fatal_error`] and returned as
-/// `Ok`, so the caller can persist state for everything that already landed
-/// before propagating the failure. `into_result()` still turns it into an
-/// `Err`, so the run exits non-zero either way.
+/// Everything `apply_api` materializes before its first write.
 #[derive(Default)]
 struct PreparedApply<'a> {
     /// One authoritative live view per namespace. Views the caller supplied
@@ -654,6 +619,42 @@ pub async fn apply_blocked_namespaces(
     Ok(prepared.blocked)
 }
 
+/// Apply configuration to the gateway via the admin API.
+///
+/// Iterates `namespaces` explicitly rather than inferring them from `desired`.
+/// This matters for `exclusive` ownership: a namespace the repo manages but no
+/// longer declares resources in still needs to be reconciled (to prune the
+/// resources that were removed). The caller decides the scope
+/// (`reconcile::resolved_namespaces`: `ownership.namespaces` for exclusive;
+/// declared plus ledger-derived namespaces for shared).
+///
+/// In shared ownership mode, only resources in the caller-provided managed set
+/// can be deleted; admin-added resources are reported in `unmanaged_skipped`
+/// but not touched. Exclusive mode treats every live resource in scope as owned.
+///
+/// **Preflight:** an authenticated `GET /health` runs before the first
+/// mutation. A gateway that reports `admin_writes_enabled: false` (or runs in
+/// file/dp/mesh/node_agent mode) fails the whole run with one clear error
+/// instead of N per-resource 403s.
+///
+/// **Atomicity:** both strategies are **per-namespace**, not environment-wide.
+/// `full_replace` delegates to the gateway's `/restore?confirm=true` endpoint
+/// which is atomic for the single namespace it targets, but when the scope
+/// spans multiple namespaces each namespace is restored in its own API call;
+/// a failure on namespace N leaves namespaces 0..N already restored. To make
+/// the per-namespace failure visible rather than swallowing subsequent
+/// namespaces, a restore error is recorded in `ApplyResult::errors` and the
+/// loop continues to the next namespace. The overall call still returns Err
+/// via `into_result()` so the workflow fails, but the error message now
+/// enumerates every namespace that failed (and implicitly, every one that
+/// succeeded). Operators running cross-namespace full_replace should
+/// understand this: partial restores need manual remediation.
+///
+/// **Fatal errors** (see [`is_fatal`]) stop the loop but do *not* discard the
+/// aggregate: they are recorded in [`ApplyResult::fatal_error`] and returned as
+/// `Ok`, so the caller can persist state for everything that already landed
+/// before propagating the failure. `into_result()` still turns it into an
+/// `Err`, so the run exits non-zero either way.
 pub async fn apply_api(
     desired: &GatewayConfig,
     client: &AdminClient,
@@ -2694,7 +2695,7 @@ impl<'a> Preconditions<'a> {
         update: bool,
     ) -> crate::error::Result<Option<String>> {
         if kind == "Consumer" {
-            return self.confirm_consumer(id, update).await;
+            return self.confirm_consumer(id).await;
         }
         let Some(tagged) = self.client.get_tagged(kind, id, self.namespace).await? else {
             return Ok(None);
@@ -2781,11 +2782,7 @@ impl<'a> Preconditions<'a> {
         })
     }
 
-    async fn confirm_consumer(
-        &mut self,
-        id: &str,
-        _update: bool,
-    ) -> crate::error::Result<Option<String>> {
+    async fn confirm_consumer(&mut self, id: &str) -> crate::error::Result<Option<String>> {
         let planned = self.consumer_evidence.get(id).ok_or_else(|| {
             crate::error::Error::ConditionalWriteUnavailable(
                 "complete planned consumer evidence was not captured before allocation".to_string(),

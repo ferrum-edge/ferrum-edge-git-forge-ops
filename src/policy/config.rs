@@ -56,7 +56,7 @@ pub struct RequireAuthPluginRuleConfig {
     pub severity: Severity,
     /// Plugin names that count as authentication. Defaults cover the
     /// Ferrum Edge built-in auth plugins. The explicit allowlist accepts
-    /// canonical auth plugin ids such as `jwt` and rejects unrelated plugin
+    /// canonical auth plugin ids such as `jwt_auth` and rejects unrelated plugin
     /// names that merely contain auth-like substrings.
     #[serde(default = "default_auth_plugin_names")]
     pub auth_plugin_names: Vec<String>,

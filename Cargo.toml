@@ -61,4 +61,3 @@ rustix = { version = "1", features = ["fs"] }
 # tests/unit/yaml_compat_tests.rs and the export readback tests check src/yaml.rs
 # against it. Never a runtime dependency.
 serde_yaml = "0.9"
-base64 = "0.23"

@@ -182,10 +182,12 @@ fn unknown_fields_error_cannot_emit_a_workflow_command() {
     assert!(rendered.contains('\u{fffd}'), "{rendered}");
 }
 
-/// Every `Error` variant that carries repository- or gateway-sourced text.
+/// Every `Error` variant that carries repository- or gateway-sourced text and
+/// can be built from a string or a path (variants wrapping a source error are
+/// not listed).
 ///
-/// A variant added later with an unsanitized payload fails here rather than
-/// in an Actions log.
+/// Add a new text-carrying variant here, so an unsanitized payload fails this
+/// test rather than reaching an Actions log.
 #[test]
 fn untrusted_error_variants_cannot_emit_a_workflow_command() {
     let bad = HOSTILE.to_string();
@@ -220,13 +222,30 @@ fn untrusted_error_variants_cannot_emit_a_workflow_command() {
         code: 1,
         stderr: bad.clone(),
     };
+    let missing_kind = Error::MissingKind {
+        path: path.to_path_buf(),
+    };
+    let missing_spec = Error::MissingSpec {
+        path: path.to_path_buf(),
+    };
+    let committed_not_live = Error::CommittedNotLive {
+        reason: bad.clone(),
+        message: bad.clone(),
+    };
 
     check("UnknownFields", unknown_fields);
     check("UnknownKind", unknown_kind);
     check("OrphanOverlay", orphan_overlay);
     check("ApiError", api_error);
     check("ValidateProcess", validate_process);
+    check("MissingKind", missing_kind);
+    check("MissingSpec", missing_spec);
+    check("CommittedNotLive", committed_not_live);
     check("ConfigSymlink", Error::ConfigSymlink(path.clone()));
+    check(
+        "ConfigNotDirectory",
+        Error::ConfigNotDirectory(path.clone()),
+    );
     check("NoResourcesDir", Error::NoResourcesDir(path));
     check("Config", Error::Config(bad.clone()));
     check("BackupNamespace", Error::BackupNamespace(bad.clone()));
@@ -251,6 +270,17 @@ fn untrusted_error_variants_cannot_emit_a_workflow_command() {
         Error::GatewayWriteStateUnknown(bad.clone()),
     );
     check("HttpClient", Error::HttpClient(bad.clone()));
+    check("BinaryNotFound", Error::BinaryNotFound(bad.clone()));
+    check("ApiSpecsAtRisk", Error::ApiSpecsAtRisk(bad.clone()));
+    check(
+        "RestoreNeedsManualRecovery",
+        Error::RestoreNeedsManualRecovery(bad.clone()),
+    );
+    check(
+        "UnsupportedBackupSections",
+        Error::UnsupportedBackupSections(bad.clone()),
+    );
+    check("JwtError", Error::JwtError(bad.clone()));
     check(
         "CredentialSlotRemap",
         Error::CredentialSlotRemap(bad.clone()),

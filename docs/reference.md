@@ -302,7 +302,7 @@ case-insensitive), malformed numbers, zero for the timeout and TTL settings
 |---|---|---|
 | `FERRUM_ENV` | — | Environment from `.gitforgeops/config.yaml`; `--env` wins. |
 | `FERRUM_NAMESPACE` | — | Limit the run to one namespace. |
-| `FERRUM_OVERLAY` | — | Overlay to use when no environment is selected. |
+| `FERRUM_OVERLAY` | — | Overlay to use when the selected environment declares none, or when no environment is selected. |
 | `FERRUM_GATEWAY_MODE` | `api` | `api` or `file`. |
 | `FERRUM_APPLY_STRATEGY` | `incremental` | `incremental` or `full_replace`; repository config wins when an environment is selected. |
 | `FERRUM_GATEWAY_URL` | — | Admin API URL. See [Transport security](#transport-security). |
@@ -330,7 +330,7 @@ case-insensitive), malformed numbers, zero for the timeout and TTL settings
 | `FERRUM_GITHUB_REQUEST_TIMEOUT_SECS` | `30` | GitHub API request timeout. |
 | `FERRUM_GATEWAY_MAX_RETRIES` | `3` | Admin API retries; `0` disables. See [Retries](apply.md#retries). |
 | `GITHUB_TOKEN`, `GITHUB_REPOSITORY` | — | GitHub API access for reviews, overrides and allocation. |
-| `GITFORGEOPS_PR_NUMBER` | — | PR to associate with the run (set by review workflows). |
+| `GITFORGEOPS_PR_NUMBER` | — | PR whose override `plan` and `apply` evaluate, and where allocated credentials are posted (set by the bundled apply workflow; `review` takes `--pr`). |
 | `GITFORGEOPS_ACTOR` | — | Credential recipient during `apply`. |
 | `GITFORGEOPS_ALLOCATION_REVISION` | checked-out commit | Revision allocation records are bound to. |
 

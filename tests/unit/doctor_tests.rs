@@ -177,7 +177,11 @@ fn a_missing_validator_pin_and_binary_are_separate_findings() {
         .as_ref()
         .expect("remediation")
         .contains("trusted validator build"));
-    assert_ne!(find(&checks, "validator-binary").id, pin.id);
+    assert!(
+        ids(&checks).contains(&"validator-binary"),
+        "{:?}",
+        ids(&checks)
+    );
 }
 
 #[test]
@@ -550,7 +554,8 @@ fn github_checks_without_a_token_are_unknown_rather_than_passed() {
     let check = find(&checks, "settings-audit");
     assert_eq!(check.status, Status::Unknown);
     assert!(check.detail.contains("Administration: read"));
-    // An unknown check must not be able to make a repository look ready...
+    // An unknown check does not block, so the repository still reads as
+    // ready...
     let mut report = Report::default();
     report.extend(checks);
     assert!(report.is_ready());

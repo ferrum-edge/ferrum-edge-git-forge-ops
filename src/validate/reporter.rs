@@ -12,17 +12,6 @@ pub enum OutputFormat {
     GithubAnnotations,
 }
 
-impl OutputFormat {
-    /// Parse from a string value (case-insensitive).
-    pub fn from_str_lossy(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "json" => Self::Json,
-            "github" | "github-annotations" | "github_annotations" => Self::GithubAnnotations,
-            _ => Self::Text,
-        }
-    }
-}
-
 /// Format a `ValidationResult` for the given output mode.
 pub fn format_result(result: &ValidationResult, format: OutputFormat) -> String {
     match format {

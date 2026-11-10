@@ -349,8 +349,6 @@ impl PreparedConsumerRotation {
 pub struct ConditionalMetadata {
     pub namespace: String,
     pub namespace_token: NamespaceToken,
-    pub row_tokens: BTreeMap<String, BTreeMap<String, RowToken>>,
-    pub raw_rows: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl fmt::Debug for ConditionalMetadata {
@@ -420,8 +418,6 @@ pub fn conditional_backup(
     if maps.len() != 4 || counts.len() != 6 {
         return Err(invalid());
     }
-    let mut row_tokens = BTreeMap::new();
-    let mut raw_rows = BTreeMap::new();
     let mut consumers = BTreeMap::new();
     for section in ["proxies", "consumers", "upstreams", "plugin_configs"] {
         let rows = root
@@ -433,8 +429,6 @@ pub fn conditional_backup(
             .and_then(Value::as_object)
             .ok_or_else(invalid)?;
         let mut ids = BTreeSet::new();
-        let mut tokens = BTreeMap::new();
-        let mut raw = BTreeMap::new();
         for row in rows {
             let id = row.get("id").and_then(Value::as_str).ok_or_else(invalid)?;
             validate_identity(row, namespace, id)?;
@@ -448,18 +442,14 @@ pub fn conditional_backup(
                     id.to_string(),
                     ConsumerEvidence {
                         row: row.clone(),
-                        token: token.clone(),
+                        token,
                     },
                 );
             }
-            raw.insert(id.to_string(), row.clone());
-            tokens.insert(id.to_string(), token);
         }
         if tags.len() != ids.len() || tags.keys().any(|id| !ids.contains(id.as_str())) {
             return Err(invalid());
         }
-        raw_rows.insert(section.to_string(), raw);
-        row_tokens.insert(section.to_string(), tokens);
     }
     let specs = root
         .get("api_specs")
@@ -498,8 +488,6 @@ pub fn conditional_backup(
     snapshot.extras.conditional = Some(ConditionalMetadata {
         namespace: namespace.to_string(),
         namespace_token,
-        row_tokens,
-        raw_rows,
     });
     Ok(snapshot)
 }

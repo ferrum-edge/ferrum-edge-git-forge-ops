@@ -66,17 +66,8 @@ fn require_provisioner_token(token: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// Fetch the libsodium public key for an environment's secrets.
-pub async fn fetch_public_key(
-    client: &Client,
-    repo: &str,
-    environment: &str,
-    token: &str,
-) -> crate::error::Result<EnvSecretPublicKey> {
-    fetch_public_key_at(client, DEFAULT_GITHUB_API_BASE, repo, environment, token).await
-}
-
-/// [`fetch_public_key`] against an explicit API origin.
+/// Fetch the libsodium public key for an environment's secrets from the
+/// GitHub API at `api_base`.
 ///
 /// Production callers pass [`DEFAULT_GITHUB_API_BASE`]. Tests inject an
 /// in-process loopback origin; TLS and bearer-token handling are unchanged.
@@ -140,30 +131,8 @@ pub fn seal_secret(pubkey_b64: &str, plaintext: &[u8]) -> crate::error::Result<S
     Ok(base64::engine::general_purpose::STANDARD.encode(sealed))
 }
 
-/// Create or overwrite an environment secret on GitHub.
-pub async fn put_environment_secret(
-    client: &Client,
-    repo: &str,
-    environment: &str,
-    secret_name: &str,
-    plaintext: &[u8],
-    pubkey: &EnvSecretPublicKey,
-    token: &str,
-) -> crate::error::Result<()> {
-    put_environment_secret_at(
-        client,
-        DEFAULT_GITHUB_API_BASE,
-        repo,
-        environment,
-        secret_name,
-        plaintext,
-        pubkey,
-        token,
-    )
-    .await
-}
-
-/// [`put_environment_secret`] against an explicit API origin.
+/// Create or overwrite an environment secret through the GitHub API at
+/// `api_base`.
 ///
 /// Production callers pass [`DEFAULT_GITHUB_API_BASE`]. Tests inject an
 /// in-process loopback origin; TLS and bearer-token handling are unchanged.

@@ -173,8 +173,9 @@ pub fn resolve_env(
                     ))
                 })?;
                 merge(default.clone(), env, env_config)
-            } else if repo.environments.len() == 1 {
-                let (name, env) = repo.environments.iter().next().unwrap();
+            } else if let (1, Some((name, env))) =
+                (repo.environments.len(), repo.environments.iter().next())
+            {
                 merge(name.clone(), env, env_config)
             } else if repo.environments.is_empty() {
                 synthetic_default(env_config, selected.as_deref())

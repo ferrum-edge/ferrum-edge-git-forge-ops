@@ -14,21 +14,6 @@ pub fn comment_status_is_retryable(status: u16) -> bool {
     matches!(status, 408 | 429 | 503)
 }
 
-/// Promote a PR-comment delivery failure to a trusted-review failure after
-/// the caller has written its step-summary/stdout fallback. Secretless and
-/// fork reviews intentionally retain best-effort delivery.
-pub fn enforce_required_comment_delivery(
-    require_live: bool,
-    delivery_error: &str,
-) -> crate::error::Result<()> {
-    if require_live {
-        return Err(crate::error::Error::Config(format!(
-            "trusted live review could not post its required PR comment: {delivery_error}"
-        )));
-    }
-    Ok(())
-}
-
 /// Post `comment` to the PR. It is published, so it goes through the display
 /// sink like stdout.
 pub async fn post_pr_comment(

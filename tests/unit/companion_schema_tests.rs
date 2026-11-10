@@ -75,16 +75,6 @@ fn intentionally_uncovered(struct_name: &str) -> BTreeSet<String> {
     skip
 }
 
-fn spec_keys(resource: &Resource) -> BTreeSet<String> {
-    let value = serde_json::to_value(resource).expect("serialize resource");
-    value["spec"]
-        .as_object()
-        .expect("spec is an object")
-        .keys()
-        .cloned()
-        .collect()
-}
-
 /// Keys the fixture *authored* under `spec:` for one kind, read from the raw
 /// YAML. Coverage must be measured here, not on the serialized resource:
 /// Serde defaults are emitted even for fields the fixture never set (a
@@ -182,7 +172,6 @@ fn companion_schema_fixture_loads_and_assembles_under_strict_mode() {
 #[test]
 fn companion_schema_fixture_covers_every_mirrored_field() {
     let source = schema_source();
-    let resources = load_fixture();
 
     for (struct_name, matcher) in [
         ("Proxy", "Proxy"),
@@ -191,21 +180,6 @@ fn companion_schema_fixture_covers_every_mirrored_field() {
         ("PluginConfig", "PluginConfig"),
         ("MeshConfigSpec", "MeshConfig"),
     ] {
-        let resource = resources
-            .iter()
-            .map(|(_, resource)| resource)
-            .find(|resource| {
-                matches!(
-                    (matcher, resource),
-                    ("Proxy", Resource::Proxy { .. })
-                        | ("Consumer", Resource::Consumer { .. })
-                        | ("Upstream", Resource::Upstream { .. })
-                        | ("PluginConfig", Resource::PluginConfig { .. })
-                        | ("MeshConfig", Resource::MeshConfig { .. })
-                )
-            })
-            .unwrap_or_else(|| panic!("fixture is missing a {matcher}"));
-
         let expected: BTreeSet<String> = declared_fields(&source, struct_name)
             .difference(&intentionally_uncovered(struct_name))
             .cloned()
@@ -214,7 +188,6 @@ fn companion_schema_fixture_covers_every_mirrored_field() {
         // serialized resource is checked separately (round-trip test);
         // measuring here would let Serde defaults pose as coverage.
         let covered = authored_spec_keys(matcher);
-        let _ = spec_keys(resource);
         let missing: Vec<&String> = expected.difference(&covered).collect();
         assert!(
             missing.is_empty(),

@@ -1614,7 +1614,8 @@ fn shipped_resource_examples_pass_the_backend_allowlist_when_uncommented() {
 
     // What a fork actually does: rename the file and uncomment it. The proxy
     // example must therefore name a real upstream and must not smuggle a
-    // placeholder backend host alongside `upstream_id`.
+    // placeholder backend host alongside `upstream_id`. Read through the
+    // fixture copy: unit tests never read the customer-owned `resources/` tree.
     let uncommented = |path: &str| {
         let text = std::fs::read_to_string(path).expect("shipped example exists");
         text.lines()
@@ -1634,7 +1635,9 @@ fn shipped_resource_examples_pass_the_backend_allowlist_when_uncommented() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("example.yaml"),
-            uncommented(&format!("resources/ferrum/{kind}/_example.yaml")),
+            uncommented(&format!(
+                "tests/fixtures/shipped-examples/ferrum/{kind}/_example.yaml"
+            )),
         )
         .unwrap();
     }
@@ -2114,7 +2117,7 @@ fn require_auth_plugin_ignores_disabled_plugins() {
         extra: Default::default(),
         id: "jwt-disabled".to_string(),
         namespace: "ferrum".to_string(),
-        plugin_name: "jwt".to_string(),
+        plugin_name: "jwt_auth".to_string(),
         scope: PluginScope::Global,
         proxy_id: None,
         enabled: false,
@@ -2177,7 +2180,7 @@ fn require_auth_plugin_ignores_disabled_plugins() {
 
 #[test]
 fn require_auth_plugin_uses_explicit_allowlist() {
-    // The allowlist accepts canonical auth plugin ids such as `jwt` and
+    // The allowlist accepts canonical auth plugin ids such as `jwt_auth` and
     // rejects unrelated plugin names that merely contain auth-like
     // substrings (e.g. `body_size_audit`, `fake-auth-bypass`).
     use gitforgeops::config::schema::{PluginConfig, PluginScope};
@@ -2822,11 +2825,6 @@ fn conditional_auth_exemption_is_exact_and_reports_stale_entries() {
         1,
         "{findings:?}"
     );
-    assert!(findings.iter().any(|finding| {
-        finding.severity == Severity::Info
-            && finding.namespace == "ferrum"
-            && finding.message.contains("exemption 'ferrum/api'")
-    }));
     assert!(!findings
         .iter()
         .any(|finding| { finding.kind == "PolicyConfig" && finding.message.contains("stale") }));

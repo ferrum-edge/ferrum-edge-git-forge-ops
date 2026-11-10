@@ -151,7 +151,6 @@ pub struct ConfigExport {
     pub cached: bool,
     /// Keyed label of the gateway's fingerprint key.
     pub fingerprint_key_id: String,
-    pub ferrum_version: Option<String>,
     /// Set when `counts` disagrees with the document. Advisory, as for a
     /// read-only `/backup` comparison.
     pub count_seal_notice: Option<String>,
@@ -222,10 +221,6 @@ impl ConfigExport {
             .get("source")
             .and_then(Value::as_str)
             .is_some_and(|source| source.eq_ignore_ascii_case("cached"));
-        let ferrum_version = document
-            .get("ferrum_version")
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let version = document
             .get("version")
             .and_then(Value::as_str)
@@ -274,7 +269,6 @@ impl ConfigExport {
             namespace: namespace.to_string(),
             cached: header_cached || body_cached,
             fingerprint_key_id,
-            ferrum_version,
             count_seal_notice: seal_notice,
             version,
             rows,

@@ -592,7 +592,7 @@ async fn surface_delivered_credentials(
             None => {
                 undelivered.push(slot.slot.as_str());
                 body.text(
-                    "**NOT DELIVERED** — the recipient had no SSH key on file or was not provided. Run `gitforgeops rotate` after adding an SSH key to deliver the value.\n\n",
+                    "**NOT DELIVERED** — no recipient was configured for this run, so no ciphertext was created.\n\n",
                 );
             }
         }
@@ -640,7 +640,7 @@ async fn surface_delivered_credentials(
     display::write_composed_stdout(&body);
     if !undelivered.is_empty() {
         eoutln!(
-            "Warning: {} slot(s) could not be delivered (no recipient SSH key): {}",
+            "Warning: {} slot(s) were not delivered (no recipient configured): {}",
             undelivered.len(),
             safe(undelivered.join(", "))
         );
@@ -3594,7 +3594,7 @@ async fn cmd_apply(
                             safe(&d.key_fingerprint)
                         ),
                         None => eoutln!(
-                            "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
+                            "  {} -> NOT DELIVERED (no recipient configured)",
                             safe(&slot.slot)
                         ),
                     }
@@ -4467,8 +4467,9 @@ async fn cmd_verify(
 /// around the existing commands:
 ///
 /// 1. **It never mutates.** No settings writer, no gateway write, no
-///    credential allocation, no state lock. The gateway scope reaches exactly
-///    `GET /health` and `GET /cluster`.
+///    credential allocation, no state lock. The gateway scope issues only
+///    `GET`s: `/health`, `/cluster`, `/namespaces` and the capability reads
+///    listed in `doctor::gateway`.
 /// 2. **It never guesses.** A check that could not run reports `UNKNOWN`, and
 ///    `UNKNOWN` is not a pass — a laptop with no administration-read token has
 ///    not verified the branch ruleset, and saying so is the whole point.
@@ -4701,8 +4702,7 @@ fn cmd_envs(
                 // target, so it never gains a monitoring environment either.
                 monitoring_environment: ResolvedEnv::default_env_name(),
                 unattended_monitoring: false,
-
-                // target, so it is never a promotion participant either.
+                // Nor is it ever a promotion participant.
                 promotion_requires: None,
             }],
         };

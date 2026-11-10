@@ -7,7 +7,6 @@ use gitforgeops::policy::config::OverrideConfig;
 use gitforgeops::policy::{PolicyFinding, Severity};
 use gitforgeops::review::comment_status_is_retryable;
 use gitforgeops::review::enforce_comment_delivery;
-use gitforgeops::review::enforce_required_comment_delivery;
 use gitforgeops::review::live_comparison_precondition_error;
 use gitforgeops::review::pr_comment::{
     build_review_comment, build_review_comment_v2, build_review_comment_with_status,
@@ -1238,15 +1237,6 @@ fn review_comment_is_utf8_safe_bounded_and_reports_omissions() {
         comment.contains("\n````\n\n"),
         "validation fence must close cleanly: {comment}"
     );
-}
-
-#[test]
-fn trusted_review_requires_comment_delivery_after_fallback() {
-    assert!(enforce_required_comment_delivery(false, "HTTP 403").is_ok());
-    let error = enforce_required_comment_delivery(true, "HTTP 403").unwrap_err();
-    let message = error.to_string();
-    assert!(message.contains("required PR comment"), "{message}");
-    assert!(message.contains("HTTP 403"), "{message}");
 }
 
 #[test]
