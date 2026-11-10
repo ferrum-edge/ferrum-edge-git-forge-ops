@@ -1966,9 +1966,9 @@ fn an_ordinary_single_line_secret_keeps_full_diagnostics() {
 #[test]
 fn review_validates_gateway_and_mesh_before_reporting_passed() {
     use gitforgeops::config::{GatewayConfig, MeshConfigSpec};
-    use gitforgeops::review::{
-        build_review_comment_with_status, validate_for_review, ReviewValidationStatus,
-    };
+    use gitforgeops::review::pr_comment::build_review_comment_with_preview;
+    use gitforgeops::review::{validate_for_review_with_report, ReviewValidationStatus};
+    use gitforgeops::secrets::ResolveReport;
 
     let dir = tempfile::tempdir().unwrap();
     let gateway = GatewayConfig::default();
@@ -1996,23 +1996,36 @@ fn review_validates_gateway_and_mesh_before_reporting_passed() {
         ),
     ] {
         let binary = echo_validator(dir.path(), "review-validator", script);
-        let result = validate_for_review(
+        let result = validate_for_review_with_report(
             &gateway,
             include_mesh.then_some(&mesh),
             binary.to_str().unwrap(),
+            &ResolveReport::default(),
         );
         assert_eq!(result.status, expected, "{}", result.output);
         assert!(result.output.contains("mode-file"));
         assert_eq!(result.output.contains("mode-mesh"), include_mesh);
         assert!(result.execution_error.is_none());
-        let comment = build_review_comment_with_status(
+        let comment = build_review_comment_with_preview(
             result.status,
             &result.output,
             &[],
             &[],
             &[],
             &[],
+            &[],
+            &[],
+            &[],
             None,
+            None,
+            None,
+            None,
+            &ResolveReport::default(),
+            false,
+            None,
+            &[],
+            &[],
+            false,
         );
         assert_eq!(
             comment.contains("Validation: PASSED"),
@@ -2023,10 +2036,11 @@ fn review_validates_gateway_and_mesh_before_reporting_passed() {
             assert!(comment.contains("rejected"));
         }
     }
-    let result = validate_for_review(
+    let result = validate_for_review_with_report(
         &gateway,
         Some(&mesh),
         dir.path().join("missing-validator").to_str().unwrap(),
+        &ResolveReport::default(),
     );
     assert_eq!(result.status, ReviewValidationStatus::ExecutionError);
     assert!(result.execution_error.is_some());

@@ -4,20 +4,165 @@ use gitforgeops::diff::{
 };
 use gitforgeops::error::Error;
 use gitforgeops::policy::config::OverrideConfig;
+use gitforgeops::policy::OverrideDecision;
 use gitforgeops::policy::{PolicyFinding, Severity};
 use gitforgeops::review::comment_status_is_retryable;
 use gitforgeops::review::enforce_comment_delivery;
 use gitforgeops::review::live_comparison_precondition_error;
 use gitforgeops::review::pr_comment::{
-    build_review_comment, build_review_comment_v2, build_review_comment_with_status,
-    environment_header, markdown_comment_for_terminal, render_spec_owned, ReviewValidationStatus,
-    MAX_REVIEW_COMMENT_BYTES,
+    build_review_comment_with_preview, environment_header, markdown_comment_for_terminal,
+    render_spec_owned, ReviewValidationStatus, MAX_REVIEW_COMMENT_BYTES,
 };
 use gitforgeops::review::{
     enforce_live_comparison, enforce_offline_blockers, redact_comparison_error,
     stale_live_view_error, STALE_LIVE_VIEW_REASON,
 };
 use gitforgeops::secrets::ResolveReport;
+
+/// The comment `cmd_review` posts, for a run with only validation, changes and
+/// audit findings: every other input of `build_review_comment_with_preview`
+/// is empty.
+fn review_comment(
+    validation_success: bool,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    comparison_error: Option<&str>,
+) -> String {
+    review_comment_with_status(
+        validation_status(validation_success),
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        comparison_error,
+    )
+}
+
+fn validation_status(success: bool) -> ReviewValidationStatus {
+    if success {
+        ReviewValidationStatus::Passed
+    } else {
+        ReviewValidationStatus::Rejected
+    }
+}
+
+fn review_comment_with_status(
+    validation_status: ReviewValidationStatus,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    comparison_error: Option<&str>,
+) -> String {
+    build_review_comment_with_preview(
+        validation_status,
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        comparison_error,
+        None,
+        &ResolveReport::default(),
+        false,
+        None,
+        &[],
+        &[],
+        false,
+    )
+}
+
+/// The posted comment with every input but adoptions and offline gate
+/// blockers.
+#[allow(clippy::too_many_arguments)]
+fn review_comment_v2(
+    validation_success: bool,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    policy: &[PolicyFinding],
+    unmanaged: &[UnmanagedResource],
+    spec_owned: &[SpecOwnedResource],
+    override_reason: Option<&str>,
+    override_cfg: Option<&OverrideConfig>,
+    comparison_error: Option<&str>,
+    environment_note: Option<&str>,
+    secrets: &ResolveReport,
+    bundle_loaded: bool,
+) -> String {
+    review_comment_v2_with_override(
+        validation_status(validation_success),
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        policy,
+        unmanaged,
+        spec_owned,
+        override_reason,
+        override_cfg,
+        comparison_error,
+        environment_note,
+        secrets,
+        bundle_loaded,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review_comment_v2_with_override(
+    validation_status: ReviewValidationStatus,
+    validation_output: &str,
+    diffs: &[ResourceDiff],
+    breaking: &[BreakingChange],
+    security: &[SecurityFinding],
+    best_practices: &[BestPractice],
+    policy: &[PolicyFinding],
+    unmanaged: &[UnmanagedResource],
+    spec_owned: &[SpecOwnedResource],
+    override_reason: Option<&str>,
+    override_cfg: Option<&OverrideConfig>,
+    comparison_error: Option<&str>,
+    environment_note: Option<&str>,
+    secrets: &ResolveReport,
+    bundle_loaded: bool,
+    security_override: Option<&OverrideDecision>,
+) -> String {
+    build_review_comment_with_preview(
+        validation_status,
+        validation_output,
+        diffs,
+        breaking,
+        security,
+        best_practices,
+        policy,
+        unmanaged,
+        spec_owned,
+        override_reason,
+        override_cfg,
+        comparison_error,
+        environment_note,
+        secrets,
+        bundle_loaded,
+        security_override,
+        &[],
+        &[],
+        false,
+    )
+}
 
 #[test]
 fn truncation_notice_ignores_headings_inside_validator_output() {
@@ -35,7 +180,7 @@ fn truncation_notice_ignores_headings_inside_validator_output() {
             overridden_by: None,
         })
         .collect();
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         false,
         "error: bad\n### Policy Violations\nmore\n",
         &[],
@@ -62,7 +207,7 @@ fn truncation_notice_ignores_headings_inside_validator_output() {
 
 #[test]
 fn review_comment_shows_validation_pass() {
-    let comment = build_review_comment(true, "", &[], &[], &[], &[], None);
+    let comment = review_comment(true, "", &[], &[], &[], &[], None);
     assert!(comment.contains("PASS"));
 }
 
@@ -128,7 +273,7 @@ fn oversized_review_preserves_every_blocker_and_names_omitted_sections() {
         status: SlotStatus::MissingRequired,
     });
     let render = || {
-        build_review_comment_v2(
+        review_comment_v2(
             false,
             "mesh rejected",
             &diffs,
@@ -190,14 +335,13 @@ fn oversized_review_preserves_every_blocker_and_names_omitted_sections() {
 
 #[test]
 fn review_comment_shows_validation_fail() {
-    let comment = build_review_comment(false, "some error", &[], &[], &[], &[], None);
+    let comment = review_comment(false, "some error", &[], &[], &[], &[], None);
     assert!(comment.contains("FAIL"));
 }
 
 #[test]
 fn verified_security_only_override_clears_only_its_verdict() {
-    use gitforgeops::policy::{OverrideDecision, VerifiedOverride};
-    use gitforgeops::review::build_review_comment_v2_with_override;
+    use gitforgeops::policy::VerifiedOverride;
 
     let decision = OverrideDecision::Active(VerifiedOverride {
         approver: "maintainer".into(),
@@ -214,7 +358,7 @@ fn verified_security_only_override_clears_only_its_verdict() {
         namespace: "tenant".into(),
         message: "literal credential".into(),
     }];
-    let comment = build_review_comment_v2_with_override(
+    let comment = review_comment_v2_with_override(
         ReviewValidationStatus::Passed,
         "",
         &[],
@@ -245,7 +389,7 @@ fn verified_security_only_override_clears_only_its_verdict() {
 
 #[test]
 fn review_comment_renders_validator_execution_failure_as_error_never_passed() {
-    let comment = build_review_comment_with_status(
+    let comment = review_comment_with_status(
         ReviewValidationStatus::ExecutionError,
         "Validator execution error: binary not found",
         &[],
@@ -261,7 +405,7 @@ fn review_comment_renders_validator_execution_failure_as_error_never_passed() {
 
 #[test]
 fn review_comment_contains_backticks_in_validator_output_safely() {
-    let comment = build_review_comment_with_status(
+    let comment = review_comment_with_status(
         ReviewValidationStatus::ExecutionError,
         "bad value ```\n### injected heading",
         &[],
@@ -277,7 +421,7 @@ fn review_comment_contains_backticks_in_validator_output_safely() {
 
 #[test]
 fn review_comment_bounds_validator_output() {
-    let comment = build_review_comment_with_status(
+    let comment = review_comment_with_status(
         ReviewValidationStatus::Rejected,
         &"x".repeat(20_000),
         &[],
@@ -303,7 +447,7 @@ fn review_comment_includes_changes_table() {
         namespace: "ferrum".to_string(),
         details: vec![],
     }];
-    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    let comment = review_comment(true, "", &diffs, &[], &[], &[], None);
     assert!(comment.contains("proxy-new"));
     assert!(comment.contains("Add"));
 }
@@ -317,7 +461,7 @@ fn review_comment_escapes_untrusted_fields_outside_validator_output() {
         namespace: "ferrum".to_string(),
         details: vec![],
     }];
-    let comment = build_review_comment(
+    let comment = review_comment(
         true,
         "",
         &diffs,
@@ -344,7 +488,7 @@ fn review_comment_preserves_table_cell_escape_after_an_input_backslash() {
         details: vec![],
     }];
 
-    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    let comment = review_comment(true, "", &diffs, &[], &[], &[], None);
     assert!(comment.contains(r"left\\\|forged-cell"), "{comment}");
     let change_row = comment
         .lines()
@@ -360,7 +504,7 @@ fn review_comment_includes_breaking_changes() {
         id: "proxy-1".to_string(),
         reason: "listen_path changed".to_string(),
     }];
-    let comment = build_review_comment(true, "", &[], &breaking, &[], &[], None);
+    let comment = review_comment(true, "", &[], &breaking, &[], &[], None);
     assert!(comment.contains("listen\\_path changed"));
     assert!(comment.contains("Breaking"));
 }
@@ -374,7 +518,7 @@ fn review_comment_includes_security_findings() {
         namespace: "team-alpha".to_string(),
         message: "Literal credential detected".to_string(),
     }];
-    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+    let comment = review_comment(true, "", &[], &[], &findings, &[], None);
     assert!(comment.contains("Literal credential"));
     // Two namespaces can hold same-named resources, so a finding is only
     // actionable when the reader can tell which one it names.
@@ -390,7 +534,7 @@ fn review_comment_includes_best_practices() {
         namespace: "team-alpha".to_string(),
         message: "No rate limiting plugin".to_string(),
     }];
-    let comment = build_review_comment(true, "", &[], &[], &[], &practices, None);
+    let comment = review_comment(true, "", &[], &[], &[], &practices, None);
     assert!(comment.contains("rate limiting"));
     assert!(comment.contains("team-alpha"));
     assert!(comment.contains("[warning]"));
@@ -398,7 +542,7 @@ fn review_comment_includes_best_practices() {
 
 #[test]
 fn review_comment_marks_live_comparison_as_skipped() {
-    let comment = build_review_comment(
+    let comment = review_comment(
         true,
         "",
         &[],
@@ -414,7 +558,7 @@ fn review_comment_marks_live_comparison_as_skipped() {
 
 #[test]
 fn comparison_error_cannot_forge_blocks_or_autolinks() {
-    let comment = build_review_comment(
+    let comment = review_comment(
         true,
         "",
         &[],
@@ -455,7 +599,7 @@ fn code_span_escapes_pipes_in_every_context() {
         id: "bullet|id".to_string(),
         reason: "changed".to_string(),
     }];
-    let comment = build_review_comment(true, "", &diffs, &breaking, &[], &[], None);
+    let comment = review_comment(true, "", &diffs, &breaking, &[], &[], None);
 
     assert!(comment.contains("`table\\|id`"), "{comment}");
     assert!(comment.contains("`bullet\\|id`"), "{comment}");
@@ -477,7 +621,7 @@ fn review_comment_replaces_invisible_format_characters_and_blank_inline_fields()
         namespace: "ferrum".to_string(),
         message: "credential\u{2066} finding".to_string(),
     }];
-    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+    let comment = review_comment(true, "", &[], &[], &findings, &[], None);
 
     assert!(!comment.contains('\u{202e}'));
     assert!(!comment.contains('\u{200b}'));
@@ -495,7 +639,7 @@ fn inline_sanitizers_keep_tabs_and_scrub_line_separators() {
         namespace: "ferrum".to_string(),
         message: "line\u{2028}separator\u{2029}pair".to_string(),
     }];
-    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+    let comment = review_comment(true, "", &[], &[], &findings, &[], None);
 
     assert!(comment.contains("tab\tseparated"), "{comment}");
     assert!(comment.contains("line�separator�pair"), "{comment}");
@@ -505,7 +649,7 @@ fn inline_sanitizers_keep_tabs_and_scrub_line_separators() {
 
 #[test]
 fn fenced_validation_output_keeps_tabs_and_scrubs_line_separators() {
-    let comment = build_review_comment(
+    let comment = review_comment(
         false,
         "error:\n\tat proxy-a\u{2028}forged",
         &[],
@@ -521,7 +665,7 @@ fn fenced_validation_output_keeps_tabs_and_scrubs_line_separators() {
 
 #[test]
 fn terminal_review_leaves_fenced_validation_output_undecoded() {
-    let comment = build_review_comment(
+    let comment = review_comment(
         false,
         "literal &#96;&#96;&#96; and &lt;tag&gt; and &#46;",
         &[],
@@ -550,7 +694,7 @@ fn terminal_review_leaves_fenced_validation_output_undecoded() {
 /// fenced validator bytes.
 #[test]
 fn terminal_review_neutralizes_workflow_commands_inside_a_fence() {
-    let comment = build_review_comment(
+    let comment = review_comment(
         false,
         "::error::forged\n\t::warning::indented\nliteral &#96;&#96;&#96; and &#46;",
         &[],
@@ -575,7 +719,7 @@ fn terminal_review_neutralizes_workflow_commands_inside_a_fence() {
 
 #[test]
 fn terminal_review_decodes_only_entities_emitted_by_the_markdown_sanitizer() {
-    let comment = build_review_comment(
+    let comment = review_comment(
         true,
         "",
         &[],
@@ -634,7 +778,7 @@ fn review_comment_v2_uses_configured_override_label_and_permission() {
         required_permission: "admin".to_string(),
     };
 
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -679,7 +823,7 @@ fn review_comment_v2_falls_back_to_defaults_when_no_override_config() {
         overridden_by: None,
     }];
 
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -718,7 +862,7 @@ fn review_comment_sanitizes_policy_text_as_single_line_markdown() {
         require_label: "x`\n\n_No blocking violations._".to_string(),
         required_permission: "write`\n### Forged Permission".to_string(),
     };
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -806,7 +950,7 @@ fn review_comment_sanitizes_every_resource_section() {
     }];
     let environment_note = environment_header(forged, forged, forged);
 
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &diffs,
@@ -843,7 +987,7 @@ fn review_comment_neutralizes_mentions_in_inline_findings() {
         remediation: None,
         overridden_by: None,
     }];
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -878,7 +1022,7 @@ fn review_comment_preserves_trusted_markup_and_names_empty_code_spans() {
         overridden_by: None,
     }];
     let note = environment_header("production", "Shared", "Incremental");
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -905,7 +1049,7 @@ fn review_comment_preserves_trusted_markup_and_names_empty_code_spans() {
 
 #[test]
 fn review_comment_uses_a_safe_fence_for_validation_output() {
-    let comment = build_review_comment(
+    let comment = review_comment(
         false,
         "failed\n```\n### Forged Result",
         &[],
@@ -920,7 +1064,7 @@ fn review_comment_uses_a_safe_fence_for_validation_output() {
 
 #[test]
 fn review_comment_scrubs_controls_and_bidi_from_validation_output() {
-    let comment = build_review_comment(
+    let comment = review_comment(
         false,
         "line one\u{1b}[31m\nline \u{202e}two",
         &[],
@@ -956,7 +1100,7 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     });
 
     // bundle_loaded=false → disclaimer present, status wording not shown
-    let no_bundle = build_review_comment_v2(
+    let no_bundle = review_comment_v2(
         true,
         "",
         &[],
@@ -982,7 +1126,7 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     assert!(!no_bundle.contains("needs allocation (generated on apply)"));
 
     // bundle_loaded=true → no disclaimer, full status wording
-    let with_bundle = build_review_comment_v2(
+    let with_bundle = review_comment_v2(
         true,
         "",
         &[],
@@ -1003,7 +1147,7 @@ fn review_comment_credential_section_discloses_bundle_context_when_absent() {
     assert!(with_bundle.contains("needs allocation (generated on apply)"));
 
     report.results[0].status = SlotStatus::MissingRequired;
-    let missing_required = build_review_comment_v2(
+    let missing_required = review_comment_v2(
         true,
         "",
         &[],
@@ -1049,7 +1193,7 @@ fn review_comment_cap_renders_the_same_prefix_across_runs() {
         let result =
             compute_diff_with_ownership(&desired, &actual, Some(&std::collections::HashSet::new()))
                 .unwrap();
-        build_review_comment_v2(
+        review_comment_v2(
             true,
             "",
             &result.diffs,
@@ -1135,7 +1279,7 @@ fn spec_owned_section_marks_confirmed_deletions() {
 fn review_comment_v2_renders_spec_owned_section() {
     let spec_owned = vec![spec_owned_entry("shared-id", true, false)];
 
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -1160,7 +1304,7 @@ fn review_comment_v2_renders_spec_owned_section() {
 
 #[test]
 fn review_comment_v2_omits_spec_owned_section_when_empty() {
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -1204,7 +1348,7 @@ fn review_comment_is_utf8_safe_bounded_and_reports_omissions() {
         .collect::<Vec<_>>();
     let validation = format!("error before embedded fence ``` {}", "診".repeat(10_000));
 
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         false,
         &validation,
         &diffs,
@@ -1252,7 +1396,7 @@ fn review_comment_renders_credential_slot_remaps_as_blocking() {
             .to_string(),
     );
 
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -1290,7 +1434,7 @@ fn review_comment_renders_credential_slot_remaps_as_blocking() {
 
 #[test]
 fn review_comment_omits_the_remap_section_when_there_are_none() {
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -1334,7 +1478,7 @@ fn review_comment_marks_error_severity_security_findings_as_blocking() {
         },
     ];
 
-    let comment = build_review_comment(true, "", &[], &[], &findings, &[], None);
+    let comment = review_comment(true, "", &[], &[], &findings, &[], None);
 
     assert!(
         comment.contains("**Apply is blocked** by 1 error-severity security finding"),
@@ -1343,7 +1487,7 @@ fn review_comment_marks_error_severity_security_findings_as_blocking() {
     assert!(comment.contains("gh-env-secret"), "{comment}");
 
     // A warning-only audit is advice, not a blocker.
-    let advisory = build_review_comment(true, "", &[], &[], &findings[1..], &[], None);
+    let advisory = review_comment(true, "", &[], &[], &findings[1..], &[], None);
     assert!(!advisory.contains("Apply is blocked"), "{advisory}");
 }
 
@@ -1359,7 +1503,7 @@ fn review_comment_environment_header_renders_as_markdown_not_escaped_text() {
         "Environment: `default` · Ownership: `Shared` · Strategy: `Incremental`"
     );
 
-    let comment = build_review_comment_v2(
+    let comment = review_comment_v2(
         true,
         "",
         &[],
@@ -1416,7 +1560,7 @@ fn review_comment_environment_header_fences_hostile_environment_names() {
 // `$GITHUB_STEP_SUMMARY`, both world-readable on a public repo.
 
 fn comment_with_comparison_error(reason: &str) -> String {
-    build_review_comment_v2(
+    review_comment_v2(
         true,
         "",
         &[],
@@ -1543,10 +1687,7 @@ fn offline_blocker_enforcement_is_opt_in() {
 
 #[test]
 fn review_security_verdict_uses_verified_override_without_hiding_findings() {
-    use gitforgeops::policy::{
-        github_override::apply_override, OverrideDecision, VerifiedOverride,
-    };
-    use gitforgeops::review::build_review_comment_v2_with_override;
+    use gitforgeops::policy::{github_override::apply_override, VerifiedOverride};
 
     let security = vec![SecurityFinding {
         severity: "error".into(),
@@ -1579,7 +1720,7 @@ fn review_security_verdict_uses_verified_override_without_hiding_findings() {
         if let Some(decision) = decision {
             apply_override(&mut policy, decision);
         }
-        let comment = build_review_comment_v2_with_override(
+        let comment = review_comment_v2_with_override(
             ReviewValidationStatus::Rejected,
             "mesh rejected",
             &[],
@@ -1666,7 +1807,7 @@ fn review_comment_bodies_lose_registered_values_at_the_sink() {
             new_value: "zq7Secret-v1".to_string(),
         }],
     }];
-    let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+    let comment = review_comment(true, "", &diffs, &[], &[], &[], None);
     let published = gitforgeops::display::scrub_text(&comment);
     assert!(!published.contains("s3cr3t"), "{published}");
     assert!(!published.contains("canary"), "{published}");
@@ -1747,7 +1888,7 @@ fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
                 new_value: "changed".to_string(),
             }],
         }];
-        let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+        let comment = review_comment(true, "", &diffs, &[], &[], &[], None);
         // Markdown escaping may respell the value; the canary survives it.
         assert!(
             comment.contains("zq7"),
@@ -1785,7 +1926,7 @@ fn review_formatter_spellings_of_live_credentials_are_redacted() {
                 new_value: "changed".to_string(),
             }],
         }];
-        let comment = build_review_comment(true, "", &diffs, &[], &[], &[], None);
+        let comment = review_comment(true, "", &diffs, &[], &[], &[], None);
         assert!(
             comment.contains("Q7"),
             "the formatter must actually echo the live value"
