@@ -284,12 +284,6 @@ impl SecretScrubber {
         self.values.is_empty()
     }
 
-    /// True when at least one secret cannot be scrubbed reliably, so every
-    /// stream is withheld rather than partially redacted.
-    pub fn is_unsafe_to_scrub(&self) -> bool {
-        self.unsafe_to_scrub
-    }
-
     /// Replace every known secret sequence in `text` with [`REDACTION`].
     pub fn scrub(&self, text: &str) -> String {
         let mut scrubbed = text.to_string();

@@ -1690,7 +1690,7 @@ struct ExportComparison {
 }
 
 /// [`load_namespace_pairs_for`] over `GET /config/export` with the viewer
-/// credential. Each pair's live side is [`config_export::ConfigExport::live_view`]
+/// credential. Each pair's live side is [`config_export::ConfigExport::live_view_with`]
 /// and its desired side is projected the way the export projects Consumers.
 ///
 /// `unresolved` is the desired configuration before credential resolution, so

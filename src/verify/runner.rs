@@ -123,7 +123,7 @@ fn check_target(url: &str) -> Result<url::Url, String> {
 /// established — so carried no request — is retried for such a method, unless
 /// the check declares `replay_safe`.
 ///
-/// `credentials` is the projection [`super::authorize_probe_credentials`]
+/// `credentials` is the projection of [`super::authorize_probe_slots`]
 /// built, never the environment's bundle: like [`run`], a single check can
 /// only resolve a slot that was authorized for verification.
 pub async fn run_check(
@@ -270,7 +270,7 @@ pub fn deadline_budget(checks: &EnvironmentChecks) -> Duration {
 
 /// Run every check, one after another, within [`deadline_budget`].
 ///
-/// `credentials` is the projection [`super::authorize_probe_credentials`]
+/// `credentials` is the projection of [`super::authorize_probe_slots`]
 /// built, never the environment's bundle: a check can only resolve a slot
 /// that was authorized for verification.
 pub async fn run(

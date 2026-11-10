@@ -16,7 +16,6 @@
 //! `additional` field, which serialized as a literal `"additional": {}` member
 //! and shipped no `role` — every request came back 401.
 
-use chrono::Utc;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use uuid::Uuid;
 
@@ -126,13 +125,8 @@ impl std::fmt::Debug for MintedJwt {
     }
 }
 
-/// Mint an HS256 token for the admin API.
-pub fn mint_jwt(secret: &str, options: &JwtOptions) -> crate::error::Result<String> {
-    mint_jwt_at(secret, options, Utc::now().timestamp()).map(|minted| minted.token)
-}
-
-/// [`mint_jwt`] issued at `now` (Unix seconds), returning the claimed
-/// lifetime with the token.
+/// Mint an HS256 token for the admin API, issued at `now` (Unix seconds),
+/// returning the claimed lifetime with the token.
 pub fn mint_jwt_at(
     secret: &str,
     options: &JwtOptions,

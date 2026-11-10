@@ -4,9 +4,9 @@ use gitforgeops::config::schema::{GatewayConfig, Proxy, Upstream};
 use gitforgeops::http_client::convergence_summary;
 use gitforgeops::http_client::{
     build_restore_body, classify_retry, is_read_only_refusal, map_api_error, merge_pages,
-    next_page_offset, resource_id_is_path_safe, split_batch, write_block_reason, AdminClient,
-    ApiErrorBody, BackupExtras, BackupSnapshot, BatchCreate, ClusterStatus, DeleteOutcome,
-    ExportEndpoint, HealthStatus, RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
+    next_page_offset, split_batch, write_block_reason, AdminClient, ApiErrorBody, BackupExtras,
+    BackupSnapshot, BatchCreate, ClusterStatus, DeleteOutcome, ExportEndpoint, HealthStatus,
+    RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -157,8 +157,8 @@ async fn admin_client_get_backup_sends_namespace_and_bearer_token() {
     env.gateway_max_retries = 0;
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
 
-    let backup = client.get_backup("team-alpha").await.unwrap();
-    assert!(backup.proxies.is_empty());
+    let backup = client.get_backup_snapshot("team-alpha").await.unwrap();
+    assert!(backup.config.proxies.is_empty());
 
     let request = rx.recv().unwrap();
     assert!(request.starts_with("GET /admin/backup HTTP/1.1"));
@@ -193,7 +193,7 @@ async fn scoped_admin_client_mints_the_resolved_namespace_claim() {
     env.gateway_url = Some(format!("http://{addr}"));
     let client =
         AdminClient::new_scoped(&env, ["team-beta", "team-alpha", "team-beta", ""]).unwrap();
-    client.get_backup("team-alpha").await.unwrap();
+    client.get_backup_snapshot("team-alpha").await.unwrap();
 
     let request = rx.recv().unwrap();
     let token = request
@@ -268,53 +268,6 @@ async fn admin_client_accepts_safe_resource_id_in_paths() {
             .starts_with("DELETE /proxies/proxy-01._~A?cleanup_orphaned_upstream=false HTTP/1.1"),
         "unexpected request line: {request}"
     );
-}
-
-// --- Resource-id path safety -------------------------------------------------
-
-#[test]
-fn resource_ids_are_validated_for_path_safety_not_server_grammar() {
-    // The gateway's *create* grammar is `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, but a
-    // live gateway can hold ids that predate it or came from another client.
-    // Refusing to build a URL for those makes them undeletable and the
-    // namespace can never converge — so anything that stays inside its path
-    // segment is allowed through and the gateway gets to have the last word.
-    for id in [
-        "proxy-01._~A",
-        "proxy~01",
-        "-leading-dash",
-        ".leading-dot",
-        "_leading",
-        "UPPER_case.9",
-        "a",
-        &"a".repeat(254),
-    ] {
-        assert!(
-            resource_id_is_path_safe(id).is_ok(),
-            "{id:?} is path-safe and must be accepted"
-        );
-    }
-}
-
-#[test]
-fn resource_ids_that_escape_the_path_segment_are_rejected() {
-    for id in [
-        "",
-        ".",
-        "..",
-        "a/b",
-        "a\\b",
-        "a?confirm=true",
-        "a#frag",
-        "a%2f",
-        "has space",
-        "tab\there",
-        "null\0byte",
-        "café",
-    ] {
-        let err = resource_id_is_path_safe(id);
-        assert!(err.is_err(), "expected {id:?} to be rejected");
-    }
 }
 
 #[tokio::test]
@@ -1051,7 +1004,7 @@ async fn redirect_on_the_gateway_origin_is_classified_not_echoed() {
         AdminClient::new_scoped(&stub_env(format!("http://{source_addr}")), TEST_NAMESPACES)
             .unwrap();
     let message = client
-        .get_backup("team-alpha")
+        .get_backup_snapshot("team-alpha")
         .await
         .unwrap_err()
         .to_string();
@@ -1228,11 +1181,12 @@ fn payload_too_large_names_the_limit_knob() {
 #[test]
 fn redirect_message_reads_with_single_spaces() {
     for location in [Some("https://gateway.example/admin"), Some("   "), None] {
-        let message = gitforgeops::http_client::map_api_error_with_location(
+        let message = gitforgeops::http_client::map_api_error_with_redirect_base(
             307,
             "",
             RequestKind::NonIdempotentMutation,
             location,
+            None,
         )
         .to_string();
         assert!(!message.contains("  "), "{location:?}: {message:?}");
@@ -1408,12 +1362,10 @@ fn backup_extras_counts_report_what_was_carried() {
     let extras = backup_extras();
     assert_eq!(extras.api_spec_count(), 2);
     assert_eq!(extras.trust_bundle_count(), 1);
-    assert!(!extras.is_empty());
 
     let none = BackupExtras::default();
     assert_eq!(none.api_spec_count(), 0);
     assert_eq!(none.trust_bundle_count(), 0);
-    assert!(none.is_empty());
 }
 
 #[test]
@@ -1918,7 +1870,7 @@ fn batch_counts_mirror_the_payload() {
     let counts = batch.counts();
     assert_eq!(counts.upstreams, 2);
     assert_eq!(counts.proxies, 1);
-    assert_eq!(counts.total(), 3);
+    assert_eq!((counts.consumers, counts.plugin_configs), (0, 0));
 }
 
 #[test]

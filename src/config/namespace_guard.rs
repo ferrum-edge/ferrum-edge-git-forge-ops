@@ -58,23 +58,6 @@ impl NamespaceScope {
         inventory_from_resources(resources)
     }
 
-    /// Build the desired/on-disk half of the snapshot.
-    pub fn from_loaded(
-        filter: Option<&str>,
-        resources: &[(String, Resource)],
-        desired: &GatewayConfig,
-        desired_mesh_count: usize,
-    ) -> Self {
-        let (on_disk_count, on_disk_namespaces) = inventory_from_resources(resources);
-        Self::with_desired(
-            filter,
-            on_disk_namespaces,
-            on_disk_count,
-            desired,
-            desired_mesh_count,
-        )
-    }
-
     /// Assemble a scope once desired selection has already run.
     pub fn with_desired(
         filter: Option<&str>,

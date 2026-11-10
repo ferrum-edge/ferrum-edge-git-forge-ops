@@ -1997,8 +1997,10 @@ mod tests {
         .with_namespaces(["ferrum", "team-alpha", "team-beta"]);
         let mut tokens = Vec::new();
         for _ in 0..1200 {
-            let token =
-                crate::jwt::mint_jwt("test-secret-must-be-32-chars-long", &options).unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let token = crate::jwt::mint_jwt_at("test-secret-must-be-32-chars-long", &options, now)
+                .unwrap()
+                .token;
             assert!(token.len() >= 284, "{}", token.len());
             register_sent_token(&token).unwrap();
             tokens.push(token);

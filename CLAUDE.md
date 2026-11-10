@@ -643,7 +643,7 @@ which the export lacks.
 
 - Fingerprints (`hmac-sha256:<64 hex>`) are keyed from the gateway's primary
   admin secret; a viewer cannot compute the repository value's fingerprint, and
-  this build does not try. `ConfigExport::live_view` substitutes the declared
+  this build does not try. `ConfigExport::live_view_with` substitutes the declared
   value only at a fingerprinted pointer that is secret-bearing in the repo
   (placeholder, URL userinfo, Consumer key/secret, classified plugin path,
   Consul token, or an ancestor of one; Edge publishes no redacted-pointer

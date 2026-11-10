@@ -325,7 +325,9 @@ fn short_operator_plugin_values_stay_ordinary_settings() {
         );
 
         let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
-        assert!(!scrubber.is_unsafe_to_scrub(), "{plugin_name}");
+        let output = scrubber.scrub_streams("validated", "");
+        assert!(output.suppressed.is_none(), "{plugin_name}");
+        assert_eq!(output.stdout, "validated", "{plugin_name}");
         assert!(
             security_blockers(&audit_security(&original)).is_empty(),
             "{plugin_name}"

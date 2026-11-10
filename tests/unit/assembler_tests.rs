@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 use gitforgeops::config::{
     apply_overlay, assemble, filter_config_by_namespace, load_resources, schema::Resource,
-    select_config_namespace, split_config_by_namespace, validate_unique_resource_keys,
-    GatewayConfig,
+    select_config_namespace, validate_unique_resource_keys, GatewayConfig,
 };
 
 /// `assemble` now returns the gateway document alongside the optional merged
@@ -576,16 +575,6 @@ fn namespace_filter_only_keeps_target_namespace() {
     assert_eq!(filtered.proxies.len(), 1);
     assert_eq!(filtered.proxies[0].id, "proxy-alpha");
     assert_eq!(filtered.proxies[0].namespace, "team-alpha");
-}
-
-#[test]
-fn split_config_by_namespace_preserves_empty_filtered_namespace() {
-    let config = assemble_gateway(vec![("ferrum".to_string(), make_proxy("proxy-default"))]);
-    let split = split_config_by_namespace(&config, Some("team-alpha"));
-
-    assert_eq!(split.len(), 1);
-    assert_eq!(split[0].0, "team-alpha");
-    assert!(split[0].1.proxies.is_empty());
 }
 
 #[test]
