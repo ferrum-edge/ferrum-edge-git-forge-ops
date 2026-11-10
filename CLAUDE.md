@@ -701,7 +701,8 @@ secrets until a reviewer approves; that is reported as `not_completed`, never
 in sync. A deployment environment may not use the suffix (the settings audit
 waives its required-reviewer rule for that shape). Nor may one be named `release` in any case
 (`RELEASE_ENVIRONMENT`): that reviewer-free GitHub Environment holds only
-`release.yml`'s registry credentials.
+`release.yml`'s registry credentials. The same holds for `settings-audit`
+(`SETTINGS_AUDIT_ENVIRONMENT`), which holds only `SETTINGS_AUDIT_TOKEN`.
 
 Fences on the reviewer-free environment:
 

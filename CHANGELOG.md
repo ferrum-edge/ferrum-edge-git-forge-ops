@@ -628,6 +628,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- `.gitforgeops/config.yaml` refuses a deployment environment named
+  `settings-audit` in any letter case (GHSA-jx32-rxh5-5q25). The settings
+  audit waives the reviewer and self-review rules for that GitHub Environment
+  because it deploys nothing, so a deployment environment of that name would
+  apply to its gateway with no reviewer while the audit still reported the
+  launch controls as active. The name is now reserved like `release`.
 - Cover the Trivy image findings CVE-2026-76844 and CVE-2026-85091 (HIGH,
   zlib) with checksum-pinned Debian Trixie `zlib1g`
   `1:1.3.dfsg+really1.3.1-1+deb13u1` updates for amd64 and arm64 from the
