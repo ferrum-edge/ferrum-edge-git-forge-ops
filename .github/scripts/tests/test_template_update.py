@@ -833,8 +833,9 @@ class IgnoredRuntimeFileTests(unittest.TestCase):
         self.fixture = Fixture(Path(self._temporary.name))
         exclude = self.fixture.customer / ".git/info/exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        exclude.write_text("__pycache__/\n*.py[cod]\n", encoding="utf-8")
-        write(self.fixture.customer, {".gitignore": ".DS_Store\n"})
+        # `.git/info/exclude` rather than `.gitignore`: `.gitignore` is
+        # upstream-managed, so a customer-only copy is itself a local edit.
+        exclude.write_text("__pycache__/\n*.py[cod]\n.DS_Store\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self._temporary.cleanup()
@@ -1467,6 +1468,21 @@ class RepositoryContractTests(unittest.TestCase):
         # files because the updater refuses to read or write through links.
         self.assertTrue((ROOT / "AGENTS.md").is_symlink())
         self.assertNotIn("AGENTS.md", template_update.UPSTREAM_MANAGED)
+
+    def test_the_agent_setup_and_its_validator_are_adopted_together(self):
+        # The required Agent Setup Policy check runs upstream's validator over
+        # these trees, and upstream changes both in the same commits (#702).
+        self.assertTrue(template_update.is_upstream_managed(".github/scripts/check_agent_setup.py"))
+        for path in (
+            ".agents/skills/_lib/resolve-agent-bin.sh",
+            ".claude/rules/testing.md",
+            ".claude/.gitignore",
+            ".gitignore",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue((ROOT / path).is_file(), path)
+                self.assertTrue(template_update.is_upstream_managed(path))
+        self.assertFalse(template_update.is_upstream_managed(".agentsx/file"))
 
     def test_every_shipped_example_is_upstream_managed(self):
         # The examples are upstream's documentation of its own contract, and
