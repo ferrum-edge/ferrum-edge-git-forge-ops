@@ -42,7 +42,7 @@ for later fixes.
   updates and deletes require the `expected_proxy_ids` association precondition
   (ferrum-edge#6744), which GitForgeOps already sends. Review the
   [v0.9.19 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919)
-  before rollout. Exact-byte hosted qualification and the six external
+  before rollout. Exact-byte hosted qualification and the five external
   acceptance scenarios remain required.
 - Edge v0.9.17, which v0.9.19 follows, carries the changes prepared for the
   unpublished v0.9.16 tag, including namespace-bounded admin tokens, stricter

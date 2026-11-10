@@ -8,7 +8,7 @@ superseded run, see the
 ## Strategies and namespaces
 
 Apply works one namespace at a time (`apply_api` over
-`split_config_by_namespace`). A failure in `team-alpha` does not stop
+`reconcile::resolved_namespaces`). A failure in `team-alpha` does not stop
 `team-beta`; results are reported per namespace in `ApplyResult`.
 
 - **`incremental`** (default) reads `/backup` once per namespace, diffs

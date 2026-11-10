@@ -19,12 +19,11 @@ pinned in [`security.yml`](../.github/workflows/security.yml), using
 `CARGO_AUDIT_ACTIONS` in
 [`check_supply_chain.py`](../.github/scripts/check_supply_chain.py) lists the reviewed commits it accepts: a Dependabot bump
 adds the new commit, the workflow switches to it, and a follow-up retires the
-old one. The accepted commits share the same action source and cargo-audit
-manifest. The
-[committed cargo-audit manifest](https://github.com/taiki-e/install-action/blob/a4d3f3f761dcd95cce1b72cb61cb6d1963438177/manifests/cargo-audit.json)
+old one. The accepted commits share the same cargo-audit manifest. The
+[committed cargo-audit manifest](https://github.com/taiki-e/install-action/blob/3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2/manifests/cargo-audit.json)
 records the 0.22.1 Linux x86-64 archive SHA-256
 `c32506f338bdcdaef5a17fb9f33abb6ecf9561324cfd34237fd335f9283a1eab`, and the
-[installer source](https://github.com/taiki-e/install-action/blob/a4d3f3f761dcd95cce1b72cb61cb6d1963438177/main.sh)
+[installer source](https://github.com/taiki-e/install-action/blob/3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2/main.sh)
 verifies that digest before extracting. (The action SHA alone says nothing
 about the contents of an external release asset.) With fallback disabled, an
 unsupported version or platform fails instead of installing from the registry.

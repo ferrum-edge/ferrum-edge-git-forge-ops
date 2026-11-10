@@ -608,8 +608,8 @@ errors. api-mode apply neither publishes nor retracts.
   drops any loaded resource from a file-mode environment is the
   `NarrowedFilePublication` apply blocker. An environment's own
   `namespace_filter` is its publication scope, not narrowing.
-- API calls send `X-Ferrum-Namespace: <ns>`; `split_config_by_namespace()`
-  groups operations.
+- API calls send `X-Ferrum-Namespace: <ns>`; `apply_api` works one
+  namespace of `reconcile::resolved_namespaces` at a time.
 - `BackupSnapshot::from_scoped_body` checks every resource's explicit wire
   namespace before deserialization can default it. A missing or foreign
   namespace refuses the snapshot for every API consumer, including confirmation
