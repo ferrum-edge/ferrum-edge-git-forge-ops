@@ -28,6 +28,13 @@ updates:
       prefix: "ci"
     labels:
       - "dependencies"
+    groups:
+      # CodeQL refuses to run when init, autobuild, analyze and upload-sarif
+      # are on different releases, so they must move together in one PR.
+      codeql-action:
+        patterns:
+          - "github/codeql-action"
+          - "github/codeql-action/*"
 
   - package-ecosystem: "docker"
     directory: "/"
