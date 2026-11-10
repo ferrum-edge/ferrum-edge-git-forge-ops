@@ -2695,7 +2695,7 @@ impl<'a> Preconditions<'a> {
         update: bool,
     ) -> crate::error::Result<Option<String>> {
         if kind == "Consumer" {
-            return self.confirm_consumer(id, update).await;
+            return self.confirm_consumer(id).await;
         }
         let Some(tagged) = self.client.get_tagged(kind, id, self.namespace).await? else {
             return Ok(None);
@@ -2782,11 +2782,7 @@ impl<'a> Preconditions<'a> {
         })
     }
 
-    async fn confirm_consumer(
-        &mut self,
-        id: &str,
-        _update: bool,
-    ) -> crate::error::Result<Option<String>> {
+    async fn confirm_consumer(&mut self, id: &str) -> crate::error::Result<Option<String>> {
         let planned = self.consumer_evidence.get(id).ok_or_else(|| {
             crate::error::Error::ConditionalWriteUnavailable(
                 "complete planned consumer evidence was not captured before allocation".to_string(),

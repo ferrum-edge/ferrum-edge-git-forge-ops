@@ -241,10 +241,10 @@ impl AdminClient {
             .admin_jwt_secret
             .clone()
             .ok_or(crate::error::Error::NoJwtSecret)?;
-        if jwt_secret.len() < 32 {
+        if jwt_secret.len() < MIN_JWT_SECRET_LEN {
             return Err(crate::error::Error::Config(format!(
-                "FERRUM_ADMIN_JWT_SECRET must be at least 32 characters to match \
-                 ferrum-edge's minimum (got {})",
+                "FERRUM_ADMIN_JWT_SECRET must be at least {MIN_JWT_SECRET_LEN} characters \
+                 to match ferrum-edge's minimum (got {})",
                 jwt_secret.len()
             )));
         }
@@ -1484,7 +1484,7 @@ impl AdminClient {
         if !query.is_empty() {
             path = format!("{path}?{}", query.join("&"));
         }
-        self.delete(kind, &path, namespace, Some(etag))
+        self.delete(kind, &path, namespace, etag)
             .await
             .map_err(|error| {
                 if kind == "Consumer" && !matches!(error, crate::error::Error::StalePlan(_)) {
@@ -1506,21 +1506,18 @@ impl AdminClient {
         kind: &str,
         path: &str,
         namespace: &str,
-        if_match: Option<&str>,
+        etag: &str,
     ) -> crate::error::Result<DeleteOutcome> {
         let target = self.authorized(path)?;
         let resp = self
             .send_with_retry(RequestKind::Mutation, |bearer| {
-                let request = target
+                target
                     .request(Method::DELETE, bearer)
-                    .header("X-Ferrum-Namespace", namespace);
-                match if_match {
-                    Some(etag) => request.header("If-Match", etag),
-                    None => request,
-                }
+                    .header("X-Ferrum-Namespace", namespace)
+                    .header("If-Match", etag)
             })
             .await?;
-        if resp.status == 412 && if_match.is_some() {
+        if resp.status == 412 {
             if let Some(detail) = association_precondition_refusal(&resp.body) {
                 return Err(crate::error::Error::UnplannedPluginReference(format!(
                     "not sent: {detail} Declare the reference in the repository to keep it, \

@@ -83,9 +83,6 @@ pub enum Error {
     #[error("ferrum-edge binary not found: {}", safe(.0))]
     BinaryNotFound(String),
 
-    #[error("validation failed with {error_count} error(s)")]
-    ValidationFailed { error_count: usize },
-
     #[error("ferrum-edge validate exited with code {code}: {}", safe_block(stderr))]
     ValidateProcess { code: i32, stderr: String },
 

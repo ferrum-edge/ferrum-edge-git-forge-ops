@@ -279,22 +279,6 @@ impl SecretScrubber {
         }
     }
 
-    /// A scrubber for exactly `values` (a generated rotation value, a token
-    /// this process sends) with no public document.
-    pub fn from_secret_values<I, S>(values: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self::from_values(
-            values
-                .into_iter()
-                .map(Into::into)
-                .filter(|value: &String| !value.is_empty())
-                .collect(),
-        )
-    }
-
     /// True when the config carried no secret material at all.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
