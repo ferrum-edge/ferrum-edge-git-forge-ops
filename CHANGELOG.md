@@ -73,6 +73,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   references the config, which apply still surfaces as
   `UnplannedPluginReference`. Older gateways ignore the parameter.
 
+- The Luna and Sol agent launchers select fast mode the way Ferrum Edge's do
+  (#706): `--fast` sends `service_tier="fast"` with `features.fast_mode=true`
+  (Luna previously sent the `priority` tier), standard mode sends no
+  `features.fast_mode` override, and the Luna launcher accepts `--no-fast`.
+
 ### Added
 
 - `.github/scripts/release_gate.py`, the release gate as a Python helper

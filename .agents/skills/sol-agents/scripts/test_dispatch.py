@@ -10,6 +10,10 @@ import unittest
 
 LAUNCHER = Path(__file__).with_name("dispatch-agent.sh")
 EFFORTS = ("medium", "high", "xhigh")
+LAUNCHERS = (
+    (LAUNCHER, "gpt-6.1-sol"),
+    (Path(__file__).parents[2] / "luna-agents" / "scripts" / "dispatch-agent.sh", "gpt-6-luna"),
+)
 
 
 class DispatchTests(unittest.TestCase):
@@ -44,43 +48,49 @@ class DispatchTests(unittest.TestCase):
         )
         self.mock.chmod(0o700)
 
-    def launch(self, *flags, effort="high", status=0):
+    def launch(self, *flags, effort="high", status=0, launcher=LAUNCHER):
         env = os.environ.copy()
         env.update(CODEX_BIN=str(self.mock), SOL_TEST_EXIT_CODE=str(status))
         return subprocess.run(
-            ["bash", str(LAUNCHER), "--worktree", str(self.worktree),
+            ["bash", str(launcher), "--worktree", str(self.worktree),
              "--prompt-file", str(self.prompt), "--effort", effort, *flags],
             cwd=self.root, env=env, capture_output=True, text=True, timeout=15,
         )
 
     def test_model_effort_speed_and_prompt(self):
-        for effort in EFFORTS:
-            for flags, tier, enabled in [((), "default", "false"),
-                                         (("--fast",), "fast", "true"),
-                                         (("--no-fast",), "default", "false")]:
-                with self.subTest(effort=effort, flags=flags):
-                    result = self.launch(*flags, effort=effort)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    payload = json.loads(result.stdout)
-                    args = payload["args"]
-                    self.assertEqual(args[0], "exec")
-                    self.assertEqual(args[args.index("--model") + 1], "gpt-6.1-sol")
-                    configs = [args[i + 1] for i, value in enumerate(args) if value == "--config"]
-                    self.assertIn(f'model_reasoning_effort="{effort}"', configs)
-                    self.assertIn(f'service_tier="{tier}"', configs)
-                    self.assertIn(f"features.fast_mode={enabled}", configs)
-                    self.assertEqual(args[-1], "-")
-                    self.assertEqual(payload["prompt"], self.prompt_text)
-                    self.assertEqual(Path(payload["cwd"]).resolve(), self.worktree)
-                    self.assertIn(f"fast={enabled} service_tier={tier}", result.stderr)
+        for launcher, model in LAUNCHERS:
+            for effort in EFFORTS:
+                for flags, tier, fast in [((), "default", "false"),
+                                          (("--fast",), "fast", "true"),
+                                          (("--no-fast",), "default", "false")]:
+                    with self.subTest(model=model, effort=effort, flags=flags):
+                        result = self.launch(*flags, effort=effort, launcher=launcher)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        payload = json.loads(result.stdout)
+                        args = payload["args"]
+                        self.assertEqual(args[0], "exec")
+                        self.assertEqual(args[args.index("--model") + 1], model)
+                        configs = [args[i + 1] for i, value in enumerate(args)
+                                   if value == "--config"]
+                        self.assertIn(f'model_reasoning_effort="{effort}"', configs)
+                        self.assertIn(f'service_tier="{tier}"', configs)
+                        # Standard mode sends no fast-mode override at all.
+                        fast_configs = [c for c in configs if c.startswith("features.fast_mode")]
+                        expected = ["features.fast_mode=true"] if fast == "true" else []
+                        self.assertEqual(fast_configs, expected)
+                        self.assertEqual(args[-1], "-")
+                        self.assertEqual(payload["prompt"], self.prompt_text)
+                        self.assertEqual(Path(payload["cwd"]).resolve(), self.worktree)
+                        self.assertIn(f"fast={fast} service_tier={tier}", result.stderr)
 
     def test_conflicting_speed_options_refuse_dispatch(self):
-        for flags in [("--fast", "--no-fast"), ("--no-fast", "--fast")]:
-            with self.subTest(flags=flags):
-                result = self.launch(*flags)
-                self.assertEqual(result.returncode, 2)
-                self.assertEqual(result.stdout, "")
-                self.assertIn("Conflicting speed options", result.stderr)
+        for launcher, model in LAUNCHERS:
+            for flags in [("--fast", "--no-fast"), ("--no-fast", "--fast")]:
+                with self.subTest(model=model, flags=flags):
+                    result = self.launch(*flags, launcher=launcher)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("Conflicting speed options", result.stderr)
 
     def test_unsupported_effort_refuses_dispatch(self):
         for effort in ("none", "minimal", "invalid"):
