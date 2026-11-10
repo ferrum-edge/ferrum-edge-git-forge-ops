@@ -576,13 +576,16 @@ impl AdminClient {
         F: Fn(&str) -> RequestBuilder,
     {
         let max_attempts = self.max_retries.saturating_add(1);
-        let mut last_error: Option<String> = None;
         // Set once an attempt got an HTTP response and was retried anyway: the
         // gateway saw that attempt, which may have committed a write. A retry
         // after a connect error does not count; nothing was sent.
         let mut answered_before = false;
 
-        for attempt in 1..=max_attempts {
+        // Every iteration returns, or retries only while `attempt <
+        // max_attempts`, so the loop always ends in one of its returns.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
             // Registered with the display sink by `token`.
             let token = self.token()?;
             match build(&token).send().await {
@@ -641,7 +644,6 @@ impl AdminClient {
                         Err(_) => false,
                     };
                     if retryable && attempt < max_attempts {
-                        last_error = Some(format!("HTTP {status}"));
                         answered_before = true;
                         match retry_after {
                             Some(delay) => tokio::time::sleep(delay).await,
@@ -661,7 +663,6 @@ impl AdminClient {
                     });
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
-                    last_error = Some(transport_error("request to the gateway failed", e));
                     backoff_sleep(attempt).await;
                 }
                 Err(e) => {
@@ -670,11 +671,6 @@ impl AdminClient {
                 }
             }
         }
-
-        Err(crate::error::Error::HttpClient(format!(
-            "retries exhausted after {max_attempts} attempts: {}",
-            last_error.unwrap_or_else(|| "unknown".to_string())
-        )))
     }
 
     /// Turn a completed response into `Ok(())` or a typed error.
@@ -3347,8 +3343,6 @@ pub struct HealthStatus {
     /// `false` ⇒ config-database mutations are refused right now.
     #[serde(default)]
     pub admin_writes_enabled: Option<bool>,
-    #[serde(default)]
-    pub config_rejected: Option<bool>,
 }
 
 /// Reason the gateway will refuse config writes, or `None` when it accepts

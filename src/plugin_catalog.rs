@@ -1032,11 +1032,11 @@ pub fn cfg_array<'a>(
     cfg_at(value, path).and_then(|v| v.as_array())
 }
 
-/// Number of effective `api_chargeback` instances on this proxy. More than one
-/// is rejected by the gateway at admission and reload.
-pub fn over_attached_chargeback(config: &GatewayConfig, proxy: &Proxy) -> usize {
-    effective_plugins(config, proxy)
-        .into_iter()
+/// Number of `api_chargeback` instances in a proxy's [`effective_plugins`].
+/// More than one is rejected by the gateway at admission and reload.
+pub fn over_attached_chargeback(effective: &[&PluginConfig]) -> usize {
+    effective
+        .iter()
         .filter(|plugin| plugin.plugin_name == "api_chargeback")
         .count()
 }

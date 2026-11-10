@@ -98,13 +98,34 @@ fn admin_client_builds_without_mtls() {
     AdminClient::new_scoped(&env, TEST_NAMESPACES).expect("client should build without mTLS");
 }
 
-#[test]
-fn admin_client_honors_custom_timeouts() {
+#[tokio::test]
+async fn admin_client_honors_the_configured_request_timeout() {
+    // A gateway that accepts the request and never answers: only the
+    // configured request timeout (1s here, 60s by default) ends the call.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        // Parked in the channel, unanswered, until the test drops `rx`.
+        let _ = tx.send(stream);
+    });
+
     let mut env = base_env();
-    env.gateway_connect_timeout_secs = 3;
-    env.gateway_request_timeout_secs = 15;
-    AdminClient::new_scoped(&env, TEST_NAMESPACES)
-        .expect("client should build with custom timeouts");
+    env.gateway_url = Some(format!("http://{addr}"));
+    env.gateway_request_timeout_secs = 1;
+    env.gateway_max_retries = 0;
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+
+    let started = std::time::Instant::now();
+    let error = client.get_health().await.unwrap_err().to_string();
+    let elapsed = started.elapsed();
+    assert!(error.contains("timed out"), "{error}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the 1s request timeout was not applied: {elapsed:?}"
+    );
+    drop(rx);
 }
 
 #[tokio::test]
@@ -1954,6 +1975,18 @@ fn write_block_reason_tolerates_a_sparse_health_body() {
     // Older builds (or an unauthenticated projection) report only status/ready.
     // Absence of the flag is not evidence of read-only mode.
     let health = serde_json::from_str::<HealthStatus>(r#"{"status":"ok","ready":true}"#).unwrap();
+    assert!(write_block_reason(&health).is_none());
+}
+
+#[test]
+fn health_fields_gitforgeops_does_not_act_on_never_fail_the_preflight() {
+    // Only the fields the write gate reads are modeled (#695): an unmodeled
+    // field of an unexpected shape must not turn a writable gateway into a
+    // health-parse failure.
+    let health = serde_json::from_str::<HealthStatus>(
+        r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true,"config_rejected":{"reason":"older document"}}"#,
+    )
+    .unwrap();
     assert!(write_block_reason(&health).is_none());
 }
 

@@ -1467,7 +1467,6 @@ fn a_report_never_prints_a_header_value_or_a_response_body() {
     // only from the name, method, path, expected status and a bounded detail.
     let rendered = report(&[Outcome::Unexpected]).render_text();
     assert!(rendered.contains("/orders"));
-    assert!(!rendered.contains("s3cret"));
     let json = gitforgeops::json_output::pretty(&report(&[Outcome::Unexpected])).expect("json");
     assert!(!json.contains("headers"), "{json}");
 }

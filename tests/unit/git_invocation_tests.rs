@@ -98,6 +98,7 @@ const PINNED_SPAWNS: &[(&str, &str)] = &[
     ("validate/runner.rs", r#"Command::new("/bin/sh")"#),
     ("validate/runner.rs", r#"Command::new("/bin/sh")"#),
     ("validate/runner.rs", r#"Command::new("/bin/sh")"#),
+    ("validate/runner.rs", r#"Command::new("/bin/sh")"#),
     (
         "validate/runner.rs",
         r#"Command::new("/bin/sh").args(["-c","kill-0\"$1\"2>/dev/null||exit1;\case\"$(ps-ostat=-p\"$1\"2>/dev/null)\"inZ*)exit1;;esac","sh",descendant,])"#,

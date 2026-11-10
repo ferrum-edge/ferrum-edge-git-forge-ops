@@ -60,8 +60,8 @@ fields GitForgeOps does carry: built-in names, priorities, retired names, and re
 2. Download the adopted vocabularies, GitForgeOps resource schema and fixtures from that exact
    commit into the matching paths under `contracts/ferrum-contracts/`.
 3. Update `PIN` with the tag, commit SHA, and `shasum -a 256` for every vendored file.
-4. Update `edge_version` in `PIN` and the explicit compatible-version mapping in the contract
-   test when the pinned Ferrum Edge version changes.
+4. Update `edge_version` in `PIN` and the literal tag, commit and Edge version the contract test
+   asserts. The Edge version must already be in `.github/ferrum-edge-checksums.txt`.
 5. Resolve drift through the owning implementation or the upstream contract, then re-vendor; do
    not patch a shared vendored file locally.
 6. Open a PR and let the existing Rust CI run the contract test.

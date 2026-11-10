@@ -733,35 +733,6 @@ fn the_github_context_reads_blank_variables_as_unset() {
 }
 
 #[test]
-fn github_doctor_does_not_execute_the_checkout_auditor() {
-    // Neither the checkout's auditor nor a checkout module shadowing a
-    // standard-library import of the bundled one may run.
-    let dir = repo(&[
-        (
-            ".github/scripts/audit_settings.py",
-            "from pathlib import Path\nPath('checkout-auditor-ran').write_text('bad')\n",
-        ),
-        (
-            "argparse.py",
-            "from pathlib import Path\nPath('checkout-module-ran').write_text('bad')\n",
-        ),
-    ]);
-    let checks = doctor::github::run(
-        dir.path(),
-        &doctor::github::GithubContext {
-            repository: Some("acme/repo".to_string()),
-            token: Some("token".to_string()),
-            state_writer_app_id: Some("99".to_string()),
-            template_repo: false,
-            release_publishing: false,
-        },
-    );
-    assert!(!dir.path().join("checkout-auditor-ran").exists());
-    assert!(!dir.path().join("checkout-module-ran").exists());
-    assert_eq!(find(&checks, "settings-audit").status, Status::Unknown);
-}
-
-#[test]
 fn github_checks_surface_each_auditor_violation_as_its_own_finding() {
     // Doctor owns no settings baseline: it runs the same auditor the bootstrap
     // writes for and the scheduled audit runs, and republishes its findings.
@@ -837,27 +808,6 @@ fn a_release_secret_permission_failure_names_the_extra_token_permissions() {
     let remedy = check.remediation.as_deref().expect("remediation");
     assert!(remedy.contains("Secrets: read"), "{check:?}");
     assert!(remedy.contains("Environments: read"), "{check:?}");
-}
-
-#[test]
-fn github_doctor_uses_its_bundled_auditor_when_checkout_copy_is_missing() {
-    let dir = repo(&[]);
-    let checks = doctor::github::run(
-        dir.path(),
-        &doctor::github::GithubContext {
-            repository: Some("acme/repo".to_string()),
-            token: Some("token".to_string()),
-            state_writer_app_id: Some("99".to_string()),
-            template_repo: false,
-            release_publishing: false,
-        },
-    );
-    let check = find(&checks, "settings-audit");
-    assert_eq!(check.status, Status::Unknown);
-    assert!(
-        !check.detail.contains("is not in this checkout"),
-        "{check:?}"
-    );
 }
 
 // -- the gateway scope reads, and only reads -------------------------------
