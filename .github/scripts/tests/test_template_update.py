@@ -137,8 +137,9 @@ class Fixture:
                 "--repo-root",
                 str(self.customer),
                 *args,
-                "--upstream",
-                upstream or str(self.upstream),
+                # The `=` form, so a value that starts with `-` reaches the
+                # script instead of being read by argparse as an option.
+                f"--upstream={upstream or self.upstream}",
             ],
             check=False,
             text=True,
@@ -528,6 +529,21 @@ class TemplateUpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("not a Git option", result.stderr)
         self.assertFalse(marker.exists())
+
+    def test_a_command_line_upstream_may_not_be_a_git_option(self):
+        # The baseline stays valid, so only the `--upstream` guard of each
+        # command path can refuse the value before Git sees it.
+        marker = self.fixture.customer.parent / "command-line-injection-marker"
+        malicious_upstream = f"--upload-pack=touch {marker}"
+        for command in ("status", "plan", "apply", "detect-baseline"):
+            with self.subTest(command=command):
+                result = self.fixture.run(command, upstream=malicious_upstream)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    "upstream must be a path or URL, not a Git option", result.stderr
+                )
+                self.assertNotIn(str(template_update.BASELINE_PATH), result.stderr)
+                self.assertFalse(marker.exists())
 
     def test_baseline_commit_must_be_a_full_object_id(self):
         marker = self.fixture.customer.parent / "commit-injection-marker"

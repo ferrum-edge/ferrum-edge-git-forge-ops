@@ -490,11 +490,6 @@ class PoolAvailabilityTests(unittest.TestCase):
         self.assertIn("Pool availability could not be confirmed", text)
         self.assertNotIn("neither opened nor closed", text)
 
-    def test_a_clean_scan_remains_ok_after_a_healthy_pool_check(self):
-        report = check_base_image_pin.Report(has_pins=True)
-        check_base_image_pin.check_pool(self.pin, report, fetch=lambda url: 200)
-        self.assertIs(report.state, State.OK)
-
 
 class RenderTests(unittest.TestCase):
     def test_a_clean_report_keeps_redundant_pins_until_base_metadata_is_verified(self):

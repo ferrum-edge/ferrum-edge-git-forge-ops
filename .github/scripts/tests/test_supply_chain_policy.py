@@ -61,7 +61,6 @@ _HEREDOC_OPERATOR_RE = re.compile(r"(?<!<)<<(?!<)")
 _ACTION_SHA_RE = re.compile(r"@[0-9a-f]{40}")
 _SECRETS_KEY_RE = re.compile(r"^\s*-?\s*secrets\s*:", re.MULTILINE | re.IGNORECASE)
 _FIXTURE_LOOP_RE = re.compile(r"^for fixture in ([^;]+); do$", re.MULTILINE)
-_SECRETS_EXPRESSION_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b")
 _LOADER_SHARD_LIMIT_RE = re.compile(r"^MAX_BUNDLE_SHARDS = (\d+)$", re.MULTILINE)
 _LOAD_BUNDLES_STEP_RE = re.compile(
     r"      - name: Load credential bundles\n.*?(?=      - name: )",
@@ -4816,23 +4815,26 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         # `secrets.NAME` and `secrets['NAME']` were caught in validate-pr.yml,
         # but the whole-context forms — which hand over EVERY environment
         # secret at once — were allowed everywhere else, which is where the
-        # privileged workflows actually used them.
+        # privileged workflows actually used them. The checker's own pattern
+        # is tested, so weakening it fails here.
+        pattern = check_supply_chain._SECRETS_EXPRESSION_RE
         for leak in (
             "${{ toJSON(secrets) }}",
             "${{ fromJSON(toJSON(secrets)) }}",
             "${{ secrets }}",
             "${{ secrets.FERRUM_GATEWAY_URL }}",
             "${{ secrets['FERRUM_GATEWAY_URL'] }}",
+            # Expression contexts are case-insensitive.
+            "${{ toJSON(SECRETS) }}",
+            "${{ Secrets.FERRUM_GATEWAY_URL }}",
         ):
-            self.assertRegex(
-                leak, _SECRETS_EXPRESSION_RE, f"{leak} must be treated as a secret leak"
-            )
+            self.assertRegex(leak, pattern, f"{leak} must be treated as a secret leak")
         for benign in (
             "# secrets never reach this job",
             "${{ github.token }}",
             "${{ vars.GITFORGEOPS_STATE_APP_ID }}",
         ):
-            self.assertNotRegex(benign, _SECRETS_EXPRESSION_RE)
+            self.assertNotRegex(benign, pattern)
 
     def test_only_named_secret_references_survive_in_any_workflow(self):
         # validate-pr.yml must receive NO secrets; every other workflow may
