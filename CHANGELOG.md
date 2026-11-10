@@ -7,6 +7,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The default `require_auth_plugin.auth_plugin_names` allowlist is now exactly
+  the ten built-in authenticators (#691). It no longer appends fourteen
+  non-plugin spellings (`jwt`, `oidc`, `keyauth`, …), so a custom plugin with
+  one of those names no longer counts as an authenticator for the policy rule,
+  the security audit or breaking-change detection unless the operator lists
+  it. `is_default_auth_plugin_name`, which only tests called, is removed.
 - The state loader reads only version-3 ledgers (#690). The in-memory upgrade
   of version-2 ledgers was a compatibility layer the buildout policy rules
   out; a version-2 `.state/<env>.json` is now refused. `save()` still writes

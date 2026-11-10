@@ -2214,10 +2214,9 @@ fn require_auth_plugin_uses_explicit_allowlist() {
         ..Default::default()
     };
 
-    // Cases 1 and 2: `jwt` and `basic-auth` are legacy aliases on the default
-    // allowlist, not gateway plugins. They count as custom authenticators,
-    // which run on plain HTTP only unless their protocols are declared, so
-    // gRPC and WebSocket requests stay unauthenticated.
+    // Cases 1 and 2: `jwt` and `basic-auth` are not gateway plugin names and
+    // are not on the default allowlist, so a plugin by either name does not
+    // count as an authenticator unless the operator lists it.
     for (id, name) in [("jwt-1", "jwt"), ("ba-1", "basic-auth")] {
         let cfg = GatewayConfig {
             proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
@@ -2227,7 +2226,9 @@ fn require_auth_plugin_uses_explicit_allowlist() {
         let findings = evaluate_policies(&cfg, &policies);
         assert_eq!(findings.len(), 1, "{name}: {findings:?}");
         assert!(
-            findings[0].message.contains("gRPC, WebSocket"),
+            findings[0]
+                .message
+                .contains("has no enabled authentication plugin in its effective plugin list"),
             "{findings:?}"
         );
     }
@@ -3597,7 +3598,8 @@ fn policy_config_rejects_non_auth_builtins_in_auth_plugin_names() {
         assert!(err.contains(&format!("Did you mean `{builtin}`?")), "{err}");
     }
 
-    // Authenticators, custom names and legacy aliases still load.
+    // Authenticators and custom names load; an explicitly listed `jwt` is
+    // just another custom name.
     let loaded = load("[jwt_auth, mtls_auth, company_sso, jwt]")
         .unwrap()
         .unwrap();
@@ -3736,17 +3738,18 @@ fn catalog_holds_the_full_builtin_registry() {
 #[test]
 fn default_auth_plugin_names_cover_every_builtin_authenticator() {
     use gitforgeops::plugin_catalog::AUTH_PLUGIN_NAMES;
-    use gitforgeops::policy::config::{default_auth_plugin_names, is_default_auth_plugin_name};
+    use gitforgeops::policy::config::default_auth_plugin_names;
 
     let defaults = default_auth_plugin_names();
     assert_eq!(AUTH_PLUGIN_NAMES.len(), 10);
-    for name in AUTH_PLUGIN_NAMES {
-        assert!(
-            defaults.iter().any(|d| d == name),
-            "{name} missing from the default auth allowlist"
-        );
-        assert!(is_default_auth_plugin_name(name));
-    }
+    // Exactly the built-in authenticators: a non-plugin spelling such as
+    // `jwt` or `keyauth` would count a same-named custom plugin as an
+    // authenticator the operator never listed.
+    let builtins: Vec<String> = AUTH_PLUGIN_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    assert_eq!(defaults, builtins);
     // A proxy protected only by jwt_auth used to be reported unauthenticated.
     let policies = PolicyConfig {
         policies: PolicyRules {
