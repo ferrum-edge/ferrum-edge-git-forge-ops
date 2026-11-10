@@ -7,6 +7,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The default `require_auth_plugin.auth_plugin_names` allowlist is now exactly
+  the ten built-in authenticators (#691). It no longer appends fourteen
+  non-plugin spellings (`jwt`, `oidc`, `keyauth`, …), so a custom plugin with
+  one of those names no longer counts as an authenticator for the policy rule,
+  the security audit or breaking-change detection unless the operator lists
+  it. `is_default_auth_plugin_name`, which only tests called, is removed.
+- The state loader reads only version-3 ledgers (#690). The in-memory upgrade
+  of version-2 ledgers was a compatibility layer the buildout policy rules
+  out; a version-2 `.state/<env>.json` is now refused. `save()` still writes
+  only the constant `managed:v1` marker per resource key.
 - The GitHub acceptance runbook now provisions and exercises viewer-capped
   drift monitoring (#440) in its disposable repository. The upstream template
   has no gateway environment, so that is the only place the step can run end
@@ -428,6 +438,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The PR review comment's "Apply verdict" no longer says "No evaluated
+  blocker" while `review --fail-on-blockers` fails (#688). A narrowed
+  file-mode publication, colliding publication paths, invalid smoke checks
+  and a missing probe-Consumer allowlist are now listed in the verdict with
+  their remedies, from the same `apply_blockers` result the flag uses, instead
+  of as separate "Apply blocked" lines on the environment banner (or, for the
+  narrowed publication, nowhere). A slot remap acknowledged with
+  `--allow-credential-slot-remap` no longer reads as blocking.
 - The credential-bundle shard-ceiling error no longer tells operators to add
   `FERRUM_CREDS_BUNDLE_<N>` bindings to `drift-check.yml`. That workflow stopped
   loading bundles when unattended monitoring was split from deployment, and the
@@ -633,6 +651,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- `.gitforgeops/config.yaml` refuses a deployment environment named
+  `settings-audit` in any letter case (GHSA-jx32-rxh5-5q25). The settings
+  audit waives the reviewer and self-review rules for that GitHub Environment
+  because it deploys nothing, so a deployment environment of that name would
+  apply to its gateway with no reviewer while the audit still reported the
+  launch controls as active. The name is now reserved like `release`.
 - Cover the Trivy image findings CVE-2026-76844 and CVE-2026-85091 (HIGH,
   zlib) with checksum-pinned Debian Trixie `zlib1g`
   `1:1.3.dfsg+really1.3.1-1+deb13u1` updates for amd64 and arm64 from the

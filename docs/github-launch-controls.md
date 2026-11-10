@@ -1129,7 +1129,9 @@ would hold every weekly run in "waiting for approval". `audit_settings.py`
 waives the reviewer and self-review rules for this name, still audits its
 branch policy, and does not count it as a protected environment.
 `bootstrap_repo_settings.py` creates it on every repository, templates
-included.
+included. Because of that waiver the name `settings-audit` is reserved in any
+letter case: `.gitforgeops/config.yaml` refuses a deployment environment of
+that name.
 
 `settings-audit.yml` runs only from the default branch. It checks:
 

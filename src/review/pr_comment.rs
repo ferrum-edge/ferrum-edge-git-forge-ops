@@ -111,6 +111,7 @@ pub fn build_review_comment_with_status(
             &ResolveReport::default(),
             false,
             None,
+            &[],
             false,
         ),
     );
@@ -120,6 +121,12 @@ pub fn build_review_comment_with_status(
 /// A bounded, count-complete verdict precedes every bulk section. Counts use
 /// the full input slices, never the detail caps. Keep this block independent
 /// of environment banners, validator output, and finding message lengths.
+///
+/// `gate_blockers` are the offline apply blockers that no count line below
+/// describes (see [`build_review_comment_with_preview`]); any one of them
+/// blocks. `slot_remaps_acknowledged` is `--allow-credential-slot-remap`,
+/// which clears the slot-remap blocker exactly as
+/// [`crate::verdict::slot_remap_blocker`] does.
 #[allow(clippy::too_many_arguments)]
 fn verdict_summary(
     validation: ReviewValidationStatus,
@@ -129,7 +136,8 @@ fn verdict_summary(
     secrets: &ResolveReport,
     bundle_loaded: bool,
     decision: Option<&OverrideDecision>,
-    provisioning_blocked: bool,
+    gate_blockers: &[crate::verdict::ApplyBlocker],
+    slot_remaps_acknowledged: bool,
 ) -> String {
     let security_count = security
         .iter()
@@ -146,12 +154,13 @@ fn verdict_summary(
         .count();
     let conflicts = spec_owned.iter().filter(|row| row.is_conflict()).count();
     let missing = secrets.missing_required().len();
-    let blocked = provisioning_blocked
+    let slot_remaps_blocking = !slot_remaps_acknowledged && !secrets.slot_remaps.is_empty();
+    let blocked = !gate_blockers.is_empty()
         || validation != ReviewValidationStatus::Passed
         || security_blocking > 0
         || policy_blocking > 0
         || conflicts > 0
-        || !secrets.slot_remaps.is_empty()
+        || slot_remaps_blocking
         || (bundle_loaded && missing > 0);
     let mut md = String::from("### Apply verdict\n\n");
     md.push_str(if blocked {
@@ -160,7 +169,7 @@ fn verdict_summary(
         "> No evaluated blocker. Gateway-dependent gates and unavailable credential evidence still apply.\n\n"
     });
     md.push_str(&format!(
-        "- Validation: {}.\n- Security Findings: {} total, {security_blocking} blocking, {} overridden.\n- Policy Violations: {} total, {policy_blocking} blocking.\n- Spec-owned Resources: {} total, {conflicts} **CONFLICT**(s); conflicting namespaces cannot apply.\n- Credential Slot Remaps: {} blocking unless explicitly acknowledged with `--allow-credential-slot-remap`.\n",
+        "- Validation: {}.\n- Security Findings: {} total, {security_blocking} blocking, {} overridden.\n- Policy Violations: {} total, {policy_blocking} blocking.\n- Spec-owned Resources: {} total, {conflicts} **CONFLICT**(s); conflicting namespaces cannot apply.\n- Credential Slot Remaps: {} {}.\n",
         match validation {
             ReviewValidationStatus::Passed => "passed",
             ReviewValidationStatus::Rejected => "rejected; blocks apply",
@@ -171,6 +180,11 @@ fn verdict_summary(
         policy.len(),
         spec_owned.len(),
         secrets.slot_remaps.len(),
+        if slot_remaps_acknowledged {
+            "acknowledged with `--allow-credential-slot-remap`; not blocking"
+        } else {
+            "blocking unless explicitly acknowledged with `--allow-credential-slot-remap`"
+        },
     ));
     if bundle_loaded {
         md.push_str(&format!(
@@ -1149,9 +1163,19 @@ pub fn build_review_comment_v2_with_override(
         security_override,
         &[],
         &[],
+        false,
     )
 }
 
+/// The review comment `cmd_review` posts.
+///
+/// `gate_blockers` are the offline apply blockers from
+/// [`crate::verdict::apply_blockers`] that have no findings section or count
+/// line of their own: missing provisioning prerequisites, a narrowed or
+/// colliding file publication, invalid smoke checks and a missing probe
+/// allowlist. Each is listed in the verdict with its remedy, so the verdict
+/// blocks whenever `review --fail-on-blockers` would fail on one of them.
+/// `slot_remaps_acknowledged` is `--allow-credential-slot-remap`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_review_comment_with_preview(
     validation_status: ReviewValidationStatus,
@@ -1171,7 +1195,8 @@ pub fn build_review_comment_with_preview(
     bundle_loaded: bool,
     security_override: Option<&OverrideDecision>,
     adoptions: &[crate::apply::AdoptionCandidate],
-    provisioning_blockers: &[crate::verdict::ApplyBlocker],
+    gate_blockers: &[crate::verdict::ApplyBlocker],
+    slot_remaps_acknowledged: bool,
 ) -> String {
     let mut md = build_review_comment_inner(
         validation_status,
@@ -1301,14 +1326,17 @@ pub fn build_review_comment_with_preview(
         }
         append_omitted_list_item(&mut md, secrets.slot_remaps.len(), "slot remap");
         md.push('\n');
-        md.push_str(
+        md.push_str(if slot_remaps_acknowledged {
+            "> Acknowledged with `--allow-credential-slot-remap`: apply accepts the \
+             reassignments listed above.\n\n"
+        } else {
             "> **Apply is blocked.** Rotation replaces the value and sends it at its current slot \
              but does not remove the bundle key. Before shrinking or shifting a Consumer array, move \
              surviving rotated values to their new canonical slots in the private bundle and \
              remove vacated keys, preserving unrelated entries. Reseed plugin-config slots and \
              retire orphaned keys from the bundle, or re-run with `--allow-credential-slot-remap` \
-             to accept the reassignment.\n\n",
-        );
+             to accept the reassignment.\n\n"
+        });
     }
 
     if !secrets.results.is_empty() {
@@ -1356,9 +1384,10 @@ pub fn build_review_comment_with_preview(
         secrets,
         bundle_loaded,
         security_override,
-        !provisioning_blockers.is_empty(),
+        gate_blockers,
+        slot_remaps_acknowledged,
     );
-    for blocker in provisioning_blockers {
+    for blocker in gate_blockers {
         summary.push_str(&format!("- **Apply is blocked:** {}\n", blocker.summary()));
     }
     summary.push_str(&format!("- Ownership adoptions: {}.\n\n", adoptions.len()));

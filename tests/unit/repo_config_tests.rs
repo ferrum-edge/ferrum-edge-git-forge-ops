@@ -229,6 +229,28 @@ fn a_deployment_environment_may_not_take_the_release_name() {
 }
 
 #[test]
+fn a_deployment_environment_may_not_take_the_settings_audit_name() {
+    // The settings audit waives the required-reviewer and prevent-self-review
+    // rules for the `settings-audit` GitHub Environment, which deploys nothing.
+    // A deployment environment of that name would apply to its gateway with no
+    // reviewer. GitHub compares environment names case-insensitively, so every
+    // spelling is refused.
+    for name in ["settings-audit", "Settings-Audit", "SETTINGS-AUDIT"] {
+        let yaml = format!("environments:\n  {name}:\n    ownership:\n      mode: shared\n");
+        let file = write_repo_config(&yaml);
+        let error = RepoConfig::load_from_path(file.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("environment '{name}'")), "{error}");
+        assert!(error.contains("reserved"), "{error}");
+    }
+    // A name that only contains it is an ordinary deployment environment.
+    let yaml = "environments:\n  settings-audit-lab:\n    ownership:\n      mode: shared\n";
+    let file = write_repo_config(yaml);
+    assert!(RepoConfig::load_from_path(file.path()).unwrap().is_some());
+}
+
+#[test]
 fn repo_config_rejects_prune_threshold_above_100() {
     // delete_pct in cmd_apply is 0..=100. A YAML value > 100 would make the
     // guard `delete_pct > threshold` never fire — mass deletions would

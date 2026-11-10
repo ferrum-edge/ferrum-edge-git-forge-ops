@@ -701,7 +701,8 @@ secrets until a reviewer approves; that is reported as `not_completed`, never
 in sync. A deployment environment may not use the suffix (the settings audit
 waives its required-reviewer rule for that shape). Nor may one be named `release` in any case
 (`RELEASE_ENVIRONMENT`): that reviewer-free GitHub Environment holds only
-`release.yml`'s registry credentials.
+`release.yml`'s registry credentials. The same holds for `settings-audit`
+(`SETTINGS_AUDIT_ENVIRONMENT`), which holds only `SETTINGS_AUDIT_TOKEN`.
 
 Fences on the reviewer-free environment:
 
@@ -1484,7 +1485,13 @@ gateway, as `Vec<ApplyBlocker>` over eleven `BlockerKind`s:
   before assembly (`preflight_deployment_inputs`); only `review` surfaces them
   as blockers.
 - `review --fail-on-blockers` uses the same computation for its exit code;
-  default `review` renders the verdict and exits 0.
+  default `review` renders the verdict and exits 0. The comment's "Apply
+  verdict" counts the findings classes from the findings themselves, honors
+  `--allow-credential-slot-remap` for slot remaps, and lists every other
+  class (provisioning, narrowed or colliding publication, smoke checks, probe
+  allowlist) from the same `apply_blockers` result with its remedy, so it
+  blocks whenever one of them would fail the flag. The flag changes only the
+  exit code.
 - `cmd_apply` calls the *same per-class predicates* (`security_blocker`,
   `policy_blocker`, `required_credentials_blocker`, `validation_blocker`,
   `credential_provisioning_blockers`) at its own gate points, because order

@@ -152,9 +152,8 @@ ledger itself is protected.
 [`src/state.rs`](../src/state.rs) defines the format. The writer emits version
 3: a constant `managed:v1` marker per resource key, credential delivery
 metadata, the pending-create journal, override evidence, and the published mesh
-path. Version 2 files are still read and rewritten as version 3 on the next
-save. There are no migrations to run. The ledger holds no credential-derived
-hashes.
+path. Only version 3 is read; any other version is refused. There are no
+migrations to run. The ledger holds no credential-derived hashes.
 
 ## Spec-owned resources
 

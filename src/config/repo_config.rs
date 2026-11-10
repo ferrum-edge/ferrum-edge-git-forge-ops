@@ -92,6 +92,17 @@ pub const MONITORING_ENVIRONMENT_SUFFIX: &str = "-monitor";
 /// `bootstrap_repo_settings.py` use the same name.
 pub const RELEASE_ENVIRONMENT: &str = "release";
 
+/// Reserved name of the GitHub Environment `settings-audit.yml` binds.
+///
+/// It holds only `SETTINGS_AUDIT_TOKEN` and deploys nothing, so the settings
+/// audit waives its required-reviewer and prevent-self-review rules and does
+/// not count it as a protected environment. A deployment environment of this
+/// name (GitHub compares environment names case-insensitively) would make
+/// every apply to its gateway run without a reviewer while the audit still
+/// reports the launch controls as active. `audit_settings.SETTINGS_AUDIT_ENVIRONMENT`
+/// uses the same name.
+pub const SETTINGS_AUDIT_ENVIRONMENT: &str = "settings-audit";
+
 /// Derive the monitoring environment name for a deployment environment.
 pub fn monitoring_environment_name(environment: &str) -> String {
     format!("{environment}{MONITORING_ENVIRONMENT_SUFFIX}")
@@ -339,6 +350,15 @@ impl RepoConfig {
                      reserved for the GitHub Environment that holds release.yml's registry \
                      credentials, whose reviewer rule the settings audit waives. Rename this \
                      deployment environment and its GitHub Environment."
+                )));
+            }
+
+            if name.eq_ignore_ascii_case(SETTINGS_AUDIT_ENVIRONMENT) {
+                return Err(crate::error::Error::Config(format!(
+                    "environment '{name}': the name '{SETTINGS_AUDIT_ENVIRONMENT}' (in any case) \
+                     is reserved for the GitHub Environment that holds settings-audit.yml's \
+                     SETTINGS_AUDIT_TOKEN, whose reviewer rules the settings audit waives. \
+                     Rename this deployment environment and its GitHub Environment."
                 )));
             }
 

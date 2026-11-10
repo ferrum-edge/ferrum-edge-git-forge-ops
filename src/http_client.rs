@@ -2116,16 +2116,6 @@ pub fn explain_config_export_refusal(
     ))
 }
 
-/// A DELETE that answers a valid not-found 404 already achieved its goal.
-/// The HTTP path validates nonempty mutation bodies before accepting that
-/// status. The gateway cascades deletes server-side (proxy delete removes its
-/// scoped plugin configs), so a diff-driven follow-up delete legitimately
-/// finds nothing. Treating it as an error left the state entry in place and
-/// wedged every later run on the same delete.
-pub fn delete_succeeded(status: u16) -> bool {
-    is_success_status(status) || status == 404
-}
-
 fn is_success_status(status: u16) -> bool {
     (200..=299).contains(&status)
 }

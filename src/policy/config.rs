@@ -120,7 +120,7 @@ pub fn effective_auth_allowlist(policy: Option<&PolicyConfig>) -> AuthAllowlist 
 /// `access_control`, `spiffe_identity`, …) runs on no protocol as an
 /// authenticator and its protocols cannot be declared, so listing it could
 /// only ever report its instances as ignored. A built-in's protocols are the
-/// gateway's, a legacy alias is not a loadable `plugin_name`, and a name
+/// gateway's, a non-plugin spelling such as `jwt` is not a loadable `plugin_name`, and a name
 /// missing from the allowlist declares nothing. All of these are mistakes to
 /// fail on rather than silently ignore.
 fn validate_require_auth_plugin(cfg: &RequireAuthPluginRuleConfig) -> crate::error::Result<()> {
@@ -271,13 +271,11 @@ fn validate_plugin_name_allowlists(rules: &PolicyRules) -> crate::error::Result<
     )
 }
 
-/// Spellings that are not real `plugin_name` values but appear in
-/// hand-written policy files and in this repo's own examples from before the
-/// catalog was pinned down. They stay in the default allowlist, but they are
-/// not built-ins, so like any custom name they count for plain HTTP only, and
-/// they can never match a live plugin — `plugin_name_is_known` flags them
-/// separately as unknown names. They cannot be given protocols under
-/// `custom_auth_plugin_protocols`.
+/// Spellings that are not real `plugin_name` values but are easily mistaken
+/// for a built-in authenticator (`jwt` for `jwt_auth`, `oauth2` for
+/// `oauth2_introspection`, …). They are not on the default allowlist, and
+/// `plugin_name_is_known` flags them as unknown names. They cannot be given
+/// protocols under `custom_auth_plugin_protocols`.
 const LEGACY_AUTH_PLUGIN_ALIASES: &[&str] = &[
     "jwt",
     "oauth2",
@@ -298,20 +296,13 @@ const LEGACY_AUTH_PLUGIN_ALIASES: &[&str] = &[
 /// Ferrum Edge built-in auth plugin ids. Matching is exact against the
 /// plugin's `plugin_name` field, as the gateway resolves plugins.
 ///
-/// The canonical ten come from [`crate::plugin_catalog::AUTH_PLUGIN_NAMES`]
-/// so this list cannot drift from the gateway's registry; the legacy aliases
-/// are appended for backwards compatibility with older policy files.
+/// They come from [`crate::plugin_catalog::AUTH_PLUGIN_NAMES`] so this list
+/// cannot drift from the gateway's registry.
 pub fn default_auth_plugin_names() -> Vec<String> {
     crate::plugin_catalog::AUTH_PLUGIN_NAMES
         .iter()
-        .chain(LEGACY_AUTH_PLUGIN_ALIASES.iter())
         .map(|name| (*name).to_string())
         .collect()
-}
-
-pub fn is_default_auth_plugin_name(plugin_name: &str) -> bool {
-    crate::plugin_catalog::AUTH_PLUGIN_NAMES.contains(&plugin_name)
-        || LEGACY_AUTH_PLUGIN_ALIASES.contains(&plugin_name)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

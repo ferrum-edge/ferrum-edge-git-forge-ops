@@ -3,10 +3,10 @@ use gitforgeops::config::env::{ApplyStrategy, EnvConfig, GatewayMode};
 use gitforgeops::config::schema::{GatewayConfig, Proxy, Upstream};
 use gitforgeops::http_client::convergence_summary;
 use gitforgeops::http_client::{
-    build_restore_body, classify_retry, delete_succeeded, is_read_only_refusal, map_api_error,
-    merge_pages, next_page_offset, resource_id_is_path_safe, split_batch, write_block_reason,
-    AdminClient, ApiErrorBody, BackupExtras, BackupSnapshot, BatchCreate, ClusterStatus,
-    DeleteOutcome, ExportEndpoint, HealthStatus, RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
+    build_restore_body, classify_retry, is_read_only_refusal, map_api_error, merge_pages,
+    next_page_offset, resource_id_is_path_safe, split_batch, write_block_reason, AdminClient,
+    ApiErrorBody, BackupExtras, BackupSnapshot, BatchCreate, ClusterStatus, DeleteOutcome,
+    ExportEndpoint, HealthStatus, RequestKind, RetryDecision, BATCH_MAX_BODY_BYTES,
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -925,23 +925,6 @@ async fn transport_failures_do_not_disclose_the_gateway_url() {
         !error.contains("for url"),
         "the URL suffix was not stripped: {error}"
     );
-}
-
-#[test]
-fn delete_treats_404_as_success() {
-    // Proxy deletes cascade server-side to scoped plugin configs, so the
-    // diff's own follow-up delete legitimately finds nothing. Recording that
-    // as an error left the state entry behind and wedged every later run.
-    assert!(delete_succeeded(200));
-    assert!(delete_succeeded(204));
-    assert!(delete_succeeded(404));
-
-    assert!(!delete_succeeded(403));
-    assert!(!delete_succeeded(409));
-    assert!(!delete_succeeded(500));
-    assert!(!delete_succeeded(300));
-    assert!(!delete_succeeded(304));
-    assert!(!delete_succeeded(399));
 }
 
 #[tokio::test]

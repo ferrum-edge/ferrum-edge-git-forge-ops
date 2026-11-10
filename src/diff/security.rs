@@ -120,7 +120,7 @@ pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
 /// The auth-plugin allowlist is the operator's statement of what counts as
 /// authentication in this repo, so when a policy config is available it wins
 /// over the built-in defaults; without one the ten built-in authenticators of
-/// `plugin_catalog::AUTH_PLUGIN_NAMES` (plus legacy spellings) are used.
+/// `plugin_catalog::AUTH_PLUGIN_NAMES` are used.
 ///
 /// Must run **before** `secrets::resolve_secrets`: the literal-credential
 /// check treats any secret string that is not a `${...}` placeholder as a

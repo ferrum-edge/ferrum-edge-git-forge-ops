@@ -60,8 +60,8 @@ policies:
     # Protocols each custom authenticator in auth_plugin_names implements
     # (its supported_protocols(): http, grpc, websocket, tcp, udp). An
     # undeclared custom authenticator counts for plain HTTP only, the
-    # gateway's default. Built-in names and legacy spellings such as jwt or
-    # oauth2 (not real plugin names) cannot be listed here.
+    # gateway's default. Built-in names and non-plugin spellings such as jwt
+    # or oauth2 cannot be listed here.
     # custom_auth_plugin_protocols:
     #   company_sso: [http, grpc, websocket]
     # Exact proxies deliberately allowed to rely on conditional authenticators.
