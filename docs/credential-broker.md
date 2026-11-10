@@ -536,6 +536,4 @@ production credentials.
 `delivered_run_id`, and for slots `apply` allocated, `allocation_commit` and
 `allocation_recipient` (cleared by `rotate`). CI commits the ledger, so
 `git log .state/<env>.json` is the delivery history. The ledger holds no
-credential-derived hashes. Version 2 ledgers that carried hashes are rewritten
-without them on the next save; rotate any low-entropy credential whose old hash
-is already in Git history.
+credential-derived hashes.

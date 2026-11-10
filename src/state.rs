@@ -10,7 +10,6 @@ use crate::diff::resource_diff::{state_key, state_key_namespace};
 
 pub const STATE_DIR: &str = ".state";
 const STATE_VERSION: u32 = 3;
-const MIN_SUPPORTED_STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CredentialMetadata {
@@ -340,9 +339,9 @@ impl StateFile {
 
         let mut state = serde_json::from_str::<Self>(&contents)
             .map_err(|source| crate::error::Error::StateParse { path, source })?;
-        if !(MIN_SUPPORTED_STATE_VERSION..=STATE_VERSION).contains(&state.version) {
+        if state.version != STATE_VERSION {
             return Err(crate::error::Error::Config(format!(
-                "state file for environment '{environment}' has unsupported version {}; this build accepts versions {MIN_SUPPORTED_STATE_VERSION} through {STATE_VERSION}",
+                "state file for environment '{environment}' has unsupported version {}; this build accepts only version {STATE_VERSION}",
                 state.version
             )));
         }
@@ -350,14 +349,6 @@ impl StateFile {
         // the correct `.state/<env>.json` file, regardless of what the on-disk
         // field says.
         state.environment = environment.to_string();
-        // State v2 stored unkeyed hashes of complete resources (including
-        // resolved Consumer credentials). Reconciliation has always consumed
-        // only the map keys, so normalize the unused values in memory and let
-        // the next ordinary save remove those offline verification oracles.
-        state.version = STATE_VERSION;
-        for marker in state.resources.values_mut() {
-            *marker = managed_resource_marker();
-        }
         state.validate_resource_keys()?;
         Ok(state)
     }
@@ -385,9 +376,9 @@ impl StateFile {
             Uuid::new_v4()
         ));
         // Serialize a sanitized copy even when a library caller constructed a
-        // StateFile directly. Loaded v2 files are normalized in load(), but
-        // save() is the final boundary that guarantees no legacy resource hash
-        // can be committed as public state.
+        // StateFile directly or a loaded file carried another marker value:
+        // save() is the boundary that guarantees no resource hash can be
+        // committed as public state.
         let mut public_state = self.clone();
         public_state.version = STATE_VERSION;
         for marker in public_state.resources.values_mut() {
@@ -950,9 +941,9 @@ impl ResourceKeys {
 }
 
 fn managed_resource_marker() -> String {
-    // Only the key participates in ownership reconciliation. Retain a stable
-    // value for backwards-compatible JSON shape without hashing resource
-    // content (which can include resolved credentials).
+    // Only the key participates in ownership reconciliation. The value is a
+    // constant so the ledger never hashes resource content (which can include
+    // resolved credentials).
     "managed:v1".to_string()
 }
 

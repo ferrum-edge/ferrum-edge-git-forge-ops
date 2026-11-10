@@ -643,9 +643,9 @@ fn state_load_uses_requested_environment_name() {
         let key = state_key("ferrum", "Proxy", "p1");
         let state_json = format!(
             r#"{{
-            "version": 2,
+            "version": 3,
             "environment": "staging",
-            "resources": {{"{key}": "sha256:abc"}}
+            "resources": {{"{key}": "managed:v1"}}
         }}"#
         );
         std::fs::write(".state/production.json", state_json).unwrap();
@@ -717,9 +717,9 @@ fn state_load_rejects_raw_resource_keys() {
     with_cwd(dir.path(), || {
         std::fs::create_dir_all(".state").unwrap();
         let state_json = r#"{
-            "version": 2,
+            "version": 3,
             "environment": "production",
-            "resources": {"ferrum:Proxy:api": "sha256:old"}
+            "resources": {"ferrum:Proxy:api": "managed:v1"}
         }"#;
         std::fs::write(".state/production.json", state_json).unwrap();
 
@@ -1001,7 +1001,9 @@ consumers:
 }
 
 #[test]
-fn loading_v2_state_sanitizes_legacy_hash_oracles_on_next_save() {
+fn state_load_rejects_version_2_ledgers() {
+    // Pre-launch buildout keeps no compatibility loader for earlier ledger
+    // revisions: a version-2 file is refused, not upgraded in memory.
     let dir = TempDir::new().unwrap();
     with_cwd(dir.path(), || {
         std::fs::create_dir_all(".state").unwrap();
@@ -1009,20 +1011,7 @@ fn loading_v2_state_sanitizes_legacy_hash_oracles_on_next_save() {
         let old = serde_json::json!({
             "version": 2,
             "environment": "production",
-            "last_applied_at": null,
-            "last_applied_commit": null,
-            "resources": {key.clone(): "sha256:consumer-secret-oracle"},
-            "credentials": {
-                "ferrum/app/keyauth/key": {
-                    "slot": "ferrum/app/keyauth/key",
-                    "shard": 0,
-                    "last_rotated": "2026-01-01T00:00:00Z",
-                    "sha256_prefix": "deadbeefdeadbeef"
-                }
-            },
-            "credential_bundle_versions": {"0": "sha256:bundle-oracle"},
-            "credential_shard_count": 1,
-            "overrides": []
+            "resources": {key: "sha256:consumer-secret-oracle"}
         });
         std::fs::write(
             ".state/production.json",
@@ -1030,19 +1019,9 @@ fn loading_v2_state_sanitizes_legacy_hash_oracles_on_next_save() {
         )
         .unwrap();
 
-        let state = StateFile::load("production").unwrap();
-        assert_eq!(state.version, 3);
-        assert_eq!(state.resources.get(&key), Some(&"managed:v1".to_string()));
-        state.save().unwrap();
-
-        let rewritten = std::fs::read_to_string(".state/production.json").unwrap();
-        assert!(!rewritten.contains("sha256_prefix"), "{rewritten}");
-        assert!(
-            !rewritten.contains("credential_bundle_versions"),
-            "{rewritten}"
-        );
-        assert!(!rewritten.contains("secret-oracle"), "{rewritten}");
-        assert!(!rewritten.contains("bundle-oracle"), "{rewritten}");
+        let error = StateFile::load("production").unwrap_err().to_string();
+        assert!(error.contains("unsupported version 2"), "{error}");
+        assert!(error.contains("accepts only version 3"), "{error}");
     });
 }
 

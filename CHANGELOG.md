@@ -7,6 +7,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The state loader reads only version-3 ledgers (#690). The in-memory upgrade
+  of version-2 ledgers was a compatibility layer the buildout policy rules
+  out; a version-2 `.state/<env>.json` is now refused. `save()` still writes
+  only the constant `managed:v1` marker per resource key.
 - The GitHub acceptance runbook now provisions and exercises viewer-capped
   drift monitoring (#440) in its disposable repository. The upstream template
   has no gateway environment, so that is the only place the step can run end
