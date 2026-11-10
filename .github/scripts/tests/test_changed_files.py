@@ -157,12 +157,13 @@ class ChangedFilesTests(unittest.TestCase):
             ".gitforgeops/smoke.example.yaml",
             ".github/scripts/audit_settings.py",
             # The conformance tests read and hash the vendored contracts and
-            # the Edge checksum allowlist; the promotion tests read these two
-            # workflows.
+            # the Edge checksum allowlist; the promotion tests read these three
+            # workflows (rotate.yml for the ledger job budgets).
             "contracts/ferrum-contracts/PIN",
             "contracts/ferrum-contracts/vocabularies/plugin-catalog.json",
             ".github/ferrum-edge-checksums.txt",
             ".github/workflows/apply-on-merge.yml",
+            ".github/workflows/rotate.yml",
             ".github/workflows/trusted-pr-review.yml",
         ):
             with self.subTest(path=path):
@@ -196,6 +197,7 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertIn("contracts/**", entries)
         self.assertIn(".github/ferrum-edge-checksums.txt", entries)
         self.assertIn(".github/workflows/apply-on-merge.yml", entries)
+        self.assertIn(".github/workflows/rotate.yml", entries)
         self.assertIn(".github/workflows/trusted-pr-review.yml", entries)
         for entry in entries:
             # Instantiate the glob with a representative concrete path.

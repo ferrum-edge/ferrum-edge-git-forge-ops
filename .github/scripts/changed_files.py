@@ -21,7 +21,7 @@ PATTERNS = {
         r"docs/quickstart\.md$|\.gitforgeops/[^/]+\.example\.yaml$|"
         r"\.github/scripts/audit_settings\.py$|contracts/|"
         r"\.github/ferrum-edge-checksums\.txt$|"
-        r"\.github/workflows/(?:apply-on-merge|trusted-pr-review)\.yml$)"
+        r"\.github/workflows/(?:apply-on-merge|rotate|trusted-pr-review)\.yml$)"
     ),
     "declarative": re.compile(r"^(?:resources/|overlays/|\.gitforgeops/|\.state(?:/|$))"),
     "state": re.compile(r"^\.state(?:/|$)"),
