@@ -116,7 +116,7 @@ keep its schema in one initial baseline; see the
 | `rust-ci.yml` | pull request, push | Build, test, lint. |
 | `security.yml` | pull request, push, weekly | Dependency audit and supply-chain policy. |
 | `supply-chain-policy.yml` | pull request (`pull_request_target`) | Trusted supply-chain policy (`trusted-supply-chain-policy`). |
-| `code-scanning.yml` | pull request, push, weekly | CodeQL and container image scan (not required). |
+| `code-scanning.yml` | build-input pull requests and pushes, weekly | CodeQL and container image scan (not required). |
 | `alloy-consumer.yml` | consumer-surface pull requests, weekly, manual | Non-required Alloy consumer qualification. |
 | `lifecycle.yml` | push, daily, manual | End-to-end acceptance against a real gateway. |
 | `release.yml` | `v*` tag | Publish the container image. |
