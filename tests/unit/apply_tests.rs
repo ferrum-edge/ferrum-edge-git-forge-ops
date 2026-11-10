@@ -381,21 +381,14 @@ fn plugin_config(
 }
 
 fn spec_extras(ids: &[&str]) -> gitforgeops::http_client::BackupExtras {
-    spec_extras_hashed(&ids.iter().map(|id| (*id, "sha-1")).collect::<Vec<_>>())
-}
-
-/// `spec_extras` with an explicit `content_hash` per spec, so a test can make
-/// one document differ between two `/backup` reads the way a concurrent
-/// `PUT /api-specs/{id}` would.
-fn spec_extras_hashed(specs: &[(&str, &str)]) -> gitforgeops::http_client::BackupExtras {
     gitforgeops::http_client::BackupExtras {
         api_specs: Some(serde_json::json!({
             "section_version": "2",
-            "items": specs.iter().map(|(id, content_hash)| serde_json::json!({
+            "items": ids.iter().map(|id| serde_json::json!({
                 "id": id,
                 "namespace": "team-alpha",
                 "proxy_id": "spec-proxy",
-                "content_hash": content_hash,
+                "content_hash": "sha-1",
             })).collect::<Vec<_>>(),
         })),
         gateway_trust_bundles: Some(serde_json::json!([{"revision": 7}])),
@@ -406,7 +399,8 @@ fn spec_extras_hashed(specs: &[(&str, &str)]) -> gitforgeops::http_client::Backu
 }
 
 /// [`backup_body`] with the opaque sections `GatewayConfig` does not model
-/// spliced back in, for the freshness re-read that reads `api_specs`.
+/// spliced back in: a coherent `/backup` answer a test serves to prove that
+/// full replace never re-reads it before `/restore`.
 fn backup_body_with_extras(
     config: &GatewayConfig,
     extras: &gitforgeops::http_client::BackupExtras,
@@ -1791,70 +1785,18 @@ async fn full_replace_preserves_the_complete_spec_owned_resource_graph() {
         .all(|request| !request.starts_with("GET /backup")));
 }
 
-/// A spec rewritten between the payload being built and the POST must abort
-/// the restore. `/restore` deletes every spec in the namespace and re-creates
-/// exactly what the payload carries, so proceeding would roll the newer
-/// document back to the one this run happened to read first.
+/// A namespace that changed between the payload being built and the POST
+/// must abort the restore; the gateway's conditional `/restore` answers 412.
+/// Two races end there. A spec rewritten in between would be rolled back to
+/// the document this run read first, because `/restore` deletes every spec in
+/// the namespace and re-creates exactly what the payload carries. A spec
+/// created in between is the more destructive half: it is absent from
+/// `api_specs.items`, and a non-empty section makes the gateway delete every
+/// spec the payload does not name without consulting
+/// `confirm_api_spec_deletion`. Either way the 412 is recorded, the restore
+/// is not replayed, and `/backup` is not re-read.
 #[tokio::test]
-async fn full_replace_aborts_when_a_spec_changed_since_the_payload_was_built() {
-    let (desired, actual) = spec_owned_graph();
-    let prepared = spec_extras_hashed(&[("spec-a", "sha-1")]);
-    let (url, requests) = spawn_recording_gateway(vec![
-        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
-        (
-            "POST /restore?confirm=true".into(),
-            412,
-            r#"{"error":"namespace changed"}"#.into(),
-            vec![],
-        ),
-    ]);
-    let client = stub_client(url);
-
-    let result = apply_api(
-        &desired,
-        &client,
-        &["team-alpha".to_string()],
-        OwnershipScope::Exclusive,
-        Some(&BTreeMap::from([("team-alpha".to_string(), actual)])),
-        Some(&BTreeMap::from([("team-alpha".to_string(), prepared)])),
-        &ApplyOptions {
-            strategy: gitforgeops::config::ApplyStrategy::FullReplace,
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("the abort is namespace-scoped, not a whole-run stop");
-
-    // Namespace-scoped: recorded so the run still exits non-zero through
-    // `into_result`, without taking every other namespace out of the apply.
-    assert!(result.fully_replaced_namespaces.is_empty());
-    let rendered = result.errors.join("\n");
-    assert!(rendered.contains("namespace changed"), "{rendered}");
-    assert!(result.into_result().is_err(), "the run must not exit green");
-    assert!(
-        requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|request| request.starts_with("POST /restore"))
-            .count()
-            == 1,
-        "a stale spec snapshot must never be replayed"
-    );
-    assert!(requests
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|request| !request.starts_with("GET /backup")));
-}
-
-/// A spec created after the payload was built is the more destructive half of
-/// the same race: it is absent from `api_specs.items`, and a non-empty section
-/// makes the gateway delete every spec the payload does not name — without
-/// consulting `confirm_api_spec_deletion`, which it only reads when the
-/// section is absent entirely.
-#[tokio::test]
-async fn full_replace_aborts_when_a_spec_was_created_since_the_payload_was_built() {
+async fn full_replace_does_not_replay_or_re_read_after_a_412_restore() {
     let (desired, actual) = spec_owned_graph();
     let prepared = spec_extras(&["spec-a"]);
     let (url, requests) = spawn_recording_gateway(vec![
@@ -1897,7 +1839,7 @@ async fn full_replace_aborts_when_a_spec_was_created_since_the_payload_was_built
             .filter(|request| request.starts_with("POST /restore"))
             .count()
             == 1,
-        "a snapshot that no longer describes the namespace must not be replayed"
+        "a stale spec snapshot must never be replayed"
     );
     assert!(requests
         .lock()
@@ -5896,12 +5838,6 @@ async fn full_replace_carries_a_preserved_spec_owned_row_top_level_field_verbati
             "POST /restore?confirm=true".into(),
             200,
             "{}".into(),
-            vec![],
-        ),
-        (
-            "GET /backup".into(),
-            200,
-            backup_body_with_extras(&actual, &extras),
             vec![],
         ),
     ]);

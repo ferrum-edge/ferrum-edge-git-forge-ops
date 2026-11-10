@@ -103,26 +103,11 @@ fn vendored_contract_files_match_the_pin_hashes() {
     }
 }
 
+/// The pin's tag and Edge version are asserted literally above; this checks
+/// that the Edge version it names is one the validator allowlist accepts.
 #[test]
-fn pinned_contract_tag_matches_the_qualified_edge_version() {
-    let (tag, _, edge_version, _) = parse_pin();
-    let edge_contract_tags = [
-        ("v0.9.9", "contracts-edge-0.9.9"),
-        ("v0.9.10", "contracts-edge-0.9.9"),
-        ("v0.9.11", "contracts-edge-0.9.11"),
-        ("v0.9.12", "contracts-edge-0.9.12"),
-        ("v0.9.13", "contracts-edge-0.9.13"),
-        ("v0.9.14", "contracts-edge-0.9.14"),
-        ("v0.9.15", "contracts-edge-0.9.15"),
-        ("v0.9.19", "contracts-edge-0.9.19"),
-        ("v0.9.20", "contracts-edge-0.9.20"),
-    ];
-    let expected_tag = edge_contract_tags
-        .iter()
-        .find_map(|(edge, contracts)| (*edge == edge_version).then_some(*contracts))
-        .unwrap_or_else(|| panic!("no contracts tag mapping for Edge {edge_version}"));
-    assert_eq!(tag, expected_tag);
-
+fn pinned_edge_version_is_in_the_checksum_allowlist() {
+    let (_, _, edge_version, _) = parse_pin();
     let checksums = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/ferrum-edge-checksums.txt"),
     )
