@@ -501,22 +501,33 @@ def unattended_environments_from_config(text: str) -> list[str]:
     return names
 
 
+# The non-deployment environments a deployment environment may not share a
+# name with, and what each one holds.
+RESERVED_ENVIRONMENTS = {
+    RELEASE_ENVIRONMENT: "holds release.yml's registry credentials",
+    SETTINGS_AUDIT_ENVIRONMENT: "fences settings-audit.yml's administration-read token",
+}
+
+
 def refuse_reserved_environments(names: list[str]) -> list[str]:
-    """A deployment environment may not be the registry-credential environment.
+    """A deployment environment may not be a reserved non-deployment environment.
 
     `release` holds only release.yml's registry push credentials and, where
-    publishing is enabled, has no required reviewer. GitHub compares
-    environment names case-insensitively, so `Release` is the same
-    environment. `src/config/repo_config.rs` refuses the same names, so the
-    bootstrap never plans a reviewed deployment environment and the reviewer-
-    free registry environment as one.
+    publishing is enabled, has no required reviewer. `settings-audit` holds
+    only the settings audit's administration-read token, and the audit waives
+    the deployment reviewer rules for it. GitHub compares environment names
+    case-insensitively, so `Release` and `Settings-Audit` are the same
+    environments. `src/config/repo_config.rs` refuses the same names, so the
+    bootstrap never plans a reviewed deployment environment and a
+    reviewer-free credential environment as one.
     """
     for name in names:
-        if name.strip().casefold() == RELEASE_ENVIRONMENT:
+        reserved = name.strip().casefold()
+        if reserved in RESERVED_ENVIRONMENTS:
             raise ValueError(
-                f"environment {name!r} is reserved for the {RELEASE_ENVIRONMENT!r} "
-                "GitHub Environment that holds release.yml's registry credentials; "
-                "rename the deployment environment"
+                f"environment {name!r} is reserved for the {reserved!r} GitHub "
+                f"Environment that {RESERVED_ENVIRONMENTS[reserved]}; rename the "
+                "deployment environment"
             )
     return names
 
@@ -1533,13 +1544,6 @@ def build_plan(api: GitHubApi, args) -> Plan:
     # protected branch by an environment rather than left as a repository secret
     # that any pushable branch could dispatch its way to.
     plan.steps.extend(step_audit_token_environment(api, repo))
-    if SETTINGS_AUDIT_ENVIRONMENT in environments:
-        plan.warnings.append(
-            f"A deployment environment is named {SETTINGS_AUDIT_ENVIRONMENT!r}, "
-            "which collides with the environment that fences the audit token. "
-            "The settings audit waives the reviewer requirement for that name, "
-            "so rename the deployment environment in .gitforgeops/config.yaml."
-        )
     publishes = release_publishing(api, repo)
     if publishes:
         # Template included: upstream is a template and publishes the image.

@@ -171,6 +171,11 @@ def secure_responses():
                 "custom_branch_policies": False,
             },
         },
+        # Reviewer-free, so it may hold the audit token and nothing else.
+        f"repos/acme/repo/environments/{audit_settings.SETTINGS_AUDIT_ENVIRONMENT}"
+        "/secrets?per_page=100": [
+            {"total_count": 1, "secrets": [{"name": "SETTINGS_AUDIT_TOKEN"}]}
+        ],
     }
 
 
@@ -527,6 +532,64 @@ class AuditTokenEnvironmentTests(unittest.TestCase):
             ),
             audit.violations,
         )
+
+    def test_the_audit_environment_may_hold_only_the_audit_token(self):
+        # It has no reviewer, so a gateway, broker or state secret placed there
+        # would reach every default-branch job that binds it unreviewed.
+        key = (
+            f"repos/acme/repo/environments/{audit_settings.SETTINGS_AUDIT_ENVIRONMENT}"
+            "/secrets?per_page=100"
+        )
+        for secret in (
+            "FERRUM_ADMIN_JWT_SECRET",
+            "GITFORGEOPS_STATE_APP_PRIVATE_KEY",
+            "FERRUM_CREDS_BUNDLE",
+            "DOCKERHUB_TOKEN",
+        ):
+            with self.subTest(secret=secret):
+                responses = secure_responses()
+                responses[key] = [
+                    {
+                        "total_count": 2,
+                        "secrets": [{"name": "SETTINGS_AUDIT_TOKEN"}, {"name": secret}],
+                    }
+                ]
+                audit = self.run_audit(responses)
+                self.assertTrue(
+                    any(
+                        "must hold only SETTINGS_AUDIT_TOKEN" in item and secret in item
+                        for item in audit.violations
+                    ),
+                    audit.violations,
+                )
+        audit = self.run_audit(secure_responses())
+        self.assertIn(
+            f"environment {audit_settings.SETTINGS_AUDIT_ENVIRONMENT}: holds only "
+            "SETTINGS_AUDIT_TOKEN",
+            audit.evidence,
+        )
+
+    def test_the_audit_environment_name_matches_case_insensitively(self):
+        # GitHub treats `Settings-Audit` and `settings-audit` as one
+        # environment, so the waiver and its secret fence follow the name in
+        # any case, and a recased name still counts as the audit environment.
+        responses = secure_responses()
+        old = f"repos/acme/repo/environments/{audit_settings.SETTINGS_AUDIT_ENVIRONMENT}"
+        for key in [key for key in responses if key.startswith(old)]:
+            responses["repos/acme/repo/environments/Settings-Audit" + key[len(old):]] = (
+                responses.pop(key)
+            )
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {
+                "total_count": 2,
+                "environments": [{"name": "production"}, {"name": "Settings-Audit"}],
+            }
+        ]
+        audit = self.run_audit(responses)
+        self.assertEqual(audit.violations, [])
+        self.assertIn("environment Settings-Audit: holds only SETTINGS_AUDIT_TOKEN", audit.evidence)
+        self.assertTrue(audit_settings.is_settings_audit_environment_name(" SETTINGS-AUDIT "))
+        self.assertFalse(audit_settings.is_settings_audit_environment_name("settings-audit-2"))
 
     def test_the_workflow_binds_the_environment_it_audits(self):
         workflow = (

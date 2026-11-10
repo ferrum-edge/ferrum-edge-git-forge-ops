@@ -102,8 +102,13 @@ RELEASE_TAG_PATTERN = "refs/tags/v*"
 # exactly the silently-stopped audit the workflow exists to prevent) and it does
 # not satisfy the at-least-one-protected-environment requirement. Its branch
 # policy is audited like any other environment's — that restriction is the whole
-# point of moving the token here.
+# point of moving the token here. Because it has no reviewer it may hold nothing
+# but `SETTINGS_AUDIT_TOKEN`. GitHub compares environment names
+# case-insensitively, so the name is matched stripped and case-folded, and
+# `src/config/repo_config.rs` and the bootstrap refuse it for a deployment
+# environment.
 SETTINGS_AUDIT_ENVIRONMENT = "settings-audit"
+SETTINGS_AUDIT_SECRET = "SETTINGS_AUDIT_TOKEN"
 
 # `release.yml` publishes from the upstream repository, or wherever repository
 # variable `GITFORGEOPS_RELEASE_ENABLED` is `true`. Its `docker` job binds this
@@ -559,6 +564,11 @@ def is_release_environment_name(name: str) -> bool:
     return name.strip().casefold() == RELEASE_ENVIRONMENT
 
 
+def is_settings_audit_environment_name(name: str) -> bool:
+    """GitHub environment names compare case-insensitively."""
+    return name.strip().casefold() == SETTINGS_AUDIT_ENVIRONMENT
+
+
 # The fine-grained token permission each secret-name listing needs. A refused
 # read names it, so the operator sees which permission the audit token lacks.
 SECRET_LISTING_PERMISSIONS = {
@@ -720,6 +730,30 @@ def audit_release_secrets(audit: Audit, repo: str, name: str) -> None:
     )
 
 
+def audit_settings_audit_secrets(audit: Audit, repo: str, name: str) -> None:
+    """The reviewer-free audit-token environment holds the audit token only.
+
+    Any other secret there would be released without a reviewer to every job
+    on the default branch that binds the environment. Only names are read,
+    never values.
+    """
+    encoded_name = quote(name, safe="")
+    secret_names = listed_secret_names(
+        f"repos/{repo}/environments/{encoded_name}/secrets?per_page=100",
+        "environment",
+    )
+    foreign = sorted(
+        secret for secret in secret_names if secret.upper() != SETTINGS_AUDIT_SECRET
+    )
+    audit.require(
+        not foreign,
+        f"audit-token environment {name!r} must hold only {SETTINGS_AUDIT_SECRET}; "
+        f"found {', '.join(foreign)}. It has no required reviewer, so deployment, "
+        "credential-broker or state-writing authority must never live there",
+        f"environment {name}: holds only {SETTINGS_AUDIT_SECRET}",
+    )
+
+
 def release_publishing_enabled(repo: str, opted_in: bool) -> bool:
     """`release.yml`'s own gate: the upstream repository or an explicit opt-in."""
     return opted_in or repo.casefold() == UPSTREAM_REPOSITORY
@@ -815,13 +849,15 @@ def audit_environment(
     # The settings-audit environment gates a read-only token, not a deployment.
     # Requiring a reviewer there would hold every scheduled run for approval and
     # produce the silently-stopped audit this whole control exists to prevent.
-    # Its branch policy is still audited below.
-    if name == SETTINGS_AUDIT_ENVIRONMENT:
+    # Its branch policy is still audited below, and the waiver is paid for by
+    # the secret-name fence.
+    if is_settings_audit_environment_name(name):
         audit.evidence.append(
             f"environment {name}: reviewer rules waived (gates the "
             "administration-read audit token, deploys nothing)"
         )
         has_reviewers = True
+        audit_settings_audit_secrets(audit, repo, name)
     elif is_release_environment_name(name) and release_tag is not None:
         # Holds only the registry push credentials and deploys to no gateway.
         # `authorize-release` gates every publication, and a reviewer would
@@ -995,8 +1031,9 @@ def run(
     # A template repository has no deployment environment, but it still runs the
     # settings audit, so it still needs the environment that holds the audit
     # token — in both modes.
+    audit_token_names = {name for name in names if is_settings_audit_environment_name(name)}
     audit.require(
-        SETTINGS_AUDIT_ENVIRONMENT in names,
+        bool(audit_token_names),
         f"repository must define the {SETTINGS_AUDIT_ENVIRONMENT!r} environment; "
         "settings-audit.yml binds it so the administration-read token is "
         "released only to the protected default branch",
@@ -1005,7 +1042,7 @@ def run(
     # Where release.yml publishes, its registry credentials must be fenced to
     # the protected refs by the `release` environment, in both modes.
     release_tag = None
-    non_deployment = {SETTINGS_AUDIT_ENVIRONMENT}
+    non_deployment = set(audit_token_names)
     if release_publishing:
         release_tag = release_tag_pattern
         if release_tag.startswith("refs/tags/"):

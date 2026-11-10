@@ -1126,12 +1126,13 @@ same rule.
 
 The environment has no reviewer on purpose: it deploys nothing, and a reviewer
 would hold every weekly run in "waiting for approval". `audit_settings.py`
-waives the reviewer and self-review rules for this name, still audits its
-branch policy, and does not count it as a protected environment.
+waives the reviewer and self-review rules for this name in any letter case,
+still audits its branch policy, fails when it holds any secret but
+`SETTINGS_AUDIT_TOKEN`, and does not count it as a protected environment.
 `bootstrap_repo_settings.py` creates it on every repository, templates
 included. Because of that waiver the name `settings-audit` is reserved in any
-letter case: `.gitforgeops/config.yaml` refuses a deployment environment of
-that name.
+letter case: `.gitforgeops/config.yaml` and the bootstrap refuse a deployment
+environment of that name.
 
 `settings-audit.yml` runs only from the default branch. It checks:
 

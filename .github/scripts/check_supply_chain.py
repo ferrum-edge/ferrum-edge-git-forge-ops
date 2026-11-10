@@ -439,7 +439,8 @@ REGISTRY_JOB_OTHER_SECRETS = frozenset({"GITHUB_TOKEN"})
 #   `<env>-monitor` derivation cannot produce it either;
 # - the dispatch inputs of rotate.yml and materialize-file.yml are refused by
 #   the `preflight` job the bound job `needs`, before any binding, unless they
-#   are a safe path component other than `release` (`DISPATCH_ENVIRONMENT_GUARD`).
+#   are a safe path component other than `release` or `settings-audit`
+#   (`DISPATCH_ENVIRONMENT_GUARD`).
 # Any other computed binding is refused. The matrix pin is the job's whole
 # `strategy.matrix`.
 COMPUTED_ENVIRONMENT_BINDINGS = {
@@ -539,7 +540,18 @@ DISPATCH_ENVIRONMENT_GUARD = (
     'echo "::error::release holds the registry credentials and is not a deployment environment."\n'
     "exit 1\n"
     "fi",
+    "if [ \"$(printf '%s' \"$INPUT_ENVIRONMENT\" | tr '[:upper:]' '[:lower:]')\" = settings-audit ]; then\n"
+    'echo "::error::settings-audit holds the settings audit token and is not a deployment environment."\n'
+    "exit 1\n"
+    "fi",
 )
+# EXPAND STEP (GHSA-jx32-rxh5-5q25). The guard above also refuses
+# `settings-audit`, whose environment holds the reviewer-free administration-read
+# audit token. rotate.yml and materialize-file.yml still run the guard without
+# that refusal: the trusted check judges a workflow edit with `main`'s checker,
+# so they switch in the follow-up pull request, which also deletes this
+# accepted older shape.
+DISPATCH_ENVIRONMENT_GUARD_BEFORE_SETTINGS_AUDIT = DISPATCH_ENVIRONMENT_GUARD[:3]
 REGISTRY_SECRET_REFERENCE = re.compile(
     r"\bsecrets\s*(?:\.\s*|\[\s*['\"]\s*)DOCKERHUB_", re.IGNORECASE
 )
@@ -5291,7 +5303,8 @@ def computed_environment_binding_violations(
     refusal = (
         f"{label}: binds {binding}, so it must need a `preflight` job whose step "
         f"{DISPATCH_ENVIRONMENT_GUARD_STEP!r} runs the pinned guard (`shell: bash`) "
-        f"that refuses an unsafe name or `{RELEASE_ENVIRONMENT}` before the binding"
+        f"that refuses an unsafe name, `{RELEASE_ENVIRONMENT}` or `settings-audit` "
+        "before the binding"
     )
     # No job condition on either side: `if: always()` on the bound job would
     # run it after a failed preflight, and a preflight that can be skipped or
@@ -5307,7 +5320,13 @@ def computed_environment_binding_violations(
         or guard.get("shell") != DISPATCH_ENVIRONMENT_GUARD_SHELL
         or guard.get("env") != DISPATCH_ENVIRONMENT_GUARD_ENV
         or not isinstance(guard.get("run"), str)
-        or not pinned_run_matches(guard["run"], DISPATCH_ENVIRONMENT_GUARD)
+        or not any(
+            pinned_run_matches(guard["run"], shape)
+            for shape in (
+                DISPATCH_ENVIRONMENT_GUARD,
+                DISPATCH_ENVIRONMENT_GUARD_BEFORE_SETTINGS_AUDIT,
+            )
+        )
     ):
         return [refusal]
     return [

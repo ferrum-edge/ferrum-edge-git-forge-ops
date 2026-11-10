@@ -1170,18 +1170,29 @@ class AuditTokenEnvironmentTests(unittest.TestCase):
         self.assertIn("reviewers: 1 -> 0", "\n".join(step.details))
         self.assertEqual(step.writes[0][2]["reviewers"], [])
 
-    def test_a_colliding_deployment_environment_name_is_warned_about(self):
-        api = FakeApi(configured_responses())
-        plan = bootstrap.build_plan(
-            api,
-            namespace(
-                environment=[bootstrap.SETTINGS_AUDIT_ENVIRONMENT],
-                reviewer=["octocat"],
-            ),
-        )
-        self.assertTrue(
-            any("collides" in warning for warning in plan.warnings), plan.warnings
-        )
+    def test_a_deployment_environment_may_not_take_the_audit_name(self):
+        # Refused, not warned: the settings audit waives the reviewer rules for
+        # this name, so a deployment environment of that name would deploy
+        # without a reviewer. GitHub compares environment names
+        # case-insensitively.
+        for name in ("settings-audit", "Settings-Audit", "SETTINGS-AUDIT"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "is reserved"):
+                    bootstrap.build_plan(
+                        FakeApi(configured_responses()),
+                        namespace(environment=[name], reviewer=["octocat"]),
+                    )
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "version: 1\nenvironments:\n  Settings-Audit:\n    overlay: production\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "is reserved"):
+                bootstrap.build_plan(
+                    FakeApi(configured_responses()),
+                    namespace(config=str(config), reviewer=["octocat"]),
+                )
 
     def test_the_audit_environment_name_is_shared_with_the_auditor(self):
         self.assertEqual(
