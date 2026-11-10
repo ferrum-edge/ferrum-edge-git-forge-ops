@@ -100,7 +100,9 @@ cargo fmt --all && cargo fmt --all -- --check
   `.github/ferrum-edge-checksums.txt`, `apply-on-merge.yml`, `rotate.yml`,
   `trusted-pr-review.yml`).
 - Unit tests never read the customer-owned `resources/` tree. Shipped-example
-  checks use `tests/fixtures/shipped-examples/`.
+  checks use `tests/fixtures/shipped-examples/`; upstream,
+  `test_shipped_examples.py` keeps those copies byte-equal to
+  `resources/*/*/_example.yaml`, so edit both together.
 - Resource-only PRs skip the Rust steps and run secretless `validate-pr.yml`.
 - `alloy-consumer.yml` is **not** required: it builds the pinned external Alloy
   producer and runs the ignored consumer test on PRs touching the consumer
