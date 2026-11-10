@@ -1293,8 +1293,9 @@ fn parse_index_segment(piece: &str) -> Option<usize> {
 ///
 /// The mode-taking `*_with_mode` variants exist so tests (and any caller that
 /// already has an `EnvConfig` in hand) don't have to go through the process
-/// environment. `main.rs` calls the two-argument forms, whose signatures stay
-/// stable.
+/// environment. Production (`main.rs`) calls the `*_with_options` forms and
+/// `report_secrets_lenient`; the forms that read the mode from the process
+/// environment are used only by tests.
 pub(crate) fn current_gateway_mode() -> crate::error::Result<GatewayMode> {
     Ok(crate::config::load_env_config()?.gateway_mode)
 }
@@ -2197,8 +2198,6 @@ fn enforce_slot_remap_policy(
     )))
 }
 
-/// Entry index a bundle-slot suffix belongs to: `"[2]/key"` → 2, and anything
-/// else → 0, since index 0 renders without its bracket (see [`is_elided`]).
 /// The legacy dotted spellings of a Consumer credential array's own slot
 /// prefix, as [`legacy_slot_from_components`] spells its entries.
 ///
@@ -2247,6 +2246,8 @@ fn legacy_entry_index(slot: &str, prefix: &str) -> Option<usize> {
     (after.is_empty() || after.starts_with('.') || after.starts_with('[')).then_some(index)
 }
 
+/// Entry index a bundle-slot suffix belongs to: `"[2]/key"` → 2, and anything
+/// else → 0, since index 0 renders without its bracket (see [`is_elided`]).
 fn entry_index_of_suffix(rest: &str) -> usize {
     rest.split('/')
         .next()

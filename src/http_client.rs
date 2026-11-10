@@ -1495,7 +1495,7 @@ impl AdminClient {
             })
     }
 
-    /// Shared DELETE path with 404 tolerance — see [`delete_succeeded`].
+    /// Conditional DELETE path with 404 tolerance.
     ///
     /// The 404 is reported (as [`DeleteOutcome::NotFound`]) rather than
     /// flattened into `Ok(())`: individually a 404 is benign, but a namespace

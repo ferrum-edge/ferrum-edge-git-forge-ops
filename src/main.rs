@@ -4467,8 +4467,9 @@ async fn cmd_verify(
 /// around the existing commands:
 ///
 /// 1. **It never mutates.** No settings writer, no gateway write, no
-///    credential allocation, no state lock. The gateway scope reaches exactly
-///    `GET /health` and `GET /cluster`.
+///    credential allocation, no state lock. The gateway scope issues only
+///    `GET`s: `/health`, `/cluster`, `/namespaces` and the capability reads
+///    listed in `doctor::gateway`.
 /// 2. **It never guesses.** A check that could not run reports `UNKNOWN`, and
 ///    `UNKNOWN` is not a pass — a laptop with no administration-read token has
 ///    not verified the branch ruleset, and saying so is the whole point.
@@ -4701,8 +4702,7 @@ fn cmd_envs(
                 // target, so it never gains a monitoring environment either.
                 monitoring_environment: ResolvedEnv::default_env_name(),
                 unattended_monitoring: false,
-
-                // target, so it is never a promotion participant either.
+                // Nor is it ever a promotion participant.
                 promotion_requires: None,
             }],
         };

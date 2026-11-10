@@ -36,7 +36,7 @@ pub struct ImportResourceCounts {
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct ImportSourceMetadata {
-    /// `api`, `file`, or `in-memory` (the public split_config helper).
+    /// `api` or `file`.
     pub source_kind: String,
     /// Namespaces represented by this source payload, sorted lexically.
     pub namespaces: Vec<String>,

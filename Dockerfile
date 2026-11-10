@@ -114,7 +114,7 @@ RUN set -eu; \
 # Slim Debian runtime rather than distroless: the image is meant to be run
 # directly (`docker run ... gitforgeops plan`) and in contexts that expect a
 # usable /bin/sh, and several of its code paths shell out — `validate` execs
-# `ferrum-edge`, overrides inspect Git, delivery execs `age`. Trixie matches
+# `ferrum-edge`, overrides inspect Git. Trixie matches
 # the glibc of the upstream ferrum-edge image so the copied binary links cleanly.
 # The current Debian Trixie package index still lists libpcre2-8-0
 # 10.46-1~deb13u2 on amd64 and arm64; the reviewed security fix is u3. The
