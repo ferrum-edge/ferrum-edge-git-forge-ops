@@ -29,9 +29,8 @@ pub use github_api::{
 pub use placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
 pub use resolver::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
-    capture_and_redact_import_service_discovery_secrets, report_secrets, report_secrets_lenient,
-    report_secrets_with_mode, report_secrets_with_mode_and_options, report_secrets_with_options,
-    resolve_secrets, resolve_secrets_with_mode, resolve_secrets_with_mode_and_options,
+    capture_and_redact_import_service_discovery_secrets, report_secrets_lenient,
+    report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options,
     resolve_secrets_with_options, slot_path, unresolved_placeholder_slots,
     validate_known_credential_types, ConsumerCoverage, ConsumerLedger, PluginConfigCapture,
     ResolveOptions, ResolveReport, ResolveResult, SlotRemapPolicy, SlotStatus,

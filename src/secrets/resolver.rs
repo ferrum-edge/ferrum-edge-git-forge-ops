@@ -180,23 +180,6 @@ pub struct ConsumerLedger {
 }
 
 impl ConsumerLedger {
-    /// Build from explicit `(namespace, consumer id)` pairs.
-    pub fn new(
-        managed_consumers: impl IntoIterator<Item = (String, String)>,
-        pending_allocations: impl IntoIterator<Item = String>,
-        coverage: ConsumerCoverage,
-    ) -> Self {
-        Self {
-            managed: managed_consumers
-                .into_iter()
-                .map(|(namespace, id)| consumer_state_key(&namespace, &id))
-                .collect(),
-            pending_allocations: pending_allocations.into_iter().collect(),
-            unbound_allocations: BTreeSet::new(),
-            coverage,
-        }
-    }
-
     /// Build from a loaded state ledger.
     ///
     /// A pending create counts as managed: it was journaled before its POST,
@@ -1291,47 +1274,19 @@ fn parse_index_segment(piece: &str) -> Option<usize> {
 
 /// Gateway mode for the current process, read from `FERRUM_GATEWAY_MODE`.
 ///
-/// The mode-taking `*_with_mode` variants exist so tests (and any caller that
-/// already has an `EnvConfig` in hand) don't have to go through the process
-/// environment. Production (`main.rs`) calls the `*_with_options` forms and
-/// `report_secrets_lenient`; the forms that read the mode from the process
-/// environment are used only by tests.
+/// For the allocator, [`report_secrets_lenient`] and
+/// [`resolve_secrets_with_options`]; a caller with an `EnvConfig` in hand
+/// passes its mode to [`report_secrets_with_mode_and_options`] or
+/// [`resolve_secrets_with_mode_and_options`] instead.
 pub(crate) fn current_gateway_mode() -> crate::error::Result<GatewayMode> {
     Ok(crate::config::load_env_config()?.gateway_mode)
 }
 
-/// Walk consumers and produce a [`ResolveReport`] **without mutating** `cfg`.
+/// [`report_secrets_with_mode_and_options`] that never fails on a
+/// *generation constraint*.
 ///
-/// Use this in contexts where the caller must preserve placeholder strings in
-/// `cfg` (notably file-mode apply, which serializes `cfg` to a YAML that gets
-/// committed to the repo). `resolve_secrets` is the right function when the
-/// caller wants placeholders replaced with bundle values in-memory.
-pub fn report_secrets(
-    cfg: &crate::config::GatewayConfig,
-    bundle: &CredentialBundle,
-) -> crate::error::Result<ResolveReport> {
-    report_secrets_with_mode(cfg, bundle, current_gateway_mode()?)
-}
-
-/// [`report_secrets`] with the slot-remap verdict supplied explicitly.
-pub fn report_secrets_with_options(
-    cfg: &crate::config::GatewayConfig,
-    bundle: &CredentialBundle,
-    options: ResolveOptions,
-) -> crate::error::Result<ResolveReport> {
-    report_secrets_with_mode_inner(
-        cfg,
-        bundle,
-        current_gateway_mode()?,
-        ConstraintMode::Enforce,
-        options,
-    )
-}
-
-/// [`report_secrets`] that never fails on a *generation constraint*.
-///
-/// Same signature and return type as [`report_secrets`]; the only difference
-/// is that placeholders the broker provably cannot generate
+/// The mode is read from the process and the options are the defaults. The
+/// only difference is that placeholders the broker provably cannot generate
 /// ([`check_generation_constraints`]) are reported as ordinary statuses rather
 /// than returned as an `Err`.
 ///
@@ -1344,7 +1299,7 @@ pub fn report_secrets_with_options(
 /// collisions) are still hard failures in both variants, because those make
 /// the report itself untrustworthy.
 ///
-/// `plan`/`diff`/`apply` keep using strict [`report_secrets`]: there the
+/// `plan`/`diff`/`apply` keep using the strict walk: there the
 /// constraint really is fatal, since apply would otherwise write a GitHub
 /// Environment Secret holding a value the gateway rejects.
 pub fn report_secrets_lenient(
@@ -1360,17 +1315,13 @@ pub fn report_secrets_lenient(
     )
 }
 
-/// [`report_secrets`] with the gateway mode supplied explicitly.
-pub fn report_secrets_with_mode(
-    cfg: &crate::config::GatewayConfig,
-    bundle: &CredentialBundle,
-    mode: GatewayMode,
-) -> crate::error::Result<ResolveReport> {
-    report_secrets_with_mode_and_options(cfg, bundle, mode, ResolveOptions::default())
-}
-
-/// [`report_secrets`] with both the gateway mode and the slot-remap verdict
-/// supplied explicitly.
+/// Walk consumers and produce a [`ResolveReport`] **without mutating** `cfg`.
+///
+/// Use this in contexts where the caller must preserve placeholder strings in
+/// `cfg` (notably file-mode apply, which serializes `cfg` to a YAML that gets
+/// committed to the repo). [`resolve_secrets_with_options`] is the right
+/// function when the caller wants placeholders replaced with bundle values
+/// in-memory.
 pub fn report_secrets_with_mode_and_options(
     cfg: &crate::config::GatewayConfig,
     bundle: &CredentialBundle,
@@ -1455,9 +1406,9 @@ fn report_secrets_with_mode_inner(
 /// The write path's last check: after resolution and allocation, any slot left
 /// here was never given a value, and writing its row would send the
 /// placeholder text as the credential. Walks the same leaves as
-/// [`report_secrets`] (Consumer credentials, `PluginConfig.config`, modeled
-/// service-discovery secrets) against an empty bundle, so every placeholder
-/// reports regardless of what the bundle holds.
+/// [`report_secrets_with_mode_and_options`] (Consumer credentials,
+/// `PluginConfig.config`, modeled service-discovery secrets) against an empty
+/// bundle, so every placeholder reports regardless of what the bundle holds.
 pub fn unresolved_placeholder_slots(cfg: &GatewayConfig) -> crate::error::Result<Vec<String>> {
     let report = report_secrets_with_mode_inner(
         cfg,
@@ -1498,14 +1449,9 @@ pub fn unresolved_placeholder_slots(cfg: &GatewayConfig) -> crate::error::Result
 /// holds a slot for the dropped type (see `check_omitted_credential_types`). Unknown credential map keys are refused before this walk,
 /// so gitforgeops cannot create a custom type the gateway would store without
 /// authenticating.
-pub fn resolve_secrets(
-    cfg: &mut GatewayConfig,
-    bundle: &CredentialBundle,
-) -> crate::error::Result<ResolveReport> {
-    resolve_secrets_with_mode(cfg, bundle, current_gateway_mode()?)
-}
-
-/// [`resolve_secrets`] with the slot-remap verdict supplied explicitly.
+///
+/// The gateway mode comes from the process; see
+/// [`resolve_secrets_with_mode_and_options`].
 pub fn resolve_secrets_with_options(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,
@@ -1514,17 +1460,8 @@ pub fn resolve_secrets_with_options(
     resolve_secrets_with_mode_and_options(cfg, bundle, current_gateway_mode()?, options)
 }
 
-/// [`resolve_secrets`] with the gateway mode supplied explicitly.
-pub fn resolve_secrets_with_mode(
-    cfg: &mut GatewayConfig,
-    bundle: &CredentialBundle,
-    mode: GatewayMode,
-) -> crate::error::Result<ResolveReport> {
-    resolve_secrets_with_mode_and_options(cfg, bundle, mode, ResolveOptions::default())
-}
-
-/// [`resolve_secrets`] with both the gateway mode and the slot-remap verdict
-/// supplied explicitly. Any error leaves the entire input unchanged.
+/// [`resolve_secrets_with_options`] with the gateway mode supplied
+/// explicitly. Any error leaves the entire input unchanged.
 pub fn resolve_secrets_with_mode_and_options(
     cfg: &mut GatewayConfig,
     bundle: &CredentialBundle,

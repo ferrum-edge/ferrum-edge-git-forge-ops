@@ -299,7 +299,8 @@ fn provenance_scrubs_legacy_brokered_identities_without_hiding_literal_identitie
 #[cfg(unix)]
 #[test]
 fn scrubber_provenance_preserves_canonical_indexed_escaped_slots_and_unresolved_siblings() {
-    use gitforgeops::secrets::{resolve_secrets, SecretScrubber};
+    use super::resolver_fixtures::resolve_secrets;
+    use gitforgeops::secrets::SecretScrubber;
     use std::collections::BTreeMap;
 
     let placeholder = "${gh-env-secret:alloc=require}";
@@ -1261,7 +1262,7 @@ fn captured_validator_input(dir: &Path) -> gitforgeops::config::GatewayConfig {
 #[cfg(unix)]
 #[test]
 fn resolved_placeholder_shaped_values_reach_shape_checks_verbatim() {
-    use gitforgeops::secrets::resolve_secrets;
+    use super::resolver_fixtures::resolve_secrets;
     use gitforgeops::validate::run_validation_with_report;
     use std::collections::BTreeMap;
 
@@ -1350,7 +1351,7 @@ exit 0
 #[cfg(unix)]
 #[test]
 fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
-    use gitforgeops::secrets::resolve_secrets;
+    use super::resolver_fixtures::resolve_secrets;
     use gitforgeops::validate::{run_validation_with_report, validation_standin};
     use std::collections::BTreeMap;
 
@@ -1457,7 +1458,8 @@ fn validator_standins_use_canonical_escaped_slots_and_preserve_discovery() {
 #[cfg(unix)]
 #[test]
 fn validator_report_never_grants_standins_to_unreported_or_conflicting_slots() {
-    use gitforgeops::secrets::{resolve_secrets, ResolveReport, SlotStatus};
+    use super::resolver_fixtures::resolve_secrets;
+    use gitforgeops::secrets::{ResolveReport, SlotStatus};
     use gitforgeops::validate::run_validation_with_report;
 
     let placeholder = "${gh-env-secret:alloc=require}";
@@ -1495,7 +1497,7 @@ fn validator_report_never_grants_standins_to_unreported_or_conflicting_slots() {
 #[cfg(unix)]
 #[test]
 fn unresolved_reports_and_report_free_documents_keep_standins_for_every_alloc_mode() {
-    use gitforgeops::secrets::resolve_secrets;
+    use super::resolver_fixtures::resolve_secrets;
     use gitforgeops::validate::{run_validation_with_report, validation_standin};
 
     for alloc in ["require", "generate", "rotate"] {

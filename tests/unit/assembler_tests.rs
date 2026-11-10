@@ -961,8 +961,8 @@ fn normalization_preserves_credential_slot_names() {
     // Cross-module upgrade guard: normalizing object -> array must NOT
     // rename slots, or every already-allocated credential orphans in the
     // GitHub Environment Secret bundle and gets regenerated.
+    use super::resolver_fixtures::report_secrets;
     use gitforgeops::config::assembler::normalize_consumer_credentials;
-    use gitforgeops::secrets::report_secrets;
 
     let placeholder = serde_json::json!("${gh-env-secret:alloc=require}");
     let mut object_form = consumer_config_with_credentials(serde_json::json!({

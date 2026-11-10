@@ -9,7 +9,7 @@ use gitforgeops::diff::{
 
 fn mask_without_bundle(desired: &GatewayConfig, actual: &mut GatewayConfig) {
     let mut resolved = desired.clone();
-    let report = gitforgeops::secrets::resolve_secrets_with_mode(
+    let report = super::resolver_fixtures::resolve_secrets_with_mode(
         &mut resolved,
         &gitforgeops::secrets::CredentialBundle::default(),
         gitforgeops::config::GatewayMode::Api,

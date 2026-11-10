@@ -122,7 +122,7 @@ pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
 /// over the built-in defaults; without one the ten built-in authenticators of
 /// `plugin_catalog::AUTH_PLUGIN_NAMES` are used.
 ///
-/// Must run **before** `secrets::resolve_secrets`: the literal-credential
+/// Must run **before** `secrets::resolve_secrets_with_options`: the literal-credential
 /// check treats any secret string that is not a `${...}` placeholder as a
 /// committed secret, so auditing a resolved config flags every allocated
 /// credential.

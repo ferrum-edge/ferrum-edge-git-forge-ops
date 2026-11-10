@@ -1869,7 +1869,13 @@ mod tests {
         for _ in 0..32 {
             crate::http_client::BackupSnapshot::from_body(&body).unwrap();
             register_sent_token("Q7-live-deduplicated-key").unwrap();
-            crate::secrets::resolve_secrets(&mut config.clone(), &Default::default()).unwrap();
+            crate::secrets::resolve_secrets_with_mode_and_options(
+                &mut config.clone(),
+                &Default::default(),
+                crate::config::GatewayMode::Api,
+                Default::default(),
+            )
+            .unwrap();
             let headers = std::collections::BTreeMap::from([(
                 "X-Key".to_string(),
                 crate::verify::HeaderValue::slot("slot"),
@@ -1919,9 +1925,14 @@ mod tests {
                 )
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
-                1 => crate::secrets::resolve_secrets(&mut live_config(&value), &Default::default())
-                    .map(|_| ())
-                    .map_err(|error| error.to_string()),
+                1 => crate::secrets::resolve_secrets_with_mode_and_options(
+                    &mut live_config(&value),
+                    &Default::default(),
+                    crate::config::GatewayMode::Api,
+                    Default::default(),
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
                 _ => {
                     let headers = std::collections::BTreeMap::from([(
                         "X-Key".to_string(),

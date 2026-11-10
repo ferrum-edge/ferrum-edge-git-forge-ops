@@ -782,7 +782,7 @@ async fn allocate_if_needed(
     // Re-resolve so `desired` picks up freshly allocated values. The
     // allocator only produces values for slots classified as NeedsAllocation
     // (first-apply generate OR first-apply rotate). Already-allocated
-    // placeholders were resolved in the initial `resolve_secrets` pass.
+    // placeholders were resolved in the initial `resolve_secrets_with_options` pass.
     let merged = secrets::merge_bundles(per_shard);
     let _ = secrets::resolve_secrets_with_options(desired, &merged, resolve_options)?;
 
@@ -2985,7 +2985,7 @@ async fn cmd_apply(
     // In file mode we MUST NOT mutate `desired`: the file-mode branch below
     // serializes `desired` to a committed-to-repo YAML, and replacing
     // placeholders with real bundle values here would leak credentials into
-    // the committed artifact. `report_secrets` walks and classifies without
+    // the committed artifact. `report_secrets_with_mode_and_options` walks and classifies without
     // touching `cfg`.
     //
     // In api mode we want the mutation: apply_api pushes `desired` to the
@@ -3002,9 +3002,12 @@ async fn cmd_apply(
     let ledger = consumer_ledger(&resolved, &state, &allocation_binding);
     let initial_options = resolve_options.with_consumer_ledger(&ledger);
     let secret_report = match env_config.gateway_mode {
-        GatewayMode::File => {
-            secrets::report_secrets_with_options(&desired, &initial_bundle, initial_options)?
-        }
+        GatewayMode::File => secrets::report_secrets_with_mode_and_options(
+            &desired,
+            &initial_bundle,
+            GatewayMode::File,
+            initial_options,
+        )?,
         GatewayMode::Api => {
             secrets::resolve_secrets_with_options(&mut desired, &initial_bundle, initial_options)?
         }
