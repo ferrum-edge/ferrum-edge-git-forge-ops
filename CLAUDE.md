@@ -135,8 +135,9 @@ cargo fmt --all && cargo fmt --all -- --check
   refuses to start one that uses a CodeQL action other than `upload-sarif`, so
   CodeQL and the image scan live in the unlisted `code-scanning.yml`
   (`ruleset_workflow_codeql_violations`). `security.yml`'s
-  `security-supply-chain-policy` stays required until the ruleset switch and a
-  later retire PR (`docs/github-launch-controls.md`, "Switching the
+  `security-supply-chain-policy` is no longer a required context; it still
+  runs the workflow-script unit tests until the retire follow-up moves them to
+  their own job (`docs/github-launch-controls.md`, "Switching the
   supply-chain policy check").
 - `trusted-pr-review.yml` is a default-branch `workflow_run`. It accepts only
   manifest-verified resource and overlay YAML, copies environment/policy routing

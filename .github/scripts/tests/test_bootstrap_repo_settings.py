@@ -1170,18 +1170,29 @@ class AuditTokenEnvironmentTests(unittest.TestCase):
         self.assertIn("reviewers: 1 -> 0", "\n".join(step.details))
         self.assertEqual(step.writes[0][2]["reviewers"], [])
 
-    def test_a_colliding_deployment_environment_name_is_warned_about(self):
-        api = FakeApi(configured_responses())
-        plan = bootstrap.build_plan(
-            api,
-            namespace(
-                environment=[bootstrap.SETTINGS_AUDIT_ENVIRONMENT],
-                reviewer=["octocat"],
-            ),
-        )
-        self.assertTrue(
-            any("collides" in warning for warning in plan.warnings), plan.warnings
-        )
+    def test_a_deployment_environment_may_not_take_the_audit_name(self):
+        # Refused, not warned: the settings audit waives the reviewer rules for
+        # this name, so a deployment environment of that name would deploy
+        # without a reviewer. GitHub compares environment names
+        # case-insensitively.
+        for name in ("settings-audit", "Settings-Audit", "SETTINGS-AUDIT"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "is reserved"):
+                    bootstrap.build_plan(
+                        FakeApi(configured_responses()),
+                        namespace(environment=[name], reviewer=["octocat"]),
+                    )
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "version: 1\nenvironments:\n  Settings-Audit:\n    overlay: production\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "is reserved"):
+                bootstrap.build_plan(
+                    FakeApi(configured_responses()),
+                    namespace(config=str(config), reviewer=["octocat"]),
+                )
 
     def test_the_audit_environment_name_is_shared_with_the_auditor(self):
         self.assertEqual(
@@ -1482,8 +1493,6 @@ class SharedConstantTests(unittest.TestCase):
             audit, ruleset, set(audit_settings.REQUIRED_STATUS_CHECKS), APP_ID
         )
         self.assertEqual(audit.violations, [])
-        # Including the transitional context: running the bootstrap is the
-        # documented way to add it, so what it writes draws no warning.
         self.assertEqual(audit.warnings, [])
         # The audit reads GitHub's copy, which adds `source_type` to the body
         # the bootstrap writes; it matches only repository-sourced rulesets.
@@ -1505,10 +1514,9 @@ class SharedConstantTests(unittest.TestCase):
             )
         )
 
-    def test_the_ruleset_adds_the_trusted_policy_check_beside_the_retiring_one(self):
-        # GHSA-x5m2-4555-q4cr expand step: the bootstrap writes the
-        # protected-definition check and keeps the in-tree job's context,
-        # which still runs the workflow-script unit tests.
+    def test_the_ruleset_requires_the_trusted_policy_check_not_the_retired_one(self):
+        # GHSA-x5m2-4555-q4cr retire step: the bootstrap writes the
+        # protected-definition check and no longer the in-tree job's context.
         ruleset = bootstrap.main_ruleset_body(
             [{"actor_type": "Integration", "actor_id": APP_ID, "bypass_mode": "always"}]
         )
@@ -1519,7 +1527,7 @@ class SharedConstantTests(unittest.TestCase):
             check["context"] for check in rule["parameters"]["required_status_checks"]
         ]
         self.assertIn("trusted-supply-chain-policy", contexts)
-        self.assertIn("security-supply-chain-policy", contexts)
+        self.assertNotIn("security-supply-chain-policy", contexts)
         self.assertEqual(len(contexts), len(set(contexts)))
         # Every context is bound to the GitHub Actions app, as the manual
         # ruleset method does, so a status from another source cannot satisfy it.

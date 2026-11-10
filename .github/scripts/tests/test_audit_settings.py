@@ -17,9 +17,10 @@ SPEC.loader.exec_module(audit_settings)
 REQUIRED_CHECKS = {
     "rust-ci-check",
     "security-cargo-audit",
-    "security-supply-chain-policy",
+    "trusted-supply-chain-policy",
     "state-guard-reject-state-edits",
     "gitforgeops-required-static-validation",
+    "validate-trusted-policy",
 }
 
 
@@ -171,6 +172,11 @@ def secure_responses():
                 "custom_branch_policies": False,
             },
         },
+        # Reviewer-free, so it may hold the audit token and nothing else.
+        f"repos/acme/repo/environments/{audit_settings.SETTINGS_AUDIT_ENVIRONMENT}"
+        "/secrets?per_page=100": [
+            {"total_count": 1, "secrets": [{"name": "SETTINGS_AUDIT_TOKEN"}]}
+        ],
     }
 
 
@@ -527,6 +533,64 @@ class AuditTokenEnvironmentTests(unittest.TestCase):
             ),
             audit.violations,
         )
+
+    def test_the_audit_environment_may_hold_only_the_audit_token(self):
+        # It has no reviewer, so a gateway, broker or state secret placed there
+        # would reach every default-branch job that binds it unreviewed.
+        key = (
+            f"repos/acme/repo/environments/{audit_settings.SETTINGS_AUDIT_ENVIRONMENT}"
+            "/secrets?per_page=100"
+        )
+        for secret in (
+            "FERRUM_ADMIN_JWT_SECRET",
+            "GITFORGEOPS_STATE_APP_PRIVATE_KEY",
+            "FERRUM_CREDS_BUNDLE",
+            "DOCKERHUB_TOKEN",
+        ):
+            with self.subTest(secret=secret):
+                responses = secure_responses()
+                responses[key] = [
+                    {
+                        "total_count": 2,
+                        "secrets": [{"name": "SETTINGS_AUDIT_TOKEN"}, {"name": secret}],
+                    }
+                ]
+                audit = self.run_audit(responses)
+                self.assertTrue(
+                    any(
+                        "must hold only SETTINGS_AUDIT_TOKEN" in item and secret in item
+                        for item in audit.violations
+                    ),
+                    audit.violations,
+                )
+        audit = self.run_audit(secure_responses())
+        self.assertIn(
+            f"environment {audit_settings.SETTINGS_AUDIT_ENVIRONMENT}: holds only "
+            "SETTINGS_AUDIT_TOKEN",
+            audit.evidence,
+        )
+
+    def test_the_audit_environment_name_matches_case_insensitively(self):
+        # GitHub treats `Settings-Audit` and `settings-audit` as one
+        # environment, so the waiver and its secret fence follow the name in
+        # any case, and a recased name still counts as the audit environment.
+        responses = secure_responses()
+        old = f"repos/acme/repo/environments/{audit_settings.SETTINGS_AUDIT_ENVIRONMENT}"
+        for key in [key for key in responses if key.startswith(old)]:
+            responses["repos/acme/repo/environments/Settings-Audit" + key[len(old):]] = (
+                responses.pop(key)
+            )
+        responses["repos/acme/repo/environments?per_page=100"] = [
+            {
+                "total_count": 2,
+                "environments": [{"name": "production"}, {"name": "Settings-Audit"}],
+            }
+        ]
+        audit = self.run_audit(responses)
+        self.assertEqual(audit.violations, [])
+        self.assertIn("environment Settings-Audit: holds only SETTINGS_AUDIT_TOKEN", audit.evidence)
+        self.assertTrue(audit_settings.is_settings_audit_environment_name(" SETTINGS-AUDIT "))
+        self.assertFalse(audit_settings.is_settings_audit_environment_name("settings-audit-2"))
 
     def test_the_workflow_binds_the_environment_it_audits(self):
         workflow = (
@@ -1441,17 +1505,18 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
         )
 
 
-class TrustedPolicyCheckTransitionTests(unittest.TestCase):
-    """GHSA-x5m2-4555-q4cr: the protected-definition policy check is being added.
+class TrustedPolicyCheckTests(unittest.TestCase):
+    """GHSA-x5m2-4555-q4cr: the protected-definition policy checks are required.
 
-    `trusted-supply-chain-policy` joins the ruleset in an operator step after
-    its workflow reaches the default branch, so the audit accepts a ruleset
-    without it (with a warning) and still requires the in-tree job's context.
+    `trusted-supply-chain-policy` and `validate-trusted-policy` come from
+    `pull_request_target` workflows the pull request cannot edit. The retired
+    in-tree `security-supply-chain-policy` context is no longer required, and a
+    ruleset that still lists it passes, so the operator can drop it at any time.
     """
 
     TRUSTED = "trusted-supply-chain-policy"
     AGENT_POLICY = "validate-trusted-policy"
-    RETIRING = "security-supply-chain-policy"
+    RETIRED = "security-supply-chain-policy"
 
     def audit_ruleset(
         self, contexts: set[str], unbound: frozenset[str] = frozenset()
@@ -1498,35 +1563,30 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
                 rendered = "\n".join(audit.violations)
                 self.assertIn("[skip ci]", rendered, label)
 
-    def test_the_trusted_check_is_part_of_the_launch_baseline(self):
-        self.assertIn(self.TRUSTED, audit_settings.REQUIRED_STATUS_CHECKS)
-        self.assertIn(self.RETIRING, audit_settings.REQUIRED_STATUS_CHECKS)
-        self.assertEqual(
-            audit_settings.TRANSITIONAL_STATUS_CHECKS,
-            (self.TRUSTED, "validate-trusted-policy"),
-        )
-        self.assertIn("validate-trusted-policy", audit_settings.REQUIRED_STATUS_CHECKS)
-        self.assertIn("validate-trusted-policy", audit_settings.SOURCE_BOUND_STATUS_CHECKS)
+    def test_the_trusted_checks_are_part_of_the_launch_baseline(self):
+        self.assertEqual(set(audit_settings.REQUIRED_STATUS_CHECKS), REQUIRED_CHECKS)
+        self.assertNotIn(self.RETIRED, audit_settings.REQUIRED_STATUS_CHECKS)
+        self.assertFalse(hasattr(audit_settings, "TRANSITIONAL_STATUS_CHECKS"))
+        self.assertIn(self.AGENT_POLICY, audit_settings.SOURCE_BOUND_STATUS_CHECKS)
 
-    def test_a_ruleset_before_the_switch_passes_with_a_warning(self):
+    def test_a_ruleset_without_the_trusted_checks_fails(self):
+        # No longer a warning: the ruleset switch is done.
+        for absent in (self.TRUSTED, self.AGENT_POLICY):
+            with self.subTest(absent=absent):
+                audit = self.audit_ruleset(REQUIRED_CHECKS - {absent})
+                rendered = "\n".join(audit.violations)
+                self.assertIn("missing required status checks", rendered)
+                self.assertIn(absent, rendered)
+
+    def test_a_ruleset_with_the_trusted_checks_passes_cleanly(self):
         audit = self.audit_ruleset(REQUIRED_CHECKS)
-        self.assertEqual(audit.violations, [])
-        self.assertEqual(len(audit.warnings), 2, audit.warnings)
-        rendered = "\n".join(audit.warnings)
-        self.assertIn(self.TRUSTED, rendered)
-        self.assertIn(self.AGENT_POLICY, rendered)
-
-    def test_a_ruleset_after_the_switch_passes_cleanly(self):
-        audit = self.audit_ruleset(REQUIRED_CHECKS | {self.TRUSTED, self.AGENT_POLICY})
         self.assertEqual(audit.violations, [])
         self.assertEqual(audit.warnings, [])
 
-    def test_the_retiring_context_is_still_required(self):
-        # It still runs the workflow-script unit tests until the retire step.
-        audit = self.audit_ruleset((REQUIRED_CHECKS - {self.RETIRING}) | {self.TRUSTED})
-        rendered = "\n".join(audit.violations)
-        self.assertIn("missing required status checks", rendered)
-        self.assertIn(self.RETIRING, rendered)
+    def test_the_retired_context_may_stay_until_the_operator_drops_it(self):
+        audit = self.audit_ruleset(REQUIRED_CHECKS | {self.RETIRED})
+        self.assertEqual(audit.violations, [])
+        self.assertEqual(audit.warnings, [])
 
     def test_the_trusted_check_must_be_bound_to_github_actions(self):
         # Unbound, a commit status a collaborator posts with their own token
@@ -1536,7 +1596,7 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
                 ruleset = secure_responses()["repos/acme/repo/rulesets/7"]
                 checks = [
                     {"context": context, "integration_id": audit_settings.GITHUB_ACTIONS_APP_ID}
-                    for context in sorted(REQUIRED_CHECKS)
+                    for context in sorted(REQUIRED_CHECKS - {self.TRUSTED})
                 ]
                 checks.append(
                     {"context": self.TRUSTED}
@@ -1583,7 +1643,7 @@ class TrustedPolicyCheckTransitionTests(unittest.TestCase):
         self.assertEqual(len(audit.warnings), 1, audit.warnings)
         self.assertIn("'rust-ci-check' from any source", audit.warnings[0])
 
-    def test_only_the_transitional_context_is_softened(self):
+    def test_every_required_context_is_enforced(self):
         for context in sorted(REQUIRED_CHECKS):
             with self.subTest(context=context):
                 audit = self.audit_ruleset(REQUIRED_CHECKS - {context})

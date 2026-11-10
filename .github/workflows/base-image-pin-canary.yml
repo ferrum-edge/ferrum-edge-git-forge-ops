@@ -76,7 +76,6 @@ jobs:
             --trivy-report base-image-scan.json \
             --report-file base-image-pin-report.md
           status=$?
-          echo "checker_status=$status" >>"$GITHUB_OUTPUT"
           # 0 is ok, repin or unknown, 1 is "the pins no longer cover the base"
           # (stale). Anything else is the checker failing to run at all, and
           # then there is no report for the tracking issue to carry.

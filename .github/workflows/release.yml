@@ -1,20 +1,18 @@
 name: Release
 
 on:
+  # Only a release tag publishes. A push to `main` used to publish `:latest`
+  # and `:main-<sha>` too, but `authorize-release` requires a lifecycle result
+  # that only an operator-dispatched, attested run can produce, so every merge
+  # ended in a failed Release run (#700).
   push:
-    branches: [main]
-    # `apply-on-merge.yml` and `rotate.yml` push the ownership ledger (and, in
-    # file mode, the assembled documents) straight to `main` as the state-writer
-    # App. Those commits contain no build input, so rebuilding and republishing
-    # the image for them wastes a multi-platform build and moves the `latest`
-    # tag for no reason. They used to carry `[skip ci]`, which suppressed every
-    # workflow indiscriminately, including the required checks; scoping the
-    # exclusion to the paths CI actually should ignore is the narrower fix.
+    # Inert: GitHub does not evaluate path filters for tag pushes. The
+    # protected checker on `main` still requires these entries; the follow-up
+    # to #700 removes them once the checker that refuses a branch trigger
+    # instead is on `main`.
     paths-ignore:
       - '.state/**'
       - 'assembled/**'
-      # The signed image is built from Dockerfile/src, not the post-publication
-      # record. Filling its digest and evidence must not republish :latest.
       - 'release/**'
     tags: ['v*']
 
@@ -94,11 +92,10 @@ jobs:
           runs_file=$(mktemp)
           trap 'rm -f "$runs_file"' EXIT
 
-          # Both workflows start on the same push, so a single sample is
-          # always too early — the release would be permanently red and the
-          # gate would be something operators re-run past rather than read.
-          # Wait for the lifecycle run for THIS revision to finish, bounded,
-          # and say which of the three outcomes happened.
+          # The operator usually tags while the attested lifecycle run for
+          # the revision is still finishing, so a single sample can be too
+          # early. Wait for the lifecycle run for THIS revision to finish,
+          # bounded, and say which outcome happened.
           run_ids=
           for attempt in $(seq 1 40); do
             gh api "repos/${REPO}/actions/workflows/lifecycle.yml/runs?head_sha=${RELEASE_SHA}&per_page=20" \
@@ -124,14 +121,24 @@ jobs:
               sleep 30
               continue
             fi
-            # Completed, none successful: a finished run that did not certify
-            # is a different thing from one that has not happened, and the
-            # operator needs to be told which.
-            if [ "$(jq -r '.total_count // 0' "$runs_file")" -gt 0 ]; then
+            # Completed, none successful: a run that failed or timed out is a
+            # different thing from one that has not happened, and the operator
+            # needs to be told which. A run that was cancelled (a later push
+            # or the nightly run superseded it) or skipped proved nothing
+            # either way, so it counts as not run yet.
+            failed=$(jq -r '
+              [.workflow_runs[]? | select(.conclusion == "failure" or .conclusion == "timed_out")]
+              | length
+            ' "$runs_file")
+            if [ "$failed" -gt 0 ]; then
               echo "::error::Lifecycle acceptance ran for ${RELEASE_SHA} and did not pass. Fix the scenarios it reported, not the gate."
               exit 1
             fi
-            echo "Lifecycle acceptance has not started for ${RELEASE_SHA} yet (attempt ${attempt}/40)."
+            if [ "$(jq -r '.total_count // 0' "$runs_file")" -gt 0 ]; then
+              echo "Every lifecycle acceptance run for ${RELEASE_SHA} was cancelled or skipped before it finished; dispatch the workflow for this commit (attempt ${attempt}/40)."
+            else
+              echo "Lifecycle acceptance has not started for ${RELEASE_SHA} yet (attempt ${attempt}/40)."
+            fi
             sleep 30
           done
           [ -n "$run_ids" ] || {
@@ -263,8 +270,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern=v{{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=main-{{sha}},enable={{is_default_branch}}
 
       - name: Build and push
         id: build

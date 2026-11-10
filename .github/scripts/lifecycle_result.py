@@ -30,15 +30,14 @@ names who attested it.
 
 Usage::
 
-    lifecycle_result.py declare                     # the required scenario ids
+    lifecycle_result.py init --result FILE
     lifecycle_result.py record --result FILE --scenario ID --status STATUS \\
         [--detail TEXT]
     lifecycle_result.py seal --result FILE --revision SHA --gateway BUILD
     lifecycle_result.py attest --result FILE --attestation FILE \\
         --revision SHA --attested-by LOGIN
     lifecycle_result.py verify --result FILE --revision SHA \\
-        [--gateway BUILD | --gateway-allowlist FILE] [--max-age-hours N] \\
-        [--summary FILE]
+        [--gateway BUILD | --gateway-allowlist FILE] [--summary FILE]
 """
 
 from __future__ import annotations
@@ -450,8 +449,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("declare", help="print the declared scenario ids")
-
     initialize = sub.add_parser("init")
     initialize.add_argument("--result", required=True)
 
@@ -484,17 +481,11 @@ def main(argv: list[str] | None = None) -> int:
         "--gateway-allowlist",
         help="a checksum allowlist; the recorded gateway build must be one of its digests",
     )
-    verifier.add_argument("--max-age-hours", type=int, default=DEFAULT_MAX_AGE_HOURS)
     verifier.add_argument("--summary")
 
     args = parser.parse_args(argv)
 
     try:
-        if args.command == "declare":
-            for identifier, description in REQUIRED_SCENARIOS:
-                print(f"{identifier}\t{description}")
-            return 0
-
         if args.command == "init":
             save(Path(args.result), empty_result())
             print(f"initialized {len(REQUIRED_SCENARIO_IDS)} scenario(s) as {NOT_RUN}")
@@ -539,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
             result,
             args.revision,
             args.gateway,
-            args.max_age_hours,
+            DEFAULT_MAX_AGE_HOURS,
             datetime.now(timezone.utc),
             allowlist,
         )

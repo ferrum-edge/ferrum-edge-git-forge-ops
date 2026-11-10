@@ -384,20 +384,11 @@ STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 # One reviewed pin per Dependabot bump: allow the new pin alongside the current
 # one before switching the workflow, then retire the previous pin in a
-# follow-up PR. v2.88.1 remains accepted while #680 moves the workflows to
-# v2.90.2; v2.87.29 and v2.87.30 are still listed until a follow-up retires
-# them, and the older v2.87.27 pin was retired in #604.
+# follow-up PR. Only v2.90.2, the pin both workflows use, is accepted; v2.88.1,
+# v2.87.30 and v2.87.29 were retired once #680 moved the workflows to it, and
+# v2.87.27 in #604.
 CARGO_AUDIT_ACTIONS = frozenset(
     {
-        # v2.87.29 changes other tool manifests; action source and the
-        # cargo-audit manifest are unchanged from v2.87.27.
-        "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",
-        # v2.87.30 changes other tool manifests; action source and the
-        # cargo-audit manifest remain unchanged.
-        "taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177",
-        # v2.88.1 changes other tool manifests and adds similarity-rs; action
-        # source and the cargo-audit manifest remain unchanged.
-        "taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68",
         # v2.90.2 adds mold and yq manifests, refreshes jq/curl bootstrap
         # checksums in main.sh and adds a `fallback: skip` mode the workflows
         # do not use; the cargo-audit and cargo-llvm-cov manifests are unchanged.
@@ -439,7 +430,8 @@ REGISTRY_JOB_OTHER_SECRETS = frozenset({"GITHUB_TOKEN"})
 #   `<env>-monitor` derivation cannot produce it either;
 # - the dispatch inputs of rotate.yml and materialize-file.yml are refused by
 #   the `preflight` job the bound job `needs`, before any binding, unless they
-#   are a safe path component other than `release` (`DISPATCH_ENVIRONMENT_GUARD`).
+#   are a safe path component other than `release` or `settings-audit`
+#   (`DISPATCH_ENVIRONMENT_GUARD`).
 # Any other computed binding is refused. The matrix pin is the job's whole
 # `strategy.matrix`.
 COMPUTED_ENVIRONMENT_BINDINGS = {
@@ -539,7 +531,18 @@ DISPATCH_ENVIRONMENT_GUARD = (
     'echo "::error::release holds the registry credentials and is not a deployment environment."\n'
     "exit 1\n"
     "fi",
+    "if [ \"$(printf '%s' \"$INPUT_ENVIRONMENT\" | tr '[:upper:]' '[:lower:]')\" = settings-audit ]; then\n"
+    'echo "::error::settings-audit holds the settings audit token and is not a deployment environment."\n'
+    "exit 1\n"
+    "fi",
 )
+# EXPAND STEP (GHSA-jx32-rxh5-5q25). The guard above also refuses
+# `settings-audit`, whose environment holds the reviewer-free administration-read
+# audit token. rotate.yml and materialize-file.yml still run the guard without
+# that refusal: the trusted check judges a workflow edit with `main`'s checker,
+# so they switch in the follow-up pull request, which also deletes this
+# accepted older shape.
+DISPATCH_ENVIRONMENT_GUARD_BEFORE_SETTINGS_AUDIT = DISPATCH_ENVIRONMENT_GUARD[:3]
 REGISTRY_SECRET_REFERENCE = re.compile(
     r"\bsecrets\s*(?:\.\s*|\[\s*['\"]\s*)DOCKERHUB_", re.IGNORECASE
 )
@@ -5291,7 +5294,8 @@ def computed_environment_binding_violations(
     refusal = (
         f"{label}: binds {binding}, so it must need a `preflight` job whose step "
         f"{DISPATCH_ENVIRONMENT_GUARD_STEP!r} runs the pinned guard (`shell: bash`) "
-        f"that refuses an unsafe name or `{RELEASE_ENVIRONMENT}` before the binding"
+        f"that refuses an unsafe name, `{RELEASE_ENVIRONMENT}` or `settings-audit` "
+        "before the binding"
     )
     # No job condition on either side: `if: always()` on the bound job would
     # run it after a failed preflight, and a preflight that can be skipped or
@@ -5307,7 +5311,13 @@ def computed_environment_binding_violations(
         or guard.get("shell") != DISPATCH_ENVIRONMENT_GUARD_SHELL
         or guard.get("env") != DISPATCH_ENVIRONMENT_GUARD_ENV
         or not isinstance(guard.get("run"), str)
-        or not pinned_run_matches(guard["run"], DISPATCH_ENVIRONMENT_GUARD)
+        or not any(
+            pinned_run_matches(guard["run"], shape)
+            for shape in (
+                DISPATCH_ENVIRONMENT_GUARD,
+                DISPATCH_ENVIRONMENT_GUARD_BEFORE_SETTINGS_AUDIT,
+            )
+        )
     ):
         return [refusal]
     return [
@@ -5672,7 +5682,6 @@ def local_action_violations(
 REQUIRED_CHECK_WORKFLOWS = {
     "rust-ci-check": ".github/workflows/rust-ci.yml",
     "security-cargo-audit": ".github/workflows/security.yml",
-    "security-supply-chain-policy": ".github/workflows/security.yml",
     SUPPLY_CHAIN_POLICY_JOB: SUPPLY_CHAIN_POLICY_PATH,
     "state-guard-reject-state-edits": ".github/workflows/state-guard.yml",
     "gitforgeops-required-static-validation": ".github/workflows/validate-pr.yml",
@@ -6313,17 +6322,14 @@ RELEASE_GATE_WORKFLOW = ".github/workflows/release.yml"
 RELEASE_GATE_HELPER = ".github/scripts/release_gate.py"
 RELEASE_GATE_JOB = "authorize-release"
 RELEASE_GATE_STEP = "Verify the published commit passed every required check"
-# The contexts `bootstrap_repo_settings.py` requires on `main`, plus the one
-# being added to the ruleset (GHSA-x5m2-4555-q4cr), as `<workflow> / <job>`.
+# The contexts `bootstrap_repo_settings.py` requires on `main`, as
+# `<workflow> / <job>`.
 RELEASE_GATE_REQUIRED_CHECKS = (
     "Rust CI / rust-ci-check",
     "Security / security-cargo-audit",
-    "Security / security-supply-chain-policy",
+    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "GitForgeOps State Guard / state-guard-reject-state-edits",
     "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-)
-RELEASE_GATE_ACCEPTED_CHECKS = (
-    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "Agent Setup Policy / validate-trusted-policy",
 )
 RELEASE_GATE_APP_ID = 15368
@@ -6345,7 +6351,27 @@ RELEASE_GATE_MARKERS = (
 # Module constants of the helper, each bound exactly once, to exactly this.
 RELEASE_GATE_PINS = {
     "REQUIRED_CHECKS": RELEASE_GATE_REQUIRED_CHECKS,
-    "ACCEPTED_CHECKS": RELEASE_GATE_ACCEPTED_CHECKS,
+    "ACTIONS_APP_ID": RELEASE_GATE_APP_ID,
+    "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
+}
+# EXPAND STEP (#701, retiring `security-supply-chain-policy`). release_gate.py
+# still requires the retired context and tolerates the two protected-definition
+# checks while absent (`ACCEPTED_CHECKS`). The trusted check judges a helper
+# edit with `main`'s checker, so the helper moves to the pins above in a
+# follow-up, which also deletes this older shape. A helper that binds
+# `ACCEPTED_CHECKS` is held to it.
+RELEASE_GATE_PINS_BEFORE_RETIRE = {
+    "REQUIRED_CHECKS": (
+        "Rust CI / rust-ci-check",
+        "Security / security-cargo-audit",
+        "Security / security-supply-chain-policy",
+        "GitForgeOps State Guard / state-guard-reject-state-edits",
+        "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
+    ),
+    "ACCEPTED_CHECKS": (
+        "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
+        "Agent Setup Policy / validate-trusted-policy",
+    ),
     "ACTIONS_APP_ID": RELEASE_GATE_APP_ID,
     "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
 }
@@ -6552,7 +6578,12 @@ def release_gate_helper_violations(root: Path) -> list[str]:
     except (SyntaxError, UnicodeDecodeError, ValueError) as error:
         return [f"{label}: the helper must parse as Python: {error}"]
     violations: list[str] = []
-    for name, expected in RELEASE_GATE_PINS.items():
+    pins = (
+        RELEASE_GATE_PINS_BEFORE_RETIRE
+        if _python_bindings(tree, "ACCEPTED_CHECKS")
+        else RELEASE_GATE_PINS
+    )
+    for name, expected in pins.items():
         value = _module_constant(tree, name)
         if type(value) is not type(expected) or value != expected:
             violations.append(f"{label}: {name} must be assigned exactly {expected!r}")
@@ -6740,6 +6771,7 @@ _RELEASE_PUSH_TRIGGER_RE = re.compile(
     r"^  push:\s*$\n(?P<body>(?:^    .*\n|^      .*\n)*)",
     re.MULTILINE,
 )
+_RELEASE_BRANCH_FILTER_RE = re.compile(r"^\s+branches(?:-ignore)?\s*:", re.MULTILINE | re.IGNORECASE)
 _FORK_GUARD_RE = re.compile(r"^\s*if: .*repository\.fork", re.MULTILINE)
 _JOB_ENVIRONMENT_RE = re.compile(r"^ {4}environment\s*:", re.MULTILINE)
 _SECRETS_EXPRESSION_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b", re.IGNORECASE)
@@ -6995,17 +7027,17 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"release.yml: build provenance is missing subject {required!r}"
             )
-    # The ledger commits that `apply-on-merge.yml` and `rotate.yml` push to
-    # `main` contain no build input. They used to carry `[skip ci]`, which
-    # suppressed the required checks along with everything else; excluding the
-    # paths from the image build is the narrower control.
+    # Only a release tag publishes (#700). `authorize-release` requires a
+    # lifecycle result that only an operator-dispatched, attested run can
+    # produce, so a branch trigger fails on every merge; it would also
+    # publish for the ledger commits `apply-on-merge.yml` and `rotate.yml`
+    # push to `main`.
     release_push = _RELEASE_PUSH_TRIGGER_RE.search(release)
     release_push_body = release_push.group("body") if release_push else ""
-    for ignored in ("- '.state/**'", "- 'assembled/**'"):
-        if ignored not in release_push_body:
-            violations.append(
-                f"release.yml: push trigger must ignore ledger-only commits ({ignored})"
-            )
+    if _RELEASE_BRANCH_FILTER_RE.search(release_push_body):
+        violations.append(
+            "release.yml: the push trigger must not name branches; only release tags publish"
+        )
     if "tags: ['v*']" not in release_push_body:
         violations.append("release.yml: push trigger must keep publishing release tags")
     # This repository is a template customers copy. A copy is not a fork, so
@@ -7236,7 +7268,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     security_workflow = (workflows / "security.yml").read_text(encoding="utf-8")
-    violations.extend(trusted_supply_chain_policy_violations(security_workflow))
+    # EXPAND STEP (#701). `security-supply-chain-policy` is no longer a
+    # required context; while security.yml still defines the job, it keeps
+    # running the trusted checker. The follow-up that deletes the job also
+    # deletes this pin.
+    if "\n  security-supply-chain-policy:\n" in security_workflow:
+        violations.extend(trusted_supply_chain_policy_violations(security_workflow))
     violations.extend(supply_chain_policy_workflow_violations(root))
     violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
     violations.extend(cargo_audit_install_violations(security_workflow))
