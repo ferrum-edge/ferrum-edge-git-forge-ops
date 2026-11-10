@@ -4,8 +4,9 @@
 //!
 //! Hermetic, like `exit_code_matrix_tests.rs`: the child starts from
 //! `env_clear()`, and `python3` on its `PATH` is a shell stub that records the
-//! argv and `GH_TOKEN` it was given, so no test reaches GitHub. Unix-only for
-//! the stub.
+//! argv and `GH_TOKEN` it was given, so no test reaches GitHub. The tests that
+//! must prove the bundled auditor itself runs use the real `python3` with a
+//! `gh` stub first on `PATH` instead. Unix-only for the stubs.
 
 #![cfg(unix)]
 
@@ -127,6 +128,38 @@ impl Doctor {
 
     fn auditor_token(&self) -> Option<String> {
         std::fs::read_to_string(self.token_path()).ok()
+    }
+
+    fn gh_marker_path(&self) -> PathBuf {
+        self.scratch.path().join("gh-ran")
+    }
+
+    /// Replace the `python3` stub with the real interpreter, so the bundled
+    /// auditor itself runs, and put a `gh` stub first on `PATH` that records
+    /// that it was called and fails like a refused request. Nothing reaches
+    /// GitHub, and the auditor fails closed to `UNKNOWN`.
+    fn real_auditor_with_gh_stub(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let search = std::env::var_os("PATH").expect("test PATH");
+        let python = std::env::split_paths(&search)
+            .map(|dir| dir.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("the bundled-auditor tests need python3 on PATH, as every workflow does");
+        let python = std::fs::canonicalize(python).expect("resolve python3");
+        let bin = self.scratch.path().join("bin");
+        std::fs::remove_file(bin.join("python3")).expect("remove python stub");
+        std::os::unix::fs::symlink(python, bin.join("python3")).expect("link python3");
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf ran > '{}'\necho 'gh: stubbed (HTTP 401)' >&2\nexit 1\n",
+                self.gh_marker_path().display()
+            ),
+        )
+        .expect("write gh stub");
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod gh stub");
     }
 }
 
@@ -403,4 +436,53 @@ fn an_auditor_exit_zero_without_its_success_line_is_not_a_pass() {
         text.contains("UNKNOWN Repository settings match the launch baseline"),
         "{text}"
     );
+}
+
+// -- the bundled auditor, not the checkout's, is what runs --------------------
+
+#[test]
+fn github_doctor_does_not_execute_the_checkout_auditor() {
+    // Neither the checkout's auditor nor a checkout module shadowing a
+    // standard-library import of the bundled one may run, and the bundled
+    // auditor must really have started (its `gh` call is the proof).
+    let doctor = Doctor::new(&[
+        (
+            ".github/scripts/audit_settings.py",
+            "from pathlib import Path\nPath('checkout-auditor-ran').write_text('bad')\n",
+        ),
+        (
+            "argparse.py",
+            "from pathlib import Path\nPath('checkout-module-ran').write_text('bad')\n",
+        ),
+    ]);
+    doctor.real_auditor_with_gh_stub();
+    let output = doctor.run(&["--scope", "github"], GITHUB_READY);
+    let text = stdout(&output);
+    assert!(
+        doctor.gh_marker_path().exists(),
+        "the bundled auditor never ran: {text}"
+    );
+    assert!(!doctor.repo.path().join("checkout-auditor-ran").exists());
+    assert!(!doctor.repo.path().join("checkout-module-ran").exists());
+    assert!(
+        text.contains("UNKNOWN Repository settings match the launch baseline"),
+        "{text}"
+    );
+}
+
+#[test]
+fn github_doctor_uses_its_bundled_auditor_when_checkout_copy_is_missing() {
+    let doctor = Doctor::new(&[]);
+    doctor.real_auditor_with_gh_stub();
+    let output = doctor.run(&["--scope", "github"], GITHUB_READY);
+    let text = stdout(&output);
+    assert!(
+        doctor.gh_marker_path().exists(),
+        "the bundled auditor never ran: {text}"
+    );
+    assert!(
+        text.contains("UNKNOWN Repository settings match the launch baseline"),
+        "{text}"
+    );
+    assert!(!text.contains("is not in this checkout"), "{text}");
 }
