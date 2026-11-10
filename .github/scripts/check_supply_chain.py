@@ -384,9 +384,9 @@ STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 # One reviewed pin per Dependabot bump: allow the new pin alongside the current
 # one before switching the workflow, then retire the previous pin in a
-# follow-up PR. v2.87.30 remains accepted while #651 moves the workflows to
-# v2.88.1; v2.87.29 is still listed until a follow-up retires it, and the
-# older v2.87.27 pin was retired in #604.
+# follow-up PR. v2.88.1 remains accepted while #680 moves the workflows to
+# v2.90.2; v2.87.29 and v2.87.30 are still listed until a follow-up retires
+# them, and the older v2.87.27 pin was retired in #604.
 CARGO_AUDIT_ACTIONS = frozenset(
     {
         # v2.87.29 changes other tool manifests; action source and the
@@ -398,6 +398,10 @@ CARGO_AUDIT_ACTIONS = frozenset(
         # v2.88.1 changes other tool manifests and adds similarity-rs; action
         # source and the cargo-audit manifest remain unchanged.
         "taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68",
+        # v2.90.2 adds mold and yq manifests, refreshes jq/curl bootstrap
+        # checksums in main.sh and adds a `fallback: skip` mode the workflows
+        # do not use; the cargo-audit and cargo-llvm-cov manifests are unchanged.
+        "taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2",
     }
 )
 SECURITY_PUSH_POLICY_PATHS = (
