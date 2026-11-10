@@ -1,8 +1,8 @@
 use crate::config::schema::Proxy;
 use crate::config::{collect_namespaces, GatewayConfig};
 use crate::plugin_catalog::{
-    auth_coverage, http_family_auth_plugin_names, plugin_instance_list, AuthCoverage,
-    STREAM_AUTH_PLUGIN_NAMES,
+    auth_coverage, http_family_auth_plugin_names, plugin_instance_list, AuthAllowlist,
+    AuthCoverage, EnabledPlugins, STREAM_AUTH_PLUGIN_NAMES,
 };
 use crate::policy::config::RequireAuthPluginRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
@@ -29,8 +29,15 @@ impl RequireAuthPluginRule {
     /// classification. So is the trigger guard: an authenticator carrying a
     /// `trigger` only runs on the requests it matches, so it never counts,
     /// and an intentionally public route needs a code-owned exemption.
-    fn coverage<'a>(&self, cfg: &'a GatewayConfig, proxy: &Proxy) -> AuthCoverage<'a> {
-        auth_coverage(cfg, proxy, &self.config.auth_allowlist())
+    ///
+    /// `enabled` and `auth` are built once per evaluation, not per proxy.
+    fn coverage<'a>(
+        &self,
+        enabled: &EnabledPlugins<'a>,
+        proxy: &Proxy,
+        auth: &AuthAllowlist,
+    ) -> AuthCoverage<'a> {
+        auth_coverage(enabled, proxy, auth)
     }
 }
 
@@ -162,6 +169,7 @@ impl PolicyCheck for RequireAuthPluginRule {
         let mut findings = Vec::new();
         let namespaces = collect_namespaces(cfg);
         let auth = self.config.auth_allowlist();
+        let enabled = EnabledPlugins::new(cfg);
         for exemption in &self.config.conditional_auth_exemptions {
             let (namespace, proxy_id) = exemption.split_once('/').unwrap_or(("", ""));
             if !namespaces.iter().any(|entry| entry == namespace) {
@@ -173,7 +181,7 @@ impl PolicyCheck for RequireAuthPluginRule {
                 .find(|proxy| proxy.namespace == namespace && proxy.id == proxy_id);
             let stale = match proxy {
                 Some(proxy) => {
-                    let coverage = self.coverage(cfg, proxy);
+                    let coverage = self.coverage(&enabled, proxy, &auth);
                     coverage.is_authenticated()
                         || coverage.conditional.is_empty()
                         || coverage.conditional_exemption_gap(&auth).is_some()
@@ -203,7 +211,7 @@ impl PolicyCheck for RequireAuthPluginRule {
         }
 
         for proxy in &cfg.proxies {
-            let coverage = self.coverage(cfg, proxy);
+            let coverage = self.coverage(&enabled, proxy, &auth);
             if coverage.is_authenticated() {
                 continue;
             }

@@ -19,10 +19,9 @@ use gitforgeops::config::repo_config::RepoConfig;
 use gitforgeops::config::GatewayConfig;
 use gitforgeops::verify::runner::{deadline_budget, run_check, run_within};
 use gitforgeops::verify::{
-    authorize_probe_credentials, authorize_probe_slots, bind_probe_slots, is_idempotent_method,
-    labelled_probe_consumers, probe_credential_slots, refuse_unbound_slots, resolve_headers,
-    BindingStatus, EnvironmentChecks, HeaderValue, Outcome, ProbeConsumerAllowlist,
-    ProbeCredentials, SmokeCheck, SmokeConfig, VerifyReport, VerifyStatus,
+    authorize_probe_slots, bind_probe_slots, is_idempotent_method, labelled_probe_consumers,
+    refuse_unbound_slots, resolve_headers, BindingStatus, EnvironmentChecks, HeaderValue, Outcome,
+    ProbeConsumerAllowlist, ProbeCredentials, SmokeCheck, SmokeConfig, VerifyReport, VerifyStatus,
     LEGACY_SMOKE_CONFIG_VERSION, MAX_CHECKS_PER_ENVIRONMENT, MAX_CHECK_ATTEMPTS,
     MAX_CHECK_RETRY_BACKOFF_MS, MAX_CHECK_TIMEOUT_SECS, MAX_ENVIRONMENT_VERIFY_BUDGET_SECS,
     SMOKE_CONFIG_VERSION, VERIFY_DEADLINE_GRACE_SECS, VERIFY_FAILED_EXIT_CODE,
@@ -697,16 +696,43 @@ fn checks_sending(method: &str, slot: &str) -> EnvironmentChecks {
     }
 }
 
+/// The slots `verify` sends: [`authorize_probe_slots`], then the
+/// authorization's projection of `bundle`.
+fn authorize_probe_credentials(
+    environment: &str,
+    checks: &EnvironmentChecks,
+    desired: &GatewayConfig,
+    allowlist: Option<&ProbeConsumerAllowlist>,
+    bundle: &BTreeMap<String, String>,
+) -> gitforgeops::error::Result<ProbeCredentials> {
+    authorize_probe_slots(environment, checks, desired, allowlist)?.project(bundle)
+}
+
+/// Whether `slot` passes the label half of the binding: with no operator
+/// allowlist visible, a labelled Consumer's brokered secret binds as
+/// `AllowlistNotVisible`.
+fn is_probe_slot(desired: &GatewayConfig, slot: &str) -> bool {
+    let bindings = bind_probe_slots(&checks_sending("GET", slot), desired, None, None);
+    bindings[0].status == BindingStatus::AllowlistNotVisible
+}
+
 #[test]
 fn only_brokered_secrets_of_labelled_consumers_are_probe_slots() {
-    let slots = probe_credential_slots(&desired());
-    let expected: std::collections::BTreeSet<String> = [PROBE_SLOT, PROBE_PASSWORD_SLOT]
+    let candidates = [
+        PROBE_SLOT,
+        PROBE_PASSWORD_SLOT,
+        CUSTOMER_SLOT,
+        MISLABELLED_SLOT,
+        PLUGIN_SLOT,
+        "ferrum/orders-probe/basicauth/username",
+    ];
+    let slots: Vec<&str> = candidates
         .into_iter()
-        .map(str::to_string)
+        .filter(|slot| is_probe_slot(&desired(), slot))
         .collect();
     // Not the customer, not a label that only looks like opt-in, and never an
     // identity such as basicauth.username.
-    assert_eq!(slots, expected);
+    assert_eq!(slots, [PROBE_SLOT, PROBE_PASSWORD_SLOT]);
 }
 
 /// The operator's allowlist: the probe, and nothing else.
@@ -820,7 +846,7 @@ fn a_customer_labelled_by_a_pull_request_is_refused_unless_the_operator_lists_it
     // names its key. The label is now present, so only the operator's list
     // stands between the check and the customer's key.
     let labelled = desired_with_labelled_customer();
-    assert!(probe_credential_slots(&labelled).contains(CUSTOMER_SLOT));
+    assert!(is_probe_slot(&labelled, CUSTOMER_SLOT));
     let error = authorize_probe_credentials(
         "staging",
         &checks_sending("GET", CUSTOMER_SLOT),

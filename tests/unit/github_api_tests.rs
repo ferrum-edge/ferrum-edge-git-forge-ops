@@ -1963,11 +1963,11 @@ async fn override_permission_unreadable_during_final_pass_is_inactive() {
     assert_eq!(permission_reads, 2);
 }
 
-/// `Link` header lines the strict parser reads as `Next` or `Ambiguous` (#562
-/// review). Override pagination ignores them; SSH key discovery refuses the
-/// ambiguous ones. Each entry is the raw header line(s) a stub response
-/// carries.
-const AMBIGUOUS_OR_NEXT_LINKS: &[&str] = &[
+/// `Link` header lines the strict parser reads as a next page at `{base}/x`
+/// (#562 review). Override pagination ignores them. Each entry is the raw
+/// header line(s) a stub response carries; the last is two `Link` headers,
+/// combined the way SSH key discovery combines them (`link_entry`).
+const NEXT_LINKS: &[&str] = &[
     "Link: <{base}/x>; rel=next\r\n",
     "Link: <{base}/x>; rel = \"next\"\r\n",
     "Link: <{base}/x>; rel=\"prev next\"\r\n",
@@ -1976,6 +1976,12 @@ const AMBIGUOUS_OR_NEXT_LINKS: &[&str] = &[
     "Link: <{base}/p1>; rel=\"prev\", <{base}/x>; rel=\"next\"\r\n",
     "Link: <{base}/p1>; title=\"a, b\"; rel=\"prev\", <{base}/x>; rel=next\r\n",
     "Link: <{base}/p1>; rel=\"prev\"\r\nLink: <{base}/x>; rel=\"next\"\r\n",
+];
+
+/// `Link` header lines the strict parser reads as `Ambiguous` (#562 review):
+/// not an unambiguous RFC 8288 list, or two different `next` targets.
+/// Override pagination ignores them; SSH key discovery refuses them.
+const AMBIGUOUS_LINKS: &[&str] = &[
     "Link: not-a-link\r\n",
     "Link: <{base}/x\r\n",
     "Link: <{base}/x>; rel\r\n",
@@ -2034,36 +2040,49 @@ const MALFORMED_URI_LINKS: &[&str] = &[
     "Link: <https://[>; rel=\"next\"\r\n",
 ];
 
-/// The strict parser SSH key discovery uses still classifies the tables.
-#[test]
-fn next_link_classifies_next_ambiguous_and_absent_values() {
+/// One table entry classified the way SSH key discovery reads a response:
+/// each `Link` header through `next_link`, any `Ambiguous` or two different
+/// `next` targets ambiguous. The stub substitutes its origin for `{base}`; so
+/// does this.
+fn link_entry(entry: &str) -> gitforgeops::policy::github_override::NextLink {
     use gitforgeops::policy::github_override::{next_link, NextLink};
-    // The stub substitutes its origin for `{base}`; so does this table.
-    let base = |line: &str| line.replace("{base}", "http://127.0.0.1:1");
-    for line in AMBIGUOUS_OR_NEXT_LINKS {
-        // A single header line is checked here; multi-line entries are covered
-        // by SSH key discovery's every-header test.
-        let line = base(line);
-        let value = line
-            .split("\r\n")
-            .next()
-            .unwrap()
-            .strip_prefix("Link: ")
-            .unwrap();
-        if line.matches("Link:").count() == 1 {
-            assert_ne!(next_link(value), NextLink::Absent, "{line:?}");
+    let entry = entry.replace("{base}", "http://127.0.0.1:1");
+    let mut next: Option<String> = None;
+    for line in entry.split("\r\n").filter(|line| !line.is_empty()) {
+        match next_link(line.strip_prefix("Link: ").unwrap()) {
+            NextLink::Absent => {}
+            NextLink::Next(target) if next.as_ref().is_none_or(|existing| existing == &target) => {
+                next = Some(target)
+            }
+            NextLink::Next(_) | NextLink::Ambiguous => return NextLink::Ambiguous,
         }
     }
-    for line in NO_NEXT_LINKS.iter().filter(|line| !line.is_empty()) {
-        let line = base(line);
-        let value = line.trim_end().strip_prefix("Link: ").unwrap();
-        assert_eq!(next_link(value), NextLink::Absent, "{line:?}");
+    next.map_or(NextLink::Absent, NextLink::Next)
+}
+
+/// The strict parser SSH key discovery uses classifies each table exactly.
+#[test]
+fn next_link_classifies_next_ambiguous_and_absent_values() {
+    use gitforgeops::policy::github_override::NextLink;
+    for entry in NEXT_LINKS {
+        assert_eq!(
+            link_entry(entry),
+            NextLink::Next("http://127.0.0.1:1/x".to_string()),
+            "{entry:?}"
+        );
+    }
+    for entry in AMBIGUOUS_LINKS {
+        assert_eq!(link_entry(entry), NextLink::Ambiguous, "{entry:?}");
+    }
+    for entry in NO_NEXT_LINKS {
+        assert_eq!(link_entry(entry), NextLink::Absent, "{entry:?}");
     }
 }
 
 fn every_link_header() -> impl Iterator<Item = &'static str> {
-    AMBIGUOUS_OR_NEXT_LINKS
+    NEXT_LINKS
         .iter()
+        .chain(AMBIGUOUS_LINKS)
         .chain(NO_NEXT_LINKS)
         .chain(MALFORMED_URI_LINKS)
         .copied()

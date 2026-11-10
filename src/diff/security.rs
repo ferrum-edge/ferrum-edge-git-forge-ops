@@ -7,7 +7,8 @@ use crate::plugin_catalog::{
     has_local_redis_fallback, is_auth_plugin, is_builtin, is_reserved, is_retired,
     plugin_instance_list, proxy_transport, retired_replacement, scheme_is_tls,
     waf_has_enforcing_rule, waf_mode, waf_mode_is_passive, waf_skips_oversized_body, AuthAllowlist,
-    AuthCoverage, RetiredRemediation, RETIRED_PLUGIN_NAMES, STREAM_AUTH_PLUGIN_NAMES,
+    AuthCoverage, EnabledPlugins, RetiredRemediation, RETIRED_PLUGIN_NAMES,
+    STREAM_AUTH_PLUGIN_NAMES,
 };
 use crate::policy::config::effective_auth_allowlist;
 use crate::policy::PolicyConfig;
@@ -122,7 +123,7 @@ pub fn audit_security(config: &GatewayConfig) -> Vec<SecurityFinding> {
 /// over the built-in defaults; without one the ten built-in authenticators of
 /// `plugin_catalog::AUTH_PLUGIN_NAMES` are used.
 ///
-/// Must run **before** `secrets::resolve_secrets`: the literal-credential
+/// Must run **before** `secrets::resolve_secrets_with_options`: the literal-credential
 /// check treats any secret string that is not a `${...}` placeholder as a
 /// committed secret, so auditing a resolved config flags every allocated
 /// credential.
@@ -171,11 +172,12 @@ pub fn audit_security_with_scope(
         }
     }
 
+    let enabled = EnabledPlugins::new(config);
     for proxy in &config.proxies {
         let exemption = policy
             .map(|cfg| &cfg.policies.require_auth_plugin)
             .filter(|cfg| cfg.has_conditional_auth_exemption(&proxy.namespace, &proxy.id));
-        check_proxy(config, proxy, &auth, exemption.is_some(), &mut findings);
+        check_proxy(&enabled, proxy, &auth, exemption.is_some(), &mut findings);
         check_proxy_plugin_associations(config, proxy, ownership_scope, &mut findings);
     }
 
@@ -207,7 +209,7 @@ pub fn audit_security_with_scope(
 }
 
 fn check_proxy(
-    config: &GatewayConfig,
+    enabled: &EnabledPlugins<'_>,
     proxy: &Proxy,
     auth: &AuthAllowlist,
     has_exemption: bool,
@@ -219,7 +221,7 @@ fn check_proxy(
     // one such as `soap_ws_security`. An authenticator carrying a trigger
     // never counts, because it only runs on the requests its predicate
     // matches.
-    let coverage = auth_coverage(config, proxy, auth);
+    let coverage = auth_coverage(enabled, proxy, auth);
     let exemption_gap = coverage.conditional_exemption_gap(auth);
     let exempt = has_exemption
         && !coverage.is_authenticated()

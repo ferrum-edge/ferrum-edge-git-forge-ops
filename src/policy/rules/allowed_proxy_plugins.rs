@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::config::GatewayConfig;
-use crate::plugin_catalog::effective_plugins;
+use crate::plugin_catalog::{effective_plugins, EnabledPlugins};
 use crate::policy::config::AllowedProxyPluginsRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
 
@@ -53,6 +53,7 @@ impl PolicyCheck for AllowedProxyPluginsRule {
             .iter()
             .map(|plugin| (plugin.namespace.as_str(), plugin.id.as_str()))
             .collect();
+        let enabled = EnabledPlugins::new(cfg);
 
         for proxy in &cfg.proxies {
             for assoc in &proxy.plugins {
@@ -78,7 +79,7 @@ impl PolicyCheck for AllowedProxyPluginsRule {
                 }
             }
             // Use the same enabled/global/scoped merge as runtime-facing rules.
-            for plugin in effective_plugins(cfg, proxy) {
+            for plugin in effective_plugins(&enabled, proxy) {
                 let plugin_name = &plugin.plugin_name;
                 if allowed.contains(&plugin_name.as_str()) {
                     continue;

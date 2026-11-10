@@ -6,10 +6,29 @@ name: Code Scanning
 # workflow must pass, which would turn each newly fixed CRITICAL/HIGH image
 # finding into a merge block (docs/github-launch-controls.md, section 2a).
 
+# Both triggers take the same `paths` (a policy test compares them): neither
+# job can change result on a PR that touches nothing the build or image reads.
+# Resource and overlay PRs are left out: the image does not embed them, and
+# the required `validate-pr.yml` validates them with the same validator.
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'benches/**'
+      - 'examples/**'
+      - '.cargo/**'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - 'rust-toolchain'
+      - 'Dockerfile'
+      # The image embeds the settings auditor (`include_str!`).
+      - '.github/scripts/audit_settings.py'
+      - '.github/workflows/code-scanning.yml'
   push:
     branches: [main]
     paths:

@@ -2809,7 +2809,7 @@ fn conditional_auth_exemption_is_exact_and_reports_stale_entries() {
     assert!(blocking[0].message.contains("conditional"));
 
     let exempt = gitforgeops::plugin_catalog::auth_coverage(
-        &cfg,
+        &gitforgeops::plugin_catalog::EnabledPlugins::new(&cfg),
         &cfg.proxies[0],
         &policies.policies.require_auth_plugin.auth_allowlist(),
     );
@@ -3786,7 +3786,7 @@ fn default_auth_plugin_names_cover_every_builtin_authenticator() {
 
 #[test]
 fn effective_plugins_scoped_instance_replaces_the_global() {
-    use gitforgeops::plugin_catalog::effective_plugins;
+    use gitforgeops::plugin_catalog::{effective_plugins, EnabledPlugins};
 
     let p = attach(
         proxy("p1", BackendScheme::Https, 30_000, true),
@@ -3813,7 +3813,7 @@ fn effective_plugins_scoped_instance_replaces_the_global() {
         ..Default::default()
     };
 
-    let effective = effective_plugins(&cfg, &p);
+    let effective = effective_plugins(&EnabledPlugins::new(&cfg), &p);
     let ids: Vec<&str> = effective.iter().map(|pl| pl.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -3824,7 +3824,7 @@ fn effective_plugins_scoped_instance_replaces_the_global() {
 
 #[test]
 fn effective_plugins_keeps_the_global_for_other_plugin_names() {
-    use gitforgeops::plugin_catalog::effective_plugins;
+    use gitforgeops::plugin_catalog::{effective_plugins, EnabledPlugins};
 
     let p = attach(
         proxy("p1", BackendScheme::Https, 30_000, true),
@@ -3851,7 +3851,7 @@ fn effective_plugins_keeps_the_global_for_other_plugin_names() {
         ..Default::default()
     };
 
-    let ids: Vec<&str> = effective_plugins(&cfg, &p)
+    let ids: Vec<&str> = effective_plugins(&EnabledPlugins::new(&cfg), &p)
         .iter()
         .map(|pl| pl.id.as_str())
         .collect();
@@ -3861,7 +3861,7 @@ fn effective_plugins_keeps_the_global_for_other_plugin_names() {
 
 #[test]
 fn effective_plugins_excludes_disabled_instances() {
-    use gitforgeops::plugin_catalog::effective_plugins;
+    use gitforgeops::plugin_catalog::{effective_plugins, EnabledPlugins};
 
     let p = proxy("p1", BackendScheme::Https, 30_000, true);
     let mut disabled = catalog_plugin(
@@ -3879,14 +3879,14 @@ fn effective_plugins_excludes_disabled_instances() {
     };
 
     assert!(
-        effective_plugins(&cfg, &p).is_empty(),
+        effective_plugins(&EnabledPlugins::new(&cfg), &p).is_empty(),
         "a disabled plugin is skipped by the gateway on every request"
     );
 }
 
 #[test]
 fn effective_plugins_keeps_every_size_limiting_instance() {
-    use gitforgeops::plugin_catalog::effective_plugins;
+    use gitforgeops::plugin_catalog::{effective_plugins, EnabledPlugins};
 
     // Size limits are conjunctive: a looser scoped instance must not be able
     // to displace a stricter global one.
@@ -3915,7 +3915,7 @@ fn effective_plugins_keeps_every_size_limiting_instance() {
         ..Default::default()
     };
 
-    let ids: Vec<&str> = effective_plugins(&cfg, &p)
+    let ids: Vec<&str> = effective_plugins(&EnabledPlugins::new(&cfg), &p)
         .iter()
         .map(|pl| pl.id.as_str())
         .collect();
@@ -3925,7 +3925,7 @@ fn effective_plugins_keeps_every_size_limiting_instance() {
 
 #[test]
 fn effective_plugins_sorts_by_priority_override() {
-    use gitforgeops::plugin_catalog::{effective_plugins, effective_priority};
+    use gitforgeops::plugin_catalog::{effective_plugins, effective_priority, EnabledPlugins};
 
     let p = proxy("p1", BackendScheme::Https, 30_000, true);
     let mut late_cors = catalog_plugin(
@@ -3951,7 +3951,7 @@ fn effective_plugins_sorts_by_priority_override() {
         plugin_configs: vec![late_cors, logging],
         ..Default::default()
     };
-    let ids: Vec<&str> = effective_plugins(&cfg, &p)
+    let ids: Vec<&str> = effective_plugins(&EnabledPlugins::new(&cfg), &p)
         .iter()
         .map(|pl| pl.id.as_str())
         .collect();

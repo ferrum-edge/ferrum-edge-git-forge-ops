@@ -135,7 +135,9 @@ without a PR every blocker stands.
 
 `review` computes the same verdict and always shows it, but exits `0` by
 default. `review --fail-on-blockers` (or
-`GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`) makes it exit `1` on blockers;
+`GITFORGEOPS_REVIEW_FAIL_ON_BLOCKERS=true`) makes it exit `1` on blockers
+(without a credential bundle, `alloc=require` slots are left to `apply`, as
+the verdict says);
 `--require-live` makes it exit non-zero when the live comparison or the PR
 comment fails. The bundled workflows use `--require-live` for trusted live
 review and leave static review as comment output.
@@ -401,9 +403,9 @@ gets a fake value of the right shape:
 | other credentials, and token/header/secret plugin config | `gitforgeops-validation-standin-<64 hex>` |
 | endpoint plugin config (`ldap_url`, `redis_url`, `jwks_uri`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
 
-The scheme follows the field (`ldaps://`, `redis://`, `kafka://`, otherwise
-`https://`). Resolved values are always validated unchanged. Stand-ins are
-never exported, applied, delivered or stored.
+The scheme follows the field (`ldaps://`, `redis://`, otherwise `https://`).
+Resolved values are always validated unchanged. Stand-ins are never exported,
+applied, delivered or stored.
 
 **Workflow-command injection is blocked.** Resource ids, namespaces and
 gateway responses can be attacker-controlled. All diagnostics pass through one

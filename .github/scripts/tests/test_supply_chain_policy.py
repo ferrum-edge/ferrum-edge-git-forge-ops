@@ -4245,6 +4245,62 @@ class SupplyChainPolicyTests(unittest.TestCase):
             [],
         )
 
+    def test_code_scanning_pull_requests_take_the_push_paths(self):
+        # #699: CodeQL and the image scan cannot change result on a PR that
+        # touches nothing the build or the image reads, so both triggers take
+        # one path list. The workflow reports no required check, so the
+        # "required workflows are never path-filtered" rule does not apply.
+        workflow_path = ".github/workflows/code-scanning.yml"
+        self.assertNotIn(workflow_path, check_supply_chain.REQUIRED_CHECK_WORKFLOWS.values())
+        triggers = check_supply_chain.parse_workflow((ROOT / workflow_path).read_text())["on"]
+        self.assertTrue(triggers["push"]["paths"])
+        self.assertEqual(triggers["pull_request"]["paths"], triggers["push"]["paths"])
+        self.assertIn("Dockerfile", triggers["pull_request"]["paths"])
+        self.assertIn(".github/scripts/audit_settings.py", triggers["pull_request"]["paths"])
+
+    def test_apply_builds_the_binary_only_for_a_configured_repository(self):
+        # #699: an unconfigured repository skips through empty matrices before
+        # the enumerator calls the binary, so the toolchain, cache and build
+        # steps are gated on the configuration check, which runs first. The
+        # enumerator itself stays unconditioned and pinned.
+        document = check_supply_chain.parse_workflow(
+            (ROOT / ".github/workflows/apply-on-merge.yml").read_text()
+        )
+        steps = document["jobs"]["list-envs"]["steps"]
+        names = [step.get("name") for step in steps]
+        self.assertEqual(
+            names,
+            [
+                None,
+                "Check for repository configuration",
+                "Install Rust toolchain",
+                "Cache cargo registry",
+                "Build gitforgeops",
+                "Enumerate environments",
+            ],
+        )
+        configured = steps[1]
+        self.assertEqual(configured["id"], "configured")
+        self.assertNotIn("if", configured)
+        self.assertIn("if [[ -f .gitforgeops/config.yaml ]]; then", configured["run"])
+        for step in steps[2:5]:
+            with self.subTest(step=step["name"]):
+                self.assertEqual(step["if"], "steps.configured.outputs.present == 'true'")
+        self.assertNotIn("if", steps[5])
+        self.assertEqual(
+            check_supply_chain.environment_producer_violations(
+                ".github/workflows/apply-on-merge.yml", document
+            ),
+            [],
+        )
+        # Nothing can have written a promotion record when both matrices are
+        # empty, so the summary job does not start a runner for them.
+        summary = document["jobs"]["promotion-summary"]
+        self.assertEqual(summary["needs"], ["list-envs", "apply", "promote"])
+        self.assertIn("!cancelled()", summary["if"])
+        self.assertIn("needs.list-envs.outputs.envs != '[]'", summary["if"])
+        self.assertIn("needs.list-envs.outputs.promotions != '[]'", summary["if"])
+
     def test_alloy_consumer_qualification_is_isolated_and_not_required(self):
         workflow_path = ".github/workflows/alloy-consumer.yml"
         workflow = (ROOT / workflow_path).read_text()
@@ -4283,6 +4339,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 "src/lib.rs",
                 "src/error.rs",
                 "src/diagnostics.rs",
+                "src/yaml.rs",
+                "src/plugin_catalog.rs",
+                "src/json_output.rs",
                 "src/config/**",
                 "src/validate/**",
                 "src/apply/**",

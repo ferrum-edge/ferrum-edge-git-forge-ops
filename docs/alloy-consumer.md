@@ -25,7 +25,9 @@ dependencies, so the required `validator-pairing` job and
 Alloy. It runs on pull requests that change the consumer surface, weekly, and
 on manual dispatch. The surface is everything the test exercises: the CLI load
 boundary (`src/main.rs`, `src/cli.rs`, `src/lib.rs`, `src/error.rs`,
-`src/diagnostics.rs`), `src/config/**`, `src/validate/**`, the load-boundary
+`src/diagnostics.rs`), the shared YAML parser, plugin catalog and JSON output
+helpers (`src/yaml.rs`, `src/plugin_catalog.rs`, `src/json_output.rs`),
+`src/config/**`, `src/validate/**`, the load-boundary
 checks in `src/apply/**` and `src/secrets/**`, the build and dependency inputs
 (`build.rs`, `.cargo/**`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`),
 the test and its registration, the Alloy provenance, the validator allowlist

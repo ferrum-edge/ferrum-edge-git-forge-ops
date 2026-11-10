@@ -17,7 +17,7 @@
 //! (`docs/plugins.md`, "Plugin Scope Merging"), which the analysis passes and
 //! policy rules all share.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -367,12 +367,8 @@ fn is_scoped_to(plugin: &PluginConfig, proxy: &Proxy) -> bool {
 /// Disabled instances never appear: the gateway skips them on every request,
 /// so treating one as present is how a `enabled: false` auth plugin sneaks a
 /// proxy past an auth check.
-pub fn effective_plugins<'a>(config: &'a GatewayConfig, proxy: &Proxy) -> Vec<&'a PluginConfig> {
-    let enabled_in_ns: Vec<&PluginConfig> = config
-        .plugin_configs
-        .iter()
-        .filter(|plugin| plugin.enabled && plugin.namespace == proxy.namespace)
-        .collect();
+pub fn effective_plugins<'a>(enabled: &EnabledPlugins<'a>, proxy: &Proxy) -> Vec<&'a PluginConfig> {
+    let enabled_in_ns = enabled.in_namespace(&proxy.namespace);
 
     let scoped: Vec<&PluginConfig> = enabled_in_ns
         .iter()
@@ -399,6 +395,34 @@ pub fn effective_plugins<'a>(config: &'a GatewayConfig, proxy: &Proxy) -> Vec<&'
     effective.extend(scoped);
     effective.sort_by_key(|plugin| effective_priority(plugin));
     effective
+}
+
+/// A document's enabled plugin configs by namespace, in document order: what
+/// [`effective_plugins`] and [`auth_coverage`] start from for each proxy.
+/// Build it once per pass over a document instead of filtering every plugin
+/// config again for every proxy.
+pub struct EnabledPlugins<'a> {
+    by_namespace: HashMap<&'a str, Vec<&'a PluginConfig>>,
+}
+
+impl<'a> EnabledPlugins<'a> {
+    pub fn new(config: &'a GatewayConfig) -> Self {
+        let mut by_namespace: HashMap<&'a str, Vec<&'a PluginConfig>> = HashMap::new();
+        for plugin in config.plugin_configs.iter().filter(|plugin| plugin.enabled) {
+            by_namespace
+                .entry(plugin.namespace.as_str())
+                .or_default()
+                .push(plugin);
+        }
+        Self { by_namespace }
+    }
+
+    fn in_namespace(&self, namespace: &str) -> &[&'a PluginConfig] {
+        self.by_namespace
+            .get(namespace)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
 }
 
 // --- Backend scheme ---
@@ -811,7 +835,7 @@ impl<'a> AuthCoverage<'a> {
 /// are classified as conditional and never cover a protocol; see
 /// [`AuthCoverage`].
 pub fn auth_coverage<'a>(
-    config: &'a GatewayConfig,
+    enabled: &EnabledPlugins<'a>,
     proxy: &Proxy,
     auth: &AuthAllowlist,
 ) -> AuthCoverage<'a> {
@@ -821,7 +845,7 @@ pub fn auth_coverage<'a>(
     let mut conditional = Vec::new();
     let mut inapplicable = Vec::new();
     let http_plugins_are_inert = !transport.is_stream() && proxy.passthrough;
-    for plugin in effective_plugins(config, proxy) {
+    for plugin in effective_plugins(enabled, proxy) {
         if !auth.contains(&plugin.plugin_name) {
             continue;
         }

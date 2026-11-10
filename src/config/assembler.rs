@@ -472,7 +472,7 @@ fn merge_mesh_singleton<T: PartialEq + std::fmt::Debug>(
 ///
 /// # Slot stability
 ///
-/// This runs before `secrets::resolve_secrets` walks the credential tree, so
+/// This runs before the secret resolver walks the credential tree, so
 /// placeholders are now one array level deeper than they used to be. Slot
 /// names are unaffected: the walker elides array index 0, so
 /// `keyauth: {key: "${…}"}` and `keyauth: [{key: "${…}"}]` both derive

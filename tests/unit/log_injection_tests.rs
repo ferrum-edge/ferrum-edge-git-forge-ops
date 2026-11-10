@@ -25,7 +25,9 @@ use gitforgeops::diff::{
 use gitforgeops::error::Error;
 use gitforgeops::policy::config::{PolicyRules, RequireAuthPluginRuleConfig};
 use gitforgeops::policy::{evaluate_policies, PolicyConfig, Severity};
-use gitforgeops::review::pr_comment::{build_review_comment, markdown_comment_for_terminal};
+use gitforgeops::review::pr_comment::{
+    build_review_comment_with_preview, markdown_comment_for_terminal, ReviewValidationStatus,
+};
 
 use tempfile::TempDir;
 
@@ -136,7 +138,27 @@ fn review_terminal_output_neutralizes_fenced_workflow_commands() {
         namespace: "ferrum".into(),
         details: vec![],
     }];
-    let comment = build_review_comment(false, validation, &diffs, &[], &[], &[], None);
+    let comment = build_review_comment_with_preview(
+        ReviewValidationStatus::Rejected,
+        validation,
+        &diffs,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        &Default::default(),
+        false,
+        None,
+        &[],
+        &[],
+        false,
+    );
 
     // The published comment keeps the validator's text verbatim inside its
     // dynamic fence; only the terminal rendering is neutralized.

@@ -73,7 +73,10 @@ Never retried:
   may establish success through authoritative readback and conditional ownership
   assertions; rotation records completion only after confirmed live publication.
 - **`/restore` failures** other than the connectivity case. A 500 with
-  `rollback: incomplete` or `unknown_outcome` is `RestoreNeedsManualRecovery`.
+  `rollback: incomplete` or `unknown_outcome` is `RestoreNeedsManualRecovery`
+  and says not to re-run apply. Restore errors withhold everything the gateway
+  sent (its message, the at-risk spec names, the rollback details) and keep
+  only GitForgeOps' own remedy.
 - **Request timeouts.** The outcome is unknown; the next run re-diffs.
 - **Other 4xx** (400, 401, 403, 404, 409, 412, 422). A `412` answers a
   conditional write; see

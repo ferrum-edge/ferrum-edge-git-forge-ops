@@ -3458,7 +3458,7 @@ async fn non_proxy_scope_with_stray_target_does_not_enter_batch_only_path() {
 async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fallback() {
     use gitforgeops::apply::{incremental_plugin_attach_notice, order_incremental_diffs};
     use gitforgeops::review::pr_comment::{
-        build_review_comment_v2_with_status, ReviewValidationStatus,
+        build_review_comment_with_preview, ReviewValidationStatus,
     };
 
     let mut desired = scoped_plugin_desired();
@@ -3485,7 +3485,7 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
         vec!["independent", "pc1", "p1", "old"]
     );
     let note = incremental_plugin_attach_notice(&Default::default(), &diffs, &desired).unwrap();
-    let review = build_review_comment_v2_with_status(
+    let review = build_review_comment_with_preview(
         ReviewValidationStatus::Passed,
         "",
         &diffs,
@@ -3500,6 +3500,10 @@ async fn mixed_cycle_preview_orders_the_same_writes_as_execution_and_explains_fa
         None,
         Some(note),
         &Default::default(),
+        false,
+        None,
+        &[],
+        &[],
         false,
     );
     assert!(review.contains("POST /batch"));

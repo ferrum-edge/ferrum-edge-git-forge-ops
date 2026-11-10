@@ -782,7 +782,7 @@ async fn allocate_if_needed(
     // Re-resolve so `desired` picks up freshly allocated values. The
     // allocator only produces values for slots classified as NeedsAllocation
     // (first-apply generate OR first-apply rotate). Already-allocated
-    // placeholders were resolved in the initial `resolve_secrets` pass.
+    // placeholders were resolved in the initial `resolve_secrets_with_options` pass.
     let merged = secrets::merge_bundles(per_shard);
     let _ = secrets::resolve_secrets_with_options(desired, &merged, resolve_options)?;
 
@@ -1690,7 +1690,7 @@ struct ExportComparison {
 }
 
 /// [`load_namespace_pairs_for`] over `GET /config/export` with the viewer
-/// credential. Each pair's live side is [`config_export::ConfigExport::live_view`]
+/// credential. Each pair's live side is [`config_export::ConfigExport::live_view_with`]
 /// and its desired side is projected the way the export projects Consumers.
 ///
 /// `unresolved` is the desired configuration before credential resolution, so
@@ -2985,7 +2985,7 @@ async fn cmd_apply(
     // In file mode we MUST NOT mutate `desired`: the file-mode branch below
     // serializes `desired` to a committed-to-repo YAML, and replacing
     // placeholders with real bundle values here would leak credentials into
-    // the committed artifact. `report_secrets` walks and classifies without
+    // the committed artifact. `report_secrets_with_mode_and_options` walks and classifies without
     // touching `cfg`.
     //
     // In api mode we want the mutation: apply_api pushes `desired` to the
@@ -3002,9 +3002,12 @@ async fn cmd_apply(
     let ledger = consumer_ledger(&resolved, &state, &allocation_binding);
     let initial_options = resolve_options.with_consumer_ledger(&ledger);
     let secret_report = match env_config.gateway_mode {
-        GatewayMode::File => {
-            secrets::report_secrets_with_options(&desired, &initial_bundle, initial_options)?
-        }
+        GatewayMode::File => secrets::report_secrets_with_mode_and_options(
+            &desired,
+            &initial_bundle,
+            GatewayMode::File,
+            initial_options,
+        )?,
         GatewayMode::Api => {
             secrets::resolve_secrets_with_options(&mut desired, &initial_bundle, initial_options)?
         }
@@ -4264,7 +4267,7 @@ async fn cmd_review(
     // counts the findings classes from the findings themselves and lists every
     // other class from this vec, so it blocks whenever `--fail-on-blockers`
     // would fail on one of them, and the flag only changes the exit code.
-    let blockers = verdict::apply_blockers(ApplyGateInputs {
+    let mut blockers = verdict::apply_blockers(ApplyGateInputs {
         validation_ok: matches!(validation_status, review::ReviewValidationStatus::Passed),
         security_findings: &security_findings,
         security_overridden,
@@ -4278,6 +4281,14 @@ async fn cmd_review(
         smoke_checks_invalid: smoke_invalid,
         probe_allowlist_invalid,
     });
+    // Without a bundle every `alloc=require` slot reads as missing, which is
+    // no evidence either way: the verdict says the bundle is unavailable and
+    // that apply checks those slots, and does not count them. The flag must
+    // not fail on what the verdict cannot decide (#688). `plan` and `apply`
+    // keep the blocker.
+    if !bundle_loaded {
+        blockers.retain(|blocker| blocker.kind != verdict::BlockerKind::RequiredCredentials);
+    }
     // The classes with no findings section or count line of their own. Their
     // remedies are fixed text, so nothing from the environment or the smoke
     // file reaches the PR.

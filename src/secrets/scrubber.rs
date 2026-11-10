@@ -284,20 +284,44 @@ impl SecretScrubber {
         self.values.is_empty()
     }
 
-    /// True when at least one secret cannot be scrubbed reliably, so every
-    /// stream is withheld rather than partially redacted.
-    pub fn is_unsafe_to_scrub(&self) -> bool {
-        self.unsafe_to_scrub
-    }
-
     /// Replace every known secret sequence in `text` with [`REDACTION`].
+    ///
+    /// Needles claim their occurrences longest first, and a shorter needle
+    /// never takes bytes a longer one already claimed, which is what replacing
+    /// the needles one after another, longest first, produced. The text is
+    /// rebuilt once instead of copied again for every needle that matches.
     pub fn scrub(&self, text: &str) -> String {
-        let mut scrubbed = text.to_string();
+        // Disjoint claimed byte ranges, start -> end.
+        let mut claimed: BTreeMap<usize, usize> = BTreeMap::new();
         for needle in &self.needles {
-            if scrubbed.contains(needle.as_str()) {
-                scrubbed = scrubbed.replace(needle.as_str(), REDACTION);
+            let mut from = 0;
+            while let Some(found) = text[from..].find(needle.as_str()) {
+                let start = from + found;
+                let end = start + needle.len();
+                let overlaps = claimed
+                    .range(..end)
+                    .next_back()
+                    .is_some_and(|(_, &claimed_end)| claimed_end > start);
+                if overlaps {
+                    // A later occurrence may still start inside this one.
+                    from = start + text[start..].chars().next().map_or(1, char::len_utf8);
+                } else {
+                    claimed.insert(start, end);
+                    from = end;
+                }
             }
         }
+        if claimed.is_empty() {
+            return text.to_string();
+        }
+        let mut scrubbed = String::with_capacity(text.len());
+        let mut at = 0;
+        for (start, end) in claimed {
+            scrubbed.push_str(&text[at..start]);
+            scrubbed.push_str(REDACTION);
+            at = end;
+        }
+        scrubbed.push_str(&text[at..]);
         scrubbed
     }
 

@@ -4,7 +4,7 @@ use crate::config::schema::{BackendScheme, PluginConfig, Proxy, SdStalePolicy, U
 use crate::config::GatewayConfig;
 use crate::plugin_catalog::{
     effective_plugins, effective_scheme, is_ai_plugin, is_observability_plugin,
-    over_attached_chargeback, scheme_is_http_family, AI_GUARDRAIL_PLUGIN_NAMES,
+    over_attached_chargeback, scheme_is_http_family, EnabledPlugins, AI_GUARDRAIL_PLUGIN_NAMES,
     OBSERVABILITY_PLUGIN_NAMES, RATE_LIMIT_PLUGIN_NAMES,
 };
 
@@ -44,9 +44,10 @@ impl BestPractice {
 
 pub fn check_best_practices(config: &GatewayConfig) -> Vec<BestPractice> {
     let mut findings = Vec::new();
+    let enabled = EnabledPlugins::new(config);
 
     for proxy in &config.proxies {
-        check_proxy(config, proxy, &mut findings);
+        check_proxy(&enabled, proxy, &mut findings);
     }
 
     for upstream in &config.upstreams {
@@ -94,8 +95,8 @@ fn rate_limit_expectation(
     }
 }
 
-fn check_proxy(config: &GatewayConfig, proxy: &Proxy, findings: &mut Vec<BestPractice>) {
-    let effective = effective_plugins(config, proxy);
+fn check_proxy(enabled: &EnabledPlugins<'_>, proxy: &Proxy, findings: &mut Vec<BestPractice>) {
+    let effective = effective_plugins(enabled, proxy);
     let has = |name: &str| effective.iter().any(|plugin| plugin.plugin_name == name);
     let id = proxy.id.as_str();
     let ns = proxy.namespace.as_str();

@@ -3,10 +3,8 @@ pub mod pr_comment;
 
 pub use github::{comment_status_is_retryable, post_composed_pr_comment, post_pr_comment};
 pub use pr_comment::{
-    build_review_comment, build_review_comment_v2, build_review_comment_v2_with_override,
-    build_review_comment_v2_with_status, build_review_comment_with_status, environment_header,
-    markdown_comment_for_terminal, render_empty_namespace_selection, render_mesh_retraction,
-    render_spec_owned, ReviewValidationStatus,
+    environment_header, markdown_comment_for_terminal, render_empty_namespace_selection,
+    render_mesh_retraction, render_spec_owned, ReviewValidationStatus,
 };
 
 /// Prefix shared by every published "the live comparison did not happen" note.
@@ -134,18 +132,6 @@ pub struct ReviewValidation {
     pub status: ReviewValidationStatus,
     pub output: String,
     pub execution_error: Option<String>,
-}
-
-pub fn validate_for_review(
-    gateway: &crate::config::GatewayConfig,
-    mesh: Option<&crate::config::MeshConfigSpec>,
-    binary_path: &str,
-) -> ReviewValidation {
-    combine_validation_for_review(
-        crate::validate::run_validation(gateway, binary_path),
-        mesh,
-        binary_path,
-    )
 }
 
 /// Review validation for a resolved snapshot, preserving resolution provenance

@@ -810,18 +810,6 @@ fn consumer_secret_slots(desired: &GatewayConfig) -> BTreeMap<String, SlotOwner>
     owners
 }
 
-/// Every slot of a Consumer labelled [`VERIFY_PROBE_LABEL`]` = "true"` in
-/// `desired`: the label half of the binding. A slot must also belong to a
-/// Consumer in the operator's [`ProbeConsumerAllowlist`] before `verify`
-/// sends it.
-pub fn probe_credential_slots(desired: &GatewayConfig) -> BTreeSet<String> {
-    consumer_secret_slots(desired)
-        .into_iter()
-        .filter(|(_, owner)| owner.labelled)
-        .map(|(slot, _)| slot)
-        .collect()
-}
-
 /// The Consumers `desired` labels [`VERIFY_PROBE_LABEL`]` = "true"`, as
 /// `<namespace>/<consumer-id>`, so a review shows every label a change adds.
 pub fn labelled_probe_consumers(desired: &GatewayConfig) -> Vec<String> {
@@ -1173,18 +1161,6 @@ pub fn missing_allowlist_error(environment: &str) -> crate::error::Error {
          `{VERIFY_PROBE_LABEL}` label alone authorizes nothing.",
         crate::diagnostics::sanitize_line(environment)
     ))
-}
-
-/// [`authorize_probe_slots`], then [`ProbeAuthorization::project`] `bundle`.
-pub fn authorize_probe_credentials(
-    environment: &str,
-    checks: &EnvironmentChecks,
-    desired: &GatewayConfig,
-    allowlist: Option<&ProbeConsumerAllowlist>,
-    bundle: &BTreeMap<String, String>,
-) -> crate::error::Result<ProbeCredentials> {
-    let authorization = authorize_probe_slots(environment, checks, desired, allowlist)?;
-    authorization.project(bundle)
 }
 
 /// Turn declared header values into the exact bytes to send.

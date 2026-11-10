@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
+use super::resolver_fixtures::resolve_secrets;
 use gitforgeops::config::schema::{Consumer, GatewayConfig};
 use gitforgeops::secrets::{
-    bundle::{pick_shard, shard_secret_name},
-    load_bundles_from_env, parse_placeholder, resolve_secrets, slot_path, PlaceholderAlloc,
-    SlotStatus,
+    bundle::{pick_shard, shard_secret_name, ShardSizes},
+    load_bundles_from_env, parse_placeholder, slot_path, PlaceholderAlloc, SlotStatus,
 };
 
 const TEST_ED25519_PUBLIC_KEY: &str =
@@ -109,6 +109,37 @@ fn builtin_unbrokered_heuristic_matches_stay_sensitive_to_the_scrubber() {
         "[REDACTED] [REDACTED] visible-setting"
     );
 }
+#[test]
+fn the_longest_secret_wins_where_two_secrets_overlap() {
+    // #694: scrubbing claims each needle's occurrences longest first, so a
+    // shorter secret that starts earlier but overlaps a longer one never
+    // splits it and leaves the longer secret's tail behind.
+    let gateway: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "builtin",
+            "plugin_name": "a2a_gateway",
+            "scope": "global",
+            "config": {
+                "signing_key": "synthetic-overlap-long-tail-material",
+                "api_key": "lead-synthetic-overlap",
+                "mode": "visible-setting"
+            }
+        }]
+    }))
+    .unwrap();
+    let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+    assert_eq!(
+        scrubber.scrub("x lead-synthetic-overlap-long-tail-material y"),
+        "x lead-[REDACTED] y"
+    );
+    assert_eq!(
+        scrubber.scrub("lead-synthetic-overlap, synthetic-overlap-long-tail-material"),
+        "[REDACTED], [REDACTED]"
+    );
+    assert_eq!(scrubber.scrub("visible-setting"), "visible-setting");
+}
+
 /// One plugin per path Ferrum Edge v0.9.19's `plugin_config_projection` added
 /// to its redaction schema, each value long enough to be scrubbed, with the
 /// broker slot import must capture it under.
@@ -325,7 +356,9 @@ fn short_operator_plugin_values_stay_ordinary_settings() {
         );
 
         let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
-        assert!(!scrubber.is_unsafe_to_scrub(), "{plugin_name}");
+        let output = scrubber.scrub_streams("validated", "");
+        assert!(output.suppressed.is_none(), "{plugin_name}");
+        assert_eq!(output.stdout, "validated", "{plugin_name}");
         assert!(
             security_blockers(&audit_security(&original)).is_empty(),
             "{plugin_name}"
@@ -708,7 +741,7 @@ fn existing_slot_stays_on_its_current_shard() {
     // regardless of how shard_count has grown. pick_shard alone wouldn't
     // guarantee this; allocate_and_deliver now consults the per-shard map
     // first. This test covers the bookkeeping directly.
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle};
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, ShardSizes};
 
     let slot = "ferrum/app/api_key";
 
@@ -732,15 +765,21 @@ fn existing_slot_stays_on_its_current_shard() {
     assert_eq!(existing, Some(0));
 
     // Sanity: pick_shard is still deterministic for new slots.
-    let fresh = pick_shard("ferrum/other/cred", 32, &shards, shard_count).unwrap();
+    let fresh = pick_shard(
+        "ferrum/other/cred",
+        32,
+        &ShardSizes::of(&shards),
+        shard_count,
+    )
+    .unwrap();
     assert!(fresh < shard_count);
 }
 
 #[test]
 fn pick_shard_is_deterministic_and_within_bounds() {
-    let shards = BTreeMap::new();
-    let a = pick_shard("slot-a", 32, &shards, 4).unwrap();
-    let a_again = pick_shard("slot-a", 32, &shards, 4).unwrap();
+    let sizes = ShardSizes::default();
+    let a = pick_shard("slot-a", 32, &sizes, 4).unwrap();
+    let a_again = pick_shard("slot-a", 32, &sizes, 4).unwrap();
     assert_eq!(a, a_again);
     assert!(a < 4);
 }
@@ -750,7 +789,9 @@ fn pick_shard_falls_back_to_other_shards_when_hash_target_full() {
     // A full hash-target shard must not hide free space on other existing
     // shards. Probe the remaining shards 0..shard_count before signaling
     // overflow.
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES};
+    use gitforgeops::secrets::bundle::{
+        pick_shard, CredentialBundle, ShardSizes, BUNDLE_SOFT_LIMIT_BYTES,
+    };
 
     // Build 4 shards. Fill the slot's hash-target with junk past the soft
     // limit; leave the others empty.
@@ -760,8 +801,7 @@ fn pick_shard_falls_back_to_other_shards_when_hash_target_full() {
 
     // Find which shard the hash points to (with empty shards, target is
     // selected purely by hash).
-    let empty: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
-    let target = pick_shard(slot, value_len, &empty, shard_count).unwrap();
+    let target = pick_shard(slot, value_len, &ShardSizes::default(), shard_count).unwrap();
 
     let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
     let stuffing: String = "x".repeat(BUNDLE_SOFT_LIMIT_BYTES);
@@ -770,7 +810,7 @@ fn pick_shard_falls_back_to_other_shards_when_hash_target_full() {
         .or_default()
         .insert("filler".to_string(), stuffing);
 
-    let chosen = pick_shard(slot, value_len, &shards, shard_count)
+    let chosen = pick_shard(slot, value_len, &ShardSizes::of(&shards), shard_count)
         .expect("must find capacity in another shard, not return None");
     assert_ne!(
         chosen, target,
@@ -784,7 +824,9 @@ fn pick_shard_returns_none_only_when_all_shards_full() {
     // Probing must NOT mask a genuinely-full state — the caller still
     // needs the None signal to grow shard_count. Fill every shard past
     // the soft limit and confirm pick_shard returns None.
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES};
+    use gitforgeops::secrets::bundle::{
+        pick_shard, CredentialBundle, ShardSizes, BUNDLE_SOFT_LIMIT_BYTES,
+    };
 
     let slot = "ferrum/app/another-cred";
     let value_len = 64;
@@ -799,7 +841,7 @@ fn pick_shard_returns_none_only_when_all_shards_full() {
     }
 
     assert!(
-        pick_shard(slot, value_len, &shards, shard_count).is_none(),
+        pick_shard(slot, value_len, &ShardSizes::of(&shards), shard_count).is_none(),
         "every shard is full; pick_shard must signal overflow with None"
     );
 }
@@ -872,7 +914,7 @@ fn report_secrets_does_not_mutate_config() {
     // placeholders in `desired` before serializing to disk — otherwise
     // resolved values would land in the committed YAML. `report_secrets`
     // is the non-mutating path that file mode uses.
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let mut cfg = GatewayConfig::default();
     let mut consumer = Consumer {
@@ -1348,7 +1390,8 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
     // Literal `/` inside a flat key is intentionally NOT supported here —
     // see slot_path's doc comment for the rationale (no CLI escape that
     // round-trips through escape_slot_component without double-escaping).
-    use gitforgeops::secrets::{report_secrets, slot_path};
+    use super::resolver_fixtures::report_secrets;
+    use gitforgeops::secrets::slot_path;
 
     fn config_with_credential(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
         let mut cfg = GatewayConfig::default();
@@ -1429,7 +1472,7 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
     // projected size accounts for earlier candidates in the same run. With
     // shard_count=1, every slot hashes to shard 0; without staging, phase 2
     // could serialize one oversized shard.
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle};
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, ShardSizes};
 
     // 600-byte values × ~80 candidates ≈ 48 KB → well over the 40 KB soft
     // limit on a single shard.
@@ -1439,11 +1482,11 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
     // Without staging: pick_shard against the same empty `shards` always
     // succeeds for shard 0, regardless of how many we've already planned.
     {
-        let shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+        let sizes = ShardSizes::default();
         let mut allowed_to_zero = 0usize;
         for i in 0..candidate_count {
             let slot = format!("ferrum/app/cred-{i}");
-            if pick_shard(&slot, value_len, &shards, 1) == Some(0) {
+            if pick_shard(&slot, value_len, &sizes, 1) == Some(0) {
                 allowed_to_zero += 1;
             }
         }
@@ -1458,16 +1501,14 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
     // None and the caller would grow shard_count.
     {
         let mut staged: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+        let mut sizes = ShardSizes::default();
         let mut admitted_to_zero = 0usize;
         let mut rejected = 0usize;
         for i in 0..candidate_count {
             let slot = format!("ferrum/app/cred-{i}");
-            match pick_shard(&slot, value_len, &staged, 1) {
+            match pick_shard(&slot, value_len, &sizes, 1) {
                 Some(0) => {
-                    staged
-                        .entry(0)
-                        .or_default()
-                        .insert(slot, "x".repeat(value_len));
+                    sizes.stage(&mut staged, 0, slot, "x".repeat(value_len));
                     admitted_to_zero += 1;
                 }
                 Some(other) => panic!("shard_count=1 must yield shard 0, got {other}"),
@@ -1479,6 +1520,30 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
             "staging must reject some candidates once shard 0 fills"
         );
         assert!(rejected > 0, "at least one candidate must be rejected");
+    }
+}
+
+#[test]
+fn staged_shard_sizes_match_serializing_the_staged_shards() {
+    // #694: allocation keeps a running size per shard instead of serializing
+    // the shard again for every slot it places. The running size must be the
+    // serialized length exactly: escaped characters, the separating commas
+    // and a replaced value included.
+    let mut shards: BTreeMap<u32, gitforgeops::secrets::CredentialBundle> = BTreeMap::new();
+    shards
+        .entry(1)
+        .or_default()
+        .insert("ferrum/seed/keyauth/key".to_string(), "seeded".to_string());
+    let mut sizes = ShardSizes::of(&shards);
+    for (shard, slot, value) in [
+        (0, "ferrum/a/keyauth/key", "plain-value"),
+        (0, "ferrum/b/keyauth/key", "quote\" and \\ backslash"),
+        (1, "ferrum/c/jwt/secret", "tab\tnew\nline \u{1}"),
+        (0, "ferrum/a/keyauth/key", "replaced-with-a-longer-value"),
+        (2, "ferrum/\u{e9}/keyauth/key", "caf\u{e9}"),
+    ] {
+        sizes.stage(&mut shards, shard, slot.to_string(), value.to_string());
+        assert_eq!(sizes, ShardSizes::of(&shards), "after staging {slot}");
     }
 }
 
@@ -1690,9 +1755,8 @@ fn assert_unknown_credential_diagnostic(diagnostic: &str, unknown: &str, suggest
 
 #[test]
 fn broker_refuses_unknown_credential_types_and_suggests_known_misspellings() {
-    use gitforgeops::secrets::{
-        report_secrets, report_secrets_lenient, validate_known_credential_types,
-    };
+    use super::resolver_fixtures::report_secrets;
+    use gitforgeops::secrets::{report_secrets_lenient, validate_known_credential_types};
 
     let mut seeded = consumer_with(
         "api_key",
@@ -1743,7 +1807,7 @@ fn object_and_array_credential_forms_derive_the_same_slot() {
     // `keyauth: [{key: "${...}"}]` — and must still derive
     // `ferrum/app/keyauth/key`, or every existing consumer's API key gets
     // regenerated and redelivered on the next apply.
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let object_form = consumer_with("keyauth", entry("key", REQUIRE));
     let array_form = consumer_with(
@@ -1773,7 +1837,7 @@ fn object_and_array_credential_forms_derive_the_same_slot() {
 fn second_array_entry_gets_an_indexed_slot() {
     // Index >= 1 appends `[N]`, so a consumer with two keyauth entries gets
     // two distinct slots rather than colliding on one.
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "keyauth",
@@ -1830,7 +1894,8 @@ fn slot_path_addresses_array_entries_from_the_cli() {
 fn slot_path_matches_walker_for_array_form_credentials() {
     // `gitforgeops rotate --credential keyauth/key` must find the slot the
     // walker emits for the canonical array form.
-    use gitforgeops::secrets::{report_secrets, slot_path};
+    use super::resolver_fixtures::report_secrets;
+    use gitforgeops::secrets::slot_path;
 
     let cfg = consumer_with(
         "keyauth",
@@ -1945,8 +2010,8 @@ fn redacted_sentinel_in_bundle_is_refused() {
 fn jwt_generate_with_undersized_len_is_rejected_at_resolve_time() {
     // jwt/hmac_auth secrets must be >= 32 chars. len=16 yields 22 base64url
     // characters, so it must fail at plan time — before any GitHub write.
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     for cred_type in ["jwt", "hmac_auth"] {
         let mut cfg = consumer_with(
@@ -1968,8 +2033,8 @@ fn jwt_generate_with_undersized_len_is_rejected_at_resolve_time() {
 
 #[test]
 fn jwt_generate_with_default_len_is_accepted() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     let mut cfg = consumer_with(
         "jwt",
@@ -1983,8 +2048,8 @@ fn jwt_generate_with_default_len_is_accepted() {
 fn keyauth_generate_with_small_len_is_still_allowed() {
     // The >= 32 char floor is jwt/hmac_auth only; keyauth just needs
     // non-empty and <= 4096.
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     let mut cfg = consumer_with(
         "keyauth",
@@ -1999,8 +2064,8 @@ fn already_allocated_undersized_jwt_slot_is_not_re_validated() {
     // The length check gates GENERATION. A slot that already has a value
     // resolves normally — we neither regenerate it nor block the apply on a
     // `len=` that is no longer used.
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     let mut cfg = consumer_with(
         "jwt",
@@ -2126,8 +2191,8 @@ fn generate_credential_value_respects_the_value_cap_and_sentinel() {
 fn basicauth_generate_is_rejected_in_file_mode() {
     // A file-mode ferrum-edge hard-rejects a plaintext password; only the
     // admin API hashes one on write.
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     let mut cfg = consumer_with(
         "basicauth",
@@ -2146,8 +2211,8 @@ fn basicauth_generate_is_rejected_in_file_mode() {
 
 #[test]
 fn basicauth_generate_is_allowed_in_api_mode() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     let mut cfg = consumer_with(
         "basicauth",
@@ -2163,8 +2228,8 @@ fn basicauth_generate_is_allowed_in_api_mode() {
 fn basicauth_password_hash_generate_is_rejected_in_every_mode() {
     // `hmac_sha256:<64 hex>` is computed with the gateway's server-side
     // secret. Random bytes are never a valid hash, api mode included.
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     for mode in [GatewayMode::Api, GatewayMode::File] {
         let mut cfg = consumer_with(
@@ -2185,8 +2250,8 @@ fn basicauth_password_hash_generate_is_rejected_in_every_mode() {
 fn basicauth_already_allocated_resolves_in_file_mode() {
     // The mode check only gates allocation. A file-mode repo that set its own
     // password_hash (or resolved a previously allocated password) is fine.
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     let mut cfg = consumer_with(
         "basicauth",
@@ -2210,7 +2275,8 @@ fn basicauth_already_allocated_resolves_in_file_mode() {
 /// reports it as a status instead of an error.
 #[test]
 fn lenient_report_does_not_fail_on_generation_constraints() {
-    use gitforgeops::secrets::{report_secrets, report_secrets_lenient};
+    use super::resolver_fixtures::report_secrets;
+    use gitforgeops::secrets::report_secrets_lenient;
 
     let cfg = consumer_with(
         "jwt",
@@ -2257,7 +2323,8 @@ fn lenient_report_still_fails_on_structural_errors() {
 
 #[test]
 fn lenient_and_strict_agree_when_no_constraint_is_violated() {
-    use gitforgeops::secrets::{report_secrets, report_secrets_lenient};
+    use super::resolver_fixtures::report_secrets;
+    use gitforgeops::secrets::report_secrets_lenient;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2436,7 +2503,7 @@ fn resolve_always_enforces_the_generation_constraint_the_lenient_report_skips() 
 /// with evidence (see the shrink test below).
 #[test]
 fn multi_entry_credential_array_warns_that_order_is_identity() {
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2471,7 +2538,7 @@ fn multi_entry_credential_array_warns_that_order_is_identity() {
 /// positional advisory fires.
 #[test]
 fn steady_multi_entry_credential_array_still_resolves() {
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2499,7 +2566,7 @@ fn steady_multi_entry_credential_array_still_resolves() {
 
 #[test]
 fn single_entry_credential_array_raises_no_warning() {
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2521,7 +2588,7 @@ fn single_entry_credential_array_raises_no_warning() {
 /// credential.
 #[test]
 fn shrunk_credential_array_refuses_the_orphaned_slot_remap() {
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2564,7 +2631,8 @@ fn shrunk_credential_array_refuses_the_orphaned_slot_remap() {
 /// hazard is still recorded and rendered — it is just no longer terminal.
 #[test]
 fn allowed_slot_remap_downgrades_the_shrink_refusal_to_a_report() {
-    use gitforgeops::secrets::{report_secrets_with_options, ResolveOptions};
+    use super::resolver_fixtures::report_secrets_with_options;
+    use gitforgeops::secrets::ResolveOptions;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2599,7 +2667,7 @@ fn allowed_slot_remap_downgrades_the_shrink_refusal_to_a_report() {
 /// mutating api-mode path cannot be laxer than the file-mode reporting one.
 #[test]
 fn resolve_secrets_refuses_the_same_shrink_report_secrets_refuses() {
-    use gitforgeops::secrets::resolve_secrets;
+    use super::resolver_fixtures::resolve_secrets;
 
     let mut cfg = consumer_with(
         "keyauth",
@@ -2625,7 +2693,7 @@ fn resolve_secrets_refuses_the_same_shrink_report_secrets_refuses() {
 /// positional advisory and nothing to remap.
 #[test]
 fn single_entry_placeholder_consumer_still_resolves() {
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2648,7 +2716,7 @@ fn single_entry_placeholder_consumer_still_resolves() {
 /// anything, so it stays non-fatal — the fence is evidence, not array length.
 #[test]
 fn shrink_without_a_stored_value_for_the_lost_index_is_not_fatal() {
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2662,7 +2730,7 @@ fn shrink_without_a_stored_value_for_the_lost_index_is_not_fatal() {
 
 #[test]
 fn matching_bundle_slots_raise_no_orphan_warning() {
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2698,7 +2766,8 @@ fn matching_bundle_slots_raise_no_orphan_warning() {
 /// documented sequence.
 #[test]
 fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
-    use gitforgeops::secrets::{report_secrets, slot_path};
+    use super::resolver_fixtures::report_secrets;
+    use gitforgeops::secrets::slot_path;
 
     let cfg = consumer_with(
         "keyauth",
@@ -2730,8 +2799,8 @@ fn slot_addressed_rotation_target_resolves_before_the_entry_is_removed() {
 /// required values and pending allocations stay unresolved (#364).
 #[test]
 fn unresolved_slots_follow_resolution_provenance_not_value_shape() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     const SEEDED: &str = "seeded-provenance-value";
     let mut cfg = consumer_with(
@@ -2881,9 +2950,9 @@ fn consumer_secret_bundle_values_that_are_placeholder_text_are_refused() {
 /// a placeholder remains a supplied value (#364, #379).
 #[test]
 fn ordinary_consumer_secrets_and_placeholder_shaped_plugin_seeds_resolve() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::schema::PluginConfig;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     const SECRET: &str = "q7Zr-P2vX-synthetic-random-secret-9KtM";
     let mut cfg = consumer_with("keyauth", serde_json::json!([entry("key", REQUIRE)]));
@@ -3197,12 +3266,18 @@ fn ledger_of(
     managed: &[(&str, &str)],
     coverage: gitforgeops::secrets::ConsumerCoverage,
 ) -> gitforgeops::secrets::ConsumerLedger {
-    gitforgeops::secrets::ConsumerLedger::new(
-        managed
-            .iter()
-            .map(|(namespace, id)| (namespace.to_string(), id.to_string())),
-        Vec::new(),
+    // A ledger recording exactly these Consumers and no allocations.
+    let mut state = gitforgeops::state::StateFile::default();
+    for (namespace, id) in managed {
+        state.resources.insert(
+            gitforgeops::diff::resource_diff::state_key(namespace, "Consumer", id),
+            "managed".to_string(),
+        );
+    }
+    gitforgeops::secrets::ConsumerLedger::from_state(
+        &state,
         coverage,
+        &gitforgeops::state::AllocationBinding::new(None, None),
     )
 }
 
@@ -4451,7 +4526,7 @@ fn seeded_plugin_endpoint_resolves_regardless_of_allocation_mode() {
 /// allocator never has to recover it by splitting the slot string apart.
 #[test]
 fn report_records_the_credential_type_structurally() {
-    use gitforgeops::secrets::report_secrets;
+    use super::resolver_fixtures::report_secrets;
 
     let cfg = consumer_with(
         "hmac_auth",
@@ -4481,9 +4556,9 @@ fn explicit_credential_type_must_agree_with_the_slot() {
 
 #[test]
 fn resolver_and_allocator_share_generation_verdicts_in_both_modes() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
     use gitforgeops::secrets::allocator::generate_credential_value_with_mode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     for mode in [GatewayMode::Api, GatewayMode::File] {
         for (kind, leaf, length, allowed) in [
@@ -4684,8 +4759,9 @@ fn unclassifiable_slot_is_a_hard_error_not_a_silent_skip() {
 /// the same function, so they cannot disagree about where the floor sits.
 #[test]
 fn plan_time_and_generate_time_minimum_checks_agree() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::{generate_credential_value, resolve_secrets_with_mode};
+    use gitforgeops::secrets::generate_credential_value;
 
     for len in [16usize, 23, 24, 32] {
         let mut cfg = consumer_with(
@@ -4712,7 +4788,7 @@ fn plan_time_and_generate_time_minimum_checks_agree() {
 #[test]
 fn reserve_shard_refuses_to_create_a_shard_past_the_ceiling() {
     use gitforgeops::secrets::bundle::{
-        reserve_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
+        reserve_shard, CredentialBundle, ShardSizes, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
     };
 
     let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
@@ -4728,6 +4804,7 @@ fn reserve_shard_refuses_to_create_a_shard_past_the_ceiling() {
         "ferrum/app/keyauth/key",
         64,
         &shards,
+        &ShardSizes::of(&shards),
         &mut shard_count,
         "allocating",
     )
@@ -4762,7 +4839,7 @@ fn reserve_shard_refuses_to_create_a_shard_past_the_ceiling() {
 #[test]
 fn reserve_shard_grows_up_to_the_ceiling() {
     use gitforgeops::secrets::bundle::{
-        reserve_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
+        reserve_shard, CredentialBundle, ShardSizes, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
     };
 
     let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
@@ -4776,6 +4853,7 @@ fn reserve_shard_grows_up_to_the_ceiling() {
         "ferrum/app/keyauth/key",
         64,
         &shards,
+        &ShardSizes::of(&shards),
         &mut shard_count,
         "allocating",
     )
@@ -4790,7 +4868,7 @@ fn reserve_shard_grows_up_to_the_ceiling() {
 /// the old one, which `merge_bundles` would then prefer.
 #[test]
 fn reserve_shard_keeps_a_slot_on_its_existing_shard() {
-    use gitforgeops::secrets::bundle::{reserve_shard, CredentialBundle};
+    use gitforgeops::secrets::bundle::{reserve_shard, CredentialBundle, ShardSizes};
 
     let slot = "ferrum/app/keyauth/key";
     let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
@@ -4800,7 +4878,8 @@ fn reserve_shard_keeps_a_slot_on_its_existing_shard() {
         .insert(slot.to_string(), "old-value".to_string());
 
     let mut shard_count = 8;
-    let shard = reserve_shard(slot, 64, &shards, &mut shard_count, "rotating")
+    let sizes = ShardSizes::of(&shards);
+    let shard = reserve_shard(slot, 64, &shards, &sizes, &mut shard_count, "rotating")
         .expect("an already-placed slot always resolves");
     assert_eq!(shard, 3);
     assert_eq!(shard_count, 8, "an existing slot must not grow the layout");
@@ -4810,12 +4889,12 @@ fn reserve_shard_keeps_a_slot_on_its_existing_shard() {
 /// slots onto a shard the workflows no longer bind.
 #[test]
 fn pick_shard_never_targets_an_unbound_shard_index() {
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, MAX_BUNDLE_SHARDS};
+    use gitforgeops::secrets::bundle::{pick_shard, ShardSizes, MAX_BUNDLE_SHARDS};
 
-    let shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    let sizes = ShardSizes::default();
     for n in 0..64 {
         let slot = format!("ferrum/app-{n}/keyauth/key");
-        let chosen = pick_shard(&slot, 64, &shards, 100).expect("empty shards always have room");
+        let chosen = pick_shard(&slot, 64, &sizes, 100).expect("empty shards always have room");
         assert!(
             chosen < MAX_BUNDLE_SHARDS,
             "slot {slot} landed on unbound shard {chosen}"
@@ -4922,10 +5001,9 @@ fn import_capture_brokers_the_consul_token_and_keeps_discovery_identity_readable
 /// value import captured, from the same slot.
 #[test]
 fn consul_token_placeholder_resolves_from_the_captured_slot() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::{
-        capture_and_redact_import_service_discovery_secrets, resolve_secrets_with_mode, SlotStatus,
-    };
+    use gitforgeops::secrets::{capture_and_redact_import_service_discovery_secrets, SlotStatus};
 
     let mut imported = config_with_consul_token(Some("SYNTHETIC-AUDIT-TOKEN"));
     let bundle = capture_and_redact_import_service_discovery_secrets(&mut imported).unwrap();
@@ -4957,8 +5035,9 @@ fn consul_token_placeholder_resolves_from_the_captured_slot() {
 /// placeholder for the gateway to receive.
 #[test]
 fn missing_consul_token_slot_is_reported_as_missing_required() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::{resolve_secrets_with_mode, SlotStatus};
+    use gitforgeops::secrets::SlotStatus;
 
     let mut cfg = config_with_consul_token(Some(REQUIRE));
     let report = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api).unwrap();
@@ -4973,8 +5052,8 @@ fn missing_consul_token_slot_is_reported_as_missing_required() {
 /// GitHub Environment Secret holding a value that can never authenticate.
 #[test]
 fn consul_token_refuses_generation() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::resolve_secrets_with_mode;
 
     let mut cfg = config_with_consul_token(Some(GENERATE));
     let err = resolve_secrets_with_mode(&mut cfg, &BTreeMap::new(), GatewayMode::Api)
@@ -4990,8 +5069,9 @@ fn consul_token_refuses_generation() {
 /// refusal above is about *allocating*, not about reading.
 #[test]
 fn seeded_consul_token_resolves_even_under_alloc_generate() {
+    use super::resolver_fixtures::resolve_secrets_with_mode;
     use gitforgeops::config::GatewayMode;
-    use gitforgeops::secrets::{resolve_secrets_with_mode, SlotStatus};
+    use gitforgeops::secrets::SlotStatus;
 
     let mut cfg = config_with_consul_token(Some(GENERATE));
     let bundle = BTreeMap::from([(CONSUL_TOKEN_SLOT.to_string(), "seeded-token".to_string())]);

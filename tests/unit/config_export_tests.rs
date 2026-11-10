@@ -221,7 +221,7 @@ fn a_count_seal_that_disagrees_is_advisory() {
 fn declared_secrets_are_not_reported_as_drift_and_are_listed_as_uncompared() {
     let desired = desired();
     let export = export_with('a', 'b', KEY_ID);
-    let view = export.live_view(&desired).unwrap();
+    let view = export.live_view_with(&desired, &desired).unwrap();
 
     let consumer = &view.actual.consumers[0];
     let keyauth = &consumer.credentials["keyauth"];
@@ -255,7 +255,7 @@ fn a_fingerprint_the_repository_does_not_declare_is_still_drift() {
     let plugins = json!([live_plugin(&fp('e'), "http")]);
     let body = document("ferrum", KEY_ID, consumers, plugins).to_string();
     let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
-    let view = export.live_view(&desired).unwrap();
+    let view = export.live_view_with(&desired, &desired).unwrap();
 
     let consumer = &view.actual.consumers[0];
     assert_eq!(consumer.credentials["keyauth"][1]["key"], json!(fp('c')));
@@ -279,7 +279,7 @@ fn a_fingerprint_shaped_value_in_a_non_secret_field_is_compared() {
     let plugins = json!([live_plugin(&fp('e'), &fp('9'))]);
     let body = document("ferrum", KEY_ID, consumers, plugins).to_string();
     let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
-    let view = export.live_view(&desired).unwrap();
+    let view = export.live_view_with(&desired, &desired).unwrap();
 
     let plugin = &view.actual.plugin_configs[0];
     assert_eq!(plugin.config["protocol"], json!(fp('9')));
@@ -301,7 +301,9 @@ fn a_resolved_secret_at_a_modeled_path_is_still_uncompared() {
     let consumer = &mut desired.consumers[0];
     let key = json!([{ "key": "resolved-key-value-0001" }]);
     consumer.credentials.insert("keyauth".to_string(), key);
-    let view = export_with('a', 'b', KEY_ID).live_view(&desired).unwrap();
+    let view = export_with('a', 'b', KEY_ID)
+        .live_view_with(&desired, &desired)
+        .unwrap();
     let keyauth = &view.actual.consumers[0].credentials["keyauth"];
     assert_eq!(keyauth, &json!([{ "key": "resolved-key-value-0001" }]));
 }
@@ -318,7 +320,7 @@ fn every_declared_consumer_leaves_its_hidden_credentials_uncompared() {
     consumer["credentials"] = json!({});
     let body = document("ferrum", KEY_ID, json!([consumer]), json!([])).to_string();
     let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
-    let view = export.live_view(&desired).unwrap();
+    let view = export.live_view_with(&desired, &desired).unwrap();
 
     assert_eq!(view.uncompared.len(), 1);
     let site = &view.uncompared[0];
@@ -350,7 +352,7 @@ fn a_consumer_exported_without_its_hidden_fingerprint_is_never_verified() {
     let plugins = json!([live_plugin(&fp('e'), "grpc")]);
     let body = document("ferrum", KEY_ID, json!([consumer]), plugins).to_string();
     let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
-    let view = export.live_view(&desired).unwrap();
+    let view = export.live_view_with(&desired, &desired).unwrap();
     // The key, the hidden credentials (recorded although absent) and the token.
     assert_eq!(view.uncompared.len(), 3);
     let site = &view.uncompared[1];
@@ -418,7 +420,7 @@ fn a_placeholder_stays_secret_bearing_after_the_bundle_resolves_it() {
     let body = document("ferrum", KEY_ID, json!([]), json!([plugin])).to_string();
     let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
 
-    let without_source = export.live_view(&resolved).unwrap();
+    let without_source = export.live_view_with(&resolved, &resolved).unwrap();
     assert!(without_source.uncompared.is_empty());
 
     let view = export.live_view_with(&resolved, &unresolved).unwrap();
@@ -523,7 +525,7 @@ fn edge_0_9_19_redacted_plugin_values_are_not_false_drift() {
         }
         let body = document("ferrum", KEY_ID, json!([]), json!([live])).to_string();
         let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
-        let view = export.live_view(&desired).unwrap();
+        let view = export.live_view_with(&desired, &desired).unwrap();
 
         let mut uncompared: Vec<&str> = view
             .uncompared
@@ -554,7 +556,7 @@ fn a_whole_value_fingerprinted_around_a_secret_is_never_authoritative() {
     plugin["config"] = json!({ "headers": fp('c') });
     let body = document("ferrum", KEY_ID, json!([]), json!([plugin])).to_string();
     let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
-    let view = export.live_view(&desired).unwrap();
+    let view = export.live_view_with(&desired, &desired).unwrap();
 
     assert_eq!(view.masked_ancestors.len(), 1);
     assert_eq!(view.masked_ancestors[0].pointer, "/config/headers");
@@ -721,7 +723,11 @@ fn a_baseline_round_trips_through_a_file_and_rejects_malformed_input() {
 fn the_summary_is_unverified_without_a_complete_baseline() {
     let desired = desired();
     let export = export_with('a', 'b', KEY_ID);
-    let uncompared = export.live_view(&desired).unwrap().uncompared.len();
+    let uncompared = export
+        .live_view_with(&desired, &desired)
+        .unwrap()
+        .uncompared
+        .len();
     let exports = [export];
 
     let none = SecretFingerprintSummary::evaluate(&exports, uncompared, None, &desired);

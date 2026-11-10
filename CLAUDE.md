@@ -97,10 +97,12 @@ cargo fmt --all && cargo fmt --all -- --check
   toolchain/lint config, `Dockerfile`) or a non-Rust file the unit suite reads
   or the binary embeds (`docs/quickstart.md`, `.gitforgeops/*.example.yaml`,
   `.github/scripts/audit_settings.py`, `contracts/`,
-  `.github/ferrum-edge-checksums.txt`, `apply-on-merge.yml`,
+  `.github/ferrum-edge-checksums.txt`, `apply-on-merge.yml`, `rotate.yml`,
   `trusted-pr-review.yml`).
 - Unit tests never read the customer-owned `resources/` tree. Shipped-example
-  checks use `tests/fixtures/shipped-examples/`.
+  checks use `tests/fixtures/shipped-examples/`; upstream,
+  `test_shipped_examples.py` keeps those copies byte-equal to
+  `resources/*/*/_example.yaml`, so edit both together.
 - Resource-only PRs skip the Rust steps and run secretless `validate-pr.yml`.
 - `alloy-consumer.yml` is **not** required: it builds the pinned external Alloy
   producer and runs the ignored consumer test on PRs touching the consumer
@@ -641,7 +643,7 @@ which the export lacks.
 
 - Fingerprints (`hmac-sha256:<64 hex>`) are keyed from the gateway's primary
   admin secret; a viewer cannot compute the repository value's fingerprint, and
-  this build does not try. `ConfigExport::live_view` substitutes the declared
+  this build does not try. `ConfigExport::live_view_with` substitutes the declared
   value only at a fingerprinted pointer that is secret-bearing in the repo
   (placeholder, URL userinfo, Consumer key/secret, classified plugin path,
   Consul token, or an ancestor of one; Edge publishes no redacted-pointer
@@ -1491,7 +1493,9 @@ gateway, as `Vec<ApplyBlocker>` over eleven `BlockerKind`s:
   class (provisioning, narrowed or colliding publication, smoke checks, probe
   allowlist) from the same `apply_blockers` result with its remedy, so it
   blocks whenever one of them would fail the flag. The flag changes only the
-  exit code.
+  exit code. Without a credential bundle the verdict cannot decide
+  `alloc=require` slots ("bundle unavailable"), so `review` drops
+  `RequiredCredentials` from the flag's gate too; `plan` and `apply` keep it.
 - `cmd_apply` calls the *same per-class predicates* (`security_blocker`,
   `policy_blocker`, `required_credentials_blocker`, `validation_blocker`,
   `credential_provisioning_blockers`) at its own gate points, because order

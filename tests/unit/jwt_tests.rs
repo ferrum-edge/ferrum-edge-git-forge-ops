@@ -1,8 +1,13 @@
 use base64::Engine as _;
 use gitforgeops::config::env::EnvConfig;
-use gitforgeops::jwt::{mint_jwt, JwtOptions};
+use gitforgeops::jwt::{mint_jwt_at, JwtOptions};
 
 const SECRET: &str = "test-secret-key-that-is-at-least-32-chars-long";
+
+/// The token the admin client mints now.
+fn mint_jwt(secret: &str, options: &JwtOptions) -> gitforgeops::error::Result<String> {
+    mint_jwt_at(secret, options, chrono::Utc::now().timestamp()).map(|minted| minted.token)
+}
 
 fn payload_of(token: &str) -> serde_json::Value {
     let parts: Vec<&str> = token.split('.').collect();

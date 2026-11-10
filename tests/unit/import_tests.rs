@@ -773,7 +773,7 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
 
     let resources = gitforgeops::config::load_resources(&output).unwrap();
     let mut assembled = gitforgeops::config::assemble(resources).unwrap().gateway;
-    gitforgeops::secrets::resolve_secrets_with_mode(
+    super::resolver_fixtures::resolve_secrets_with_mode(
         &mut assembled,
         &merged,
         gitforgeops::config::env::GatewayMode::Api,
@@ -877,7 +877,7 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
 
     let resources = gitforgeops::config::load_resources(&output).unwrap();
     let mut assembled = gitforgeops::config::assemble(resources).unwrap().gateway;
-    gitforgeops::secrets::resolve_secrets_with_mode(
+    super::resolver_fixtures::resolve_secrets_with_mode(
         &mut assembled,
         &merged,
         gitforgeops::config::env::GatewayMode::Api,
@@ -1626,7 +1626,7 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
     split_config(&config, tmp.path()).unwrap();
     let resources = gitforgeops::config::load_resources(tmp.path()).unwrap();
     let assembled = gitforgeops::config::assemble(resources).unwrap();
-    let report = gitforgeops::secrets::report_secrets(
+    let report = super::resolver_fixtures::report_secrets(
         &assembled.gateway,
         &std::collections::BTreeMap::new(),
     )
@@ -1666,7 +1666,7 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
         ),
     ]);
     let mut round_tripped = assembled.gateway;
-    gitforgeops::secrets::resolve_secrets_with_mode(
+    super::resolver_fixtures::resolve_secrets_with_mode(
         &mut round_tripped,
         &bundle,
         gitforgeops::config::env::GatewayMode::Api,
@@ -2172,7 +2172,7 @@ fn imported_consul_token_resolves_from_the_migration_bundle() {
     let (merged, _) = gitforgeops::secrets::load_bundles_from_env(&raw_bundle).unwrap();
     let resources = gitforgeops::config::load_resources(&output).unwrap();
     let mut assembled = gitforgeops::config::assemble(resources).unwrap().gateway;
-    gitforgeops::secrets::resolve_secrets_with_mode(
+    super::resolver_fixtures::resolve_secrets_with_mode(
         &mut assembled,
         &merged,
         gitforgeops::config::GatewayMode::Api,
