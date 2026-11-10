@@ -384,20 +384,11 @@ STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 # One reviewed pin per Dependabot bump: allow the new pin alongside the current
 # one before switching the workflow, then retire the previous pin in a
-# follow-up PR. v2.88.1 remains accepted while #680 moves the workflows to
-# v2.90.2; v2.87.29 and v2.87.30 are still listed until a follow-up retires
-# them, and the older v2.87.27 pin was retired in #604.
+# follow-up PR. Only v2.90.2, the pin both workflows use, is accepted; v2.88.1,
+# v2.87.30 and v2.87.29 were retired once #680 moved the workflows to it, and
+# v2.87.27 in #604.
 CARGO_AUDIT_ACTIONS = frozenset(
     {
-        # v2.87.29 changes other tool manifests; action source and the
-        # cargo-audit manifest are unchanged from v2.87.27.
-        "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",
-        # v2.87.30 changes other tool manifests; action source and the
-        # cargo-audit manifest remain unchanged.
-        "taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177",
-        # v2.88.1 changes other tool manifests and adds similarity-rs; action
-        # source and the cargo-audit manifest remain unchanged.
-        "taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68",
         # v2.90.2 adds mold and yq manifests, refreshes jq/curl bootstrap
         # checksums in main.sh and adds a `fallback: skip` mode the workflows
         # do not use; the cargo-audit and cargo-llvm-cov manifests are unchanged.
