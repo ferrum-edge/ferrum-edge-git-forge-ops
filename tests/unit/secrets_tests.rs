@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::resolver_fixtures::resolve_secrets;
 use gitforgeops::config::schema::{Consumer, GatewayConfig};
 use gitforgeops::secrets::{
-    bundle::{pick_shard, shard_secret_name},
+    bundle::{pick_shard, shard_secret_name, ShardSizes},
     load_bundles_from_env, parse_placeholder, slot_path, PlaceholderAlloc, SlotStatus,
 };
 
@@ -109,6 +109,37 @@ fn builtin_unbrokered_heuristic_matches_stay_sensitive_to_the_scrubber() {
         "[REDACTED] [REDACTED] visible-setting"
     );
 }
+#[test]
+fn the_longest_secret_wins_where_two_secrets_overlap() {
+    // #694: scrubbing claims each needle's occurrences longest first, so a
+    // shorter secret that starts earlier but overlaps a longer one never
+    // splits it and leaves the longer secret's tail behind.
+    let gateway: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "builtin",
+            "plugin_name": "a2a_gateway",
+            "scope": "global",
+            "config": {
+                "signing_key": "synthetic-overlap-long-tail-material",
+                "api_key": "lead-synthetic-overlap",
+                "mode": "visible-setting"
+            }
+        }]
+    }))
+    .unwrap();
+    let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+    assert_eq!(
+        scrubber.scrub("x lead-synthetic-overlap-long-tail-material y"),
+        "x lead-[REDACTED] y"
+    );
+    assert_eq!(
+        scrubber.scrub("lead-synthetic-overlap, synthetic-overlap-long-tail-material"),
+        "[REDACTED], [REDACTED]"
+    );
+    assert_eq!(scrubber.scrub("visible-setting"), "visible-setting");
+}
+
 /// One plugin per path Ferrum Edge v0.9.19's `plugin_config_projection` added
 /// to its redaction schema, each value long enough to be scrubbed, with the
 /// broker slot import must capture it under.
@@ -710,7 +741,7 @@ fn existing_slot_stays_on_its_current_shard() {
     // regardless of how shard_count has grown. pick_shard alone wouldn't
     // guarantee this; allocate_and_deliver now consults the per-shard map
     // first. This test covers the bookkeeping directly.
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle};
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, ShardSizes};
 
     let slot = "ferrum/app/api_key";
 
@@ -734,15 +765,21 @@ fn existing_slot_stays_on_its_current_shard() {
     assert_eq!(existing, Some(0));
 
     // Sanity: pick_shard is still deterministic for new slots.
-    let fresh = pick_shard("ferrum/other/cred", 32, &shards, shard_count).unwrap();
+    let fresh = pick_shard(
+        "ferrum/other/cred",
+        32,
+        &ShardSizes::of(&shards),
+        shard_count,
+    )
+    .unwrap();
     assert!(fresh < shard_count);
 }
 
 #[test]
 fn pick_shard_is_deterministic_and_within_bounds() {
-    let shards = BTreeMap::new();
-    let a = pick_shard("slot-a", 32, &shards, 4).unwrap();
-    let a_again = pick_shard("slot-a", 32, &shards, 4).unwrap();
+    let sizes = ShardSizes::default();
+    let a = pick_shard("slot-a", 32, &sizes, 4).unwrap();
+    let a_again = pick_shard("slot-a", 32, &sizes, 4).unwrap();
     assert_eq!(a, a_again);
     assert!(a < 4);
 }
@@ -752,7 +789,9 @@ fn pick_shard_falls_back_to_other_shards_when_hash_target_full() {
     // A full hash-target shard must not hide free space on other existing
     // shards. Probe the remaining shards 0..shard_count before signaling
     // overflow.
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES};
+    use gitforgeops::secrets::bundle::{
+        pick_shard, CredentialBundle, ShardSizes, BUNDLE_SOFT_LIMIT_BYTES,
+    };
 
     // Build 4 shards. Fill the slot's hash-target with junk past the soft
     // limit; leave the others empty.
@@ -762,8 +801,7 @@ fn pick_shard_falls_back_to_other_shards_when_hash_target_full() {
 
     // Find which shard the hash points to (with empty shards, target is
     // selected purely by hash).
-    let empty: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
-    let target = pick_shard(slot, value_len, &empty, shard_count).unwrap();
+    let target = pick_shard(slot, value_len, &ShardSizes::default(), shard_count).unwrap();
 
     let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
     let stuffing: String = "x".repeat(BUNDLE_SOFT_LIMIT_BYTES);
@@ -772,7 +810,7 @@ fn pick_shard_falls_back_to_other_shards_when_hash_target_full() {
         .or_default()
         .insert("filler".to_string(), stuffing);
 
-    let chosen = pick_shard(slot, value_len, &shards, shard_count)
+    let chosen = pick_shard(slot, value_len, &ShardSizes::of(&shards), shard_count)
         .expect("must find capacity in another shard, not return None");
     assert_ne!(
         chosen, target,
@@ -786,7 +824,9 @@ fn pick_shard_returns_none_only_when_all_shards_full() {
     // Probing must NOT mask a genuinely-full state — the caller still
     // needs the None signal to grow shard_count. Fill every shard past
     // the soft limit and confirm pick_shard returns None.
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES};
+    use gitforgeops::secrets::bundle::{
+        pick_shard, CredentialBundle, ShardSizes, BUNDLE_SOFT_LIMIT_BYTES,
+    };
 
     let slot = "ferrum/app/another-cred";
     let value_len = 64;
@@ -801,7 +841,7 @@ fn pick_shard_returns_none_only_when_all_shards_full() {
     }
 
     assert!(
-        pick_shard(slot, value_len, &shards, shard_count).is_none(),
+        pick_shard(slot, value_len, &ShardSizes::of(&shards), shard_count).is_none(),
         "every shard is full; pick_shard must signal overflow with None"
     );
 }
@@ -1432,7 +1472,7 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
     // projected size accounts for earlier candidates in the same run. With
     // shard_count=1, every slot hashes to shard 0; without staging, phase 2
     // could serialize one oversized shard.
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle};
+    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, ShardSizes};
 
     // 600-byte values × ~80 candidates ≈ 48 KB → well over the 40 KB soft
     // limit on a single shard.
@@ -1442,11 +1482,11 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
     // Without staging: pick_shard against the same empty `shards` always
     // succeeds for shard 0, regardless of how many we've already planned.
     {
-        let shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+        let sizes = ShardSizes::default();
         let mut allowed_to_zero = 0usize;
         for i in 0..candidate_count {
             let slot = format!("ferrum/app/cred-{i}");
-            if pick_shard(&slot, value_len, &shards, 1) == Some(0) {
+            if pick_shard(&slot, value_len, &sizes, 1) == Some(0) {
                 allowed_to_zero += 1;
             }
         }
@@ -1461,16 +1501,14 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
     // None and the caller would grow shard_count.
     {
         let mut staged: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+        let mut sizes = ShardSizes::default();
         let mut admitted_to_zero = 0usize;
         let mut rejected = 0usize;
         for i in 0..candidate_count {
             let slot = format!("ferrum/app/cred-{i}");
-            match pick_shard(&slot, value_len, &staged, 1) {
+            match pick_shard(&slot, value_len, &sizes, 1) {
                 Some(0) => {
-                    staged
-                        .entry(0)
-                        .or_default()
-                        .insert(slot, "x".repeat(value_len));
+                    sizes.stage(&mut staged, 0, slot, "x".repeat(value_len));
                     admitted_to_zero += 1;
                 }
                 Some(other) => panic!("shard_count=1 must yield shard 0, got {other}"),
@@ -1482,6 +1520,30 @@ fn pick_shard_with_staging_prevents_oversized_shard_in_batch() {
             "staging must reject some candidates once shard 0 fills"
         );
         assert!(rejected > 0, "at least one candidate must be rejected");
+    }
+}
+
+#[test]
+fn staged_shard_sizes_match_serializing_the_staged_shards() {
+    // #694: allocation keeps a running size per shard instead of serializing
+    // the shard again for every slot it places. The running size must be the
+    // serialized length exactly: escaped characters, the separating commas
+    // and a replaced value included.
+    let mut shards: BTreeMap<u32, gitforgeops::secrets::CredentialBundle> = BTreeMap::new();
+    shards
+        .entry(1)
+        .or_default()
+        .insert("ferrum/seed/keyauth/key".to_string(), "seeded".to_string());
+    let mut sizes = ShardSizes::of(&shards);
+    for (shard, slot, value) in [
+        (0, "ferrum/a/keyauth/key", "plain-value"),
+        (0, "ferrum/b/keyauth/key", "quote\" and \\ backslash"),
+        (1, "ferrum/c/jwt/secret", "tab\tnew\nline \u{1}"),
+        (0, "ferrum/a/keyauth/key", "replaced-with-a-longer-value"),
+        (2, "ferrum/\u{e9}/keyauth/key", "caf\u{e9}"),
+    ] {
+        sizes.stage(&mut shards, shard, slot.to_string(), value.to_string());
+        assert_eq!(sizes, ShardSizes::of(&shards), "after staging {slot}");
     }
 }
 
@@ -4726,7 +4788,7 @@ fn plan_time_and_generate_time_minimum_checks_agree() {
 #[test]
 fn reserve_shard_refuses_to_create_a_shard_past_the_ceiling() {
     use gitforgeops::secrets::bundle::{
-        reserve_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
+        reserve_shard, CredentialBundle, ShardSizes, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
     };
 
     let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
@@ -4742,6 +4804,7 @@ fn reserve_shard_refuses_to_create_a_shard_past_the_ceiling() {
         "ferrum/app/keyauth/key",
         64,
         &shards,
+        &ShardSizes::of(&shards),
         &mut shard_count,
         "allocating",
     )
@@ -4776,7 +4839,7 @@ fn reserve_shard_refuses_to_create_a_shard_past_the_ceiling() {
 #[test]
 fn reserve_shard_grows_up_to_the_ceiling() {
     use gitforgeops::secrets::bundle::{
-        reserve_shard, CredentialBundle, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
+        reserve_shard, CredentialBundle, ShardSizes, BUNDLE_SOFT_LIMIT_BYTES, MAX_BUNDLE_SHARDS,
     };
 
     let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
@@ -4790,6 +4853,7 @@ fn reserve_shard_grows_up_to_the_ceiling() {
         "ferrum/app/keyauth/key",
         64,
         &shards,
+        &ShardSizes::of(&shards),
         &mut shard_count,
         "allocating",
     )
@@ -4804,7 +4868,7 @@ fn reserve_shard_grows_up_to_the_ceiling() {
 /// the old one, which `merge_bundles` would then prefer.
 #[test]
 fn reserve_shard_keeps_a_slot_on_its_existing_shard() {
-    use gitforgeops::secrets::bundle::{reserve_shard, CredentialBundle};
+    use gitforgeops::secrets::bundle::{reserve_shard, CredentialBundle, ShardSizes};
 
     let slot = "ferrum/app/keyauth/key";
     let mut shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
@@ -4814,7 +4878,8 @@ fn reserve_shard_keeps_a_slot_on_its_existing_shard() {
         .insert(slot.to_string(), "old-value".to_string());
 
     let mut shard_count = 8;
-    let shard = reserve_shard(slot, 64, &shards, &mut shard_count, "rotating")
+    let sizes = ShardSizes::of(&shards);
+    let shard = reserve_shard(slot, 64, &shards, &sizes, &mut shard_count, "rotating")
         .expect("an already-placed slot always resolves");
     assert_eq!(shard, 3);
     assert_eq!(shard_count, 8, "an existing slot must not grow the layout");
@@ -4824,12 +4889,12 @@ fn reserve_shard_keeps_a_slot_on_its_existing_shard() {
 /// slots onto a shard the workflows no longer bind.
 #[test]
 fn pick_shard_never_targets_an_unbound_shard_index() {
-    use gitforgeops::secrets::bundle::{pick_shard, CredentialBundle, MAX_BUNDLE_SHARDS};
+    use gitforgeops::secrets::bundle::{pick_shard, ShardSizes, MAX_BUNDLE_SHARDS};
 
-    let shards: BTreeMap<u32, CredentialBundle> = BTreeMap::new();
+    let sizes = ShardSizes::default();
     for n in 0..64 {
         let slot = format!("ferrum/app-{n}/keyauth/key");
-        let chosen = pick_shard(&slot, 64, &shards, 100).expect("empty shards always have room");
+        let chosen = pick_shard(&slot, 64, &sizes, 100).expect("empty shards always have room");
         assert!(
             chosen < MAX_BUNDLE_SHARDS,
             "slot {slot} landed on unbound shard {chosen}"

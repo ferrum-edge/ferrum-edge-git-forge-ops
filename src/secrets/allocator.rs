@@ -7,7 +7,7 @@ use reqwest::Client;
 use crate::config::GatewayMode;
 
 use super::bundle::{
-    merge_bundles, reserve_shard, serialize_bundle, shard_secret_name, CredentialBundle,
+    merge_bundles, reserve_shard, serialize_bundle, shard_secret_name, CredentialBundle, ShardSizes,
 };
 use super::delivery::{discover_recipient_at, DeliveryResult};
 use super::github_api::{fetch_public_key_at, put_environment_secret_at, DEFAULT_GITHUB_API_BASE};
@@ -173,6 +173,7 @@ pub async fn allocate_and_deliver_at(
     }
     let mut planned: Vec<Planned> = Vec::new();
     let mut staged: BTreeMap<u32, CredentialBundle> = shards.clone();
+    let mut staged_sizes = ShardSizes::of(&staged);
 
     for candidate in candidates {
         // Fails before any GitHub write, so a `len=` that violates the
@@ -200,6 +201,7 @@ pub async fn allocate_and_deliver_at(
             &candidate.slot,
             value.len(),
             &staged,
+            &staged_sizes,
             shard_count,
             "allocating",
         )
@@ -207,10 +209,7 @@ pub async fn allocate_and_deliver_at(
 
         // Reserve in `staged` before discovering any recipient keys, so
         // every slot's capacity check also completes without network I/O.
-        staged
-            .entry(shard)
-            .or_default()
-            .insert(candidate.slot.clone(), value.clone());
+        staged_sizes.stage(&mut staged, shard, candidate.slot.clone(), value.clone());
 
         planned.push(Planned {
             slot: candidate.slot.clone(),
@@ -377,7 +376,8 @@ pub async fn rotate_and_deliver_at(
         .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
 
     // Capacity and serialization refusals also precede key discovery.
-    let target_shard = reserve_shard(slot, value.len(), shards, shard_count, "rotating")
+    let sizes = ShardSizes::of(shards);
+    let target_shard = reserve_shard(slot, value.len(), shards, &sizes, shard_count, "rotating")
         .map_err(|source| AllocationFailure::with_partial(source, partial.clone()))?;
     let mut staged_bundle = shards.get(&target_shard).cloned().unwrap_or_default();
     staged_bundle.insert(slot.to_string(), value.clone());

@@ -551,7 +551,7 @@ pub fn write_bundle_handoff(
 pub fn pick_shard(
     slot: &str,
     value_len: usize,
-    shards: &BTreeMap<u32, CredentialBundle>,
+    sizes: &ShardSizes,
     shard_count: u32,
 ) -> Option<u32> {
     if shard_count == 0 {
@@ -564,7 +564,7 @@ pub fn pick_shard(
     let first_8 = u64::from_be_bytes(digest[0..8].try_into().unwrap_or_default());
     let target = (first_8 % addressable as u64) as u32;
 
-    if projected_shard_size(slot, value_len, shards, target) <= BUNDLE_SOFT_LIMIT_BYTES {
+    if projected_shard_size(slot, value_len, sizes, target) <= BUNDLE_SOFT_LIMIT_BYTES {
         return Some(target);
     }
 
@@ -576,7 +576,7 @@ pub fn pick_shard(
         if s == target {
             continue;
         }
-        if projected_shard_size(slot, value_len, shards, s) <= BUNDLE_SOFT_LIMIT_BYTES {
+        if projected_shard_size(slot, value_len, sizes, s) <= BUNDLE_SOFT_LIMIT_BYTES {
             return Some(s);
         }
     }
@@ -601,6 +601,7 @@ pub fn reserve_shard(
     slot: &str,
     value_len: usize,
     shards: &BTreeMap<u32, CredentialBundle>,
+    sizes: &ShardSizes,
     shard_count: &mut u32,
     operation: &str,
 ) -> crate::error::Result<u32> {
@@ -614,7 +615,7 @@ pub fn reserve_shard(
         if *shard_count == 0 {
             *shard_count = 1;
         }
-        if let Some(index) = pick_shard(slot, value_len, shards, *shard_count) {
+        if let Some(index) = pick_shard(slot, value_len, sizes, *shard_count) {
             return Ok(index);
         }
         if *shard_count >= MAX_BUNDLE_SHARDS {
@@ -640,16 +641,57 @@ pub(crate) fn shard_ceiling_error(slot: &str, operation: &str) -> crate::error::
     ))
 }
 
-fn projected_shard_size(
-    slot: &str,
-    value_len: usize,
-    shards: &BTreeMap<u32, CredentialBundle>,
-    target: u32,
-) -> usize {
-    let existing = shards
-        .get(&target)
-        .map(|b| serde_json::to_string(b).map(|s| s.len()).unwrap_or(0))
-        .unwrap_or(2);
+fn projected_shard_size(slot: &str, value_len: usize, sizes: &ShardSizes, target: u32) -> usize {
     // Add slot + value + JSON overhead.
-    existing + slot.len() + value_len + 8
+    sizes.get(target) + slot.len() + value_len + 8
+}
+
+/// The serialized size of every shard, kept current while slots are staged,
+/// so placing a slot never re-serializes a shard (an allocation run places
+/// each new slot against up to [`MAX_BUNDLE_SHARDS`] shards).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShardSizes(BTreeMap<u32, usize>);
+
+impl ShardSizes {
+    /// The serialized size of each shard in `shards`.
+    pub fn of(shards: &BTreeMap<u32, CredentialBundle>) -> Self {
+        Self(
+            shards
+                .iter()
+                .map(|(index, bundle)| {
+                    let size = serde_json::to_string(bundle).map_or(0, |json| json.len());
+                    (*index, size)
+                })
+                .collect(),
+        )
+    }
+
+    /// A shard that does not exist yet serializes as `{}`.
+    fn get(&self, shard: u32) -> usize {
+        self.0.get(&shard).copied().unwrap_or(2)
+    }
+
+    /// Insert `slot` into `shards[shard]` and update that shard's size by the
+    /// entry's serialized length: exactly what serializing the shard again
+    /// would give.
+    pub fn stage(
+        &mut self,
+        shards: &mut BTreeMap<u32, CredentialBundle>,
+        shard: u32,
+        slot: String,
+        value: String,
+    ) {
+        let json_len = |text: &str| serde_json::to_string(text).map_or(0, |json| json.len());
+        let entry_len = |entry_value: &str| json_len(&slot) + 1 + json_len(entry_value);
+        let added = entry_len(&value);
+        let size = self.get(shard);
+        let bundle = shards.entry(shard).or_default();
+        let size = match bundle.insert(slot.clone(), value) {
+            Some(previous) => size - entry_len(&previous) + added,
+            // A comma separates it from the entries already there.
+            None if bundle.len() > 1 => size + added + 1,
+            None => size + added,
+        };
+        self.0.insert(shard, size);
+    }
 }

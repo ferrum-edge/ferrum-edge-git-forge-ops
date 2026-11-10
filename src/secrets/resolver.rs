@@ -1826,7 +1826,22 @@ fn check_array_slot_identity(
     // from the canonical one when an enclosing array index is 0.
     let verbatim_prefix = format!("{}/", join_slot_components_verbatim(components));
     let legacy_prefixes = legacy_array_prefixes(components);
-    for slot in bundle.keys() {
+    // Only keys under one of these spellings can match, and the bundle is
+    // sorted: scan those key ranges, merged back into bundle order, instead
+    // of every slot in the bundle.
+    let mut candidates = BTreeSet::new();
+    for spelling in [&scan_prefix, &verbatim_prefix]
+        .into_iter()
+        .chain(&legacy_prefixes)
+    {
+        candidates.extend(
+            bundle
+                .range(spelling.clone()..)
+                .map(|(slot, _)| slot)
+                .take_while(|slot| slot.starts_with(spelling.as_str())),
+        );
+    }
+    for slot in candidates {
         // Every spelling the lookup still reads names the same slot, so the
         // retirement check scans all of them: a value stored under an older
         // spelling resolves again on regrowth exactly like a canonical one.
