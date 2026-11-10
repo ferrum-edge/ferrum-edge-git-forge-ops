@@ -592,7 +592,7 @@ async fn surface_delivered_credentials(
             None => {
                 undelivered.push(slot.slot.as_str());
                 body.text(
-                    "**NOT DELIVERED** — the recipient had no SSH key on file or was not provided. Run `gitforgeops rotate` after adding an SSH key to deliver the value.\n\n",
+                    "**NOT DELIVERED** — no recipient was configured for this run, so no ciphertext was created.\n\n",
                 );
             }
         }
@@ -640,7 +640,7 @@ async fn surface_delivered_credentials(
     display::write_composed_stdout(&body);
     if !undelivered.is_empty() {
         eoutln!(
-            "Warning: {} slot(s) could not be delivered (no recipient SSH key): {}",
+            "Warning: {} slot(s) were not delivered (no recipient configured): {}",
             undelivered.len(),
             safe(undelivered.join(", "))
         );
@@ -3594,7 +3594,7 @@ async fn cmd_apply(
                             safe(&d.key_fingerprint)
                         ),
                         None => eoutln!(
-                            "  {} -> NOT DELIVERED (no recipient or no compatible SSH key)",
+                            "  {} -> NOT DELIVERED (no recipient configured)",
                             safe(&slot.slot)
                         ),
                     }

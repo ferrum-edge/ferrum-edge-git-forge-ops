@@ -33,7 +33,7 @@ pub const BUNDLE_SECRET_PREFIX: &str = "FERRUM_CREDS_BUNDLE";
 ///   2. `MAX_BUNDLE_SHARDS` in `.github/scripts/credential_bundles.py`,
 ///   3. the `FERRUM_CREDS_BUNDLE_<N>` env bindings in the "Load credential
 ///      bundles" step of `.github/workflows/apply-on-merge.yml`,
-///      `drift-check.yml`, `materialize-file.yml` and `rotate.yml`.
+///      `materialize-file.yml` and `rotate.yml`.
 ///
 /// Reading is deliberately unbounded: `load_bundles_from_env` still accepts any
 /// shard index so a repository that allocated beyond an older, higher ceiling
@@ -634,8 +634,7 @@ pub(crate) fn shard_ceiling_error(slot: &str, operation: &str) -> crate::error::
          added deliberately: raise MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and in \
          .github/scripts/credential_bundles.py, then add the matching \
          FERRUM_CREDS_BUNDLE_<N> env bindings to the 'Load credential bundles' step of \
-         .github/workflows/apply-on-merge.yml, drift-check.yml, materialize-file.yml and \
-         rotate.yml.",
+         .github/workflows/apply-on-merge.yml, materialize-file.yml and rotate.yml.",
         next = shard_secret_name(MAX_BUNDLE_SHARDS),
         last = MAX_BUNDLE_SHARDS - 1,
     ))

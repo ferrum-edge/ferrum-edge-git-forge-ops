@@ -423,6 +423,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The credential-bundle shard-ceiling error no longer tells operators to add
+  `FERRUM_CREDS_BUNDLE_<N>` bindings to `drift-check.yml`. That workflow stopped
+  loading bundles when unattended monitoring was split from deployment, and the
+  supply-chain check refuses such a binding there; the remedy now names only
+  `apply-on-merge.yml`, `materialize-file.yml` and `rotate.yml`.
+- An allocated slot listed as `NOT DELIVERED` is now explained as having no
+  recipient configured for the run. The old text blamed a missing SSH key and
+  suggested `rotate`, but a recipient without a compatible key refuses
+  allocation before any secret is written, so that cause cannot reach the
+  notice.
 - Without `GITFORGEOPS_PR_NUMBER`, `plan` and `apply` now pick the PR whose
   override they evaluate by the bundled workflow's own rule (#664). That rule
   is `merge_context.py`'s: the one closed PR with `merged_at` into the
