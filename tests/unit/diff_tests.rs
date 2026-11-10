@@ -932,7 +932,12 @@ fn breaking_auth_plugin_deletion_scoped_by_namespace() {
     let desired = GatewayConfig::default();
     let actual = GatewayConfig {
         plugin_configs: vec![
-            make_plugin_config("plugin-shared", "team-alpha", "jwt", PluginScope::Proxy),
+            make_plugin_config(
+                "plugin-shared",
+                "team-alpha",
+                "jwt_auth",
+                PluginScope::Proxy,
+            ),
             make_plugin_config(
                 "plugin-shared",
                 "team-beta",

@@ -139,7 +139,7 @@ fn mint_jwt_default_ttl_is_one_hour() {
 }
 
 #[test]
-fn mint_jwt_honours_ttl_override_and_rejects_nonpositive() {
+fn mint_jwt_honours_ttl_override_and_defaults_a_nonpositive_ttl() {
     let options = JwtOptions {
         ttl_secs: 120,
         ..JwtOptions::default()
@@ -152,15 +152,18 @@ fn mint_jwt_honours_ttl_override_and_rejects_nonpositive() {
 
     // A zero/negative TTL would serialize as `exp <= iat`, which the gateway
     // rejects outright — fall back to the default instead.
-    let bad = JwtOptions {
-        ttl_secs: 0,
-        ..JwtOptions::default()
-    };
-    let claims = payload_of(&mint_jwt(SECRET, &bad).unwrap());
-    assert_eq!(
-        claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
-        3600
-    );
+    for ttl_secs in [0, -5] {
+        let bad = JwtOptions {
+            ttl_secs,
+            ..JwtOptions::default()
+        };
+        let claims = payload_of(&mint_jwt(SECRET, &bad).unwrap());
+        assert_eq!(
+            claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+            3600,
+            "ttl_secs = {ttl_secs}"
+        );
+    }
 }
 
 #[test]
