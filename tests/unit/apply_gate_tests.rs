@@ -2523,6 +2523,118 @@ fn review_fail_on_blockers_covers_missing_required_slots() {
     );
 }
 
+/// Run `review` with and without `--fail-on-blockers` and assert the rendered
+/// verdict agrees with the exit code the flag derives from `apply_blockers`.
+fn assert_review_verdict_matches_fail_on_blockers(
+    repo: &Repo,
+    args: &[&str],
+    env: &[(&str, &str)],
+    blocked: bool,
+) -> String {
+    let defaulted = repo.run(args, env);
+    let mut flagged_args = args.to_vec();
+    flagged_args.push("--fail-on-blockers");
+    let flagged = repo.run(&flagged_args, env);
+    let rendered = stdout(&defaulted);
+    assert!(
+        defaulted.status.success(),
+        "{rendered} {}",
+        stderr(&defaulted)
+    );
+    assert_eq!(
+        flagged.status.success(),
+        !blocked,
+        "{} {}",
+        stdout(&flagged),
+        stderr(&flagged)
+    );
+    assert_eq!(
+        rendered,
+        stdout(&flagged),
+        "the flag only changes the exit code"
+    );
+    assert_eq!(rendered.contains("Apply is blocked"), blocked, "{rendered}");
+    assert_eq!(
+        rendered.contains("No evaluated blocker"),
+        !blocked,
+        "{rendered}"
+    );
+    assert!(!rendered.contains("**Apply blocked** —"), "{rendered}");
+    rendered
+}
+
+#[test]
+fn review_verdict_lists_a_narrowed_file_publication() {
+    // `--fail-on-blockers` fails on it, so the verdict must say so too.
+    let repo = two_namespace_repo(&[]);
+    let rendered = assert_review_verdict_matches_fail_on_blockers(
+        &repo,
+        &["review"],
+        &[("FERRUM_NAMESPACE", "billing")],
+        true,
+    );
+    assert!(
+        rendered.contains("- **Apply is blocked:** narrowed-file-publication (1):"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn review_verdict_lists_a_publication_path_collision() {
+    let repo = two_namespace_repo(&[]);
+    let published = repo.published().to_string_lossy().into_owned();
+    let rendered = assert_review_verdict_matches_fail_on_blockers(
+        &repo,
+        &["review"],
+        &[("FERRUM_MESH_FILE_OUTPUT_PATH", published.as_str())],
+        true,
+    );
+    assert!(
+        rendered.contains("- **Apply is blocked:** publication-path-collision (1):"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn review_verdict_lists_invalid_smoke_checks() {
+    let repo = two_namespace_repo(&[(".gitforgeops/smoke.yaml", "checks: [\n")]);
+    let rendered = assert_review_verdict_matches_fail_on_blockers(&repo, &["review"], &[], true);
+    assert!(
+        rendered.contains("- **Apply is blocked:** invalid-smoke-checks (1):"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn review_verdict_honours_an_acknowledged_credential_slot_remap() {
+    let repo = Repo::with_consumer(SHRUNK_CONSUMER);
+    let env = [("FERRUM_CREDS_JSON", TWO_SLOT_BUNDLE)];
+
+    let unacknowledged =
+        assert_review_verdict_matches_fail_on_blockers(&repo, &["review"], &env, true);
+    assert!(
+        unacknowledged.contains("blocking unless explicitly acknowledged"),
+        "{unacknowledged}"
+    );
+
+    // The flag clears the slot-remap blocker in `apply_blockers`; the verdict
+    // must not keep reporting it.
+    let acknowledged = assert_review_verdict_matches_fail_on_blockers(
+        &repo,
+        &["review", "--allow-credential-slot-remap"],
+        &env,
+        false,
+    );
+    assert!(
+        acknowledged.contains("acknowledged with `--allow-credential-slot-remap`; not blocking"),
+        "{acknowledged}"
+    );
+    assert!(
+        acknowledged.contains("### Credential Slot Remaps"),
+        "the hazard is accepted, not hidden: {acknowledged}"
+    );
+}
+
 #[test]
 fn reserved_plugin_names_block_public_preview_and_apply_with_default_disabled_policy() {
     for enabled in [false, true] {

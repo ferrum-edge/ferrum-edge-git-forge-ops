@@ -4247,17 +4247,6 @@ async fn cmd_review(
             &assembled.namespace_scope,
         ));
     }
-    // Neither refusal has a findings section of its own. The remedy is fixed
-    // text, so nothing from the environment or the smoke file reaches the PR.
-    let preflight_blockers = [
-        verdict::publication_path_collision_blocker(publication_path_error.is_some()),
-        verdict::invalid_smoke_checks_blocker(smoke_invalid),
-        verdict::probe_consumer_allowlist_blocker(probe_allowlist_invalid),
-    ];
-    for blocker in preflight_blockers.into_iter().flatten() {
-        let remedy = blocker.kind.remedy();
-        ownership_note.push_str(&format!("\n\n**Apply blocked** — {remedy}"));
-    }
     // Which Consumer each traffic-check slot would spend, and every Consumer
     // carrying the probe label, so a label or slot a change adds is visible.
     if let Some(preview) = &probe_preview {
@@ -4269,16 +4258,12 @@ async fn cmd_review(
         ownership_note.push_str(&section);
     }
 
-    let provisioning_blockers = verdict::credential_provisioning_blockers(
-        &secret_report,
-        env_config.github_provisioner_token.is_some(),
-        env_config.github_repository.is_some(),
-    );
     let security_overridden =
         matches!(override_decision, Some(policy::OverrideDecision::Active(_)));
-    // Same computation `plan` uses for its exit code. The comment below is
-    // built from the findings themselves, not from this vec, so
-    // `--fail-on-blockers` cannot change what the reviewer reads.
+    // Same computation `plan` uses for its exit code. The comment's verdict
+    // counts the findings classes from the findings themselves and lists every
+    // other class from this vec, so it blocks whenever `--fail-on-blockers`
+    // would fail on one of them, and the flag only changes the exit code.
     let blockers = verdict::apply_blockers(ApplyGateInputs {
         validation_ok: matches!(validation_status, review::ReviewValidationStatus::Passed),
         security_findings: &security_findings,
@@ -4293,6 +4278,24 @@ async fn cmd_review(
         smoke_checks_invalid: smoke_invalid,
         probe_allowlist_invalid,
     });
+    // The classes with no findings section or count line of their own. Their
+    // remedies are fixed text, so nothing from the environment or the smoke
+    // file reaches the PR.
+    let gate_blockers: Vec<verdict::ApplyBlocker> = blockers
+        .iter()
+        .filter(|blocker| {
+            matches!(
+                blocker.kind,
+                verdict::BlockerKind::ProvisionerToken
+                    | verdict::BlockerKind::ProvisioningRepository
+                    | verdict::BlockerKind::NarrowedFilePublication
+                    | verdict::BlockerKind::PublicationPathCollision
+                    | verdict::BlockerKind::InvalidSmokeChecks
+                    | verdict::BlockerKind::ProbeConsumerAllowlist
+            )
+        })
+        .copied()
+        .collect();
 
     let override_reason = override_decision
         .as_ref()
@@ -4315,7 +4318,8 @@ async fn cmd_review(
         bundle_loaded,
         override_decision.as_ref(),
         &adoptions,
-        &provisioning_blockers,
+        &gate_blockers,
+        allow_credential_slot_remap,
     );
 
     let mut comment_delivery_error = None;

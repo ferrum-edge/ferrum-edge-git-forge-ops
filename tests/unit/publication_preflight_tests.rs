@@ -312,7 +312,7 @@ fn assert_review_blocker(repo: &Repo, gateway: &str, mesh: &str, label: &str, de
             "{args:?}: {text}"
         );
         assert!(text.contains(detail), "{args:?}: {text}");
-        assert!(stdout.contains("Apply blocked"), "{args:?}: {text}");
+        assert!(stdout.contains("Apply is blocked"), "{args:?}: {text}");
         if fail_on_blockers {
             assert!(text.contains(label), "{args:?}: {text}");
         }
@@ -517,7 +517,7 @@ fn cli_accepts_a_valid_or_absent_smoke_file() {
                 combined(&output)
             );
             assert!(
-                !String::from_utf8_lossy(&output.stdout).contains("Apply blocked"),
+                !String::from_utf8_lossy(&output.stdout).contains("Apply is blocked"),
                 "{smoke:?} {args:?}: {}",
                 combined(&output)
             );
@@ -749,7 +749,7 @@ fn cli_review_shows_which_consumer_each_slot_would_spend() {
             assert_eq!(output.status.code(), Some(0), "{text}");
         }
         for expected in [
-            "Apply blocked",
+            "Apply is blocked",
             "names a credential verify would refuse",
             CUSTOMER_SLOT,
             "ferrum/orders-client",

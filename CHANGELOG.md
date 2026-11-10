@@ -423,6 +423,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The PR review comment's "Apply verdict" no longer says "No evaluated
+  blocker" while `review --fail-on-blockers` fails (#688). A narrowed
+  file-mode publication, colliding publication paths, invalid smoke checks
+  and a missing probe-Consumer allowlist are now listed in the verdict with
+  their remedies, from the same `apply_blockers` result the flag uses, instead
+  of as separate "Apply blocked" lines on the environment banner (or, for the
+  narrowed publication, nowhere). A slot remap acknowledged with
+  `--allow-credential-slot-remap` no longer reads as blocking.
 - The credential-bundle shard-ceiling error no longer tells operators to add
   `FERRUM_CREDS_BUNDLE_<N>` bindings to `drift-check.yml`. That workflow stopped
   loading bundles when unattended monitoring was split from deployment, and the
