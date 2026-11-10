@@ -137,6 +137,25 @@ class ReleaseBaselineTests(unittest.TestCase):
         issues = check_release_baseline.check(self.root)
         self.assertIn("quickstart must require a supported release record", issues)
 
+    def test_only_a_release_tag_publishes(self):
+        # A branch trigger would republish for the record-only commit that
+        # fills the image digest, and fail its gate on every merge (#700).
+        workflow = self.root / ".github/workflows/release.yml"
+        original = workflow.read_text(encoding="utf-8")
+        self.assertEqual(check_release_baseline.check(self.root), [])
+        workflow.write_text(
+            original.replace("  push:\n", "  push:\n    branches: [main]\n", 1),
+            encoding="utf-8",
+        )
+        self.assertIn(
+            "record-only finalization must not trigger another image publication",
+            check_release_baseline.check(self.root),
+        )
+        workflow.write_text(original.replace("    tags: ['v*']\n", ""), encoding="utf-8")
+        self.assertIn(
+            "release.yml must publish on release tags", check_release_baseline.check(self.root)
+        )
+
     def test_release_gate_must_use_recorded_gateway_digest(self):
         workflow = self.root / ".github/workflows/release.yml"
         workflow.write_text(

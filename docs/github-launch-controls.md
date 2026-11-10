@@ -75,7 +75,7 @@ stay red on `main` until the settings behind them exist:
 
 | Workflow | Red until | Section |
 | --- | --- | --- |
-| `Release` | the `main` ruleset declares required checks. Until then `gh pr checks --required` exits non-zero with "no required checks reported", so every push to `main` fails the publication gate. | [§2](#2-protect-main-with-an-active-ruleset) |
+| `Release` | the `main` ruleset declares required checks. Until then `gh pr checks --required` exits non-zero with "no required checks reported", so every `v*` tag fails the publication gate. | [§2](#2-protect-main-with-an-active-ruleset) |
 | `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template), the `main` ruleset binds `state-guard-reject-state-edits` (and, once required, `trusted-supply-chain-policy` and `validate-trusted-policy`) to the GitHub Actions app, and an organization ruleset requires every workflow that reports a required check by path, with the `main` ruleset's bypass actors | [§1](#1-create-the-state-writer-github-app), [§2](#switching-the-supply-chain-policy-check), [§2a](#2a-require-the-trusted-workflows-by-path), [§5](#5-enable-settings-drift-monitoring) |
 
 Neither workflow may assume a control it cannot verify. Configure §1-§5 first
@@ -226,8 +226,8 @@ secrets of a **`release`** GitHub Environment, which the `docker` job binds:
 - `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` set with
   `gh secret set NAME --repo owner/repo --env release`, and no `DOCKERHUB_*`
   repository or organization secret;
-- no required reviewer is needed: every push to the default branch publishes,
-  and `authorize-release` is the publication gate. A reviewer you add is kept
+- no required reviewer is needed: only a `v*` tag publishes, and
+  `authorize-release` is the publication gate. A reviewer you add is kept
   by the bootstrap and accepted by the audit;
 - nothing but `DOCKERHUB_*` secrets: without a reviewer, a gateway,
   credential-broker or state-writer secret there would reach any

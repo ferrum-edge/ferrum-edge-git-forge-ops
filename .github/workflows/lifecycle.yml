@@ -37,9 +37,13 @@ on:
 permissions:
   contents: read
 
+# A newer push supersedes an older push's run on the same ref, and the nightly
+# run supersedes the previous nightly one. A dispatched run carries an
+# operator's attestation for a release, so it has its own group and is never
+# cancelled: a merge landing mid-run must not discard it (#700).
 concurrency:
-  group: lifecycle-${{ github.ref }}
-  cancel-in-progress: true
+  group: lifecycle-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   lifecycle-acceptance:

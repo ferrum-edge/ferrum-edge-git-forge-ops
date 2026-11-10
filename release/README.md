@@ -147,8 +147,8 @@ organization secrets; see
 and the migration of an existing install. It then publishes to both registries, attests provenance under
 each name, and uploads the `supply-chain-inputs` artifact with the resulting
 digest. Finalize `baseline.json` with that digest and the exact source SHA
-**after** the image exists. `release.yml` ignores changes under `release/`, so
-the record-only commit does not republish the image or move `latest`. Publish
+**after** the image exists. `release.yml` publishes only on `v*` tags, so the
+record-only commit does not republish the image or move `latest`. Publish
 the GitHub release with the committed notes and link to this record.
 
 After the first supported baseline, announce each fix in a versioned release

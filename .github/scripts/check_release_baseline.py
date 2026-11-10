@@ -111,7 +111,12 @@ def check(root: Path) -> list[str]:
     else:
         issues.append("release status must be pending or supported")
 
-    if "- 'release/**'" not in workflow:
+    # Only a release tag publishes, so the record-only commit that fills the
+    # image digest after publication cannot publish again.
+    push = re.search(r"^  push:[ \t]*\n(?P<body>(?:(?:    .*)?\n)*)", workflow, re.MULTILINE)
+    if push is None or "tags: ['v*']" not in push.group("body"):
+        issues.append("release.yml must publish on release tags")
+    elif re.search(r"^\s+branches(?:-ignore)?\s*:", push.group("body"), re.MULTILINE | re.IGNORECASE):
         issues.append("record-only finalization must not trigger another image publication")
     if workflow.count("python3 -I .github/scripts/check_release_baseline.py") != 2:
         issues.append("both release jobs must check the baseline")

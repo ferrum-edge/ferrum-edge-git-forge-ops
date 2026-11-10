@@ -7371,17 +7371,36 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("missing subject" in item for item in violations), violations
         )
 
-    def test_release_push_trigger_ignores_ledger_commits_and_keeps_tags(self):
+    def test_release_publishes_only_on_release_tags(self):
+        # A branch trigger publishes for every merge and ledger commit, and its
+        # gate fails on each one: only an attested, dispatched lifecycle run
+        # can certify a revision (#700).
+        for trigger in (
+            "    branches: [main]\n",
+            "    branches-ignore: [wip]\n",
+            "    Branches:\n      - main\n",
+        ):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows/release.yml"
+                text = path.read_text(encoding="utf-8")
+                changed = text.replace("  push:\n", "  push:\n" + trigger, 1)
+                self.assertNotEqual(changed, text)
+                path.write_text(changed, encoding="utf-8")
+                violations = self._violations(root)
+                self.assertTrue(
+                    any("must not name branches" in item for item in violations), violations
+                )
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
             path = root / ".github/workflows/release.yml"
             path.write_text(
-                path.read_text(encoding="utf-8").replace("      - '.state/**'\n", ""),
+                path.read_text(encoding="utf-8").replace("    tags: ['v*']\n", ""),
                 encoding="utf-8",
             )
             violations = self._violations(root)
         self.assertTrue(
-            any("ignore ledger-only commits" in item for item in violations), violations
+            any("keep publishing release tags" in item for item in violations), violations
         )
 
     def test_release_gate_must_name_upstream_rather_than_test_for_a_fork(self):

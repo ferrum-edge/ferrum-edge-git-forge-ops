@@ -6750,6 +6750,7 @@ _RELEASE_PUSH_TRIGGER_RE = re.compile(
     r"^  push:\s*$\n(?P<body>(?:^    .*\n|^      .*\n)*)",
     re.MULTILINE,
 )
+_RELEASE_BRANCH_FILTER_RE = re.compile(r"^\s+branches(?:-ignore)?\s*:", re.MULTILINE | re.IGNORECASE)
 _FORK_GUARD_RE = re.compile(r"^\s*if: .*repository\.fork", re.MULTILINE)
 _JOB_ENVIRONMENT_RE = re.compile(r"^ {4}environment\s*:", re.MULTILINE)
 _SECRETS_EXPRESSION_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b", re.IGNORECASE)
@@ -7005,17 +7006,17 @@ def main(argv: list[str] | None = None) -> int:
             violations.append(
                 f"release.yml: build provenance is missing subject {required!r}"
             )
-    # The ledger commits that `apply-on-merge.yml` and `rotate.yml` push to
-    # `main` contain no build input. They used to carry `[skip ci]`, which
-    # suppressed the required checks along with everything else; excluding the
-    # paths from the image build is the narrower control.
+    # Only a release tag publishes (#700). `authorize-release` requires a
+    # lifecycle result that only an operator-dispatched, attested run can
+    # produce, so a branch trigger fails on every merge; it would also
+    # publish for the ledger commits `apply-on-merge.yml` and `rotate.yml`
+    # push to `main`.
     release_push = _RELEASE_PUSH_TRIGGER_RE.search(release)
     release_push_body = release_push.group("body") if release_push else ""
-    for ignored in ("- '.state/**'", "- 'assembled/**'"):
-        if ignored not in release_push_body:
-            violations.append(
-                f"release.yml: push trigger must ignore ledger-only commits ({ignored})"
-            )
+    if _RELEASE_BRANCH_FILTER_RE.search(release_push_body):
+        violations.append(
+            "release.yml: the push trigger must not name branches; only release tags publish"
+        )
     if "tags: ['v*']" not in release_push_body:
         violations.append("release.yml: push trigger must keep publishing release tags")
     # This repository is a template customers copy. A copy is not a fork, so
