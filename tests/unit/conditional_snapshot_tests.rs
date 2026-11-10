@@ -1465,6 +1465,60 @@ async fn restore_uncertain_admission_fence_and_bad_seal_responses_are_never_repl
 }
 
 #[tokio::test]
+async fn restore_refusals_keep_the_tools_own_remedy_and_withhold_the_gateways_text() {
+    // #689: every restore error is withheld, but the three failures with a
+    // known next step keep GitForgeOps' fixed remedy. Nothing the gateway
+    // sent (its message, the at-risk spec names, the rollback details) is
+    // shown, and none of them is replayed.
+    let cases: [(u16, Value, &str); 3] = [
+        (
+            409,
+            json!({"error": SECRET, "api_specs_at_risk": ["spec-private-name"],
+                "confirmation_required": "confirm_api_spec_deletion=true"}),
+            "--confirm-api-spec-deletion",
+        ),
+        (
+            500,
+            json!({"error": SECRET, "rollback": "incomplete",
+                "restore_errors": ["spec-private-name"]}),
+            "Do NOT re-run apply",
+        ),
+        (
+            413,
+            json!({"error": SECRET}),
+            "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB",
+        ),
+    ];
+    for (status, body, remedy) in cases {
+        let body = body.to_string();
+        let (client, requests) = gateway(move |_, _| (status, body.clone(), vec![]));
+        let extras = planned_extras(&GatewayConfig::default(), NS, BackupExtras::default());
+        let error = client
+            .post_restore(&GatewayConfig::default(), NS, &extras, false)
+            .await
+            .unwrap_err();
+        assert_eq!(requests.lock().unwrap().len(), 1, "{status}");
+        match (status, &error) {
+            (409, gitforgeops::error::Error::ApiSpecsAtRisk(_))
+            | (500, gitforgeops::error::Error::RestoreNeedsManualRecovery(_))
+            | (413, gitforgeops::error::Error::ApiError { status: 413, .. }) => {}
+            _ => panic!("{status}: unexpected error class"),
+        }
+        let rendered = format!("{error:?} {error}");
+        assert!(rendered.contains(remedy), "{status}: remedy missing");
+        assert!(
+            rendered.contains("response details withheld"),
+            "{status}: not withheld"
+        );
+        assert!(!rendered.contains(SECRET), "{status}: gateway text shown");
+        assert!(
+            !rendered.contains("spec-private-name"),
+            "{status}: gateway detail shown"
+        );
+    }
+}
+
+#[tokio::test]
 async fn contradictory_batch_unsupported_responses_never_authorize_fallback() {
     for body in [
         json!({"applied": false, "reason": "reload_timeout", "error": SECRET}).to_string(),

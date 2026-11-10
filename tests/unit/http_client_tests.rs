@@ -1155,10 +1155,10 @@ fn restore_rollback_failure_demands_manual_recovery() {
     ));
     let msg = err.to_string();
     assert!(msg.contains("Do NOT re-run apply"), "got: {msg}");
-    assert!(
-        msg.contains("proxy-a"),
-        "should surface restore_errors: {msg}"
-    );
+    // `post_restore` withholds the gateway's text, so the variant carries
+    // only the tool's remedy.
+    assert!(!msg.contains("proxy-a"), "got: {msg}");
+    assert!(!msg.contains("import failed"), "got: {msg}");
 }
 
 #[test]

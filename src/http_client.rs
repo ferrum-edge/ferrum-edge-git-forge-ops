@@ -1112,7 +1112,7 @@ impl AdminClient {
         }
         self.check_mutation(&resp, RequestKind::Restore)
             .await
-            .map_err(conditional::withhold_error)?;
+            .map_err(conditional::withhold_restore_error)?;
         if resp.status != 200 {
             return Err(crate::error::Error::AmbiguousMutation(
                 "conditional restore returned an unexpected success status; do not replay"
@@ -1976,6 +1976,19 @@ fn rollback_needs_manual_recovery(rollback: Option<&str>) -> bool {
     matches!(rollback, Some("incomplete") | Some("unknown_outcome"))
 }
 
+// GitForgeOps' own next step for the three `/restore` failures that have one.
+// `post_restore` withholds the gateway's text but keeps these
+// (`conditional::withhold_restore_error`); none carries response data.
+const API_SPECS_AT_RISK_REMEDY: &str = "API specs are managed through the admin API, not this \
+     repo. Use incremental apply to keep them, or re-run `gitforgeops apply \
+     --confirm-api-spec-deletion` to delete the complete ownership graph deliberately.";
+const RESTORE_MANUAL_RECOVERY_REMEDY: &str = "the namespace may hold a partially restored \
+     configuration. Do NOT re-run apply — inspect the gateway with `gitforgeops diff`, restore \
+     from a known backup if needed, then reconcile.";
+const RESTORE_BODY_LIMIT_ADVICE: &str = "payload exceeds the gateway's restore body limit \
+     (FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB, default 100 MiB). Split the namespace or switch to \
+     the incremental apply strategy.";
+
 /// The `GET /config/export` URL, checked for the transport a viewer bearer
 /// token may use.
 #[derive(Clone, PartialEq, Eq)]
@@ -2212,24 +2225,20 @@ pub fn map_api_error_with_redirect_base(
     if status == 409 && parsed.api_specs_at_risk.is_some() {
         let at_risk = describe_api_specs_at_risk(&parsed.api_specs_at_risk);
         return crate::error::Error::ApiSpecsAtRisk(format!(
-            "full_replace refused: the namespace holds API spec(s) this payload would delete ({at_risk}). \
-             API specs are managed through the admin API, not this repo. Use incremental apply to keep \
-             them, or re-run `gitforgeops apply --confirm-api-spec-deletion` to delete the complete \
-             ownership graph deliberately. Gateway said: {message}"
+            "full_replace refused: the namespace holds API spec(s) this payload would delete \
+             ({at_risk}). {API_SPECS_AT_RISK_REMEDY} Gateway said: {message}"
         ));
     }
 
+    // Only `post_restore` sends this kind, and it withholds the gateway's text,
+    // so the variant carries the tool's own remedy alone.
     if kind == RequestKind::Restore
         && status == 500
         && rollback_needs_manual_recovery(parsed.rollback.as_deref())
     {
-        let rollback = bounded_error_message(parsed.rollback.as_deref().unwrap_or("unknown"));
-        let details = summarize_restore_errors(&parsed.restore_errors);
-        return crate::error::Error::RestoreNeedsManualRecovery(format!(
-            "rollback={rollback}; the namespace may hold a partially restored configuration. \
-             Do NOT re-run apply — inspect the gateway with `gitforgeops diff`, restore from a known \
-             backup if needed, then reconcile. Gateway said: {message}{details}"
-        ));
+        return crate::error::Error::RestoreNeedsManualRecovery(
+            RESTORE_MANUAL_RECOVERY_REMEDY.to_string(),
+        );
     }
 
     if parsed.applied == Some(false) {
@@ -2264,10 +2273,7 @@ pub fn map_api_error_with_redirect_base(
         // The advice depends on which body was too large: only `/restore` has
         // its own (much larger) limit and a strategy-level workaround.
         let advice = match kind {
-            RequestKind::Restore => "payload exceeds the gateway's restore body limit \
-                 (FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB, default 100 MiB). Split the namespace or \
-                 switch to the incremental apply strategy."
-                .to_string(),
+            RequestKind::Restore => RESTORE_BODY_LIMIT_ADVICE.to_string(),
             RequestKind::NonIdempotentMutation => format!(
                 "the create or POST /batch body exceeds the gateway's admin request body limit. \
                  Incremental apply chunks POST /batch bodies under {BATCH_MAX_BODY_BYTES} bytes \
@@ -2308,22 +2314,6 @@ fn describe_api_specs_at_risk(at_risk: &Option<serde_json::Value>) -> String {
         Some(serde_json::Value::Number(n)) => format!("{n} spec(s)"),
         Some(other) => bounded_error_message(&other.to_string()),
         None => "count unknown".to_string(),
-    }
-}
-
-fn summarize_restore_errors(errors: &Option<Vec<serde_json::Value>>) -> String {
-    match errors {
-        Some(list) if !list.is_empty() => format!(
-            "\nrestore_errors: {}",
-            bounded_error_message(
-                &list
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            )
-        ),
-        _ => String::new(),
     }
 }
 
