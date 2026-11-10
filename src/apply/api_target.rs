@@ -250,7 +250,9 @@ pub fn order_incremental_diffs(
         .map(|d| state_key(&d.namespace, &d.kind, &d.id))
         .collect();
     let unblocking = rename_unblocking_keys(&diffs, &index);
-    diffs.sort_by_key(|d| {
+    // Cached: building the state key allocates, and the sort would otherwise
+    // rebuild it on every comparison.
+    diffs.sort_by_cached_key(|d| {
         let key = state_key(&d.namespace, &d.kind, &d.id);
         let cyclic = keys.contains(&key);
         let unblocks = unblocking.contains(&key);

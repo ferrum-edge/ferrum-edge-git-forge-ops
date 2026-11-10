@@ -238,7 +238,7 @@ fn check_proxy(config: &GatewayConfig, proxy: &Proxy, findings: &mut Vec<BestPra
     // The `/charges` registry is a process-global singleton with no instance
     // dimension, so two retained chargeback hooks double-count one client
     // transaction. The gateway rejects this at admission and reload.
-    let chargeback_instances = over_attached_chargeback(config, proxy);
+    let chargeback_instances = over_attached_chargeback(&effective);
     if chargeback_instances > 1 {
         findings.push(BestPractice::warning(
             "Proxy",

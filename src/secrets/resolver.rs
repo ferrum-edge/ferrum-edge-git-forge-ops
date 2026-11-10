@@ -2143,7 +2143,13 @@ fn check_plugin_array_slot_identity(
     }
 
     let scan_prefix = format!("{prefix}/");
-    for slot in bundle.keys() {
+    // Only keys under this array can match, and the bundle is sorted: scan
+    // that key range instead of every slot in the bundle.
+    let under_array = bundle
+        .range(scan_prefix.clone()..)
+        .map(|(slot, _)| slot)
+        .take_while(|slot| slot.starts_with(&scan_prefix));
+    for slot in under_array {
         let Some(rest) = slot.strip_prefix(&scan_prefix) else {
             continue;
         };
