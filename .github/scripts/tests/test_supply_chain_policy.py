@@ -24,6 +24,7 @@ CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",  # v2.87.29
     "taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177",  # v2.87.30
     "taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68",  # v2.88.1
+    "taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2",  # v2.90.2
 )
 REJECTED_CARGO_AUDIT_ACTION_PINS = (
     "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",  # retired v2.87.27
