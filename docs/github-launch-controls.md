@@ -177,7 +177,8 @@ no other include or exclude patterns. It must:
 - block deletion and non-fast-forward updates;
 - reject `[skip ci]` in commit messages (a `commit_message_pattern` rule with
   `negate: true`). That marker suppresses every workflow, required checks
-  included; `release.yml` uses `paths-ignore` for ledger commits instead;
+  included. Ledger commits need no marker: `release.yml` publishes only on
+  `v*` tags;
 - require at least these GitHub Actions job names. Ruleset contexts use the job
   name, not the `Workflow / job` label shown on a PR:
   - `rust-ci-check`

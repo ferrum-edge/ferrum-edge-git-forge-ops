@@ -6,14 +6,6 @@ on:
   # that only an operator-dispatched, attested run can produce, so every merge
   # ended in a failed Release run (#700).
   push:
-    # Inert: GitHub does not evaluate path filters for tag pushes. The
-    # protected checker on `main` still requires these entries; the follow-up
-    # to #700 removes them once the checker that refuses a branch trigger
-    # instead is on `main`.
-    paths-ignore:
-      - '.state/**'
-      - 'assembled/**'
-      - 'release/**'
     tags: ['v*']
 
 concurrency:
