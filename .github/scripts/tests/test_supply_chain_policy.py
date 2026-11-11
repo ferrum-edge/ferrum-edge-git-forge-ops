@@ -9013,18 +9013,11 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
                         f"jobs.{job}: binds ${{{{ inputs.environment }}}}",
                     )
 
-    def test_the_dispatch_guard_may_also_refuse_the_audit_environment(self):
-        # GHSA-jx32-rxh5-5q25, expand step: the guard that also refuses
-        # `settings-audit` (the reviewer-free audit-token environment) is
-        # accepted next to the shipped one, so the workflows can move to it
-        # under this checker. A guard that drops the `release` refusal is
-        # still refused.
-        release_refusal = (
-            "            echo \"::error::release holds the registry credentials and is not a "
-            "deployment environment.\"\n"
-            "            exit 1\n"
-            "          fi\n"
-        )
+    def test_the_dispatch_guard_refuses_the_audit_environment(self):
+        # GHSA-jx32-rxh5-5q25: the shipped guard also refuses `settings-audit`
+        # (the reviewer-free audit-token environment). A guard that drops or
+        # weakens that refusal, including the older guard that refused only
+        # `release`, is refused.
         audit_refusal = (
             "          if [ \"$(printf '%s' \"$INPUT_ENVIRONMENT\" | tr '[:upper:]' "
             "'[:lower:]')\" = settings-audit ]; then\n"
@@ -9036,16 +9029,18 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
         for name, job in (("rotate.yml", "rotate"), ("materialize-file.yml", "materialize")):
             shipped = self._shipped(name)
             label = f".github/workflows/{name}"
-            self.assertEqual(shipped.count(release_refusal), 1)
-            expanded = shipped.replace(release_refusal, release_refusal + audit_refusal)
-            with self.subTest(name=name):
-                self.assertEqual(self._violations(expanded, label), [])
-                without_release = expanded.replace("= release ]; then", "= other ]; then")
-                self.assertNotEqual(without_release, expanded)
-                self._refused(
-                    self._violations(without_release, label),
-                    f"jobs.{job}: binds ${{{{ inputs.environment }}}}",
-                )
+            self.assertEqual(shipped.count(audit_refusal), 1)
+            self.assertEqual(self._violations(shipped, label), [])
+            for changed in (
+                shipped.replace("= settings-audit ]; then", "= other ]; then"),
+                shipped.replace(audit_refusal, ""),
+            ):
+                with self.subTest(name=name):
+                    self.assertNotEqual(changed, shipped)
+                    self._refused(
+                        self._violations(changed, label),
+                        f"jobs.{job}: binds ${{{{ inputs.environment }}}}",
+                    )
 
     def test_the_full_checker_refuses_a_sibling_release_job(self):
         # Exactly the reported bypass: a sibling job outside authorize-release

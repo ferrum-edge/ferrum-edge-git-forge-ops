@@ -245,9 +245,9 @@ of the pinned bindings in `COMPUTED_ENVIRONMENT_BINDINGS`: the matrix values
 `gitforgeops envs` enumerates from the protected configuration, and the
 `rotate.yml` / `materialize-file.yml` dispatch input, which their `preflight`
 job refuses (in a pinned `shell: bash` step) when it is not a safe name or is
-`release`. Each matrix's producer (job output and step script) is pinned as
-well, and no `defaults:`, `env:`, `container:` or `continue-on-error` may
-apply to a pinned producer or guard. Reusable-workflow call jobs are refused,
+`release` or `settings-audit`. Each matrix's producer (job output and step
+script) is pinned as well, and no `defaults:`, `env:`, `container:` or
+`continue-on-error` may apply to a pinned producer or guard. Reusable-workflow call jobs are refused,
 because a called workflow could bind `release` where the policy cannot read
 it. The settings audit checks the environment, its secrets and the secret
 scope (section 5).
@@ -1132,7 +1132,8 @@ still audits its branch policy, fails when it holds any secret but
 `bootstrap_repo_settings.py` creates it on every repository, templates
 included. Because of that waiver the name `settings-audit` is reserved in any
 letter case: `.gitforgeops/config.yaml` and the bootstrap refuse a deployment
-environment of that name.
+environment of that name, and the `rotate.yml` / `materialize-file.yml`
+preflight refuses it as a dispatch input.
 
 `settings-audit.yml` runs only from the default branch. It checks:
 
