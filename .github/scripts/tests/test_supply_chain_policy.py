@@ -2387,36 +2387,6 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 self._violations(root),
             )
 
-    def test_trusted_policy_checker_has_no_stale_bootstrap_fallback(self):
-        # A one-time commit-pinned bootstrap covered the window where `main`
-        # did not yet carry this checker. `main` carries it now, so a fallback
-        # can only substitute an OLDER policy for the protected one — exactly
-        # what happens when a tree legitimately changes something the old
-        # policy still demands.
-        workflow = (ROOT / ".github/workflows/security.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertNotIn("bootstrap-supply-chain", workflow)
-        self.assertEqual(
-            check_supply_chain.trusted_supply_chain_policy_violations(workflow), []
-        )
-
-        with_fallback = workflow.replace(
-            "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py\n",
-            "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py\n"
-            "            if [ ! -f \"$CHECKER\" ]; then\n"
-            "              CHECKER=bootstrap-supply-chain/.github/scripts/check_supply_chain.py\n"
-            "            fi\n",
-            1,
-        )
-        violations = check_supply_chain.trusted_supply_chain_policy_violations(
-            with_fallback
-        )
-        self.assertTrue(
-            any("only from the protected default branch" in item for item in violations),
-            violations,
-        )
-
     def test_cargo_audit_gate_runs_the_default_branch_checker_and_policy(self):
         workflow = (ROOT / ".github/workflows/security.yml").read_text(
             encoding="utf-8"
@@ -2866,145 +2836,6 @@ class SupplyChainPolicyTests(unittest.TestCase):
             ),
             violations,
         )
-
-    def test_security_policy_must_execute_the_default_branch_checker(self):
-        secure = "\n".join(
-            [
-                "if: github.event_name == 'pull_request'",
-                "ref: ${{ github.event.repository.default_branch }}",
-                "path: trusted-supply-chain",
-                "CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py",
-                "Candidate must retain the regular-file supply-chain checker.",
-                "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
-                'python3 -I - "$CHECKER" "$GITHUB_WORKSPACE" <<\'PY\'',
-                "module.ROOT = candidate",
-                'module.WORKFLOWS = candidate / ".github" / "workflows"',
-                "module.ACTION_FILES = sorted(",
-                "sys.argv = [str(checker)]",
-                "raise SystemExit(module.main())",
-            ]
-        )
-        self.assertEqual(
-            check_supply_chain.trusted_supply_chain_policy_violations(secure), []
-        )
-
-        insecure = secure.replace(
-            "ref: ${{ github.event.repository.default_branch }}",
-            "ref: ${{ github.event.pull_request.base.sha }}",
-        )
-        violations = check_supply_chain.trusted_supply_chain_policy_violations(
-            insecure
-        )
-        self.assertTrue(any("missing" in item for item in violations))
-        self.assertTrue(any("unprotected PR base" in item for item in violations))
-
-    def test_security_policy_runner_must_be_isolated_from_the_candidate(self):
-        # GHSA-x5m2-4555-q4cr: the runner executes in the candidate checkout,
-        # and a plain `python3 -` imports candidate root modules first.
-        workflow = (ROOT / ".github/workflows/security.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertEqual(
-            check_supply_chain.TRUSTED_POLICY_RUNNER,
-            'python3 -I - "$CHECKER" "$GITHUB_WORKSPACE"',
-        )
-        self.assertEqual(workflow.count(check_supply_chain.TRUSTED_POLICY_RUNNER), 1)
-        self.assertEqual(
-            check_supply_chain.trusted_supply_chain_policy_violations(workflow), []
-        )
-
-        importable = workflow.replace(
-            check_supply_chain.TRUSTED_POLICY_RUNNER,
-            'python3 - "$CHECKER" "$GITHUB_WORKSPACE"',
-            1,
-        )
-        self.assertNotEqual(importable, workflow)
-        violations = check_supply_chain.trusted_supply_chain_policy_violations(
-            importable
-        )
-        self.assertTrue(
-            any(
-                "missing" in item and "python3 -I -" in item for item in violations
-            ),
-            violations,
-        )
-
-        # Keeping the isolated line while adding a second, plain run of the
-        # same checker reopens the import path.
-        doubled = workflow.replace(
-            check_supply_chain.TRUSTED_POLICY_RUNNER,
-            'python3 - "$CHECKER" "$GITHUB_WORKSPACE" </dev/null || true\n'
-            "            " + check_supply_chain.TRUSTED_POLICY_RUNNER,
-            1,
-        )
-        self.assertNotEqual(doubled, workflow)
-        violations = check_supply_chain.trusted_supply_chain_policy_violations(
-            doubled
-        )
-        self.assertTrue(
-            any("invoked exactly once" in item for item in violations), violations
-        )
-
-        anchor = "        env:\n          EVENT_NAME: ${{ github.event_name }}\n"
-        self.assertIn(anchor, workflow)
-        for variable in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"):
-            with self.subTest(variable=variable):
-                redirected = workflow.replace(
-                    anchor, anchor + f"          {variable}: ${{{{ github.workspace }}}}\n", 1
-                )
-                violations = check_supply_chain.trusted_supply_chain_policy_violations(
-                    redirected
-                )
-                self.assertTrue(
-                    any(
-                        "must not set" in item and variable in item
-                        for item in violations
-                    ),
-                    violations,
-                )
-
-    def test_candidate_root_modules_cannot_preempt_the_trusted_checker(self):
-        # Hostile candidate-root modules named after what the runner and the
-        # checker import. Without `-I` one of them runs first and exits green;
-        # with it the trusted checker runs and still reports a real violation.
-        runner = self._trusted_policy_runner_source()
-        hostile = (
-            "import os\n"
-            "print('shadowed', flush=True)\n"
-            "os._exit(0)\n"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            candidate = self._mirror_repo(Path(directory))
-            for module in ("pathlib.py", "argparse.py", "json.py", "re.py"):
-                (candidate / module).write_text(hostile, encoding="utf-8")
-            # A known violation the trusted checker must still find.
-            path = candidate / ".github/workflows/rotate.yml"
-            text = path.read_text(encoding="utf-8")
-            start = text.index(
-                "      - name: Refresh protected branch and reject stale deployments"
-            )
-            end = text.index("      - name: ", start + 20)
-            path.write_text(text[:start] + text[end:], encoding="utf-8")
-
-            def run(flags: list[str]) -> subprocess.CompletedProcess:
-                return subprocess.run(
-                    [sys.executable, *flags, "-", str(SCRIPT), str(candidate)],
-                    input=runner,
-                    cwd=str(candidate),
-                    check=False,
-                    text=True,
-                    capture_output=True,
-                )
-
-            shadowed = run([])
-            isolated = run(["-I"])
-        # The planted modules really are reachable without isolation...
-        self.assertEqual(shadowed.returncode, 0, shadowed.stdout + shadowed.stderr)
-        self.assertIn("shadowed", shadowed.stdout)
-        # ...and isolated mode runs the trusted checker, which rejects the tree.
-        self.assertEqual(isolated.returncode, 1, isolated.stdout + isolated.stderr)
-        self.assertNotIn("shadowed", isolated.stdout)
-        self.assertIn("must refresh the protected branch", isolated.stderr)
 
     # -- GHSA-x5m2-4555-q4cr tier 2: the protected-definition policy check --
 
@@ -7954,36 +7785,24 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertNotIn("security-supply-chain-policy", jobs)
         self.assertNotIn("ACCEPTED_CHECKS", check_supply_chain.RELEASE_GATE_PINS)
 
-    def test_the_helper_may_move_to_the_retired_shape(self):
-        # #701 expand step: the shipped helper still binds ACCEPTED_CHECKS and
-        # requires the retired context; a helper without ACCEPTED_CHECKS that
-        # requires exactly the launch list is accepted too, and each shape is
-        # held to its own lists.
+    def test_the_helper_requires_exactly_the_launch_list(self):
+        # #701: the helper requires exactly the six launch contexts. Dropping
+        # one, or bringing back the retired `security-supply-chain-policy`, is
+        # refused.
         source = (ROOT / check_supply_chain.RELEASE_GATE_HELPER).read_text(encoding="utf-8")
-        before = check_supply_chain.RELEASE_GATE_PINS_BEFORE_RETIRE
-        old_required = "REQUIRED_CHECKS = (\n" + "".join(
-            f'    "{context}",\n' for context in before["REQUIRED_CHECKS"]
-        ) + ")"
-        new_required = "REQUIRED_CHECKS = (\n" + "".join(
+        required = "REQUIRED_CHECKS = (\n" + "".join(
             f'    "{context}",\n' for context in check_supply_chain.RELEASE_GATE_REQUIRED_CHECKS
         ) + ")"
-        accepted = "ACCEPTED_CHECKS = (\n" + "".join(
-            f'    "{context}",\n' for context in before["ACCEPTED_CHECKS"]
-        ) + ")"
-        self.assertEqual(source.count(old_required), 1)
-        self.assertEqual(source.count(accepted), 1)
-        retired = (
-            source.replace(old_required, new_required)
-            .replace(accepted, "")
-            .replace("ACCEPTED_CHECKS", "()")
-        )
-        self.assertEqual(self._helper_violations(retired), [])
+        self.assertEqual(source.count(required), 1)
+        self.assertEqual(self._helper_violations(source), [])
+        retired = '    "Security / security-supply-chain-policy",\n'
+        cargo_audit = '    "Security / security-cargo-audit",\n'
         for name, changed in (
-            ("dropped check", retired.replace('    "Security / security-cargo-audit",\n', "", 1)),
-            ("retired context kept", source.replace(accepted, "").replace("ACCEPTED_CHECKS", "()")),
-            ("new list with old tolerance", source.replace(old_required, new_required)),
+            ("dropped check", source.replace(cargo_audit, "", 1)),
+            ("retired context added", source.replace(cargo_audit, cargo_audit + retired, 1)),
         ):
             with self.subTest(name=name):
+                self.assertNotEqual(changed, source)
                 self.assertTrue(
                     any(
                         "REQUIRED_CHECKS must be assigned exactly" in item
@@ -8235,16 +8054,6 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             if f"uses: {current_pin}" in workflow:
                 return workflow.replace(f"uses: {current_pin}", f"uses: {pin}", 1)
         self.fail("security.yml must use the reviewed cargo-audit installer pin")
-
-    def _trusted_policy_runner_source(self) -> str:
-        """The inline runner `security.yml` feeds the trusted checker."""
-        workflow = (ROOT / ".github/workflows/security.yml").read_text(
-            encoding="utf-8"
-        )
-        start = workflow.index(check_supply_chain.TRUSTED_POLICY_RUNNER + " <<'PY'\n")
-        body = workflow.index("\n", start) + 1
-        end = workflow.index("\n          PY\n", body)
-        return textwrap.dedent(workflow[body:end]) + "\n"
 
     def _mirror_repo(self, root: Path) -> Path:
         """Copy the policy-relevant tree so a test can mutate one file.

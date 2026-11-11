@@ -31,24 +31,28 @@ CHECKER_SPEC.loader.exec_module(check_supply_chain)
 REQUIRED = [
     "Rust CI / rust-ci-check",
     "Security / security-cargo-audit",
-    "Security / security-supply-chain-policy",
+    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "GitForgeOps State Guard / state-guard-reject-state-edits",
     "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-]
-# Being added to the ruleset (GHSA-x5m2-4555-q4cr): tolerated while absent,
-# but a reported result must pass.
-ACCEPTED = [
-    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "Agent Setup Policy / validate-trusted-policy",
 ]
+# The two launch contexts whose workflows `pull_request_target` loads from the
+# protected branch.
+TRUSTED_POLICY_CHECK = {
+    "bucket": "pass",
+    "name": "trusted-supply-chain-policy",
+    "workflow": "GitForgeOps Supply-Chain Policy",
+    "required": True,
+}
+AGENT_POLICY_CHECK = {
+    "bucket": "pass",
+    "name": "validate-trusted-policy",
+    "workflow": "Agent Setup Policy",
+    "required": True,
+}
 
 PASSING_CHECKS = [
-    {
-        "bucket": "pass",
-        "name": "security-supply-chain-policy",
-        "workflow": "Security",
-        "required": True,
-    },
+    TRUSTED_POLICY_CHECK,
     {
         "bucket": "pass",
         "name": "gitforgeops-required-static-validation",
@@ -68,19 +72,13 @@ PASSING_CHECKS = [
         "workflow": "GitForgeOps State Guard",
         "required": True,
     },
+    AGENT_POLICY_CHECK,
 ]
-TRUSTED_POLICY_CHECK = {
-    "bucket": "pass",
-    "name": "trusted-supply-chain-policy",
-    "workflow": "GitForgeOps Supply-Chain Policy",
-    "required": False,
-}
-AGENT_POLICY_CHECK = {
-    "bucket": "pass",
-    "name": "validate-trusted-policy",
-    "workflow": "Agent Setup Policy",
-    "required": False,
-}
+
+
+def without(*removed: dict) -> list[dict]:
+    """PASSING_CHECKS without the given launch checks."""
+    return [check for check in PASSING_CHECKS if check not in removed]
 
 HEAD_SHA = "b" * 40
 RELEASE_SHA = "a" * 40
@@ -130,7 +128,7 @@ def full_run_page() -> list[dict]:
     history = passing_runs()
     return history + [
         dict(history[2], id=identifier, conclusion="failure")
-        for identifier in range(1, 96)
+        for identifier in range(1, 101 - len(history))
     ]
 
 
@@ -255,7 +253,11 @@ class ReleaseGateWiringTests(unittest.TestCase):
 
     def test_the_helper_pins_the_launch_lists_and_budget(self) -> None:
         self.assertEqual(list(release_gate.REQUIRED_CHECKS), REQUIRED)
-        self.assertEqual(list(release_gate.ACCEPTED_CHECKS), ACCEPTED)
+        self.assertEqual(
+            list(release_gate.REQUIRED_CHECKS),
+            list(check_supply_chain.RELEASE_GATE_REQUIRED_CHECKS),
+        )
+        self.assertNotIn("Security / security-supply-chain-policy", REQUIRED)
         self.assertEqual(release_gate.ACTIONS_APP_ID, 15368)
         self.assertEqual(release_gate.BUDGET_SECONDS, 900)
         self.assertEqual(release_gate.POLL_SECONDS, 15)
@@ -509,57 +511,41 @@ class ReleaseGateBehavior:
         ]
         self.assert_gate(checks, False)
 
-    def test_the_trusted_policy_check_may_be_absent_before_the_ruleset_switch(self) -> None:
-        # The ruleset gains `trusted-supply-chain-policy` in an operator step
-        # after its workflow merges; until then `--required` does not list it.
-        self.assert_gate(PASSING_CHECKS, True)
-        self.assert_gate(PASSING_CHECKS + [TRUSTED_POLICY_CHECK], True)
+    def test_each_missing_launch_check_is_rejected(self) -> None:
+        # #701: the protected-definition checks are required like the others,
+        # never tolerated while absent.
+        for check in PASSING_CHECKS:
+            with self.subTest(check=check["name"]):
+                self.assert_gate(without(check), False)
 
-    def test_a_passing_trusted_check_still_allows_unrelated_optional_failures(self) -> None:
-        checks = PASSING_CHECKS + [
-            TRUSTED_POLICY_CHECK,
-            {"bucket": "fail", "name": "coverage", "workflow": "Rust CI"},
-        ]
-        self.assert_gate(checks, True)
-
-    def test_a_reported_trusted_policy_check_must_pass(self) -> None:
+    def test_a_reported_policy_check_must_pass(self) -> None:
         for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
             for bucket in ("fail", "pending", "skipping", "cancel"):
                 with self.subTest(check=policy["name"], bucket=bucket):
-                    reported = dict(policy, bucket=bucket)
-                    # The stub excludes this optional record from --required,
-                    # and the ruleset does not list it yet. Only the actual
-                    # second gh invocation can reveal it.
-                    self.assert_gate(
-                        PASSING_CHECKS + [reported], False, settings=rules(*REQUIRED)
-                    )
+                    self.assert_gate(without(policy) + [dict(policy, bucket=bucket)], False)
 
-    def test_a_passing_agent_policy_check_is_accepted_before_the_ruleset_switch(self) -> None:
-        self.assert_gate(
-            PASSING_CHECKS + [AGENT_POLICY_CHECK], True, settings=rules(*REQUIRED)
+    def test_the_retired_security_context_is_not_required(self) -> None:
+        # #701 retire step: `security-supply-chain-policy` no longer runs, and
+        # the gate passes without it.
+        self.assertNotIn(
+            "security-supply-chain-policy", [check["name"] for check in PASSING_CHECKS]
         )
+        self.assert_gate(PASSING_CHECKS, True, settings=rules(*REQUIRED))
 
-    def test_the_trusted_policy_check_is_verified_after_the_ruleset_switch(self) -> None:
-        for bucket in ("pass", "fail", "pending"):
-            with self.subTest(bucket=bucket):
-                reported = dict(TRUSTED_POLICY_CHECK, bucket=bucket, required=True)
-                self.assert_gate(PASSING_CHECKS + [reported], bucket == "pass")
-
-    def test_the_trusted_policy_check_does_not_replace_the_retiring_one(self) -> None:
-        # Expand step: the in-tree job still runs the workflow-script tests and
-        # stays required until the retire step.
-        without_old = [
-            check for check in PASSING_CHECKS if check["name"] != "security-supply-chain-policy"
-        ]
-        self.assert_gate(without_old + [TRUSTED_POLICY_CHECK], False)
+    def test_a_ruleset_missing_a_policy_context_fails_immediately(self) -> None:
+        for context in (REQUIRED[2], REQUIRED[5]):
+            with self.subTest(context=context):
+                settings = rules(*[item for item in REQUIRED if item != context])
+                self.assert_gate(PASSING_CHECKS, False, settings=settings)
+                self.assertEqual(self.sleeps, [])
 
     def test_a_passing_duplicate_cannot_mask_a_failing_trusted_result(self) -> None:
-        # Every reported result under the accepted context must pass, so a
-        # second, passing check run with the same name changes nothing.
+        # Every reported result under a launch context must pass, so a second,
+        # passing check run with the same name changes nothing.
         failing = dict(TRUSTED_POLICY_CHECK, bucket="fail")
         for order in ([TRUSTED_POLICY_CHECK, failing], [failing, TRUSTED_POLICY_CHECK]):
             with self.subTest(order=[check["bucket"] for check in order]):
-                self.assert_gate(PASSING_CHECKS + order, False)
+                self.assert_gate(without(TRUSTED_POLICY_CHECK) + order, False)
 
     def test_check_lookup_errors_fail_closed_even_with_valid_json_stdout(self) -> None:
         for mode in ("required", "all"):
@@ -772,25 +758,20 @@ class ReleaseGateBehavior:
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
 
-    def test_pending_transitional_checks_wait_then_pass(self) -> None:
+    def test_pending_policy_checks_wait_then_pass(self) -> None:
         for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
             with self.subTest(check=policy["name"]):
-                pending = PASSING_CHECKS + [dict(policy, bucket="pending")]
-                passing = PASSING_CHECKS + [policy]
-                result = self.run_gate(
-                    PASSING_CHECKS, samples=[pending, passing], settings=rules(*REQUIRED)
-                )
+                pending = without(policy) + [dict(policy, bucket="pending")]
+                result = self.run_gate(PASSING_CHECKS, samples=[pending, PASSING_CHECKS])
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.sleeps, [["sleep", "15"]])
 
-    def test_pending_transitional_checks_wait_then_fail(self) -> None:
+    def test_pending_policy_checks_wait_then_fail(self) -> None:
         for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
             with self.subTest(check=policy["name"]):
-                pending = PASSING_CHECKS + [dict(policy, bucket="pending")]
-                failed = PASSING_CHECKS + [dict(policy, bucket="cancel")]
-                result = self.run_gate(
-                    PASSING_CHECKS, samples=[pending, failed], settings=rules(*REQUIRED)
-                )
+                pending = without(policy) + [dict(policy, bucket="pending")]
+                failed = without(policy) + [dict(policy, bucket="cancel")]
+                result = self.run_gate(PASSING_CHECKS, samples=[pending, failed])
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.sleeps, [["sleep", "15"]])
 
@@ -819,31 +800,34 @@ class ReleaseGateBehavior:
         self.assertEqual(self.sleeps, [])
         self.assertIn("Timed out", result.stderr)
 
-    def test_an_absent_trusted_policy_check_cannot_pass_once_required(self) -> None:
+    def test_absent_policy_checks_cannot_pass(self) -> None:
         result = self.run_gate(
-            PASSING_CHECKS, settings=rules(*REQUIRED, *ACCEPTED), sleep_advance=900
+            without(TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK),
+            settings=rules(*REQUIRED),
+            sleep_advance=900,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
         self.assertIn("Timed out", result.stderr)
 
-    def test_a_missing_required_trusted_check_waits_then_passes(self) -> None:
-        trusted = dict(TRUSTED_POLICY_CHECK, required=True)
-        agent_policy = dict(AGENT_POLICY_CHECK, required=True)
+    def test_missing_policy_checks_wait_then_pass(self) -> None:
         result = self.run_gate(
             PASSING_CHECKS,
-            settings=rules(*REQUIRED, *ACCEPTED),
-            samples=[PASSING_CHECKS, PASSING_CHECKS + [trusted, agent_policy]],
+            settings=rules(*REQUIRED),
+            samples=[without(TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK), PASSING_CHECKS],
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
 
     def test_missing_required_contexts_on_page_two_cannot_pass_by_absence(self) -> None:
-        first_page = rules(*REQUIRED) + [{"type": "deletion"}] * 99
-        for context in (*ACCEPTED, "Rust CI / coverage"):
-            with self.subTest(context=context):
+        coverage = {"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}
+        for check in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK, coverage):
+            with self.subTest(check=check["name"]):
+                context = f"{check['workflow']} / {check['name']}"
+                first_page = rules(*[item for item in REQUIRED if item != context])
+                first_page += [{"type": "deletion"}] * (100 - len(first_page))
                 result = self.run_gate(
-                    PASSING_CHECKS,
+                    without(check),
                     rule_pages=[first_page, rules(context)],
                     sleep_advance=900,
                 )
@@ -852,16 +836,17 @@ class ReleaseGateBehavior:
                 self.assertIn("Timed out", result.stderr)
 
     def test_required_contexts_on_page_two_wait_then_pass(self) -> None:
-        first_page = rules(*REQUIRED) + [{"type": "deletion"}] * 99
         extra = {"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}
         for check in (TRUSTED_POLICY_CHECK, extra):
             with self.subTest(check=check):
                 required = dict(check, required=True)
                 context = f"{check['workflow']} / {check['name']}"
+                first_page = rules(*[item for item in REQUIRED if item != context])
+                first_page += [{"type": "deletion"}] * (100 - len(first_page))
                 result = self.run_gate(
                     PASSING_CHECKS,
                     rule_pages=[first_page, rules(context)],
-                    samples=[PASSING_CHECKS, PASSING_CHECKS + [required]],
+                    samples=[without(check), without(check) + [required]],
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.sleeps, [["sleep", "15"]])
@@ -874,7 +859,7 @@ class ReleaseGateBehavior:
                 self.assertEqual(self.sleeps, [])
 
     def test_later_required_settings_are_validated_and_source_bound(self) -> None:
-        for context, app in ((ACCEPTED[0], 42), ("Rust CI / coverage", None)):
+        for context, app in ((REQUIRED[2], 42), ("Rust CI / coverage", None)):
             with self.subTest(context=context, app=app):
                 later = rules(context)
                 later[0]["parameters"]["required_status_checks"][0]["integration_id"] = app
@@ -906,8 +891,8 @@ class ReleaseGateBehavior:
 
     def test_a_required_trusted_check_must_also_appear_in_the_required_lookup(self) -> None:
         result = self.run_gate(
-            PASSING_CHECKS + [TRUSTED_POLICY_CHECK],
-            settings=rules(*REQUIRED, *ACCEPTED),
+            without(TRUSTED_POLICY_CHECK) + [dict(TRUSTED_POLICY_CHECK, required=False)],
+            settings=rules(*REQUIRED),
             sleep_advance=900,
         )
         self.assertNotEqual(result.returncode, 0)
@@ -921,7 +906,8 @@ class ReleaseGateBehavior:
             PASSING_CHECKS,
             samples=[pending, PASSING_CHECKS],
             responses={"RULES": [
-                json.dumps([rules(*REQUIRED)]), json.dumps([rules(*REQUIRED, *ACCEPTED)])
+                json.dumps([rules(*REQUIRED)]),
+                json.dumps([rules(*REQUIRED, "Rust CI / coverage")]),
             ]},
             sleep_advance=450,
         )
@@ -1045,16 +1031,18 @@ class ReleaseGateBehavior:
     def test_newer_retry_evidence_on_another_page_cannot_be_hidden(self) -> None:
         history = passing_runs()
         retry = dict(history[2], id=900, conclusion="cancelled")
+        total = len(history) + 1
         response = json.dumps([
-            {"total_count": 6, "check_runs": [retry]},
-            {"total_count": 6, "check_runs": history},
+            {"total_count": total, "check_runs": [retry]},
+            {"total_count": total, "check_runs": history},
         ])
         self.assert_gate(PASSING_CHECKS, False, responses={"RUNS": [response]})
         self.assertEqual(self.sleeps, [])
 
     def test_passing_cli_cannot_authorize_incomplete_run_history(self) -> None:
-        incomplete = json.dumps([{"total_count": 6, "check_runs": passing_runs()}])
-        complete = json.dumps([{"total_count": 5, "check_runs": passing_runs()}])
+        count = len(passing_runs())
+        incomplete = json.dumps([{"total_count": count + 1, "check_runs": passing_runs()}])
+        complete = json.dumps([{"total_count": count, "check_runs": passing_runs()}])
         result = self.run_gate(PASSING_CHECKS, responses={"RUNS": [incomplete, complete]})
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("incomplete check-run evidence", result.stderr)
@@ -1092,8 +1080,8 @@ class ReleaseGateBehavior:
         # pages because a queued retry raced pagination. Never judge it.
         history = passing_runs()
         inconsistent = json.dumps([
-            {"total_count": 5, "check_runs": history},
-            {"total_count": 6, "check_runs": []},
+            {"total_count": len(history), "check_runs": history},
+            {"total_count": len(history) + 1, "check_runs": []},
         ])
         result = self.run_gate(
             PASSING_CHECKS, responses={"RUNS": [inconsistent]}, sleep_advance=900
@@ -1149,15 +1137,16 @@ class ReleaseGateBehavior:
     def test_history_completeness_is_required_again_after_waiting(self) -> None:
         history = passing_runs()
         retry = dict(history[2], id=900, status="queued", conclusion=None)
-        pending = json.dumps([{"total_count": 6, "check_runs": history + [retry]}])
+        total = len(history) + 1
+        pending = json.dumps([{"total_count": total, "check_runs": history + [retry]}])
         complete = json.dumps([{
-            "total_count": 6,
+            "total_count": total,
             "check_runs": history + [dict(retry, status="completed", conclusion="success")],
         }])
-        incomplete = json.dumps([{"total_count": 6, "check_runs": history}])
+        incomplete = json.dumps([{"total_count": total, "check_runs": history}])
         inconsistent = json.dumps([
-            {"total_count": 5, "check_runs": history},
-            {"total_count": 6, "check_runs": []},
+            {"total_count": len(history), "check_runs": history},
+            {"total_count": total, "check_runs": []},
         ])
         with self.subTest(evidence="incomplete"):
             result = self.run_gate(
@@ -1189,19 +1178,20 @@ class ReleaseGateBehavior:
     def test_duplicate_run_ids_cannot_complete_the_advertised_count(self) -> None:
         history = passing_runs()
         long_history = full_run_page()
+        total = len(history) + 1
         pages = (
-            [{"total_count": 6, "check_runs": history + [history[2]]}],
+            [{"total_count": total, "check_runs": history + [history[2]]}],
             [
-                {"total_count": 6, "check_runs": history},
-                {"total_count": 6, "check_runs": [history[2]]},
+                {"total_count": total, "check_runs": history},
+                {"total_count": total, "check_runs": [history[2]]},
             ],
             [
                 {"total_count": 101, "check_runs": long_history},
                 {"total_count": 101, "check_runs": [long_history[2]]},
             ],
-            # Even when all five distinct IDs are accounted for, overlapping
+            # Even when every distinct ID is accounted for, overlapping
             # pages are inconsistent evidence and must fail closed.
-            [{"total_count": 5, "check_runs": history + [history[2]]}],
+            [{"total_count": len(history), "check_runs": history + [history[2]]}],
         )
         for response in pages:
             with self.subTest(response=response):

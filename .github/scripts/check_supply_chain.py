@@ -3089,12 +3089,11 @@ def security_push_trigger_violations(text: str) -> list[str]:
     return violations
 
 
-# The exact triggers `security.yml` may carry. `security-cargo-audit` and
-# `security-supply-chain-policy` are required contexts defined by this
-# workflow: the organization ruleset runs `main`'s copy on pull requests, but
-# a merged edit becomes `main`'s copy, and without the ruleset the pull
-# request's own copy runs. Every pinned job switches on
-# `github.event_name`. An added trigger — `workflow_dispatch:` above all —
+# The exact triggers `security.yml` may carry. `security-cargo-audit` is a
+# required context defined by this workflow: the organization ruleset runs
+# `main`'s copy on pull requests, but a merged edit becomes `main`'s copy, and
+# without the ruleset the pull request's own copy runs. The pinned job switches
+# on `github.event_name`. An added trigger — `workflow_dispatch:` above all —
 # would run that candidate copy outside `pull_request`, take the `else` branch
 # and post a second result under a required check name from a run no rule
 # reviewed. So the trigger list is part of the pinned shape.
@@ -3110,9 +3109,8 @@ def security_trigger_violations(text: str) -> list[str]:
     """`security.yml` may run on exactly the reviewed triggers.
 
     Read from the strict workflow reader, so the checked list is the one the
-    runner acts on. The required `security-cargo-audit` and
-    `security-supply-chain-policy` jobs switch on `github.event_name`, so an
-    extra trigger would run the candidate's own copy of the workflow on an
+    runner acts on. The required `security-cargo-audit` job switches on
+    `github.event_name`, so an extra trigger would run the candidate's own copy of the workflow on an
     event this policy never reviewed and post another check run under the
     required name. Pin the key set, the pull request types and branch, and the
     push branch.
@@ -3256,86 +3254,6 @@ def validator_locator_violations(texts: list[str]) -> list[str]:
     if "FERRUM_EDGE_VERSION" in joined:
         violations.append(
             "workflows must not select the validator by release identity; the reviewed digest allowlist is the pin"
-        )
-    return violations
-
-
-# The runner executes inside the candidate checkout. Without `-I`, `python3 -`
-# puts that directory first on `sys.path`, so a candidate root module named
-# after anything the runner or the checker imports (`pathlib.py`,
-# `importlib/`, `argparse.py`) runs before the trusted policy and can exit 0.
-# Isolated mode drops the working directory and the user site directory and
-# ignores every `PYTHON*` environment variable.
-TRUSTED_POLICY_RUNNER = 'python3 -I - "$CHECKER" "$GITHUB_WORKSPACE"'
-TRUSTED_POLICY_RUNNER_ARGUMENTS = '"$CHECKER" "$GITHUB_WORKSPACE"'
-# `-I` already ignores these, but naming one in the policy workflow is still
-# an attempt to move the interpreter's import path or start-up code onto
-# candidate files, and the reviewed workflow has no use for any of them.
-TRUSTED_POLICY_FORBIDDEN_ENV = re.compile(r"\bPYTHON(?:PATH|STARTUP|HOME)\b")
-
-
-def trusted_supply_chain_policy_violations(text: str) -> list[str]:
-    """`security.yml` must run `main`'s checker, isolated, against the candidate.
-
-    This is a substring contract over the candidate's own copy of
-    `security.yml`, enforced by the run that copy defines. It catches an honest
-    regression and a shadowed import; it cannot stop a pull request that
-    rewrites the job itself. `supply-chain-policy.yml` is the workflow whose
-    definition the pull request does not supply (see
-    `supply_chain_policy_workflow_violations`). This job stays, unchanged,
-    until the ruleset requires that workflow's check instead (see
-    docs/github-launch-controls.md).
-    """
-    required = (
-        "if: github.event_name == 'pull_request'",
-        "ref: ${{ github.event.repository.default_branch }}",
-        "path: trusted-supply-chain",
-        "CANDIDATE_CHECKER=.github/scripts/check_supply_chain.py",
-        "Candidate must retain the regular-file supply-chain checker.",
-        "CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py",
-        TRUSTED_POLICY_RUNNER,
-        "module.ROOT = candidate",
-        'module.WORKFLOWS = candidate / ".github" / "workflows"',
-        "module.ACTION_FILES = sorted(",
-        "sys.argv = [str(checker)]",
-        "raise SystemExit(module.main())",
-    )
-    violations = [
-        f"security.yml: trusted supply-chain policy runner is missing {item!r}"
-        for item in required
-        if item not in text
-    ]
-    if text.count("CHECKER=trusted-supply-chain/.github/scripts/check_supply_chain.py") != 1:
-        violations.append(
-            "security.yml: the protected default-branch policy checker must be selected exactly once"
-        )
-    # Exactly one invocation, and it is the isolated one: a second, plain
-    # `python3 -` run of the same checker would reopen the import path.
-    if text.count(TRUSTED_POLICY_RUNNER_ARGUMENTS) != 1:
-        violations.append(
-            "security.yml: the trusted policy checker must be invoked exactly once, "
-            f"as {TRUSTED_POLICY_RUNNER!r}"
-        )
-    forbidden = sorted(set(TRUSTED_POLICY_FORBIDDEN_ENV.findall(text)))
-    if forbidden:
-        violations.append(
-            "security.yml: the policy workflow must not set "
-            f"{', '.join(forbidden)}; the trusted checker's interpreter takes no "
-            "import path or start-up code from the environment"
-        )
-    # The one-time pinned bootstrap covered the window where `main` did not yet
-    # carry this checker. Now that it does, any fallback can only substitute an
-    # older policy for the protected one — which is how a policy change that
-    # the current tree depends on gets silently un-enforced.
-    if "bootstrap-supply-chain" in text:
-        violations.append(
-            "security.yml: the trusted policy checker must come only from the protected default branch"
-        )
-    if "path: trusted-supply-chain" in text and (
-        "ref: ${{ github.event.pull_request.base.sha }}" in text
-    ):
-        violations.append(
-            "security.yml: an unprotected PR base SHA must not supply the policy checker"
         )
     return violations
 
@@ -6297,7 +6215,7 @@ def state_push_retry_violations(workflow: str, text: str, commit_step: str) -> l
 # runs `RELEASE_GATE_HELPER` from it (#473). That code comes from the release
 # commit, which this checker judged on its pull request, so the checker pins
 # what a pull request must not weaken: the helper's exact invocation, the
-# launch check lists, the GitHub Actions App binding and the sampling budget.
+# launch check list, the GitHub Actions App binding and the sampling budget.
 #
 # It also pins a small import, reference and call surface. Those pins catch
 # drift and accidental reach; they are not a sandbox. A value passed through a
@@ -6338,27 +6256,6 @@ RELEASE_GATE_MARKERS = (
 # Module constants of the helper, each bound exactly once, to exactly this.
 RELEASE_GATE_PINS = {
     "REQUIRED_CHECKS": RELEASE_GATE_REQUIRED_CHECKS,
-    "ACTIONS_APP_ID": RELEASE_GATE_APP_ID,
-    "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
-}
-# EXPAND STEP (#701, retiring `security-supply-chain-policy`). release_gate.py
-# still requires the retired context and tolerates the two protected-definition
-# checks while absent (`ACCEPTED_CHECKS`). The trusted check judges a helper
-# edit with `main`'s checker, so the helper moves to the pins above in a
-# follow-up, which also deletes this older shape. A helper that binds
-# `ACCEPTED_CHECKS` is held to it.
-RELEASE_GATE_PINS_BEFORE_RETIRE = {
-    "REQUIRED_CHECKS": (
-        "Rust CI / rust-ci-check",
-        "Security / security-cargo-audit",
-        "Security / security-supply-chain-policy",
-        "GitForgeOps State Guard / state-guard-reject-state-edits",
-        "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-    ),
-    "ACCEPTED_CHECKS": (
-        "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
-        "Agent Setup Policy / validate-trusted-policy",
-    ),
     "ACTIONS_APP_ID": RELEASE_GATE_APP_ID,
     "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
 }
@@ -6565,12 +6462,7 @@ def release_gate_helper_violations(root: Path) -> list[str]:
     except (SyntaxError, UnicodeDecodeError, ValueError) as error:
         return [f"{label}: the helper must parse as Python: {error}"]
     violations: list[str] = []
-    pins = (
-        RELEASE_GATE_PINS_BEFORE_RETIRE
-        if _python_bindings(tree, "ACCEPTED_CHECKS")
-        else RELEASE_GATE_PINS
-    )
-    for name, expected in pins.items():
+    for name, expected in RELEASE_GATE_PINS.items():
         value = _module_constant(tree, name)
         if type(value) is not type(expected) or value != expected:
             violations.append(f"{label}: {name} must be assigned exactly {expected!r}")
@@ -7255,12 +7147,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     security_workflow = (workflows / "security.yml").read_text(encoding="utf-8")
-    # EXPAND STEP (#701). `security-supply-chain-policy` is no longer a
-    # required context; while security.yml still defines the job, it keeps
-    # running the trusted checker. The follow-up that deletes the job also
-    # deletes this pin.
-    if "\n  security-supply-chain-policy:\n" in security_workflow:
-        violations.extend(trusted_supply_chain_policy_violations(security_workflow))
     violations.extend(supply_chain_policy_workflow_violations(root))
     violations.extend(trusted_cargo_audit_policy_violations(security_workflow))
     violations.extend(cargo_audit_install_violations(security_workflow))
