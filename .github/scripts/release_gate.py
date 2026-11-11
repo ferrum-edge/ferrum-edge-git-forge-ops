@@ -16,8 +16,8 @@ gate's verdicts, except where noted below:
 * Each poll brackets its samples with an identity read of the pull request,
   re-reads the effective branch rules, reads the required and the full
   `gh pr checks` rollups and every check run on the merged head, and judges
-  them together. A failed, cancelled or skipped required or transitional check
-  fails at once; skipped is never a pass, which is why a required job in an
+  them together. A failed, cancelled or skipped required check fails at once;
+  skipped is never a pass, which is why a required job in an
   `edited`-triggered workflow must not be skipped by a job-level `if:`.
 * Check-run pages whose advertised totals disagree are a pagination race:
   the sample is not judged, and the gate polls again. Duplicate, conflicting
@@ -42,7 +42,7 @@ It differs from the inline gate only in these cases, each stricter or more robus
 
 Run it from a checkout with `python3 -I .github/scripts/release_gate.py`.
 `gh` reads `GH_TOKEN`; the gate reads `REPO`, `RELEASE_SHA` and
-`DEFAULT_BRANCH`. The supply-chain checker pins the launch check lists, the
+`DEFAULT_BRANCH`. The supply-chain checker pins the launch check list, the
 GitHub Actions App binding and the budget below, and the small import,
 reference and call surface this file uses: only `gh api` and `gh pr checks`,
 and the environment only as a copy. Those pins catch drift, not a deliberate
@@ -66,14 +66,9 @@ from typing import Callable
 REQUIRED_CHECKS = (
     "Rust CI / rust-ci-check",
     "Security / security-cargo-audit",
-    "Security / security-supply-chain-policy",
+    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "GitForgeOps State Guard / state-guard-reject-state-edits",
     "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-)
-# Being added to the ruleset (GHSA-x5m2-4555-q4cr): tolerated while absent,
-# but a reported result must pass, and once required it is waited for.
-ACCEPTED_CHECKS = (
-    "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "Agent Setup Policy / validate-trusted-policy",
 )
 ACTIONS_APP_ID = 15368
@@ -386,8 +381,7 @@ def judge(
     checks = check_contexts(checks_values[0])
     reported = check_contexts(all_values[0])
     settings = required_settings(rules_values[0])
-    launch = REQUIRED_CHECKS + ACCEPTED_CHECKS
-    launch_names = {context_name(context) for context in launch}
+    launch_names = {context_name(context) for context in REQUIRED_CHECKS}
     if any(
         sum(
             1
@@ -401,14 +395,7 @@ def judge(
         for setting in settings
     ):
         raise GateError("launch-required checks must retain their GitHub Actions source binding")
-    watched: dict = {(setting["name"], setting["app"]): setting for setting in settings}
-    for context in ACCEPTED_CHECKS:
-        name = context_name(context)
-        watched.setdefault((name, ACTIONS_APP_ID), {"name": name, "app": ACTIONS_APP_ID})
     setting_names = {setting["name"] for setting in settings}
-    required_contexts = REQUIRED_CHECKS + tuple(
-        context for context in ACCEPTED_CHECKS if context_name(context) in setting_names
-    )
     if any(check["name"] not in setting_names for check in checks):
         raise GateError("required check has no source-bound rule")
 
@@ -442,19 +429,19 @@ def judge(
     if len(identities) != pages[0]["total_count"]:
         raise GateError("incomplete check-run evidence")
     latest = []
-    for setting in watched.values():
+    for setting in settings:
         matching = [
             run for run in history
             if run["name"] == setting["name"] and run["app"]["id"] == setting["app"]
         ]
         newest = max(matching, key=lambda run: run["id"]) if matching else None
         latest.append((setting, newest))
-    guarded = checks + [check for check in reported if check["context"] in launch]
+    guarded = checks + [check for check in reported if check["context"] in REQUIRED_CHECKS]
     if any(check["bucket"] not in ("pass", "pending") for check in guarded) or any(
         run is not None and run["status"] == "completed" and run["conclusion"] != "success"
         for _, run in latest
     ):
-        raise GateError("required or transitional check failed, was cancelled or skipped")
+        raise GateError("required check failed, was cancelled or skipped")
     # Runs may arrive after an empty CLI sample. They still cannot authorize
     # it: an empty lookup must be sampled again.
     sampled = {check["context"] for check in checks}
@@ -462,9 +449,9 @@ def judge(
         required_missing
         or all_missing
         or any(check["bucket"] == "pending" for check in checks)
-        or any(context not in sampled for context in required_contexts)
+        or any(context not in sampled for context in REQUIRED_CHECKS)
         or any(check["bucket"] == "pending" for check in guarded)
-        or any(run is None and setting in settings for setting, run in latest)
+        or any(run is None for _, run in latest)
         or any(run is not None and run["status"] != "completed" for _, run in latest)
     ):
         return "wait"

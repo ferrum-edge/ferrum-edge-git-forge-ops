@@ -54,9 +54,11 @@ jobs:
       # resolves that binding before any of its steps run, so the name is checked here,
       # in a job it `needs`: a safe path component, and never `release`, the
       # reviewer-free environment that holds only release.yml's registry
-      # credentials (any letter case; GitHub compares environment names
-      # case-insensitively). check_supply_chain.py pins this step, its
-      # explicit shell, and the absence of any defaults or env around it.
+      # credentials, or `settings-audit`, the reviewer-free environment that
+      # holds only the settings audit token (any letter case; GitHub compares
+      # environment names case-insensitively). check_supply_chain.py pins this
+      # step, its explicit shell, and the absence of any defaults or env
+      # around it.
       - name: Refuse an unsafe or reserved environment input
         shell: bash
         env:
@@ -69,6 +71,10 @@ jobs:
           }
           if [ "$(printf '%s' "$INPUT_ENVIRONMENT" | tr '[:upper:]' '[:lower:]')" = release ]; then
             echo "::error::release holds the registry credentials and is not a deployment environment."
+            exit 1
+          fi
+          if [ "$(printf '%s' "$INPUT_ENVIRONMENT" | tr '[:upper:]' '[:lower:]')" = settings-audit ]; then
+            echo "::error::settings-audit holds the settings audit token and is not a deployment environment."
             exit 1
           fi
 

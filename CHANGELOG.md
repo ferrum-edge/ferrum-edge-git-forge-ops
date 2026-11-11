@@ -7,6 +7,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The `security-supply-chain-policy` job is retired (#701). `security.yml`'s
+  new `security-workflow-scripts` job runs the workflow-script unit tests and
+  the tree's own `check_supply_chain.py`; it is not a required context, and
+  the candidate-run policy runner is gone. The release gate requires exactly
+  the six launch contexts, `trusted-supply-chain-policy` and
+  `validate-trusted-policy` included, instead of tolerating those two while
+  absent. Remove `security-supply-chain-policy` from the `main` ruleset's
+  required checks (by hand or by re-running the bootstrap) once this is on
+  `main`: nothing reports it any more.
 - `review --fail-on-blockers` no longer fails on missing `alloc=require` slots
   when no credential bundle is loaded (#688). The review verdict already
   reports them as undecidable ("bundle unavailable"); `plan` and `apply` still
@@ -473,6 +482,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- `release.yml`'s inert `paths-ignore` entries under its tag-only push
+  trigger (#700). GitHub never applies path filters to tag pushes.
+- The unused `.claude/skills/sol-agents/agent-brief.md` and
+  `continuation-brief.md` copies of the Sol briefs (#706).
 - `lifecycle_result.py declare` and `verify --max-age-hours`, which nothing
   used; `verify` always applies the 72-hour window `attest` uses (#703).
 - `check_agent_setup.py` no longer requires the `.claude/skills/sol-agents/`
@@ -715,6 +728,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- `rotate.yml` and `materialize-file.yml` refuse `settings-audit` in any
+  letter case as a dispatch environment, so a dispatch can no longer bind
+  the reviewer-free audit-token environment (GHSA-jx32-rxh5-5q25).
+  `check_supply_chain.py` no longer accepts their guard without that refusal.
 - `bootstrap_repo_settings.py` refuses a deployment environment named
   `settings-audit` in any letter case. `audit_settings.py` matches that name
   case-insensitively and fails when the audit-token environment holds any

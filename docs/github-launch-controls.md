@@ -76,7 +76,7 @@ stay red on `main` until the settings behind them exist:
 | Workflow | Red until | Section |
 | --- | --- | --- |
 | `Release` | the `main` ruleset declares required checks. Until then `gh pr checks --required` exits non-zero with "no required checks reported", so every `v*` tag fails the publication gate. | [§2](#2-protect-main-with-an-active-ruleset) |
-| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template), the `main` ruleset binds `state-guard-reject-state-edits` (and, once required, `trusted-supply-chain-policy` and `validate-trusted-policy`) to the GitHub Actions app, and an organization ruleset requires every workflow that reports a required check by path, with the `main` ruleset's bypass actors | [§1](#1-create-the-state-writer-github-app), [§2](#switching-the-supply-chain-policy-check), [§2a](#2a-require-the-trusted-workflows-by-path), [§5](#5-enable-settings-drift-monitoring) |
+| `GitHub Settings Audit` | the `settings-audit` environment exists and holds `SETTINGS_AUDIT_TOKEN`, repository variable `GITFORGEOPS_STATE_APP_ID` is set (or `GITFORGEOPS_TEMPLATE_REPO=true` on a template), the `main` ruleset binds `state-guard-reject-state-edits`, `trusted-supply-chain-policy` and `validate-trusted-policy` to the GitHub Actions app, and an organization ruleset requires every workflow that reports a required check by path, with the `main` ruleset's bypass actors | [§1](#1-create-the-state-writer-github-app), [§2](#switching-the-supply-chain-policy-check), [§2a](#2a-require-the-trusted-workflows-by-path), [§5](#5-enable-settings-drift-monitoring) |
 
 Neither workflow may assume a control it cannot verify. Configure §1-§5 first
 and neither goes red.
@@ -177,7 +177,8 @@ no other include or exclude patterns. It must:
 - block deletion and non-fast-forward updates;
 - reject `[skip ci]` in commit messages (a `commit_message_pattern` rule with
   `negate: true`). That marker suppresses every workflow, required checks
-  included; `release.yml` uses `paths-ignore` for ledger commits instead;
+  included. Ledger commits need no marker: `release.yml` publishes only on
+  `v*` tags;
 - require at least these GitHub Actions job names. Ruleset contexts use the job
   name, not the `Workflow / job` label shown on a PR:
   - `rust-ci-check`
@@ -245,9 +246,9 @@ of the pinned bindings in `COMPUTED_ENVIRONMENT_BINDINGS`: the matrix values
 `gitforgeops envs` enumerates from the protected configuration, and the
 `rotate.yml` / `materialize-file.yml` dispatch input, which their `preflight`
 job refuses (in a pinned `shell: bash` step) when it is not a safe name or is
-`release`. Each matrix's producer (job output and step script) is pinned as
-well, and no `defaults:`, `env:`, `container:` or `continue-on-error` may
-apply to a pinned producer or guard. Reusable-workflow call jobs are refused,
+`release` or `settings-audit`. Each matrix's producer (job output and step
+script) is pinned as well, and no `defaults:`, `env:`, `container:` or
+`continue-on-error` may apply to a pinned producer or guard. Reusable-workflow call jobs are refused,
 because a called workflow could bind `release` where the policy cannot read
 it. The settings audit checks the environment, its secrets and the secret
 scope (section 5).
@@ -262,12 +263,12 @@ workflow could read until now.
 
 ### Switching the supply-chain policy check
 
-The supply-chain verdict is moving from `security-supply-chain-policy` (in
+The supply-chain verdict moved from `security-supply-chain-policy` (in
 `security.yml`, whose definition the pull request under review supplies
 unless the organization ruleset in section 2a lists it) to
 `trusted-supply-chain-policy` (in `supply-chain-policy.yml`, which
 `pull_request_target` always loads from the protected branch; see
-[section 4](#4-restrict-github-actions)). It lands in three steps:
+[section 4](#4-restrict-github-actions)). It landed in three steps:
 
 1. **Expand (merged).** `supply-chain-policy.yml` is on `main`.
    `bootstrap_repo_settings.py` writes both contexts. `audit_settings.py`
@@ -279,15 +280,19 @@ unless the organization ruleset in section 2a lists it) to
 2. **Ruleset switch (operator).** Add `trusted-supply-chain-policy` to the
    `main` ruleset and bind the required contexts to GitHub Actions, as
    described below.
-3. **Retire (in progress, #701).** The audit and bootstrap require only the
-   new context (merged): a ruleset that still lists
-   `security-supply-chain-policy` passes the audit, so an administrator can
-   remove that context from the `main` ruleset at any time, by hand or by
-   re-running the bootstrap. The checker no longer treats it as a required
-   context and accepts a release gate without it. A follow-up pull request
-   moves the workflow-script unit tests out of `security-supply-chain-policy`
-   into their own `security.yml` job, removes the candidate-run policy
-   runner, and makes the release gate require only the new contexts.
+3. **Retire (merged, #701).** The audit and bootstrap require only the new
+   context, and the checker no longer treats `security-supply-chain-policy`
+   as a required context. `security.yml` no longer defines that job: the
+   workflow-script unit tests run in its `security-workflow-scripts` job,
+   which is not a required context, and the candidate-run policy runner is
+   gone. The release gate requires exactly the six contexts listed in
+   [The release gate](#the-release-gate). Because nothing reports
+   `security-supply-chain-policy` any more, a `main` ruleset that still lists
+   it holds every pull request waiting for it: remove it right after the
+   retire step merges, by hand (**Settings → Rules → Rulesets → main →
+   Require status checks to pass**) or by re-running the bootstrap, which
+   writes only the six contexts. A ruleset that still lists it passes the
+   audit.
 
 Take step 2 after step 1 has merged, as an administrator:
 
@@ -298,17 +303,16 @@ Take step 2 after step 1 has merged, as an administrator:
    (a branch from before it lacks the workflow file, so the check fails).
    Confirm that `GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy`
    appears and passes.
-3. Add the context **without removing `security-supply-chain-policy`**. That
-   job still runs the workflow-script unit tests until the retire step. Bind it
-   to the GitHub Actions app: a required context with no source accepts a
-   commit status of that name from anyone with write access, posted with their
-   own token. Either:
+3. Add the context and bind it to the GitHub Actions app: a required context
+   with no source accepts a commit status of that name from anyone with write
+   access, posted with their own token. Either:
    - from an up-to-date checkout of `main`, re-run the bootstrap with the same
      flags you used before (it rewrites the whole `main` ruleset). It writes
      every required context bound to GitHub Actions (`integration_id` 15368).
      Check that the plan's only `main ruleset` change is to
      `rules.required_status_checks.required_status_checks`: it adds
-     `trusted-supply-chain-policy (app 15368)` and moves any existing
+     `trusted-supply-chain-policy (app 15368)`, removes
+     `security-supply-chain-policy` (step 3) and moves any existing
      `(any source)` context to `(app 15368)`. Then apply:
 
      ```bash
@@ -321,8 +325,10 @@ Take step 2 after step 1 has merged, as an administrator:
    - or, by hand: **Settings → Rules → Rulesets → main → Require status checks
      to pass → Add checks**, enter `trusted-supply-chain-policy`, choose GitHub
      Actions as the source, and save. Set GitHub Actions as the source of the
-     other required checks as well.
-4. Confirm the ruleset lists both contexts, each with integration 15368:
+     other required checks as well, and remove `security-supply-chain-policy`
+     (step 3).
+4. Confirm the ruleset lists the six launch contexts, each with integration
+   15368, and no `security-supply-chain-policy`:
 
    ```bash
    gh api repos/owner/repo/rulesets --jq '.[] | select(.target == "branch") | .id' |
@@ -757,7 +763,7 @@ any workflow expression that reaches the whole `secrets` context
 credential broker only ever needs the `FERRUM_CREDS_BUNDLE[_N]` shards, bound
 by name.
 
-The `security-supply-chain-policy` check runs the **protected branch's** copy
+The `trusted-supply-chain-policy` check runs the **protected branch's** copy
 of the checker against the candidate tree, under `python3 -I` so that no module
 in the candidate checkout can load before the trusted policy. A pull request
 therefore cannot weaken the policy by editing the checker: its edits take
@@ -1020,23 +1026,17 @@ What the checker enforces for this check:
   the name through the same app; the `workflows` rule in
   [section 2a](#2a-require-the-trusted-workflows-by-path) does.
 
-Until the `main` ruleset requires `trusted-supply-chain-policy`
-([Switching the supply-chain policy check](#switching-the-supply-chain-policy-check)),
-a green `security-supply-chain-policy` is trustworthy only together with
-exact-head review of every change under `.github/workflows/`.
-
 ### The release gate
 
 `release.yml`'s `authorize-release` job publishes only a commit that maps to
 exactly one merged pull request whose launch-required checks passed on its
 head, each bound to the GitHub Actions app: `rust-ci-check`,
-`security-cargo-audit`, `security-supply-chain-policy`,
-`state-guard-reject-state-edits` and `gitforgeops-required-static-validation`,
-plus `trusted-supply-chain-policy` and the Agent Setup Policy's
-`validate-trusted-policy` (`ACCEPTED_CHECKS`): each may be absent until the
-`main` ruleset requires it, but once it is reported or required it must pass,
-and a required one that has not reported yet is waited for. The job
-checks out the release commit and runs `.github/scripts/release_gate.py` from
+`security-cargo-audit`, `trusted-supply-chain-policy`,
+`state-guard-reject-state-edits`, `gitforgeops-required-static-validation`
+and the Agent Setup Policy's `validate-trusted-policy` (`REQUIRED_CHECKS`).
+Every one must be required by the `main` ruleset and pass, and one that has
+not reported yet is waited for, as is any other context the ruleset requires.
+The job checks out the release commit and runs `.github/scripts/release_gate.py` from
 it (#473).
 
 The gate's code comes from the release commit, which the checker judged on its
@@ -1050,9 +1050,9 @@ weaken:
   and job set no `env` or `defaults`. It is the job's second step, right after
   a plain `actions/checkout` of the release commit with only
   `persist-credentials: false`, and the helper must exist.
-- **Launch lists, app and budget.** `REQUIRED_CHECKS`, `ACCEPTED_CHECKS`,
-  `ACTIONS_APP_ID` and `BUDGET_SECONDS` are each assigned their pinned value
-  once at module level, never rebound, and read.
+- **Launch list, app and budget.** `REQUIRED_CHECKS`, `ACTIONS_APP_ID` and
+  `BUDGET_SECONDS` are each assigned their pinned value once at module level,
+  never rebound, and read.
 - **Imports and references.** The helper imports only `json`, `os`, `re`,
   `subprocess`, `sys`, `time` and `urllib.parse`, plus
   `from __future__ import annotations` and `from typing import Callable`,
@@ -1132,7 +1132,8 @@ still audits its branch policy, fails when it holds any secret but
 `bootstrap_repo_settings.py` creates it on every repository, templates
 included. Because of that waiver the name `settings-audit` is reserved in any
 letter case: `.gitforgeops/config.yaml` and the bootstrap refuse a deployment
-environment of that name.
+environment of that name, and the `rotate.yml` / `materialize-file.yml`
+preflight refuses it as a dispatch input.
 
 `settings-audit.yml` runs only from the default branch. It checks:
 

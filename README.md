@@ -114,7 +114,7 @@ keep its schema in one initial baseline; see the
 | `validator-pin-canary.yml` | daily, manual | Reports a stale validator digest pin. |
 | `base-image-pin-canary.yml` | daily, manual | Watches the Docker base image for fixes. |
 | `rust-ci.yml` | pull request, push | Build, test, lint. |
-| `security.yml` | pull request, push, weekly | Dependency audit and supply-chain policy. |
+| `security.yml` | pull request, push, weekly | Dependency audit and workflow-script tests. |
 | `supply-chain-policy.yml` | pull request (`pull_request_target`) | Trusted supply-chain policy (`trusted-supply-chain-policy`). |
 | `code-scanning.yml` | build-input pull requests and pushes, weekly | CodeQL and container image scan (not required). |
 | `alloy-consumer.yml` | consumer-surface pull requests, weekly, manual | Non-required Alloy consumer qualification. |
