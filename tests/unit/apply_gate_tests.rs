@@ -2523,6 +2523,28 @@ fn review_fail_on_blockers_covers_missing_required_slots() {
     );
 }
 
+#[test]
+fn review_without_a_bundle_leaves_required_slots_to_apply() {
+    // #688: with no bundle every `alloc=require` slot reads as missing. The
+    // verdict cannot decide them ("bundle unavailable"), so the flag must not
+    // fail on them either; `plan` (above) and `apply` still refuse.
+    let repo = Repo::with_consumer(BROKERED_CONSUMER);
+    let rendered = assert_review_verdict_matches_fail_on_blockers(&repo, &["review"], &[], false);
+    assert!(
+        rendered.contains(
+            "1 declared; bundle unavailable, required-slot status must be checked at apply"
+        ),
+        "{rendered}"
+    );
+    let applied = repo.run(&["apply", "--auto-approve"], &[]);
+    assert!(
+        !applied.status.success(),
+        "apply must still refuse the missing slot: {}",
+        stdout(&applied)
+    );
+    assert!(!repo.published().exists());
+}
+
 /// Run `review` with and without `--fail-on-blockers` and assert the rendered
 /// verdict agrees with the exit code the flag derives from `apply_blockers`.
 fn assert_review_verdict_matches_fail_on_blockers(

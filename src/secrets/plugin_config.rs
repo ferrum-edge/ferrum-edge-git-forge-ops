@@ -509,8 +509,6 @@ pub(crate) fn endpoint_scheme(plugin_name: &str, path: &[ConfigPathComponent]) -
         "ldaps"
     } else if says("redis") {
         "redis"
-    } else if says("kafka") || leaf.contains("broker") {
-        "kafka"
     } else {
         "https"
     }

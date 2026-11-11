@@ -4,7 +4,7 @@ use gitforgeops::config::env::{
     load_env_config, validate_gateway_transport, validate_verify_transport, ApplyStrategy,
     EnvConfig, GatewayMode,
 };
-use gitforgeops::jwt::{mint_jwt, JwtOptions};
+use gitforgeops::jwt::{mint_jwt_at, JwtOptions};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
 // Env tests mutate process-global state and must run serially. Cargo's test
@@ -185,7 +185,10 @@ fn gateway_verifies(
 fn mint_from_loaded_env() -> (EnvConfig, String) {
     let config = load_env_config().unwrap();
     let secret = config.admin_jwt_secret.as_deref().unwrap();
-    let token = mint_jwt(secret, &JwtOptions::from_env(&config)).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let token = mint_jwt_at(secret, &JwtOptions::from_env(&config), now)
+        .unwrap()
+        .token;
     (config, token)
 }
 

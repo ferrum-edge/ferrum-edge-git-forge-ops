@@ -9,7 +9,6 @@
 <p align="center">
   <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/rust-ci.yml"><img src="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/rust-ci.yml/badge.svg?branch=main" alt="Rust CI" /></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/security.yml"><img src="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/security.yml/badge.svg?branch=main" alt="Security" /></a>
-  <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/release.yml"><img src="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/workflows/release.yml/badge.svg?branch=main" alt="Release" /></a>
   <a href="https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue" alt="License" /></a>
   <img src="https://img.shields.io/badge/rust-1.99.1-orange?logo=rust" alt="Rust 1.99.1" />
   <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge-git-forge-ops"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge-git-forge-ops" alt="Docker Pulls" /></a>
@@ -117,10 +116,10 @@ keep its schema in one initial baseline; see the
 | `rust-ci.yml` | pull request, push | Build, test, lint. |
 | `security.yml` | pull request, push, weekly | Dependency audit and supply-chain policy. |
 | `supply-chain-policy.yml` | pull request (`pull_request_target`) | Trusted supply-chain policy (`trusted-supply-chain-policy`). |
-| `code-scanning.yml` | pull request, push, weekly | CodeQL and container image scan (not required). |
+| `code-scanning.yml` | build-input pull requests and pushes, weekly | CodeQL and container image scan (not required). |
 | `alloy-consumer.yml` | consumer-surface pull requests, weekly, manual | Non-required Alloy consumer qualification. |
 | `lifecycle.yml` | push, daily, manual | End-to-end acceptance against a real gateway. |
-| `release.yml` | push to `main`, `v*` tag | Publish the container image. |
+| `release.yml` | `v*` tag | Publish the container image. |
 | `agent-setup-ci.yml`, `agent-setup-policy.yml` | pull request | Contributor tooling checks. |
 
 ## GitHub plan requirements
@@ -958,16 +957,19 @@ through reviewed Dependabot PRs. The runtime never runs `apt-get`;
 
 ### Published images
 
-`release.yml` publishes on pushes to `main` (except ledger, `assembled/` and
-`release/` changes) and on `v*` tags, for `linux/amd64` and `linux/arm64`:
+`release.yml` publishes only on `v*` tags, for `linux/amd64` and
+`linux/arm64`:
 
 - `docker.io/ferrumedge/ferrum-edge-git-forge-ops`
 - `ghcr.io/ferrum-edge/ferrum-edge-git-forge-ops`
 
 | Trigger | Tags |
 |---|---|
-| push to `main` | `:latest`, `:main-<sha>` |
-| tag `v0.1.0` | `:0.1.0`, `:0.1`, `:v0.1.0` |
+| tag `v0.1.0` | `:0.1.0`, `:0.1`, `:v0.1.0`, `:latest` |
+
+`:latest` comes from `docker/metadata-action`'s default for a release tag.
+There is no `:main` image: publication needs a lifecycle result an operator
+attested for that exact revision, which an ordinary merge does not have.
 
 Images carry BuildKit provenance and SBOM attestations, and GHCR also gets a
 GitHub-signed provenance attestation. A release requires a lifecycle

@@ -46,6 +46,7 @@ Dockerfile  .dockerignore
 .github/workflows/  .github/scripts/
 .github/ferrum-edge-checksums.txt  .github/cargo-audit-policy.json
 .github/dependabot.yml
+.agents/  .claude/  .gitignore
 .gitforgeops/config.example.yaml  .gitforgeops/policies.example.yaml
 .gitforgeops/smoke.example.yaml  .env.example
 release/  docs/  README.md  CHANGELOG.md  CLAUDE.md  SECURITY.md  LICENSE.md
@@ -60,7 +61,7 @@ resources/  overlays/
 .github/CODEOWNERS
 ```
 
-Three of these deserve a note:
+Four of these deserve a note:
 
 - **`.state/`** is your ownership ledger. Overwriting it with upstream's copy,
   or restoring an old one during a rollback, would describe a gateway you no
@@ -69,6 +70,13 @@ Three of these deserve a note:
 - **`.github/CODEOWNERS`** ships with upstream's maintainers, and setup tells
   you to replace them. Adopting upstream's copy would hand review of your
   launch-critical paths back to people outside your organization.
+- **`.agents/`, `.claude/` and `.gitignore` are upstream-managed** because
+  the required Agent Setup Policy check runs upstream's
+  `.github/scripts/check_agent_setup.py`, and upstream changes that validator
+  and the agent trees together. Adopting one without the other would fail the
+  check on every pull request. A local edit to these files shows up as an
+  ordinary conflict. `AGENTS.md` is a link to `CLAUDE.md`; the updater adopts
+  no links, so it is not listed and `CLAUDE.md` carries its content.
 - **`README.md` is upstream-managed** because it documents the engine and
   changes with it. If you rewrote it for your team, every upstream edit shows
   up as a conflict; keep yours with `--keep README.md`. Putting your own

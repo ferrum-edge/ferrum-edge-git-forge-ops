@@ -57,67 +57,6 @@ pub enum ReviewValidationStatus {
     ExecutionError,
 }
 
-pub fn build_review_comment(
-    validation_success: bool,
-    validation_output: &str,
-    diffs: &[ResourceDiff],
-    breaking: &[BreakingChange],
-    security: &[SecurityFinding],
-    best_practices: &[BestPractice],
-    comparison_error: Option<&str>,
-) -> String {
-    build_review_comment_with_status(
-        if validation_success {
-            ReviewValidationStatus::Passed
-        } else {
-            ReviewValidationStatus::Rejected
-        },
-        validation_output,
-        diffs,
-        breaking,
-        security,
-        best_practices,
-        comparison_error,
-    )
-}
-
-pub fn build_review_comment_with_status(
-    validation_status: ReviewValidationStatus,
-    validation_output: &str,
-    diffs: &[ResourceDiff],
-    breaking: &[BreakingChange],
-    security: &[SecurityFinding],
-    best_practices: &[BestPractice],
-    comparison_error: Option<&str>,
-) -> String {
-    let mut md = build_review_comment_inner(
-        validation_status,
-        validation_output,
-        diffs,
-        breaking,
-        security,
-        best_practices,
-        comparison_error,
-        None,
-        false,
-    );
-    md.insert_str(
-        0,
-        &verdict_summary(
-            validation_status,
-            security,
-            &[],
-            &[],
-            &ResolveReport::default(),
-            false,
-            None,
-            &[],
-            false,
-        ),
-    );
-    finalize_comment(md)
-}
-
 /// A bounded, count-complete verdict precedes every bulk section. Counts use
 /// the full input slices, never the detail caps. Keep this block independent
 /// of environment banners, validator output, and finding message lengths.
@@ -997,7 +936,7 @@ pub fn render_probe_bindings(
 
 /// The "Spec-owned resources" section, or an empty string when there are none.
 ///
-/// Split out from `build_review_comment_v2` so the wording is testable on its
+/// Split out from `build_review_comment_with_preview` so the wording is testable on its
 /// own, and so conflicts (the repo declares a row an API spec owns) get louder
 /// treatment than the merely-informational entries.
 pub fn render_spec_owned(spec_owned: &[SpecOwnedResource]) -> String {
@@ -1044,127 +983,6 @@ pub fn render_spec_owned(spec_owned: &[SpecOwnedResource]) -> String {
     }
 
     md
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_review_comment_v2(
-    validation_success: bool,
-    validation_output: &str,
-    diffs: &[ResourceDiff],
-    breaking: &[BreakingChange],
-    security: &[SecurityFinding],
-    best_practices: &[BestPractice],
-    policy: &[PolicyFinding],
-    unmanaged: &[UnmanagedResource],
-    spec_owned: &[SpecOwnedResource],
-    override_reason: Option<&str>,
-    override_cfg: Option<&OverrideConfig>,
-    comparison_error: Option<&str>,
-    environment_note: Option<&str>,
-    secrets: &ResolveReport,
-    bundle_loaded: bool,
-) -> String {
-    build_review_comment_v2_with_status(
-        if validation_success {
-            ReviewValidationStatus::Passed
-        } else {
-            ReviewValidationStatus::Rejected
-        },
-        validation_output,
-        diffs,
-        breaking,
-        security,
-        best_practices,
-        policy,
-        unmanaged,
-        spec_owned,
-        override_reason,
-        override_cfg,
-        comparison_error,
-        environment_note,
-        secrets,
-        bundle_loaded,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_review_comment_v2_with_status(
-    validation_status: ReviewValidationStatus,
-    validation_output: &str,
-    diffs: &[ResourceDiff],
-    breaking: &[BreakingChange],
-    security: &[SecurityFinding],
-    best_practices: &[BestPractice],
-    policy: &[PolicyFinding],
-    unmanaged: &[UnmanagedResource],
-    spec_owned: &[SpecOwnedResource],
-    override_reason: Option<&str>,
-    override_cfg: Option<&OverrideConfig>,
-    comparison_error: Option<&str>,
-    environment_note: Option<&str>,
-    secrets: &ResolveReport,
-    bundle_loaded: bool,
-) -> String {
-    build_review_comment_v2_with_override(
-        validation_status,
-        validation_output,
-        diffs,
-        breaking,
-        security,
-        best_practices,
-        policy,
-        unmanaged,
-        spec_owned,
-        override_reason,
-        override_cfg,
-        comparison_error,
-        environment_note,
-        secrets,
-        bundle_loaded,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_review_comment_v2_with_override(
-    validation_status: ReviewValidationStatus,
-    validation_output: &str,
-    diffs: &[ResourceDiff],
-    breaking: &[BreakingChange],
-    security: &[SecurityFinding],
-    best_practices: &[BestPractice],
-    policy: &[PolicyFinding],
-    unmanaged: &[UnmanagedResource],
-    spec_owned: &[SpecOwnedResource],
-    override_reason: Option<&str>,
-    override_cfg: Option<&OverrideConfig>,
-    comparison_error: Option<&str>,
-    environment_note: Option<&str>,
-    secrets: &ResolveReport,
-    bundle_loaded: bool,
-    security_override: Option<&OverrideDecision>,
-) -> String {
-    build_review_comment_with_preview(
-        validation_status,
-        validation_output,
-        diffs,
-        breaking,
-        security,
-        best_practices,
-        policy,
-        unmanaged,
-        spec_owned,
-        override_reason,
-        override_cfg,
-        comparison_error,
-        environment_note,
-        secrets,
-        bundle_loaded,
-        security_override,
-        &[],
-        &[],
-        false,
-    )
 }
 
 /// The review comment `cmd_review` posts.

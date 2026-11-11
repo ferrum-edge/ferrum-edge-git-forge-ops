@@ -52,12 +52,27 @@ jobs:
         with:
           persist-credentials: false
 
+      # An unconfigured repository (upstream, a fresh template copy) needs no
+      # binary: `Enumerate environments` emits empty matrices before it calls
+      # one. Skip the toolchain, cache and build so that run takes seconds.
+      - name: Check for repository configuration
+        id: configured
+        run: |
+          set -euo pipefail
+          if [[ -f .gitforgeops/config.yaml ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Rust toolchain
+        if: steps.configured.outputs.present == 'true'
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # pinned action; Rust 1.99.1
         with:
           toolchain: 1.99.1
 
       - name: Cache cargo registry
+        if: steps.configured.outputs.present == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
@@ -67,6 +82,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build gitforgeops
+        if: steps.configured.outputs.present == 'true'
         run: cargo install --path . --locked
 
       - name: Enumerate environments
@@ -305,8 +321,9 @@ jobs:
         # MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and in
         # .github/scripts/credential_bundles.py (16 x ~440 ~= 7,000 slots).
         # Adding capacity means raising both constants and extending this block
-        # in all four privileged workflows; check_supply_chain.py fails the
-        # build when they drift apart.
+        # in all four loader steps (two here, one each in materialize-file.yml
+        # and rotate.yml); check_supply_chain.py fails the build when they
+        # drift apart.
         #
         # The loader writes the filtered payload to a file and the binary reads
         # the PATH from FERRUM_CREDS_JSON_FILE: $GITHUB_ENV materializes into
@@ -963,8 +980,9 @@ jobs:
         # MAX_BUNDLE_SHARDS in src/secrets/bundle.rs and in
         # .github/scripts/credential_bundles.py (16 x ~440 ~= 7,000 slots).
         # Adding capacity means raising both constants and extending this block
-        # in all four privileged workflows; check_supply_chain.py fails the
-        # build when they drift apart.
+        # in all four loader steps (two here, one each in materialize-file.yml
+        # and rotate.yml); check_supply_chain.py fails the build when they
+        # drift apart.
         #
         # The loader writes the filtered payload to a file and the binary reads
         # the PATH from FERRUM_CREDS_JSON_FILE: $GITHUB_ENV materializes into
@@ -1395,10 +1413,11 @@ jobs:
           exit 1
 
   # One GitHub-native record of what was promoted, from what revision, on whose
-  # authority. `always()` so a blocked promotion is reported rather than absent.
+  # authority. `!cancelled()` so a blocked promotion is reported rather than
+  # absent; skipped when both matrices are empty (nothing can have a record).
   promotion-summary:
-    needs: [apply, promote]
-    if: ${{ !cancelled() }}
+    needs: [list-envs, apply, promote]
+    if: ${{ !cancelled() && needs.list-envs.result == 'success' && (needs.list-envs.outputs.envs != '[]' || needs.list-envs.outputs.promotions != '[]') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:

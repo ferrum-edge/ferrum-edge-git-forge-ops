@@ -7,6 +7,41 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `review --fail-on-blockers` no longer fails on missing `alloc=require` slots
+  when no credential bundle is loaded (#688). The review verdict already
+  reports them as undecidable ("bundle unavailable"); `plan` and `apply` still
+  refuse them.
+- The public API no longer carries functions only tests called (#692).
+  Removed: the `build_review_comment*` shapes other than
+  `build_review_comment_with_preview`, `review::validate_for_review`,
+  `report_secrets`, `report_secrets_with_mode`, `report_secrets_with_options`,
+  `resolve_secrets`, `resolve_secrets_with_mode`, `ConsumerLedger::new`,
+  `AdminClient::get_backup`, `NamespaceScope::from_loaded`,
+  `SecretScrubber::is_unsafe_to_scrub`, `verify::probe_credential_slots`,
+  `verify::authorize_probe_credentials`, `ConfigExport::live_view`,
+  `jwt::mint_jwt`, `map_api_error_with_location`, `resource_id_is_path_safe`,
+  `BatchCreated::total`, `BackupExtras::is_empty` and
+  `config::split_config_by_namespace`.
+- Code scanning (CodeQL and the image scan) runs on pull requests only when
+  they touch the paths its push trigger watches (#699). Apply's `list-envs`
+  job skips the Rust toolchain and build when the repository has no
+  `.gitforgeops/config.yaml`, and the promotion summary runs only when a
+  matrix is non-empty.
+- Rust CI routing now includes `.github/workflows/rotate.yml`, and the Alloy
+  consumer qualification also runs for changes to `src/yaml.rs`,
+  `src/plugin_catalog.rs` and `src/json_output.rs` (#698).
+- `release.yml` publishes images only on `v*` tags (#700). Pushes to `main` no
+  longer publish `:latest`/`:main-<sha>`, and failed on every merge because
+  only an operator-attested lifecycle run can certify a revision. `:latest`
+  now moves with release tags. `check_supply_chain.py` and
+  `check_release_baseline.py` refuse a branch trigger on `release.yml`.
+- Template updates now adopt `.agents/`, `.claude/` and `.gitignore` together
+  with the agent-setup validator that judges them (#702). Local edits there
+  show up as ordinary conflicts.
+- The settings audit and bootstrap no longer require the retired
+  `security-supply-chain-policy` context, and a ruleset without
+  `trusted-supply-chain-policy` or `validate-trusted-policy` now fails the
+  audit instead of warning (#701).
 - The default `require_auth_plugin.auth_plugin_names` allowlist is now exactly
   the ten built-in authenticators (#691). It no longer appends fourteen
   non-plugin spellings (`jwt`, `oidc`, `keyauth`, …), so a custom plugin with
@@ -436,8 +471,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   vendored hashes, fixture deserialization, schema envelope fields, and compatibility with
   the qualified Ferrum Edge version.
 
+### Removed
+
+- `lifecycle_result.py declare` and `verify --max-age-hours`, which nothing
+  used; `verify` always applies the 72-hour window `attest` uses (#703).
+- `check_agent_setup.py` no longer requires the `.claude/skills/sol-agents/`
+  copies of the Sol briefs (#706).
+
 ### Fixed
 
+- Full-replace restore errors again show GitForgeOps' own remedy:
+  `--confirm-api-spec-deletion` for API specs at risk,
+  `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` for an oversized body, and "Do NOT
+  re-run apply" after an incomplete rollback (#689). Everything the gateway
+  sent stays withheld.
+- The release gate no longer says lifecycle acceptance "did not pass" when
+  every lifecycle run for the revision was cancelled or skipped; it says no
+  run finished and to dispatch one (#700). Dispatched lifecycle runs have
+  their own concurrency group, so a merge can no longer cancel an operator's
+  attestation run.
+- `test_supply_chain_policy.py` tests the checker's own secrets-expression
+  pattern, and `test_template_update.py` now covers the command-line
+  `--upstream` Git-option guards (#703).
 - The PR review comment's "Apply verdict" no longer says "No evaluated
   blocker" while `review --fail-on-blockers` fails (#688). A narrowed
   file-mode publication, colliding publication paths, invalid smoke checks
@@ -649,8 +704,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   credential migration bundle is written, instead of being published whole. A
   document wholly inside the selection imports as before.
 
+### Performance
+
+- Plan, review and apply analysis builds each document's enabled-plugin index
+  once per pass instead of refiltering every plugin config per proxy.
+  Validator output is scrubbed with one rebuild instead of one copy per
+  matching secret. Consumer slot-identity checks range-scan the bundle, and
+  credential allocation tracks shard sizes instead of re-serializing shards
+  (#694).
+
 ### Security
 
+- `bootstrap_repo_settings.py` refuses a deployment environment named
+  `settings-audit` in any letter case. `audit_settings.py` matches that name
+  case-insensitively and fails when the audit-token environment holds any
+  secret other than `SETTINGS_AUDIT_TOKEN` (GHSA-jx32-rxh5-5q25).
+- `check_supply_chain.py` accepts only taiki-e/install-action v2.90.2 for
+  `security-cargo-audit`. v2.87.29, v2.87.30 and v2.88.1 are retired (#701).
 - `.gitforgeops/config.yaml` refuses a deployment environment named
   `settings-audit` in any letter case (GHSA-jx32-rxh5-5q25). The settings
   audit waives the reviewer and self-review rules for that GitHub Environment

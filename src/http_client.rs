@@ -1010,13 +1010,6 @@ impl AdminClient {
         self.get_conditional_backup(namespace).await
     }
 
-    /// Convenience wrapper for callers that only need the four managed
-    /// resource kinds. Backup-only sections are dropped; use
-    /// [`AdminClient::get_backup_snapshot`] when they matter.
-    pub async fn get_backup(&self, namespace: &str) -> crate::error::Result<GatewayConfig> {
-        Ok(self.get_backup_snapshot(namespace).await?.config)
-    }
-
     /// List every namespace the token can see, following pagination.
     ///
     /// `GET /namespaces` answers `{data, pagination}` with a default page size
@@ -1112,7 +1105,7 @@ impl AdminClient {
         }
         self.check_mutation(&resp, RequestKind::Restore)
             .await
-            .map_err(conditional::withhold_error)?;
+            .map_err(conditional::withhold_restore_error)?;
         if resp.status != 200 {
             return Err(crate::error::Error::AmbiguousMutation(
                 "conditional restore returned an unexpected success status; do not replay"
@@ -1976,6 +1969,19 @@ fn rollback_needs_manual_recovery(rollback: Option<&str>) -> bool {
     matches!(rollback, Some("incomplete") | Some("unknown_outcome"))
 }
 
+// GitForgeOps' own next step for the three `/restore` failures that have one.
+// `post_restore` withholds the gateway's text but keeps these
+// (`conditional::withhold_restore_error`); none carries response data.
+const API_SPECS_AT_RISK_REMEDY: &str = "API specs are managed through the admin API, not this \
+     repo. Use incremental apply to keep them, or re-run `gitforgeops apply \
+     --confirm-api-spec-deletion` to delete the complete ownership graph deliberately.";
+const RESTORE_MANUAL_RECOVERY_REMEDY: &str = "the namespace may hold a partially restored \
+     configuration. Do NOT re-run apply — inspect the gateway with `gitforgeops diff`, restore \
+     from a known backup if needed, then reconcile.";
+const RESTORE_BODY_LIMIT_ADVICE: &str = "payload exceeds the gateway's restore body limit \
+     (FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB, default 100 MiB). Split the namespace or switch to \
+     the incremental apply strategy.";
+
 /// The `GET /config/export` URL, checked for the transport a viewer bearer
 /// token may use.
 #[derive(Clone, PartialEq, Eq)]
@@ -2118,28 +2124,14 @@ fn is_success_status(status: u16) -> bool {
 
 /// Map a failing response to the most specific error variant available.
 pub fn map_api_error(status: u16, body: &str, kind: RequestKind) -> crate::error::Error {
-    map_api_error_with_location(status, body, kind, None)
+    map_api_error_with_redirect_base(status, body, kind, None, None)
 }
 
-/// [`map_api_error`] with the response's `Location` header, which only the 3xx
-/// arm consults.
-///
-/// This base-less form has no configured gateway URL to compare against, so it
-/// can only say whether a destination is relative or an absolute URL at some
-/// unclassifiable other origin. A live call site holds the base URL and uses
-/// [`map_api_error_with_redirect_base`] to classify the relationship fully.
-pub fn map_api_error_with_location(
-    status: u16,
-    body: &str,
-    kind: RequestKind,
-    location: Option<&str>,
-) -> crate::error::Error {
-    map_api_error_with_redirect_base(status, body, kind, location, None)
-}
-
-/// [`map_api_error_with_location`] with the configured gateway base URL, so the
-/// 3xx arm can describe how a redirect's `Location` relates to it without
-/// echoing either value.
+/// [`map_api_error`] with the response's `Location` header and the configured
+/// gateway base URL, which only the 3xx arm consults: it describes how the
+/// redirect's `Location` relates to the base without echoing either value.
+/// Without a base it can only say whether a destination is relative or an
+/// absolute URL at some unclassifiable other origin.
 pub fn map_api_error_with_redirect_base(
     status: u16,
     body: &str,
@@ -2212,24 +2204,20 @@ pub fn map_api_error_with_redirect_base(
     if status == 409 && parsed.api_specs_at_risk.is_some() {
         let at_risk = describe_api_specs_at_risk(&parsed.api_specs_at_risk);
         return crate::error::Error::ApiSpecsAtRisk(format!(
-            "full_replace refused: the namespace holds API spec(s) this payload would delete ({at_risk}). \
-             API specs are managed through the admin API, not this repo. Use incremental apply to keep \
-             them, or re-run `gitforgeops apply --confirm-api-spec-deletion` to delete the complete \
-             ownership graph deliberately. Gateway said: {message}"
+            "full_replace refused: the namespace holds API spec(s) this payload would delete \
+             ({at_risk}). {API_SPECS_AT_RISK_REMEDY} Gateway said: {message}"
         ));
     }
 
+    // Only `post_restore` sends this kind, and it withholds the gateway's text,
+    // so the variant carries the tool's own remedy alone.
     if kind == RequestKind::Restore
         && status == 500
         && rollback_needs_manual_recovery(parsed.rollback.as_deref())
     {
-        let rollback = bounded_error_message(parsed.rollback.as_deref().unwrap_or("unknown"));
-        let details = summarize_restore_errors(&parsed.restore_errors);
-        return crate::error::Error::RestoreNeedsManualRecovery(format!(
-            "rollback={rollback}; the namespace may hold a partially restored configuration. \
-             Do NOT re-run apply — inspect the gateway with `gitforgeops diff`, restore from a known \
-             backup if needed, then reconcile. Gateway said: {message}{details}"
-        ));
+        return crate::error::Error::RestoreNeedsManualRecovery(
+            RESTORE_MANUAL_RECOVERY_REMEDY.to_string(),
+        );
     }
 
     if parsed.applied == Some(false) {
@@ -2264,10 +2252,7 @@ pub fn map_api_error_with_redirect_base(
         // The advice depends on which body was too large: only `/restore` has
         // its own (much larger) limit and a strategy-level workaround.
         let advice = match kind {
-            RequestKind::Restore => "payload exceeds the gateway's restore body limit \
-                 (FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB, default 100 MiB). Split the namespace or \
-                 switch to the incremental apply strategy."
-                .to_string(),
+            RequestKind::Restore => RESTORE_BODY_LIMIT_ADVICE.to_string(),
             RequestKind::NonIdempotentMutation => format!(
                 "the create or POST /batch body exceeds the gateway's admin request body limit. \
                  Incremental apply chunks POST /batch bodies under {BATCH_MAX_BODY_BYTES} bytes \
@@ -2308,22 +2293,6 @@ fn describe_api_specs_at_risk(at_risk: &Option<serde_json::Value>) -> String {
         Some(serde_json::Value::Number(n)) => format!("{n} spec(s)"),
         Some(other) => bounded_error_message(&other.to_string()),
         None => "count unknown".to_string(),
-    }
-}
-
-fn summarize_restore_errors(errors: &Option<Vec<serde_json::Value>>) -> String {
-    match errors {
-        Some(list) if !list.is_empty() => format!(
-            "\nrestore_errors: {}",
-            bounded_error_message(
-                &list
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            )
-        ),
-        _ => String::new(),
     }
 }
 
@@ -2472,13 +2441,6 @@ impl BackupExtras {
             Some(_) => 1,
             None => 0,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.api_specs.is_none()
-            && self.gateway_trust_bundles.is_none()
-            && self.unsupported_sections.is_empty()
-            && self.unmodeled_nested_fields.is_empty()
     }
 }
 
@@ -3140,12 +3102,6 @@ pub struct BatchCreated {
     pub upstreams: usize,
 }
 
-impl BatchCreated {
-    pub fn total(&self) -> usize {
-        self.proxies + self.consumers + self.plugin_configs + self.upstreams
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct BatchResponse {
     created: BatchCreated,
@@ -3697,14 +3653,6 @@ fn validate_resource_id_for_path(id: &str) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// Test-visible wrapper for [`validate_resource_id_for_path`].
-///
-/// Exposed so the accept/reject matrix can be exercised without a gateway —
-/// the alternative is a network round-trip per id, which the suite forbids.
-pub fn resource_id_is_path_safe(id: &str) -> crate::error::Result<()> {
-    validate_resource_id_for_path(id)
-}
-
 async fn backoff_sleep(attempt: u32) {
     // Full-jitter backoff based on 500ms · 2^(attempt-1), capped at 8s.
     // Keep a small floor so retries never hammer a recovering gateway with an
@@ -3742,6 +3690,58 @@ impl fmt::Debug for RawResponse {
 impl fmt::Debug for ApiErrorBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ApiErrorBody(<redacted>)")
+    }
+}
+
+// The accept/reject matrix of a private helper, exercised without a gateway:
+// the alternative is a network round-trip per id, which the suite forbids.
+#[cfg(test)]
+mod resource_id_path_tests {
+    use super::validate_resource_id_for_path;
+
+    #[test]
+    fn resource_ids_are_validated_for_path_safety_not_server_grammar() {
+        // The gateway's *create* grammar is `^[a-zA-Z0-9][a-zA-Z0-9._-]*$`, but a
+        // live gateway can hold ids that predate it or came from another client.
+        // Refusing to build a URL for those makes them undeletable and the
+        // namespace can never converge — so anything that stays inside its path
+        // segment is allowed through and the gateway gets to have the last word.
+        for id in [
+            "proxy-01._~A",
+            "proxy~01",
+            "-leading-dash",
+            ".leading-dot",
+            "_leading",
+            "UPPER_case.9",
+            "a",
+            &"a".repeat(254),
+        ] {
+            assert!(
+                validate_resource_id_for_path(id).is_ok(),
+                "{id:?} is path-safe and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_ids_that_escape_the_path_segment_are_rejected() {
+        for id in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a?confirm=true",
+            "a#frag",
+            "a%2f",
+            "has space",
+            "tab\there",
+            "null\0byte",
+            "café",
+        ] {
+            let err = validate_resource_id_for_path(id);
+            assert!(err.is_err(), "expected {id:?} to be rejected");
+        }
     }
 }
 

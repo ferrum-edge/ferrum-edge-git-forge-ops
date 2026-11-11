@@ -22,7 +22,7 @@
 //! - A fingerprinted field cannot be compared with the repository. Where the
 //!   repository declares a **secret-bearing** value at the same location (a
 //!   brokered placeholder, a modeled secret leaf, or a URL with userinfo),
-//!   [`ConfigExport::live_view`] substitutes the declared value into the live
+//!   [`ConfigExport::live_view_with`] substitutes the declared value into the live
 //!   view (so the field is not reported as drift it cannot be) and records the
 //!   site in [`ExportLiveView::uncompared`]. Edge v0.9.9 publishes no list of
 //!   the pointers it redacted, so a fingerprint-shaped string anywhere else is
@@ -313,17 +313,11 @@ impl ConfigExport {
     /// custom types, an `mtls_auth` type with no valid identity), so only a
     /// baseline can say they did not change.
     ///
-    /// Equivalent to [`Self::live_view_with`] with `desired` as its own
-    /// secret source.
-    pub fn live_view(&self, desired: &GatewayConfig) -> crate::error::Result<ExportLiveView> {
-        self.live_view_with(desired, desired)
-    }
-
-    /// [`Self::live_view`] for a `desired` whose placeholders were already
-    /// resolved from a credential bundle. Secret-bearing locations are taken
-    /// from both `desired` and `unresolved` (the same configuration before
-    /// resolution), so a brokered value stays secret-bearing once the bundle
-    /// has replaced its placeholder.
+    /// `desired` may have had its placeholders resolved from a credential
+    /// bundle. Secret-bearing locations are taken from both `desired` and
+    /// `unresolved` (the same configuration before resolution; pass `desired`
+    /// twice when nothing was resolved), so a brokered value stays
+    /// secret-bearing once the bundle has replaced its placeholder.
     pub fn live_view_with(
         &self,
         desired: &GatewayConfig,

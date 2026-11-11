@@ -38,6 +38,7 @@ on:
       - 'contracts/**'
       - '.github/ferrum-edge-checksums.txt'
       - '.github/workflows/apply-on-merge.yml'
+      - '.github/workflows/rotate.yml'
       - '.github/workflows/trusted-pr-review.yml'
 
 permissions:

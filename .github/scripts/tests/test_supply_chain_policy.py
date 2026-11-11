@@ -21,12 +21,12 @@ sys.modules[SPEC.name] = check_supply_chain
 SPEC.loader.exec_module(check_supply_chain)
 
 CARGO_AUDIT_ACTION_PINS = (
-    "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",  # v2.87.29
-    "taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177",  # v2.87.30
-    "taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68",  # v2.88.1
     "taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2",  # v2.90.2
 )
 REJECTED_CARGO_AUDIT_ACTION_PINS = (
+    "taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68",  # retired v2.88.1
+    "taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177",  # retired v2.87.30
+    "taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283",  # retired v2.87.29
     "taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe",  # retired v2.87.27
     "taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172",  # retired v2.87.20
     "taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0",  # retired v2.87.22
@@ -61,7 +61,6 @@ _HEREDOC_OPERATOR_RE = re.compile(r"(?<!<)<<(?!<)")
 _ACTION_SHA_RE = re.compile(r"@[0-9a-f]{40}")
 _SECRETS_KEY_RE = re.compile(r"^\s*-?\s*secrets\s*:", re.MULTILINE | re.IGNORECASE)
 _FIXTURE_LOOP_RE = re.compile(r"^for fixture in ([^;]+); do$", re.MULTILINE)
-_SECRETS_EXPRESSION_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b")
 _LOADER_SHARD_LIMIT_RE = re.compile(r"^MAX_BUNDLE_SHARDS = (\d+)$", re.MULTILINE)
 _LOAD_BUNDLES_STEP_RE = re.compile(
     r"      - name: Load credential bundles\n.*?(?=      - name: )",
@@ -4245,6 +4244,62 @@ class SupplyChainPolicyTests(unittest.TestCase):
             [],
         )
 
+    def test_code_scanning_pull_requests_take_the_push_paths(self):
+        # #699: CodeQL and the image scan cannot change result on a PR that
+        # touches nothing the build or the image reads, so both triggers take
+        # one path list. The workflow reports no required check, so the
+        # "required workflows are never path-filtered" rule does not apply.
+        workflow_path = ".github/workflows/code-scanning.yml"
+        self.assertNotIn(workflow_path, check_supply_chain.REQUIRED_CHECK_WORKFLOWS.values())
+        triggers = check_supply_chain.parse_workflow((ROOT / workflow_path).read_text())["on"]
+        self.assertTrue(triggers["push"]["paths"])
+        self.assertEqual(triggers["pull_request"]["paths"], triggers["push"]["paths"])
+        self.assertIn("Dockerfile", triggers["pull_request"]["paths"])
+        self.assertIn(".github/scripts/audit_settings.py", triggers["pull_request"]["paths"])
+
+    def test_apply_builds_the_binary_only_for_a_configured_repository(self):
+        # #699: an unconfigured repository skips through empty matrices before
+        # the enumerator calls the binary, so the toolchain, cache and build
+        # steps are gated on the configuration check, which runs first. The
+        # enumerator itself stays unconditioned and pinned.
+        document = check_supply_chain.parse_workflow(
+            (ROOT / ".github/workflows/apply-on-merge.yml").read_text()
+        )
+        steps = document["jobs"]["list-envs"]["steps"]
+        names = [step.get("name") for step in steps]
+        self.assertEqual(
+            names,
+            [
+                None,
+                "Check for repository configuration",
+                "Install Rust toolchain",
+                "Cache cargo registry",
+                "Build gitforgeops",
+                "Enumerate environments",
+            ],
+        )
+        configured = steps[1]
+        self.assertEqual(configured["id"], "configured")
+        self.assertNotIn("if", configured)
+        self.assertIn("if [[ -f .gitforgeops/config.yaml ]]; then", configured["run"])
+        for step in steps[2:5]:
+            with self.subTest(step=step["name"]):
+                self.assertEqual(step["if"], "steps.configured.outputs.present == 'true'")
+        self.assertNotIn("if", steps[5])
+        self.assertEqual(
+            check_supply_chain.environment_producer_violations(
+                ".github/workflows/apply-on-merge.yml", document
+            ),
+            [],
+        )
+        # Nothing can have written a promotion record when both matrices are
+        # empty, so the summary job does not start a runner for them.
+        summary = document["jobs"]["promotion-summary"]
+        self.assertEqual(summary["needs"], ["list-envs", "apply", "promote"])
+        self.assertIn("!cancelled()", summary["if"])
+        self.assertIn("needs.list-envs.outputs.envs != '[]'", summary["if"])
+        self.assertIn("needs.list-envs.outputs.promotions != '[]'", summary["if"])
+
     def test_alloy_consumer_qualification_is_isolated_and_not_required(self):
         workflow_path = ".github/workflows/alloy-consumer.yml"
         workflow = (ROOT / workflow_path).read_text()
@@ -4283,6 +4338,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 "src/lib.rs",
                 "src/error.rs",
                 "src/diagnostics.rs",
+                "src/yaml.rs",
+                "src/plugin_catalog.rs",
+                "src/json_output.rs",
                 "src/config/**",
                 "src/validate/**",
                 "src/apply/**",
@@ -4816,23 +4874,26 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         # `secrets.NAME` and `secrets['NAME']` were caught in validate-pr.yml,
         # but the whole-context forms — which hand over EVERY environment
         # secret at once — were allowed everywhere else, which is where the
-        # privileged workflows actually used them.
+        # privileged workflows actually used them. The checker's own pattern
+        # is tested, so weakening it fails here.
+        pattern = check_supply_chain._SECRETS_EXPRESSION_RE
         for leak in (
             "${{ toJSON(secrets) }}",
             "${{ fromJSON(toJSON(secrets)) }}",
             "${{ secrets }}",
             "${{ secrets.FERRUM_GATEWAY_URL }}",
             "${{ secrets['FERRUM_GATEWAY_URL'] }}",
+            # Expression contexts are case-insensitive.
+            "${{ toJSON(SECRETS) }}",
+            "${{ Secrets.FERRUM_GATEWAY_URL }}",
         ):
-            self.assertRegex(
-                leak, _SECRETS_EXPRESSION_RE, f"{leak} must be treated as a secret leak"
-            )
+            self.assertRegex(leak, pattern, f"{leak} must be treated as a secret leak")
         for benign in (
             "# secrets never reach this job",
             "${{ github.token }}",
             "${{ vars.GITFORGEOPS_STATE_APP_ID }}",
         ):
-            self.assertNotRegex(benign, _SECRETS_EXPRESSION_RE)
+            self.assertNotRegex(benign, pattern)
 
     def test_only_named_secret_references_survive_in_any_workflow(self):
         # validate-pr.yml must receive NO secrets; every other workflow may
@@ -7369,17 +7430,36 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             any("missing subject" in item for item in violations), violations
         )
 
-    def test_release_push_trigger_ignores_ledger_commits_and_keeps_tags(self):
+    def test_release_publishes_only_on_release_tags(self):
+        # A branch trigger publishes for every merge and ledger commit, and its
+        # gate fails on each one: only an attested, dispatched lifecycle run
+        # can certify a revision (#700).
+        for trigger in (
+            "    branches: [main]\n",
+            "    branches-ignore: [wip]\n",
+            "    Branches:\n      - main\n",
+        ):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                path = root / ".github/workflows/release.yml"
+                text = path.read_text(encoding="utf-8")
+                changed = text.replace("  push:\n", "  push:\n" + trigger, 1)
+                self.assertNotEqual(changed, text)
+                path.write_text(changed, encoding="utf-8")
+                violations = self._violations(root)
+                self.assertTrue(
+                    any("must not name branches" in item for item in violations), violations
+                )
         with tempfile.TemporaryDirectory() as directory:
             root = self._mirror_repo(Path(directory))
             path = root / ".github/workflows/release.yml"
             path.write_text(
-                path.read_text(encoding="utf-8").replace("      - '.state/**'\n", ""),
+                path.read_text(encoding="utf-8").replace("    tags: ['v*']\n", ""),
                 encoding="utf-8",
             )
             violations = self._violations(root)
         self.assertTrue(
-            any("ignore ledger-only commits" in item for item in violations), violations
+            any("keep publishing release tags" in item for item in violations), violations
         )
 
     def test_release_gate_must_name_upstream_rather_than_test_for_a_fork(self):
@@ -7863,18 +7943,53 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertEqual(check_supply_chain.release_gate_helper_violations(ROOT), [])
 
     def test_release_gate_pins_match_the_ruleset_contexts(self):
-        # The launch list is REQUIRED_CHECK_WORKFLOWS minus the job being added
-        # to the ruleset, which the gate tolerates while absent.
+        # The launch list is exactly REQUIRED_CHECK_WORKFLOWS: the retired
+        # `security-supply-chain-policy` is gone and nothing is tolerated
+        # while absent.
         jobs = [
             context.split(" / ")[-1]
             for context in check_supply_chain.RELEASE_GATE_REQUIRED_CHECKS
-            + check_supply_chain.RELEASE_GATE_ACCEPTED_CHECKS
         ]
         self.assertEqual(sorted(jobs), sorted(check_supply_chain.REQUIRED_CHECK_WORKFLOWS))
-        self.assertEqual(
-            [context.split(" / ")[-1] for context in check_supply_chain.RELEASE_GATE_ACCEPTED_CHECKS],
-            [check_supply_chain.SUPPLY_CHAIN_POLICY_JOB, "validate-trusted-policy"],
+        self.assertNotIn("security-supply-chain-policy", jobs)
+        self.assertNotIn("ACCEPTED_CHECKS", check_supply_chain.RELEASE_GATE_PINS)
+
+    def test_the_helper_may_move_to_the_retired_shape(self):
+        # #701 expand step: the shipped helper still binds ACCEPTED_CHECKS and
+        # requires the retired context; a helper without ACCEPTED_CHECKS that
+        # requires exactly the launch list is accepted too, and each shape is
+        # held to its own lists.
+        source = (ROOT / check_supply_chain.RELEASE_GATE_HELPER).read_text(encoding="utf-8")
+        before = check_supply_chain.RELEASE_GATE_PINS_BEFORE_RETIRE
+        old_required = "REQUIRED_CHECKS = (\n" + "".join(
+            f'    "{context}",\n' for context in before["REQUIRED_CHECKS"]
+        ) + ")"
+        new_required = "REQUIRED_CHECKS = (\n" + "".join(
+            f'    "{context}",\n' for context in check_supply_chain.RELEASE_GATE_REQUIRED_CHECKS
+        ) + ")"
+        accepted = "ACCEPTED_CHECKS = (\n" + "".join(
+            f'    "{context}",\n' for context in before["ACCEPTED_CHECKS"]
+        ) + ")"
+        self.assertEqual(source.count(old_required), 1)
+        self.assertEqual(source.count(accepted), 1)
+        retired = (
+            source.replace(old_required, new_required)
+            .replace(accepted, "")
+            .replace("ACCEPTED_CHECKS", "()")
         )
+        self.assertEqual(self._helper_violations(retired), [])
+        for name, changed in (
+            ("dropped check", retired.replace('    "Security / security-cargo-audit",\n', "", 1)),
+            ("retired context kept", source.replace(accepted, "").replace("ACCEPTED_CHECKS", "()")),
+            ("new list with old tolerance", source.replace(old_required, new_required)),
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    any(
+                        "REQUIRED_CHECKS must be assigned exactly" in item
+                        for item in self._helper_violations(changed)
+                    )
+                )
 
     def test_helper_invocation_is_pinned(self):
         step = self.RELEASE_HELPER_STEP
@@ -8897,6 +9012,40 @@ class RegistrySecretEnvironmentTests(unittest.TestCase):
                         self._violations(changed, label),
                         f"jobs.{job}: binds ${{{{ inputs.environment }}}}",
                     )
+
+    def test_the_dispatch_guard_may_also_refuse_the_audit_environment(self):
+        # GHSA-jx32-rxh5-5q25, expand step: the guard that also refuses
+        # `settings-audit` (the reviewer-free audit-token environment) is
+        # accepted next to the shipped one, so the workflows can move to it
+        # under this checker. A guard that drops the `release` refusal is
+        # still refused.
+        release_refusal = (
+            "            echo \"::error::release holds the registry credentials and is not a "
+            "deployment environment.\"\n"
+            "            exit 1\n"
+            "          fi\n"
+        )
+        audit_refusal = (
+            "          if [ \"$(printf '%s' \"$INPUT_ENVIRONMENT\" | tr '[:upper:]' "
+            "'[:lower:]')\" = settings-audit ]; then\n"
+            "            echo \"::error::settings-audit holds the settings audit token and is "
+            "not a deployment environment.\"\n"
+            "            exit 1\n"
+            "          fi\n"
+        )
+        for name, job in (("rotate.yml", "rotate"), ("materialize-file.yml", "materialize")):
+            shipped = self._shipped(name)
+            label = f".github/workflows/{name}"
+            self.assertEqual(shipped.count(release_refusal), 1)
+            expanded = shipped.replace(release_refusal, release_refusal + audit_refusal)
+            with self.subTest(name=name):
+                self.assertEqual(self._violations(expanded, label), [])
+                without_release = expanded.replace("= release ]; then", "= other ]; then")
+                self.assertNotEqual(without_release, expanded)
+                self._refused(
+                    self._violations(without_release, label),
+                    f"jobs.{job}: binds ${{{{ inputs.environment }}}}",
+                )
 
     def test_the_full_checker_refuses_a_sibling_release_job(self):
         # Exactly the reported bypass: a sibling job outside authorize-release

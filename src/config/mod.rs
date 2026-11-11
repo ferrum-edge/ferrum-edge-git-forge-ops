@@ -90,25 +90,6 @@ pub fn collect_namespaces(config: &GatewayConfig) -> Vec<String> {
     namespaces.into_iter().collect()
 }
 
-pub fn split_config_by_namespace(
-    config: &GatewayConfig,
-    namespace_filter: Option<&str>,
-) -> Vec<(String, GatewayConfig)> {
-    match namespace_filter {
-        Some(namespace) => vec![(
-            namespace.to_string(),
-            filter_config_by_namespace(config, namespace),
-        )],
-        None => collect_namespaces(config)
-            .into_iter()
-            .map(|namespace| {
-                let namespace_config = filter_config_by_namespace(config, &namespace);
-                (namespace, namespace_config)
-            })
-            .collect(),
-    }
-}
-
 /// Reject ambiguous live identities before comparison or ownership decisions.
 /// Diagnostics include keys only, never resource bodies or credential values.
 pub fn validate_unique_live_resource_keys(config: &GatewayConfig) -> crate::error::Result<()> {

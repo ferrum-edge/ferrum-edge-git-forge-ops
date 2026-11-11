@@ -690,6 +690,31 @@ pub(super) fn withhold_error(error: Error) -> Error {
     }
 }
 
+/// [`withhold_error`] for `POST /restore`. The gateway's text is withheld the
+/// same way, but the three restore failures with a known next step keep
+/// GitForgeOps' own fixed remedy, which carries nothing from the response:
+/// API specs at risk (`--confirm-api-spec-deletion`), an incomplete rollback
+/// ("Do NOT re-run apply") and a body over the restore limit.
+pub(super) fn withhold_restore_error(error: Error) -> Error {
+    const WITHHELD: &str = "response details withheld";
+    match error {
+        Error::ApiSpecsAtRisk(_) => Error::ApiSpecsAtRisk(format!(
+            "full_replace refused: the namespace holds API spec(s) this payload would delete; \
+             {WITHHELD}. {}",
+            super::API_SPECS_AT_RISK_REMEDY
+        )),
+        Error::RestoreNeedsManualRecovery(_) => Error::RestoreNeedsManualRecovery(format!(
+            "{WITHHELD}; {}",
+            super::RESTORE_MANUAL_RECOVERY_REMEDY
+        )),
+        Error::ApiError { status: 413, .. } => Error::ApiError {
+            status: 413,
+            message: format!("{WITHHELD} — {}", super::RESTORE_BODY_LIMIT_ADVICE),
+        },
+        other => withhold_error(other),
+    }
+}
+
 pub(super) fn require_restore_seal(response: &str, request: &Value) -> Result<()> {
     let response = parse_sensitive(response).map_err(|_| {
         Error::AmbiguousMutation(

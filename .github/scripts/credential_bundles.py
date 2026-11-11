@@ -10,9 +10,10 @@ context is held for manual approval.
 
 Because the bindings are written out by hand, the number of shards is fixed.
 `MAX_BUNDLE_SHARDS` below must stay equal to `MAX_BUNDLE_SHARDS` in
-`src/secrets/bundle.rs`, and both must match the bindings in the four
-privileged workflows; `.github/scripts/check_supply_chain.py` fails the build
-when they drift.
+`src/secrets/bundle.rs`, and both must match the bindings in the three
+privileged workflows (`apply-on-merge.yml`, `materialize-file.yml` and
+`rotate.yml`); `.github/scripts/check_supply_chain.py` fails the build when
+they drift.
 
 Contract kept from the previous secrets-dump loader: a blank value means the
 secret is unset, malformed JSON fails closed rather than degrading to an empty

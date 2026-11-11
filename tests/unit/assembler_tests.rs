@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 use gitforgeops::config::{
     apply_overlay, assemble, filter_config_by_namespace, load_resources, schema::Resource,
-    select_config_namespace, split_config_by_namespace, validate_unique_resource_keys,
-    GatewayConfig,
+    select_config_namespace, validate_unique_resource_keys, GatewayConfig,
 };
 
 /// `assemble` now returns the gateway document alongside the optional merged
@@ -579,16 +578,6 @@ fn namespace_filter_only_keeps_target_namespace() {
 }
 
 #[test]
-fn split_config_by_namespace_preserves_empty_filtered_namespace() {
-    let config = assemble_gateway(vec![("ferrum".to_string(), make_proxy("proxy-default"))]);
-    let split = split_config_by_namespace(&config, Some("team-alpha"));
-
-    assert_eq!(split.len(), 1);
-    assert_eq!(split[0].0, "team-alpha");
-    assert!(split[0].1.proxies.is_empty());
-}
-
-#[test]
 fn select_config_namespace_leaves_all_namespaces_when_unfiltered() {
     let resources = vec![
         ("ferrum".to_string(), make_proxy("proxy-default")),
@@ -961,8 +950,8 @@ fn normalization_preserves_credential_slot_names() {
     // Cross-module upgrade guard: normalizing object -> array must NOT
     // rename slots, or every already-allocated credential orphans in the
     // GitHub Environment Secret bundle and gets regenerated.
+    use super::resolver_fixtures::report_secrets;
     use gitforgeops::config::assembler::normalize_consumer_credentials;
-    use gitforgeops::secrets::report_secrets;
 
     let placeholder = serde_json::json!("${gh-env-secret:alloc=require}");
     let mut object_form = consumer_config_with_credentials(serde_json::json!({

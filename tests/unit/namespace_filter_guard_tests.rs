@@ -163,8 +163,15 @@ fn live_empty_matching_namespace_is_not_a_miss() {
 }
 
 #[test]
-fn from_loaded_counts_resources() {
-    let scope = NamespaceScope::from_loaded(None, &[], &GatewayConfig::default(), 0);
+fn an_empty_inventory_counts_no_resources() {
+    let (on_disk_count, on_disk_namespaces) = NamespaceScope::on_disk_inventory(&[]);
+    let scope = NamespaceScope::with_desired(
+        None,
+        on_disk_namespaces,
+        on_disk_count,
+        &GatewayConfig::default(),
+        0,
+    );
     assert_eq!(scope.on_disk_count, 0);
     assert!(scope.on_disk_namespaces.is_empty());
     assert!(!scope.empty_desired_mismatch());
