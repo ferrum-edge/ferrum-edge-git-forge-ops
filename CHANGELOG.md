@@ -7,6 +7,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **BREAKING:** the PolyForm Noncommercial 1.0.0 license file is now
+  `LICENSE`, byte-identical to the other Ferrum Edge repositories' text,
+  replacing `LICENSE.md` (#705). The template updater manages `LICENSE` and
+  keeps `LICENSE.md` as a retired managed path, so an update removes an
+  unchanged `LICENSE.md` and reports an edited one as a conflict. A copy whose
+  updater predates this change gets `LICENSE.md` removed without `LICENSE`
+  being added, and must copy `LICENSE` and `LICENSE-COMMERCIAL.md` from
+  upstream by hand (`docs/template-updates.md`).
 - The `security-supply-chain-policy` job is retired (#701). `security.yml`'s
   new `security-workflow-scripts` job runs the workflow-script unit tests and
   the tree's own `check_supply_chain.py`; it is not a required context, and
@@ -134,6 +142,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `LICENSE-COMMERCIAL.md` gives this repository the commercial license the
+  other Ferrum Edge repositories ship (#705): ferrum-edge's text with the
+  product name "Ferrum Edge GitForgeOps". The README license section links it,
+  and template updates adopt it.
 - `.github/scripts/release_gate.py`, the release gate as a Python helper
   (#473). `release.yml`'s `authorize-release` job now checks out the release
   commit first and runs `python3 -I .github/scripts/release_gate.py` in place
@@ -728,6 +740,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Update `quinn-udp` to 0.5.16 for RUSTSEC-2026-0538 (GHSA-6pp4-4cxf-xf88),
+  a receive-loop spin after a truncated datagram on targets that read one
+  datagram per `recvmsg`.
 - `rotate.yml` and `materialize-file.yml` refuse `settings-audit` in any
   letter case as a dispatch environment, so a dispatch can no longer bind
   the reviewer-free audit-token environment (GHSA-jx32-rxh5-5q25).

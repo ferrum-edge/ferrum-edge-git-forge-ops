@@ -88,6 +88,14 @@ BASELINE_PATH = Path(".gitforgeops/baseline.json")
 DEFAULT_UPSTREAM = "https://github.com/ferrum-edge/ferrum-edge-git-forge-ops.git"
 DEFAULT_REF = "main"
 
+# Files upstream used to ship and has since removed or renamed. They stay in
+# `UPSTREAM_MANAGED` so an update removes a copy's unchanged file (or reports a
+# conflict when the copy edited it) instead of leaving it behind for good: a
+# path outside the managed fence is never compared, so its removal upstream
+# would never reach anyone. `LICENSE.md` became `LICENSE`, the name the other
+# Ferrum Edge repositories use.
+RETIRED_UPSTREAM_MANAGED = ("LICENSE.md",)
+
 # Paths upstream owns. A customer may edit them, but upstream's version is the
 # one that carries security and correctness fixes, so a change on both sides is
 # a conflict rather than a silent overwrite in either direction.
@@ -127,7 +135,9 @@ UPSTREAM_MANAGED = (
     "CHANGELOG.md",
     "CLAUDE.md",
     "SECURITY.md",
-    "LICENSE.md",
+    "LICENSE",
+    "LICENSE-COMMERCIAL.md",
+    *RETIRED_UPSTREAM_MANAGED,
 )
 
 # Never read from upstream, never written. This is the customer's repository.
