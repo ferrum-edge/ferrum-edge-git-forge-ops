@@ -212,7 +212,10 @@ class TemplateUpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         (self.fixture.upstream / "LICENSE.md").unlink()
         return self.fixture.upstream_change(
-            {"LICENSE": "# PolyForm Noncommercial License 1.0.0\n\nrevised\n"},
+            {
+                "LICENSE": "# PolyForm Noncommercial License 1.0.0\n\nrevised\n",
+                "LICENSE-COMMERCIAL.md": "# Commercial License\n",
+            },
             "rename the license",
         )
 
@@ -225,6 +228,7 @@ class TemplateUpdateTests(unittest.TestCase):
             self.fixture.read("LICENSE"),
             "# PolyForm Noncommercial License 1.0.0\n\nrevised\n",
         )
+        self.assertEqual(self.fixture.read("LICENSE-COMMERCIAL.md"), "# Commercial License\n")
         baseline = json.loads(self.fixture.read(".gitforgeops/baseline.json"))
         self.assertEqual(baseline["commit"], target)
 
@@ -1512,6 +1516,12 @@ class RepositoryContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, template_update.UPSTREAM_MANAGED)
                 self.assertFalse((ROOT / path).exists(), path)
+
+    def test_both_license_files_are_upstream_managed(self):
+        for path in ("LICENSE", "LICENSE-COMMERCIAL.md"):
+            with self.subTest(path=path):
+                self.assertTrue((ROOT / path).is_file(), path)
+                self.assertTrue(template_update.is_upstream_managed(path))
 
     def test_changelog_and_env_example_are_upstream_managed_but_agent_alias_is_not(self):
         self.assertIn("CHANGELOG.md", template_update.UPSTREAM_MANAGED)
