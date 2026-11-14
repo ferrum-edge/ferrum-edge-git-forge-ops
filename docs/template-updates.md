@@ -49,8 +49,16 @@ Dockerfile  .dockerignore
 .agents/  .claude/  .gitignore
 .gitforgeops/config.example.yaml  .gitforgeops/policies.example.yaml
 .gitforgeops/smoke.example.yaml  .env.example
-release/  docs/  README.md  CHANGELOG.md  CLAUDE.md  SECURITY.md  LICENSE.md
+release/  docs/  README.md  CHANGELOG.md  CLAUDE.md  SECURITY.md
+LICENSE
 ```
+
+Upstream renamed `LICENSE.md` to `LICENSE`. `LICENSE.md` stays in the
+upstream-managed list, so an update removes your copy's unchanged `LICENSE.md`
+alongside adding `LICENSE`, or reports a conflict if you edited it, instead of
+leaving both files in place. An updater from before that change knows only
+`LICENSE.md`: it removes the old file without adding `LICENSE`. If yours did,
+copy `LICENSE` from upstream at the target revision into the same pull request.
 
 **Yours**: never read from upstream and never written.
 
