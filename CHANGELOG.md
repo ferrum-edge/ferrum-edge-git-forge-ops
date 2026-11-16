@@ -17,8 +17,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `check_supply_chain.py` admits `allow-unsafe-pr-checkout: true` only on those
   two candidate data checkouts, with exactly the reviewed `repository`, `ref`,
   `path` and `persist-credentials: false`, and refuses it on any other step of
-  any workflow or local action. It still accepts the policy workflow shape
-  without the opt-in; a follow-up stops accepting it.
+  any workflow or local action. The pinned `supply-chain-policy.yml` shape
+  requires it, so the opt-in cannot be dropped from that workflow by a pull
+  request.
 - **BREAKING:** the PolyForm Noncommercial 1.0.0 license file is now
   `LICENSE`, byte-identical to the other Ferrum Edge repositories' text,
   replacing `LICENSE.md` (#705). The template updater manages `LICENSE` and

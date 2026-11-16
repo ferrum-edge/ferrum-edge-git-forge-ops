@@ -3023,26 +3023,31 @@ class SupplyChainPolicyTests(unittest.TestCase):
         self.assertEqual(text.count(needle), 1)
         return text.replace(needle, needle + self.UNSAFE_PR_CHECKOUT_LINE, 1)
 
-    def test_policy_workflow_shape_admits_the_candidate_checkout_opt_in(self):
-        # Expand step: the reviewed shape with and without the opt-in.
+    def test_policy_workflow_shape_requires_the_candidate_checkout_opt_in(self):
+        # Contract step: the pinned shape carries the opt-in on the candidate
+        # checkout, right after its `persist-credentials: false`.
         self.assertEqual(
-            check_supply_chain.SUPPLY_CHAIN_POLICY_FORK_SHAPE,
-            check_supply_chain.SUPPLY_CHAIN_POLICY_SHAPE[:28]
-            + ("          allow-unsafe-pr-checkout: true",)
-            + check_supply_chain.SUPPLY_CHAIN_POLICY_SHAPE[28:],
-        )
-        self.assertEqual(
-            check_supply_chain.SUPPLY_CHAIN_POLICY_SHAPE[26:28],
-            ("          path: candidate", "          persist-credentials: false"),
+            check_supply_chain.SUPPLY_CHAIN_POLICY_SHAPE[26:29],
+            (
+                "          path: candidate",
+                "          persist-credentials: false",
+                "          allow-unsafe-pr-checkout: true",
+            ),
         )
         relative = check_supply_chain.SUPPLY_CHAIN_POLICY_PATH
-        original = (ROOT / relative).read_text(encoding="utf-8")
-        opted_in = self._opted_in(relative)
-        for text in (original, opted_in):
-            with self.subTest(opted_in=self.UNSAFE_PR_CHECKOUT_LINE in text):
-                self.assertEqual(
-                    check_supply_chain.supply_chain_policy_shape_violations(text), []
-                )
+        opted_in = (ROOT / relative).read_text(encoding="utf-8")
+        self.assertEqual(opted_in, self._opted_in(relative))
+        self.assertEqual(
+            check_supply_chain.supply_chain_policy_shape_violations(opted_in), []
+        )
+        # The shape without the opt-in, accepted during the expand step, is
+        # refused now.
+        without = opted_in.replace(self.UNSAFE_PR_CHECKOUT_LINE, "", 1)
+        self.assertNotEqual(without, opted_in)
+        violations = check_supply_chain.supply_chain_policy_shape_violations(without)
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn("must keep its pinned shape", violations[0])
+        self.assertIn("allow-unsafe-pr-checkout: true", violations[0])
         candidate = self.CANDIDATE_DATA_CHECKOUTS[relative]
         mutants = {
             # On the protected-branch checkout instead of the candidate's.

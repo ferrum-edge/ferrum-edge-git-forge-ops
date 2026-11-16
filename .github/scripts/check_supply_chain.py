@@ -3316,6 +3316,7 @@ SUPPLY_CHAIN_POLICY_SHAPE = (
     "          ref: ${{ github.event.pull_request.head.sha }}",
     "          path: candidate",
     "          persist-credentials: false",
+    "          allow-unsafe-pr-checkout: true",
     "      - name: Judge candidate with protected supply-chain policy",
     f"        run: {SUPPLY_CHAIN_POLICY_INVOCATION}",
 )
@@ -3324,27 +3325,16 @@ SUPPLY_CHAIN_POLICY_SHAPE = (
 # out a fork pull request's head or merge commit unless the step sets this
 # input. A same-repository head is never refused. The candidate checkout above
 # is data for the protected checker under `python3 -I` and nothing in it runs,
-# so it may opt in: without it every fork pull request fails this required
+# so it opts in: without it every fork pull request fails this required
 # check at checkout. `unsafe_pr_checkout_violations` admits the input nowhere
 # else.
 UNSAFE_PR_CHECKOUT_INPUT = "allow-unsafe-pr-checkout"
-_CANDIDATE_CHECKOUT_PERSIST = "          persist-credentials: false"
-_CANDIDATE_CHECKOUT_PATH_INDEX = SUPPLY_CHAIN_POLICY_SHAPE.index("          path: candidate")
-# Expand step of an expand/contract pair (docs/github-launch-controls.md,
-# section 4): the protected checker accepts the reviewed shape with or without
-# the candidate checkout's opt-in, so the workflow binding can move in a later
-# pull request that this checker judges. The contract step drops the shape
-# without the opt-in.
-SUPPLY_CHAIN_POLICY_FORK_SHAPE = (
-    SUPPLY_CHAIN_POLICY_SHAPE[: _CANDIDATE_CHECKOUT_PATH_INDEX + 2]
-    + (f"          {UNSAFE_PR_CHECKOUT_INPUT}: true",)
-    + SUPPLY_CHAIN_POLICY_SHAPE[_CANDIDATE_CHECKOUT_PATH_INDEX + 2 :]
-)
-assert (
-    SUPPLY_CHAIN_POLICY_SHAPE[_CANDIDATE_CHECKOUT_PATH_INDEX + 1]
-    == _CANDIDATE_CHECKOUT_PERSIST
-)
-SUPPLY_CHAIN_POLICY_SHAPES = (SUPPLY_CHAIN_POLICY_SHAPE, SUPPLY_CHAIN_POLICY_FORK_SHAPE)
+# The pinned shape above requires the opt-in on the candidate checkout and
+# nowhere else (the contract step of the expand/contract pair that added it).
+assert SUPPLY_CHAIN_POLICY_SHAPE.count(f"          {UNSAFE_PR_CHECKOUT_INPUT}: true") == 1
+assert SUPPLY_CHAIN_POLICY_SHAPE[
+    SUPPLY_CHAIN_POLICY_SHAPE.index("          path: candidate") + 2
+] == f"          {UNSAFE_PR_CHECKOUT_INPUT}: true"
 _PINNED_USES = re.compile(r"^(\s*(?:-\s+)?uses:\s*[^@\s]+)@[0-9a-f]{40}$")
 # YAML starts a comment at a `#` preceded by whitespace. A `#` glued to a
 # value is part of it, so it is kept and the line no longer matches. A
@@ -3367,14 +3357,9 @@ def policy_workflow_shape(text: str) -> list[str]:
 def supply_chain_policy_shape_violations(text: str) -> list[str]:
     """The trusted policy workflow must keep exactly its reviewed shape."""
     shape = policy_workflow_shape(text)
-    if any(shape == list(accepted) for accepted in SUPPLY_CHAIN_POLICY_SHAPES):
+    expected = list(SUPPLY_CHAIN_POLICY_SHAPE)
+    if shape == expected:
         return []
-    # Report the first difference from the accepted shape the text is closest
-    # to: with the opt-in when it names the input, without it otherwise.
-    opted_in = any(UNSAFE_PR_CHECKOUT_INPUT in line.casefold() for line in shape)
-    expected = list(
-        SUPPLY_CHAIN_POLICY_FORK_SHAPE if opted_in else SUPPLY_CHAIN_POLICY_SHAPE
-    )
     index = next(
         (
             position
