@@ -7,18 +7,18 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- `supply-chain-policy.yml` and `agent-setup-policy.yml` set
-  `allow-unsafe-pr-checkout: true` on their candidate data checkouts, so fork
-  pull requests get `trusted-supply-chain-policy` and `validate-trusted-policy`
-  verdicts again instead of failing at checkout (binding step).
-- `check_supply_chain.py` accepts `allow-unsafe-pr-checkout: true` on the
-  candidate data checkout of `supply-chain-policy.yml` and
-  `agent-setup-policy.yml`, and refuses that input on any other step of any
-  workflow or local action. `actions/checkout` v7.0.1 refuses a fork pull
-  request's head in a `pull_request_target` run without it, so fork pull
-  requests currently fail both required policy checks at checkout. This is the
-  expand step: a follow-up pull request adds the opt-in to both workflows, and
-  a last one stops accepting the policy workflow shape without it.
+- Fork pull requests get `trusted-supply-chain-policy` and
+  `validate-trusted-policy` verdicts again. `actions/checkout` v7.0.1 refuses a
+  fork pull request's head in a `pull_request_target` run unless the step sets
+  `allow-unsafe-pr-checkout: true`, so both required checks failed at checkout
+  for every fork pull request. `supply-chain-policy.yml` and
+  `agent-setup-policy.yml` now set it on their candidate data checkouts, which
+  only feed the protected-branch validators run under `python3 -I`.
+- `check_supply_chain.py` admits `allow-unsafe-pr-checkout: true` only on those
+  two candidate data checkouts, with exactly the reviewed `repository`, `ref`,
+  `path` and `persist-credentials: false`, and refuses it on any other step of
+  any workflow or local action. It still accepts the policy workflow shape
+  without the opt-in; a follow-up stops accepting it.
 - **BREAKING:** the PolyForm Noncommercial 1.0.0 license file is now
   `LICENSE`, byte-identical to the other Ferrum Edge repositories' text,
   replacing `LICENSE.md` (#705). The template updater manages `LICENSE` and
