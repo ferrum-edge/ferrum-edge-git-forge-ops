@@ -7,6 +7,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `supply-chain-policy.yml` and `agent-setup-policy.yml` set
+  `allow-unsafe-pr-checkout: true` on their candidate data checkouts, so fork
+  pull requests get `trusted-supply-chain-policy` and `validate-trusted-policy`
+  verdicts again instead of failing at checkout (binding step).
 - `check_supply_chain.py` accepts `allow-unsafe-pr-checkout: true` on the
   candidate data checkout of `supply-chain-policy.yml` and
   `agent-setup-policy.yml`, and refuses that input on any other step of any
