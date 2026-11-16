@@ -384,15 +384,20 @@ STEP_SPLIT = re.compile(r"\n(?=\s*-\s+(?:name|uses):)")
 STEP_NAME = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$", re.MULTILINE)
 # One reviewed pin per Dependabot bump: allow the new pin alongside the current
 # one before switching the workflow, then retire the previous pin in a
-# follow-up PR. Only v2.90.2, the pin both workflows use, is accepted; v2.88.1,
-# v2.87.30 and v2.87.29 were retired once #680 moved the workflows to it, and
-# v2.87.27 in #604.
+# follow-up PR. v2.90.2 remains accepted while #719 moves the workflows to
+# v2.90.3; a follow-up retires it. v2.88.1, v2.87.30 and v2.87.29 were retired
+# once #680 moved the workflows to v2.90.2, and v2.87.27 in #604.
 CARGO_AUDIT_ACTIONS = frozenset(
     {
         # v2.90.2 adds mold and yq manifests, refreshes jq/curl bootstrap
         # checksums in main.sh and adds a `fallback: skip` mode the workflows
         # do not use; the cargo-audit and cargo-llvm-cov manifests are unchanged.
         "taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2",
+        # v2.90.3 only updates the biome, kingfisher, mise,
+        # protoc-gen-connect-openapi, rclone, syft, vacuum and yq manifests;
+        # action.yml, main.sh and the cargo-audit and cargo-llvm-cov manifests
+        # are unchanged.
+        "taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39",
     }
 )
 SECURITY_PUSH_POLICY_PATHS = (
