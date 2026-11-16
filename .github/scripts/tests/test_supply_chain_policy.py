@@ -79,20 +79,20 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 original = (ROOT / ".github/workflows" / workflow).read_text(
                     encoding="utf-8"
                 )
-                updated = original.replace("Rust 1.99.1", "Rust 1.99.2").replace(
-                    "toolchain: 1.99.1", "toolchain: 1.99.2"
+                updated = original.replace("Rust 1.100.0", "Rust 1.100.1").replace(
+                    "toolchain: 1.100.0", "toolchain: 1.100.1"
                 )
                 self.assertNotEqual(updated, original)
                 self.assertEqual(shape_check(updated), [])
                 self.assertEqual(
                     check_supply_chain.rust_toolchain_violations(
-                        workflow, updated, "1.99.2"
+                        workflow, updated, "1.100.1"
                     ),
                     [],
                 )
                 self.assertTrue(
                     check_supply_chain.rust_toolchain_violations(
-                        workflow, updated, "1.99.1"
+                        workflow, updated, "1.100.0"
                     )
                 )
 
@@ -2533,9 +2533,9 @@ class SupplyChainPolicyTests(unittest.TestCase):
             encoding="utf-8"
         )
         job = check_supply_chain.workflow_job(workflow, "security-cargo-audit")
-        self.assertIn("toolchain: 1.99.1", job)
+        self.assertIn("toolchain: 1.100.0", job)
         bumped_job = _ACTION_SHA_RE.sub("@" + "a" * 40, job).replace(
-            "toolchain: 1.99.1", "toolchain: 1.100.0"
+            "toolchain: 1.100.0", "toolchain: 1.101.0"
         )
         self.assertNotEqual(bumped_job, job)
         bumped = workflow.replace(job, bumped_job, 1)
@@ -2543,7 +2543,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
         # Each free part still answers to its own rule.
         self.assertTrue(check_supply_chain.cargo_audit_install_violations(bumped))
         self.assertTrue(
-            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.99.1")
+            check_supply_chain.rust_toolchain_violations("security.yml", bumped, "1.100.0")
         )
 
     def test_cargo_audit_comment_bypass_is_refused_by_the_trusted_checker(self):
@@ -5752,7 +5752,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             root = self._mirror_repo(Path(temporary))
             dockerfile = root / "Dockerfile"
             text = dockerfile.read_text(encoding="utf-8")
-            changed = text.replace("rust:1.99.1-bookworm", "rust:1.98.0-bookworm", 1)
+            changed = text.replace("rust:1.100.0-bookworm", "rust:1.98.0-bookworm", 1)
             self.assertNotEqual(text, changed)
             dockerfile.write_text(changed, encoding="utf-8")
             violations = self._violations(root)
@@ -5839,7 +5839,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 manifest["rust_toolchain"],
-                "1.99.1",
+                "1.100.0",
             )
             self.assertTrue(
                 any(
