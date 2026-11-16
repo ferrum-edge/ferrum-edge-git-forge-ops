@@ -13,6 +13,10 @@ name: GitForgeOps Supply-Chain Policy
 #
 # - The candidate is checked out under `candidate/` as data, with no
 #   credentials persisted. Nothing in it runs.
+#   `allow-unsafe-pr-checkout: true` lets actions/checkout fetch a fork's
+#   head here (it refuses one under this trigger otherwise); it is safe only
+#   because nothing in `candidate/` runs, and `check_supply_chain.py` admits
+#   the input on this one step.
 # - The only program is the protected branch's checker, started from `base/`
 #   under `python3 -I` and pointed at the candidate with `--root`. Isolated
 #   mode puts neither the working directory nor the script directory on the
@@ -68,6 +72,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           path: candidate
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       # A missing checker is a missing file, and `python3` exits non-zero.
       - name: Judge candidate with protected supply-chain policy

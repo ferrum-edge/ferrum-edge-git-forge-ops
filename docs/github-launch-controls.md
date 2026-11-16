@@ -947,14 +947,15 @@ What the checker enforces for this check:
   `allow-unsafe-pr-checkout: true`. A same-repository head is never refused.
   `supply-chain-policy.yml` and `agent-setup-policy.yml` check the candidate
   out only as data for a protected-branch validator run under `python3 -I`,
-  so they are the opt-in's only legitimate users: without it every fork pull
-  request fails both required checks at checkout. The checker admits the
+  so they are the opt-in's only legitimate users, and both set it on their
+  candidate checkout: without it every fork pull request fails both required
+  checks at checkout. The checker admits the
   input only on those two candidate checkouts, with exactly the reviewed
   `repository`, `ref`, `path` and `persist-credentials: false`
   (`unsafe_pr_checkout_violations`), in every workflow and local action. It
-  landed checker-first: this checker accepts the policy workflow with or
-  without the opt-in, a later pull request adds it to both workflows, and a
-  last one drops the shape without it.
+  landed checker-first: the checker learned the opt-in, then a second pull
+  request added it to both workflows. Until the contract step lands, the
+  checker still accepts the policy workflow shape without it.
 - **The tree it reads.** Before reading anything, it walks the whole candidate
   without following links. It follows each relative link target component by
   component from the link's directory, and refuses any symlink that is

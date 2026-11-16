@@ -6,6 +6,10 @@ name: Agent Setup Policy
 # pull_request_target keeps this workflow definition on the protected default
 # branch. It never executes candidate code: the candidate is data for the
 # trusted default-branch validator only.
+# The candidate checkout sets `allow-unsafe-pr-checkout: true` so a fork
+# pull request's head can be checked out under this trigger; that is safe
+# only while nothing in `.agent-setup-candidate` is executed, and
+# `check_supply_chain.py` admits the input on that one step.
 on:
   pull_request_target:
     types:
@@ -33,6 +37,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           path: .agent-setup-candidate
           persist-credentials: false
+          allow-unsafe-pr-checkout: true
 
       - name: Check out trusted default-branch validator
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
