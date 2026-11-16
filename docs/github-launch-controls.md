@@ -938,7 +938,7 @@ What the checker enforces for this check:
   it. Any 40-hex commit is accepted there, including one GitHub resolves
   through a fork of `actions/checkout`, so a change to that commit needs the
   same exact-head review as any other workflow change. The candidate checkout
-  may also carry `allow-unsafe-pr-checkout: true`, and nothing else may
+  must carry `allow-unsafe-pr-checkout: true`, and nothing else may
   (see the next item).
 - **Fork pull requests and `allow-unsafe-pr-checkout`.** `actions/checkout`
   (the pinned v7.0.1, and v6.1.0 / v5.1.0 / v4.4.0) refuses, in a
@@ -954,8 +954,8 @@ What the checker enforces for this check:
   `repository`, `ref`, `path` and `persist-credentials: false`
   (`unsafe_pr_checkout_violations`), in every workflow and local action. It
   landed checker-first: the checker learned the opt-in, then a second pull
-  request added it to both workflows. Until the contract step lands, the
-  checker still accepts the policy workflow shape without it.
+  request added it to both workflows, and the pinned shape of
+  `supply-chain-policy.yml` now requires it.
 - **The tree it reads.** Before reading anything, it walks the whole candidate
   without following links. It follows each relative link target component by
   component from the link's directory, and refuses any symlink that is
