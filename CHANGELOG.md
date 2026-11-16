@@ -764,8 +764,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `settings-audit` in any letter case. `audit_settings.py` matches that name
   case-insensitively and fails when the audit-token environment holds any
   secret other than `SETTINGS_AUDIT_TOKEN` (GHSA-jx32-rxh5-5q25).
-- `check_supply_chain.py` accepts only taiki-e/install-action v2.90.2 for
-  `security-cargo-audit`. v2.87.29, v2.87.30 and v2.88.1 are retired (#701).
+- `check_supply_chain.py` accepts only taiki-e/install-action v2.90.3 for
+  `security-cargo-audit`. v2.87.29, v2.87.30, v2.88.1 (#701) and v2.90.2 are
+  retired.
 - `.gitforgeops/config.yaml` refuses a deployment environment named
   `settings-audit` in any letter case (GHSA-jx32-rxh5-5q25). The settings
   audit waives the reviewer and self-review rules for that GitHub Environment
