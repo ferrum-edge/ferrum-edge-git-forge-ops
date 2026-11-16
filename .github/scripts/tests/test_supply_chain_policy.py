@@ -3003,6 +3003,185 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 len(check_supply_chain.supply_chain_policy_workflow_violations(root)), 1
             )
 
+    # -- actions/checkout fork protection: the candidate data checkout opt-in --
+
+    UNSAFE_PR_CHECKOUT_LINE = "          allow-unsafe-pr-checkout: true\n"
+    CANDIDATE_DATA_CHECKOUTS = {
+        ".github/workflows/supply-chain-policy.yml": (
+            "          path: candidate\n          persist-credentials: false\n"
+        ),
+        ".github/workflows/agent-setup-policy.yml": (
+            "          path: .agent-setup-candidate\n          persist-credentials: false\n"
+        ),
+    }
+
+    def _opted_in(self, relative: str) -> str:
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        if self.UNSAFE_PR_CHECKOUT_LINE in text:
+            return text
+        needle = self.CANDIDATE_DATA_CHECKOUTS[relative]
+        self.assertEqual(text.count(needle), 1)
+        return text.replace(needle, needle + self.UNSAFE_PR_CHECKOUT_LINE, 1)
+
+    def test_policy_workflow_shape_admits_the_candidate_checkout_opt_in(self):
+        # Expand step: the reviewed shape with and without the opt-in.
+        self.assertEqual(
+            check_supply_chain.SUPPLY_CHAIN_POLICY_FORK_SHAPE,
+            check_supply_chain.SUPPLY_CHAIN_POLICY_SHAPE[:28]
+            + ("          allow-unsafe-pr-checkout: true",)
+            + check_supply_chain.SUPPLY_CHAIN_POLICY_SHAPE[28:],
+        )
+        self.assertEqual(
+            check_supply_chain.SUPPLY_CHAIN_POLICY_SHAPE[26:28],
+            ("          path: candidate", "          persist-credentials: false"),
+        )
+        relative = check_supply_chain.SUPPLY_CHAIN_POLICY_PATH
+        original = (ROOT / relative).read_text(encoding="utf-8")
+        opted_in = self._opted_in(relative)
+        for text in (original, opted_in):
+            with self.subTest(opted_in=self.UNSAFE_PR_CHECKOUT_LINE in text):
+                self.assertEqual(
+                    check_supply_chain.supply_chain_policy_shape_violations(text), []
+                )
+        candidate = self.CANDIDATE_DATA_CHECKOUTS[relative]
+        mutants = {
+            # On the protected-branch checkout instead of the candidate's.
+            "on_base_checkout": (
+                candidate + self.UNSAFE_PR_CHECKOUT_LINE,
+                candidate,
+                "          path: base\n          persist-credentials: false\n",
+            ),
+            "false_value": (self.UNSAFE_PR_CHECKOUT_LINE, "          allow-unsafe-pr-checkout: false\n", None),
+            "duplicated": (
+                self.UNSAFE_PR_CHECKOUT_LINE,
+                self.UNSAFE_PR_CHECKOUT_LINE * 2,
+                None,
+            ),
+            "persisted_credentials": (
+                "          path: candidate\n          persist-credentials: false\n",
+                "          path: candidate\n          persist-credentials: true\n",
+                None,
+            ),
+        }
+        for label, (needle, replacement, extra) in mutants.items():
+            with self.subTest(label=label):
+                mutated = opted_in.replace(needle, replacement, 1)
+                if extra is not None:
+                    mutated = mutated.replace(extra, extra + self.UNSAFE_PR_CHECKOUT_LINE, 1)
+                self.assertNotEqual(mutated, opted_in)
+                violations = check_supply_chain.supply_chain_policy_shape_violations(mutated)
+                self.assertEqual(len(violations), 1, violations)
+                self.assertIn("must keep its pinned shape", violations[0])
+
+    def test_unsafe_pr_checkout_opt_in_only_on_candidate_data_checkouts(self):
+        for relative in self.CANDIDATE_DATA_CHECKOUTS:
+            with self.subTest(relative=relative):
+                document = check_supply_chain.parse_workflow(self._opted_in(relative))
+                self.assertEqual(
+                    check_supply_chain.unsafe_pr_checkout_violations(relative, document), []
+                )
+        # Without the opt-in there is nothing to judge.
+        state_guard = ".github/workflows/state-guard.yml"
+        self.assertEqual(
+            check_supply_chain.unsafe_pr_checkout_violations(
+                state_guard,
+                check_supply_chain.parse_workflow(
+                    (ROOT / state_guard).read_text(encoding="utf-8")
+                ),
+            ),
+            [],
+        )
+        agent = ".github/workflows/agent-setup-policy.yml"
+        opted_in = self._opted_in(agent)
+        candidate = self.CANDIDATE_DATA_CHECKOUTS[agent]
+        base = "          path: .agent-setup-base\n          persist-credentials: false\n"
+        refused = {
+            "another_workflow": (
+                state_guard,
+                (ROOT / state_guard).read_text(encoding="utf-8").replace(
+                    "          path: trusted-guard\n          persist-credentials: false\n",
+                    "          path: trusted-guard\n          persist-credentials: false\n"
+                    + self.UNSAFE_PR_CHECKOUT_LINE,
+                    1,
+                ),
+            ),
+            "base_checkout": (
+                agent,
+                opted_in.replace(candidate + self.UNSAFE_PR_CHECKOUT_LINE, candidate, 1).replace(
+                    base, base + self.UNSAFE_PR_CHECKOUT_LINE, 1
+                ),
+            ),
+            "both_checkouts": (agent, opted_in.replace(base, base + self.UNSAFE_PR_CHECKOUT_LINE, 1)),
+            "workspace_root": (
+                agent,
+                opted_in.replace("          path: .agent-setup-candidate\n", "          path: .\n", 1),
+            ),
+            "persisted_credentials": (
+                agent,
+                opted_in.replace(
+                    candidate, candidate.replace("false", "true"), 1
+                ),
+            ),
+            "string_value": (
+                agent,
+                opted_in.replace(self.UNSAFE_PR_CHECKOUT_LINE, "          allow-unsafe-pr-checkout: yes\n", 1),
+            ),
+            "other_case": (
+                agent,
+                opted_in.replace(
+                    candidate + self.UNSAFE_PR_CHECKOUT_LINE,
+                    candidate + "          Allow-Unsafe-PR-Checkout: true\n",
+                    1,
+                ),
+            ),
+            "not_checkout": (
+                agent,
+                opted_in.replace(
+                    "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n"
+                    "        with:\n          repository:",
+                    "uses: someone/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n"
+                    "        with:\n          repository:",
+                    1,
+                ),
+            ),
+        }
+        for label, (relative, text) in refused.items():
+            with self.subTest(label=label):
+                self.assertNotEqual(text, (ROOT / relative).read_text(encoding="utf-8"))
+                violations = check_supply_chain.unsafe_pr_checkout_violations(
+                    relative, check_supply_chain.parse_workflow(text)
+                )
+                self.assertEqual(len(violations), 1, violations)
+                self.assertIn("allow-unsafe-pr-checkout", violations[0])
+
+    def test_unsafe_pr_checkout_opt_in_end_to_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._mirror_repo(Path(directory))
+            for relative in self.CANDIDATE_DATA_CHECKOUTS:
+                (root / relative).write_text(self._opted_in(relative), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-I", str(SCRIPT), "--root", str(root)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            workflow = root / ".github/workflows/rust-ci.yml"
+            text = workflow.read_text(encoding="utf-8")
+            needle = "persist-credentials: false\n"
+            self.assertIn(needle, text)
+            indent = text.split(needle, 1)[0].rsplit("\n", 1)[1]
+            workflow.write_text(
+                text.replace(needle, needle + indent + "allow-unsafe-pr-checkout: true\n", 1),
+                encoding="utf-8",
+            )
+            self.assertTrue(
+                any(
+                    item.startswith(".github/workflows/rust-ci.yml: `allow-unsafe-pr-checkout`")
+                    for item in self._violations(root)
+                )
+            )
+
     # A small workflow in the reader's subset that hostile fixtures mutate.
     SUBSET_WORKFLOW = (
         "name: Fixture\n"
