@@ -937,7 +937,25 @@ What the checker enforces for this check:
   The `actions/checkout` commit is the one free part, so Dependabot can bump
   it. Any 40-hex commit is accepted there, including one GitHub resolves
   through a fork of `actions/checkout`, so a change to that commit needs the
-  same exact-head review as any other workflow change.
+  same exact-head review as any other workflow change. The candidate checkout
+  must carry `allow-unsafe-pr-checkout: true`, and nothing else may
+  (see the next item).
+- **Fork pull requests and `allow-unsafe-pr-checkout`.** `actions/checkout`
+  (the pinned v7.0.1, and v6.1.0 / v5.1.0 / v4.4.0) refuses, in a
+  `pull_request_target` or `workflow_run` run, to check out a fork pull
+  request's head or merge commit unless the step sets
+  `allow-unsafe-pr-checkout: true`. A same-repository head is never refused.
+  `supply-chain-policy.yml` and `agent-setup-policy.yml` check the candidate
+  out only as data for a protected-branch validator run under `python3 -I`,
+  so they are the opt-in's only legitimate users, and both set it on their
+  candidate checkout: without it every fork pull request fails both required
+  checks at checkout. The checker admits the
+  input only on those two candidate checkouts, with exactly the reviewed
+  `repository`, `ref`, `path` and `persist-credentials: false`
+  (`unsafe_pr_checkout_violations`), in every workflow and local action. It
+  landed checker-first: the checker learned the opt-in, then a second pull
+  request added it to both workflows, and the pinned shape of
+  `supply-chain-policy.yml` now requires it.
 - **The tree it reads.** Before reading anything, it walks the whole candidate
   without following links. It follows each relative link target component by
   component from the link's directory, and refuses any symlink that is

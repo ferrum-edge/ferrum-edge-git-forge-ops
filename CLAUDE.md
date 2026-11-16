@@ -123,7 +123,11 @@ cargo fmt --all && cargo fmt --all -- --check
     context's own job (`REQUIRED_CHECK_WORKFLOWS`), no computed job names, no
     `checks`/`statuses` write;
   - the parsed `security-cargo-audit` job and `security.yml`'s reviewed `on:`
-    triggers are pinned.
+    triggers are pinned;
+  - `allow-unsafe-pr-checkout` (actions/checkout's fork-head opt-in under
+    `pull_request_target`) only on the candidate data checkouts of
+    `supply-chain-policy.yml` and `agent-setup-policy.yml`
+    (`unsafe_pr_checkout_violations`).
 - An organization ruleset requires, by path at `main`, every workflow in
   `REQUIRED_CHECK_WORKFLOWS` (`audit_settings.REQUIRED_RULESET_WORKFLOWS`;
   [launch controls §2a](docs/github-launch-controls.md#2a-require-the-trusted-workflows-by-path)).

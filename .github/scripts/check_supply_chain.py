@@ -2539,9 +2539,9 @@ RUST_CI_CHECK_JOB = [
     "            ~/.cargo/registry",
     "            ~/.cargo/git",
     "            target",
-    "          key: ${{ runner.os }}-rust-ci-${{ hashFiles('**/Cargo.lock') }}",
+    "          key: ${{ runner.os }}-rust-ci-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}",
     "          restore-keys: |",
-    "            ${{ runner.os }}-rust-ci-",
+    "            ${{ runner.os }}-rust-ci-${{ hashFiles('rust-toolchain.toml') }}-",
     "      - name: cargo fmt --check",
     "        if: github.event_name != 'pull_request' || steps.scope.outputs.rust == 'true'",
     "        run: cargo fmt --all -- --check",
@@ -2657,9 +2657,9 @@ COVERAGE_JOB = [
     "            ~/.cargo/registry",
     "            ~/.cargo/git",
     "            target",
-    "          key: ${{ runner.os }}-rust-coverage-${{ hashFiles('**/Cargo.lock') }}",
+    "          key: ${{ runner.os }}-rust-coverage-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}",
     "          restore-keys: |",
-    "            ${{ runner.os }}-rust-coverage-",
+    "            ${{ runner.os }}-rust-coverage-${{ hashFiles('rust-toolchain.toml') }}-",
     "      # Always install from the pinned action's checksum manifest, as",
     "      # security.yml does for cargo-audit. `~/.cargo/bin` is deliberately not",
     "      # cached: a restored binary would skip that verification.",
@@ -3312,9 +3312,25 @@ SUPPLY_CHAIN_POLICY_SHAPE = (
     "          ref: ${{ github.event.pull_request.head.sha }}",
     "          path: candidate",
     "          persist-credentials: false",
+    "          allow-unsafe-pr-checkout: true",
     "      - name: Judge candidate with protected supply-chain policy",
     f"        run: {SUPPLY_CHAIN_POLICY_INVOCATION}",
 )
+# `actions/checkout` (v7.0.1, and v6.1.0 / v5.1.0 / v4.4.0 on the older major
+# lines) refuses, in a `pull_request_target` or `workflow_run` run, to check
+# out a fork pull request's head or merge commit unless the step sets this
+# input. A same-repository head is never refused. The candidate checkout above
+# is data for the protected checker under `python3 -I` and nothing in it runs,
+# so it opts in: without it every fork pull request fails this required
+# check at checkout. `unsafe_pr_checkout_violations` admits the input nowhere
+# else.
+UNSAFE_PR_CHECKOUT_INPUT = "allow-unsafe-pr-checkout"
+# The pinned shape above requires the opt-in on the candidate checkout and
+# nowhere else (the contract step of the expand/contract pair that added it).
+assert SUPPLY_CHAIN_POLICY_SHAPE.count(f"          {UNSAFE_PR_CHECKOUT_INPUT}: true") == 1
+assert SUPPLY_CHAIN_POLICY_SHAPE[
+    SUPPLY_CHAIN_POLICY_SHAPE.index("          path: candidate") + 2
+] == f"          {UNSAFE_PR_CHECKOUT_INPUT}: true"
 _PINNED_USES = re.compile(r"^(\s*(?:-\s+)?uses:\s*[^@\s]+)@[0-9a-f]{40}$")
 # YAML starts a comment at a `#` preceded by whitespace. A `#` glued to a
 # value is part of it, so it is kept and the line no longer matches. A
@@ -3368,6 +3384,87 @@ def supply_chain_policy_workflow_violations(root: Path) -> list[str]:
             "workflow must remain a regular file"
         ]
     return supply_chain_policy_shape_violations(path.read_text(encoding="utf-8"))
+
+
+# The only steps that may opt in to checking out fork pull request code: the
+# candidate data checkouts of the two `pull_request_target` policy workflows,
+# each feeding a protected-branch validator run under `python3 -I` from a
+# separate default-branch checkout. Exact `with:` mappings, so the opt-in
+# cannot move to a checkout that persists credentials or lands in the
+# workspace root, where later steps run.
+UNSAFE_PR_CHECKOUT_STEPS = {
+    SUPPLY_CHAIN_POLICY_PATH: {
+        "repository": "${{ github.event.pull_request.head.repo.full_name }}",
+        "ref": "${{ github.event.pull_request.head.sha }}",
+        "path": "candidate",
+        "persist-credentials": "false",
+        UNSAFE_PR_CHECKOUT_INPUT: "true",
+    },
+    ".github/workflows/agent-setup-policy.yml": {
+        "repository": "${{ github.event.pull_request.head.repo.full_name }}",
+        "ref": "${{ github.event.pull_request.head.sha }}",
+        "path": ".agent-setup-candidate",
+        "persist-credentials": "false",
+        UNSAFE_PR_CHECKOUT_INPUT: "true",
+    },
+}
+
+
+def _mappings_with_key(node, name: str):
+    """Every mapping (at any depth) holding `name` as a key, in any case."""
+    if isinstance(node, dict):
+        if any(str(key).casefold() == name for key in node):
+            yield node
+        for value in node.values():
+            yield from _mappings_with_key(value, name)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _mappings_with_key(item, name)
+
+
+def unsafe_pr_checkout_violations(relative: str, document: dict) -> list[str]:
+    """`allow-unsafe-pr-checkout` only on a reviewed candidate data checkout.
+
+    `relative` is the workflow or local action path relative to the root.
+    """
+    holders = [
+        mapping
+        for mapping in _mappings_with_key(document, UNSAFE_PR_CHECKOUT_INPUT)
+    ]
+    if not holders:
+        return []
+    allowed = UNSAFE_PR_CHECKOUT_STEPS.get(relative)
+    refusal = (
+        f"{relative}: `{UNSAFE_PR_CHECKOUT_INPUT}` is admitted only on the candidate "
+        "data checkout of supply-chain-policy.yml and agent-setup-policy.yml, with "
+        f"exactly {{repository, ref, path, persist-credentials: false, "
+        f"{UNSAFE_PR_CHECKOUT_INPUT}: true}}"
+    )
+    if allowed is None or len(holders) != 1:
+        return [refusal]
+    with_block = holders[0]
+    steps = [
+        step
+        for jobs in (value for key, value in document.items() if str(key).casefold() == "jobs")
+        if isinstance(jobs, dict)
+        for job in jobs.values()
+        if isinstance(job, dict)
+        for key, job_steps in job.items()
+        if str(key).casefold() == "steps" and isinstance(job_steps, list)
+        for step in job_steps
+        if isinstance(step, dict)
+    ]
+    owner = next((step for step in steps if step.get("with") is with_block), None)
+    uses = owner.get("uses") if owner is not None else None
+    if (
+        owner is None
+        or not isinstance(uses, str)
+        or uses.split("@", 1)[0].casefold() != "actions/checkout"
+        or set(owner) - {"name", "uses", "with"}
+        or with_block != allowed
+    ):
+        return [refusal]
+    return []
 
 
 def candidate_tree_violations(root: Path) -> list[str]:
@@ -6729,11 +6826,22 @@ def main(argv: list[str] | None = None) -> int:
         document = workflow_documents.get(workflow.relative_to(root).as_posix())
         if document is not None:
             references = workflow_action_references(document)
+            violations.extend(
+                unsafe_pr_checkout_violations(
+                    workflow.relative_to(root).as_posix(), document
+                )
+            )
         else:
             # A local action: its `uses:` are read from the parsed file, as the
             # runner reads them, never from a text scan a spelling can evade.
             try:
-                references = workflow_action_references(parse_workflow(text))
+                local_document = parse_workflow(text)
+                references = workflow_action_references(local_document)
+                violations.extend(
+                    unsafe_pr_checkout_violations(
+                        workflow.relative_to(root).as_posix(), local_document
+                    )
+                )
             except WorkflowSyntaxError as error:
                 references = []
                 violations.append(
