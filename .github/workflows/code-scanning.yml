@@ -207,9 +207,15 @@ jobs:
             -v "$PWD/tests:/build/tests:ro" \
             -v "$RUNNER_TEMP/override-tests:/checks" \
             gitforgeops:test-builder sh -ec '
-              cargo test --release --locked --offline --test unit_tests --no-run
-              find /build/target/release/deps -maxdepth 1 -type f \
-                -name "unit_tests-*" -executable -exec cp "{}" /checks/unit_tests \;
+              # Ask cargo where it wrote the test binary: Rust 1.100 moved
+              # test executables out of target/release/deps, so a fixed
+              # path breaks on toolchain bumps.
+              cargo test --release --locked --offline --test unit_tests --no-run \
+                --message-format=json > /tmp/artifacts.json
+              grep "\"kind\":\[\"test\"\]" /tmp/artifacts.json \
+                | sed -n "s/.*\"executable\":\"\([^\"]*\)\".*/\1/p" > /tmp/test-binaries
+              test "$(wc -l < /tmp/test-binaries)" -eq 1
+              cp "$(cat /tmp/test-binaries)" /checks/unit_tests
               test -x /checks/unit_tests
             '
 

@@ -149,7 +149,7 @@ cargo fmt --all && cargo fmt --all -- --check
 - Environments with `live_review: false` are removed before the
   Environment-bound matrix; file mode requires it. Fork PRs and new or remapped
   namespaces never enter the privileged live-read boundary.
-- Rust is pinned to 1.99.1 in `rust-toolchain.toml`. External Actions use full
+- Rust is pinned to 1.100.0 in `rust-toolchain.toml`. External Actions use full
   commit SHAs.
 - Every workflow job declares a literal `timeout-minutes`
   (`job_timeout_violations`): at most 120, or 360 for a job that commits the

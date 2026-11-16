@@ -548,8 +548,8 @@ fn the_bundled_auditor_runs_only_gh() {
 
 /// The builder whose Git and libraries the Dockerfile's override Git
 /// assessment describes (Git 2.39.5, zlib1g 1:1.2.13.dfsg-1).
-const ASSESSED_BUILDER: &str = "FROM rust:1.99.1-bookworm@sha256:\
-e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS builder";
+const ASSESSED_BUILDER: &str = "FROM rust:1.100.0-bookworm@sha256:\
+ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder";
 
 #[test]
 fn the_assessment_names_the_pinned_builder() {
