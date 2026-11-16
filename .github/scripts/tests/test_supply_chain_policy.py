@@ -7577,7 +7577,8 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
              "          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}\n"
              "\n      - name: Install Rust toolchain\n",
              "alloy-consumer.yml: cache key family"),
-            ("rust-ci.yml", "            ${{ runner.os }}-rust-ci-\n",
+            ("rust-ci.yml",
+             "            ${{ runner.os }}-rust-ci-${{ hashFiles('rust-toolchain.toml') }}-\n",
              "            ${{ runner.os }}-\n", "rust-ci.yml: cache key family"),
             ("apply-on-merge.yml", privileged_key,
              privileged_key + "          restore-keys: | # fallback\n            ${{ runner.os }}-\n",
