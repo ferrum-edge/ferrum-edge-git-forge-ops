@@ -1503,16 +1503,19 @@ mod tests {
                     "basicauth": [{"username": "x", "password": secret}],
                     "mtls_auth": [{"identity": "x"}]}}],
             "plugin_configs": [{"id": "plugin", "namespace": "ferrum", "plugin_name": "otel_tracing", "scope": "global",
-                "config": {"headers": {"authorization": secret}}}],
+                "config": {"authorization": secret}}],
             "upstreams": [{"id": "upstream", "namespace": "ferrum", "targets": [],
                 "service_discovery": {"provider": "consul", "consul": {
                     "address": "https://consul.example", "service_name": "service", "token": secret}}}]
         })).unwrap()
     }
 
-    /// A short credential, schema-declared plugin secret or discovery secret
-    /// refuses the run, naming the resource and field path but never the
-    /// value. An empty one has nothing to protect and is skipped.
+    /// A short credential, schema-declared plugin secret (a field that only
+    /// ever holds a credential, such as `otel_tracing` `authorization`; an
+    /// arbitrary header map is an operator value and never refuses) or
+    /// discovery secret refuses the run, naming the resource and field path
+    /// but never the value. An empty one has nothing to protect and is
+    /// skipped.
     #[test]
     fn live_admission_refuses_short_leaves_without_registering_them() {
         enable();
@@ -1522,10 +1525,7 @@ mod tests {
                     "consumer",
                     "Consumer ferrum/consumer credentials.basicauth[0].password",
                 ),
-                (
-                    "plugin",
-                    "PluginConfig ferrum/plugin config.headers.authorization",
-                ),
+                ("plugin", "PluginConfig ferrum/plugin config.authorization"),
                 (
                     "discovery",
                     "Upstream ferrum/upstream service_discovery.consul.token",

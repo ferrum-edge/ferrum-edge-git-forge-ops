@@ -393,11 +393,11 @@ fn short_operator_plugin_values_stay_ordinary_settings() {
 
 /// One plugin per credential or operator-chosen token Ferrum Edge's
 /// `plugin_config_projection` redacts after v0.9.20 (v0.9.20 itself does not):
-/// the `ai_tool_governor` approval and `mcp_gateway` server header maps
-/// (secrets), and the `request_termination` / `transaction_debugger` selector
-/// tokens, `waf` rule conditions and `mesh_route_dispatch` match operands
-/// (operator values), each long enough to be scrubbed, with the broker slot
-/// import must capture it under.
+/// the `ai_tool_governor` approval and `mcp_gateway` server header maps, the
+/// `request_termination` / `transaction_debugger` selector tokens, `waf` rule
+/// conditions and `mesh_route_dispatch` match operands (all operator values),
+/// each long enough to be scrubbed, with the broker slot import must capture
+/// it under.
 fn edge_post_0_9_20_redacted_plugins() -> Vec<(&'static str, serde_json::Value, Vec<&'static str>)>
 {
     vec![
@@ -609,14 +609,64 @@ fn short_post_0_9_20_operator_plugin_values_stay_ordinary_settings() {
     }
 }
 
-/// A live `/backup` whose credential header map holds a short ordinary value
-/// (`x-api-version: "2"`) is admitted: every admin read (`diff`, `plan`,
-/// `review`, `apply`) decodes it, nothing short is registered, and a long
-/// credential beside it is still registered and scrubbed from display.
+/// A live `/backup` whose header map holds a short ordinary value
+/// (`x-api-version: "2"`, Grafana's `X-Scope-OrgID: "12345"`) is admitted:
+/// every admin read (`diff`, `plan`, `review`, `apply`) decodes it, nothing
+/// short is registered, and a long credential beside it is still registered
+/// and scrubbed from display. One case per arbitrary header map.
 #[test]
 fn short_live_credential_header_values_never_refuse_a_backup_read() {
     gitforgeops::display::enable_display_scrubbing_on_this_thread();
     for (plugin_name, credential, config) in [
+        (
+            "otel_tracing",
+            "zq9-otel-team-credential",
+            serde_json::json!({"headers": {
+                "x-api-version": "2",
+                "x-honeycomb-team": "zq9-otel-team-credential"
+            }}),
+        ),
+        (
+            "opa",
+            "zq9-opa-bundle-credential",
+            serde_json::json!({"headers": {
+                "x-api-version": "2",
+                "x-bundle-token": "zq9-opa-bundle-credential"
+            }}),
+        ),
+        (
+            "ai_transcript_audit",
+            "zq9-audit-ingest-credential",
+            serde_json::json!({"sink": {"custom_headers": {
+                "x-api-version": "2",
+                "x-ingest-key": "zq9-audit-ingest-credential"
+            }}}),
+        ),
+        (
+            "http_logging",
+            "zq9-http-collector-credential",
+            serde_json::json!({"custom_headers": {
+                "x-api-version": "2",
+                "x-collector-auth": "zq9-http-collector-credential"
+            }}),
+        ),
+        (
+            "loki_logging",
+            "zq9-loki-tenant-credential",
+            serde_json::json!({"custom_headers": {
+                "X-Scope-OrgID": "12345",
+                "x-api-version": "2",
+                "x-loki-auth": "zq9-loki-tenant-credential"
+            }}),
+        ),
+        (
+            "proxy_alerts",
+            "zq9-alert-hook-credential",
+            serde_json::json!({"channels": [{"headers": {
+                "x-api-version": "2",
+                "x-hook-auth": "zq9-alert-hook-credential"
+            }}]}),
+        ),
         (
             "ai_tool_governor",
             "zq9-approval-credential",
@@ -649,6 +699,81 @@ fn short_live_credential_header_values_never_refuse_a_backup_read() {
         assert!(!shown.contains("zq9-"), "{plugin_name}: {shown}");
         assert!(shown.contains("x-api-version 2"), "{plugin_name}: {shown}");
     }
+}
+
+/// A short header value named like a credential (`authorization: "x"`,
+/// `x-functions-key: "abc"`) is too short to broker or redact, so it stays an
+/// ordinary setting; import names it in a warning notice and the security
+/// audit reports a non-blocking warning, never the value. A short ordinary
+/// header (`X-Scope-OrgID`) raises neither.
+#[test]
+fn short_credential_named_header_values_are_warned_about() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    let original = single_plugin_gateway(
+        "http_logging",
+        serde_json::json!({"custom_headers": {
+            "authorization": "q7x",
+            "x-functions-key": "q7y",
+            "X-Scope-OrgID": "12345"
+        }}),
+    );
+    let mut gateway = original.clone();
+    let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+    assert!(capture.captured.is_empty());
+    assert!(capture.unbrokered.is_empty());
+    assert_eq!(
+        gateway.plugin_configs[0].config,
+        original.plugin_configs[0].config
+    );
+    let warned: Vec<&str> = capture
+        .short_credential_named
+        .iter()
+        .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+        .collect();
+    assert_eq!(
+        warned,
+        [
+            "custom_headers.authorization",
+            "custom_headers.x-functions-key"
+        ]
+    );
+
+    let result = gitforgeops::import::ImportResult {
+        short_credential_plugin_config: capture.short_credential_named,
+        ..Default::default()
+    };
+    let notice = result
+        .short_credential_plugin_config_notice()
+        .expect("short credential notice");
+    assert!(notice.contains("WARNING"), "{notice}");
+    assert!(notice.contains("plugin_name=http_logging"), "{notice}");
+    assert!(notice.contains("custom_headers.authorization"), "{notice}");
+    assert!(
+        notice.contains("custom_headers.x-functions-key"),
+        "{notice}"
+    );
+    assert!(!notice.contains("X-Scope-OrgID"), "{notice}");
+    assert!(!notice.contains("q7"), "{notice}");
+
+    let findings = audit_security(&original);
+    assert!(security_blockers(&findings).is_empty(), "{findings:?}");
+    let warnings: Vec<&str> = findings
+        .iter()
+        .map(|finding| finding.message.as_str())
+        .filter(|message| message.contains("Short credential-named"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{findings:?}");
+    assert!(warnings[0].contains("config.custom_headers.authorization"));
+    assert!(warnings[1].contains("config.custom_headers.x-functions-key"));
+    for finding in &findings {
+        assert!(!finding.message.contains("q7"), "{}", finding.message);
+    }
+
+    assert!(gitforgeops::import::ImportResult::default()
+        .short_credential_plugin_config_notice()
+        .is_none());
 }
 
 /// `opa` `opa_host` is an endpoint Edge projects structurally, not a
