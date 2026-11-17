@@ -1107,6 +1107,47 @@ fn uncompared_sites(view: &gitforgeops::config_export::ExportLiveView) -> Vec<(S
         .collect()
 }
 
+/// Edge fingerprints every `api_chargeback_sink` insert query parameter.
+/// The repository keeps them literal (they are ClickHouse settings), so each
+/// fingerprinted one is put back and counted as uncompared, never drift.
+#[test]
+fn fingerprinted_chargeback_query_params_are_uncompared_not_drift() {
+    let desired: GatewayConfig = serde_json::from_value(json!({
+        "plugin_configs": [{
+            "id": "sink",
+            "namespace": "ferrum",
+            "plugin_name": "api_chargeback_sink",
+            "scope": "global",
+            "config": {"clickhouse": {"insert_query_params": {
+                "async_insert": "1",
+                "date_time_input_format": "best_effort"
+            }}},
+        }],
+    }))
+    .unwrap();
+    let mut live = serde_json::to_value(&desired.plugin_configs[0]).unwrap();
+    let pointers = [
+        "/config/clickhouse/insert_query_params/async_insert",
+        "/config/clickhouse/insert_query_params/date_time_input_format",
+    ];
+    for pointer in pointers {
+        *live.pointer_mut(pointer).unwrap() = json!(fp('e'));
+    }
+    let body = document("ferrum", KEY_ID, json!([]), json!([live])).to_string();
+    let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+    let view = export.live_view_with(&desired, &desired).unwrap();
+    let mut uncompared: Vec<&str> = view
+        .uncompared
+        .iter()
+        .map(|site| site.pointer.as_str())
+        .collect();
+    uncompared.sort_unstable();
+    assert_eq!(uncompared, pointers);
+    assert!(view.masked_ancestors.is_empty());
+    let diffs = compute_diff(&desired, &view.actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+}
+
 #[test]
 fn widened_edge_fingerprints_are_uncompared_not_drift() {
     let desired = widened_desired();

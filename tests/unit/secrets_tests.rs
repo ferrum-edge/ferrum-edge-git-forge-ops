@@ -660,15 +660,6 @@ fn short_live_credential_header_values_never_refuse_a_backup_read() {
             }}),
         ),
         (
-            "api_chargeback_sink",
-            "zq9-clickhouse-credential",
-            serde_json::json!({"clickhouse": {"insert_query_params": {
-                "x-api-version": "2",
-                "database": "default",
-                "password": "zq9-clickhouse-credential"
-            }}}),
-        ),
-        (
             "proxy_alerts",
             "zq9-alert-hook-credential",
             serde_json::json!({"channels": [{"headers": {
@@ -708,6 +699,86 @@ fn short_live_credential_header_values_never_refuse_a_backup_read() {
         assert!(!shown.contains("zq9-"), "{plugin_name}: {shown}");
         assert!(shown.contains("x-api-version 2"), "{plugin_name}: {shown}");
     }
+}
+
+/// A short value whose credential-like name sits in a sibling field
+/// (`request_termination` `{header, header_value}`) is warned about too, on
+/// import and in the security audit, without blocking.
+#[test]
+fn short_values_named_by_a_sibling_field_are_warned_about() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    let original = single_plugin_gateway(
+        "request_termination",
+        serde_json::json!({"trigger": {"header": "authorization", "header_value": "q7z"}}),
+    );
+    let mut gateway = original.clone();
+    let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+    assert!(capture.captured.is_empty());
+    assert!(capture.unbrokered.is_empty());
+    let warned: Vec<&str> = capture
+        .short_credential_named
+        .iter()
+        .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+        .collect();
+    assert_eq!(warned, ["trigger.header_value"]);
+
+    let findings = audit_security(&original);
+    assert!(security_blockers(&findings).is_empty(), "{findings:?}");
+    assert!(
+        findings.iter().any(|finding| finding.message.contains(
+            "Short credential-named plugin-config value in 'config.trigger.header_value'"
+        )),
+        "{findings:?}"
+    );
+    for finding in &findings {
+        assert!(!finding.message.contains("q7z"), "{}", finding.message);
+    }
+}
+
+/// `api_chargeback_sink` insert query parameters are ClickHouse settings
+/// (Edge refuses credential-named keys): import keeps every value literal,
+/// long or short, with no allowance or warning, nothing gates it, and a live
+/// `/backup` holding one is admitted without registering it.
+#[test]
+fn chargeback_insert_query_params_stay_literal_settings() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    let config = serde_json::json!({"clickhouse": {"insert_query_params": {
+        "async_insert": "1",
+        "date_time_input_format": "best_effort",
+        "session_timezone": "Europe/Berlin"
+    }}});
+    let original = single_plugin_gateway("api_chargeback_sink", config.clone());
+    let mut gateway = original.clone();
+    let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+    assert!(capture.captured.is_empty());
+    assert!(capture.unbrokered.is_empty());
+    assert!(capture.short_credential_named.is_empty());
+    assert_eq!(
+        gateway.plugin_configs[0].config,
+        original.plugin_configs[0].config
+    );
+    assert!(audit_security(&original)
+        .iter()
+        .all(|finding| !finding.message.contains("insert_query_params")));
+    assert!(security_blockers(&audit_security(&original)).is_empty());
+
+    let body = serde_json::json!({
+        "version": "1",
+        "proxies": [], "consumers": [], "upstreams": [],
+        "plugin_configs": [{"id": "plugin", "namespace": "ferrum",
+            "plugin_name": "api_chargeback_sink", "scope": "global", "config": config}]
+    })
+    .to_string();
+    gitforgeops::http_client::BackupSnapshot::from_body(&body).unwrap();
+    assert_eq!(
+        gitforgeops::display::scrub_text("best_effort Europe/Berlin"),
+        "best_effort Europe/Berlin"
+    );
 }
 
 /// A short header value named like a credential (`authorization: "x"`,
