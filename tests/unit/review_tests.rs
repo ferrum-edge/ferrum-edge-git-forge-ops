@@ -1814,9 +1814,9 @@ fn review_comment_bodies_lose_registered_values_at_the_sink() {
     assert!(!published.contains("field\\_canary"), "{published}");
 }
 
-/// A live value on a plugin path Ferrum Edge v0.9.19 started redacting is
-/// registered from the live snapshot, so a diff that echoes it loses it at
-/// the PR comment's sink.
+/// A live value on a plugin path Ferrum Edge v0.9.19 started redacting, or
+/// on a shared secret GHSA-5p93-qfr5-m7m9 classified, is registered from the
+/// live snapshot, so a diff that echoes it loses it at the PR comment's sink.
 #[test]
 fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
     gitforgeops::display::enable_display_scrubbing_on_this_thread();
@@ -1844,6 +1844,18 @@ fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
             serde_json::json!({"global_exemptions": {"header_present": {
                 "x-trusted-hop": "zq7-waf-header-present-v19"
             }}}),
+        ),
+        (
+            "openapi_validator",
+            "zq7-openapi-bypass-header-value",
+            serde_json::json!({"bypass": {"header_present": {
+                "x-internal-scan": "zq7-openapi-bypass-header-value"
+            }}}),
+        ),
+        (
+            "ai_semantic_firewall",
+            "zq7-firewall-snippet-hash-salt",
+            serde_json::json!({"privacy": {"snippet_hash_salt": "zq7-firewall-snippet-hash-salt"}}),
         ),
         (
             "fault_injection",

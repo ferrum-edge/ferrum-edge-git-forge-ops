@@ -52,7 +52,8 @@ Loading is fail-closed and deterministic:
 - A selected overlay directory must exist. The error names the environment,
   the overlay and the file that selected it.
 - Files are sorted before parsing, walker errors propagate, and symlinks
-  anywhere in `resources/` or the selected overlay are rejected.
+  anywhere in `resources/` or the selected overlay are rejected, including a
+  symlinked `overlays/` directory.
 - Each resource or overlay file must be a regular file of at most 1 MiB, the
   same per-file cap PR input staging applies. A larger file is refused with a
   size error before it is buffered or parsed. `import` refuses to render a

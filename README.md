@@ -360,8 +360,9 @@ credentials. It accepts only `version: 1`, and unknown keys fail with the file
 path and key.
 
 The file is read before anything else runs, so it must be a plain file in the
-checkout: symlinks, non-regular files (directories, FIFOs, devices) and files
-over 1 MiB are refused before parsing. The same rule applies to
+checkout: symlinks (the file itself or a symlinked `.gitforgeops` directory),
+non-regular files (directories, FIFOs, devices) and files over 1 MiB are
+refused before parsing. The same rule applies to
 `.gitforgeops/policies.yaml` and `.gitforgeops/smoke.yaml`.
 
 ```yaml

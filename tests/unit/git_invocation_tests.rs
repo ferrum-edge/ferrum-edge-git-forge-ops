@@ -517,13 +517,13 @@ fn doctor_runs_only_the_bundled_auditor() {
     assert!(!doctor_runs_the_bundled_auditor(&rebound));
 }
 
-#[test]
-fn the_bundled_auditor_runs_only_gh() {
-    // Doctor runs this script with `python3 -I -c` (pinned by
-    // `doctor_runs_only_the_bundled_auditor`); its own subprocess use is
-    // pinned here.
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/audit_settings.py");
-    let source = std::fs::read_to_string(path).unwrap();
+/// Why the bundled auditor's source can reach something other than its one
+/// `gh api` call, or `None`. Every Python spelling that runs a program or
+/// reaches a module or attribute by computed name is banned, and the one
+/// command list, its one extension and the one `subprocess.run` are pinned as
+/// exact statements with exact occurrence counts, so `"g" + "it"`, an aliased
+/// import or a second call cannot get past it (#673).
+fn bundled_auditor_escape(source: &str) -> Option<String> {
     for api in [
         "os.system",
         "os.popen",
@@ -539,11 +539,91 @@ fn the_bundled_auditor_runs_only_gh() {
         "create_subprocess",
         "\"git\"",
         "'git'",
+        "getattr(",
+        "eval(",
+        "exec(",
+        "compile(",
+        "__import__",
+        "importlib",
+        "runpy",
+        "globals(",
+        "vars(",
+        "__builtins__",
+        "sys.modules",
     ] {
-        assert!(!source.contains(api), "the bundled auditor uses {api}");
+        if source.contains(api) {
+            return Some(format!("uses {api}"));
+        }
     }
-    assert_eq!(source.matches("subprocess.run(").count(), 1);
-    assert!(source.contains(r#"command = ["gh", "api", path]"#));
+    for (text, count) in [
+        ("subprocess", 2),
+        ("import subprocess\n", 1),
+        (
+            "result = subprocess.run(command, check=False, text=True, capture_output=True)",
+            1,
+        ),
+        (r#"command = ["gh", "api", path]"#, 1),
+        (r#"command.extend(["--paginate", "--slurp"])"#, 1),
+    ] {
+        let found = source.matches(text).count();
+        if found != count {
+            return Some(format!(
+                "has {found} occurrence(s) of {text:?}, expected {count}"
+            ));
+        }
+    }
+    // The one list `subprocess.run` receives is named only by the three
+    // pinned statements.
+    let found = word_count(source, "command");
+    if found != 3 {
+        return Some(format!("names `command` {found} time(s), expected 3"));
+    }
+    None
+}
+
+/// Occurrences of `word` not inside a longer identifier.
+fn word_count(source: &str, word: &str) -> usize {
+    let boundary = |c: Option<char>| !matches!(c, Some(c) if c.is_alphanumeric() || c == '_');
+    source
+        .match_indices(word)
+        .filter(|(at, _)| {
+            boundary(source[..*at].chars().next_back())
+                && boundary(source[at + word.len()..].chars().next())
+        })
+        .count()
+}
+
+#[test]
+fn the_bundled_auditor_runs_only_gh() {
+    // Doctor runs this script with `python3 -I -c` (pinned by
+    // `doctor_runs_only_the_bundled_auditor`); its own subprocess use is
+    // pinned here.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/scripts/audit_settings.py");
+    let source = std::fs::read_to_string(path).unwrap();
+    assert_eq!(bundled_auditor_escape(&source), None);
+
+    let pinned_command = r#"command = ["gh", "api", path]"#;
+    assert!(source.contains(pinned_command));
+    for mutated in [
+        format!("{source}\ngetattr(subprocess, \"run\")([\"true\"])\n"),
+        format!("{source}\neval(\"1\")\n"),
+        format!("{source}\nexec(\"pass\")\n"),
+        format!("{source}\n__import__(\"subprocess\")\n"),
+        format!("{source}\nimport importlib\n"),
+        format!("{source}\nimport subprocess as sp\n"),
+        format!("{source}\nsubprocess.run([\"true\"])\n"),
+        format!("{source}\ncommand = [\"g\" + \"it\", \"log\"]\n"),
+        source.replace(pinned_command, r#"command = ["g" + "h", "api", path]"#),
+        source.replace(
+            r#"command.extend(["--paginate", "--slurp"])"#,
+            r#"command.extend(["--paginate", "--slurp", extra])"#,
+        ),
+    ] {
+        assert!(
+            bundled_auditor_escape(&mutated).is_some(),
+            "accepted a mutated auditor"
+        );
+    }
 }
 
 /// The builder whose Git and libraries the Dockerfile's override Git
@@ -563,19 +643,106 @@ fn the_assessment_names_the_pinned_builder() {
     );
 }
 
+/// `source` without `//` comments and without whitespace, so pinned text in a
+/// comment never satisfies a pin. String literals are kept whole.
+fn compact_code(source: &str) -> String {
+    let mut out = String::new();
+    let mut chars = source.chars().peekable();
+    let (mut in_string, mut escaped) = (false, false);
+    while let Some(c) = chars.next() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if c == '/' && chars.peek() == Some(&'/') {
+            for skipped in chars.by_ref() {
+                if skipped == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if !c.is_whitespace() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The definition of the hex check the `merge-base` operands rely on.
+const IS_REVISION_DEFINITION: &str =
+    "pubfnis_revision(value:&str)->bool{value.len()==40&&value.bytes().all(|b|b.is_ascii_hexdigit())}";
+
+/// The code from the `HEAD` read to the `merge-base` call, as one contiguous
+/// run: both operands are validated by `is_revision` with nothing between
+/// the checks and the call.
+const MERGE_BASE_BLOCK: &str = concat!(
+    r#"letrevision=git(source,&["rev-parse","HEAD"])?;letrevision=revision.trim();"#,
+    r#"if!is_revision(revision){returnErr("missingactualsourcerevision".into());}"#,
+    r#"ifmerged{letmerge=merge_revision.filter(|sha|is_revision(sha))"#,
+    r#".ok_or("missingmergedPRrevision")?;"#,
+    r#"git(source,&["merge-base","--is-ancestor",merge,revision])?;}"#,
+);
+
+/// Every `is_revision(` in `override_input.rs`: the definition, the `HEAD`
+/// check, the merged-PR filter and the tree-entry check.
+const IS_REVISION_SITES: usize = 4;
+
+/// Why the `merge-base` operands may no longer be hex-validated, or `None`.
+fn merge_base_validation_gap(source: &str) -> Option<String> {
+    let code = compact_code(source);
+    for (text, count) in [
+        (IS_REVISION_DEFINITION, 1),
+        (MERGE_BASE_BLOCK, 1),
+        ("is_revision(", IS_REVISION_SITES),
+        ("merge-base", 1),
+        ("letmerge=", 1),
+    ] {
+        let found = code.matches(text).count();
+        if found != count {
+            return Some(format!(
+                "has {found} occurrence(s) of {text:?}, expected {count}"
+            ));
+        }
+    }
+    None
+}
+
 #[test]
 fn the_merge_base_operands_stay_hex_validated() {
     // The pinned `merge-base` call passes `merge` and `revision`; they are safe
     // revision operands only because this check admits 40 hex digits alone.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/policy/override_input.rs");
-    let compact: String = std::fs::read_to_string(path)
-        .unwrap()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    assert!(compact.contains(
-        "pubfnis_revision(value:&str)->bool{value.len()==40&&value.bytes().all(|b|b.is_ascii_hexdigit())}"
-    ));
-    assert!(compact.contains("if!is_revision(revision){"));
-    assert!(compact.contains("letmerge=merge_revision.filter(|sha|is_revision(sha))"));
+    let source = std::fs::read_to_string(path).unwrap();
+    assert_eq!(merge_base_validation_gap(&source), None);
+
+    let filter = ".filter(|sha| is_revision(sha))";
+    let check = "if !is_revision(revision) {";
+    let length = "value.len() == 40";
+    for needle in [filter, check, length] {
+        assert!(source.contains(needle), "{needle}");
+    }
+    for mutated in [
+        // The filter dropped, with the old text kept in a comment.
+        source.replace(filter, "") + "\n// let merge = merge_revision.filter(|sha| is_revision(sha))\n",
+        // The filter dropped, with the old text kept in dead code.
+        source.replace(filter, "")
+            + "\n#[cfg(any())]\nfn dead() { let merge = merge_revision.filter(|sha| is_revision(sha)); }\n",
+        source.replace(check, "if revision.is_empty() {"),
+        source.replace(length, "value.len() >= 40"),
+        // A new call site, which the count makes someone review.
+        source.clone() + "\nfn other(value: &str) -> bool { is_revision(value) }\n",
+    ] {
+        assert!(
+            merge_base_validation_gap(&mutated).is_some(),
+            "accepted a mutated merge-base validation"
+        );
+    }
+    assert_eq!(compact_code("a // b \"c\"\nd \"e // f\""), "ad\"e//f\"");
 }

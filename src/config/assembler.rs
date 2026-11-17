@@ -563,6 +563,9 @@ pub fn apply_overlay_with_options(
     overlay_dir: &Path,
     options: LoadOptions,
 ) -> crate::error::Result<()> {
+    // `overlays/` itself, not only `overlays/<env>`, must not lead out of the
+    // checkout (GHSA-hfxp-g32w-pf8f).
+    super::repo_file::refuse_symlinked_ancestors(overlay_dir)?;
     let root_metadata = match std::fs::symlink_metadata(overlay_dir) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {

@@ -35,6 +35,12 @@ FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2
 # (`config` and `rev-parse HEAD` probes, and the override regression
 # fixtures' `init`, `config`, `add`, `commit`, `ls-tree`, `rev-parse`,
 # `status` and `update-index`).
+# A new Bookworm advisory against the unchanged libraries would otherwise wait
+# for the next builder bump, so the assessment is dated: the daily base image
+# pin canary (.github/scripts/check_base_image_pin.py) fails and opens its
+# tracking issue once the review-by date passes. Redo the assessment against
+# Debian's security tracker before moving the dates, at most 92 days apart.
+# Override Git assessment: last reviewed 2026-11-16, review by 2027-02-14.
 RUN set -eu; \
     mkdir -p /opt/override-git/lib; \
     cp /usr/bin/git /opt/override-git/git; \

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -261,6 +262,142 @@ class RealDockerfileTests(unittest.TestCase):
             self.assertEqual(
                 len(set(by_arch.values())), 1, f"{name} pins different versions per architecture"
             )
+
+
+    def test_the_override_git_assessment_is_dated_within_one_window(self):
+        # #673: the canary enforces the review-by date daily; a pull request
+        # cannot grant the assessment more than one window.
+        self.assertTrue(self.pin.copies_override_git)
+        reviewed = self.pin.assessment_reviewed
+        review_by = self.pin.assessment_review_by
+        self.assertIsNotNone(reviewed)
+        self.assertIsNotNone(review_by)
+        self.assertLess(reviewed, review_by)
+        self.assertLessEqual(
+            review_by - reviewed, check_base_image_pin.MAX_ASSESSMENT_WINDOW
+        )
+        report = check_base_image_pin.Report()
+        check_base_image_pin.check_assessment(self.pin, report, reviewed)
+        self.assertEqual(report.assessment_due, [])
+        # sol F2 / dsf F1: the live last-reviewed date has already happened,
+        # so the deadline is at most one window from now. Only a future date
+        # fails here; time passing never does (the canary enforces expiry).
+        self.assertLessEqual(
+            reviewed,
+            datetime.now(timezone.utc).date() + check_base_image_pin.ASSESSMENT_CLOCK_SKEW,
+        )
+
+
+OVERRIDE_GIT_DOCKERFILE = DOCKERFILE.replace(
+    "RUN cargo build --release --locked\n",
+    "# Override Git assessment: last reviewed 2026-11-16, review by 2027-02-14.\n"
+    "RUN set -eu; \\\n"
+    "    mkdir -p /opt/override-git/lib; \\\n"
+    "    cp /usr/bin/git /opt/override-git/git\n"
+    "RUN cargo build --release --locked\n",
+)
+
+
+class AssessmentTests(unittest.TestCase):
+    """#673: the override Git CVE assessment carries an enforced review-by date."""
+
+    def due(self, dockerfile, today):
+        pin = check_base_image_pin.parse_dockerfile(dockerfile)
+        report = check_base_image_pin.Report(has_pins=True)
+        check_base_image_pin.check_assessment(pin, report, today)
+        return report
+
+    def test_the_fixture_reads_the_copy_and_both_dates(self):
+        pin = check_base_image_pin.parse_dockerfile(OVERRIDE_GIT_DOCKERFILE)
+        self.assertTrue(pin.copies_override_git)
+        self.assertEqual(pin.assessment_reviewed, date(2026, 11, 16))
+        self.assertEqual(pin.assessment_review_by, date(2027, 2, 14))
+
+    def test_an_assessment_within_its_window_is_ok(self):
+        for today in (date(2026, 11, 16), date(2027, 2, 14)):
+            with self.subTest(today=today):
+                report = self.due(OVERRIDE_GIT_DOCKERFILE, today)
+                self.assertEqual(report.assessment_due, [])
+                self.assertIs(report.state, State.OK)
+
+    def test_a_passed_review_by_date_is_stale_with_its_own_headline(self):
+        report = self.due(OVERRIDE_GIT_DOCKERFILE, date(2027, 2, 15))
+        self.assertIs(report.state, State.STALE)
+        self.assertEqual(len(report.assessment_due), 1)
+        self.assertIn("2027-02-14 has passed", report.assessment_due[0])
+        text = check_base_image_pin.render(report)
+        self.assertTrue(text.startswith(check_base_image_pin.ASSESSMENT_HEADLINE), text)
+        for url in check_base_image_pin.ASSESSMENT_TRACKERS:
+            self.assertIn(url, text)
+        self.assertNotIn("SHA256SUMS", text)
+
+    def test_a_package_failure_keeps_the_package_headline(self):
+        report = self.due(OVERRIDE_GIT_DOCKERFILE, date(2027, 3, 1))
+        report.uncovered = ["CVE-2026-1 HIGH perl-base 1 -> 2 (neither pinned nor purged)"]
+        text = check_base_image_pin.render(report)
+        self.assertTrue(text.startswith(check_base_image_pin.HEADLINE[State.STALE]), text)
+        self.assertIn("Override Git assessment due", text)
+
+    def test_a_copy_without_a_dated_assessment_is_stale(self):
+        dockerfile = OVERRIDE_GIT_DOCKERFILE.replace(
+            "# Override Git assessment: last reviewed 2026-11-16, review by 2027-02-14.\n", ""
+        )
+        report = self.due(dockerfile, date(2026, 11, 17))
+        self.assertIs(report.state, State.STALE)
+        self.assertIn("carries no", report.assessment_due[0])
+
+    def test_a_window_longer_than_the_limit_is_stale_before_it_ends(self):
+        for line in (
+            "review by 2027-02-17.",  # 93 days
+            "review by 2026-11-16.",  # no window at all
+        ):
+            with self.subTest(line=line):
+                dockerfile = OVERRIDE_GIT_DOCKERFILE.replace("review by 2027-02-14.", line)
+                report = self.due(dockerfile, date(2026, 11, 16))
+                self.assertIs(report.state, State.STALE)
+                self.assertIn("review window", report.assessment_due[0])
+
+    def test_a_future_last_reviewed_date_is_stale(self):
+        # sol F2 / dsf F1: a 90-day window that starts in the future would
+        # keep the canary green until it ends.
+        dockerfile = OVERRIDE_GIT_DOCKERFILE.replace(
+            "last reviewed 2026-11-16, review by 2027-02-14.",
+            "last reviewed 2040-01-01, review by 2040-02-14.",
+        )
+        report = self.due(dockerfile, date(2026, 11, 17))
+        self.assertIs(report.state, State.STALE)
+        self.assertEqual(len(report.assessment_due), 1, report.assessment_due)
+        self.assertIn("2040-01-01 is in the future", report.assessment_due[0])
+
+    def test_one_day_of_clock_skew_is_allowed_and_two_are_not(self):
+        self.assertEqual(self.due(OVERRIDE_GIT_DOCKERFILE, date(2026, 11, 15)).assessment_due, [])
+        report = self.due(OVERRIDE_GIT_DOCKERFILE, date(2026, 11, 14))
+        self.assertIs(report.state, State.STALE)
+        self.assertEqual(len(report.assessment_due), 1, report.assessment_due)
+        self.assertIn("2026-11-16 is in the future", report.assessment_due[0])
+
+    def test_two_assessment_lines_are_refused(self):
+        line = "# Override Git assessment: last reviewed 2026-11-16, review by 2027-02-14.\n"
+        with self.assertRaises(ValueError):
+            check_base_image_pin.parse_dockerfile(
+                OVERRIDE_GIT_DOCKERFILE.replace(line, line + line)
+            )
+
+    def test_a_dockerfile_without_the_copy_needs_no_assessment(self):
+        report = self.due(DOCKERFILE, date(2030, 1, 1))
+        self.assertEqual(report.assessment_due, [])
+
+    def test_main_enforces_the_date_against_todays_utc_date(self):
+        stale_line = "# Override Git assessment: last reviewed 2020-01-01, review by 2020-03-01.\n"
+        dockerfile = OVERRIDE_GIT_DOCKERFILE.replace(
+            "# Override Git assessment: last reviewed 2026-11-16, review by 2027-02-14.\n",
+            stale_line,
+        )
+        code, body = MainTests().run_main(
+            [vulnerability("perl-base", "5.40.1-6+deb13u1")], dockerfile=dockerfile
+        )
+        self.assertEqual(code, 1)
+        self.assertIn(check_base_image_pin.ASSESSMENT_HEADLINE, body)
 
 
 class TrivyReportTests(unittest.TestCase):

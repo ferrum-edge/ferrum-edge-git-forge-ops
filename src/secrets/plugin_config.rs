@@ -166,7 +166,14 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             secret(&["headers", "*"]),
             secret(&["custom_headers", "*"]),
         ],
-        "ai_semantic_firewall" => vec![endpoint(&["provider", "endpoint"])],
+        // `privacy.snippet_hash_salt` keys the hashes of logged snippets; a
+        // reader holding it can confirm guessed snippets against them.
+        // Ferrum Edge v0.9.20 accepts it unredacted; later Edge redacts it
+        // (ferrum-edge#7054).
+        "ai_semantic_firewall" => vec![
+            endpoint(&["provider", "endpoint"]),
+            secret(&["privacy", "snippet_hash_salt"]),
+        ],
         "ai_tool_governor" => vec![
             endpoint(&["endpoint_url"]),
             endpoint(&["approval", "endpoint_url"]),
@@ -212,6 +219,12 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             operator_value(&["custom_headers", "*"]),
         ],
         "waf" => vec![secret(&["global_exemptions", "header_present", "*"])],
+        // Since Edge v0.9.19 every `bypass.header_present` value is a shared
+        // secret (16 to 4096 visible ASCII characters) whose exact presence
+        // skips OpenAPI request validation, the same kind of value as the
+        // `waf` exemption above (GHSA-5p93-qfr5-m7m9). Edge v0.9.20 does not
+        // yet redact it; later Edge does (ferrum-edge#7054).
+        "openapi_validator" => vec![secret(&["bypass", "header_present", "*"])],
         "request_transformer" => vec![operator_value(&["rules", "*", "value"])],
         "mesh_route_dispatch" => vec![operator_value(&[
             "rules",
@@ -451,8 +464,10 @@ fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]
             &["custom_rules", "*", "conditions", "headers", "*"],
             &["rule_overrides", "*", "conditions", "headers", "*"],
         ],
-        "openapi_validator" => &[&["bypass", "header_present", "*"]],
-        "ai_semantic_firewall" => &[&["privacy", "snippet_hash_salt"]],
+        // `openapi_validator` `bypass.header_present.*` and
+        // `ai_semantic_firewall` `privacy.snippet_hash_salt` are brokered
+        // secret rules in `rules_for` (GHSA-5p93-qfr5-m7m9), which already
+        // makes them export sites.
         "ai_tool_governor" => &[&["approval", "headers", "*"]],
         "mcp_gateway" => &[&["servers", "*", "headers", "*"]],
         "mesh_route_dispatch" => &[
@@ -1211,6 +1226,81 @@ mod tests {
         );
     }
 
+    /// `openapi_validator` `bypass.header_present` values and the `waf`
+    /// exemption values are the same kind of shared secret, so a header map
+    /// is classified identically under both (GHSA-5p93-qfr5-m7m9).
+    #[test]
+    fn openapi_validator_bypass_secrets_match_the_waf_exemption() {
+        let headers = serde_json::json!({
+            "x-internal-scan": "synthetic-bypass-value-1",
+            "x-second-scan": "synthetic-bypass-value-2"
+        });
+        let waf = serde_json::json!({"global_exemptions": {"header_present": headers.clone()}});
+        let openapi = serde_json::json!({
+            "bypass": {"header_present": headers, "paths": ["/health"]}
+        });
+        let relative = |paths: Vec<Vec<ConfigPathComponent>>, prefix: usize| {
+            paths
+                .into_iter()
+                .map(|path| render_config_path(&path[prefix..]))
+                .collect::<Vec<_>>()
+        };
+
+        let waf_classified = classify_plugin_config("waf", &waf);
+        let openapi_classified = classify_plugin_config("openapi_validator", &openapi);
+        assert_eq!(
+            relative(openapi_classified.sensitive.clone(), 2),
+            relative(waf_classified.sensitive, 2)
+        );
+        assert_eq!(
+            dotted(openapi_classified.sensitive),
+            vec![
+                "bypass.header_present.x-internal-scan",
+                "bypass.header_present.x-second-scan"
+            ]
+        );
+        assert!(openapi_classified.unbrokered.is_empty());
+        assert_eq!(
+            dotted(sensitive_string_paths("openapi_validator", &openapi)),
+            vec![
+                "bypass.header_present.x-internal-scan",
+                "bypass.header_present.x-second-scan"
+            ]
+        );
+        assert_eq!(
+            dotted(
+                rule_declared_paths("openapi_validator", &openapi)
+                    .into_iter()
+                    .collect()
+            ),
+            vec![
+                "bypass.header_present.x-internal-scan",
+                "bypass.header_present.x-second-scan"
+            ]
+        );
+    }
+
+    #[test]
+    fn ai_semantic_firewall_snippet_hash_salt_is_a_secret() {
+        let config = serde_json::json!({
+            "privacy": {"include_snippet_hash": true, "snippet_hash_salt": "synthetic-salt-value"}
+        });
+        let classified = classify_plugin_config("ai_semantic_firewall", &config);
+        assert_eq!(
+            dotted(classified.sensitive),
+            vec!["privacy.snippet_hash_salt"]
+        );
+        assert!(classified.unbrokered.is_empty());
+        assert_eq!(
+            dotted(
+                rule_declared_paths("ai_semantic_firewall", &config)
+                    .into_iter()
+                    .collect()
+            ),
+            vec!["privacy.snippet_hash_salt"]
+        );
+    }
+
     /// Edge after v0.9.20 fingerprints every scalar leaf of a custom plugin's
     /// config. Each is an export site, while import still brokers only the
     /// heuristic matches and reports the rest for review.
@@ -1258,16 +1348,6 @@ mod tests {
                 "transaction_debugger",
                 serde_json::json!({"capture_request_header_value": "debug-me"}),
                 vec!["capture_request_header_value"],
-            ),
-            (
-                "openapi_validator",
-                serde_json::json!({"bypass": {"header_present": {"x-bypass": "s"}}}),
-                vec!["bypass.header_present.x-bypass"],
-            ),
-            (
-                "ai_semantic_firewall",
-                serde_json::json!({"privacy": {"snippet_hash_salt": "salty"}}),
-                vec!["privacy.snippet_hash_salt"],
             ),
             (
                 "request_mirror",

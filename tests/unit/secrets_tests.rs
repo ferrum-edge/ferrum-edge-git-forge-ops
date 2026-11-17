@@ -141,8 +141,11 @@ fn the_longest_secret_wins_where_two_secrets_overlap() {
 }
 
 /// One plugin per path Ferrum Edge v0.9.19's `plugin_config_projection` added
-/// to its redaction schema, each value long enough to be scrubbed, with the
-/// broker slot import must capture it under.
+/// to its redaction schema, plus the two shared secrets GHSA-5p93-qfr5-m7m9
+/// found unclassified (`openapi_validator` `bypass.header_present`, the same
+/// kind of value as the `waf` exemption, and `ai_semantic_firewall`
+/// `privacy.snippet_hash_salt`), each value long enough to be scrubbed, with
+/// the broker slot import must capture it under.
 fn edge_0_9_19_redacted_plugins() -> Vec<(&'static str, serde_json::Value, Vec<&'static str>)> {
     vec![
         (
@@ -184,6 +187,28 @@ fn edge_0_9_19_redacted_plugins() -> Vec<(&'static str, serde_json::Value, Vec<&
                 "global_exemptions": {"header_present": {"x-trusted-hop": "synthetic-waf-exemption"}}
             }),
             vec!["ferrum/builtin/@plugin/waf/config/global_exemptions/header_present/x-trusted-hop"],
+        ),
+        (
+            "openapi_validator",
+            serde_json::json!({
+                "bypass": {
+                    "paths": ["/health"],
+                    "header_present": {"x-internal-scan": "synthetic-openapi-bypass"}
+                }
+            }),
+            vec![
+                "ferrum/builtin/@plugin/openapi_validator/config/bypass/header_present/x-internal-scan",
+            ],
+        ),
+        (
+            "ai_semantic_firewall",
+            serde_json::json!({
+                "privacy": {
+                    "include_snippet_hash": true,
+                    "snippet_hash_salt": "synthetic-firewall-salt"
+                }
+            }),
+            vec!["ferrum/builtin/@plugin/ai_semantic_firewall/config/privacy/snippet_hash_salt"],
         ),
         (
             "fault_injection",

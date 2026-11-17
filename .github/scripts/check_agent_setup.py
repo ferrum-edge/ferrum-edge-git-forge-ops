@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import stat
 import sys
@@ -139,6 +140,112 @@ CODEOWNED_PATHS = (
     "/.github/workflows/",
     "/.github/scripts/",
 )
+
+# Every tree and root file this checker reads. Each is walked once, without
+# following a link, before anything is read (#727): the per-path `is_symlink`
+# checks below see only the final component, so a symlinked `.claude` or
+# `.github` directory, or a file whose link leaves the checkout, would
+# otherwise be followed out of the tree under review. Links that stay inside
+# the tree (`AGENTS.md` -> `CLAUDE.md`) are fine here; the specific paths that
+# must not be links at all are still refused by name, and
+# `check_supply_chain.py` additionally refuses absolute and chained links in
+# the whole tree.
+SETUP_TREE_ENTRIES = (".agents", ".claude", ".github", "AGENTS.md", "CLAUDE.md")
+
+
+def _link_climbs(root: Path, path: Path, target: str) -> bool:
+    """Whether a relative link target climbs above the tree root, even to return."""
+    parts = list(path.parent.relative_to(root).parts)
+    for component in target.split("/"):
+        if component == "..":
+            if not parts:
+                return True
+            parts.pop()
+        elif component not in ("", "."):
+            parts.append(component)
+    return False
+
+
+def setup_tree_violations(root: Path) -> list[str]:
+    """Links that leave `root`, dangling links and special files in the setup trees.
+
+    `root` must already be resolved. Every component under each
+    `SETUP_TREE_ENTRIES` entry, the entry itself included, is `lstat`-ed; a
+    link is judged by its text (a relative target may not climb above the
+    root, even to come back in) and by its resolution, which must stay inside
+    the root and name a directory or a regular file. A link to an in-tree
+    directory is followed and its target walked the same way (once per
+    resolved directory), because later checks read through it. Devices, FIFOs
+    and sockets are refused, since reading one can hang the job. `.git`
+    metadata is skipped.
+    """
+    real_root = Path(os.path.realpath(root))
+    violations: list[str] = []
+
+    def judge(path: Path) -> Path | None:
+        """Record any violation at `path`; return the directory to walk behind
+        it (itself, or an in-tree link's resolved target), else None."""
+        relative = path.relative_to(root).as_posix()
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            violations.append(f"{relative}: cannot inspect setup content: {error.strerror}")
+            return None
+        if stat.S_ISLNK(mode):
+            target = os.readlink(path)
+            resolved = Path(os.path.realpath(path))
+            climbs = not os.path.isabs(target) and _link_climbs(root, path, target)
+            if climbs or not (resolved == real_root or resolved.is_relative_to(real_root)):
+                violations.append(
+                    f"{relative}: symlink leaves the tree under review ({target!r}); "
+                    "setup content must resolve inside the repository"
+                )
+                return None
+            try:
+                resolved_mode = os.stat(path).st_mode
+            except OSError:
+                violations.append(f"{relative}: symlink does not resolve ({target!r})")
+                return None
+            if stat.S_ISDIR(resolved_mode):
+                return resolved
+            if not stat.S_ISREG(resolved_mode):
+                violations.append(
+                    f"{relative}: symlink resolves to a special file ({target!r})"
+                )
+            return None
+        if stat.S_ISDIR(mode):
+            return path
+        if not stat.S_ISREG(mode):
+            violations.append(
+                f"{relative}: only regular files, directories and in-tree symlinks "
+                "may hold setup content; this is a special file"
+            )
+        return None
+
+    walked: set[Path] = set()
+    pending = [directory for name in SETUP_TREE_ENTRIES if (directory := judge(root / name))]
+    while pending:
+        top = pending.pop(0)
+        real_top = Path(os.path.realpath(top))
+        if real_top in walked:
+            continue
+        walked.add(real_top)
+        for directory, dirnames, filenames in os.walk(top, followlinks=False):
+            here = Path(directory)
+            dirnames[:] = sorted(
+                name for name in dirnames if not (name == ".git" and not (here / name).is_symlink())
+            )
+            for entry in sorted(dirnames + filenames):
+                path = here / entry
+                behind = judge(path)
+                # A real subdirectory is walked by `os.walk` itself; a link to
+                # an in-tree directory is walked on its own.
+                if behind is not None and behind != path:
+                    pending.append(behind)
+    # A directory reached both directly and through a link reports once.
+    return list(dict.fromkeys(violations))
 
 
 def read_text(path: Path) -> str:
@@ -452,7 +559,13 @@ def validate_agent_workflows(root: Path) -> list[str]:
 
 
 def collect_violations(root: Path) -> list[str]:
+    if root.is_symlink() or not root.is_dir():
+        return [f"{root}: the tree under review must be a real directory"]
     root = root.resolve()
+    # Nothing is read until every setup path is proven to stay in the tree.
+    tree_violations = setup_tree_violations(root)
+    if tree_violations:
+        return tree_violations
     violations: list[str] = []
     agent_skills = root / ".agents" / "skills"
     claude_root = root / ".claude"
