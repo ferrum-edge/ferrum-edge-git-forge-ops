@@ -1306,10 +1306,13 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   redaction and security checks. This gate is import-only; `apply`/`plan` are
   unaffected.
 - Schema rules cover OAuth/OIDC client secrets and private keys, OIDC session
-  encryption secrets, LDAP service-account passwords, and SOAP WS-Security Redis
-  and UsernameToken credentials. Check additions against the gateway's OpenAPI
-  schemas and its `plugin_config_projection` table, because `/config/export`
-  fingerprints whatever that projection redacts.
+  encryption secrets, LDAP service-account passwords, SOAP WS-Security Redis
+  and UsernameToken credentials, the `waf` and `openapi_validator`
+  `header_present` shared secrets and the `ai_semantic_firewall` snippet-hash
+  salt. Check additions against the gateway's OpenAPI schemas and its
+  `plugin_config_projection` table, because `/config/export` fingerprints
+  whatever that projection redacts; a shared secret the pinned gateway does
+  not redact yet is still classified.
 - Operator-chosen values Edge redacts (`request_transformer` rule values,
   `mesh_route_dispatch` request-transform values, `ws_logging` custom headers,
   `fault_injection` and `response_mock` match conditions) use

@@ -470,9 +470,10 @@ fn edge_0_9_19_brokered_plugin_values_are_masked_without_hiding_siblings() {
     assert!(!rendered.contains("live-upstream-credential"), "{rendered}");
 }
 
-/// Every path Ferrum Edge v0.9.19 added to its redaction schema: a brokered
-/// leaf is masked against any live value, and a changed sibling on the same
-/// plugin is still reported.
+/// Every path Ferrum Edge v0.9.19 added to its redaction schema, plus the
+/// shared secrets GHSA-5p93-qfr5-m7m9 classified: a brokered leaf is masked
+/// against any live value, and a changed sibling on the same plugin is still
+/// reported.
 #[test]
 fn edge_0_9_19_brokered_plugin_paths_are_all_masked_per_leaf() {
     const PLACEHOLDER: &str = "${gh-env-secret:alloc=require}";
@@ -497,6 +498,16 @@ fn edge_0_9_19_brokered_plugin_paths_are_all_masked_per_leaf() {
             "waf",
             "/global_exemptions/header_present/x-hop",
             serde_json::json!({"global_exemptions": {"header_present": {"x-hop": PLACEHOLDER}}}),
+        ),
+        (
+            "openapi_validator",
+            "/bypass/header_present/x-internal-scan",
+            serde_json::json!({"bypass": {"header_present": {"x-internal-scan": PLACEHOLDER}}}),
+        ),
+        (
+            "ai_semantic_firewall",
+            "/privacy/snippet_hash_salt",
+            serde_json::json!({"privacy": {"snippet_hash_salt": PLACEHOLDER}}),
         ),
         (
             "fault_injection",

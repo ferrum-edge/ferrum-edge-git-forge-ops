@@ -886,6 +886,115 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
     assert_eq!(assembled.plugin_configs[0].config, original_plugin_config);
 }
 
+/// GHSA-5p93-qfr5-m7m9: an `openapi_validator` `bypass.header_present` value
+/// is a shared secret that skips request validation. Import used to write it
+/// into the plugin's resource file verbatim while brokering the identical
+/// `waf` exemption. Both now land in the private migration bundle.
+#[test]
+fn import_brokers_openapi_validator_bypass_secrets_like_the_waf_exemption() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    for (id, plugin_name, plugin_config) in [
+        (
+            "oav1",
+            "openapi_validator",
+            serde_json::json!({"bypass": {
+                "paths": ["/health"],
+                "header_present": {"x-internal-scan": "synthetic-bypass-shared-value"}
+            }}),
+        ),
+        (
+            "waf1",
+            "waf",
+            serde_json::json!({"mode": "enforce", "global_exemptions": {
+                "header_present": {"x-internal-scan": "synthetic-waf-shared-value"}
+            }}),
+        ),
+    ] {
+        config.plugin_configs.push(PluginConfig {
+            labels: Default::default(),
+            extra: Default::default(),
+            id: id.to_string(),
+            plugin_name: plugin_name.to_string(),
+            namespace: "ferrum".to_string(),
+            config: plugin_config,
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            trigger: None,
+            api_spec_id: None,
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
+        });
+    }
+    let original_plugin_configs: Vec<serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| plugin.config.clone())
+        .collect();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("secret-migration.json");
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(result.redacted_plugin_config_values, 2);
+
+    for id in ["oav1", "waf1"] {
+        let plugin_yaml =
+            std::fs::read_to_string(output.join(format!("ferrum/plugins/{id}.yaml"))).unwrap();
+        assert!(!plugin_yaml.contains("synthetic-"), "{id}");
+        assert!(
+            plugin_yaml.contains("x-internal-scan: ${gh-env-secret:alloc=require}"),
+            "{id}"
+        );
+    }
+    let bypass_yaml = std::fs::read_to_string(output.join("ferrum/plugins/oav1.yaml")).unwrap();
+    assert!(bypass_yaml.contains("/health"), "{bypass_yaml}");
+
+    let raw_bundle = std::fs::read_to_string(&bundle_path).unwrap();
+    let (merged, _) = gitforgeops::secrets::load_bundles_from_env(&raw_bundle).unwrap();
+    assert_eq!(
+        merged.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            "ferrum/oav1/@plugin/openapi_validator/config/bypass/header_present/x-internal-scan",
+            "ferrum/waf1/@plugin/waf/config/global_exemptions/header_present/x-internal-scan",
+        ]
+    );
+
+    let resources = gitforgeops::config::load_resources(&output).unwrap();
+    let mut assembled = gitforgeops::config::assemble(resources).unwrap().gateway;
+    super::resolver_fixtures::resolve_secrets_with_mode(
+        &mut assembled,
+        &merged,
+        gitforgeops::config::env::GatewayMode::Api,
+    )
+    .unwrap();
+    let mut resolved: Vec<(String, serde_json::Value)> = assembled
+        .plugin_configs
+        .iter()
+        .map(|plugin| (plugin.id.clone(), plugin.config.clone()))
+        .collect();
+    resolved.sort_by(|left, right| left.0.cmp(&right.0));
+    assert!(
+        resolved
+            .iter()
+            .map(|(_, config)| config.clone())
+            .collect::<Vec<_>>()
+            == original_plugin_configs,
+        "import -> private bundle seed -> assemble changed a plugin config"
+    );
+}
+
 /// F5: a plugin this build does not know has no schema to classify it by, so
 /// only the key/URL sensitivity heuristics run. What they flag is brokered;
 /// what they do not would land in the committed file verbatim, so it takes an
