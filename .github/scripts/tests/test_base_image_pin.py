@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -279,6 +279,13 @@ class RealDockerfileTests(unittest.TestCase):
         report = check_base_image_pin.Report()
         check_base_image_pin.check_assessment(self.pin, report, reviewed)
         self.assertEqual(report.assessment_due, [])
+        # sol F2 / dsf F1: the live last-reviewed date has already happened,
+        # so the deadline is at most one window from now. Only a future date
+        # fails here; time passing never does (the canary enforces expiry).
+        self.assertLessEqual(
+            reviewed,
+            datetime.now(timezone.utc).date() + check_base_image_pin.ASSESSMENT_CLOCK_SKEW,
+        )
 
 
 OVERRIDE_GIT_DOCKERFILE = DOCKERFILE.replace(
@@ -349,6 +356,25 @@ class AssessmentTests(unittest.TestCase):
                 report = self.due(dockerfile, date(2026, 11, 16))
                 self.assertIs(report.state, State.STALE)
                 self.assertIn("review window", report.assessment_due[0])
+
+    def test_a_future_last_reviewed_date_is_stale(self):
+        # sol F2 / dsf F1: a 90-day window that starts in the future would
+        # keep the canary green until it ends.
+        dockerfile = OVERRIDE_GIT_DOCKERFILE.replace(
+            "last reviewed 2026-11-16, review by 2027-02-14.",
+            "last reviewed 2040-01-01, review by 2040-02-14.",
+        )
+        report = self.due(dockerfile, date(2026, 11, 17))
+        self.assertIs(report.state, State.STALE)
+        self.assertEqual(len(report.assessment_due), 1, report.assessment_due)
+        self.assertIn("2040-01-01 is in the future", report.assessment_due[0])
+
+    def test_one_day_of_clock_skew_is_allowed_and_two_are_not(self):
+        self.assertEqual(self.due(OVERRIDE_GIT_DOCKERFILE, date(2026, 11, 15)).assessment_due, [])
+        report = self.due(OVERRIDE_GIT_DOCKERFILE, date(2026, 11, 14))
+        self.assertIs(report.state, State.STALE)
+        self.assertEqual(len(report.assessment_due), 1, report.assessment_due)
+        self.assertIn("2026-11-16 is in the future", report.assessment_due[0])
 
     def test_two_assessment_lines_are_refused(self):
         line = "# Override Git assessment: last reviewed 2026-11-16, review by 2027-02-14.\n"

@@ -89,6 +89,10 @@ ASSESSMENT_LINE = re.compile(
 )
 # The longest review window a reassessment may grant itself.
 MAX_ASSESSMENT_WINDOW = timedelta(days=92)
+# How far a "last reviewed" date may run ahead of the checker's UTC date: a
+# reviewer east of UTC can write tomorrow's date. Anything later is a future
+# claim that would push the deadline out without a review.
+ASSESSMENT_CLOCK_SKEW = timedelta(days=1)
 # Where a reviewer checks the copied libraries' Bookworm advisories.
 ASSESSMENT_TRACKERS = (
     "https://security-tracker.debian.org/tracker/source-package/zlib",
@@ -470,9 +474,11 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
 
 
 def check_assessment(pin: BasePin, report: Report, today: date) -> None:
-    """The override Git CVE assessment must carry a bounded review-by date
-    that has not passed. A Dockerfile without the override Git copy has
-    nothing to assess."""
+    """The override Git CVE assessment must carry a review-by date at most one
+    window after a last-reviewed date that has already happened, and the
+    review-by date must not have passed. Bounding the window alone would let
+    a future last-reviewed date defer the next review without limit. A
+    Dockerfile without the override Git copy has nothing to assess."""
     if not pin.copies_override_git:
         return
     reviewed, review_by = pin.assessment_reviewed, pin.assessment_review_by
@@ -486,6 +492,10 @@ def check_assessment(pin: BasePin, report: Report, today: date) -> None:
         report.assessment_due.append(
             f"review window {reviewed} to {review_by} is not between one and "
             f"{MAX_ASSESSMENT_WINDOW.days} days"
+        )
+    if reviewed > today + ASSESSMENT_CLOCK_SKEW:
+        report.assessment_due.append(
+            f"last reviewed {reviewed} is in the future (today is {today})"
         )
     if today > review_by:
         report.assessment_due.append(
