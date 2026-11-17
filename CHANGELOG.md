@@ -187,11 +187,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Every arbitrary header map is now an operator value, not a secret:
   `otel_tracing` `headers.*`, `opa` `headers.*`, `ai_transcript_audit`
   `sink.custom_headers.*` / `headers.*` / `custom_headers.*`, `http_logging`
-  and `loki_logging` `custom_headers.*` and `proxy_alerts`
-  `channels.*.headers.*`, like `ws_logging` `custom_headers`. A value of at
+  and `loki_logging` `custom_headers.*`, `proxy_alerts`
+  `channels.*.headers.*` and the `api_chargeback_sink`
+  `clickhouse.insert_query_params.*` map, like `ws_logging` `custom_headers`. A value of at
   least 8 bytes is still brokered, masked, scrubbed and blocks `apply` as a
   literal; a shorter one (Grafana's `X-Scope-OrgID: "12345"`) is an ordinary
-  setting, so a live `/backup` holding one no longer refuses every `diff`,
+  setting (as is `database: "default"`), so a live `/backup` holding one no
+  longer refuses every `diff`,
   `plan`, `review` and `apply`. Fields that only ever hold a credential
   (`otel_tracing` `authorization`, `loki_logging` `authorization_header`)
   stay secrets. A short operator value whose header or parameter name looks

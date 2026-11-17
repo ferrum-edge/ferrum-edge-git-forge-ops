@@ -1338,7 +1338,8 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   `mesh_route_dispatch` request-transform values and match operands, every
   arbitrary header map — `otel_tracing`, `opa`, `ai_transcript_audit`,
   `http_logging`, `loki_logging`, `ws_logging`, `proxy_alerts`,
-  `ai_tool_governor` approval, `mcp_gateway` server headers (credentials ride
+  `ai_tool_governor` approval, `mcp_gateway` server headers, plus the
+  `api_chargeback_sink` ClickHouse insert query-parameter map (credentials ride
   there, but so do short ordinary headers, and a short declared secret would
   refuse every live `/backup` read) —
   `fault_injection` and `response_mock` match conditions, `waf` custom-rule

@@ -660,6 +660,15 @@ fn short_live_credential_header_values_never_refuse_a_backup_read() {
             }}),
         ),
         (
+            "api_chargeback_sink",
+            "zq9-clickhouse-credential",
+            serde_json::json!({"clickhouse": {"insert_query_params": {
+                "x-api-version": "2",
+                "database": "default",
+                "password": "zq9-clickhouse-credential"
+            }}}),
+        ),
+        (
             "proxy_alerts",
             "zq9-alert-hook-credential",
             serde_json::json!({"channels": [{"headers": {

@@ -285,7 +285,11 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         ],
         "api_chargeback_sink" => vec![
             endpoint(&["clickhouse", "url"]),
-            secret(&["clickhouse", "insert_query_params", "*"]),
+            // Query parameters on every ClickHouse insert: credentials
+            // (`password`) ride here, but so do short ordinary settings
+            // (`database: "default"`), so it is an operator value like the
+            // header maps.
+            operator_value(&["clickhouse", "insert_query_params", "*"]),
         ],
         "workload_metrics" => vec![
             endpoint(&["tracing_provider", "config", "url"]),
@@ -1571,6 +1575,18 @@ mod tests {
                 vec!["custom_headers.X-Scope-OrgID"],
             ),
             (
+                "api_chargeback_sink",
+                serde_json::json!({"clickhouse": {"insert_query_params": {
+                    "database": "default",
+                    "password": "synthetic-clickhouse-password"
+                }}}),
+                vec!["clickhouse.insert_query_params.password"],
+                vec![
+                    "clickhouse.insert_query_params.database",
+                    "clickhouse.insert_query_params.password",
+                ],
+            ),
+            (
                 "proxy_alerts",
                 serde_json::json!({"channels": [{"headers": {"x-route": "ops", "x-hook": "synthetic-hook-key"}}]}),
                 vec!["channels.[0].headers.x-hook"],
@@ -1652,6 +1668,18 @@ mod tests {
                 &dispatch
             )),
             vec!["rules.[0].match.query_params.token.exact"]
+        );
+
+        let chargeback = serde_json::json!({"clickhouse": {"insert_query_params": {
+            "password": "pw1",
+            "database": "default"
+        }}});
+        assert_eq!(
+            dotted(short_credential_named_paths(
+                "api_chargeback_sink",
+                &chargeback
+            )),
+            vec!["clickhouse.insert_query_params.password"]
         );
 
         let transform = serde_json::json!({"rules": [{"key": "X-Api-Key", "value": "1"}]});

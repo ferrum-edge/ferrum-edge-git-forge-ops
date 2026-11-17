@@ -201,7 +201,7 @@ requiring them to be secret (a `request_transformer` rule value, a
 custom header or any other plugin header map (`otel_tracing`, `opa`,
 `ai_transcript_audit`, `http_logging`, `loki_logging` and `proxy_alerts`
 headers, an `ai_tool_governor` approval header or `mcp_gateway` server
-header), a `fault_injection` or `response_mock` match condition, a `waf`
+header, or an `api_chargeback_sink` ClickHouse insert query parameter), a `fault_injection` or `response_mock` match condition, a `waf`
 custom-rule or override header condition, the `request_termination` and
 `transaction_debugger` selector header values) are never refused
 either. One of at least 8 bytes is brokered on import, protected, and blocks
