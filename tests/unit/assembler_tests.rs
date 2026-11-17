@@ -254,6 +254,37 @@ fn overlay_rejects_a_symlinked_overlay_root() {
     assert!(error.contains(&link.display().to_string()), "{error}");
 }
 
+/// `overlays/` itself, not only `overlays/<env>`, must not lead out of the
+/// checkout (GHSA-hfxp-g32w-pf8f).
+#[cfg(unix)]
+#[test]
+fn overlay_rejects_a_symlinked_overlays_directory() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside");
+    write_overlay(
+        &outside.join("staging"),
+        "team-alpha/proxies/shared.yaml",
+        "kind: Proxy\nspec:\n  id: shared\n  backend_host: outside.example\n",
+    );
+    let checkout = temp.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let overlays = checkout.join("overlays");
+    symlink(&outside, &overlays).unwrap();
+    let mut resources = vec![("team-alpha".to_string(), make_proxy("shared"))];
+
+    let error = apply_overlay(&mut resources, &overlays.join("staging"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("symbolic links"), "{error}");
+    assert!(error.contains(&overlays.display().to_string()), "{error}");
+    let Resource::Proxy { spec } = &resources[0].1 else {
+        panic!("expected the base proxy");
+    };
+    assert_eq!(spec.backend_host, "localhost");
+}
+
 #[test]
 fn overlay_requires_kind_and_resource_id() {
     for (body, expected) in [
