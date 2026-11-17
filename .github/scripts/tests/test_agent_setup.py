@@ -297,6 +297,100 @@ class AgentSetupTests(unittest.TestCase):
         self.assertIn("shared library directory must not be a symlink", joined)
         self.assertIn("missing dispatch isolation helpers", joined)
 
+    def test_rejects_an_intermediate_directory_symlink_out_of_the_tree(self):
+        # #727: `.claude` itself links to a complete, valid-looking setup
+        # outside the checkout. The per-path checks only see `.claude/rules`
+        # and `.claude/skills`, which are real directories behind the link.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "checkout"
+            root.mkdir()
+            write_valid_setup(root)
+            outside = base / "outside-claude"
+            (root / ".claude").rename(outside)
+            (root / ".claude").symlink_to(outside, target_is_directory=True)
+            violations = check_agent_setup.collect_violations(root)
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn(".claude: symlink leaves the tree under review", violations[0])
+
+    def test_rejects_an_out_of_tree_file_symlink_anywhere_in_the_setup_trees(self):
+        for relative in (
+            ".agents/skills/sample/references/notes.md",
+            ".claude/rules/linked.md",
+            ".github/workflows/linked.yml",
+            "CLAUDE.md",
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                root = base / "checkout"
+                root.mkdir()
+                write_valid_setup(root)
+                outside = base / "outside.md"
+                outside.write_text("outside the checkout\n", encoding="utf-8")
+                link = root / relative
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(os.path.relpath(outside, link.parent))
+                violations = check_agent_setup.collect_violations(root)
+                self.assertEqual(
+                    violations,
+                    [
+                        f"{relative}: symlink leaves the tree under review "
+                        f"({os.readlink(link)!r}); setup content must resolve "
+                        "inside the repository"
+                    ],
+                )
+
+    def test_rejects_a_link_that_climbs_out_and_back_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "checkout"
+            root.mkdir()
+            write_valid_setup(root)
+            (root / "CLAUDE.md").write_text("instructions\n", encoding="utf-8")
+            (root / "AGENTS.md").symlink_to("../checkout/CLAUDE.md")
+            violations = check_agent_setup.collect_violations(root)
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn("AGENTS.md: symlink leaves the tree under review", violations[0])
+
+    def test_accepts_in_tree_links_and_refuses_dangling_ones(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            (root / "CLAUDE.md").write_text("instructions\n", encoding="utf-8")
+            (root / "AGENTS.md").symlink_to("CLAUDE.md")
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+
+            (root / ".claude" / "rules" / "gone.md").symlink_to("missing.md")
+            violations = check_agent_setup.collect_violations(root)
+        self.assertEqual(
+            violations, [".claude/rules/gone.md: symlink does not resolve ('missing.md')"]
+        )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_refuses_special_files_before_reading_anything(self):
+        # Reading a FIFO blocks, so this returns only if the walk refuses it
+        # before any setup file is opened.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            os.mkfifo(root / ".claude" / "rules" / "pipe.md")
+            violations = check_agent_setup.collect_violations(root)
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn(".claude/rules/pipe.md: only regular files", violations[0])
+
+    def test_refuses_a_symlinked_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            real = base / "real"
+            real.mkdir()
+            write_valid_setup(real)
+            link = base / "link"
+            link.symlink_to(real, target_is_directory=True)
+            violations = check_agent_setup.collect_violations(link)
+        self.assertEqual(
+            violations, [f"{link}: the tree under review must be a real directory"]
+        )
+
     def test_requires_claude_mirror_except_for_claude_native_launchers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
