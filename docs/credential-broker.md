@@ -198,12 +198,18 @@ credential, a custom plugin's secret-looking field) may be an ordinary setting: 
 does not refuse the run. Operator-chosen values Ferrum Edge redacts without
 requiring them to be secret (a `request_transformer` rule value, a
 `mesh_route_dispatch` request-transform value or match operand, a `ws_logging`
-custom header, an `ai_tool_governor` approval header or `mcp_gateway` server
-header, a `fault_injection` or `response_mock` match condition, a `waf`
+custom header or any other plugin header map (`otel_tracing`, `opa`,
+`ai_transcript_audit`, `http_logging`, `loki_logging` and `proxy_alerts`
+headers, an `ai_tool_governor` approval header or `mcp_gateway` server
+header, or an `api_chargeback_sink` ClickHouse insert query parameter), a `fault_injection` or `response_mock` match condition, a `waf`
 custom-rule or override header condition, the `request_termination` and
 `transaction_debugger` selector header values) are never refused
 either. One of at least 8 bytes is brokered on import, protected, and blocks
-apply as a literal; a shorter one is an ordinary setting that stays literal. A short probe value refuses projection/header
+apply as a literal; a shorter one is an ordinary setting that stays literal.
+When such a short value's header or parameter name looks like a credential
+(`authorization`, a name ending in `token` or `key`), `import` names it in a
+warning notice and the security audit reports a non-blocking warning, because
+it cannot be brokered or redacted. A short probe value refuses projection/header
 resolution, before any probe request. Admission also refuses a value whose
 review formatter spelling falls below 8 bytes after CRLF collapse or trimming,
 rather than admitting a short spelling that would suppress ordinary prose. A

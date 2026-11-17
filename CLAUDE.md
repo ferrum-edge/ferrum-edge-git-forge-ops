@@ -1335,17 +1335,26 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   whatever that projection redacts; a shared secret the pinned gateway does
   not redact yet is still classified.
 - Operator-chosen values Edge redacts (`request_transformer` rule values,
-  `mesh_route_dispatch` request-transform values and match operands,
-  `ws_logging` custom headers, the `ai_tool_governor` approval and
-  `mcp_gateway` server header maps (credentials ride there, but so do short
-  ordinary headers, and a short declared secret would refuse every live read),
+  `mesh_route_dispatch` request-transform values and match operands, every
+  arbitrary header map — `otel_tracing`, `opa`, `ai_transcript_audit`,
+  `http_logging`, `loki_logging`, `ws_logging`, `proxy_alerts`,
+  `ai_tool_governor` approval, `mcp_gateway` server headers, plus the
+  `api_chargeback_sink` ClickHouse insert query-parameter map (credentials ride
+  there, but so do short ordinary headers, and a short declared secret would
+  refuse every live `/backup` read) —
   `fault_injection` and `response_mock` match conditions, `waf` custom-rule
   and override header conditions, the
   `request_termination` and `transaction_debugger` selector header values)
   use `RuleKind::Value`. A string of at least 8 bytes is brokered, masked,
   scrubbed and literal-gated like a secret; a shorter one (`value: "1"`)
   stays an ordinary literal, since the bundle and scrubber refuse it. None is
-  rule-declared for display admission. `export_redacted_paths` adds every
+  rule-declared for display admission. A short one whose entry name looks
+  like a credential (`PluginConfigClassification::short_credential_named`:
+  key-name heuristics or a name ending in `key`, skipping an operand's
+  match-kind key) gets an import warning notice and a non-blocking
+  security-audit warning, never the value. Keep `secret` for fields that only
+  ever hold a credential (`otel_tracing` `authorization`, `loki_logging`
+  `authorization_header`). `export_redacted_paths` adds every
   matched site, whatever its length or JSON type, for `/config/export`
   substitution.
 - `basicauth[].username` and `mtls_auth[].identity` are never brokered

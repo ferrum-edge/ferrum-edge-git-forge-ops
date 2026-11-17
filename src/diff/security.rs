@@ -12,7 +12,9 @@ use crate::plugin_catalog::{
 };
 use crate::policy::config::effective_auth_allowlist;
 use crate::policy::PolicyConfig;
-use crate::secrets::plugin_config::{render_config_path, sensitive_string_paths, value_at};
+use crate::secrets::plugin_config::{
+    render_config_path, sensitive_string_paths, short_credential_named_paths, value_at,
+};
 use crate::secrets::resolver::is_identity_credential_leaf;
 
 #[derive(Debug, Clone)]
@@ -723,6 +725,22 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
             &plugin.namespace,
             format!(
                 "Literal plugin-config secret in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
+                plugin.id, plugin.plugin_name, plugin.namespace
+            ),
+        ));
+    }
+    // A header or query value too short to broker or redact (so never a
+    // placeholder) is an ordinary setting, and nothing above gates it; when
+    // its name looks like a credential, say so (never the value) instead of
+    // applying it silently.
+    for path in short_credential_named_paths(&plugin.plugin_name, &plugin.config) {
+        let path = render_config_path(&path);
+        findings.push(SecurityFinding::warning(
+            "PluginConfig",
+            &plugin.id,
+            &plugin.namespace,
+            format!(
+                "Short credential-named plugin-config value in 'config.{path}' on plugin {} ({}) in namespace {}: it is under 8 bytes, so it is kept as an ordinary setting, committed and applied literally, and cannot be brokered or redacted; if it is a credential, use a longer one through ${{gh-env-secret:alloc=require}}",
                 plugin.id, plugin.plugin_name, plugin.namespace
             ),
         ));

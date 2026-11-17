@@ -103,10 +103,21 @@ const KAFKA_SAFE_PROPERTIES: &[&str] = &[
 
 fn rules_for(plugin_name: &str) -> Vec<Rule> {
     match plugin_name {
+        // Arbitrary header maps (here and in `opa`, `ai_transcript_audit`,
+        // `http_logging`, `loki_logging`, `proxy_alerts`, `ws_logging`,
+        // `ai_tool_governor`, `mcp_gateway`) are operator values, not
+        // secrets: a vendor credential usually rides there, but so do
+        // ordinary short headers (`X-Scope-OrgID: "12345"`,
+        // `x-api-version: "2"`) and Edge sets no minimum. A declared secret
+        // shorter than 8 bytes would refuse every live `/backup` read, so a
+        // value long enough to protect is brokered, masked and gated while a
+        // shorter one stays an ordinary setting (with a warning when its
+        // header name looks like a credential). Fields that only ever hold a
+        // credential (`authorization`, `authorization_header`) stay secrets.
         "otel_tracing" => vec![
             endpoint(&["endpoint"]),
             secret(&["authorization"]),
-            secret(&["headers", "*"]),
+            operator_value(&["headers", "*"]),
         ],
         "spec_expose" => vec![endpoint(&["spec_url"])],
         "grpc_method_router"
@@ -158,13 +169,13 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             secret(&["redis_password"]),
             secret(&["username_token", "credentials", "*", "password"]),
         ],
-        "opa" => vec![secret(&["headers", "*"])],
+        "opa" => vec![operator_value(&["headers", "*"])],
         "ai_transcript_audit" => vec![
             endpoint(&["sink", "endpoint_url"]),
-            secret(&["sink", "custom_headers", "*"]),
+            operator_value(&["sink", "custom_headers", "*"]),
             endpoint(&["endpoint_url"]),
-            secret(&["headers", "*"]),
-            secret(&["custom_headers", "*"]),
+            operator_value(&["headers", "*"]),
+            operator_value(&["custom_headers", "*"]),
         ],
         // `privacy.snippet_hash_salt` keys the hashes of logged snippets; a
         // reader holding it can confirm guessed snippets against them.
@@ -210,7 +221,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         ],
         "http_logging" => vec![
             endpoint(&["endpoint_url"]),
-            secret(&["custom_headers", "*"]),
+            operator_value(&["custom_headers", "*"]),
         ],
         "kafka_logging" => vec![Rule {
             path: &["producer_config"],
@@ -219,7 +230,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         "loki_logging" => vec![
             endpoint(&["endpoint_url"]),
             secret(&["authorization_header"]),
-            secret(&["custom_headers", "*"]),
+            operator_value(&["custom_headers", "*"]),
         ],
         // Ferrum Edge v0.9.19 redacts these, so `/config/export` fingerprints
         // them. `header_present` values are shared secrets (Edge requires at
@@ -269,12 +280,16 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         "proxy_alerts" => vec![
             endpoint(&["channels", "*", "webhook_url"]),
             endpoint(&["channels", "*", "url"]),
-            secret(&["channels", "*", "headers", "*"]),
+            operator_value(&["channels", "*", "headers", "*"]),
             secret(&["channels", "*", "body_template"]),
         ],
         "api_chargeback_sink" => vec![
             endpoint(&["clickhouse", "url"]),
-            secret(&["clickhouse", "insert_query_params", "*"]),
+            // Query parameters on every ClickHouse insert: credentials
+            // (`password`) ride here, but so do short ordinary settings
+            // (`database: "default"`), so it is an operator value like the
+            // header maps.
+            operator_value(&["clickhouse", "insert_query_params", "*"]),
         ],
         "workload_metrics" => vec![
             endpoint(&["tracing_provider", "config", "url"]),
@@ -529,6 +544,12 @@ pub(crate) struct PluginConfigClassification {
     /// the builtin's schema rules, or unflagged strings in a non-builtin plugin.
     /// Import must refuse before publication unless the operator accepts them.
     pub unbrokered: Vec<Vec<ConfigPathComponent>>,
+    /// Non-empty [`RuleKind::Value`] leaves too short to broker (so ordinary
+    /// settings) whose entry name looks like a credential (`authorization`,
+    /// `x-functions-key`, `token`). They are committed and applied literally
+    /// and cannot be scrubbed, so import and the security audit warn about
+    /// each one instead of staying silent.
+    pub short_credential_named: Vec<Vec<ConfigPathComponent>>,
 }
 
 /// Classify a plugin config's string leaves.
@@ -561,6 +582,7 @@ pub(crate) fn classify_plugin_config(
         return PluginConfigClassification {
             sensitive: sensitive.into_iter().collect(),
             unbrokered: Vec::new(),
+            short_credential_named: Vec::new(),
         };
     }
 
@@ -572,12 +594,14 @@ pub(crate) fn classify_plugin_config(
         return PluginConfigClassification {
             sensitive: sensitive.into_iter().collect(),
             unbrokered,
+            short_credential_named: Vec::new(),
         };
     }
 
     // Operator values too short to broker or scrub are ordinary settings: the
     // schema rule, not the key-name heuristic, decides them.
     let mut ordinary = BTreeSet::new();
+    let mut short_credential_named = BTreeSet::new();
     for rule in rules_for(plugin_name) {
         if matches!(rule.kind, RuleKind::Value) {
             let mut values = BTreeSet::new();
@@ -585,6 +609,9 @@ pub(crate) fn classify_plugin_config(
             for path in values {
                 match value_at(config, &path) {
                     Some(Value::String(text)) if text.len() < MIN_SCRUB_LENGTH => {
+                        if !text.is_empty() && entry_name_looks_like_credential(&path) {
+                            short_credential_named.insert(path.clone());
+                        }
                         ordinary.insert(path);
                     }
                     _ => {
@@ -605,7 +632,42 @@ pub(crate) fn classify_plugin_config(
     PluginConfigClassification {
         sensitive: sensitive.into_iter().collect(),
         unbrokered,
+        short_credential_named: short_credential_named.into_iter().collect(),
     }
+}
+
+/// Match-kind keys of an operand object (`{exact: ...}`); the entry they
+/// belong to is named one level up.
+const OPERAND_KINDS: &[&str] = &["exact", "prefix", "suffix", "regex", "contains"];
+
+/// Whether the map entry a matched leaf belongs to (a header or query
+/// parameter name, skipping an operand's match-kind key) is named like a
+/// credential: the key-name heuristics, plus any name ending in `key`
+/// (`x-functions-key`, `Ocp-Apim-Subscription-Key`).
+fn entry_name_looks_like_credential(path: &[ConfigPathComponent]) -> bool {
+    let mut keys = path.iter().rev().filter_map(|part| match part {
+        ConfigPathComponent::Key(key) => Some(key.as_str()),
+        ConfigPathComponent::Index(_) => None,
+    });
+    let Some(mut name) = keys.next() else {
+        return false;
+    };
+    if OPERAND_KINDS.contains(&normalize_key(name).as_str()) {
+        let Some(entry) = keys.next() else {
+            return false;
+        };
+        name = entry;
+    }
+    is_sensitive_key(name) || normalize_key(name).ends_with("key")
+}
+
+/// Short, credential-named operator values (see
+/// [`PluginConfigClassification::short_credential_named`]).
+pub(crate) fn short_credential_named_paths(
+    plugin_name: &str,
+    config: &Value,
+) -> Vec<Vec<ConfigPathComponent>> {
+    classify_plugin_config(plugin_name, config).short_credential_named
 }
 
 /// Return every sensitive string for redaction and security checks, including
@@ -1463,6 +1525,165 @@ mod tests {
                 "{plugin}"
             );
         }
+    }
+
+    /// Every arbitrary header map is an operator value: a long value is
+    /// brokered, a short ordinary header (`X-Scope-OrgID: "12345"`) stays
+    /// literal, and none is rule-declared, so no short live header refuses
+    /// display admission. Fields that only ever hold a credential stay
+    /// declared secrets.
+    #[test]
+    fn arbitrary_header_maps_are_operator_values() {
+        for (plugin, config, brokered, sites) in [
+            (
+                "otel_tracing",
+                serde_json::json!({"headers": {"x-honeycomb-team": "synthetic-team-key", "x-env": "prod"}}),
+                vec!["headers.x-honeycomb-team"],
+                vec!["headers.x-env", "headers.x-honeycomb-team"],
+            ),
+            (
+                "opa",
+                serde_json::json!({"headers": {"x-bundle-token": "synthetic-opa-token", "x-tier": "a"}}),
+                vec!["headers.x-bundle-token"],
+                vec!["headers.x-bundle-token", "headers.x-tier"],
+            ),
+            (
+                "ai_transcript_audit",
+                serde_json::json!({
+                    "sink": {"custom_headers": {"x-ingest": "synthetic-ingest-key", "x-v": "2"}},
+                    "headers": {"x-flat": "1"},
+                    "custom_headers": {"x-legacy": "synthetic-legacy-key"}
+                }),
+                vec!["custom_headers.x-legacy", "sink.custom_headers.x-ingest"],
+                vec![
+                    "custom_headers.x-legacy",
+                    "headers.x-flat",
+                    "sink.custom_headers.x-ingest",
+                    "sink.custom_headers.x-v",
+                ],
+            ),
+            (
+                "http_logging",
+                serde_json::json!({"custom_headers": {"x-collector": "synthetic-collector", "x-dc": "eu1"}}),
+                vec!["custom_headers.x-collector"],
+                vec!["custom_headers.x-collector", "custom_headers.x-dc"],
+            ),
+            (
+                "loki_logging",
+                serde_json::json!({"custom_headers": {"X-Scope-OrgID": "12345"}}),
+                vec![],
+                vec!["custom_headers.X-Scope-OrgID"],
+            ),
+            (
+                "api_chargeback_sink",
+                serde_json::json!({"clickhouse": {"insert_query_params": {
+                    "database": "default",
+                    "password": "synthetic-clickhouse-password"
+                }}}),
+                vec!["clickhouse.insert_query_params.password"],
+                vec![
+                    "clickhouse.insert_query_params.database",
+                    "clickhouse.insert_query_params.password",
+                ],
+            ),
+            (
+                "proxy_alerts",
+                serde_json::json!({"channels": [{"headers": {"x-route": "ops", "x-hook": "synthetic-hook-key"}}]}),
+                vec!["channels.[0].headers.x-hook"],
+                vec![
+                    "channels.[0].headers.x-hook",
+                    "channels.[0].headers.x-route",
+                ],
+            ),
+        ] {
+            let classification = classify_plugin_config(plugin, &config);
+            assert_eq!(dotted(classification.sensitive), brokered, "{plugin}");
+            assert!(classification.unbrokered.is_empty(), "{plugin}");
+            assert!(classification.short_credential_named.is_empty(), "{plugin}");
+            assert!(rule_declared_paths(plugin, &config).is_empty(), "{plugin}");
+            assert_eq!(
+                dotted(export_redacted_paths(plugin, &config).into_iter().collect()),
+                sites,
+                "{plugin}"
+            );
+        }
+
+        for (plugin, config, declared) in [
+            (
+                "otel_tracing",
+                serde_json::json!({"authorization": "s"}),
+                "authorization",
+            ),
+            (
+                "loki_logging",
+                serde_json::json!({"authorization_header": "s"}),
+                "authorization_header",
+            ),
+        ] {
+            assert_eq!(
+                dotted(rule_declared_paths(plugin, &config).into_iter().collect()),
+                vec![declared],
+                "{plugin}"
+            );
+        }
+    }
+
+    /// A short operator value is an ordinary setting, but one whose entry
+    /// name looks like a credential (skipping an operand's match-kind key)
+    /// is reported so import and the security audit can warn about it.
+    #[test]
+    fn short_credential_named_operator_values_are_reported() {
+        let config = serde_json::json!({"custom_headers": {
+            "authorization": "x",
+            "x-functions-key": "abc",
+            "X-Scope-OrgID": "12345",
+            "x-empty-token": "",
+            "x-long-token": "synthetic-long-token"
+        }});
+        let classification = classify_plugin_config("http_logging", &config);
+        assert_eq!(
+            dotted(classification.short_credential_named),
+            vec![
+                "custom_headers.authorization",
+                "custom_headers.x-functions-key"
+            ]
+        );
+        assert_eq!(
+            dotted(classification.sensitive),
+            vec!["custom_headers.x-long-token"]
+        );
+        assert!(classification.unbrokered.is_empty());
+        assert_eq!(
+            dotted(sensitive_string_paths("http_logging", &config)),
+            vec!["custom_headers.x-long-token"]
+        );
+
+        let dispatch = serde_json::json!({"rules": [{"match": {"query_params": {
+            "token": {"exact": "t1"},
+            "page": {"exact": "2"}
+        }}}]});
+        assert_eq!(
+            dotted(short_credential_named_paths(
+                "mesh_route_dispatch",
+                &dispatch
+            )),
+            vec!["rules.[0].match.query_params.token.exact"]
+        );
+
+        let chargeback = serde_json::json!({"clickhouse": {"insert_query_params": {
+            "password": "pw1",
+            "database": "default"
+        }}});
+        assert_eq!(
+            dotted(short_credential_named_paths(
+                "api_chargeback_sink",
+                &chargeback
+            )),
+            vec!["clickhouse.insert_query_params.password"]
+        );
+
+        let transform = serde_json::json!({"rules": [{"key": "X-Api-Key", "value": "1"}]});
+        assert!(short_credential_named_paths("request_transformer", &transform).is_empty());
     }
 
     /// Edge classifies the `mesh_authz` policy operands as `secret`, but
