@@ -111,7 +111,7 @@ keep its schema in one initial baseline; see the
 | `rotate.yml` | manual | Rotate one consumer credential. |
 | `materialize-file.yml` | manual | Encrypted, fully resolved file for file-mode gateways. |
 | `settings-audit.yml` | weekly, manual | Checks GitHub protections against the baseline. |
-| `validator-pin-canary.yml` | daily, manual | Reports a stale validator digest pin. |
+| `validator-pin-canary.yml` | daily, weekly, manual | Reports a stale validator digest pin; weekly, checks against Ferrum Edge `main`. |
 | `base-image-pin-canary.yml` | daily, manual | Watches the Docker base image for fixes. |
 | `rust-ci.yml` | pull request, push | Build, test, lint. |
 | `security.yml` | pull request, push, weekly | Dependency audit and workflow-script tests. |
@@ -1081,6 +1081,13 @@ pinned binary rejects `tests/fixtures/validator-resource-labels.yaml`, it opens
 or updates one issue titled *Refresh the pinned ferrum-edge validator digest*.
 `validate-pr.yml` runs the same label check on every PR as part of
 `gitforgeops-required-static-validation`.
+
+Its weekly `edge-main-drift` job is an early warning, not a pin: it copies the
+gateway binary out of Edge's signed `main` image (Cosign-verified against
+Edge's Main Latest Image workflow), runs the label probe, `gitforgeops validate`
+for every environment and the lifecycle suite with it, and opens or closes one
+issue labelled `edge-main-drift`. It never reads or changes the allowlist.
+Dispatch it with `gh workflow run validator-pin-canary.yml -f check=edge-main`.
 
 ## Upgrading
 
