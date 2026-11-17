@@ -17,7 +17,8 @@ precedence order:
   stale   the base reports a fix this repository does not cover — a newer point
           release than the pinned version, a package that is neither pinned
           nor purged from the runtime image, or a pinned .deb has left the
-          Debian pool, which fails the image build on a 404
+          Debian pool, which fails the image build on a 404 — or the override
+          Git CVE assessment is past its review-by date
   unknown nothing is stale, but the pool check did not confirm every pinned
           .deb (the mirror did not answer, or a package has no pool
           directory). Unknown is never a pass: the canary leaves the tracking
@@ -30,6 +31,13 @@ precedence order:
 
 Nothing here needs Docker: it consumes a Trivy JSON report produced by the
 canary workflow, so the canary and the `trivy-image` gate judge the same data.
+
+The builder's copied Bookworm Git libraries are invisible to Trivy, so the
+Dockerfile assesses their open Debian advisories by hand and dates that
+assessment (`ASSESSMENT_LINE`). The daily canary enforces the review-by date
+(#673): a new Bookworm zlib or PCRE2 advisory, or a new fixed version, reaches
+a maintainer through the tracking issue within one review window instead of
+waiting for the next builder bump.
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -69,6 +78,22 @@ EPOCH_ENTRY = re.compile(
 )
 # The mirror the stage fetches from, e.g. "https://deb.debian.org/debian/".
 MIRROR = re.compile(r'"(?P<mirror>https://[^"]*?)\$pool/\$file"')
+# The builder copies its Git and every library it links into this directory.
+OVERRIDE_GIT_COPY = "/opt/override-git"
+# The dated review of those libraries' open Debian advisories. A Dockerfile
+# that copies override Git must carry exactly one such comment line.
+ASSESSMENT_LINE = re.compile(
+    r"^# Override Git assessment: last reviewed (?P<reviewed>\d{4}-\d{2}-\d{2}), "
+    r"review by (?P<review_by>\d{4}-\d{2}-\d{2})\.$",
+    re.MULTILINE,
+)
+# The longest review window a reassessment may grant itself.
+MAX_ASSESSMENT_WINDOW = timedelta(days=92)
+# Where a reviewer checks the copied libraries' Bookworm advisories.
+ASSESSMENT_TRACKERS = (
+    "https://security-tracker.debian.org/tracker/source-package/zlib",
+    "https://security-tracker.debian.org/tracker/source-package/pcre2",
+)
 
 DIGITS = "0123456789"
 
@@ -182,6 +207,9 @@ class BasePin:
     pools: dict[str, str] = field(default_factory=dict)
     epochs: dict[str, int] = field(default_factory=dict)
     mirror: str = ""
+    copies_override_git: bool = False
+    assessment_reviewed: date | None = None
+    assessment_review_by: date | None = None
 
     @property
     def reference(self) -> str:
@@ -276,6 +304,14 @@ def parse_dockerfile(text: str) -> BasePin:
             if name:
                 epochs[name] = int(match.group("epoch"))
     mirror_match = MIRROR.search(text)
+    assessments = list(ASSESSMENT_LINE.finditer(text))
+    if len(assessments) > 1:
+        raise ValueError("Dockerfile carries more than one override Git assessment date line")
+    reviewed = review_by = None
+    if assessments:
+        reviewed = date.fromisoformat(assessments[0].group("reviewed"))
+        review_by = date.fromisoformat(assessments[0].group("review_by"))
+    copies_override_git = any(OVERRIDE_GIT_COPY in line for line in logical_lines(text))
     return BasePin(
         image=image,
         digest=digest,
@@ -284,6 +320,9 @@ def parse_dockerfile(text: str) -> BasePin:
         pools=pools,
         epochs=epochs,
         mirror=mirror_match.group("mirror") if mirror_match else "",
+        copies_override_git=copies_override_git,
+        assessment_reviewed=reviewed,
+        assessment_review_by=review_by,
     )
 
 
@@ -362,6 +401,7 @@ class Report:
     redundant_pins: list[str] = field(default_factory=list)
     missing_from_pool: list[str] = field(default_factory=list)
     unverified_pool: list[str] = field(default_factory=list)
+    assessment_due: list[str] = field(default_factory=list)
     has_pins: bool = False
 
     @property
@@ -376,7 +416,7 @@ class Report:
     def state(self) -> State:
         """The one place the verdict is decided, from the evidence collected.
         A pool check that did not complete is never read as a confirmed pool."""
-        if self.uncovered or self.stale_pins or self.missing_from_pool:
+        if self.uncovered or self.stale_pins or self.missing_from_pool or self.assessment_due:
             return State.STALE
         if self.unverified_pool:
             return State.UNKNOWN
@@ -427,6 +467,30 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
             report.redundant_pins.append(name)
 
     return report
+
+
+def check_assessment(pin: BasePin, report: Report, today: date) -> None:
+    """The override Git CVE assessment must carry a bounded review-by date
+    that has not passed. A Dockerfile without the override Git copy has
+    nothing to assess."""
+    if not pin.copies_override_git:
+        return
+    reviewed, review_by = pin.assessment_reviewed, pin.assessment_review_by
+    if reviewed is None or review_by is None:
+        report.assessment_due.append(
+            "the Dockerfile copies override Git but carries no "
+            "`# Override Git assessment: last reviewed YYYY-MM-DD, review by YYYY-MM-DD.` line"
+        )
+        return
+    if not reviewed < review_by <= reviewed + MAX_ASSESSMENT_WINDOW:
+        report.assessment_due.append(
+            f"review window {reviewed} to {review_by} is not between one and "
+            f"{MAX_ASSESSMENT_WINDOW.days} days"
+        )
+    if today > review_by:
+        report.assessment_due.append(
+            f"last reviewed {reviewed}; the review-by date {review_by} has passed (today is {today})"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -481,11 +545,18 @@ HEADLINE = {
     State.STALE: "The pinned runtime security packages no longer cover the base image.",
 }
 RETIRED_HEADLINE = "The digest-pinned runtime base needs no point-release package stage."
+ASSESSMENT_HEADLINE = "The override Git CVE assessment in the Dockerfile is due for review."
 
 
 def headline(report: Report) -> str:
     if report.state is State.OK and not report.has_pins:
         return RETIRED_HEADLINE
+    if (
+        report.state is State.STALE
+        and report.assessment_due
+        and not (report.uncovered or report.stale_pins or report.missing_from_pool)
+    ):
+        return ASSESSMENT_HEADLINE
     return HEADLINE[report.state]
 
 
@@ -554,6 +625,27 @@ def render(report: Report) -> str:
                 "stages are required to build from reviewed digests only.",
                 "",
             ]
+
+    if report.assessment_due:
+        lines += [
+            "**Override Git assessment due.** The builder's copied Bookworm Git",
+            "libraries have no dpkg record in the runtime image, so no scan sees them:",
+            "",
+        ]
+        lines += [f"- {entry}" for entry in report.assessment_due] + [""]
+        lines += [
+            "Check every open and newly fixed Bookworm advisory for the copied",
+            "libraries, at least:",
+            "",
+        ]
+        lines += [f"- {url}" for url in ASSESSMENT_TRACKERS] + [""]
+        lines += [
+            "Redo the Dockerfile's override Git assessment for each one (copy a fixed",
+            "Bookworm build, or show the flawed code is unreachable from the CLI's Git",
+            "calls), then update its `# Override Git assessment:` line, granting at",
+            f"most {MAX_ASSESSMENT_WINDOW.days} days.",
+            "",
+        ]
 
     if report.redundant_pins:
         lines += [
@@ -637,6 +729,7 @@ def main(argv: list[str] | None = None) -> int:
 
     findings, current_digest = parse_trivy_report(document)
     report = classify(findings, pin, current_digest)
+    check_assessment(pin, report, datetime.now(timezone.utc).date())
     if not args.skip_pool_check:
         check_pool(pin, report)
 
