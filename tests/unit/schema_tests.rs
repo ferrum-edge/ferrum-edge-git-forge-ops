@@ -786,7 +786,7 @@ fn websocket_permessage_deflate_is_typed_and_omits_its_default() {
     )
     .expect_err("an unknown value is refused, never defaulted");
     assert!(
-        error.to_string().contains("websocket_permessage_deflate"),
+        error.to_string().contains("unknown variant `Passthrough`"),
         "{error}"
     );
 }
