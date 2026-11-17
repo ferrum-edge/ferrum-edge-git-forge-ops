@@ -197,8 +197,10 @@ header name, a header-map value, a Kafka producer property not named like a
 credential, a custom plugin's secret-looking field) may be an ordinary setting: it is not registered and
 does not refuse the run. Operator-chosen values Ferrum Edge redacts without
 requiring them to be secret (a `request_transformer` rule value, a
-`mesh_route_dispatch` request-transform value, a `ws_logging` custom header,
-a `fault_injection` or `response_mock` match condition) are never refused
+`mesh_route_dispatch` request-transform value or match operand, a `ws_logging`
+custom header, a `fault_injection` or `response_mock` match condition, a `waf`
+custom-rule or override header condition, the `request_termination` and
+`transaction_debugger` selector header values) are never refused
 either. One of at least 8 bytes is brokered on import, protected, and blocks
 apply as a literal; a shorter one is an ordinary setting that stays literal. A short probe value refuses projection/header
 resolution, before any probe request. Admission also refuses a value whose

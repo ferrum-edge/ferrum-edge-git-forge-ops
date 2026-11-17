@@ -1915,6 +1915,85 @@ fn review_comment_loses_edge_0_9_19_redacted_plugin_values() {
     }
 }
 
+/// A live value on a credential or operator-chosen token Ferrum Edge
+/// redacts after v0.9.20 is registered from the live snapshot, so a diff that
+/// echoes it loses it at the PR comment's sink.
+#[test]
+fn review_comment_loses_edge_post_0_9_20_redacted_plugin_values() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    for (plugin_name, value, config) in [
+        (
+            "ai_tool_governor",
+            "zq7-approval-header-post-v20",
+            serde_json::json!({"approval": {"headers": {
+                "x-approval-auth": "zq7-approval-header-post-v20"
+            }}}),
+        ),
+        (
+            "mcp_gateway",
+            "zq7-mcp-server-header-post-v20",
+            serde_json::json!({"servers": {"docs": {"headers": {
+                "x-functions-key": "zq7-mcp-server-header-post-v20"
+            }}}}),
+        ),
+        (
+            "request_termination",
+            "zq7-kill-token-post-v20",
+            serde_json::json!({"trigger": {"header": "x-kill",
+                "header_value": "zq7-kill-token-post-v20"}}),
+        ),
+        (
+            "transaction_debugger",
+            "zq7-debug-selector-post-v20",
+            serde_json::json!({"capture_request_header": "x-debug",
+                "capture_request_header_value": "zq7-debug-selector-post-v20"}),
+        ),
+        (
+            "waf",
+            "zq7-waf-condition-post-v20",
+            serde_json::json!({"custom_rules": [{"conditions": {"headers": {
+                "x-tenant": "zq7-waf-condition-post-v20"
+            }}}]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            "zq7-route-operand-post-v20",
+            serde_json::json!({"rules": [{"match": {"query_params": {
+                "tenant": {"exact": "zq7-route-operand-post-v20"}
+            }}}]}),
+        ),
+    ] {
+        let config = serde_json::from_value(serde_json::json!({
+            "plugin_configs": [{"id": "plugin", "namespace": "ferrum",
+                "plugin_name": plugin_name, "scope": "global", "config": config}]
+        }))
+        .unwrap();
+        gitforgeops::display::register_gateway_config(&config).unwrap();
+        let diffs = vec![ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "PluginConfig".to_string(),
+            id: "plugin".to_string(),
+            namespace: "ferrum".to_string(),
+            details: vec![FieldChange {
+                field: format!("config {value}"),
+                old_value: value.to_string(),
+                new_value: "changed".to_string(),
+            }],
+        }];
+        let comment = review_comment(true, "", &diffs, &[], &[], &[], None);
+        assert!(
+            comment.contains("zq7"),
+            "{plugin_name}: the formatter must actually echo the live value"
+        );
+        let published = gitforgeops::display::scrub_text(&comment);
+        assert!(!published.contains("zq7"), "{plugin_name}: {published}");
+        assert!(
+            published.contains("[REDACTED]"),
+            "{plugin_name}: {published}"
+        );
+    }
+}
+
 /// Both formatter paths must be protected by the final publication sink:
 /// inline code collapses CRLF to one space; prose escapes Markdown punctuation.
 #[test]

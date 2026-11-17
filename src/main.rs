@@ -1765,7 +1765,7 @@ fn print_fingerprint_notes(
         );
     } else {
         eoutln!(
-            "Note: {} fingerprinted secret field(s) on declared resources were not verified. GET /config/export fingerprints secrets with a key derived from the gateway's admin secret, so the viewer credential cannot compute the fingerprint of the repository's value. Pass --fingerprint-baseline with a baseline recorded by --write-fingerprint-baseline to detect changes between exports.",
+            "Note: {} fingerprinted secret field(s) on declared resources were not verified. GET /config/export fingerprints secrets with a key derived from a gateway-side secret (FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET after Ferrum Edge v0.9.20, the admin secret on v0.9.20), so the viewer credential cannot compute the fingerprint of the repository's value. Pass --fingerprint-baseline with a baseline recorded by --write-fingerprint-baseline to detect changes between exports.",
             summary.uncompared
         );
     }

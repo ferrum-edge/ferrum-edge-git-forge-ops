@@ -274,7 +274,11 @@ once `monitoring.unattended: true` (which must not hold
 `FERRUM_ADMIN_JWT_SECRET`). The drift check reads `GET /config/export`, which
 the gateway caps at `viewer`. Secrets come back as fingerprints the viewer key
 cannot reproduce, so `diff` reports them as unverified rather than in sync
-(`--exit-on-drift` exits `6`, a warning). A manual `gitforgeops diff` uses the
+(`--exit-on-drift` exits `6`, a warning). On Ferrum Edge after v0.9.20, also
+set one `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on every gateway
+replica (a gateway setting, not a GitHub secret): without it fingerprints
+change on every gateway restart and differ between replicas, so a fingerprint
+baseline cannot stay comparable. A manual `gitforgeops diff` uses the
 same key when it is set. See
 [Scheduled monitoring](reference.md#scheduled-monitoring) and
 [Reading with a viewer-capped credential](../README.md#reading-with-a-viewer-capped-credential).

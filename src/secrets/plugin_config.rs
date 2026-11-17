@@ -174,14 +174,21 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             endpoint(&["provider", "endpoint"]),
             secret(&["privacy", "snippet_hash_salt"]),
         ],
+        // Edge after v0.9.20 redacts the approval webhook's static headers
+        // and each MCP server's upstream request headers: the approval
+        // service's or hosted MCP server's credential rides there under an
+        // arbitrary vendor name, so every value is a secret, as for
+        // `otel_tracing` `headers`.
         "ai_tool_governor" => vec![
             endpoint(&["endpoint_url"]),
             endpoint(&["approval", "endpoint_url"]),
+            secret(&["approval", "headers", "*"]),
         ],
         "ai_stream_router" => vec![endpoint(&["providers", "*", "endpoint"])],
         "mcp_gateway" => vec![
             endpoint(&["servers", "*", "upstream_url"]),
             endpoint(&["upstream_url"]),
+            secret(&["servers", "*", "headers", "*"]),
         ],
         "ai_semantic_cache" => vec![
             endpoint(&["redis_url"]),
@@ -218,7 +225,15 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             endpoint(&["endpoint_url"]),
             operator_value(&["custom_headers", "*"]),
         ],
-        "waf" => vec![secret(&["global_exemptions", "header_present", "*"])],
+        // `conditions.headers` values scope a custom rule or override to
+        // requests carrying a header value. Edge after v0.9.20 redacts them
+        // because an operator may target with a shared secret, as for
+        // `fault_injection`; a `null` (presence-only) condition stays `null`.
+        "waf" => vec![
+            secret(&["global_exemptions", "header_present", "*"]),
+            operator_value(&["custom_rules", "*", "conditions", "headers", "*"]),
+            operator_value(&["rule_overrides", "*", "conditions", "headers", "*"]),
+        ],
         // Since Edge v0.9.19 every `bypass.header_present` value is a shared
         // secret (16 to 4096 visible ASCII characters) whose exact presence
         // skips OpenAPI request validation, the same kind of value as the
@@ -226,13 +241,22 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         // yet redact it; later Edge does (ferrum-edge#7054).
         "openapi_validator" => vec![secret(&["bypass", "header_present", "*"])],
         "request_transformer" => vec![operator_value(&["rules", "*", "value"])],
-        "mesh_route_dispatch" => vec![operator_value(&[
-            "rules",
-            "*",
-            "request_transform",
-            "*",
-            "value",
-        ])],
+        // Match operands (Edge after v0.9.20) select a route by a value the
+        // client presents, which may be a shared secret. Each is a bare
+        // string or a one-key `{exact|prefix|regex: ...}` object: the
+        // trailing `*` matches the bare string (a scalar where a container is
+        // expected) and the object form's inner value.
+        "mesh_route_dispatch" => vec![
+            operator_value(&["rules", "*", "request_transform", "*", "value"]),
+            operator_value(&["rules", "*", "match", "headers", "*", "*"]),
+            operator_value(&["rules", "*", "match", "without_headers", "*", "*"]),
+            operator_value(&["rules", "*", "match", "query_params", "*", "*"]),
+        ],
+        // Operator-chosen selector tokens Edge after v0.9.20 redacts: the
+        // header value a request must carry to be terminated or captured.
+        // Neither has a gateway minimum, so short ones stay literal.
+        "request_termination" => vec![operator_value(&["trigger", "header_value"])],
+        "transaction_debugger" => vec![operator_value(&["capture_request_header_value"])],
         "fault_injection" => vec![operator_value(&["match", "headers", "*"])],
         "response_mock" => vec![
             operator_value(&["rules", "*", "match", "headers", "*"]),
@@ -268,16 +292,19 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 /// of them is substituted and counted as uncompared instead of reading as
 /// permanent drift once the pin moves; a gateway that does not fingerprint
 /// them (v0.9.20) still compares them as ordinary values. Import brokering,
-/// redaction, scrubbing and display admission are unchanged: making any of
-/// these a brokered secret is a separate decision for the pin that adopts it.
+/// redaction, scrubbing and display admission are unchanged for them.
 ///
-/// Mirrors Edge's secret, endpoint-URL, endpoint-path and TLS-source rules.
-/// The TLS-source and endpoint rules withhold only some values (inline key
-/// material, a non-trivial path, a credential-bearing URL); listing the site
-/// is harmless for the rest, because only a live fingerprint is substituted.
+/// Only values Edge merely withholds belong here: endpoint URLs and paths
+/// (`opa` `opa_host`, a `mesh_route_dispatch` rewrite, a mirror path), TLS
+/// certificate and key sources, and the generated `mesh_authz` policy slice.
+/// A credential or operator-chosen token Edge redacts is a [`rules_for`] rule
+/// instead (brokered, literal-gated and masked), whether or not the pinned
+/// gateway redacts it yet. The TLS-source and endpoint rules withhold only
+/// some values (inline key material, a non-trivial path, a credential-bearing
+/// URL); listing the site is harmless for the rest, because only a live
+/// fingerprint is substituted.
 fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]] {
     match plugin_name {
-        "request_termination" => &[&["trigger", "header_value"]],
         "mtls_auth" => &[&["allowed_issuers", "*", "ca_certificate_pem"]],
         "soap_ws_security" => &[
             &["x509_signature", "trusted_certs", "*"],
@@ -459,30 +486,18 @@ fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]
                 "federation_endpoint",
             ],
         ],
+        // Edge projects the OPA server URL structurally like any endpoint
+        // (it may carry a base path); it names a server, not a credential,
+        // and URL userinfo is caught by the import heuristics.
         "opa" => &[&["opa_host"]],
-        "waf" => &[
-            &["custom_rules", "*", "conditions", "headers", "*"],
-            &["rule_overrides", "*", "conditions", "headers", "*"],
-        ],
-        // `openapi_validator` `bypass.header_present.*` and
-        // `ai_semantic_firewall` `privacy.snippet_hash_salt` are brokered
-        // secret rules in `rules_for` (GHSA-5p93-qfr5-m7m9), which already
-        // makes them export sites.
-        "ai_tool_governor" => &[&["approval", "headers", "*"]],
-        "mcp_gateway" => &[&["servers", "*", "headers", "*"]],
-        "mesh_route_dispatch" => &[
-            &["rules", "*", "match", "headers", "*", "*"],
-            &["rules", "*", "match", "without_headers", "*", "*"],
-            &["rules", "*", "match", "query_params", "*", "*"],
-            &["rules", "*", "rewrite", "uri"],
-        ],
+        // A backend path rewrite is projected like an endpoint path.
+        "mesh_route_dispatch" => &[&["rules", "*", "rewrite", "uri"]],
         "request_mirror" => &[&["mirror_path"]],
         "udp_logging" => &[
             &["dtls_key_path"],
             &["dtls_cert_path"],
             &["dtls_ca_cert_path"],
         ],
-        "transaction_debugger" => &[&["capture_request_header_value"]],
         _ => &[],
     }
 }
@@ -1333,41 +1348,27 @@ mod tests {
         assert_eq!(dotted(classification.sensitive), vec!["api_key"]);
     }
 
-    /// Built-in sites Edge's projection on `main` added after v0.9.20 are
-    /// export sites only: nothing about import brokering, redaction or display
-    /// admission changes for them.
+    /// Built-in sites Edge's projection on `main` merely withholds (endpoint
+    /// URLs and paths, TLS sources, the generated mesh policy slice) are
+    /// export sites only: nothing about import brokering, redaction or
+    /// display admission changes for them.
     #[test]
-    fn post_v0_9_20_builtin_sites_are_export_only() {
+    fn post_v0_9_20_withheld_builtin_sites_are_export_only() {
         for (plugin, config, sites) in [
-            (
-                "request_termination",
-                serde_json::json!({"status_code": 403, "trigger": {"header_name": "x-kill", "header_value": "on"}}),
-                vec!["trigger.header_value"],
-            ),
-            (
-                "transaction_debugger",
-                serde_json::json!({"capture_request_header_value": "debug-me"}),
-                vec!["capture_request_header_value"],
-            ),
             (
                 "request_mirror",
                 serde_json::json!({"mirror_host": "shadow.internal", "mirror_path": "/ingest/t0k"}),
                 vec!["mirror_path"],
             ),
             (
-                "waf",
-                serde_json::json!({"custom_rules": [{"conditions": {"headers": {"x-tenant": "t1", "x-any": null}}}]}),
-                vec!["custom_rules.[0].conditions.headers.x-tenant"],
+                "opa",
+                serde_json::json!({"opa_host": "http://opa.internal:8181/v1/base", "policy_path": "authz/allow"}),
+                vec!["opa_host"],
             ),
             (
-                // A bare operand is withheld whole (a scalar where Edge
-                // expects a container); the object form keeps its match kind.
                 "mesh_route_dispatch",
-                serde_json::json!({"rules": [{"match": {"headers": {"x-a": "v", "x-b": {"exact": "w"}}}}]}),
-                vec![
-                    "rules.[0].match.headers.x-a",
-                    "rules.[0].match.headers.x-b.exact",
-                ],
+                serde_json::json!({"rules": [{"rewrite": {"uri": "/internal/backend-path"}}]}),
+                vec!["rules.[0].rewrite.uri"],
             ),
             (
                 "mesh_authz",
@@ -1393,6 +1394,143 @@ mod tests {
             let classification = classify_plugin_config(plugin, &config);
             assert!(classification.sensitive.is_empty(), "{plugin}");
             assert!(rule_declared_paths(plugin, &config).is_empty(), "{plugin}");
+        }
+    }
+
+    /// Credentials Edge after v0.9.20 redacts are brokered secret rules:
+    /// import captures every string, a short live value refuses display
+    /// admission, and each is an export site.
+    #[test]
+    fn post_v0_9_20_credential_header_maps_are_secrets() {
+        for (plugin, config, sites) in [
+            (
+                "ai_tool_governor",
+                serde_json::json!({"approval": {
+                    "endpoint_url": "https://approvals.example/hook",
+                    "headers": {"x-approval-auth": "synthetic-approval-token", "x-short": "s"}
+                }}),
+                vec![
+                    "approval.endpoint_url",
+                    "approval.headers.x-approval-auth",
+                    "approval.headers.x-short",
+                ],
+            ),
+            (
+                "mcp_gateway",
+                serde_json::json!({"servers": {"docs": {
+                    "upstream_url": "https://mcp.example/docs",
+                    "headers": {"Ocp-Apim-Subscription-Key": "synthetic-mcp-key"}
+                }}}),
+                vec![
+                    "servers.docs.headers.Ocp-Apim-Subscription-Key",
+                    "servers.docs.upstream_url",
+                ],
+            ),
+        ] {
+            let classification = classify_plugin_config(plugin, &config);
+            assert_eq!(dotted(classification.sensitive), sites, "{plugin}");
+            assert!(classification.unbrokered.is_empty(), "{plugin}");
+            assert_eq!(
+                dotted(rule_declared_paths(plugin, &config).into_iter().collect()),
+                sites,
+                "{plugin}"
+            );
+            assert_eq!(
+                dotted(export_redacted_paths(plugin, &config).into_iter().collect()),
+                sites,
+                "{plugin}"
+            );
+        }
+    }
+
+    /// Operator-chosen tokens and match operands Edge after v0.9.20 redacts
+    /// are [`RuleKind::Value`] rules: brokered when long enough to protect,
+    /// ordinary settings when shorter, never rule-declared, and an export
+    /// site whatever their length.
+    #[test]
+    fn post_v0_9_20_operator_tokens_are_operator_values() {
+        for (plugin, config, brokered, sites) in [
+            (
+                "request_termination",
+                serde_json::json!({"status_code": 403, "trigger": {"header": "x-kill", "header_value": "kill-switch-token"}}),
+                vec!["trigger.header_value"],
+                vec!["trigger.header_value"],
+            ),
+            (
+                "request_termination",
+                serde_json::json!({"trigger": {"header": "x-kill", "header_value": "on"}}),
+                vec![],
+                vec!["trigger.header_value"],
+            ),
+            (
+                "transaction_debugger",
+                serde_json::json!({"capture_request_header": "x-debug", "capture_request_header_value": "debug-session-42"}),
+                vec!["capture_request_header_value"],
+                vec!["capture_request_header_value"],
+            ),
+            (
+                "transaction_debugger",
+                serde_json::json!({"capture_request_header": "x-debug", "capture_request_header_value": "1"}),
+                vec![],
+                vec!["capture_request_header_value"],
+            ),
+            (
+                "waf",
+                serde_json::json!({
+                    "custom_rules": [{"conditions": {"headers": {"x-tenant": "tenant-alpha-key", "x-env": "t1", "x-any": null}}}],
+                    "rule_overrides": {"FE-XSS-001": {"conditions": {"headers": {"x-scan": "scanner-shared-value"}}}}
+                }),
+                vec![
+                    "custom_rules.[0].conditions.headers.x-tenant",
+                    "rule_overrides.FE-XSS-001.conditions.headers.x-scan",
+                ],
+                vec![
+                    "custom_rules.[0].conditions.headers.x-env",
+                    "custom_rules.[0].conditions.headers.x-tenant",
+                    "rule_overrides.FE-XSS-001.conditions.headers.x-scan",
+                ],
+            ),
+            (
+                // A bare operand is matched whole (a scalar where Edge
+                // expects a container); the object form keeps its match kind.
+                "mesh_route_dispatch",
+                serde_json::json!({"rules": [{"match": {
+                    "headers": {"x-a": "v", "x-b": {"exact": "route-shared-secret"}},
+                    "without_headers": {"x-c": {"prefix": "internal-only-"}},
+                    "query_params": {"token": "query-shared-secret", "page": "2"}
+                }}]}),
+                vec![
+                    "rules.[0].match.headers.x-b.exact",
+                    "rules.[0].match.query_params.token",
+                    "rules.[0].match.without_headers.x-c.prefix",
+                ],
+                vec![
+                    "rules.[0].match.headers.x-a",
+                    "rules.[0].match.headers.x-b.exact",
+                    "rules.[0].match.query_params.page",
+                    "rules.[0].match.query_params.token",
+                    "rules.[0].match.without_headers.x-c.prefix",
+                ],
+            ),
+        ] {
+            let classification = classify_plugin_config(plugin, &config);
+            assert_eq!(dotted(classification.sensitive), brokered, "{plugin}");
+            assert!(
+                classification.unbrokered.is_empty(),
+                "{plugin}: {:?}",
+                dotted(classification.unbrokered)
+            );
+            assert_eq!(
+                dotted(sensitive_string_paths(plugin, &config)),
+                brokered,
+                "{plugin}"
+            );
+            assert!(rule_declared_paths(plugin, &config).is_empty(), "{plugin}");
+            assert_eq!(
+                dotted(export_redacted_paths(plugin, &config).into_iter().collect()),
+                sites,
+                "{plugin}"
+            );
         }
     }
 
