@@ -262,6 +262,231 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
     }
 }
 
+/// Sites the Ferrum Edge `plugin_config_projection` on `main` (after the pinned
+/// v0.9.20) withholds from `/config/export` that [`rules_for`] does not
+/// declare. They only extend [`export_redacted_paths`], so a fingerprint at one
+/// of them is substituted and counted as uncompared instead of reading as
+/// permanent drift once the pin moves; a gateway that does not fingerprint
+/// them (v0.9.20) still compares them as ordinary values. Import brokering,
+/// redaction, scrubbing and display admission are unchanged: making any of
+/// these a brokered secret is a separate decision for the pin that adopts it.
+///
+/// Mirrors Edge's secret, endpoint-URL, endpoint-path and TLS-source rules.
+/// The TLS-source and endpoint rules withhold only some values (inline key
+/// material, a non-trivial path, a credential-bearing URL); listing the site
+/// is harmless for the rest, because only a live fingerprint is substituted.
+fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]] {
+    match plugin_name {
+        "request_termination" => &[&["trigger", "header_value"]],
+        "mtls_auth" => &[&["allowed_issuers", "*", "ca_certificate_pem"]],
+        "soap_ws_security" => &[
+            &["x509_signature", "trusted_certs", "*"],
+            &["saml", "trusted_signing_certs", "*"],
+        ],
+        "mesh_authz" => &[
+            &[
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "to",
+                "*",
+                "headers",
+                "*",
+            ],
+            &[
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "values",
+                "*",
+            ],
+            &[
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "not_values",
+                "*",
+            ],
+            &[
+                "mesh_slice",
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "to",
+                "*",
+                "headers",
+                "*",
+            ],
+            &[
+                "mesh_slice",
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "values",
+                "*",
+            ],
+            &[
+                "mesh_slice",
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "not_values",
+                "*",
+            ],
+            &[
+                "mesh_slice",
+                "node_waypoint_capture_mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "to",
+                "*",
+                "headers",
+                "*",
+            ],
+            &[
+                "mesh_slice",
+                "node_waypoint_capture_mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "values",
+                "*",
+            ],
+            &[
+                "mesh_slice",
+                "node_waypoint_capture_mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "not_values",
+                "*",
+            ],
+            &[
+                "mesh_slice",
+                "ext_authz_providers",
+                "*",
+                "include_additional_headers_in_check",
+                "*",
+                "value",
+            ],
+            &["mesh_slice", "ext_authz_providers", "*", "path_prefix"],
+            &["mesh_slice", "proxy_configs", "*", "environment", "*"],
+            &["mesh_slice", "extension_configs", "*", "value"],
+            &[
+                "mesh_slice",
+                "telemetry_resources",
+                "*",
+                "config",
+                "tracing",
+                "providers",
+                "*",
+                "config",
+                "url",
+            ],
+            &[
+                "mesh_slice",
+                "telemetry_resources",
+                "*",
+                "config",
+                "tracing",
+                "providers",
+                "*",
+                "config",
+                "agent_url",
+            ],
+            &[
+                "mesh_slice",
+                "telemetry_resources",
+                "*",
+                "config",
+                "tracing",
+                "providers",
+                "*",
+                "config",
+                "collector_url",
+            ],
+            &[
+                "mesh_slice",
+                "telemetry_resources",
+                "*",
+                "config",
+                "tracing",
+                "providers",
+                "*",
+                "config",
+                "endpoint",
+            ],
+            &[
+                "mesh_slice",
+                "request_authentications",
+                "*",
+                "jwt_rules",
+                "*",
+                "jwks_uri",
+            ],
+            &["mesh_slice", "multi_cluster", "federation_endpoint"],
+            &[
+                "mesh_slice",
+                "multi_cluster",
+                "remote_clusters",
+                "*",
+                "control_plane_url",
+            ],
+            &[
+                "mesh_slice",
+                "multi_cluster",
+                "remote_clusters",
+                "*",
+                "federation_endpoint",
+            ],
+        ],
+        "opa" => &[&["opa_host"]],
+        "waf" => &[
+            &["custom_rules", "*", "conditions", "headers", "*"],
+            &["rule_overrides", "*", "conditions", "headers", "*"],
+        ],
+        // `openapi_validator` `bypass.header_present.*` and
+        // `ai_semantic_firewall` `privacy.snippet_hash_salt` are brokered
+        // secret rules in `rules_for` (GHSA-5p93-qfr5-m7m9), which already
+        // makes them export sites.
+        "ai_tool_governor" => &[&["approval", "headers", "*"]],
+        "mcp_gateway" => &[&["servers", "*", "headers", "*"]],
+        "mesh_route_dispatch" => &[
+            &["rules", "*", "match", "headers", "*", "*"],
+            &["rules", "*", "match", "without_headers", "*", "*"],
+            &["rules", "*", "match", "query_params", "*", "*"],
+            &["rules", "*", "rewrite", "uri"],
+        ],
+        "request_mirror" => &[&["mirror_path"]],
+        "udp_logging" => &[
+            &["dtls_key_path"],
+            &["dtls_cert_path"],
+            &["dtls_ca_cert_path"],
+        ],
+        "transaction_debugger" => &[&["capture_request_header_value"]],
+        _ => &[],
+    }
+}
+
 /// What a plugin config's string leaves were classified as.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PluginConfigClassification {
@@ -366,13 +591,19 @@ pub(crate) fn sensitive_string_paths(
 
 /// Every location `/config/export` fingerprints that the repository can
 /// put its declared value back at: [`sensitive_string_paths`], plus the node
-/// each secret, endpoint or [`RuleKind::Value`] rule matches, as a whole.
-/// Edge fingerprints the whole non-null value at a secret site, and at an
-/// endpoint site that is not a string, whatever its length or JSON type (a
-/// `request_transformer` body rule's `value` may be `true`, a number or an
-/// object; `failover_ldap_urls` is an array). Matching the site itself keeps
-/// such a value comparable against a baseline instead of reading as drift
-/// or as a masked ancestor.
+/// each secret, endpoint or [`RuleKind::Value`] rule (and each
+/// [`export_only_rules_for`] rule) matches, as a whole. Edge fingerprints the
+/// whole non-null value at a secret site, and at an endpoint site that is not
+/// a string, whatever its length or JSON type (a `request_transformer` body
+/// rule's `value` may be `true`, a number or an object; `failover_ldap_urls`
+/// is an array). A non-null scalar met where a rule expects a container is
+/// fingerprinted too (Edge fails closed on it). Matching the site itself keeps
+/// such a value comparable against a baseline instead of reading as drift or
+/// as a masked ancestor.
+///
+/// A custom (non-built-in) plugin has no schema, so Edge after v0.9.20
+/// fingerprints every scalar leaf (string, number, boolean) of its object
+/// config; each one is a site.
 pub(crate) fn export_redacted_paths(
     plugin_name: &str,
     config: &Value,
@@ -380,20 +611,56 @@ pub(crate) fn export_redacted_paths(
     let mut found: BTreeSet<_> = sensitive_string_paths(plugin_name, config)
         .into_iter()
         .collect();
-    if !config.is_object() || !is_builtin(plugin_name) {
+    if !config.is_object() {
         return found;
     }
+    if !is_builtin(plugin_name) {
+        collect_scalar_leaf_paths(config, &[], &mut found);
+        return found;
+    }
+    let mut site = |node: &Value, path: &[ConfigPathComponent], _complete: bool| {
+        if !node.is_null() {
+            found.insert(path.to_vec());
+        }
+    };
     for rule in rules_for(plugin_name) {
         if matches!(rule.kind, RuleKind::KafkaProperties) {
             continue;
         }
-        walk_rule(config, rule.path, &[], &mut |node, path, complete| {
-            if complete && !node.is_null() {
-                found.insert(path.to_vec());
-            }
-        });
+        walk_rule(config, rule.path, &[], &mut site);
+    }
+    for path in export_only_rules_for(plugin_name) {
+        walk_rule(config, path, &[], &mut site);
     }
     found
+}
+
+/// Every non-null scalar leaf under `value`.
+fn collect_scalar_leaf_paths(
+    value: &Value,
+    current: &[ConfigPathComponent],
+    found: &mut BTreeSet<Vec<ConfigPathComponent>>,
+) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let mut next = current.to_vec();
+                next.push(ConfigPathComponent::Key(key.clone()));
+                collect_scalar_leaf_paths(child, &next, found);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let mut next = current.to_vec();
+                next.push(ConfigPathComponent::Index(index));
+                collect_scalar_leaf_paths(child, &next, found);
+            }
+        }
+        Value::Null => {}
+        _ => {
+            found.insert(current.to_vec());
+        }
+    }
 }
 
 /// The LDAP scheme an `ldap_auth` config already commits to, if any.
@@ -1031,6 +1298,116 @@ mod tests {
                     .collect()
             ),
             vec!["privacy.snippet_hash_salt"]
+        );
+    }
+
+    /// Edge after v0.9.20 fingerprints every scalar leaf of a custom plugin's
+    /// config. Each is an export site, while import still brokers only the
+    /// heuristic matches and reports the rest for review.
+    #[test]
+    fn custom_plugin_scalar_leaves_are_export_sites() {
+        let config = serde_json::json!({
+            "mode": "strict",
+            "retries": 3,
+            "enabled": true,
+            "unset": null,
+            "nested": {"labels": ["a", {"weight": 2.5}]},
+            "api_key": "live-key-value"
+        });
+        assert_eq!(
+            dotted(
+                export_redacted_paths("custom_enterprise_plugin", &config)
+                    .into_iter()
+                    .collect()
+            ),
+            vec![
+                "api_key",
+                "enabled",
+                "mode",
+                "nested.labels.[0]",
+                "nested.labels.[1].weight",
+                "retries"
+            ]
+        );
+        let classification = classify_plugin_config("custom_enterprise_plugin", &config);
+        assert_eq!(dotted(classification.sensitive), vec!["api_key"]);
+    }
+
+    /// Built-in sites Edge's projection on `main` added after v0.9.20 are
+    /// export sites only: nothing about import brokering, redaction or display
+    /// admission changes for them.
+    #[test]
+    fn post_v0_9_20_builtin_sites_are_export_only() {
+        for (plugin, config, sites) in [
+            (
+                "request_termination",
+                serde_json::json!({"status_code": 403, "trigger": {"header_name": "x-kill", "header_value": "on"}}),
+                vec!["trigger.header_value"],
+            ),
+            (
+                "transaction_debugger",
+                serde_json::json!({"capture_request_header_value": "debug-me"}),
+                vec!["capture_request_header_value"],
+            ),
+            (
+                "request_mirror",
+                serde_json::json!({"mirror_host": "shadow.internal", "mirror_path": "/ingest/t0k"}),
+                vec!["mirror_path"],
+            ),
+            (
+                "waf",
+                serde_json::json!({"custom_rules": [{"conditions": {"headers": {"x-tenant": "t1", "x-any": null}}}]}),
+                vec!["custom_rules.[0].conditions.headers.x-tenant"],
+            ),
+            (
+                // A bare operand is withheld whole (a scalar where Edge
+                // expects a container); the object form keeps its match kind.
+                "mesh_route_dispatch",
+                serde_json::json!({"rules": [{"match": {"headers": {"x-a": "v", "x-b": {"exact": "w"}}}}]}),
+                vec![
+                    "rules.[0].match.headers.x-a",
+                    "rules.[0].match.headers.x-b.exact",
+                ],
+            ),
+            (
+                "mesh_authz",
+                serde_json::json!({"mesh_policies": [{"rules": [{"when": [{"key": "request.headers[x]", "values": ["v1", "v2"]}]}]}]}),
+                // `key` is already a site through the name heuristic.
+                vec![
+                    "mesh_policies.[0].rules.[0].when.[0].key",
+                    "mesh_policies.[0].rules.[0].when.[0].values.[0]",
+                    "mesh_policies.[0].rules.[0].when.[0].values.[1]",
+                ],
+            ),
+            (
+                "udp_logging",
+                serde_json::json!({"dtls_key_path": "/etc/ferrum/dtls.key", "dtls_cert_path": "/etc/ferrum/dtls.crt"}),
+                vec!["dtls_cert_path", "dtls_key_path"],
+            ),
+        ] {
+            assert_eq!(
+                dotted(export_redacted_paths(plugin, &config).into_iter().collect()),
+                sites,
+                "{plugin}"
+            );
+            let classification = classify_plugin_config(plugin, &config);
+            assert!(classification.sensitive.is_empty(), "{plugin}");
+            assert!(rule_declared_paths(plugin, &config).is_empty(), "{plugin}");
+        }
+    }
+
+    /// Edge fails closed on a non-null scalar where a rule expects a
+    /// container; a number there is an export site too, not only a string.
+    #[test]
+    fn a_scalar_where_a_rule_expects_a_container_is_an_export_site() {
+        let config = serde_json::json!({"headers": 42});
+        assert_eq!(
+            dotted(
+                export_redacted_paths("otel_tracing", &config)
+                    .into_iter()
+                    .collect()
+            ),
+            vec!["headers"]
         );
     }
 

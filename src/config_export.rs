@@ -29,6 +29,14 @@
 //!   compared as an ordinary value and reported when it differs. Where the
 //!   repository declares nothing there, the fingerprint stays and the
 //!   structural difference is reported.
+//! - The predicted sites also cover what Edge's projection on `main` (after
+//!   the pinned v0.9.20) withholds: the `header` / `query` / `cookie` operands
+//!   of a plugin's `trigger`, every scalar leaf of a custom plugin's config,
+//!   the built-in paths of [`export_redacted_paths`]'s export-only rules, and
+//!   TLS private-key material anywhere in a Proxy, Upstream or plugin config.
+//!   A gateway that does not fingerprint a site sends its value, which is
+//!   compared as usual, so predicting more sites than the pinned gateway
+//!   withholds never hides drift there.
 //! - Fingerprint equality only shows that a stored value is **unchanged
 //!   between two exports** under one gateway key. [`FingerprintBaseline`]
 //!   records an export's fingerprints; a later run compares against it and
@@ -539,10 +547,9 @@ fn desired_comparison_rows(
     let mut rows = HashMap::new();
     for proxy in &desired.proxies {
         let value = serde_json::to_value(proxy)?;
-        rows.insert(
-            ("Proxy", proxy.id.clone()),
-            DesiredRow::new(value, BTreeSet::new()),
-        );
+        let mut secrets = BTreeSet::new();
+        collect_tls_material_sites(&value, &mut String::new(), None, &mut secrets);
+        rows.insert(("Proxy", proxy.id.clone()), DesiredRow::new(value, secrets));
     }
     for consumer in &desired.consumers {
         let projected = project_consumer_for_export(consumer);
@@ -567,6 +574,13 @@ fn desired_comparison_rows(
             }
             secrets.insert(pointer);
         }
+        if let Some(config) = value.get("config") {
+            let mut pointer = String::from("/config");
+            collect_tls_material_sites(config, &mut pointer, None, &mut secrets);
+        }
+        if let Some(trigger) = value.get("trigger") {
+            collect_trigger_sites(trigger, &mut secrets);
+        }
         rows.insert(
             ("PluginConfig", plugin.id.clone()),
             DesiredRow::new(value, secrets),
@@ -582,6 +596,7 @@ fn desired_comparison_rows(
             }
             secrets.insert(pointer);
         }
+        collect_tls_material_sites(&value, &mut String::new(), None, &mut secrets);
         rows.insert(
             ("Upstream", upstream.id.clone()),
             DesiredRow::new(value, secrets),
@@ -607,6 +622,228 @@ fn consumer_secret_pointers(projected: &Consumer) -> BTreeSet<String> {
         }
     }
     pointers
+}
+
+/// How a field name classifies the TLS material it holds, after Edge's
+/// `tls_material_field` (`plugin_config_projection`, after v0.9.20).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TlsMaterialField {
+    PrivateKey,
+    Public,
+}
+
+fn tls_material_field(name: &str) -> Option<TlsMaterialField> {
+    match name {
+        "backend_tls_client_key_path" | "client_key_path" | "private_key" => {
+            Some(TlsMaterialField::PrivateKey)
+        }
+        "backend_tls_client_cert_path"
+        | "backend_tls_server_ca_cert_path"
+        | "client_cert_path"
+        | "server_ca_cert_path"
+        | "client_certificate"
+        | "ca_certificates" => Some(TlsMaterialField::Public),
+        _ => None,
+    }
+}
+
+/// A PEM block whose label names a private key, anywhere in `value`
+/// (Edge's `contains_inline_private_key`).
+fn contains_inline_private_key(value: &str) -> bool {
+    const BANNER: &str = "-----BEGIN";
+    let normalized = value.to_ascii_uppercase();
+    normalized.match_indices(BANNER).any(|(start, _)| {
+        let after = &normalized[start + BANNER.len()..];
+        let label = after.find("-----").map_or(after, |end| &after[..end]);
+        label.contains("PRIVATE KEY")
+    })
+}
+
+/// Add every string Edge after v0.9.20 withholds as TLS private-key material
+/// (its TLS-material sweep over whole Proxy and Upstream bodies and over
+/// plugin configs): one carrying a private-key PEM block anywhere, or, under a
+/// private-key field, any PEM armour or control character. A certificate-plus-
+/// key bundle pasted into a certificate field is caught by the first rule.
+/// Array entries inherit their field's classification.
+fn collect_tls_material_sites(
+    value: &Value,
+    pointer: &mut String,
+    field: Option<TlsMaterialField>,
+    out: &mut BTreeSet<String>,
+) {
+    match value {
+        Value::String(text) => {
+            let private_key_field = field == Some(TlsMaterialField::PrivateKey)
+                && (text.to_ascii_uppercase().contains("-----BEGIN")
+                    || text.chars().any(char::is_control));
+            if contains_inline_private_key(text) || private_key_field {
+                out.insert(pointer.clone());
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                let len = pointer.len();
+                push_pointer_segment(pointer, key);
+                collect_tls_material_sites(child, pointer, tls_material_field(key), out);
+                pointer.truncate(len);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let len = pointer.len();
+                push_pointer_segment(pointer, &index.to_string());
+                collect_tls_material_sites(child, pointer, field, out);
+                pointer.truncate(len);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Trigger `match` predicates whose operands a client presents, so Edge after
+/// v0.9.20 withholds them (`TRIGGER_CLIENT_FIELD_PREDICATES`).
+const TRIGGER_CLIENT_FIELD_PREDICATES: [&str; 3] = ["header", "query", "cookie"];
+
+/// Trigger `match` predicates Edge leaves visible.
+const TRIGGER_VISIBLE_PREDICATES: [&str; 12] = [
+    "method",
+    "path",
+    "host",
+    "sni",
+    "protocol",
+    "source_cidr",
+    "namespace",
+    "proxy_id",
+    "listen_port",
+    "consumer",
+    "auth_method",
+    "spiffe_id",
+];
+
+/// Add every site of a PluginConfig `trigger` that Edge after v0.9.20
+/// withholds from the export (`project_plugin_trigger_with`): each operand
+/// (`exact[]` and `prefix[]` entries, `regex`) of a `header` / `query` /
+/// `cookie` predicate, anywhere in the `all` / `any` / `not` tree. Like Edge,
+/// any shape a trigger cannot have is a site as a whole.
+fn collect_trigger_sites(trigger: &Value, out: &mut BTreeSet<String>) {
+    let mut pointer = String::from("/trigger");
+    let Some(map) = trigger.as_object().filter(|map| map.contains_key("when")) else {
+        withheld_site(trigger, &pointer, out);
+        return;
+    };
+    for (key, child) in map {
+        let len = pointer.len();
+        push_pointer_segment(&mut pointer, key);
+        if key == "when" {
+            trigger_node_sites(child, &mut pointer, out);
+        } else {
+            withheld_site(child, &pointer, out);
+        }
+        pointer.truncate(len);
+    }
+}
+
+/// A site Edge withholds as a whole (it leaves `null` alone).
+fn withheld_site(value: &Value, pointer: &str, out: &mut BTreeSet<String>) {
+    if !value.is_null() {
+        out.insert(pointer.to_string());
+    }
+}
+
+fn trigger_node_sites(node: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
+    let Some(map) = node.as_object() else {
+        withheld_site(node, pointer, out);
+        return;
+    };
+    for (key, child) in map {
+        let len = pointer.len();
+        push_pointer_segment(pointer, key);
+        match (key.as_str(), child) {
+            ("all" | "any", Value::Array(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    let item_len = pointer.len();
+                    push_pointer_segment(pointer, &index.to_string());
+                    trigger_node_sites(item, pointer, out);
+                    pointer.truncate(item_len);
+                }
+            }
+            ("not", child) => trigger_node_sites(child, pointer, out),
+            ("match", child) => trigger_leaf_sites(child, pointer, out),
+            (_, child) => withheld_site(child, pointer, out),
+        }
+        pointer.truncate(len);
+    }
+}
+
+fn trigger_leaf_sites(leaf: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
+    let Some(map) = leaf.as_object() else {
+        withheld_site(leaf, pointer, out);
+        return;
+    };
+    for (key, predicate) in map {
+        if TRIGGER_VISIBLE_PREDICATES.contains(&key.as_str()) {
+            continue;
+        }
+        let len = pointer.len();
+        push_pointer_segment(pointer, key);
+        if TRIGGER_CLIENT_FIELD_PREDICATES.contains(&key.as_str()) {
+            trigger_field_predicate_sites(predicate, pointer, out);
+        } else {
+            withheld_site(predicate, pointer, out);
+        }
+        pointer.truncate(len);
+    }
+}
+
+fn trigger_field_predicate_sites(
+    predicate: &Value,
+    pointer: &mut String,
+    out: &mut BTreeSet<String>,
+) {
+    let Some(map) = predicate.as_object() else {
+        withheld_site(predicate, pointer, out);
+        return;
+    };
+    for (key, child) in map {
+        if matches!(key.as_str(), "name" | "presence" | "multi_value") {
+            continue;
+        }
+        let len = pointer.len();
+        push_pointer_segment(pointer, key);
+        if key == "value" {
+            trigger_operand_sites(child, pointer, out);
+        } else {
+            withheld_site(child, pointer, out);
+        }
+        pointer.truncate(len);
+    }
+}
+
+/// A trigger string match: every operand except a boolean `case_insensitive`
+/// flag, entry by entry for the `exact` / `prefix` lists.
+fn trigger_operand_sites(value: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
+    let Some(map) = value.as_object() else {
+        withheld_site(value, pointer, out);
+        return;
+    };
+    for (key, operand) in map {
+        if key == "case_insensitive" && operand.is_boolean() {
+            continue;
+        }
+        let len = pointer.len();
+        push_pointer_segment(pointer, key);
+        if let Value::Array(items) = operand {
+            for (index, item) in items.iter().enumerate() {
+                let item_len = pointer.len();
+                push_pointer_segment(pointer, &index.to_string());
+                withheld_site(item, pointer, out);
+                pointer.truncate(item_len);
+            }
+        } else {
+            withheld_site(operand, pointer, out);
+        }
+        pointer.truncate(len);
+    }
 }
 
 /// Add the pointer of every string that is a brokered placeholder or a URL

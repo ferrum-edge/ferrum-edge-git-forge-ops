@@ -7,8 +7,15 @@ GitForgeOps-owned resource schema are byte-for-byte copies from `contracts-edge-
 contract test verifies every file's SHA-256, checks that the pinned Edge version maps to the
 contracts tag and appears in the validator checksum allowlist, compares plugin names and
 priorities plus retired and reserved names with the local catalog, checks the assembler's
-`provisioned-by` label, parses valid and invalid resource fixtures with the local `Resource` serde
-type, and checks the schema's top-level envelope against that type.
+`provisioned-by` label, loads every valid resource fixture and refuses every invalid one with the
+strict production loader (`load_resources`, the same path `import`, `validate` and `apply` use),
+and checks the schema's top-level envelope against that loader.
+
+The loader accepts only `kind` and `spec` (plus `id` on a MeshConfig) and refuses any other
+wrapper key. The `contracts-edge-0.9.20` envelope schema is open (no top-level
+`additionalProperties: false`), so it admits files the loader refuses
+([ferrum-contracts#73](https://github.com/ferrum-edge/ferrum-contracts/issues/73)). The contract
+test fails on a re-pin to any release whose envelope is still open.
 
 The published [contracts-edge-0.9.20 release](https://github.com/ferrum-edge/ferrum-contracts/releases/tag/contracts-edge-0.9.20)
 is an annotated tag (`82b277b495e73cfadfacb6f3123de02a984658e4`) that resolves to commit

@@ -66,6 +66,7 @@ fn proxy(id: &str, protocol: BackendScheme, read_timeout: u64, tls_verify: bool)
         upstream_subset: None,
         api_spec_id: None,
         websocket_idle_timeout_seconds: None,
+        websocket_permessage_deflate: Default::default(),
         stream_proxy_protocol: None,
         backend_proxy_protocol: None,
         stream_match: None,

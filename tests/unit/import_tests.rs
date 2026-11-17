@@ -66,6 +66,7 @@ fn make_test_config() -> GatewayConfig {
             upstream_subset: None,
             api_spec_id: None,
             websocket_idle_timeout_seconds: None,
+            websocket_permessage_deflate: Default::default(),
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
@@ -371,6 +372,52 @@ fn a_source_without_unmodelled_fields_reports_no_passthrough_review() {
     .expect("a modelled source imports under the fail-closed default");
 
     assert!(result.acknowledged_passthrough_notice().is_none());
+}
+
+/// Edge v0.9.9's `websocket_permessage_deflate` is modeled: a backup proxy
+/// carrying it imports under the fail-closed default (no
+/// `--accept-unknown-field`), the field is written, and the tree loads under
+/// the strict loader.
+#[test]
+fn a_backup_proxy_with_websocket_permessage_deflate_imports_without_acknowledgement() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.json");
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    // Injected as raw backup JSON, the way the gateway sends it, not through
+    // the typed field.
+    let mut backup = serde_json::to_value(make_test_config()).unwrap();
+    backup["proxies"][0]["websocket_permessage_deflate"] = serde_json::json!("terminate");
+    std::fs::write(&backup_path, backup.to_string()).unwrap();
+
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .expect("a modeled field imports under the fail-closed default");
+    assert!(result.acknowledged_passthrough_notice().is_none());
+
+    let written = std::fs::read_to_string(output.join("ferrum/proxies/proxy-test.yaml")).unwrap();
+    assert!(
+        written.contains("websocket_permessage_deflate: terminate"),
+        "{written}"
+    );
+    let resources = gitforgeops::config::load_resources(&output)
+        .expect("the imported tree loads under the strict loader");
+    let proxy = resources
+        .iter()
+        .find_map(|(_, resource)| match resource {
+            Resource::Proxy { spec } => Some(spec),
+            _ => None,
+        })
+        .expect("imported proxy");
+    assert_eq!(
+        proxy.websocket_permessage_deflate,
+        WebSocketPermessageDeflate::Terminate
+    );
 }
 
 #[test]
