@@ -167,7 +167,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   now blocks `apply`, and `import` of a gateway holding one needs a credential
   import bundle (GHSA-5p93-qfr5-m7m9).
 - **BREAKING:** the plugin-config values Ferrum Edge after v0.9.20 redacts as
-  credentials or operator-chosen tokens are classified as secrets, not only
+  credentials or operator-chosen tokens are brokered or classified, not only
   predicted as `/config/export` fingerprint sites. `ai_tool_governor`
   `approval.headers.*`, `mcp_gateway` `servers.*.headers.*`,
   `request_termination` `trigger.header_value`, `transaction_debugger`
@@ -184,6 +184,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ordinary setting, so a live `/backup` holding one never refuses `diff`,
   `plan`, `review` or `apply`. Ferrum Edge v0.9.20 does not redact these
   fields; a v0.9.20 export still compares them as written.
+- Every arbitrary header map is now an operator value, not a secret:
+  `otel_tracing` `headers.*`, `opa` `headers.*`, `ai_transcript_audit`
+  `sink.custom_headers.*` / `headers.*` / `custom_headers.*`, `http_logging`
+  and `loki_logging` `custom_headers.*` and `proxy_alerts`
+  `channels.*.headers.*`, like `ws_logging` `custom_headers`. A value of at
+  least 8 bytes is still brokered, masked, scrubbed and blocks `apply` as a
+  literal; a shorter one (Grafana's `X-Scope-OrgID: "12345"`) is an ordinary
+  setting, so a live `/backup` holding one no longer refuses every `diff`,
+  `plan`, `review` and `apply`. Fields that only ever hold a credential
+  (`otel_tracing` `authorization`, `loki_logging` `authorization_header`)
+  stay secrets. A short operator value whose header or parameter name looks
+  like a credential (`authorization`, `*token`, `*key`) is still written and
+  applied literally, but `import` now names it in a warning notice and the
+  security audit (`validate`, `plan`, `review`, `apply`) reports a
+  non-blocking warning, never the value.
 - `/config/export` fingerprint docs and `diff` notes no longer say the key is
   the gateway's admin secret: Ferrum Edge after v0.9.20 keys fingerprints from
   `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (random per process when
