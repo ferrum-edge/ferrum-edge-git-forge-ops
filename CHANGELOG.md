@@ -152,6 +152,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (#706): `--fast` sends `service_tier="fast"` with `features.fast_mode=true`
   (Luna previously sent the `priority` tier), standard mode sends no
   `features.fast_mode` override, and the Luna launcher accepts `--no-fast`.
+- **BREAKING:** `websocket_permessage_deflate` is repository-owned like every
+  modeled Proxy field. A live proxy whose value differs from the declaration
+  (an undeclared field means `strip`) is reported as drift, and `apply` writes
+  the declared value instead of refusing the namespace. Declare the field, or
+  re-import, before applying to a gateway that uses `passthrough` or
+  `terminate`. (#714)
+- The contract conformance test loads every pinned `gitforgeops-resource`
+  fixture with the strict production loader, refuses envelope keys outside the
+  contract, and fails a re-pin to a contracts release whose envelope is still
+  open (ferrum-contracts#73). (#716)
+- **BREAKING:** a literal `openapi_validator` `bypass.header_present.*` or
+  `ai_semantic_firewall` `privacy.snippet_hash_salt` value in repository YAML
+  now blocks `apply`, and `import` of a gateway holding one needs a credential
+  import bundle (GHSA-5p93-qfr5-m7m9).
 
 ### Added
 
@@ -240,6 +254,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   for intentionally public proxies. Exempted auth findings stay visible at
   `info`; stale entries are informational, while malformed, wildcard and
   duplicate entries are rejected.
+- `Proxy.websocket_permessage_deflate` (Ferrum Edge v0.9.9+; `strip`,
+  `passthrough` or `terminate`) is modeled. Repositories can declare it,
+  `import` writes it, and `apply` sends it, where before the strict loader,
+  import and apply refused it. Best-practice rate-limit advice reads it. (#714)
+- A unit test compares the mirrored `Proxy`/`Upstream` fields with the pinned
+  Ferrum Edge OpenAPI and fails when a writable gateway field is not modeled,
+  or when the validator pin moves without regenerating
+  `tests/fixtures/edge-openapi/resource-fields.json`. (#714)
 
 ### Changed
 
@@ -741,6 +763,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   contains any other namespace is refused before the tree, import manifest or
   credential migration bundle is written, instead of being published whole. A
   document wholly inside the selection imports as before.
+- `diff` with the viewer credential no longer reports permanent drift against a
+  Ferrum Edge build that also fingerprints plugin trigger
+  `header`/`query`/`cookie` operands, custom-plugin scalars, newer built-in
+  plugin paths or TLS private-key material in `GET /config/export`. Those sites
+  count as unverified secrets (exit 6 without a baseline); a gateway that sends
+  them literally is compared as before. (#715)
 
 ### Performance
 
@@ -1390,3 +1418,19 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   both forms for validate, plan, apply and review terminal output, while the
   Markdown sent to the GitHub comment and step summary keeps readable text
   (GHSA-955f-64c5-hvfx).
+- Local runs refuse a symlinked `.gitforgeops` or `overlays` directory, not
+  only a symlinked leaf: repository configuration and overlay reads check every
+  directory a relative path names (GHSA-hfxp-g32w-pf8f).
+- `openapi_validator` `bypass.header_present` values (shared secrets that skip
+  OpenAPI request validation) and `ai_semantic_firewall`
+  `privacy.snippet_hash_salt` are classified as plugin-config secrets: import
+  brokers them into the migration bundle, a literal value blocks apply, diff
+  and review mask them, and the scrubber registers them (GHSA-5p93-qfr5-m7m9).
+- `check_agent_setup.py` walks `.agents`, `.claude`, `.github`, `AGENTS.md` and
+  `CLAUDE.md` before reading anything and refuses links that leave the tree,
+  dangling links, special files and a symlinked root (#727).
+- The override Git CVE tripwire pins the merge-base hex check and the bundled
+  auditor's one `gh` call with exact occurrence counts and bans Python
+  indirection (`getattr`, `eval`, `exec`, `__import__`, `importlib` and
+  similar). The Dockerfile's override Git assessment carries a review-by date
+  that the daily base-image pin canary enforces (#673).
