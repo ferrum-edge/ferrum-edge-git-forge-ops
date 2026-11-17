@@ -263,7 +263,8 @@ fn resource_fixtures(class: &str) -> Vec<(String, Value)> {
     let directory = contract_dir()
         .join("fixtures/gitforgeops-resource")
         .join(class);
-    let mut fixtures: Vec<(String, Value)> = fs::read_dir(&directory)
+    // Sorted by file name, so failures are reported in a stable order.
+    let fixtures: BTreeMap<String, Value> = fs::read_dir(&directory)
         .unwrap_or_else(|error| panic!("read {class} fixtures: {error}"))
         .map(|entry| {
             let path = entry.expect("fixture entry").path();
@@ -274,9 +275,8 @@ fn resource_fixtures(class: &str) -> Vec<(String, Value)> {
             (name, document)
         })
         .collect();
-    fixtures.sort_by(|left, right| left.0.cmp(&right.0));
     assert!(!fixtures.is_empty(), "no {class} contract fixtures");
-    fixtures
+    fixtures.into_iter().collect()
 }
 
 #[test]
