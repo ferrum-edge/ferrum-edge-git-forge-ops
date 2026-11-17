@@ -542,8 +542,9 @@ fn edge_post_0_9_20_redacted_plugin_paths_are_scrubbed_and_gated_as_literals() {
     );
 }
 
-/// The selector tokens, rule conditions and match operands have no gateway
-/// minimum, so a value too short to broker or scrub is an ordinary setting:
+/// The header maps, selector tokens, rule conditions and match operands have
+/// no gateway minimum, so a value too short to broker or scrub is an ordinary
+/// setting:
 /// import keeps it literal without a plaintext allowance, the scrubber does
 /// not withhold validator output over it, and the literal-secret gate lets it
 /// through.
@@ -553,6 +554,14 @@ fn short_post_0_9_20_operator_plugin_values_stay_ordinary_settings() {
     use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
 
     for (plugin_name, config) in [
+        (
+            "ai_tool_governor",
+            serde_json::json!({"approval": {"headers": {"x-api-version": "2"}}}),
+        ),
+        (
+            "mcp_gateway",
+            serde_json::json!({"servers": {"docs": {"headers": {"x-ms-version": "v1"}}}}),
+        ),
         (
             "request_termination",
             serde_json::json!({"trigger": {"header": "x-kill", "header_value": "on"}}),
@@ -597,6 +606,48 @@ fn short_post_0_9_20_operator_plugin_values_stay_ordinary_settings() {
             security_blockers(&audit_security(&original)).is_empty(),
             "{plugin_name}"
         );
+    }
+}
+
+/// A live `/backup` whose credential header map holds a short ordinary value
+/// (`x-api-version: "2"`) is admitted: every admin read (`diff`, `plan`,
+/// `review`, `apply`) decodes it, nothing short is registered, and a long
+/// credential beside it is still registered and scrubbed from display.
+#[test]
+fn short_live_credential_header_values_never_refuse_a_backup_read() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    for (plugin_name, credential, config) in [
+        (
+            "ai_tool_governor",
+            "zq9-approval-credential",
+            serde_json::json!({"approval": {"headers": {
+                "x-api-version": "2",
+                "x-approval-auth": "zq9-approval-credential"
+            }}}),
+        ),
+        (
+            "mcp_gateway",
+            "zq9-mcp-server-credential",
+            serde_json::json!({"servers": {"docs": {"headers": {
+                "x-api-version": "2",
+                "x-functions-key": "zq9-mcp-server-credential"
+            }}}}),
+        ),
+    ] {
+        let body = serde_json::json!({
+            "version": "1",
+            "proxies": [], "consumers": [], "upstreams": [],
+            "plugin_configs": [{"id": "plugin", "namespace": "ferrum",
+                "plugin_name": plugin_name, "scope": "global", "config": config}]
+        })
+        .to_string();
+        let snapshot = gitforgeops::http_client::BackupSnapshot::from_body(&body)
+            .unwrap_or_else(|error| panic!("{plugin_name}: {error}"));
+        assert_eq!(snapshot.config.plugin_configs.len(), 1, "{plugin_name}");
+        let shown =
+            gitforgeops::display::scrub_text(&format!("header {credential} x-api-version 2"));
+        assert!(!shown.contains("zq9-"), "{plugin_name}: {shown}");
+        assert!(shown.contains("x-api-version 2"), "{plugin_name}: {shown}");
     }
 }
 

@@ -176,19 +176,23 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         ],
         // Edge after v0.9.20 redacts the approval webhook's static headers
         // and each MCP server's upstream request headers: the approval
-        // service's or hosted MCP server's credential rides there under an
-        // arbitrary vendor name, so every value is a secret, as for
-        // `otel_tracing` `headers`.
+        // service's or hosted MCP server's credential usually rides there
+        // under a vendor name. The same maps carry ordinary short settings
+        // (`x-api-version: "2"`) and Edge sets no minimum, so they are
+        // operator values like `ws_logging` `custom_headers`: a credential
+        // long enough to protect is brokered and gated, while a short value
+        // stays literal instead of refusing live admission (a declared
+        // secret shorter than 8 bytes refuses every `/backup` read).
         "ai_tool_governor" => vec![
             endpoint(&["endpoint_url"]),
             endpoint(&["approval", "endpoint_url"]),
-            secret(&["approval", "headers", "*"]),
+            operator_value(&["approval", "headers", "*"]),
         ],
         "ai_stream_router" => vec![endpoint(&["providers", "*", "endpoint"])],
         "mcp_gateway" => vec![
             endpoint(&["servers", "*", "upstream_url"]),
             endpoint(&["upstream_url"]),
-            secret(&["servers", "*", "headers", "*"]),
+            operator_value(&["servers", "*", "headers", "*"]),
         ],
         "ai_semantic_cache" => vec![
             endpoint(&["redis_url"]),
@@ -294,15 +298,29 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 /// them (v0.9.20) still compares them as ordinary values. Import brokering,
 /// redaction, scrubbing and display admission are unchanged for them.
 ///
-/// Only values Edge merely withholds belong here: endpoint URLs and paths
-/// (`opa` `opa_host`, a `mesh_route_dispatch` rewrite, a mirror path), TLS
-/// certificate and key sources, and the generated `mesh_authz` policy slice.
-/// A credential or operator-chosen token Edge redacts is a [`rules_for`] rule
-/// instead (brokered, literal-gated and masked), whether or not the pinned
-/// gateway redacts it yet. The TLS-source and endpoint rules withhold only
-/// some values (inline key material, a non-trivial path, a credential-bearing
-/// URL); listing the site is harmless for the rest, because only a live
-/// fingerprint is substituted.
+/// Two kinds of site belong here:
+///
+/// * Values Edge merely withholds: endpoint URLs and paths (`opa`
+///   `opa_host`, a `mesh_route_dispatch` rewrite, a mirror path, the
+///   `mesh_authz` slice's collector, JWKS and federation URLs) and TLS
+///   certificate and key sources. The TLS-source and endpoint rules withhold
+///   only some values (inline key material, a non-trivial path, a
+///   credential-bearing URL); listing the site is harmless for the rest,
+///   because only a live fingerprint is substituted.
+/// * The `mesh_authz` policy operands and slice payloads Edge classifies as
+///   `secret` (`to.*.headers.*`, `when.*.values` / `not_values`, the
+///   external-authorization header values and `path_prefix`, ProxyConfig
+///   `environment`, extension `value`). Brokering them is deliberately
+///   deferred: Edge withholds every `when` value because a path rule cannot
+///   read the sibling `key`, so most are principals, namespaces, IPs and
+///   claims rather than credentials, and brokering them would move routine
+///   authorization identities into the secret broker. A `to.*.headers.*`
+///   value is still caught by the header-map heuristic (an import plaintext
+///   allowance and the literal-secret gate).
+///
+/// Every other credential or operator-chosen token Edge redacts is a
+/// [`rules_for`] rule instead (brokered, literal-gated and masked), whether
+/// or not the pinned gateway redacts it yet.
 fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]] {
     match plugin_name {
         "mtls_auth" => &[&["allowed_issuers", "*", "ca_certificate_pem"]],
@@ -1349,9 +1367,8 @@ mod tests {
     }
 
     /// Built-in sites Edge's projection on `main` merely withholds (endpoint
-    /// URLs and paths, TLS sources, the generated mesh policy slice) are
-    /// export sites only: nothing about import brokering, redaction or
-    /// display admission changes for them.
+    /// URLs and paths, TLS sources) are export sites only: nothing about
+    /// import brokering, redaction or display admission changes for them.
     #[test]
     fn post_v0_9_20_withheld_builtin_sites_are_export_only() {
         for (plugin, config, sites) in [
@@ -1371,16 +1388,6 @@ mod tests {
                 vec!["rules.[0].rewrite.uri"],
             ),
             (
-                "mesh_authz",
-                serde_json::json!({"mesh_policies": [{"rules": [{"when": [{"key": "request.headers[x]", "values": ["v1", "v2"]}]}]}]}),
-                // `key` is already a site through the name heuristic.
-                vec![
-                    "mesh_policies.[0].rules.[0].when.[0].key",
-                    "mesh_policies.[0].rules.[0].when.[0].values.[0]",
-                    "mesh_policies.[0].rules.[0].when.[0].values.[1]",
-                ],
-            ),
-            (
                 "udp_logging",
                 serde_json::json!({"dtls_key_path": "/etc/ferrum/dtls.key", "dtls_cert_path": "/etc/ferrum/dtls.crt"}),
                 vec!["dtls_cert_path", "dtls_key_path"],
@@ -1397,18 +1404,22 @@ mod tests {
         }
     }
 
-    /// Credentials Edge after v0.9.20 redacts are brokered secret rules:
-    /// import captures every string, a short live value refuses display
-    /// admission, and each is an export site.
+    /// The credential header maps Edge after v0.9.20 redacts are operator
+    /// values: a credential long enough to protect is brokered, a short
+    /// ordinary header (`x-api-version: "2"`) stays literal and is not
+    /// rule-declared, so it never refuses live display admission, and every
+    /// value is an export site.
     #[test]
-    fn post_v0_9_20_credential_header_maps_are_secrets() {
-        for (plugin, config, sites) in [
+    fn post_v0_9_20_credential_header_maps_are_operator_values() {
+        for (plugin, config, brokered, declared, sites) in [
             (
                 "ai_tool_governor",
                 serde_json::json!({"approval": {
                     "endpoint_url": "https://approvals.example/hook",
                     "headers": {"x-approval-auth": "synthetic-approval-token", "x-short": "s"}
                 }}),
+                vec!["approval.endpoint_url", "approval.headers.x-approval-auth"],
+                vec!["approval.endpoint_url"],
                 vec![
                     "approval.endpoint_url",
                     "approval.headers.x-approval-auth",
@@ -1419,20 +1430,31 @@ mod tests {
                 "mcp_gateway",
                 serde_json::json!({"servers": {"docs": {
                     "upstream_url": "https://mcp.example/docs",
-                    "headers": {"Ocp-Apim-Subscription-Key": "synthetic-mcp-key"}
+                    "headers": {"Ocp-Apim-Subscription-Key": "synthetic-mcp-key", "x-api-version": "2"}
                 }}}),
                 vec![
                     "servers.docs.headers.Ocp-Apim-Subscription-Key",
                     "servers.docs.upstream_url",
                 ],
+                vec!["servers.docs.upstream_url"],
+                vec![
+                    "servers.docs.headers.Ocp-Apim-Subscription-Key",
+                    "servers.docs.headers.x-api-version",
+                    "servers.docs.upstream_url",
+                ],
             ),
         ] {
             let classification = classify_plugin_config(plugin, &config);
-            assert_eq!(dotted(classification.sensitive), sites, "{plugin}");
+            assert_eq!(dotted(classification.sensitive), brokered, "{plugin}");
             assert!(classification.unbrokered.is_empty(), "{plugin}");
             assert_eq!(
+                dotted(sensitive_string_paths(plugin, &config)),
+                brokered,
+                "{plugin}"
+            );
+            assert_eq!(
                 dotted(rule_declared_paths(plugin, &config).into_iter().collect()),
-                sites,
+                declared,
                 "{plugin}"
             );
             assert_eq!(
@@ -1441,6 +1463,48 @@ mod tests {
                 "{plugin}"
             );
         }
+    }
+
+    /// Edge classifies the `mesh_authz` policy operands as `secret`, but
+    /// brokering them is deferred (see [`export_only_rules_for`]): they are
+    /// export sites only. A `to.*.headers.*` value is still caught by the
+    /// header-map heuristic (import plaintext allowance, literal-secret
+    /// gate), while `when` values (principals, IPs, claims) stay literal.
+    #[test]
+    fn mesh_authz_policy_operands_are_deferred_export_sites() {
+        let config = serde_json::json!({"mesh_policies": [{"rules": [{
+            "to": [{"headers": {"authorization": "Bearer synthetic-mesh-token"}}],
+            "when": [{"key": "source.principal", "values": ["spiffe://cluster.local/ns/a/sa/b"]}]
+        }]}]});
+        let classification = classify_plugin_config("mesh_authz", &config);
+        assert!(classification.sensitive.is_empty());
+        assert_eq!(
+            dotted(classification.unbrokered),
+            vec![
+                "mesh_policies.[0].rules.[0].to.[0].headers.authorization",
+                "mesh_policies.[0].rules.[0].when.[0].key",
+            ]
+        );
+        assert_eq!(
+            dotted(sensitive_string_paths("mesh_authz", &config)),
+            vec![
+                "mesh_policies.[0].rules.[0].to.[0].headers.authorization",
+                "mesh_policies.[0].rules.[0].when.[0].key",
+            ]
+        );
+        assert!(rule_declared_paths("mesh_authz", &config).is_empty());
+        assert_eq!(
+            dotted(
+                export_redacted_paths("mesh_authz", &config)
+                    .into_iter()
+                    .collect()
+            ),
+            vec![
+                "mesh_policies.[0].rules.[0].to.[0].headers.authorization",
+                "mesh_policies.[0].rules.[0].when.[0].key",
+                "mesh_policies.[0].rules.[0].when.[0].values.[0]",
+            ]
+        );
     }
 
     /// Operator-chosen tokens and match operands Edge after v0.9.20 redacts
