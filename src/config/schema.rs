@@ -200,6 +200,38 @@ pub enum ResponseBodyMode {
     Buffer,
 }
 
+/// Per-proxy handling of the RFC 7692 `permessage-deflate` WebSocket
+/// extension (Ferrum Edge v0.9.9+). Mirrors the gateway's
+/// `WebSocketPermessageDeflate`, including its serialization: the gateway
+/// omits the `strip` default, so the mirror does too and an undeclared value
+/// compares equal to a live default.
+///
+/// - `strip` (default): the client's extension offer never reaches the backend,
+///   so every message stays inspectable by frame-parsing plugins.
+/// - `passthrough`: `permessage-deflate` is negotiated end to end and relayed
+///   as raw bytes. The gateway refuses it on a proxy with a plugin that needs
+///   the parsed WebSocket relay (`waf`, `ws_frame_logging`,
+///   `ws_message_size_limiting`, `ws_rate_limiting`, …).
+/// - `terminate`: the gateway negotiates each leg itself and inflates every
+///   message before plugins see it.
+///
+/// Stream proxies (TCP/UDP) must keep `strip`; the gateway validator says so.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSocketPermessageDeflate {
+    #[default]
+    Strip,
+    Passthrough,
+    Terminate,
+}
+
+impl WebSocketPermessageDeflate {
+    /// The gateway default, which neither side serializes.
+    pub fn is_strip(&self) -> bool {
+        *self == Self::Strip
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginScope {
@@ -854,6 +886,11 @@ pub struct Proxy {
     pub tcp_idle_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websocket_idle_timeout_seconds: Option<u64>,
+    /// RFC 7692 `permessage-deflate` handling for WebSocket upgrades; see
+    /// [`WebSocketPermessageDeflate`]. Omitted when `strip`, as the gateway
+    /// omits it.
+    #[serde(default, skip_serializing_if = "WebSocketPermessageDeflate::is_strip")]
+    pub websocket_permessage_deflate: WebSocketPermessageDeflate,
     /// Trust an inbound PROXY-protocol header on this stream listener. Only
     /// safe behind a trusted L4 hop.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -971,3 +971,191 @@ fn export_endpoint_debug_redacts_the_gateway_url() {
     assert!(!rendered.contains("/admin"), "{rendered}");
     assert!(rendered.contains("<redacted>"), "{rendered}");
 }
+
+// --- Edge's widened export projection (after v0.9.20) ----------------------
+
+/// Not key material: a label-only PEM frame the TLS-material sweep matches.
+const INLINE_KEY: &str = concat!(
+    "-----BEGIN ",
+    "PRIVATE KEY-----\nnot-key-material\n-----END ",
+    "PRIVATE KEY-----"
+);
+
+/// A repository with every kind of site Edge's projection on `main` withholds
+/// and v0.9.20 does not: client-presented trigger operands, a custom plugin's
+/// scalar leaves, a new built-in path (`request_termination`
+/// `trigger.header_value`) and inline TLS key material on an Upstream.
+fn widened_desired() -> GatewayConfig {
+    serde_json::from_value(json!({
+        "plugin_configs": [
+            {
+                "id": "gate",
+                "namespace": "ferrum",
+                "plugin_name": "key_auth",
+                "scope": "global",
+                "config": {},
+                "trigger": {"when": {"all": [
+                    {"match": {"header": {
+                        "name": "x-skip",
+                        "value": {"exact": ["shared-skip-value"], "case_insensitive": true},
+                    }}},
+                    {"not": {"match": {"query": {"name": "t", "value": {"regex": "^tok"}}}}},
+                    {"match": {"path": {"prefix": ["/api"]}}},
+                ]}},
+            },
+            {
+                "id": "custom",
+                "namespace": "ferrum",
+                "plugin_name": "acme_widget",
+                "scope": "global",
+                "config": {
+                    "mode": "strict",
+                    "retries": 3,
+                    "enabled": true,
+                    "nested": {"labels": ["a"]},
+                    "unset": null,
+                },
+            },
+            {
+                "id": "term",
+                "namespace": "ferrum",
+                "plugin_name": "request_termination",
+                "scope": "global",
+                "config": {
+                    "status_code": 403,
+                    "trigger": {"header_name": "x-kill", "header_value": "kill-switch-1"},
+                },
+            },
+        ],
+        "upstreams": [{
+            "id": "pool",
+            "namespace": "ferrum",
+            "targets": [{"host": "10.0.0.1", "port": 8080}],
+            "backend_tls_client_key_path": INLINE_KEY,
+        }],
+    }))
+    .unwrap()
+}
+
+/// `widened_desired` exported literally (as v0.9.20 does), with `edit`
+/// applied to the serialized rows.
+fn widened_export(edit: impl FnOnce(&mut Value)) -> ConfigExport {
+    let desired = widened_desired();
+    let plugins = serde_json::to_value(&desired.plugin_configs).unwrap();
+    let mut body = document("ferrum", KEY_ID, json!([]), plugins);
+    body["upstreams"] = serde_json::to_value(&desired.upstreams).unwrap();
+    body["counts"]["upstreams"] = json!(1);
+    edit(&mut body);
+    ConfigExport::from_response(&body.to_string(), "ferrum", false).unwrap()
+}
+
+fn uncompared_sites(view: &gitforgeops::config_export::ExportLiveView) -> Vec<(String, String)> {
+    view.uncompared
+        .iter()
+        .map(|site| (site.id.clone(), site.pointer.clone()))
+        .collect()
+}
+
+#[test]
+fn widened_edge_fingerprints_are_uncompared_not_drift() {
+    let desired = widened_desired();
+    let export = widened_export(|body| {
+        let plugins = &mut body["plugin_configs"];
+        let gate = &mut plugins[0]["trigger"]["when"]["all"];
+        gate[0]["match"]["header"]["value"]["exact"][0] = json!(fp('1'));
+        gate[1]["not"]["match"]["query"]["value"]["regex"] = json!(fp('2'));
+        let custom = &mut plugins[1]["config"];
+        custom["mode"] = json!(fp('3'));
+        custom["retries"] = json!(fp('4'));
+        custom["enabled"] = json!(fp('5'));
+        custom["nested"]["labels"][0] = json!(fp('6'));
+        plugins[2]["config"]["trigger"]["header_value"] = json!(fp('7'));
+        body["upstreams"][0]["backend_tls_client_key_path"] = json!(fp('8'));
+    });
+    let view = export.live_view_with(&desired, &desired).unwrap();
+
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+    assert!(
+        view.masked_ancestors.is_empty(),
+        "{:?}",
+        view.masked_ancestors
+    );
+    let mut sites = uncompared_sites(&view);
+    sites.sort();
+    let expected: Vec<(String, String)> = [
+        ("custom", "/config/enabled"),
+        ("custom", "/config/mode"),
+        ("custom", "/config/nested/labels/0"),
+        ("custom", "/config/retries"),
+        ("gate", "/trigger/when/all/0/match/header/value/exact/0"),
+        ("gate", "/trigger/when/all/1/not/match/query/value/regex"),
+        ("pool", "/backend_tls_client_key_path"),
+        ("term", "/config/trigger/header_value"),
+    ]
+    .into_iter()
+    .map(|(id, pointer)| (id.to_string(), pointer.to_string()))
+    .collect();
+    assert_eq!(sites, expected);
+
+    // Unverified, never drift: `diff --exit-on-drift` exits 6 here, not 2.
+    let exports = [export];
+    let summary = SecretFingerprintSummary::evaluate(&exports, sites.len(), None, &desired);
+    assert!(!summary.verified());
+    assert!(!summary.baseline_invalidated());
+
+    // A baseline recorded from the same export covers every new site.
+    let mut baseline = FingerprintBaseline::default();
+    baseline.record(&exports[0]);
+    let proven =
+        SecretFingerprintSummary::evaluate(&exports, sites.len(), Some(&baseline), &desired);
+    assert!(proven.verified());
+    assert!(proven.changes.is_empty(), "{:?}", proven.changes);
+}
+
+#[test]
+fn a_gateway_that_sends_widened_sites_literally_is_compared_as_usual() {
+    // The pinned v0.9.20 does not fingerprint these sites. Predicting them
+    // must neither hide a changed value nor count anything as uncompared.
+    let desired = widened_desired();
+    let view = widened_export(|_| {})
+        .live_view_with(&desired, &desired)
+        .unwrap();
+    assert!(view.uncompared.is_empty(), "{:?}", view.uncompared);
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+
+    let view = widened_export(|body| {
+        body["plugin_configs"][1]["config"]["retries"] = json!(5);
+        let header = &mut body["plugin_configs"][0]["trigger"]["when"]["all"][0];
+        header["match"]["header"]["value"]["exact"][0] = json!("another-value");
+    })
+    .live_view_with(&desired, &desired)
+    .unwrap();
+    assert!(view.uncompared.is_empty(), "{:?}", view.uncompared);
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    let ids: Vec<&str> = diffs.iter().map(|diff| diff.id.as_str()).collect();
+    assert_eq!(ids.len(), 2, "{diffs:?}");
+    assert!(
+        ids.contains(&"custom") && ids.contains(&"gate"),
+        "{diffs:?}"
+    );
+}
+
+#[test]
+fn a_fingerprint_at_a_visible_trigger_predicate_is_still_drift() {
+    // Edge keeps `path`, `method`, `host` and other routing predicates
+    // visible, so a fingerprint there is a changed value, not a withheld one.
+    let desired = widened_desired();
+    let view = widened_export(|body| {
+        let path = &mut body["plugin_configs"][0]["trigger"]["when"]["all"][2];
+        path["match"]["path"]["prefix"][0] = json!(fp('9'));
+    })
+    .live_view_with(&desired, &desired)
+    .unwrap();
+    assert!(view.uncompared.is_empty(), "{:?}", view.uncompared);
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    assert_eq!(diffs[0].id, "gate");
+    assert_eq!(diffs[0].details[0].field, "trigger");
+}

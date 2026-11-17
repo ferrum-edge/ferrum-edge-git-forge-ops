@@ -251,6 +251,27 @@ containing `;` also requires this opt-in. Ferrum Edge strips parameters for
 its re-route check, which still refuses a request if the stripped path belongs
 to a different route.
 
+`websocket_permessage_deflate` (Ferrum Edge v0.9.9+) sets how a proxy handles
+the RFC 7692 `permessage-deflate` WebSocket extension: `strip` (the default,
+omitted from exported documents as the gateway omits it), `passthrough` or
+`terminate`. `passthrough` relays a negotiated session as raw bytes, so the
+gateway refuses it on a proxy with a plugin that parses WebSocket frames
+(`waf`, `ws_frame_logging`, `ws_message_size_limiting`, `ws_rate_limiting`, …);
+`terminate` inflates every message so those plugins still apply. Stream
+proxies must keep `strip`. The field is diffed like any other: a live proxy
+whose value differs from the declaration (an undeclared field means `strip`)
+shows as drift, and `apply` writes the declared value.
+
+```yaml
+kind: Proxy
+spec:
+  id: chat
+  listen_path: /chat
+  backend_host: chat.internal
+  backend_port: 8443
+  websocket_permessage_deflate: terminate
+```
+
 ## Mesh configuration
 
 Mesh nodes read a standalone `{version, mesh}` document that is separate from

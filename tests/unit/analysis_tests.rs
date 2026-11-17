@@ -770,6 +770,49 @@ fn rate_limit_recommendation_matches_the_proxy_protocol() {
     assert!(bp_any(&http, "attach rate_limiting"));
 }
 
+/// `websocket_permessage_deflate` marks a WebSocket route. `terminate` keeps
+/// the parsed frame relay, so `ws_rate_limiting` is the advice; `passthrough`
+/// relays a negotiated session as raw bytes and Edge refuses
+/// `ws_rate_limiting` there, so the advice falls back to `rate_limiting` even
+/// when other WebSocket settings are present.
+#[test]
+fn rate_limit_recommendation_follows_websocket_permessage_deflate() {
+    use gitforgeops::config::schema::WebSocketPermessageDeflate;
+
+    let with_mode = |mode: WebSocketPermessageDeflate| {
+        let mut ws = proxy("ws", Some(BackendScheme::Https));
+        ws.allowed_ws_origins = vec!["https://app.example.test".to_string()];
+        ws.websocket_permessage_deflate = mode;
+        GatewayConfig {
+            proxies: vec![ws],
+            ..Default::default()
+        }
+    };
+    assert!(bp_any(
+        &with_mode(WebSocketPermessageDeflate::Strip),
+        "attach ws_rate_limiting"
+    ));
+    assert!(bp_any(
+        &with_mode(WebSocketPermessageDeflate::Terminate),
+        "attach ws_rate_limiting"
+    ));
+    let passthrough = with_mode(WebSocketPermessageDeflate::Passthrough);
+    assert!(
+        bp_any(&passthrough, "attach rate_limiting"),
+        "{:?}",
+        bp_messages(&passthrough)
+    );
+    assert!(!bp_any(&passthrough, "attach ws_rate_limiting"));
+
+    let mut terminate_only = proxy("ws", Some(BackendScheme::Https));
+    terminate_only.websocket_permessage_deflate = WebSocketPermessageDeflate::Terminate;
+    let terminate_only = GatewayConfig {
+        proxies: vec![terminate_only],
+        ..Default::default()
+    };
+    assert!(bp_any(&terminate_only, "attach ws_rate_limiting"));
+}
+
 #[test]
 fn rate_limit_check_accepts_the_whole_family() {
     // The old exact-match on `rate_limiting` reported a websocket proxy

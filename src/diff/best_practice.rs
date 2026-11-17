@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::config::schema::{BackendScheme, PluginConfig, Proxy, SdStalePolicy, Upstream};
+use crate::config::schema::{
+    BackendScheme, PluginConfig, Proxy, SdStalePolicy, Upstream, WebSocketPermessageDeflate,
+};
 use crate::config::GatewayConfig;
 use crate::plugin_catalog::{
     effective_plugins, effective_scheme, is_ai_plugin, is_observability_plugin,
@@ -83,8 +85,15 @@ fn rate_limit_expectation(
                 .any(|plugin| is_ai_plugin(&plugin.plugin_name))
             {
                 "ai_rate_limiter"
+            } else if proxy.websocket_permessage_deflate == WebSocketPermessageDeflate::Passthrough
+            {
+                // A negotiated `passthrough` session is relayed as raw bytes,
+                // and Edge refuses `ws_rate_limiting` (which needs the parsed
+                // frame relay) on such a proxy: limit the upgrade requests.
+                "rate_limiting"
             } else if !proxy.allowed_ws_origins.is_empty()
                 || proxy.websocket_idle_timeout_seconds.is_some()
+                || proxy.websocket_permessage_deflate == WebSocketPermessageDeflate::Terminate
             {
                 "ws_rate_limiting"
             } else {

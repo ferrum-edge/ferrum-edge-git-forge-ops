@@ -739,6 +739,110 @@ spec:
     assert!(reparsed.allow_path_parameters);
 }
 
+const PERMESSAGE_DEFLATE_PROXY: &str = r#"
+kind: Proxy
+spec:
+  id: "proxy-ws"
+  listen_path: /ws
+  backend_scheme: https
+  backend_host: "ws.internal"
+  backend_port: 8443
+  websocket_permessage_deflate: passthrough
+"#;
+
+/// Edge v0.9.9 added `websocket_permessage_deflate`; the mirror models every
+/// value and serializes the `strip` default the way Edge does (omitted), so an
+/// undeclared value never reads as drift against a default live row.
+#[test]
+fn websocket_permessage_deflate_is_typed_and_omits_its_default() {
+    for (wire, expected) in [
+        ("strip", WebSocketPermessageDeflate::Strip),
+        ("passthrough", WebSocketPermessageDeflate::Passthrough),
+        ("terminate", WebSocketPermessageDeflate::Terminate),
+    ] {
+        let spec = proxy_from_yaml(&PERMESSAGE_DEFLATE_PROXY.replace("passthrough", wire));
+        assert_eq!(spec.websocket_permessage_deflate, expected, "{wire}");
+        let emitted = serde_json::to_value(&spec).unwrap();
+        if expected.is_strip() {
+            assert!(
+                emitted.get("websocket_permessage_deflate").is_none(),
+                "{emitted}"
+            );
+        } else {
+            assert_eq!(emitted["websocket_permessage_deflate"], wire);
+        }
+    }
+
+    let omitted = proxy_from_yaml(
+        &PERMESSAGE_DEFLATE_PROXY.replace("  websocket_permessage_deflate: passthrough\n", ""),
+    );
+    assert_eq!(
+        omitted.websocket_permessage_deflate,
+        WebSocketPermessageDeflate::Strip
+    );
+
+    let error = gitforgeops::yaml::from_str::<Resource>(
+        &PERMESSAGE_DEFLATE_PROXY.replace("passthrough", "Passthrough"),
+    )
+    .expect_err("an unknown value is refused, never defaulted");
+    assert!(
+        error.to_string().contains("unknown variant `Passthrough`"),
+        "{error}"
+    );
+}
+
+/// The field loads under the strict loader (no `FERRUM_ALLOW_UNKNOWN_FIELDS`),
+/// reaches the exported document, and diffs like any modeled field.
+#[test]
+fn websocket_permessage_deflate_loads_exports_and_diffs_without_the_unknown_field_opt_in() {
+    let tree = tempfile::tempdir().unwrap();
+    let file = tree.path().join("ferrum/proxies/proxy-ws.yaml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, PERMESSAGE_DEFLATE_PROXY).unwrap();
+
+    let resources = gitforgeops::config::load_resources(tree.path())
+        .expect("strict load accepts the modeled field");
+    let assembled = gitforgeops::config::assemble(resources).unwrap();
+    let proxy = &assembled.gateway.proxies[0];
+    assert!(proxy.extra.is_empty(), "{:?}", proxy.extra);
+    assert_eq!(
+        proxy.websocket_permessage_deflate,
+        WebSocketPermessageDeflate::Passthrough
+    );
+    let exported = gitforgeops::apply::render_file_yaml(&assembled.gateway).unwrap();
+    assert!(
+        exported.contains("websocket_permessage_deflate: passthrough"),
+        "{exported}"
+    );
+
+    // A live row carrying the same value is in sync.
+    let live = assembled.gateway.clone();
+    let diffs = gitforgeops::diff::compute_diff(&assembled.gateway, &live).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+
+    // A live row with another value (or the omitted default) is drift on that
+    // field, which apply now writes instead of refusing the namespace.
+    for live_value in [
+        WebSocketPermessageDeflate::Terminate,
+        WebSocketPermessageDeflate::Strip,
+    ] {
+        let mut live = assembled.gateway.clone();
+        live.proxies[0].websocket_permessage_deflate = live_value;
+        let diffs = gitforgeops::diff::compute_diff(&assembled.gateway, &live).unwrap();
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        let fields: Vec<&str> = diffs[0]
+            .details
+            .iter()
+            .map(|change| change.field.as_str())
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["websocket_permessage_deflate"],
+            "{live_value:?}"
+        );
+    }
+}
+
 // --- MeshConfig mirror ------------------------------------------------------
 
 #[test]
