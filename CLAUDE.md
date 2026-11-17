@@ -1996,6 +1996,11 @@ Fixtures (`tests/fixtures/`):
   assembles, round-trips through export, and — by reading struct definitions
   from `schema.rs` — fails when a new mirrored field is not exercised. Add new
   fields to the fixture in the same PR. Values are illustrative only.
+- `edge-openapi/resource-fields.json` lists the pinned Edge OpenAPI's top-level
+  `Proxy`/`Upstream` properties. `companion_schema_tests.rs` fails when a
+  writable one is not mirrored, when a mirrored field is not in the list, or
+  when the list's release is not the newest in the validator allowlist; a
+  validator pin bump regenerates it (its README says how).
 - `quickstart/` is the copyable half of `docs/quickstart.md` (the files the
   guide tells operators to write, plus its `.gitforgeops/config.yaml`).
   `quickstart_tests.rs` loads it strictly, applies the production overlay,

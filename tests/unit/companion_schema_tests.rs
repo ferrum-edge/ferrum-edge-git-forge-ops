@@ -197,6 +197,89 @@ fn companion_schema_fixture_covers_every_mirrored_field() {
     }
 }
 
+/// The newest `release vX.Y.Z` noted in the validator checksum allowlist: the
+/// Edge release this repository pins.
+fn newest_allowlisted_edge_release() -> String {
+    let allowlist = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/ferrum-edge-checksums.txt"),
+    )
+    .expect("read Edge checksum allowlist");
+    allowlist
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter_map(|line| line.split_once('#').map(|(_, note)| note))
+        .filter_map(|note| {
+            let mut words = note.split_whitespace();
+            words.find(|word| *word == "release")?;
+            let version = words.next()?;
+            let parts: Vec<u64> = version
+                .strip_prefix('v')?
+                .split('.')
+                .map(|part| part.parse().ok())
+                .collect::<Option<_>>()?;
+            Some((parts, version.to_string()))
+        })
+        .max()
+        .map(|(_, version)| version)
+        .expect("the allowlist names at least one Edge release")
+}
+
+/// Every writable top-level `Proxy` / `Upstream` property of the pinned Edge
+/// OpenAPI must be mirrored. A gateway field the mirror lacks is refused by
+/// the strict loader, refused by import, and blocks apply on any live row that
+/// carries it (`websocket_permessage_deflate` went unnoticed that way from
+/// Edge v0.9.9 to v0.9.20). The reverse direction catches a misspelled mirror
+/// field. `tests/fixtures/edge-openapi/README.md` says how to regenerate the
+/// field lists when the pin moves.
+#[test]
+fn mirrored_resource_fields_match_the_pinned_edge_openapi() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/edge-openapi/resource-fields.json");
+    let fixture: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read Edge OpenAPI field lists"))
+            .expect("Edge OpenAPI field lists are JSON");
+    assert_eq!(
+        fixture["source"]["tag"].as_str(),
+        Some(newest_allowlisted_edge_release().as_str()),
+        "tests/fixtures/edge-openapi/resource-fields.json was read from another Edge release \
+         than the pinned validator; regenerate it from the new release's openapi.yaml"
+    );
+
+    let names = |value: &serde_json::Value| -> BTreeSet<String> {
+        value
+            .as_array()
+            .expect("field list is an array")
+            .iter()
+            .map(|name| name.as_str().expect("field name").to_string())
+            .collect()
+    };
+    let source = schema_source();
+    for struct_name in ["Proxy", "Upstream"] {
+        let schema = &fixture["schemas"][struct_name];
+        let writable = names(&schema["properties"]);
+        let read_only = names(&schema["read_only"]);
+        assert!(!writable.is_empty(), "{struct_name}: empty field list");
+        let mut mirrored = declared_fields(&source, struct_name);
+        assert!(mirrored.remove("extra"), "{struct_name} has a pass-through");
+
+        let unmodeled: Vec<&String> = writable.difference(&mirrored).collect();
+        assert!(
+            unmodeled.is_empty(),
+            "the pinned Edge OpenAPI {struct_name} schema has writable field(s) {unmodeled:?} \
+             that src/config/schema.rs does not mirror"
+        );
+        let unknown: Vec<&String> = mirrored
+            .iter()
+            .filter(|field| !writable.contains(*field) && !read_only.contains(*field))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "src/config/schema.rs mirrors {struct_name} field(s) {unknown:?} that the pinned \
+             Edge OpenAPI does not define"
+        );
+    }
+}
+
 #[test]
 fn companion_schema_fixture_survives_an_export_round_trip() {
     let assembled = assemble(load_fixture()).unwrap();
