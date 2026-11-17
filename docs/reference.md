@@ -482,9 +482,12 @@ with the admin credential.
 - **Fingerprinted fields.** Values the gateway's viewer projection withholds
   (keyauth keys, `jwt`/`hmac_auth` secrets, plugin-config secrets and
   credential-bearing URLs, URL userinfo in a Proxy or Upstream, the Consul
-  token) arrive as `hmac-sha256:<64 hex>`. The MAC key derives from the
-  gateway's *admin* secret, and Edge deliberately does not let a viewer
-  compute it, so `diff` cannot fingerprint the repository's value. Where the
+  token) arrive as `hmac-sha256:<64 hex>`. The MAC key derives from a
+  gateway-side secret: `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on
+  Ferrum Edge after v0.9.20 (a random key per gateway process when it is
+  unset), the admin `FERRUM_ADMIN_JWT_SECRET` on v0.9.20. Edge deliberately
+  does not let a viewer compute it, so `diff` cannot fingerprint the
+  repository's value. Where the
   repository declares a secret-bearing value at a fingerprinted location (a
   `${gh-env-secret:…}` placeholder, a URL with userinfo, a Consumer key or
   secret, a plugin-config path the secret classifier flags, the Consul token,
@@ -519,10 +522,18 @@ with the admin credential.
   overrides that.
   `diff` warns when either baseline path lies inside a git worktree. A baseline
   shows change between two exports, never agreement with the repository.
-  Fingerprints are comparable only under one `redaction.fingerprint_key_id`;
-  after the gateway's `FERRUM_ADMIN_JWT_SECRET` rotates (or a gateway without
-  one restarts), the baseline is not comparable, so `--exit-on-drift` fails
-  (`1`) rather than reporting no secret drift. Record the baseline from a
+  Fingerprints are comparable only under one `redaction.fingerprint_key_id`.
+  The key id changes when the gateway's fingerprint secret rotates, on every
+  restart of a gateway that does not set one, and between replicas that do
+  not share one. **For a baseline that survives restarts and load-balanced
+  replicas, set the same `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on
+  every gateway replica** (Ferrum Edge after v0.9.20; at least 32 characters
+  and distinct from every JWT secret; on v0.9.20 the key follows
+  `FERRUM_ADMIN_JWT_SECRET`). It is a gateway setting: GitForgeOps never
+  needs or reads it. After a key change the baseline is not comparable: the
+  secrets are reported unverified, never as drift or secret changes, and
+  `--exit-on-drift` fails (`1`) rather than reporting no secret drift, until a
+  new baseline is recorded. Record the baseline from a
   trusted state, such as right after a successful apply; a baseline rewritten by
   every drift check alerts on a change once. It holds keyed fingerprints only;
   keep it out of the repository.
@@ -578,6 +589,14 @@ rotate. The settings audit checks only secret names, requires the viewer name
 in `<env>-monitor`, and rejects an admin name there even alongside the viewer.
 No tooling reads, prints or copies secret values; an operator enters the value
 through the protected secret-entry UI.
+
+Gateways that serve the drift check should also share one
+`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (Ferrum Edge after v0.9.20).
+Without it every gateway process keys fingerprints randomly, so they change on
+each restart and differ between replicas, and any fingerprint baseline an
+operator keeps stops matching (see
+[Viewer-credential drift reads](#viewer-credential-drift-reads)). It stays on
+the gateway; no GitHub Environment holds it.
 
 The workflow keeps `diff --exit-on-drift` without
 `--accept-unverified-secrets` or automatic fingerprint-baseline storage. A fresh

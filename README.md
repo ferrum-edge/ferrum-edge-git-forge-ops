@@ -758,6 +758,10 @@ and a whole value fingerprinted around a secret or a refused baseline write
 exits `1` either way; a cached read always exits `1`. Baselines and the other
 limits are in
 [Viewer-credential drift reads](docs/reference.md#viewer-credential-drift-reads).
+Fingerprints stay comparable across gateway restarts and replicas only when
+every replica sets the same `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`
+(Ferrum Edge after v0.9.20; without it each process keys them randomly, and a
+changed key leaves secrets unverified, never drifted).
 The bundled `drift-check.yml` binds only the viewer secret. See
 [Scheduled monitoring](docs/reference.md#scheduled-monitoring).
 

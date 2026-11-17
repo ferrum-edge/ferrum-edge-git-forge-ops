@@ -647,8 +647,10 @@ namespace. `plan`, `review` and `apply` stay on `/backup`: adoption,
 pending-create matching and spec ownership need raw values and `api_spec_id`,
 which the export lacks.
 
-- Fingerprints (`hmac-sha256:<64 hex>`) are keyed from the gateway's primary
-  admin secret; a viewer cannot compute the repository value's fingerprint, and
+- Fingerprints (`hmac-sha256:<64 hex>`) are keyed from a gateway-side secret:
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on Edge after v0.9.20
+  (random per gateway process when unset), the primary admin secret on
+  v0.9.20. A viewer cannot compute the repository value's fingerprint, and
   this build does not try. `ConfigExport::live_view_with` substitutes the declared
   value only at a fingerprinted pointer that is secret-bearing in the repo
   (placeholder, URL userinfo, Consumer key/secret, classified plugin path,
@@ -668,12 +670,19 @@ which the export lacks.
   the built-in paths of `plugin_config::export_only_rules_for`, and TLS
   private-key material in Proxy, Upstream and plugin-config bodies
   (`collect_tls_material_sites`). Export-only rules never change import
-  brokering, scrubbing or display admission. A gateway that sends such a value
-  literally is compared as usual; re-check the set against Edge's
-  `plugin_config_projection.rs` on every Edge pin bump.
+  brokering, scrubbing or display admission, so they hold only values Edge
+  merely withholds (endpoint URLs and paths such as `opa` `opa_host`, TLS
+  sources, the generated `mesh_authz` slice); a credential or operator token
+  Edge redacts is a `rules_for` rule even before the pin redacts it. A gateway
+  that sends such a value literally is compared as usual; re-check the set
+  against Edge's `plugin_config_projection.rs` on every Edge pin bump.
 - `FingerprintBaseline` (`--fingerprint-baseline`, `--write-fingerprint-baseline`)
   compares two exports per `(kind, id, pointer)` on declared resources only.
-  A different `fingerprint_key_id` is "not comparable", never drift. Changes
+  A different `fingerprint_key_id` (rotation, a restart without a configured
+  fingerprint secret, or a replica with another key) is "not comparable":
+  unverified with no secret changes, never drift; nothing assumes a stable key
+  id. Docs tell operators to set one
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on every replica. Changes
   count as managed modifications (`DriftVerdict::with_secret_changes`).
   Recording refuses a run with diffs or secret changes unless
   `--force-baseline`; a baseline path inside a git worktree is warned about.
@@ -1322,10 +1331,14 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   `plugin_config_projection` table, because `/config/export` fingerprints
   whatever that projection redacts; a shared secret the pinned gateway does
   not redact yet is still classified.
+- Credential header maps Edge after v0.9.20 redacts (`ai_tool_governor`
+  `approval.headers`, `mcp_gateway` `servers.*.headers`) are secret rules.
 - Operator-chosen values Edge redacts (`request_transformer` rule values,
-  `mesh_route_dispatch` request-transform values, `ws_logging` custom headers,
-  `fault_injection` and `response_mock` match conditions) use
-  `RuleKind::Value`. A string of at least 8 bytes is brokered, masked,
+  `mesh_route_dispatch` request-transform values and match operands,
+  `ws_logging` custom headers, `fault_injection` and `response_mock` match
+  conditions, `waf` custom-rule and override header conditions, the
+  `request_termination` and `transaction_debugger` selector header values)
+  use `RuleKind::Value`. A string of at least 8 bytes is brokered, masked,
   scrubbed and literal-gated like a secret; a shorter one (`value: "1"`)
   stays an ordinary literal, since the bundle and scrubber refuse it. None is
   rule-declared for display admission. `export_redacted_paths` adds every

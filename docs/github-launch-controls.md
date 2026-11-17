@@ -637,7 +637,11 @@ a failure. Explicit CLI acceptance retains its documented limits.
 **Provisioning.** A repository administrator provisions the gateway's viewer
 key as `FERRUM_ADMIN_JWT_VIEWER_SECRET` in every environment the drift matrix
 binds, and `<env>-monitor` must not hold `FERRUM_ADMIN_JWT_SECRET`; see
-[Scheduled monitoring](reference.md#scheduled-monitoring).
+[Scheduled monitoring](reference.md#scheduled-monitoring). On the gateway side,
+Ferrum Edge after v0.9.20 keys export fingerprints from
+`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`; set the same value on every
+replica so fingerprints stay stable across restarts. No GitHub Environment
+holds it.
 
 ### 3.2 Monitoring outcomes
 

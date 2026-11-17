@@ -13,11 +13,14 @@
 //! Every value the gateway's viewer projection withholds — Consumer `keyauth`
 //! keys and `jwt` / `hmac_auth` secrets, plugin-config secrets and
 //! credential-bearing URLs, URL userinfo in a Proxy or Upstream, the Consul
-//! token — arrives as `hmac-sha256:<64 hex>`. The MAC key is derived from the
-//! gateway's *primary* admin secret, never from the viewer secret, so a
-//! viewer-credential reader **cannot compute the fingerprint of the
-//! repository's value**. Edge documents this as intentional, and this module
-//! does not try to reproduce the computation. Consequences:
+//! token — arrives as `hmac-sha256:<64 hex>`. The MAC key is derived from a
+//! gateway-side secret the reader never holds: Ferrum Edge after v0.9.20 keys
+//! it from `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (random per process
+//! when unset), and v0.9.20 from its primary `FERRUM_ADMIN_JWT_SECRET`; never
+//! from the viewer secret. So a viewer-credential reader **cannot compute the
+//! fingerprint of the repository's value**. Edge documents this as
+//! intentional, and this module does not try to reproduce the computation.
+//! Consequences:
 //!
 //! - A fingerprinted field cannot be compared with the repository. Where the
 //!   repository declares a **secret-bearing** value at the same location (a
@@ -44,10 +47,14 @@
 //!   disappeared since. It cannot say whether the value matches the
 //!   repository, and a baseline taken from a gateway that had already
 //!   drifted carries that drift forward.
-//! - `redaction.fingerprint_key_id` changes when the gateway's
-//!   `FERRUM_ADMIN_JWT_SECRET` rotates (and on every restart of a gateway
-//!   without one). Fingerprints under different key ids are not comparable;
-//!   [`FingerprintBaseline::compare`] says so instead of reporting drift.
+//! - `redaction.fingerprint_key_id` changes when the gateway's fingerprint
+//!   secret rotates (`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` after
+//!   v0.9.20, `FERRUM_ADMIN_JWT_SECRET` on v0.9.20), on every restart of a
+//!   gateway that does not set it, and between replicas that do not share it.
+//!   Nothing assumes a stable key id: a baseline keeps the key id of each
+//!   namespace's export, and fingerprints under different key ids are not
+//!   comparable, so [`FingerprintBaseline::compare`] reports
+//!   [`NamespaceSecretComparison::KeyChanged`] (unverified, never drift).
 //! - Consumer `basicauth` (and any custom credential type) is omitted from the
 //!   export. Each consumer instead carries one `hidden_credentials_fingerprint`
 //!   over the omitted types, which only a baseline can use; it is therefore
@@ -1166,8 +1173,9 @@ pub enum NamespaceSecretComparison {
     /// The baseline has no entry for the namespace.
     NoBaseline,
     /// The gateway's fingerprint key changed since the baseline (its
-    /// `FERRUM_ADMIN_JWT_SECRET` rotated, or it restarted with a random key),
-    /// so no fingerprint is comparable.
+    /// fingerprint secret rotated, it restarted with a random key, or the
+    /// export came from a replica with a different key), so no fingerprint is
+    /// comparable. Unverified, never drift.
     KeyChanged,
     Compared {
         /// Declared resources found in both the export and the baseline.
@@ -1296,8 +1304,13 @@ impl SecretFingerprintSummary {
                     summary.key_changed = true;
                     summary.notes.push(format!(
                         "namespace '{namespace}': the gateway's fingerprint key changed since the \
-                         baseline (its FERRUM_ADMIN_JWT_SECRET rotated, or a gateway without one \
-                         restarted), so no fingerprint is comparable; record a new baseline"
+                         baseline, so no fingerprint is comparable and secrets are unverified, \
+                         not drifted. The key changes when the gateway's fingerprint secret \
+                         rotates, on every restart of a gateway that does not set one, and \
+                         between replicas that do not share one: set the same \
+                         FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET on every gateway replica \
+                         (Ferrum Edge after v0.9.20; v0.9.20 uses FERRUM_ADMIN_JWT_SECRET), then \
+                         record a new baseline from a trusted state"
                     ));
                 }
                 NamespaceSecretComparison::Compared {

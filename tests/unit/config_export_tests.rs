@@ -719,6 +719,57 @@ fn a_baseline_round_trips_through_a_file_and_rejects_malformed_input() {
     assert!(FingerprintBaseline::from_json(&unknown_field.to_string()).is_err());
 }
 
+/// Ferrum Edge after v0.9.20 keys fingerprints from
+/// `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` and uses a random key per
+/// process without it, so a restart (or a replica with another key) changes
+/// the key id and every fingerprint at once. That is unverified, never drift:
+/// no secret change is reported, and the note tells the operator to set the
+/// shared fingerprint secret on the gateway.
+#[test]
+fn a_gateway_restarted_with_a_random_fingerprint_key_is_unverified_not_drift() {
+    use gitforgeops::config::repo_config::DriftAlertOn;
+    use gitforgeops::verdict::{DiffExit, DriftVerdict};
+
+    let desired = desired();
+    let mut baseline = FingerprintBaseline::default();
+    baseline.record(&export_with('a', 'b', KEY_ID));
+
+    // Every fingerprint differs under the new process's key.
+    let restarted = export_with('c', 'd', ROTATED_KEY_ID);
+    let view = restarted.live_view_with(&desired, &desired).unwrap();
+    assert!(
+        compute_diff(&project_desired_for_export(&desired), &view.actual)
+            .unwrap()
+            .is_empty()
+    );
+    let exports = [restarted];
+    let summary = SecretFingerprintSummary::evaluate(
+        &exports,
+        view.uncompared.len(),
+        Some(&baseline),
+        &desired,
+    );
+    assert!(summary.key_changed);
+    assert!(summary.changes.is_empty(), "{:?}", summary.changes);
+    assert!(!summary.verified());
+    assert!(summary.notes.iter().any(|note| note.contains("not drifted")
+        && note.contains("FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET")));
+
+    let alert = DriftAlertOn::default();
+    let drift = DriftVerdict::evaluate(&alert, &[], &[], &[])
+        .with_secret_changes(&alert, summary.changes.len());
+    assert!(!drift.has_drift());
+    let exit = DiffExit::evaluate(
+        &drift,
+        summary.authoritative(),
+        summary.baseline_invalidated(),
+        summary.verified(),
+        false,
+    );
+    assert_eq!(exit, DiffExit::BaselineInvalidated);
+    assert_ne!(exit.exit_code(), gitforgeops::verdict::DRIFT_EXIT_CODE);
+}
+
 #[test]
 fn the_summary_is_unverified_without_a_complete_baseline() {
     let desired = desired();

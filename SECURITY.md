@@ -56,7 +56,9 @@ A process that only compares configuration needs no write authority. Give it
 the gateway's `FERRUM_ADMIN_JWT_VIEWER_SECRET` (Ferrum Edge v0.9.9+) instead of
 `FERRUM_ADMIN_JWT_SECRET`: `gitforgeops diff` then reads `GET /config/export`,
 which the gateway caps at `viewer` and which carries keyed fingerprints instead
-of secret values. Handle the viewer secret like the admin one: an environment
+of secret values (keyed on Ferrum Edge after v0.9.20 from the gateway's own
+`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`, which no GitForgeOps process
+holds). Handle the viewer secret like the admin one: an environment
 secret, never logged, never committed. Unless the gateway sets
 `FERRUM_ADMIN_JWT_VIEWER_NAMESPACES`, it reads every namespace. A fingerprint
 baseline file holds only keyed fingerprints, but keep it outside the
