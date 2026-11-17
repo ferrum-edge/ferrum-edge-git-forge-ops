@@ -391,6 +391,237 @@ fn short_operator_plugin_values_stay_ordinary_settings() {
     }
 }
 
+/// One plugin per credential or operator-chosen token Ferrum Edge's
+/// `plugin_config_projection` redacts after v0.9.20 (v0.9.20 itself does not):
+/// the `ai_tool_governor` approval and `mcp_gateway` server header maps
+/// (secrets), and the `request_termination` / `transaction_debugger` selector
+/// tokens, `waf` rule conditions and `mesh_route_dispatch` match operands
+/// (operator values), each long enough to be scrubbed, with the broker slot
+/// import must capture it under.
+fn edge_post_0_9_20_redacted_plugins() -> Vec<(&'static str, serde_json::Value, Vec<&'static str>)>
+{
+    vec![
+        (
+            "ai_tool_governor",
+            serde_json::json!({"approval": {
+                "endpoint_url": "https://approvals.example/hook",
+                "headers": {"x-approval-auth": "synthetic-approval-header"}
+            }}),
+            vec![
+                "ferrum/builtin/@plugin/ai_tool_governor/config/approval/endpoint_url",
+                "ferrum/builtin/@plugin/ai_tool_governor/config/approval/headers/x-approval-auth",
+            ],
+        ),
+        (
+            "mcp_gateway",
+            serde_json::json!({"servers": {"docs": {
+                "upstream_url": "https://mcp.example/docs",
+                "headers": {"x-functions-key": "synthetic-mcp-server-key"}
+            }}}),
+            vec![
+                "ferrum/builtin/@plugin/mcp_gateway/config/servers/docs/headers/x-functions-key",
+                "ferrum/builtin/@plugin/mcp_gateway/config/servers/docs/upstream_url",
+            ],
+        ),
+        (
+            "request_termination",
+            serde_json::json!({
+                "status_code": 403,
+                "trigger": {"header": "x-kill", "header_value": "synthetic-kill-token"}
+            }),
+            vec!["ferrum/builtin/@plugin/request_termination/config/trigger/header_value"],
+        ),
+        (
+            "transaction_debugger",
+            serde_json::json!({
+                "capture_request_header": "x-debug-session",
+                "capture_request_header_value": "synthetic-debug-selector"
+            }),
+            vec![
+                "ferrum/builtin/@plugin/transaction_debugger/config/capture_request_header_value",
+            ],
+        ),
+        (
+            "waf",
+            serde_json::json!({
+                "custom_rules": [{"id": "TENANT-1", "conditions": {"headers": {
+                    "x-tenant": "synthetic-waf-condition"
+                }}}],
+                "rule_overrides": {"FE-XSS-001": {"conditions": {"headers": {
+                    "x-scanner": "synthetic-waf-override"
+                }}}}
+            }),
+            vec![
+                "ferrum/builtin/@plugin/waf/config/custom_rules/[0]/conditions/headers/x-tenant",
+                "ferrum/builtin/@plugin/waf/config/rule_overrides/FE-XSS-001/conditions/headers/x-scanner",
+            ],
+        ),
+        (
+            "mesh_route_dispatch",
+            serde_json::json!({"rules": [{"match": {
+                "headers": {"x-route": "synthetic-route-bare", "x-canary": {"exact": "synthetic-route-exact"}},
+                "without_headers": {"x-internal": {"prefix": "synthetic-route-prefix"}},
+                "query_params": {"tenant": "synthetic-route-query"}
+            }}]}),
+            vec![
+                "ferrum/builtin/@plugin/mesh_route_dispatch/config/rules/[0]/match/headers/x-canary/exact",
+                "ferrum/builtin/@plugin/mesh_route_dispatch/config/rules/[0]/match/headers/x-route",
+                "ferrum/builtin/@plugin/mesh_route_dispatch/config/rules/[0]/match/query_params/tenant",
+                "ferrum/builtin/@plugin/mesh_route_dispatch/config/rules/[0]/match/without_headers/x-internal/prefix",
+            ],
+        ),
+    ]
+}
+
+/// Edge after v0.9.20 redacts these paths, so import must broker them rather
+/// than write them into resource YAML. The header maps used to be caught only
+/// by the header-map heuristic (a plaintext allowance), and the selector
+/// tokens and the bare `without_headers` / `query_params` operands by nothing
+/// at all; they are now brokered outright.
+#[test]
+fn edge_post_0_9_20_redacted_plugin_paths_are_brokered_on_import() {
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for (plugin_name, config, expected) in edge_post_0_9_20_redacted_plugins() {
+        let mut gateway = single_plugin_gateway(plugin_name, config);
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+        let slots: Vec<&str> = capture.captured.keys().map(String::as_str).collect();
+        assert_eq!(slots, expected, "{plugin_name}");
+        let unbrokered: Vec<&str> = capture
+            .unbrokered
+            .iter()
+            .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+            .collect();
+        assert!(unbrokered.is_empty(), "{plugin_name}: {unbrokered:?}");
+        let written = gateway.plugin_configs[0].config.to_string();
+        assert!(!written.contains("synthetic-"), "{plugin_name}: {written}");
+    }
+}
+
+#[test]
+fn edge_post_0_9_20_redacted_plugin_paths_are_scrubbed_and_gated_as_literals() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+
+    for (plugin_name, config, _) in edge_post_0_9_20_redacted_plugins() {
+        let gateway = single_plugin_gateway(plugin_name, config);
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+        let rendered = gateway.plugin_configs[0].config.to_string();
+        let scrubbed = scrubber.scrub(&rendered);
+        assert!(
+            !scrubbed.contains("synthetic-"),
+            "{plugin_name}: {scrubbed}"
+        );
+        assert!(scrubbed.contains("[REDACTED]"), "{plugin_name}: {scrubbed}");
+
+        let findings = audit_security(&gateway);
+        let blockers = security_blockers(&findings);
+        assert!(
+            blockers
+                .iter()
+                .any(|finding| finding.message.contains("Literal plugin-config secret")),
+            "{plugin_name}: {findings:?}"
+        );
+        for finding in &findings {
+            assert!(!finding.message.contains("synthetic-"), "{plugin_name}");
+        }
+    }
+
+    // The header names, the match kinds and the rule's other settings stay
+    // readable beside the redacted values.
+    let gateway = single_plugin_gateway(
+        "request_termination",
+        serde_json::json!({
+            "trigger": {"header": "x-visible-kill-header", "header_value": "synthetic-kill-token"},
+            "message": "visible-termination-message"
+        }),
+    );
+    let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+    assert_eq!(
+        scrubber.scrub("synthetic-kill-token x-visible-kill-header visible-termination-message"),
+        "[REDACTED] x-visible-kill-header visible-termination-message"
+    );
+}
+
+/// The selector tokens, rule conditions and match operands have no gateway
+/// minimum, so a value too short to broker or scrub is an ordinary setting:
+/// import keeps it literal without a plaintext allowance, the scrubber does
+/// not withhold validator output over it, and the literal-secret gate lets it
+/// through.
+#[test]
+fn short_post_0_9_20_operator_plugin_values_stay_ordinary_settings() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for (plugin_name, config) in [
+        (
+            "request_termination",
+            serde_json::json!({"trigger": {"header": "x-kill", "header_value": "on"}}),
+        ),
+        (
+            "transaction_debugger",
+            serde_json::json!({
+                "capture_request_header": "x-debug",
+                "capture_request_header_value": "1"
+            }),
+        ),
+        (
+            "waf",
+            serde_json::json!({"default_rule_action": "enforce", "custom_rules": [{
+                "id": "TENANT-1",
+                "conditions": {"headers": {"x-tenant": "t1", "x-any": null}}
+            }]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            serde_json::json!({"rules": [{"match": {
+                "headers": {"x-version": "v2", "x-canary": {"exact": "yes"}},
+                "query_params": {"page": "2"}
+            }}]}),
+        ),
+    ] {
+        let original = single_plugin_gateway(plugin_name, config);
+        let mut gateway = original.clone();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+        assert!(capture.captured.is_empty(), "{plugin_name}");
+        assert!(capture.unbrokered.is_empty(), "{plugin_name}");
+        assert_eq!(
+            gateway.plugin_configs[0].config, original.plugin_configs[0].config,
+            "{plugin_name}"
+        );
+
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
+        let output = scrubber.scrub_streams("validated", "");
+        assert!(output.suppressed.is_none(), "{plugin_name}");
+        assert_eq!(output.stdout, "validated", "{plugin_name}");
+        assert!(
+            security_blockers(&audit_security(&original)).is_empty(),
+            "{plugin_name}"
+        );
+    }
+}
+
+/// `opa` `opa_host` is an endpoint Edge projects structurally, not a
+/// credential: import leaves it literal and nothing gates it.
+#[test]
+fn opa_host_stays_a_literal_endpoint() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    let original = single_plugin_gateway(
+        "opa",
+        serde_json::json!({"opa_host": "http://opa.internal:8181/v1/base", "policy_path": "authz/allow"}),
+    );
+    let mut gateway = original.clone();
+    let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+    assert!(capture.captured.is_empty());
+    assert!(capture.unbrokered.is_empty());
+    assert_eq!(
+        gateway.plugin_configs[0].config,
+        original.plugin_configs[0].config
+    );
+    assert!(security_blockers(&audit_security(&original)).is_empty());
+}
+
 const TEST_RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCeBwh5uUsN7IUDwwsg1tMZsRAknSr77S2N+DoEBkLvMTIB9ox8MIx1XeFyJpKLIaXR3WvRW49zKGPqgR8cIoWPzwdnKAFLwjYA+MDDsjDqFTU3DO1msuj0v5M74MXriVCEMZjRY7DiEnSnIpHyySyddkwm8TQDTDFxc3kRGRDMh0L5UjWb3Y18uQgmU08gF/2Liwg0Pl35D3AyKR6rxegxvolHu/g+h2+qvnwiy/lhwXyTfVhqRJ4k/lbRxAKZINJwUlRqmGiXnnppQ90UJS775L47I65bJ7LdI2FRI4iJVej2mRNE7dv+0G+ntPVeqKR8XuokO8FnZj7/Y0IYZ/zN";
 
 #[test]

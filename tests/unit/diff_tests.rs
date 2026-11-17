@@ -563,6 +563,100 @@ fn edge_0_9_19_brokered_plugin_paths_are_all_masked_per_leaf() {
     }
 }
 
+/// The credentials and operator-chosen tokens Ferrum Edge redacts after
+/// v0.9.20: a brokered leaf is masked against any live value (including the
+/// literal a v0.9.20 gateway still returns), and a changed sibling on the same
+/// plugin is still reported.
+#[test]
+fn edge_post_0_9_20_brokered_plugin_paths_are_all_masked_per_leaf() {
+    const PLACEHOLDER: &str = "${gh-env-secret:alloc=require}";
+    const LIVE: &str = "live-secret-material-post-v20";
+    for (plugin_name, pointer, config) in [
+        (
+            "ai_tool_governor",
+            "/approval/headers/x-approval-auth",
+            serde_json::json!({"approval": {"headers": {"x-approval-auth": PLACEHOLDER}}}),
+        ),
+        (
+            "mcp_gateway",
+            "/servers/docs/headers/x-functions-key",
+            serde_json::json!({"servers": {"docs": {"headers": {"x-functions-key": PLACEHOLDER}}}}),
+        ),
+        (
+            "request_termination",
+            "/trigger/header_value",
+            serde_json::json!({"trigger": {"header": "x-kill", "header_value": PLACEHOLDER}}),
+        ),
+        (
+            "transaction_debugger",
+            "/capture_request_header_value",
+            serde_json::json!({"capture_request_header": "x-debug",
+                "capture_request_header_value": PLACEHOLDER}),
+        ),
+        (
+            "waf",
+            "/custom_rules/0/conditions/headers/x-tenant",
+            serde_json::json!({"custom_rules": [{"conditions": {"headers": {"x-tenant": PLACEHOLDER}}}]}),
+        ),
+        (
+            "waf",
+            "/rule_overrides/FE-XSS-001/conditions/headers/x-scanner",
+            serde_json::json!({"rule_overrides": {"FE-XSS-001": {"conditions": {"headers": {
+                "x-scanner": PLACEHOLDER
+            }}}}}),
+        ),
+        (
+            "mesh_route_dispatch",
+            "/rules/0/match/headers/x-route",
+            serde_json::json!({"rules": [{"match": {"headers": {"x-route": PLACEHOLDER}}}]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            "/rules/0/match/without_headers/x-internal/prefix",
+            serde_json::json!({"rules": [{"match": {"without_headers": {
+                "x-internal": {"prefix": PLACEHOLDER}
+            }}}]}),
+        ),
+        (
+            "mesh_route_dispatch",
+            "/rules/0/match/query_params/tenant/exact",
+            serde_json::json!({"rules": [{"match": {"query_params": {
+                "tenant": {"exact": PLACEHOLDER}
+            }}}]}),
+        ),
+    ] {
+        let mut desired_plugin =
+            make_plugin_config("edge", "ferrum", plugin_name, PluginScope::Global);
+        desired_plugin.config = config;
+        desired_plugin.config["sibling"] = serde_json::json!("declared");
+        let desired = GatewayConfig {
+            plugin_configs: vec![desired_plugin.clone()],
+            ..GatewayConfig::default()
+        };
+
+        let mut live_plugin = desired_plugin;
+        *live_plugin.config.pointer_mut(pointer).unwrap() = serde_json::json!(LIVE);
+        let mut actual = GatewayConfig {
+            plugin_configs: vec![live_plugin.clone()],
+            ..GatewayConfig::default()
+        };
+        mask_without_bundle(&desired, &mut actual);
+        let diffs = compute_diff(&desired, &actual).unwrap();
+        assert!(diffs.is_empty(), "{plugin_name} {pointer}: {diffs:?}");
+
+        live_plugin.config["sibling"] = serde_json::json!("drifted");
+        let mut actual = GatewayConfig {
+            plugin_configs: vec![live_plugin],
+            ..GatewayConfig::default()
+        };
+        mask_without_bundle(&desired, &mut actual);
+        let diffs = compute_diff(&desired, &actual).unwrap();
+        assert_eq!(diffs.len(), 1, "{plugin_name} {pointer}: {diffs:?}");
+        let rendered = format!("{:?}", diffs[0].details);
+        assert!(!rendered.contains(LIVE), "{plugin_name}: {rendered}");
+    }
+}
+
 fn make_plugin_config(
     id: &str,
     namespace: &str,
