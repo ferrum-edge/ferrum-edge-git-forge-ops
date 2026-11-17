@@ -169,17 +169,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **BREAKING:** the plugin-config values Ferrum Edge after v0.9.20 redacts as
   credentials or operator-chosen tokens are classified as secrets, not only
   predicted as `/config/export` fingerprint sites. `ai_tool_governor`
-  `approval.headers.*` and `mcp_gateway` `servers.*.headers.*` are secret
-  rules. `request_termination` `trigger.header_value`, `transaction_debugger`
+  `approval.headers.*`, `mcp_gateway` `servers.*.headers.*`,
+  `request_termination` `trigger.header_value`, `transaction_debugger`
   `capture_request_header_value`, `waf` `custom_rules` / `rule_overrides`
   `conditions.headers.*` and `mesh_route_dispatch` match operands (`headers`,
   `without_headers`, `query_params`) are operator values: one of at least 8
   bytes is brokered on import, masked in `diff`/`review` and blocks `apply` as
   a literal; a shorter one stays an ordinary setting. Move such literals into
   `${gh-env-secret:...}` placeholders before applying. `opa` `opa_host` (an
-  endpoint Edge projects structurally) stays an export-only site. Ferrum Edge
-  v0.9.20 does not redact these fields; a v0.9.20 export still compares them
-  as written.
+  endpoint Edge projects structurally) stays an export-only site, and the
+  `mesh_authz` policy operands Edge redacts stay export-only too (brokering
+  them is deferred: most `when` values are principals, IPs and claims). A
+  short header value in the two header maps (`x-api-version: "2"`) is an
+  ordinary setting, so a live `/backup` holding one never refuses `diff`,
+  `plan`, `review` or `apply`. Ferrum Edge v0.9.20 does not redact these
+  fields; a v0.9.20 export still compares them as written.
 - `/config/export` fingerprint docs and `diff` notes no longer say the key is
   the gateway's admin secret: Ferrum Edge after v0.9.20 keys fingerprints from
   `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (random per process when

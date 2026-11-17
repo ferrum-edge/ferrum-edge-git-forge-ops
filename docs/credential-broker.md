@@ -198,7 +198,8 @@ credential, a custom plugin's secret-looking field) may be an ordinary setting: 
 does not refuse the run. Operator-chosen values Ferrum Edge redacts without
 requiring them to be secret (a `request_transformer` rule value, a
 `mesh_route_dispatch` request-transform value or match operand, a `ws_logging`
-custom header, a `fault_injection` or `response_mock` match condition, a `waf`
+custom header, an `ai_tool_governor` approval header or `mcp_gateway` server
+header, a `fault_injection` or `response_mock` match condition, a `waf`
 custom-rule or override header condition, the `request_termination` and
 `transaction_debugger` selector header values) are never refused
 either. One of at least 8 bytes is brokered on import, protected, and blocks
