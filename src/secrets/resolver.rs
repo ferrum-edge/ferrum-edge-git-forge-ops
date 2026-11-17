@@ -1022,6 +1022,9 @@ pub struct PluginConfigCapture {
     pub captured: CredentialBundle,
     /// Per-plugin review lists for builtin or custom unbrokered strings.
     pub unbrokered: Vec<UnbrokeredPluginConfig>,
+    /// Per-plugin lists of short operator values whose entry name looks like
+    /// a credential: written literally (too short to broker), so import warns.
+    pub short_credential_named: Vec<UnbrokeredPluginConfig>,
 }
 
 /// Capture sensitive string leaves from plugin configuration and replace them
@@ -1042,6 +1045,18 @@ pub fn capture_and_redact_import_plugin_config_secrets(
             continue;
         }
         let classification = classify_plugin_config(&plugin.plugin_name, &plugin.config);
+        if !classification.short_credential_named.is_empty() {
+            capture.short_credential_named.push(UnbrokeredPluginConfig {
+                namespace: plugin.namespace.clone(),
+                plugin_id: plugin.id.clone(),
+                plugin_name: plugin.plugin_name.clone(),
+                paths: classification
+                    .short_credential_named
+                    .iter()
+                    .map(|path| render_config_path(path))
+                    .collect(),
+            });
+        }
         if !classification.unbrokered.is_empty() {
             capture.unbrokered.push(UnbrokeredPluginConfig {
                 namespace: plugin.namespace.clone(),

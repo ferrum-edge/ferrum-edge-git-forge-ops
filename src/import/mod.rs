@@ -155,6 +155,14 @@ pub struct ImportResult {
     #[serde(skip)]
     pub unbrokered_plugin_config: Vec<UnbrokeredPluginConfig>,
 
+    /// Plugins whose short operator values (header or query values under 8
+    /// bytes, too short to broker) are named like credentials. They were
+    /// written literally; surfaced by
+    /// [`ImportResult::short_credential_plugin_config_notice`]. Kept out of the
+    /// manifest like `unbrokered_plugin_config`.
+    #[serde(skip)]
+    pub short_credential_plugin_config: Vec<UnbrokeredPluginConfig>,
+
     /// `Kind id: field, field` for every resource carrying an unmodelled
     /// top-level field the operator acknowledged with `--accept-unknown-field`.
     /// Surfaced by [`ImportResult::acknowledged_passthrough_notice`]. Kept out
@@ -260,6 +268,41 @@ impl ImportResult {
             "WARNING: these plugin config values were written verbatim because --allow-plaintext-plugin-config named their plugin. These paths are secret-looking builtin fields outside this build's broker rules, or unclassified custom-plugin strings. Confirm once more that none of them is a credential before committing:",
         );
         for plugin in &self.unbrokered_plugin_config {
+            let mut paths = plugin
+                .paths
+                .iter()
+                .take(MAX_PATHS_PER_PLUGIN)
+                .map(|path| diagnostic_metadata(path))
+                .collect::<Vec<_>>();
+            if plugin.paths.len() > MAX_PATHS_PER_PLUGIN {
+                paths.push(format!(
+                    "[{} more]",
+                    plugin.paths.len() - MAX_PATHS_PER_PLUGIN
+                ));
+            }
+            notice.push_str(&format!(
+                "\n  PluginConfig {} ({}, plugin_name={}): {}",
+                diagnostic_metadata(&plugin.plugin_id),
+                diagnostic_metadata(&plugin.namespace),
+                diagnostic_metadata(&plugin.plugin_name),
+                paths.join(", ")
+            ));
+        }
+        Some(notice)
+    }
+
+    /// Warning for short operator values whose name looks like a credential
+    /// (`authorization`, `x-functions-key`). Under 8 bytes they cannot be
+    /// brokered or redacted, so import kept them literal; name each one so an
+    /// operator replaces a real credential before committing.
+    pub fn short_credential_plugin_config_notice(&self) -> Option<String> {
+        if self.short_credential_plugin_config.is_empty() {
+            return None;
+        }
+        let mut notice = String::from(
+            "WARNING: these plugin config values are named like credentials but are shorter than 8 bytes, so they were written verbatim as ordinary settings (too short to broker or redact). If any of them is a credential, replace it with a longer one held in ${gh-env-secret:alloc=require} before committing:",
+        );
+        for plugin in &self.short_credential_plugin_config {
             let mut paths = plugin
                 .paths
                 .iter()
@@ -505,6 +548,7 @@ pub(crate) fn split_config_with_inventory(
         redacted_plugin_config_values: plugin_config_count,
         redacted_service_discovery_values: service_discovery_count,
         unbrokered_plugin_config,
+        short_credential_plugin_config: plugin_capture.short_credential_named,
         acknowledged_passthrough,
         ..ImportResult::default()
     };

@@ -3974,6 +3974,9 @@ async fn cmd_import(
     if let Some(notice) = result.custom_plugin_review_notice() {
         eoutln!("{}", safe_block(notice));
     }
+    if let Some(notice) = result.short_credential_plugin_config_notice() {
+        eoutln!("{}", safe_block(notice));
+    }
 
     Ok(())
 }
