@@ -201,15 +201,19 @@ requiring them to be secret (a `request_transformer` rule value, a
 custom header or any other plugin header map (`otel_tracing`, `opa`,
 `ai_transcript_audit`, `http_logging`, `loki_logging` and `proxy_alerts`
 headers, an `ai_tool_governor` approval header or `mcp_gateway` server
-header, or an `api_chargeback_sink` ClickHouse insert query parameter), a `fault_injection` or `response_mock` match condition, a `waf`
+header), a `fault_injection` or `response_mock` match condition, a `waf`
 custom-rule or override header condition, the `request_termination` and
 `transaction_debugger` selector header values) are never refused
 either. One of at least 8 bytes is brokered on import, protected, and blocks
 apply as a literal; a shorter one is an ordinary setting that stays literal.
-When such a short value's header or parameter name looks like a credential
-(`authorization`, a name ending in `token` or `key`), `import` names it in a
-warning notice and the security audit reports a non-blocking warning, because
-it cannot be brokered or redacted. A short probe value refuses projection/header
+When such a short value's header, parameter or field name looks like a
+credential (`authorization`, a name ending in `token` or `key`), whether the
+name is its map key or a sibling field such as a `request_transformer` rule's
+`key`, `import` names it in a warning notice and the security audit (`plan`,
+`review`, `apply`; not `validate`) reports a non-blocking warning, because it
+cannot be brokered or redacted. `api_chargeback_sink` ClickHouse insert query
+parameters are not brokered at all: Ferrum Edge refuses credential-named keys
+there, so their values are ClickHouse settings and stay literal. A short probe value refuses projection/header
 resolution, before any probe request. Admission also refuses a value whose
 review formatter spelling falls below 8 bytes after CRLF collapse or trimming,
 rather than admitting a short spelling that would suppress ordinary prose. A

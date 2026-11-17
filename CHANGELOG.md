@@ -187,20 +187,34 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Every arbitrary header map is now an operator value, not a secret:
   `otel_tracing` `headers.*`, `opa` `headers.*`, `ai_transcript_audit`
   `sink.custom_headers.*` / `headers.*` / `custom_headers.*`, `http_logging`
-  and `loki_logging` `custom_headers.*`, `proxy_alerts`
-  `channels.*.headers.*` and the `api_chargeback_sink`
-  `clickhouse.insert_query_params.*` map, like `ws_logging` `custom_headers`. A value of at
+  and `loki_logging` `custom_headers.*` and `proxy_alerts`
+  `channels.*.headers.*`, like `ws_logging` `custom_headers`. A value of at
   least 8 bytes is still brokered, masked, scrubbed and blocks `apply` as a
   literal; a shorter one (Grafana's `X-Scope-OrgID: "12345"`) is an ordinary
-  setting (as is `database: "default"`), so a live `/backup` holding one no
-  longer refuses every `diff`,
+  setting, so a live `/backup` holding one no longer refuses every `diff`,
   `plan`, `review` and `apply`. Fields that only ever hold a credential
   (`otel_tracing` `authorization`, `loki_logging` `authorization_header`)
-  stay secrets. A short operator value whose header or parameter name looks
-  like a credential (`authorization`, `*token`, `*key`) is still written and
-  applied literally, but `import` now names it in a warning notice and the
-  security audit (`validate`, `plan`, `review`, `apply`) reports a
-  non-blocking warning, never the value.
+  stay secrets. A short operator value whose header, parameter or field name
+  looks like a credential (`authorization`, `*token`, `*key`), whether the
+  name is its map key or a sibling field (`request_transformer` `key`,
+  `request_termination` `header`, `transaction_debugger`
+  `capture_request_header`, a `mesh_route_dispatch` request-transform
+  `name`), is still written and applied literally, but `import` now names it
+  in a warning notice and the security audit (`plan`, `review`, `apply`)
+  reports a non-blocking warning, never the value. `validate` runs only the
+  gateway validator and does not report it.
+- `api_chargeback_sink` `clickhouse.insert_query_params.*` is no longer a
+  brokered secret map: it is an export-only site, so every value stays a
+  literal setting and a `/config/export` fingerprint there is counted as
+  uncompared, never drift. Ferrum Edge v0.9.20 and later redact these values
+  but refuse credential-named keys (`password`, `user`, `access_token`,
+  `session_id`, anything containing `token`, `secret`, `credential`,
+  `passwd` or `api_key`) and the reserved `database` / `query`, so an
+  accepted key is a ClickHouse setting (`async_insert`,
+  `date_time_input_format: best_effort`), which `import` no longer moves into
+  the broker. A credential-named key that reaches the repository anyway is
+  still caught by the key-name heuristics (import plaintext allowance and the
+  literal-secret gate).
 - `/config/export` fingerprint docs and `diff` notes no longer say the key is
   the gateway's admin secret: Ferrum Edge after v0.9.20 keys fingerprints from
   `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (random per process when

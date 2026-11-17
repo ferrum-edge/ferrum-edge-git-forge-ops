@@ -283,14 +283,9 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             operator_value(&["channels", "*", "headers", "*"]),
             secret(&["channels", "*", "body_template"]),
         ],
-        "api_chargeback_sink" => vec![
-            endpoint(&["clickhouse", "url"]),
-            // Query parameters on every ClickHouse insert: credentials
-            // (`password`) ride here, but so do short ordinary settings
-            // (`database: "default"`), so it is an operator value like the
-            // header maps.
-            operator_value(&["clickhouse", "insert_query_params", "*"]),
-        ],
+        // `clickhouse.insert_query_params` is an export-only site (see
+        // `export_only_rules_for`): Edge rejects credential-named keys.
+        "api_chargeback_sink" => vec![endpoint(&["clickhouse", "url"])],
         "workload_metrics" => vec![
             endpoint(&["tracing_provider", "config", "url"]),
             endpoint(&["tracing_provider", "config", "agent_url"]),
@@ -313,7 +308,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 /// them (v0.9.20) still compares them as ordinary values. Import brokering,
 /// redaction, scrubbing and display admission are unchanged for them.
 ///
-/// Two kinds of site belong here:
+/// Three kinds of site belong here:
 ///
 /// * Values Edge merely withholds: endpoint URLs and paths (`opa`
 ///   `opa_host`, a `mesh_route_dispatch` rewrite, a mirror path, the
@@ -331,6 +326,17 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 ///   claims rather than credentials, and brokering them would move routine
 ///   authorization identities into the secret broker. A `to.*.headers.*`
 ///   value is still caught by the header-map heuristic (an import plaintext
+///   allowance and the literal-secret gate).
+/// * `api_chargeback_sink` `clickhouse.insert_query_params.*`. Edge v0.9.20
+///   and later redact every value, but their own validation refuses a
+///   credential-named key (`password`, `user`, `access_token`, `session_id`,
+///   anything containing `apikey`, `api_key`, `credential`, `passwd`,
+///   `secret` or `token`) and the reserved `database` / `query`, so an
+///   accepted key is a ClickHouse setting (`async_insert`,
+///   `session_timezone`). Its value stays literal; brokering
+///   `date_time_input_format: best_effort` would demand a hand-seeded slot
+///   for a tuning knob. A credential-named key that reaches the repository
+///   anyway is still caught by the key-name heuristics (an import plaintext
 ///   allowance and the literal-secret gate).
 ///
 /// Every other credential or operator-chosen token Edge redacts is a
@@ -525,6 +531,7 @@ fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]
         "opa" => &[&["opa_host"]],
         // A backend path rewrite is projected like an endpoint path.
         "mesh_route_dispatch" => &[&["rules", "*", "rewrite", "uri"]],
+        "api_chargeback_sink" => &[&["clickhouse", "insert_query_params", "*"]],
         "request_mirror" => &[&["mirror_path"]],
         "udp_logging" => &[
             &["dtls_key_path"],
@@ -609,7 +616,7 @@ pub(crate) fn classify_plugin_config(
             for path in values {
                 match value_at(config, &path) {
                     Some(Value::String(text)) if text.len() < MIN_SCRUB_LENGTH => {
-                        if !text.is_empty() && entry_name_looks_like_credential(&path) {
+                        if !text.is_empty() && value_name_looks_like_credential(config, &path) {
                             short_credential_named.insert(path.clone());
                         }
                         ordinary.insert(path);
@@ -640,11 +647,49 @@ pub(crate) fn classify_plugin_config(
 /// belong to is named one level up.
 const OPERAND_KINDS: &[&str] = &["exact", "prefix", "suffix", "regex", "contains"];
 
-/// Whether the map entry a matched leaf belongs to (a header or query
-/// parameter name, skipping an operand's match-kind key) is named like a
-/// credential: the key-name heuristics, plus any name ending in `key`
-/// (`x-functions-key`, `Ocp-Apim-Subscription-Key`).
-fn entry_name_looks_like_credential(path: &[ConfigPathComponent]) -> bool {
+/// Value fields whose header or field name sits in a sibling field, with the
+/// sibling keys that may carry it (`request_transformer` `{key, value}`,
+/// `mesh_route_dispatch` request-transform `{name, value}`,
+/// `request_termination` `{header, header_value}`, `transaction_debugger`
+/// `{capture_request_header, capture_request_header_value}`).
+const SIBLING_NAMED_VALUES: &[(&str, &[&str])] = &[
+    ("value", &["key", "name"]),
+    ("headervalue", &["header"]),
+    ("capturerequestheadervalue", &["capturerequestheader"]),
+];
+
+/// Whether a name looks like a credential: the key-name heuristics, plus any
+/// name ending in `key` (`x-functions-key`, `Ocp-Apim-Subscription-Key`).
+fn name_looks_like_credential(name: &str) -> bool {
+    is_sensitive_key(name) || normalize_key(name).ends_with("key")
+}
+
+/// Whether the header, parameter or field a matched leaf sets is named like
+/// a credential. The name is the map entry the leaf belongs to (skipping an
+/// operand's match-kind key), or, for a value field whose name sits beside
+/// it ([`SIBLING_NAMED_VALUES`]), that sibling string.
+fn value_name_looks_like_credential(config: &Value, path: &[ConfigPathComponent]) -> bool {
+    let Some((ConfigPathComponent::Key(leaf), parent)) = path.split_last() else {
+        return false;
+    };
+    let leaf = normalize_key(leaf);
+    let siblings = SIBLING_NAMED_VALUES
+        .iter()
+        .find(|(name, _)| *name == leaf)
+        .map(|(_, siblings)| *siblings);
+    if let (Some(siblings), Some(object)) = (
+        siblings,
+        value_at(config, parent).and_then(Value::as_object),
+    ) {
+        let named = object
+            .iter()
+            .filter(|(key, _)| siblings.contains(&normalize_key(key).as_str()))
+            .filter_map(|(_, value)| value.as_str())
+            .any(name_looks_like_credential);
+        if named {
+            return true;
+        }
+    }
     let mut keys = path.iter().rev().filter_map(|part| match part {
         ConfigPathComponent::Key(key) => Some(key.as_str()),
         ConfigPathComponent::Index(_) => None,
@@ -658,7 +703,7 @@ fn entry_name_looks_like_credential(path: &[ConfigPathComponent]) -> bool {
         };
         name = entry;
     }
-    is_sensitive_key(name) || normalize_key(name).ends_with("key")
+    name_looks_like_credential(name)
 }
 
 /// Short, credential-named operator values (see
@@ -1575,18 +1620,6 @@ mod tests {
                 vec!["custom_headers.X-Scope-OrgID"],
             ),
             (
-                "api_chargeback_sink",
-                serde_json::json!({"clickhouse": {"insert_query_params": {
-                    "database": "default",
-                    "password": "synthetic-clickhouse-password"
-                }}}),
-                vec!["clickhouse.insert_query_params.password"],
-                vec![
-                    "clickhouse.insert_query_params.database",
-                    "clickhouse.insert_query_params.password",
-                ],
-            ),
-            (
                 "proxy_alerts",
                 serde_json::json!({"channels": [{"headers": {"x-route": "ops", "x-hook": "synthetic-hook-key"}}]}),
                 vec!["channels.[0].headers.x-hook"],
@@ -1670,20 +1703,101 @@ mod tests {
             vec!["rules.[0].match.query_params.token.exact"]
         );
 
-        let chargeback = serde_json::json!({"clickhouse": {"insert_query_params": {
-            "password": "pw1",
-            "database": "default"
-        }}});
+        // A value whose name sits in a sibling field is judged by that name.
+        let transform = serde_json::json!({"rules": [
+            {"key": "X-Api-Key", "value": "k1"},
+            {"key": "Authorization", "value": "abc"},
+            {"key": "X-Env", "value": "1"}
+        ]});
         assert_eq!(
             dotted(short_credential_named_paths(
-                "api_chargeback_sink",
-                &chargeback
+                "request_transformer",
+                &transform
             )),
-            vec!["clickhouse.insert_query_params.password"]
+            vec!["rules.[0].value", "rules.[1].value"]
+        );
+        let dispatch_transform = serde_json::json!({"rules": [{"request_transform": [
+            {"operation": "set", "name": "x-route-token", "value": "t1"},
+            {"operation": "set", "name": "x-tier", "value": "gold"}
+        ]}]});
+        assert_eq!(
+            dotted(short_credential_named_paths(
+                "mesh_route_dispatch",
+                &dispatch_transform
+            )),
+            vec!["rules.[0].request_transform.[0].value"]
+        );
+        for (plugin, config, path) in [
+            (
+                "request_termination",
+                serde_json::json!({"trigger": {"header": "x-api-key", "header_value": "k1"}}),
+                "trigger.header_value",
+            ),
+            (
+                "transaction_debugger",
+                serde_json::json!({"capture_request_header": "authorization", "capture_request_header_value": "abc"}),
+                "capture_request_header_value",
+            ),
+        ] {
+            assert_eq!(
+                dotted(short_credential_named_paths(plugin, &config)),
+                vec![path],
+                "{plugin}"
+            );
+        }
+        let ordinary = serde_json::json!({"trigger": {"header": "x-kill", "header_value": "on"}});
+        assert!(short_credential_named_paths("request_termination", &ordinary).is_empty());
+    }
+
+    /// Edge redacts every `api_chargeback_sink` insert query parameter but
+    /// refuses credential-named keys, so an accepted one is a ClickHouse
+    /// setting: an export site whose value stays literal, long or short. A
+    /// credential-named key is still caught by the key-name heuristics.
+    #[test]
+    fn chargeback_insert_query_params_are_export_only() {
+        let tuning = serde_json::json!({"clickhouse": {
+            "url": "https://clickhouse.example:8443",
+            "insert_query_params": {
+                "async_insert": "1",
+                "date_time_input_format": "best_effort",
+                "session_timezone": "Europe/Berlin"
+            }
+        }});
+        let classification = classify_plugin_config("api_chargeback_sink", &tuning);
+        assert_eq!(dotted(classification.sensitive), vec!["clickhouse.url"]);
+        assert!(classification.unbrokered.is_empty());
+        assert!(classification.short_credential_named.is_empty());
+        assert_eq!(
+            dotted(
+                rule_declared_paths("api_chargeback_sink", &tuning)
+                    .into_iter()
+                    .collect()
+            ),
+            vec!["clickhouse.url"]
+        );
+        assert_eq!(
+            dotted(
+                export_redacted_paths("api_chargeback_sink", &tuning)
+                    .into_iter()
+                    .collect()
+            ),
+            vec![
+                "clickhouse.insert_query_params.async_insert",
+                "clickhouse.insert_query_params.date_time_input_format",
+                "clickhouse.insert_query_params.session_timezone",
+                "clickhouse.url",
+            ]
         );
 
-        let transform = serde_json::json!({"rules": [{"key": "X-Api-Key", "value": "1"}]});
-        assert!(short_credential_named_paths("request_transformer", &transform).is_empty());
+        let named = serde_json::json!({"clickhouse": {"insert_query_params": {
+            "password": "synthetic-clickhouse-password"
+        }}});
+        let classification = classify_plugin_config("api_chargeback_sink", &named);
+        assert!(classification.sensitive.is_empty());
+        assert_eq!(
+            dotted(classification.unbrokered),
+            vec!["clickhouse.insert_query_params.password"]
+        );
     }
 
     /// Edge classifies the `mesh_authz` policy operands as `secret`, but
