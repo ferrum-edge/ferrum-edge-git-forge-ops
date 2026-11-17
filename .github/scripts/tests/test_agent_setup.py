@@ -340,6 +340,44 @@ class AgentSetupTests(unittest.TestCase):
                     ],
                 )
 
+    def test_walks_the_target_of_an_in_tree_directory_link(self):
+        # sol F1: `.github` is an accepted in-tree link to `setup-copy/`,
+        # whose `workflows` directory links out of the checkout. Later checks
+        # read the workflows through `.github`, so the target is walked too.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "checkout"
+            root.mkdir()
+            write_valid_setup(root)
+            copy = root / "setup-copy"
+            (root / ".github").rename(copy)
+            (root / ".github").symlink_to("setup-copy", target_is_directory=True)
+            outside = base / "outside-workflows"
+            (copy / "workflows").rename(outside)
+            (copy / "workflows").symlink_to(
+                os.path.relpath(outside, copy), target_is_directory=True
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn(
+            "setup-copy/workflows: symlink leaves the tree under review", violations[0]
+        )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_directory_link_cycles_and_aliases_are_walked_once(self):
+        # A link back to an ancestor and an alias of a walked directory end
+        # the walk, and the FIFO behind both is reported once.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root)
+            rules = root / ".claude" / "rules"
+            (rules / "loop").symlink_to("..", target_is_directory=True)
+            (root / ".claude" / "alias").symlink_to("rules", target_is_directory=True)
+            os.mkfifo(rules / "pipe.md")
+            violations = check_agent_setup.collect_violations(root)
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn(".claude/rules/pipe.md: only regular files", violations[0])
+
     def test_rejects_a_link_that_climbs_out_and_back_in(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

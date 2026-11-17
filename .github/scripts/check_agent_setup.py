@@ -173,22 +173,26 @@ def setup_tree_violations(root: Path) -> list[str]:
     `SETUP_TREE_ENTRIES` entry, the entry itself included, is `lstat`-ed; a
     link is judged by its text (a relative target may not climb above the
     root, even to come back in) and by its resolution, which must stay inside
-    the root and name a directory or a regular file. Devices, FIFOs and
-    sockets are refused, since reading one can hang the job.
+    the root and name a directory or a regular file. A link to an in-tree
+    directory is followed and its target walked the same way (once per
+    resolved directory), because later checks read through it. Devices, FIFOs
+    and sockets are refused, since reading one can hang the job. `.git`
+    metadata is skipped.
     """
     real_root = Path(os.path.realpath(root))
     violations: list[str] = []
 
-    def judge(path: Path) -> bool:
-        """Record any violation at `path`; True when it is a directory to walk."""
+    def judge(path: Path) -> Path | None:
+        """Record any violation at `path`; return the directory to walk behind
+        it (itself, or an in-tree link's resolved target), else None."""
         relative = path.relative_to(root).as_posix()
         try:
             mode = os.lstat(path).st_mode
         except FileNotFoundError:
-            return False
+            return None
         except OSError as error:
             violations.append(f"{relative}: cannot inspect setup content: {error.strerror}")
-            return False
+            return None
         if stat.S_ISLNK(mode):
             target = os.readlink(path)
             resolved = Path(os.path.realpath(path))
@@ -198,36 +202,50 @@ def setup_tree_violations(root: Path) -> list[str]:
                     f"{relative}: symlink leaves the tree under review ({target!r}); "
                     "setup content must resolve inside the repository"
                 )
-                return False
+                return None
             try:
                 resolved_mode = os.stat(path).st_mode
             except OSError:
                 violations.append(f"{relative}: symlink does not resolve ({target!r})")
-                return False
-            if not (stat.S_ISDIR(resolved_mode) or stat.S_ISREG(resolved_mode)):
+                return None
+            if stat.S_ISDIR(resolved_mode):
+                return resolved
+            if not stat.S_ISREG(resolved_mode):
                 violations.append(
                     f"{relative}: symlink resolves to a special file ({target!r})"
                 )
-            return False
+            return None
         if stat.S_ISDIR(mode):
-            return True
+            return path
         if not stat.S_ISREG(mode):
             violations.append(
                 f"{relative}: only regular files, directories and in-tree symlinks "
                 "may hold setup content; this is a special file"
             )
-        return False
+        return None
 
-    for name in SETUP_TREE_ENTRIES:
-        top = root / name
-        if not judge(top):
+    walked: set[Path] = set()
+    pending = [directory for name in SETUP_TREE_ENTRIES if (directory := judge(root / name))]
+    while pending:
+        top = pending.pop(0)
+        real_top = Path(os.path.realpath(top))
+        if real_top in walked:
             continue
+        walked.add(real_top)
         for directory, dirnames, filenames in os.walk(top, followlinks=False):
             here = Path(directory)
-            dirnames.sort()
+            dirnames[:] = sorted(
+                name for name in dirnames if not (name == ".git" and not (here / name).is_symlink())
+            )
             for entry in sorted(dirnames + filenames):
-                judge(here / entry)
-    return violations
+                path = here / entry
+                behind = judge(path)
+                # A real subdirectory is walked by `os.walk` itself; a link to
+                # an in-tree directory is walked on its own.
+                if behind is not None and behind != path:
+                    pending.append(behind)
+    # A directory reached both directly and through a link reports once.
+    return list(dict.fromkeys(violations))
 
 
 def read_text(path: Path) -> str:
