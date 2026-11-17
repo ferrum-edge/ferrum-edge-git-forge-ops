@@ -77,6 +77,12 @@ class EdgeMainDriftTests(unittest.TestCase):
             "${{ runner.temp }}/edge-main-lifecycle-result.json",
         )
         self.assertNotIn("upload-artifact", body)
+        # The scenarios' gitforgeops resolves `ferrum-edge` on PATH, so the
+        # Edge main binary goes first on it, or the suite tests nothing.
+        self.assertIn(
+            'PATH="$(dirname -- "$FERRUM_EDGE_BINARY_PATH"):$PATH" bash tests/lifecycle/run.sh',
+            lifecycle["run"],
+        )
 
     def test_only_the_issue_job_writes_and_it_runs_no_code(self):
         issue = self.jobs["edge-main-drift-issue"]

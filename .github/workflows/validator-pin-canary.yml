@@ -360,7 +360,12 @@ jobs:
         env:
           FERRUM_EDGE_BINARY_PATH: ${{ steps.edge.outputs.binary }}
           LIFECYCLE_RESULT: ${{ runner.temp }}/edge-main-lifecycle-result.json
-        run: bash tests/lifecycle/run.sh
+        # The scenarios run gitforgeops, which finds `ferrum-edge` on PATH (in
+        # lifecycle.yml the installer puts it there), so put the Edge main
+        # binary first on this step's PATH.
+        run: |
+          set -euo pipefail
+          PATH="$(dirname -- "$FERRUM_EDGE_BINARY_PATH"):$PATH" bash tests/lifecycle/run.sh
 
       - name: Write the report
         id: report
