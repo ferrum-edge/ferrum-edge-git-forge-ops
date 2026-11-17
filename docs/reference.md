@@ -493,8 +493,13 @@ with the admin credential.
   credential bundle resolves them, so loading a bundle does not change which
   fields are secret-bearing. Replacing an ancestor also hides that value's
   non-secret contents, so those are counted separately and keep the run
-  non-authoritative (see exit codes above). Edge v0.9.9 does not publish which
-  pointers it redacted, so a
+  non-authoritative (see exit codes above). The fingerprinted locations
+  GitForgeOps predicts also cover what Ferrum Edge releases after v0.9.20
+  withhold: the `header`, `query` and `cookie` operands of a plugin `trigger`,
+  every string, number or boolean in a custom plugin's config, newer built-in
+  plugin paths, and TLS private-key material in a Proxy, Upstream or plugin
+  config; a gateway that still sends those values is compared as usual. Edge
+  v0.9.9 does not publish which pointers it redacted, so a
   fingerprint-shaped string anywhere else is compared like any value and shows
   as drift; a field Edge fingerprints but GitForgeOps does not classify, with
   a literal repository value, also shows as drift (noisy, never silent). Where

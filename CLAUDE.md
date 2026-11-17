@@ -662,6 +662,15 @@ which the export lacks.
   covered by a baseline or `--accept-unverified-secrets`.
   Desired Consumers go through `project_consumer_for_export` (keyauth key,
   jwt/hmac secret, mtls identity only; `basicauth` dropped).
+- The predicted sites also mirror what Edge `main` (after the pinned v0.9.20)
+  withholds: `header`/`query`/`cookie` trigger operands
+  (`collect_trigger_sites`), every scalar leaf of a custom plugin's config,
+  the built-in paths of `plugin_config::export_only_rules_for`, and TLS
+  private-key material in Proxy, Upstream and plugin-config bodies
+  (`collect_tls_material_sites`). Export-only rules never change import
+  brokering, scrubbing or display admission. A gateway that sends such a value
+  literally is compared as usual; re-check the set against Edge's
+  `plugin_config_projection.rs` on every Edge pin bump.
 - `FingerprintBaseline` (`--fingerprint-baseline`, `--write-fingerprint-baseline`)
   compares two exports per `(kind, id, pointer)` on declared resources only.
   A different `fingerprint_key_id` is "not comparable", never drift. Changes
