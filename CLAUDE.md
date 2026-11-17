@@ -1338,8 +1338,7 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   `mesh_route_dispatch` request-transform values and match operands, every
   arbitrary header map — `otel_tracing`, `opa`, `ai_transcript_audit`,
   `http_logging`, `loki_logging`, `ws_logging`, `proxy_alerts`,
-  `ai_tool_governor` approval, `mcp_gateway` server headers, plus the
-  `api_chargeback_sink` ClickHouse insert query-parameter map (credentials ride
+  `ai_tool_governor` approval, `mcp_gateway` server headers (credentials ride
   there, but so do short ordinary headers, and a short declared secret would
   refuse every live `/backup` read) —
   `fault_injection` and `response_mock` match conditions, `waf` custom-rule
@@ -1348,11 +1347,15 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   use `RuleKind::Value`. A string of at least 8 bytes is brokered, masked,
   scrubbed and literal-gated like a secret; a shorter one (`value: "1"`)
   stays an ordinary literal, since the bundle and scrubber refuse it. None is
-  rule-declared for display admission. A short one whose entry name looks
-  like a credential (`PluginConfigClassification::short_credential_named`:
-  key-name heuristics or a name ending in `key`, skipping an operand's
-  match-kind key) gets an import warning notice and a non-blocking
-  security-audit warning, never the value. Keep `secret` for fields that only
+  rule-declared for display admission. A short one whose name looks like a
+  credential (`PluginConfigClassification::short_credential_named`: key-name
+  heuristics or a name ending in `key`, judged on the map entry, skipping an
+  operand's match-kind key, or on the sibling name field of
+  `SIBLING_NAMED_VALUES`) gets an import warning notice and a non-blocking
+  security-audit warning (`plan`, `review`, `apply`; `validate` runs no
+  audit), never the value. `api_chargeback_sink`
+  `clickhouse.insert_query_params.*` is export-only, not a rule: Edge refuses
+  credential-named keys there, so its values are ClickHouse settings. Keep `secret` for fields that only
   ever hold a credential (`otel_tracing` `authorization`, `loki_logging`
   `authorization_header`). `export_redacted_paths` adds every
   matched site, whatever its length or JSON type, for `/config/export`
