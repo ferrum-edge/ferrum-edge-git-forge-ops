@@ -122,6 +122,7 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
             upstream_subset: None,
             api_spec_id: None,
             websocket_idle_timeout_seconds: None,
+            websocket_permessage_deflate: Default::default(),
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
@@ -5782,6 +5783,72 @@ async fn a_top_level_field_the_repository_declares_is_written_not_refused() {
         .cloned()
         .expect("PUT request");
     assert!(put.contains("\"future_upstream_option\":7"), "{put}");
+}
+
+/// Edge v0.9.9's `websocket_permessage_deflate` used to decode into the live
+/// row's `extra`, so apply refused the whole namespace whenever it rewrote a
+/// proxy carrying a non-default value. It is modeled now: the live decode
+/// types it, nothing is refused, and the declared value is written.
+#[tokio::test]
+async fn a_live_websocket_permessage_deflate_is_modeled_and_written_not_refused() {
+    use gitforgeops::config::schema::WebSocketPermessageDeflate;
+
+    let mut live_row = serde_json::to_value(proxy("p1", "team-alpha", None)).unwrap();
+    live_row["websocket_permessage_deflate"] = serde_json::json!("terminate");
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({"version": "1", "proxies": [live_row]}),
+    );
+    assert!(extras.unmodeled_nested_fields.is_empty());
+    assert!(
+        live.proxies[0].extra.is_empty(),
+        "{:?}",
+        live.proxies[0].extra
+    );
+    assert_eq!(
+        live.proxies[0].websocket_permessage_deflate,
+        WebSocketPermessageDeflate::Terminate
+    );
+
+    let mut declared = proxy("p1", "team-alpha", None);
+    declared.websocket_permessage_deflate = WebSocketPermessageDeflate::Terminate;
+    declared.backend_port = 8081;
+    let desired = GatewayConfig {
+        proxies: vec![declared],
+        ..Default::default()
+    };
+
+    let mut routes = vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        ("PUT /proxies/p1".into(), 200, "{}".into(), vec![]),
+    ];
+    routes.extend(tagged_rows(&live));
+    let (url, requests) = spawn_recording_gateway(routes);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.updated, 1);
+    let put = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.starts_with("PUT /proxies/p1"))
+        .cloned()
+        .expect("PUT request");
+    assert!(
+        put.contains("\"websocket_permessage_deflate\":\"terminate\""),
+        "{put}"
+    );
 }
 
 #[tokio::test]

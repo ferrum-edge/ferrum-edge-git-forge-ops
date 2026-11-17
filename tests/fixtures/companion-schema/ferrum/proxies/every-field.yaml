@@ -73,6 +73,9 @@ spec:
   udp_max_response_amplification_factor: 3.5
   tcp_idle_timeout_seconds: 600
   websocket_idle_timeout_seconds: 300
+  # Edge refuses anything but `strip` on a stream proxy; this fixture only
+  # exercises the serde mirror (see ../../README.md).
+  websocket_permessage_deflate: terminate
   stream_proxy_protocol: true
   backend_proxy_protocol: v2
   stream_match:
