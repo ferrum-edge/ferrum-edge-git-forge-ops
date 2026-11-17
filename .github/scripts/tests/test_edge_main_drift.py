@@ -60,6 +60,11 @@ class EdgeMainDriftTests(unittest.TestCase):
             if step.get("uses", "").startswith("actions/checkout@"):
                 self.assertEqual(step["with"]["persist-credentials"], "false")
         steps = {step.get("name"): step for step in job["steps"]}
+        # Cosign comes from an allowed action's checksum manifest, never a
+        # fallback download.
+        cosign = steps["Install Cosign"]
+        self.assertTrue(cosign["uses"].startswith("taiki-e/install-action@"))
+        self.assertEqual(cosign["with"], {"tool": "cosign@3.1.4", "checksum": "true", "fallback": "none"})
         resolve = steps["Resolve the Ferrum Edge main image"]["run"]
         # The digest is verified before anything is pulled or copied from it.
         self.assertIn(IDENTITY, resolve)
