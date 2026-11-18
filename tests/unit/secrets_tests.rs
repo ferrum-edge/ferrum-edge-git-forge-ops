@@ -1370,8 +1370,8 @@ fn resolver_replaces_known_slot_and_reports_resolved() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     consumer.credentials.insert(
         "keyauth".to_string(),
@@ -1406,8 +1406,8 @@ fn resolver_reports_missing_required() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     consumer.credentials.insert(
         "keyauth".to_string(),
@@ -1438,8 +1438,8 @@ fn report_secrets_does_not_mutate_config() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     let placeholder = "${gh-env-secret:alloc=require}";
     consumer.credentials.insert(
@@ -1482,8 +1482,8 @@ fn skipping_resolve_preserves_placeholder_strings_verbatim() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     let placeholder = "${gh-env-secret:alloc=generate}";
     consumer.credentials.insert(
@@ -1522,8 +1522,8 @@ fn resolver_replaces_rotate_placeholder_with_bundle_value() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     consumer.credentials.insert(
         "keyauth".to_string(),
@@ -1566,8 +1566,8 @@ fn resolver_reports_rotate_without_bundle_value_as_needs_allocation() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     consumer.credentials.insert(
         "keyauth".to_string(),
@@ -1593,8 +1593,8 @@ fn resolver_reports_needs_allocation_for_generate() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     consumer.credentials.insert(
         "keyauth".to_string(),
@@ -1621,8 +1621,8 @@ fn flat_leaf_and_nested_credentials_produce_distinct_slots() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     let mut dotted_leaf = serde_json::Map::new();
     dotted_leaf.insert(
@@ -1669,8 +1669,8 @@ fn resolver_reads_legacy_dotted_slot_for_nested_credentials() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     let mut nested = serde_json::Map::new();
     nested.insert(
@@ -1796,8 +1796,8 @@ fn slot_components_escape_slash_and_tilde_in_names() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     consumer.credentials.insert(
         "keyauth".to_string(),
@@ -1828,8 +1828,8 @@ fn object_key_with_bracket_distinct_from_array_index() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     // Object with a literal "[0]" key.
     let mut bracket_obj = serde_json::Map::new();
@@ -1916,8 +1916,8 @@ fn slot_path_matches_walker_for_nested_credentials_and_tilde() {
             custom_id: None,
             credentials: Default::default(),
             acl_groups: vec![],
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         };
         consumer.credentials.insert(cred_key.to_string(), value);
         cfg.consumers.push(consumer);
@@ -2080,8 +2080,8 @@ fn consumer_with(cred_key: &str, value: serde_json::Value) -> GatewayConfig {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     consumer.credentials.insert(cred_key.to_string(), value);
     cfg.consumers.push(consumer);
@@ -5468,8 +5468,8 @@ fn upstream_with_consul_token(token: Option<&str>) -> gitforgeops::config::schem
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     }
 }
 

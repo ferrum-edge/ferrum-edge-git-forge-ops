@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::timestamp::Timestamp;
 
 fn default_namespace() -> String {
     "ferrum".to_string()
@@ -906,9 +907,9 @@ pub struct Proxy {
     #[serde(default)]
     pub allowed_ws_origins: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<Timestamp>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -945,9 +946,9 @@ pub struct Consumer {
     #[serde(default)]
     pub acl_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<Timestamp>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -1054,9 +1055,9 @@ pub struct Upstream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<Timestamp>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a
@@ -1092,9 +1093,9 @@ pub struct PluginConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_spec_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
+    pub created_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<Timestamp>,
     /// Unknown top-level fields, carried verbatim. Empty unless
     /// `FERRUM_ALLOW_UNKNOWN_FIELDS=true` let them past the strict loader —
     /// see [`PassthroughFields`]. No `skip_serializing_if` is needed: a

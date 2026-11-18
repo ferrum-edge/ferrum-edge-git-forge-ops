@@ -863,6 +863,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- `chrono` is no longer a dependency (RUSTSEC-2026-0543: chrono is
+  unmaintained; #736). The four things it did (reading the clock, Unix
+  seconds for JWT claims, ordering RFC 3339 stamps, and the resource
+  `created_at` / `updated_at` fields) move to `src/timestamp.rs`, built on the
+  standard library, and `chrono` and its nine platform crates leave
+  `Cargo.lock`. Every serialized timestamp keeps its exact bytes: resource
+  timestamps are still UTC with a `Z` and a 0, 3, 6 or 9-digit fraction, and
+  the state file's `last_applied_at`, `last_rotated` and `recorded_at` and the
+  apply lock's `created_at` still end in `+00:00`.
+- **BREAKING:** resource `created_at` / `updated_at` values must be RFC 3339
+  (`T`, `t` or a space between date and time, and `Z`, `z` or a `±HH:MM`
+  offset). chrono's lenient extras (no colon in the offset, a `UTC` suffix,
+  unpadded fields, spaces inside the stamp, signed years) now fail at load.
+  Values exported by Ferrum Edge or written by `gitforgeops import` are
+  unaffected.
 - Update `quinn-udp` to 0.5.16 for RUSTSEC-2026-0538 (GHSA-6pp4-4cxf-xf88),
   a receive-loop spin after a truncated datagram on targets that read one
   datagram per `recvmsg`.

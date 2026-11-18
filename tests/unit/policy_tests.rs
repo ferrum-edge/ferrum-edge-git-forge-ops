@@ -70,8 +70,8 @@ fn proxy(id: &str, protocol: BackendScheme, read_timeout: u64, tls_verify: bool)
         stream_proxy_protocol: None,
         backend_proxy_protocol: None,
         stream_match: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     }
 }
 
@@ -89,8 +89,8 @@ fn plugin_config(id: &str, plugin_name: &str, namespace: &str) -> PluginConfig {
         trigger: None,
         api_spec_id: None,
         config: Default::default(),
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     }
 }
 
@@ -115,8 +115,8 @@ fn upstream(id: &str, targets: Vec<UpstreamTarget>) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     }
 }
 
@@ -2126,8 +2126,8 @@ fn require_auth_plugin_ignores_disabled_plugins() {
         trigger: None,
         api_spec_id: None,
         config: Default::default(),
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     let cfg = GatewayConfig {
         proxies: vec![p],
@@ -2167,8 +2167,8 @@ fn require_auth_plugin_ignores_disabled_plugins() {
         trigger: None,
         api_spec_id: None,
         config: Default::default(),
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     let cfg2 = GatewayConfig {
         proxies: vec![proxy("p1", BackendScheme::Https, 30_000, true)],
@@ -2199,8 +2199,8 @@ fn require_auth_plugin_uses_explicit_allowlist() {
         trigger: None,
         api_spec_id: None,
         config: Default::default(),
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
 
     let policies = PolicyConfig {
@@ -3345,8 +3345,8 @@ fn forbid_tls_verify_disabled_covers_upstreams() {
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     let cfg = GatewayConfig {
         upstreams: vec![upstream_insecure],
@@ -3689,8 +3689,8 @@ fn catalog_plugin(
         trigger: None,
         api_spec_id: None,
         config,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     }
 }
 

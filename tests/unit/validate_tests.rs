@@ -69,8 +69,8 @@ fn consumer_config(credentials: serde_json::Value) -> gitforgeops::config::schem
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
             acl_groups: Vec::new(),
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }],
         ..GatewayConfig::default()
     }
@@ -398,8 +398,8 @@ fn resolved_plugin_config_secrets_are_redacted() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }],
         ..GatewayConfig::default()
     };
@@ -650,8 +650,8 @@ fn consumer_config_for_standins(
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
             acl_groups: Vec::new(),
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }],
         ..GatewayConfig::default()
     }
@@ -1150,8 +1150,8 @@ fn plugin_config_for(
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }],
         ..GatewayConfig::default()
     }
@@ -1557,8 +1557,8 @@ fn plugin_config_stand_ins_are_shape_aware_and_input_only() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
 
     let placeholder = serde_json::json!("${gh-env-secret:alloc=require}");

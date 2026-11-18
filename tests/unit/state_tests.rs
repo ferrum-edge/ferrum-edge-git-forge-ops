@@ -47,6 +47,31 @@ fn partial_apply_keeps_the_previous_last_applied_metadata() {
     );
 }
 
+/// The ledger keeps chrono's `to_rfc3339` spelling (`+00:00`, 0/3/6/9 fraction
+/// digits) after the move off chrono, and the stamp orders against older ones.
+#[test]
+fn last_applied_stamp_keeps_the_rfc3339_offset_spelling() {
+    let mut state = StateFile {
+        last_applied_at: Some("2026-08-01T00:00:00+00:00".to_string()),
+        ..StateFile::default()
+    };
+    state.stamp_last_applied_if_clean(true);
+    let stamp = state.last_applied_at.clone().unwrap();
+    assert!(stamp.ends_with("+00:00"), "{stamp}");
+    let (seconds, _) = stamp.rsplit_once('+').unwrap();
+    let fraction = seconds.split_once('.').map_or("", |(_, digits)| digits);
+    assert!(
+        [0, 3, 6, 9].contains(&fraction.len()),
+        "{stamp}: {} fraction digits",
+        fraction.len()
+    );
+    let parsed = gitforgeops::timestamp::Timestamp::parse_rfc3339(&stamp).unwrap();
+    assert_eq!(parsed.to_rfc3339(), stamp);
+    let earlier =
+        gitforgeops::timestamp::Timestamp::parse_rfc3339("2026-08-01T00:00:00+00:00").unwrap();
+    assert!(parsed > earlier);
+}
+
 #[test]
 fn state_file_writes_and_reads_per_env() {
     let dir = TempDir::new().unwrap();
@@ -270,8 +295,8 @@ fn scoped_record_preserves_entries_outside_scope() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }
     }
 
@@ -382,8 +407,8 @@ fn exact_live_evidence_keeps_create_pending_until_an_idempotent_assertion() {
     // The gateway stamps both fields on the live row; the desired document
     // omits them. The subset match must still hold because timestamps are
     // never compared.
-    exact_live.upstreams[0].created_at = Some(chrono::Utc::now());
-    exact_live.upstreams[0].updated_at = Some(chrono::Utc::now());
+    exact_live.upstreams[0].created_at = Some(gitforgeops::timestamp::Timestamp::now());
+    exact_live.upstreams[0].updated_at = Some(gitforgeops::timestamp::Timestamp::now());
     let actual = BTreeMap::from([("ferrum".to_string(), exact_live)]);
 
     assert_eq!(
@@ -1161,8 +1186,8 @@ fn record_op_preserves_state_for_failed_delete() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }
     }
 
@@ -1257,8 +1282,8 @@ fn record_op_preserves_state_for_failed_delete() {
         custom_id: None,
         credentials: Default::default(),
         acl_groups: vec![],
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     };
     let cfg = GatewayConfig {
         consumers: vec![consumer],

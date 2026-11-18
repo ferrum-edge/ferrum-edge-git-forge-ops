@@ -185,7 +185,7 @@ fn gateway_verifies(
 fn mint_from_loaded_env() -> (EnvConfig, String) {
     let config = load_env_config().unwrap();
     let secret = config.admin_jwt_secret.as_deref().unwrap();
-    let now = chrono::Utc::now().timestamp();
+    let now = gitforgeops::timestamp::Timestamp::now().unix_seconds();
     let token = mint_jwt_at(secret, &JwtOptions::from_env(&config), now)
         .unwrap()
         .token;
