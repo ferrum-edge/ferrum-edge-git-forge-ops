@@ -336,8 +336,10 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 ///   `session_timezone`). Its value stays literal; brokering
 ///   `date_time_input_format: best_effort` would demand a hand-seeded slot
 ///   for a tuning knob. A credential-named key that reaches the repository
-///   anyway is still caught by the key-name heuristics (an import plaintext
-///   allowance and the literal-secret gate).
+///   anyway (import reads a backup file without Edge's validation) is still
+///   flagged by [`credential_named_parameter_maps`], which runs the key-name
+///   heuristics plus Edge's own refused names on these keys: an import
+///   plaintext allowance and the literal-secret gate.
 ///
 /// Every other credential or operator-chosen token Edge redacts is a
 /// [`rules_for`] rule instead (brokered, literal-gated and masked), whether
@@ -542,6 +544,71 @@ fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]
     }
 }
 
+/// Literal parameter maps (keyed by parameter name, not brokered) whose keys
+/// are judged by [`parameter_name_looks_like_credential`]: a string under a
+/// credential-named key joins the builtin heuristic matches, so import needs
+/// a plaintext allowance for it and `apply` refuses it as a literal secret.
+/// Every other value in the map stays an ordinary setting.
+fn credential_named_parameter_maps(plugin_name: &str) -> &'static [&'static [&'static str]] {
+    match plugin_name {
+        "api_chargeback_sink" => &[&["clickhouse", "insert_query_params", "*"]],
+        _ => &[],
+    }
+}
+
+/// Parameter names (normalized, see [`normalize_key`]) Ferrum Edge's
+/// `api_chargeback_sink` validation refuses outright
+/// (`CREDENTIAL_QUERY_PARAM_NAMES`), plus short credential spellings no
+/// ClickHouse setting uses (`pwd`, `pass`, `auth`, `sig`, `signature`).
+const CREDENTIAL_PARAMETER_NAMES: &[&str] = &[
+    "accesstoken",
+    "password",
+    "sessionid",
+    "user",
+    "pwd",
+    "pass",
+    "auth",
+    "sig",
+    "signature",
+];
+
+/// Substrings (normalized) that make Edge refuse a parameter name
+/// (`CREDENTIAL_QUERY_PARAM_MARKERS`; `api_key` normalizes to `apikey`).
+const CREDENTIAL_PARAMETER_MARKERS: &[&str] =
+    &["apikey", "credential", "passwd", "secret", "token"];
+
+/// Whether a literal parameter's name looks like a credential: the key-name
+/// heuristics ([`name_looks_like_credential`]), plus every name Edge's
+/// validation would refuse, in case a repository or backup file holds one.
+fn parameter_name_looks_like_credential(name: &str) -> bool {
+    let normalized = normalize_key(name);
+    name_looks_like_credential(name)
+        || CREDENTIAL_PARAMETER_NAMES.contains(&normalized.as_str())
+        || CREDENTIAL_PARAMETER_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
+}
+
+/// String leaves under a credential-named key of a
+/// [`credential_named_parameter_maps`] map.
+fn collect_credential_named_parameters(
+    plugin_name: &str,
+    config: &Value,
+    found: &mut BTreeSet<Vec<ConfigPathComponent>>,
+) {
+    for path in credential_named_parameter_maps(plugin_name) {
+        walk_rule(config, path, &[], &mut |node, at, complete| {
+            let named = matches!(
+                at.last(),
+                Some(ConfigPathComponent::Key(name)) if parameter_name_looks_like_credential(name)
+            );
+            if complete && named {
+                collect_string_paths(node, at, found);
+            }
+        });
+    }
+}
+
 /// What a plugin config's string leaves were classified as.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PluginConfigClassification {
@@ -632,6 +699,7 @@ pub(crate) fn classify_plugin_config(
     }
     let mut heuristic = BTreeSet::new();
     collect_heuristic_paths(config, &root, &mut heuristic, true);
+    collect_credential_named_parameters(plugin_name, config, &mut heuristic);
     let unbrokered = heuristic
         .into_iter()
         .filter(|path| !sensitive.contains(path) && !ordinary.contains(path))
@@ -1789,14 +1857,68 @@ mod tests {
             ]
         );
 
+        // Every name Edge refuses (exact names and markers anywhere in the
+        // name), the key-name heuristics and short credential spellings are
+        // flagged, long or short, so import needs an allowance and `apply`
+        // refuses the literal; the ordinary settings beside them are not.
         let named = serde_json::json!({"clickhouse": {"insert_query_params": {
-            "password": "synthetic-clickhouse-password"
+            "async_insert": "1",
+            "date_time_input_format": "best_effort",
+            "password": "synthetic-clickhouse-password",
+            "token_value": "z9n4-clickhouse-opaque-material",
+            "User": "default",
+            "session_id": "s1",
+            "access_token": "t",
+            "x_api_key_v": "synthetic-api-material",
+            "my-credential-ref": "c",
+            "PASSWD2": "p",
+            "client_secret_id": "s",
+            "pwd": "hunter2-hunter2",
+            "pass": "p",
+            "auth": "a",
+            "sig": "s",
+            "signature": "synthetic-signature",
+            "authorization": "Bearer x",
+            "x-functions-key": "k"
         }}});
         let classification = classify_plugin_config("api_chargeback_sink", &named);
         assert!(classification.sensitive.is_empty());
+        assert!(classification.short_credential_named.is_empty());
+        let flagged = [
+            "clickhouse.insert_query_params.PASSWD2",
+            "clickhouse.insert_query_params.User",
+            "clickhouse.insert_query_params.access_token",
+            "clickhouse.insert_query_params.auth",
+            "clickhouse.insert_query_params.authorization",
+            "clickhouse.insert_query_params.client_secret_id",
+            "clickhouse.insert_query_params.my-credential-ref",
+            "clickhouse.insert_query_params.pass",
+            "clickhouse.insert_query_params.password",
+            "clickhouse.insert_query_params.pwd",
+            "clickhouse.insert_query_params.session_id",
+            "clickhouse.insert_query_params.sig",
+            "clickhouse.insert_query_params.signature",
+            "clickhouse.insert_query_params.token_value",
+            "clickhouse.insert_query_params.x-functions-key",
+            "clickhouse.insert_query_params.x_api_key_v",
+        ];
+        assert_eq!(dotted(classification.unbrokered), flagged);
         assert_eq!(
-            dotted(classification.unbrokered),
-            vec!["clickhouse.insert_query_params.password"]
+            dotted(sensitive_string_paths("api_chargeback_sink", &named)),
+            flagged
+        );
+        assert!(rule_declared_paths("api_chargeback_sink", &named).is_empty());
+
+        // The extra names apply to this map only: elsewhere in the same
+        // config (and in other plugins) `user` is an ordinary setting.
+        let elsewhere = serde_json::json!({"clickhouse": {"user": "default", "insert_query_params": {"async_insert": "1"}}});
+        assert!(classify_plugin_config("api_chargeback_sink", &elsewhere)
+            .unbrokered
+            .is_empty());
+        assert!(
+            classify_plugin_config("http_logging", &serde_json::json!({"session_id": "s1"}))
+                .unbrokered
+                .is_empty()
         );
     }
 

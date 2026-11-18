@@ -1350,12 +1350,18 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   rule-declared for display admission. A short one whose name looks like a
   credential (`PluginConfigClassification::short_credential_named`: key-name
   heuristics or a name ending in `key`, judged on the map entry, skipping an
-  operand's match-kind key, or on the sibling name field of
-  `SIBLING_NAMED_VALUES`) gets an import warning notice and a non-blocking
+  operand's match-kind key, or on the sibling `key`/`header` field of
+  `SIBLING_NAMED_VALUES`; a leaf ending in an array index is judged by its
+  nearest enclosing key) gets an import warning notice and a non-blocking
   security-audit warning (`plan`, `review`, `apply`; `validate` runs no
   audit), never the value. `api_chargeback_sink`
   `clickhouse.insert_query_params.*` is export-only, not a rule: Edge refuses
-  credential-named keys there, so its values are ClickHouse settings. Keep `secret` for fields that only
+  credential-named keys there, so its values are ClickHouse settings. File
+  import never runs Edge's validation, so `credential_named_parameter_maps`
+  judges those keys by the key-name heuristics plus every name Edge refuses
+  (`user`, `session_id`, anything containing `token`, ...): a credential-named
+  one joins the heuristic matches (import allowance, literal-secret gate),
+  long or short. Keep `secret` for fields that only
   ever hold a credential (`otel_tracing` `authorization`, `loki_logging`
   `authorization_header`). `export_redacted_paths` adds every
   matched site, whatever its length or JSON type, for `/config/export`

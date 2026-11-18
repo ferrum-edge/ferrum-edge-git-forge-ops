@@ -781,6 +781,67 @@ fn chargeback_insert_query_params_stay_literal_settings() {
     );
 }
 
+/// A credential-named `api_chargeback_sink` insert query parameter (one Edge
+/// would refuse, such as `token_value`, `user` or `session_id`, which the
+/// generic key-name heuristics miss) still reaches a repository through file
+/// import, so it needs a plaintext allowance on import, and `apply` refuses
+/// it as a literal secret, long or short; the ordinary ClickHouse setting
+/// beside it stays literal and ungated. No value is echoed.
+#[test]
+fn credential_named_chargeback_query_params_are_gated() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    let original = single_plugin_gateway(
+        "api_chargeback_sink",
+        serde_json::json!({"clickhouse": {"insert_query_params": {
+            "async_insert": "1",
+            "session_id": "q7s",
+            "token_value": "z9n4-clickhouse-opaque-material",
+            "user": "q7u"
+        }}}),
+    );
+    let mut gateway = original.clone();
+    let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+    assert!(capture.captured.is_empty());
+    assert!(capture.short_credential_named.is_empty());
+    let unbrokered: Vec<&str> = capture
+        .unbrokered
+        .iter()
+        .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+        .collect();
+    assert_eq!(
+        unbrokered,
+        [
+            "clickhouse.insert_query_params.session_id",
+            "clickhouse.insert_query_params.token_value",
+            "clickhouse.insert_query_params.user",
+        ]
+    );
+
+    let findings = audit_security(&original);
+    let blockers: Vec<&str> = security_blockers(&findings)
+        .iter()
+        .map(|finding| finding.message.as_str())
+        .collect();
+    assert_eq!(blockers.len(), 3, "{findings:?}");
+    for field in ["session_id", "token_value", "user"] {
+        assert!(
+            blockers.iter().any(|message| message.contains(&format!(
+                "Literal plugin-config secret in 'config.clickhouse.insert_query_params.{field}'"
+            ))),
+            "{field}: {findings:?}"
+        );
+    }
+    assert!(findings
+        .iter()
+        .all(|finding| !finding.message.contains("async_insert")));
+    for finding in &findings {
+        assert!(!finding.message.contains("q7"), "{}", finding.message);
+        assert!(!finding.message.contains("z9n4"), "{}", finding.message);
+    }
+}
+
 /// A short header value named like a credential (`authorization: "x"`,
 /// `x-functions-key: "abc"`) is too short to broker or redact, so it stays an
 /// ordinary setting; import names it in a warning notice and the security
