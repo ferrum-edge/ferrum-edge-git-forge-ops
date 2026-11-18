@@ -212,8 +212,16 @@ name is its map key or a sibling field such as a `request_transformer` rule's
 `key`, `import` names it in a warning notice and the security audit (`plan`,
 `review`, `apply`; not `validate`) reports a non-blocking warning, because it
 cannot be brokered or redacted. `api_chargeback_sink` ClickHouse insert query
-parameters are not brokered at all: Ferrum Edge refuses credential-named keys
-there, so their values are ClickHouse settings and stay literal. A short probe value refuses projection/header
+parameters are not brokered: Ferrum Edge refuses credential-named keys there,
+so an ordinary key's value is a ClickHouse setting and stays literal and
+ungated. A repository or backup file can still hold a credential-named key
+(file import does not run Edge's validation), so each key is checked against
+the key-name heuristics and every name Edge refuses (`user`, `password`,
+`access_token`, `session_id`, anything containing `token`, `secret`,
+`credential`, `passwd` or `api_key`), plus `pwd`, `pass`, `auth`, `sig` and
+`signature`. A value under such a key, long or short, needs
+`--allow-plaintext-plugin-config` on import and blocks apply as a literal
+secret. A short probe value refuses projection/header
 resolution, before any probe request. Admission also refuses a value whose
 review formatter spelling falls below 8 bytes after CRLF collapse or trimming,
 rather than admitting a short spelling that would suppress ordinary prose. A

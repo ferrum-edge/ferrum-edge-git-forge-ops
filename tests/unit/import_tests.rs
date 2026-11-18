@@ -2668,6 +2668,83 @@ fn builtin_plaintext_allowance_writes_and_lists_unbrokered_paths() {
     }
 }
 
+/// A backup file is imported without Edge's validation, so an
+/// `api_chargeback_sink` insert query parameter Edge would refuse
+/// (`token_value`, which no generic key-name heuristic matches) can reach
+/// import. It is refused before anything is published, naming the path and
+/// echoing no value; the allowance writes it literally beside the ordinary
+/// ClickHouse setting.
+#[test]
+fn credential_named_chargeback_query_params_need_a_plaintext_allowance() {
+    let source = tempfile::tempdir().unwrap();
+    let backup_path = source.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
+        extra: Default::default(),
+        id: "chargeback".to_string(),
+        plugin_name: "api_chargeback_sink".to_string(),
+        namespace: "ferrum".to_string(),
+        config: serde_json::json!({"clickhouse": {"insert_query_params": {
+            "async_insert": "1",
+            "token_value": "z9n4-clickhouse-opaque-material"
+        }}}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Some(chrono::Utc::now()),
+        updated_at: Some(chrono::Utc::now()),
+    });
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination = tempfile::tempdir().unwrap();
+    let output = destination.path().join("resources");
+    let bundle_path = destination.path().join("migration.json");
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("refusing to import plaintext plugin config"));
+    assert!(error.contains("plugin_name=api_chargeback_sink"), "{error}");
+    assert!(
+        error.contains("clickhouse.insert_query_params.token_value"),
+        "{error}"
+    );
+    assert!(!error.contains("async_insert"), "{error}");
+    assert!(!error.contains("z9n4"), "{error}");
+    assert!(!output.exists());
+    assert!(!bundle_path.exists());
+
+    let result = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &["api_chargeback_sink".to_string()],
+    )
+    .unwrap();
+    assert_eq!(result.redacted_plugin_config_values, 0);
+    let yaml = std::fs::read_to_string(output.join("ferrum/plugins/chargeback.yaml")).unwrap();
+    assert!(yaml.contains("z9n4-clickhouse-opaque-material"), "{yaml}");
+    assert!(yaml.contains("async_insert"), "{yaml}");
+    let notice = result
+        .custom_plugin_review_notice()
+        .expect("chargeback review notice");
+    assert!(
+        notice.contains("clickhouse.insert_query_params.token_value"),
+        "{notice}"
+    );
+    assert!(!notice.contains("z9n4"), "{notice}");
+}
+
 // ---------------------------------------------------------------------------
 // #363: unknown fields *inside* modeled nested structures used to be dropped
 // by the typed decode, so import succeeded with a truncated resource. They now

@@ -161,8 +161,9 @@ fn edge_0_9_19_redacted_plugins() -> Vec<(&'static str, serde_json::Value, Vec<&
         (
             "mesh_route_dispatch",
             serde_json::json!({"rules": [{"request_transform": [{
-                "operation": "set",
-                "name": "x-route-auth",
+                "operation": "add",
+                "target": "header",
+                "key": "x-route-auth",
                 "value": "synthetic-dispatch-value"
             }]}]}),
             vec![
@@ -272,7 +273,7 @@ fn edge_0_9_19_redacted_plugin_paths_are_brokered_on_import() {
         let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
         let slots: Vec<&str> = capture.captured.keys().map(String::as_str).collect();
         assert_eq!(slots, expected, "{plugin_name}");
-        // `request_transformer`'s header name sits under `key`, which only the
+        // A request transform's header name sits under `key`, which only the
         // key-name heuristic flags; it stays a plaintext-allowance decision.
         let unbrokered: Vec<&str> = capture
             .unbrokered
@@ -281,6 +282,12 @@ fn edge_0_9_19_redacted_plugin_paths_are_brokered_on_import() {
             .collect();
         if plugin_name == "request_transformer" {
             assert_eq!(unbrokered, ["rules.[0].key"], "{plugin_name}");
+        } else if plugin_name == "mesh_route_dispatch" {
+            assert_eq!(
+                unbrokered,
+                ["rules.[0].request_transform.[0].key"],
+                "{plugin_name}"
+            );
         } else {
             assert!(unbrokered.is_empty(), "{plugin_name}: {unbrokered:?}");
         }
@@ -737,10 +744,12 @@ fn short_values_named_by_a_sibling_field_are_warned_about() {
     }
 }
 
-/// `api_chargeback_sink` insert query parameters are ClickHouse settings
-/// (Edge refuses credential-named keys): import keeps every value literal,
-/// long or short, with no allowance or warning, nothing gates it, and a live
-/// `/backup` holding one is admitted without registering it.
+/// Ordinary ClickHouse settings in `api_chargeback_sink` insert query
+/// parameters (Edge refuses credential-named keys): import keeps every such
+/// value literal, long or short, with no allowance or warning, nothing gates
+/// it, and a live `/backup` holding one is admitted without registering it.
+/// Credential-named keys are gated (see
+/// `credential_named_chargeback_query_params_are_gated`).
 #[test]
 fn chargeback_insert_query_params_stay_literal_settings() {
     use gitforgeops::diff::security::{audit_security, security_blockers};
@@ -779,6 +788,106 @@ fn chargeback_insert_query_params_stay_literal_settings() {
         gitforgeops::display::scrub_text("best_effort Europe/Berlin"),
         "best_effort Europe/Berlin"
     );
+}
+
+/// A credential-named `api_chargeback_sink` insert query parameter (one Edge
+/// would refuse, such as `token_value`, `user` or `session_id`, which the
+/// generic key-name heuristics miss) still reaches a repository through file
+/// import, so it needs a plaintext allowance on import, and `apply` refuses
+/// it as a literal secret, long or short; the ordinary ClickHouse setting
+/// beside it stays literal and ungated. No value is echoed.
+#[test]
+fn credential_named_chargeback_query_params_are_gated() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    let original = single_plugin_gateway(
+        "api_chargeback_sink",
+        serde_json::json!({"clickhouse": {"insert_query_params": {
+            "async_insert": "1",
+            "session_id": "q7s",
+            "token_value": "z9n4-clickhouse-opaque-material",
+            "user": "q7u"
+        }}}),
+    );
+    let mut gateway = original.clone();
+    let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+    assert!(capture.captured.is_empty());
+    assert!(capture.short_credential_named.is_empty());
+    let unbrokered: Vec<&str> = capture
+        .unbrokered
+        .iter()
+        .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+        .collect();
+    assert_eq!(
+        unbrokered,
+        [
+            "clickhouse.insert_query_params.session_id",
+            "clickhouse.insert_query_params.token_value",
+            "clickhouse.insert_query_params.user",
+        ]
+    );
+
+    let findings = audit_security(&original);
+    let blockers: Vec<&str> = security_blockers(&findings)
+        .iter()
+        .map(|finding| finding.message.as_str())
+        .collect();
+    assert_eq!(blockers.len(), 3, "{findings:?}");
+    for field in ["session_id", "token_value", "user"] {
+        assert!(
+            blockers.iter().any(|message| message.contains(&format!(
+                "Literal plugin-config secret in 'config.clickhouse.insert_query_params.{field}'"
+            ))),
+            "{field}: {findings:?}"
+        );
+    }
+    assert!(findings
+        .iter()
+        .all(|finding| !finding.message.contains("async_insert")));
+    for finding in &findings {
+        assert!(!finding.message.contains("q7"), "{}", finding.message);
+        assert!(!finding.message.contains("z9n4"), "{}", finding.message);
+    }
+}
+
+/// A short leaf inside a structured `request_transformer` body value
+/// (`{"authorization": ["q7z"]}`) ends in an array index, so it has no
+/// sibling name field; its enclosing key still makes import and the security
+/// audit warn about it.
+#[test]
+fn short_credential_named_array_elements_are_warned_about() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    let original = single_plugin_gateway(
+        "request_transformer",
+        serde_json::json!({"rules": [{"operation": "add", "target": "body",
+            "key": "payload", "value": {"authorization": ["q7z"]}}]}),
+    );
+    let mut gateway = original.clone();
+    let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+    assert!(capture.captured.is_empty());
+    let warned: Vec<&str> = capture
+        .short_credential_named
+        .iter()
+        .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+        .collect();
+    assert_eq!(warned, ["rules.[0].value.authorization.[0]"]);
+
+    let findings = audit_security(&original);
+    assert!(
+        findings.iter().any(|finding| finding.message.contains(
+            "Short credential-named plugin-config value in 'config.rules.[0].value.authorization.[0]'"
+        )),
+        "{findings:?}"
+    );
+    assert!(security_blockers(&findings)
+        .iter()
+        .all(|finding| !finding.message.contains("authorization")));
+    for finding in &findings {
+        assert!(!finding.message.contains("q7z"), "{}", finding.message);
+    }
 }
 
 /// A short header value named like a credential (`authorization: "x"`,
