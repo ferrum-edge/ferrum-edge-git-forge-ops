@@ -70,8 +70,8 @@ fn make_test_config() -> GatewayConfig {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }],
         consumers: vec![Consumer {
             labels: Default::default(),
@@ -82,8 +82,8 @@ fn make_test_config() -> GatewayConfig {
             custom_id: None,
             credentials: std::collections::BTreeMap::new(),
             acl_groups: vec![],
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }],
         ..GatewayConfig::default()
     }
@@ -604,8 +604,8 @@ fn import_from_file_roundtrip() {
 
 #[test]
 fn file_import_preserves_declared_timestamps_and_omits_absent_ones() {
-    let created: chrono::DateTime<chrono::Utc> = "2019-05-04T11:22:33Z".parse().unwrap();
-    let updated: chrono::DateTime<chrono::Utc> = "2021-09-12T08:15:00Z".parse().unwrap();
+    let created = gitforgeops::timestamp::Timestamp::parse_rfc3339("2019-05-04T11:22:33Z").unwrap();
+    let updated = gitforgeops::timestamp::Timestamp::parse_rfc3339("2021-09-12T08:15:00Z").unwrap();
 
     let mut config = make_test_config();
     config.proxies[0].created_at = Some(created);
@@ -874,8 +874,8 @@ fn import_brokers_plugin_config_secrets_and_round_trips_exactly() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
@@ -972,8 +972,8 @@ fn import_brokers_openapi_validator_bypass_secrets_like_the_waf_exemption() {
             priority_override: None,
             trigger: None,
             api_spec_id: None,
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         });
     }
     let original_plugin_configs: Vec<serde_json::Value> = config
@@ -1077,8 +1077,8 @@ fn custom_plugin_import_brokers_heuristic_matches_and_reports_the_rest() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
@@ -1139,8 +1139,8 @@ fn builtin_plugin_import_raises_no_review_notice() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
@@ -1175,8 +1175,8 @@ fn spec_owned_plugin_secrets_are_skipped_without_creating_migration_slots() {
         priority_override: None,
         trigger: None,
         api_spec_id: Some("payments-v1".to_string()),
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
@@ -2171,8 +2171,8 @@ fn consul_upstream(token: &str) -> Upstream {
         backend_tls_sni: None,
         backend_tls_san_allow_list: vec![],
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     }
 }
 
@@ -2390,8 +2390,8 @@ fn unknown_plugin_backup(source_dir: &std::path::Path) -> PathBuf {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
     backup_path
@@ -2521,8 +2521,8 @@ fn builtin_plugins_without_secret_looking_leaves_import_silently() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
@@ -2566,8 +2566,8 @@ fn builtin_plugin_backup(source: &std::path::Path, plugin_name: &str) -> PathBuf
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     if plugin_name == "otel_tracing" {
         config.plugin_configs[0].config["endpoint"] =
@@ -2695,8 +2695,8 @@ fn credential_named_chargeback_query_params_need_a_plaintext_allowance() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 

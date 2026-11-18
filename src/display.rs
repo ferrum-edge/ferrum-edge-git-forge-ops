@@ -1997,7 +1997,7 @@ mod tests {
         .with_namespaces(["ferrum", "team-alpha", "team-beta"]);
         let mut tokens = Vec::new();
         for _ in 0..1200 {
-            let now = chrono::Utc::now().timestamp();
+            let now = crate::timestamp::Timestamp::now().unix_seconds();
             let token = crate::jwt::mint_jwt_at("test-secret-must-be-32-chars-long", &options, now)
                 .unwrap()
                 .token;

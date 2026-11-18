@@ -126,8 +126,8 @@ fn apply_file_creates_parent_dirs_and_writes_yaml() {
             stream_proxy_protocol: None,
             backend_proxy_protocol: None,
             stream_match: None,
-            created_at: Some(chrono::Utc::now()),
-            updated_at: Some(chrono::Utc::now()),
+            created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+            updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
         }],
         ..GatewayConfig::default()
     };
@@ -1374,8 +1374,8 @@ async fn api_write_bodies_omit_timestamps_the_repo_never_declared() {
     // apply-run wall clock, and the create body must let the gateway stamp it.
     let mut live_proxy = proxy("p1", "ferrum", None);
     live_proxy.backend_host = "old.example".to_string();
-    live_proxy.created_at = Some(chrono::Utc::now());
-    live_proxy.updated_at = Some(chrono::Utc::now());
+    live_proxy.created_at = Some(gitforgeops::timestamp::Timestamp::now());
+    live_proxy.updated_at = Some(gitforgeops::timestamp::Timestamp::now());
 
     let desired = GatewayConfig {
         proxies: vec![proxy("p1", "ferrum", None)],

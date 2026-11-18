@@ -315,7 +315,7 @@ impl StateFile {
             file,
             "pid={}\ncreated_at={}",
             std::process::id(),
-            chrono::Utc::now().to_rfc3339()
+            crate::timestamp::Timestamp::now().to_rfc3339()
         ) {
             let _ = std::fs::remove_file(&path);
             return Err(crate::error::Error::Io(source));
@@ -474,7 +474,7 @@ impl StateFile {
             self.resources.insert(key, managed_resource_marker());
         }
 
-        self.last_applied_at = Some(chrono::Utc::now().to_rfc3339());
+        self.last_applied_at = Some(crate::timestamp::Timestamp::now().to_rfc3339());
         self.last_applied_commit = git_rev_parse_head();
     }
 
@@ -753,7 +753,7 @@ impl StateFile {
     /// full-replace results, so the timestamp reflects the latest run
     /// regardless of which code path updated `resources`.
     pub fn stamp_last_applied(&mut self) {
-        self.last_applied_at = Some(chrono::Utc::now().to_rfc3339());
+        self.last_applied_at = Some(crate::timestamp::Timestamp::now().to_rfc3339());
         self.last_applied_commit = git_rev_parse_head();
     }
 
@@ -824,7 +824,7 @@ impl StateFile {
             rule_id: rule_id.into(),
             commit: verified.applied_revision.clone(),
             approver: verified.approver.clone(),
-            recorded_at: chrono::Utc::now().to_rfc3339(),
+            recorded_at: crate::timestamp::Timestamp::now().to_rfc3339(),
             pr_number: Some(verified.pr_number),
             authorized_head: Some(verified.authorized_head.clone()),
             review_id: Some(verified.review_id),
@@ -946,7 +946,7 @@ fn credential_metadata(
     CredentialMetadata {
         slot: slot.to_string(),
         shard,
-        last_rotated: chrono::Utc::now().to_rfc3339(),
+        last_rotated: crate::timestamp::Timestamp::now().to_rfc3339(),
         delivered_to: delivered_to.map(str::to_string),
         delivered_run_id: delivered_run_id.map(str::to_string),
         allocation_commit: None,

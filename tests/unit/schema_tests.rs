@@ -1010,3 +1010,149 @@ fn resource_labels_are_typed_metadata_on_every_gateway_kind() {
         );
     }
 }
+
+/// `created_at` / `updated_at` keep the exact spelling chrono 0.4 gave them
+/// (RFC 3339 in UTC, `Z`, a 0/3/6/9-digit fraction) through JSON and YAML, so
+/// replacing chrono changes no exported or diffed byte (RUSTSEC-2026-0543).
+#[test]
+fn resource_timestamps_keep_chronos_rfc3339_spelling() {
+    // (input, chrono's serialized form)
+    let cases = [
+        ("2026-08-01T00:00:00Z", "2026-08-01T00:00:00Z"),
+        (
+            "2019-05-04T11:22:33.123456+02:00",
+            "2019-05-04T09:22:33.123456Z",
+        ),
+        ("2021-09-12t08:15:00.5z", "2021-09-12T08:15:00.500Z"),
+        (
+            "2021-09-12 08:15:00.120000-01:30",
+            "2021-09-12T09:45:00.120Z",
+        ),
+        (
+            "2021-09-12T08:15:00.000000001Z",
+            "2021-09-12T08:15:00.000000001Z",
+        ),
+        (
+            "2021-09-12T08:15:00.1234567890Z",
+            "2021-09-12T08:15:00.123456789Z",
+        ),
+    ];
+    for (input, expected) in cases {
+        let json = serde_json::json!({
+            "id": "proxy-ts",
+            "backend_host": "example.com",
+            "backend_port": 443,
+            "created_at": input,
+            "updated_at": input,
+        });
+        let proxy: Proxy = serde_json::from_value(json).unwrap();
+        let out = serde_json::to_value(&proxy).unwrap();
+        assert_eq!(out["created_at"], expected, "{input}");
+        assert_eq!(out["updated_at"], expected, "{input}");
+
+        let yaml = gitforgeops::yaml::to_string(&proxy).unwrap();
+        assert!(yaml.contains(expected), "{input}: {yaml}");
+        let reparsed: Proxy = gitforgeops::yaml::from_str(&yaml).unwrap();
+        assert_eq!(reparsed.created_at, proxy.created_at, "{input}");
+        assert_eq!(
+            serde_json::to_value(&reparsed).unwrap()["updated_at"],
+            expected
+        );
+    }
+
+    let from_yaml = proxy_from_yaml(
+        r#"
+kind: Proxy
+spec:
+  id: "proxy-ts"
+  backend_host: "example.com"
+  backend_port: 443
+  created_at: 2026-08-01T00:00:00Z
+  updated_at: "2026-08-20T10:00:00.250+02:00"
+"#,
+    );
+    let out = serde_json::to_value(&from_yaml).unwrap();
+    assert_eq!(out["created_at"], "2026-08-01T00:00:00Z");
+    assert_eq!(out["updated_at"], "2026-08-20T08:00:00.250Z");
+}
+
+/// Only RFC 3339 loads: chrono's lenient extras (no offset, an offset without
+/// a colon, a `UTC` suffix, unpadded fields) are refused at load.
+#[test]
+fn resource_timestamps_outside_rfc3339_are_refused() {
+    for input in [
+        "2026-08-01T00:00:00",
+        "2026-08-01T00:00:00+0000",
+        "2026-08-01T00:00:00 UTC",
+        "2026-8-1T00:00:00Z",
+        "2026-02-30T00:00:00Z",
+        "1754006400",
+    ] {
+        let json = serde_json::json!({
+            "id": "proxy-ts",
+            "backend_host": "example.com",
+            "backend_port": 443,
+            "created_at": input,
+        });
+        assert!(
+            serde_json::from_value::<Proxy>(json).is_err(),
+            "{input} must be refused"
+        );
+    }
+}
+
+/// A resource that loads must load again after it is written back (import,
+/// overlay merging and export all serialize and re-read). An offset that
+/// moves a four-digit local year into UTC year -1 or 10000 would serialize
+/// with a signed year, so it is refused at load; the range edges themselves
+/// round-trip.
+#[test]
+fn resource_timestamps_round_trip_at_the_year_range_edges() {
+    for input in ["0000-01-01T00:30:00+01:00", "9999-12-31T23:30:00-01:00"] {
+        let json = serde_json::json!({
+            "id": "proxy-ts",
+            "backend_host": "example.com",
+            "backend_port": 443,
+            "created_at": input,
+        });
+        let err = serde_json::from_value::<Proxy>(json).unwrap_err();
+        assert!(err.to_string().contains("input is out of range"), "{err}");
+        let yaml = format!(
+            "kind: Proxy\nspec:\n  id: proxy-ts\n  backend_host: example.com\n  backend_port: 443\n  created_at: \"{input}\"\n"
+        );
+        assert!(
+            gitforgeops::yaml::from_str::<Resource>(&yaml).is_err(),
+            "{input} must be refused"
+        );
+    }
+
+    for (input, expected) in [
+        ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00Z"),
+        ("0000-01-01T00:30:00-01:00", "0000-01-01T01:30:00Z"),
+        ("9999-12-31T23:30:00+01:00", "9999-12-31T22:30:00Z"),
+        (
+            "9999-12-31T23:59:59.999999999Z",
+            "9999-12-31T23:59:59.999999999Z",
+        ),
+    ] {
+        let json = serde_json::json!({
+            "id": "proxy-ts",
+            "backend_host": "example.com",
+            "backend_port": 443,
+            "created_at": input,
+            "updated_at": input,
+        });
+        let proxy: Proxy = serde_json::from_value(json).unwrap();
+        let yaml = gitforgeops::yaml::to_string(&proxy).unwrap();
+        let reparsed: Proxy = gitforgeops::yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("{input}: written YAML does not load: {e}\n{yaml}"));
+        assert_eq!(reparsed.created_at, proxy.created_at, "{input}");
+        let json_text = serde_json::to_string(&reparsed).unwrap();
+        let again: Proxy = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap()["updated_at"],
+            expected,
+            "{input}"
+        );
+    }
+}

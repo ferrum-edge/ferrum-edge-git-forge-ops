@@ -197,7 +197,7 @@ impl ConsumerLedger {
         coverage: ConsumerCoverage,
         binding: &crate::state::AllocationBinding,
     ) -> Self {
-        let parse = |at: &str| chrono::DateTime::parse_from_rfc3339(at).ok();
+        let parse = |at: &str| crate::timestamp::Timestamp::parse_rfc3339(at).ok();
         let last_clean_apply = state.last_applied_at.as_deref().and_then(parse);
         let mut pending_allocations = BTreeSet::new();
         let mut unbound_allocations = BTreeSet::new();

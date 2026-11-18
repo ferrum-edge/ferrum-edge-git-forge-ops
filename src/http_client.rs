@@ -194,7 +194,7 @@ pub(crate) struct ClockReading {
 impl ClockReading {
     pub(crate) fn now() -> Self {
         Self {
-            wall: chrono::Utc::now().timestamp(),
+            wall: crate::timestamp::Timestamp::now().unix_seconds(),
             monotonic: Instant::now(),
         }
     }
@@ -3577,7 +3577,7 @@ fn oldest_last_sync(status: &ClusterStatus) -> Option<&str> {
         .nodes()
         .filter_map(|n| {
             let raw = n.last_sync_at.as_deref()?;
-            let parsed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+            let parsed = crate::timestamp::Timestamp::parse_rfc3339(raw).ok()?;
             Some((parsed, raw))
         })
         .min_by_key(|(parsed, _)| *parsed)
