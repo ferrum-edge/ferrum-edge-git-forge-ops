@@ -735,28 +735,13 @@ fn name_looks_like_credential(name: &str) -> bool {
 /// Whether the header, parameter or field a matched leaf sets is named like
 /// a credential. The name is the map entry the leaf belongs to (skipping an
 /// operand's match-kind key), or, for a value field whose name sits beside
-/// it ([`SIBLING_NAMED_VALUES`]), that sibling string.
+/// it ([`SIBLING_NAMED_VALUES`]), that sibling string. A leaf ending in an
+/// array index (an element inside a structured value, such as a
+/// `request_transformer` body rule's `{"authorization": ["..."]}`) has no
+/// sibling name and is judged by its nearest enclosing key.
 fn value_name_looks_like_credential(config: &Value, path: &[ConfigPathComponent]) -> bool {
-    let Some((ConfigPathComponent::Key(leaf), parent)) = path.split_last() else {
-        return false;
-    };
-    let leaf = normalize_key(leaf);
-    let siblings = SIBLING_NAMED_VALUES
-        .iter()
-        .find(|(name, _)| *name == leaf)
-        .map(|(_, siblings)| *siblings);
-    if let (Some(siblings), Some(object)) = (
-        siblings,
-        value_at(config, parent).and_then(Value::as_object),
-    ) {
-        let named = object
-            .iter()
-            .filter(|(key, _)| siblings.contains(&normalize_key(key).as_str()))
-            .filter_map(|(_, value)| value.as_str())
-            .any(name_looks_like_credential);
-        if named {
-            return true;
-        }
+    if sibling_name_looks_like_credential(config, path) {
+        return true;
     }
     let mut keys = path.iter().rev().filter_map(|part| match part {
         ConfigPathComponent::Key(key) => Some(key.as_str()),
@@ -772,6 +757,31 @@ fn value_name_looks_like_credential(config: &Value, path: &[ConfigPathComponent]
         name = entry;
     }
     name_looks_like_credential(name)
+}
+
+/// Whether a leaf ending in a [`SIBLING_NAMED_VALUES`] field sits beside a
+/// sibling name field whose string looks like a credential.
+fn sibling_name_looks_like_credential(config: &Value, path: &[ConfigPathComponent]) -> bool {
+    let Some((ConfigPathComponent::Key(leaf), parent)) = path.split_last() else {
+        return false;
+    };
+    let leaf = normalize_key(leaf);
+    let Some(siblings) = SIBLING_NAMED_VALUES
+        .iter()
+        .find(|(name, _)| *name == leaf)
+        .map(|(_, siblings)| *siblings)
+    else {
+        return false;
+    };
+    value_at(config, parent)
+        .and_then(Value::as_object)
+        .is_some_and(|object| {
+            object
+                .iter()
+                .filter(|(key, _)| siblings.contains(&normalize_key(key).as_str()))
+                .filter_map(|(_, value)| value.as_str())
+                .any(name_looks_like_credential)
+        })
 }
 
 /// Short, credential-named operator values (see
@@ -1821,10 +1831,33 @@ mod tests {
         assert!(short_credential_named_paths("request_termination", &ordinary).is_empty());
     }
 
+    /// A short leaf ending in an array index (an element inside a structured
+    /// `request_transformer` body value) has no sibling name field, so it is
+    /// judged by its nearest enclosing key, as before sibling lookup existed.
+    #[test]
+    fn short_leaves_ending_in_an_array_index_keep_the_name_fallback() {
+        let config = serde_json::json!({"rules": [
+            {"operation": "add", "target": "body", "key": "payload",
+                "value": {"authorization": ["q7z"], "tags": ["a1"]}},
+            {"operation": "add", "target": "body", "key": "list",
+                "value": [{"x-api-key": "k2"}, "v3"]}
+        ]});
+        let classification = classify_plugin_config("request_transformer", &config);
+        assert!(classification.sensitive.is_empty());
+        assert_eq!(
+            dotted(classification.short_credential_named),
+            vec![
+                "rules.[0].value.authorization.[0]",
+                "rules.[1].value.[0].x-api-key",
+            ]
+        );
+    }
+
     /// Edge redacts every `api_chargeback_sink` insert query parameter but
     /// refuses credential-named keys, so an accepted one is a ClickHouse
     /// setting: an export site whose value stays literal, long or short. A
-    /// credential-named key is still caught by the key-name heuristics.
+    /// credential-named key (by the key-name heuristics or a name Edge
+    /// refuses) still needs an import allowance and is literal-gated.
     #[test]
     fn chargeback_insert_query_params_are_export_only() {
         let tuning = serde_json::json!({"clickhouse": {

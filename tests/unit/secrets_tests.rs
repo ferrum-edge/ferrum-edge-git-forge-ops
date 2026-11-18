@@ -849,6 +849,45 @@ fn credential_named_chargeback_query_params_are_gated() {
     }
 }
 
+/// A short leaf inside a structured `request_transformer` body value
+/// (`{"authorization": ["q7z"]}`) ends in an array index, so it has no
+/// sibling name field; its enclosing key still makes import and the security
+/// audit warn about it.
+#[test]
+fn short_credential_named_array_elements_are_warned_about() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    let original = single_plugin_gateway(
+        "request_transformer",
+        serde_json::json!({"rules": [{"operation": "add", "target": "body",
+            "key": "payload", "value": {"authorization": ["q7z"]}}]}),
+    );
+    let mut gateway = original.clone();
+    let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+    assert!(capture.captured.is_empty());
+    let warned: Vec<&str> = capture
+        .short_credential_named
+        .iter()
+        .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+        .collect();
+    assert_eq!(warned, ["rules.[0].value.authorization.[0]"]);
+
+    let findings = audit_security(&original);
+    assert!(
+        findings.iter().any(|finding| finding.message.contains(
+            "Short credential-named plugin-config value in 'config.rules.[0].value.authorization.[0]'"
+        )),
+        "{findings:?}"
+    );
+    assert!(security_blockers(&findings)
+        .iter()
+        .all(|finding| !finding.message.contains("authorization")));
+    for finding in &findings {
+        assert!(!finding.message.contains("q7z"), "{}", finding.message);
+    }
+}
+
 /// A short header value named like a credential (`authorization: "x"`,
 /// `x-functions-key: "abc"`) is too short to broker or redact, so it stays an
 /// ordinary setting; import names it in a warning notice and the security
