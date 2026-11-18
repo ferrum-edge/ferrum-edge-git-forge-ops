@@ -1,6 +1,6 @@
 ---
 name: sol-agents
-description: Dispatch and orchestrate parallel gpt-6.1-sol codex CLI subagents (medium/high/xhigh effort) for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Fast mode is optional and requires an explicit user request. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate parallel gpt-6.2-sol codex CLI subagents (medium/high/xhigh effort) for ferrum-edge-git-forge-ops issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the codex review loop. Fast mode is optional and requires an explicit user request. Use when the user asks to spawn sol/codex agents on issues, PRs, review findings, or red CI.
 ---
 
 # sol-agents: codex CLI subagent orchestration
@@ -41,7 +41,7 @@ Append `--fast` only when the user explicitly requests fast mode for that dispat
 for example "Sol high with fast mode". Use `--no-fast` for "fast mode off", "without fast mode",
 or "standard mode". Omit both flags for standard mode when no speed is specified. Carry an
 explicit choice through continuations of the same task until the user changes it; never pass both
-flags. The shared launcher pins `gpt-6.1-sol` and `service_tier="default"` normally. Only
+flags. The shared launcher pins `gpt-6.2-sol` and `service_tier="default"` normally. Only
 `--fast` adds `features.fast_mode=true` alongside `service_tier="fast"`. Keep the selected reasoning effort unchanged and report an unavailable tier.
 
 Non-negotiables:
@@ -52,7 +52,7 @@ Non-negotiables:
   `/usr/local/bin/codex` / `~/.local/bin/codex`, then `PATH`. Any candidate under
   `com.conductor.app` is refused — Conductor's bundle lags the standalone release.
 - The launcher clears inherited `CODEX_HOME` and OpenAI endpoint/auth overrides, then runs
-  `codex exec --model gpt-6.1-sol --ignore-user-config --ignore-rules --config
+  `codex exec --model gpt-6.2-sol --ignore-user-config --ignore-rules --config
   model_reasoning_effort="<effort>" --config service_tier="<default|fast>" --sandbox
   danger-full-access --cd <worktree> -`. Worktree isolation prevents git collisions; it is not a
   host sandbox.
