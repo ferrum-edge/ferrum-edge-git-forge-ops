@@ -196,12 +196,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`otel_tracing` `authorization`, `loki_logging` `authorization_header`)
   stay secrets. A short operator value whose header, parameter or field name
   looks like a credential (`authorization`, `*token`, `*key`), whether the
-  name is its map key or a sibling field (`request_transformer` `key`,
-  `request_termination` `header`, `transaction_debugger`
-  `capture_request_header`, a `mesh_route_dispatch` request-transform
-  `name`), is still written and applied literally, but `import` now names it
-  in a warning notice and the security audit (`plan`, `review`, `apply`)
-  reports a non-blocking warning, never the value. `validate` runs only the
+  name is its map key or a sibling field (`request_transformer` and
+  `mesh_route_dispatch` request-transform `key`, `request_termination`
+  `header`, `transaction_debugger` `capture_request_header`), is still
+  written and applied literally, but `import` now names it in a warning
+  notice and the security audit (`plan`, `review`, `apply`) reports a
+  non-blocking warning, never the value. `validate` runs only the
   gateway validator and does not report it.
 - `api_chargeback_sink` `clickhouse.insert_query_params.*` is no longer a
   brokered secret map: it is an export-only site, so every value stays a
@@ -212,9 +212,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `passwd` or `api_key`) and the reserved `database` / `query`, so an
   accepted key is a ClickHouse setting (`async_insert`,
   `date_time_input_format: best_effort`), which `import` no longer moves into
-  the broker. A credential-named key that reaches the repository anyway is
-  still caught by the key-name heuristics (import plaintext allowance and the
-  literal-secret gate).
+  the broker. A credential-named key that reaches the repository anyway (by
+  the key-name heuristics or a name Edge refuses) still needs an import
+  plaintext allowance and is refused by the literal-secret gate.
 - `/config/export` fingerprint docs and `diff` notes no longer say the key is
   the gateway's admin secret: Ferrum Edge after v0.9.20 keys fingerprints from
   `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (random per process when
@@ -222,6 +222,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   docs tell operators to set it on every gateway replica for baselines that
   survive restarts, and a changed `fingerprint_key_id` stays unverified, never
   drift, with a note naming the setting.
+- **BREAKING:** `api_chargeback_sink` `clickhouse.insert_query_params` keys
+  are now judged by the key-name heuristics plus every name Ferrum Edge
+  refuses there (`user`, `password`, `access_token`, `session_id`, anything
+  containing `token`, `secret`, `credential`, `passwd` or `api_key`), and by
+  `pwd`, `pass`, `auth`, `sig` and `signature` (#735). File import never runs
+  Edge's validation, so a repository can still hold such a key. A value under
+  one now needs `--allow-plaintext-plugin-config api_chargeback_sink` on
+  import, and `apply` refuses it as a literal secret, long or short. Ordinary
+  ClickHouse settings beside it stay literal and ungated.
+- **BREAKING:** resource `created_at` / `updated_at` values must be RFC 3339
+  (`T`, `t` or a space between date and time, and `Z`, `z` or a `±HH:MM`
+  offset) and fall within UTC years 0000 to 9999 (#736). chrono's lenient
+  extras now fail at load: no colon in the offset, a `UTC` suffix, unpadded
+  fields, spaces inside the stamp, and signed years. So does an offset that
+  moves the instant into UTC year -1 or 10000, which chrono wrote back with a
+  signed year. Values exported by Ferrum Edge or written by `gitforgeops
+  import` are unaffected.
 
 ### Added
 
@@ -851,6 +868,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   plugin paths or TLS private-key material in `GET /config/export`. Those sites
   count as unverified secrets (exit 6 without a baseline); a gateway that sends
   them literally is compared as before. (#715)
+- A short operator value that ends in an array index (an element inside a
+  structured `request_transformer` body value such as `{"authorization":
+  ["..."]}`) is judged by its enclosing key again, so `import` and the
+  security audit warn about a credential-named one (#735).
 
 ### Performance
 
@@ -1516,3 +1537,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   indirection (`getattr`, `eval`, `exec`, `__import__`, `importlib` and
   similar). The Dockerfile's override Git assessment carries a review-by date
   that the daily base-image pin canary enforces (#673).
+- `chrono` is no longer a dependency (RUSTSEC-2026-0543: chrono is
+  unmaintained; #736). The four things it did (reading the clock, Unix seconds
+  for JWT claims, ordering RFC 3339 stamps, and the resource `created_at` /
+  `updated_at` fields) move to `src/timestamp.rs`, which is built on the
+  standard library. `chrono` and its nine platform crates leave `Cargo.lock`.
+  Every serialized timestamp keeps its exact bytes: resource timestamps are
+  still UTC with a `Z` and a 0, 3, 6 or 9-digit fraction. The state file's
+  `last_applied_at`, `last_rotated` and `recorded_at`, and the apply lock's
+  `created_at`, still end in `+00:00`.
