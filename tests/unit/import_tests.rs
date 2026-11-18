@@ -2695,8 +2695,8 @@ fn credential_named_chargeback_query_params_need_a_plaintext_allowance() {
         priority_override: None,
         trigger: None,
         api_spec_id: None,
-        created_at: Some(chrono::Utc::now()),
-        updated_at: Some(chrono::Utc::now()),
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
     });
     std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
 
