@@ -306,7 +306,11 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 /// of them is substituted and counted as uncompared instead of reading as
 /// permanent drift once the pin moves; a gateway that does not fingerprint
 /// them (v0.9.20) still compares them as ordinary values. Import brokering,
-/// redaction, scrubbing and display admission are unchanged for them.
+/// redaction, scrubbing and display admission are unchanged for them, with
+/// one exception: a credential-named key of a
+/// [`credential_named_parameter_maps`] map (`api_chargeback_sink`
+/// `clickhouse.insert_query_params`) joins the builtin heuristic matches, so
+/// it needs an import plaintext allowance, is literal-gated and is scrubbed.
 ///
 /// Three kinds of site belong here:
 ///
@@ -533,7 +537,7 @@ fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]
         "opa" => &[&["opa_host"]],
         // A backend path rewrite is projected like an endpoint path.
         "mesh_route_dispatch" => &[&["rules", "*", "rewrite", "uri"]],
-        "api_chargeback_sink" => &[&["clickhouse", "insert_query_params", "*"]],
+        "api_chargeback_sink" => &[CHARGEBACK_INSERT_QUERY_PARAMS],
         "request_mirror" => &[&["mirror_path"]],
         "udp_logging" => &[
             &["dtls_key_path"],
@@ -544,14 +548,20 @@ fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]
     }
 }
 
+/// `api_chargeback_sink` `clickhouse.insert_query_params`: an export-only site
+/// whose keys are also judged by [`credential_named_parameter_maps`].
+const CHARGEBACK_INSERT_QUERY_PARAMS: &[&str] = &["clickhouse", "insert_query_params", "*"];
+
 /// Literal parameter maps (keyed by parameter name, not brokered) whose keys
 /// are judged by [`parameter_name_looks_like_credential`]: a string under a
 /// credential-named key joins the builtin heuristic matches, so import needs
 /// a plaintext allowance for it and `apply` refuses it as a literal secret.
 /// Every other value in the map stays an ordinary setting.
+/// Every entry must also be an [`export_only_rules_for`] entry (a test pins
+/// it), so moving the map in one place cannot silently drop the gate.
 fn credential_named_parameter_maps(plugin_name: &str) -> &'static [&'static [&'static str]] {
     match plugin_name {
-        "api_chargeback_sink" => &[&["clickhouse", "insert_query_params", "*"]],
+        "api_chargeback_sink" => &[CHARGEBACK_INSERT_QUERY_PARAMS],
         _ => &[],
     }
 }
@@ -1957,6 +1967,30 @@ mod tests {
                 .unbrokered
                 .is_empty()
         );
+    }
+
+    /// A credential-named parameter map is gated only where it is also an
+    /// export-only site, so the two tables cannot drift apart silently.
+    #[test]
+    fn credential_named_parameter_maps_are_export_only_sites() {
+        let mut checked = 0;
+        for plugin in crate::plugin_catalog::BUILTIN_PLUGINS
+            .iter()
+            .map(|plugin| plugin.name)
+        {
+            for map in credential_named_parameter_maps(plugin) {
+                assert!(
+                    export_only_rules_for(plugin).contains(map),
+                    "{plugin}: {map:?}"
+                );
+                assert!(
+                    rules_for(plugin).iter().all(|rule| rule.path != *map),
+                    "{plugin}: {map:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 1);
     }
 
     /// Edge classifies the `mesh_authz` policy operands as `secret`, but

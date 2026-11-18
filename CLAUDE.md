@@ -674,8 +674,11 @@ which the export lacks.
   withholds (endpoint URLs and paths such as `opa` `opa_host`, TLS sources)
   plus the `mesh_authz` policy operands Edge classifies as `secret`, whose
   brokering is deliberately deferred (most `when` values are principals, IPs
-  and claims; `to.*.headers.*` stays caught by the header-map heuristic).
-  Every other credential or operator token Edge redacts is a `rules_for` rule
+  and claims; `to.*.headers.*` stays caught by the header-map heuristic),
+  and the `api_chargeback_sink` `clickhouse.insert_query_params` settings,
+  whose credential-named keys (`credential_named_parameter_maps`, which
+  shares the path constant and must stay an export-only entry) are still
+  gated by the heuristics. Every other credential or operator token Edge redacts is a `rules_for` rule
   even before the pin redacts it. A gateway
   that sends such a value literally is compared as usual; re-check the set
   against Edge's `plugin_config_projection.rs` on every Edge pin bump.

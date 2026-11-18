@@ -744,10 +744,12 @@ fn short_values_named_by_a_sibling_field_are_warned_about() {
     }
 }
 
-/// `api_chargeback_sink` insert query parameters are ClickHouse settings
-/// (Edge refuses credential-named keys): import keeps every value literal,
-/// long or short, with no allowance or warning, nothing gates it, and a live
-/// `/backup` holding one is admitted without registering it.
+/// Ordinary ClickHouse settings in `api_chargeback_sink` insert query
+/// parameters (Edge refuses credential-named keys): import keeps every such
+/// value literal, long or short, with no allowance or warning, nothing gates
+/// it, and a live `/backup` holding one is admitted without registering it.
+/// Credential-named keys are gated (see
+/// `credential_named_chargeback_query_params_are_gated`).
 #[test]
 fn chargeback_insert_query_params_stay_literal_settings() {
     use gitforgeops::diff::security::{audit_security, security_blockers};
