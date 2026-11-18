@@ -1263,6 +1263,17 @@ branch (and on `workflow_dispatch`) and needs no configuration:
 - It holds `contents: read` and `issues: write`, and never touches a deployment
   environment or gateway credential.
 
+The same workflow's weekly `edge-main-drift` job (cron `17 6 * * 1`, or
+`workflow_dispatch` with `check: edge-main`) checks this repository against
+unreleased Ferrum Edge `main` (ferrum-contracts#76). It runs a binary copied
+from Edge's signed `main` image, never an allowlisted one, so it holds only
+`contents: read` and binds no environment or secret. Its findings, and a
+check that could not run, go to one `edge-main-drift` issue (found by its
+body marker) through a separate job that checks out and runs nothing and
+holds `issues: write`, for default-branch runs only; only a clean run closes
+it. Neither job is
+a required check, and the digest allowlist stays the only validator pin.
+
 To refresh, review the upstream build and run:
 
 ```bash

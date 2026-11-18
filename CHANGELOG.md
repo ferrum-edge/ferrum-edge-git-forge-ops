@@ -225,6 +225,32 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A weekly **Edge main early warning** in `validator-pin-canary.yml`
+  (job `edge-main-drift`, never a required check) runs the validator and the
+  lifecycle suite with the gateway Ferrum Edge `main` would ship next
+  (ferrum-edge/ferrum-contracts#76). It resolves Edge's `latest` image, which
+  Edge's Main Latest Image workflow moves only to a `main` commit whose CI
+  passed, verifies the digest's keyless Cosign signature against that
+  workflow, reads the Edge commit from the signed image's revision label, and
+  copies `/app/ferrum-edge` out of that digest. With that binary it runs the
+  resource-label probe, `gitforgeops validate` for every environment and
+  `tests/lifecycle/run.sh` (apply, diff and traffic against a loopback
+  gateway). A failure, or a check that could not run (an unresolvable or
+  unsigned image, a failed install), opens or updates the one issue labelled
+  `edge-main-drift` whose body carries the workflow's marker, and only a
+  clean run closes it; the issue also names ferrum-contracts'
+  `main_branch_delta` commit and whether it covers the checked commit. The
+  job holds `contents: read` and never touches the digest allowlist or the
+  release evidence; only the `edge-main-drift-issue` job, which checks out
+  and runs nothing, holds `issues: write`, with the repository's own
+  `GITHUB_TOKEN`, and only for default-branch runs. The workflow gains a second
+  `cron` entry (`17 6 * * 1`) and a `check` dispatch input
+  (`validator-pin` or `edge-main`); the existing canary job runs on the daily
+  entry or `check: validator-pin`, as before. It lives in this reviewed
+  workflow because the protected checker admits no new workflow file
+  (`KNOWN_WORKFLOWS`) in the pull request that adds it.
+  `.github/scripts/tests/test_edge_main_drift.py` pins the job's read-only
+  shape, its triggers and the issue job's guards.
 - `LICENSE-COMMERCIAL.md` gives this repository the commercial license the
   other Ferrum Edge repositories ship (#705): ferrum-edge's text with the
   product name "Ferrum Edge GitForgeOps". The README license section links it,
