@@ -1100,3 +1100,59 @@ fn resource_timestamps_outside_rfc3339_are_refused() {
         );
     }
 }
+
+/// A resource that loads must load again after it is written back (import,
+/// overlay merging and export all serialize and re-read). An offset that
+/// moves a four-digit local year into UTC year -1 or 10000 would serialize
+/// with a signed year, so it is refused at load; the range edges themselves
+/// round-trip.
+#[test]
+fn resource_timestamps_round_trip_at_the_year_range_edges() {
+    for input in ["0000-01-01T00:30:00+01:00", "9999-12-31T23:30:00-01:00"] {
+        let json = serde_json::json!({
+            "id": "proxy-ts",
+            "backend_host": "example.com",
+            "backend_port": 443,
+            "created_at": input,
+        });
+        let err = serde_json::from_value::<Proxy>(json).unwrap_err();
+        assert!(err.to_string().contains("input is out of range"), "{err}");
+        let yaml = format!(
+            "kind: Proxy\nspec:\n  id: proxy-ts\n  backend_host: example.com\n  backend_port: 443\n  created_at: \"{input}\"\n"
+        );
+        assert!(
+            gitforgeops::yaml::from_str::<Resource>(&yaml).is_err(),
+            "{input} must be refused"
+        );
+    }
+
+    for (input, expected) in [
+        ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00Z"),
+        ("0000-01-01T00:30:00-01:00", "0000-01-01T01:30:00Z"),
+        ("9999-12-31T23:30:00+01:00", "9999-12-31T22:30:00Z"),
+        (
+            "9999-12-31T23:59:59.999999999Z",
+            "9999-12-31T23:59:59.999999999Z",
+        ),
+    ] {
+        let json = serde_json::json!({
+            "id": "proxy-ts",
+            "backend_host": "example.com",
+            "backend_port": 443,
+            "created_at": input,
+            "updated_at": input,
+        });
+        let proxy: Proxy = serde_json::from_value(json).unwrap();
+        let yaml = gitforgeops::yaml::to_string(&proxy).unwrap();
+        let reparsed: Proxy = gitforgeops::yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("{input}: written YAML does not load: {e}\n{yaml}"));
+        assert_eq!(reparsed.created_at, proxy.created_at, "{input}");
+        let json_text = serde_json::to_string(&reparsed).unwrap();
+        let again: Proxy = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap()["updated_at"],
+            expected,
+            "{input}"
+        );
+    }
+}

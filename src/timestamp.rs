@@ -23,7 +23,13 @@
 //! `Deserialize` uses the same parser. chrono's deserializer also accepted
 //! inputs outside RFC 3339 (unpadded fields, spaces inside the stamp, offsets
 //! without a colon, a `UTC` suffix, signed years); those are now rejected.
-//! Every stamp that parses still serializes exactly as it did.
+//!
+//! Every [`Timestamp`] lies in UTC years 0000 through 9999, the range a
+//! four-digit RFC 3339 year can spell. The parser refuses an offset that
+//! moves an instant outside it (`0000-01-01T00:30:00+01:00` is UTC year -1),
+//! which chrono accepted and then printed with a signed year this parser
+//! cannot read back. So everything that serializes also deserializes, and
+//! every stamp that parses still serializes exactly as chrono wrote it.
 
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,8 +39,13 @@ use serde::{Deserialize, Serialize, Serializer};
 
 const SECONDS_PER_DAY: i64 = 86_400;
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
+/// 0000-01-01T00:00:00Z, the earliest instant a four-digit year can spell.
+const MIN_UNIX_SECONDS: i64 = -62_167_219_200;
+/// 9999-12-31T23:59:59Z (plus fraction or leap second), the latest.
+const MAX_UNIX_SECONDS: i64 = 253_402_300_799;
 
-/// An instant in UTC with nanosecond precision.
+/// An instant in UTC with nanosecond precision, between
+/// 0000-01-01T00:00:00Z and 9999-12-31T23:59:60.999999999Z.
 ///
 /// `nanos` reaches past one second only for a leap second (`:60`), which is
 /// stored as the preceding second plus the extra second in `nanos`, the same
@@ -73,9 +84,10 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 impl Timestamp {
-    /// The current wall-clock time.
+    /// The current wall-clock time, clamped to the supported range (a clock
+    /// outside years 0000..=9999 is not a real clock).
     pub fn now() -> Self {
-        match SystemTime::now().duration_since(UNIX_EPOCH) {
+        let raw = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(after) => Self {
                 secs: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
                 nanos: after.subsec_nanos(),
@@ -94,13 +106,28 @@ impl Timestamp {
                     },
                 }
             }
+        };
+        if raw.secs < MIN_UNIX_SECONDS {
+            Self {
+                secs: MIN_UNIX_SECONDS,
+                nanos: 0,
+            }
+        } else if raw.secs > MAX_UNIX_SECONDS {
+            Self {
+                secs: MAX_UNIX_SECONDS,
+                nanos: NANOS_PER_SECOND - 1,
+            }
+        } else {
+            raw
         }
     }
 
     /// Build a timestamp from Unix seconds and a nanosecond fraction below one
-    /// second. Returns `None` for a larger fraction.
+    /// second. Returns `None` for a larger fraction or an instant outside UTC
+    /// years 0000..=9999.
     pub fn from_unix(secs: i64, nanos: u32) -> Option<Self> {
-        (nanos < NANOS_PER_SECOND).then_some(Self { secs, nanos })
+        (nanos < NANOS_PER_SECOND && (MIN_UNIX_SECONDS..=MAX_UNIX_SECONDS).contains(&secs))
+            .then_some(Self { secs, nanos })
     }
 
     /// Whole seconds since the Unix epoch (`chrono`'s `timestamp()`). A leap
@@ -125,13 +152,10 @@ impl Timestamp {
     fn write_rfc3339(self, out: &mut impl fmt::Write, use_z: bool) -> fmt::Result {
         let days = self.secs.div_euclid(SECONDS_PER_DAY);
         let second_of_day = self.secs.rem_euclid(SECONDS_PER_DAY);
+        // Every constructor keeps the year in 0000..=9999, so four digits
+        // always suffice and the output always parses again.
         let (year, month, day) = civil_from_days(days);
-        if (0..=9999).contains(&year) {
-            write!(out, "{year:04}")?;
-        } else {
-            // ISO 8601 needs the sign for years outside 0000..=9999.
-            write!(out, "{year:+05}")?;
-        }
+        write!(out, "{year:04}")?;
         let hour = second_of_day / 3600;
         let minute = second_of_day % 3600 / 60;
         let mut second = second_of_day % 60;
@@ -255,10 +279,13 @@ fn parse_rfc3339(input: &str) -> Result<Timestamp, ParseError> {
 
     let local =
         days_from_civil(year, month, day) * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second;
-    Ok(Timestamp {
-        secs: local - offset,
-        nanos,
-    })
+    let secs = local - offset;
+    // An offset can carry a four-digit local year into UTC year -1 or 10000,
+    // which would serialize with a signed year that this parser refuses.
+    if !(MIN_UNIX_SECONDS..=MAX_UNIX_SECONDS).contains(&secs) {
+        return Err(ParseError::OutOfRange);
+    }
+    Ok(Timestamp { secs, nanos })
 }
 
 /// One to nine significant fraction digits, scaled to nanoseconds. Later
@@ -406,8 +433,6 @@ mod tests {
             (1_700_000_000, 0, "2023-11-14T22:13:20"),
             (253_402_300_799, 0, "9999-12-31T23:59:59"),
             (-62_167_219_200, 0, "0000-01-01T00:00:00"),
-            (-62_167_219_201, 0, "-0001-12-31T23:59:59"),
-            (253_402_300_800, 0, "+10000-01-01T00:00:00"),
             (1_700_000_000, 100_000_000, "2023-11-14T22:13:20.100"),
             (1_700_000_000, 123_000_000, "2023-11-14T22:13:20.123"),
             (1_700_000_000, 123_456_000, "2023-11-14T22:13:20.123456"),
@@ -448,8 +473,14 @@ mod tests {
             ),
             ("2024-02-29T00:00:00Z", "2024-02-29T00:00:00Z"),
             ("2000-02-29T00:00:00Z", "2000-02-29T00:00:00Z"),
-            ("0000-01-01T00:30:00+01:00", "-0001-12-31T23:30:00Z"),
-            ("9999-12-31T23:30:00-01:00", "+10000-01-01T00:30:00Z"),
+            ("0000-01-01T00:30:00-01:00", "0000-01-01T01:30:00Z"),
+            ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00Z"),
+            ("9999-12-31T23:30:00+01:00", "9999-12-31T22:30:00Z"),
+            (
+                "9999-12-31T23:59:59.999999999Z",
+                "9999-12-31T23:59:59.999999999Z",
+            ),
+            ("9999-12-31T23:59:60Z", "9999-12-31T23:59:60Z"),
             ("2016-12-31T23:59:60Z", "2016-12-31T23:59:60Z"),
             ("2016-12-31T23:59:60.25Z", "2016-12-31T23:59:60.250Z"),
             ("2017-01-01T00:59:60+01:00", "2016-12-31T23:59:60Z"),
@@ -490,6 +521,11 @@ mod tests {
             ("2023-11-14T24:00:00Z", ParseError::OutOfRange),
             ("2023-11-14T22:60:20Z", ParseError::OutOfRange),
             ("2023-11-14T22:13:61Z", ParseError::OutOfRange),
+            // Valid four-digit local times whose offset leaves UTC 0000..=9999.
+            ("0000-01-01T00:30:00+01:00", ParseError::OutOfRange),
+            ("0000-01-01T00:00:00.5+00:01", ParseError::OutOfRange),
+            ("9999-12-31T23:30:00-01:00", ParseError::OutOfRange),
+            ("9999-12-31T23:59:59-00:01", ParseError::OutOfRange),
         ];
         for (input, expected) in cases {
             assert_eq!(Timestamp::parse_rfc3339(input), Err(expected), "{input:?}");
@@ -519,6 +555,10 @@ mod tests {
             Some(stamp)
         );
         assert_eq!(Timestamp::from_unix(0, NANOS_PER_SECOND), None);
+        assert!(Timestamp::from_unix(MIN_UNIX_SECONDS, 0).is_some());
+        assert!(Timestamp::from_unix(MAX_UNIX_SECONDS, NANOS_PER_SECOND - 1).is_some());
+        assert_eq!(Timestamp::from_unix(MIN_UNIX_SECONDS - 1, 0), None);
+        assert_eq!(Timestamp::from_unix(MAX_UNIX_SECONDS + 1, 0), None);
         let leap = Timestamp::parse_rfc3339("2016-12-31T23:59:60Z").unwrap();
         assert_eq!(leap.unix_seconds(), 1_483_228_799);
 
@@ -535,6 +575,31 @@ mod tests {
         assert!((before..=after).contains(&secs));
         assert_eq!(Timestamp::parse_rfc3339(&now.to_rfc3339()), Ok(now));
         assert_eq!(Timestamp::parse_rfc3339(&now.to_string()), Ok(now));
+    }
+
+    #[test]
+    fn every_timestamp_at_the_range_edges_round_trips() {
+        let edges = [
+            ts(MIN_UNIX_SECONDS, 0),
+            ts(MIN_UNIX_SECONDS, 1),
+            ts(MAX_UNIX_SECONDS, 0),
+            ts(MAX_UNIX_SECONDS, NANOS_PER_SECOND - 1),
+            ts(MAX_UNIX_SECONDS, NANOS_PER_SECOND),
+            ts(MAX_UNIX_SECONDS, 2 * NANOS_PER_SECOND - 1),
+            Timestamp::parse_rfc3339("0000-01-01T00:30:00-01:00").unwrap(),
+            Timestamp::parse_rfc3339("9999-12-31T23:30:00+01:00").unwrap(),
+        ];
+        for stamp in edges {
+            assert_eq!(Timestamp::parse_rfc3339(&stamp.to_string()), Ok(stamp));
+            assert_eq!(Timestamp::parse_rfc3339(&stamp.to_rfc3339()), Ok(stamp));
+            let json = serde_json::to_string(&stamp).unwrap();
+            assert_eq!(serde_json::from_str::<Timestamp>(&json).unwrap(), stamp);
+        }
+        assert_eq!(ts(MIN_UNIX_SECONDS, 0).to_string(), "0000-01-01T00:00:00Z");
+        assert_eq!(
+            ts(MAX_UNIX_SECONDS, 2 * NANOS_PER_SECOND - 1).to_string(),
+            "9999-12-31T23:59:60.999999999Z"
+        );
     }
 
     #[test]
