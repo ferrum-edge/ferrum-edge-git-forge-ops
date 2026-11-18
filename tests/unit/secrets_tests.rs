@@ -161,8 +161,9 @@ fn edge_0_9_19_redacted_plugins() -> Vec<(&'static str, serde_json::Value, Vec<&
         (
             "mesh_route_dispatch",
             serde_json::json!({"rules": [{"request_transform": [{
-                "operation": "set",
-                "name": "x-route-auth",
+                "operation": "add",
+                "target": "header",
+                "key": "x-route-auth",
                 "value": "synthetic-dispatch-value"
             }]}]}),
             vec![
@@ -272,7 +273,7 @@ fn edge_0_9_19_redacted_plugin_paths_are_brokered_on_import() {
         let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
         let slots: Vec<&str> = capture.captured.keys().map(String::as_str).collect();
         assert_eq!(slots, expected, "{plugin_name}");
-        // `request_transformer`'s header name sits under `key`, which only the
+        // A request transform's header name sits under `key`, which only the
         // key-name heuristic flags; it stays a plaintext-allowance decision.
         let unbrokered: Vec<&str> = capture
             .unbrokered
@@ -281,6 +282,12 @@ fn edge_0_9_19_redacted_plugin_paths_are_brokered_on_import() {
             .collect();
         if plugin_name == "request_transformer" {
             assert_eq!(unbrokered, ["rules.[0].key"], "{plugin_name}");
+        } else if plugin_name == "mesh_route_dispatch" {
+            assert_eq!(
+                unbrokered,
+                ["rules.[0].request_transform.[0].key"],
+                "{plugin_name}"
+            );
         } else {
             assert!(unbrokered.is_empty(), "{plugin_name}: {unbrokered:?}");
         }

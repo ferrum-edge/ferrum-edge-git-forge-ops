@@ -716,12 +716,12 @@ pub(crate) fn classify_plugin_config(
 const OPERAND_KINDS: &[&str] = &["exact", "prefix", "suffix", "regex", "contains"];
 
 /// Value fields whose header or field name sits in a sibling field, with the
-/// sibling keys that may carry it (`request_transformer` `{key, value}`,
-/// `mesh_route_dispatch` request-transform `{name, value}`,
+/// sibling keys that may carry it (`request_transformer` and
+/// `mesh_route_dispatch` request-transform `{operation, target, key, value}`,
 /// `request_termination` `{header, header_value}`, `transaction_debugger`
 /// `{capture_request_header, capture_request_header_value}`).
 const SIBLING_NAMED_VALUES: &[(&str, &[&str])] = &[
-    ("value", &["key", "name"]),
+    ("value", &["key"]),
     ("headervalue", &["header"]),
     ("capturerequestheadervalue", &["capturerequestheader"]),
 ];
@@ -1784,9 +1784,13 @@ mod tests {
             )),
             vec!["rules.[0].value", "rules.[1].value"]
         );
+        // A `mesh_route_dispatch` request transform names its header in
+        // `key` (Edge's `RawRouteHeaderTransformRule`); `name` is not a
+        // field there, so it names nothing.
         let dispatch_transform = serde_json::json!({"rules": [{"request_transform": [
-            {"operation": "set", "name": "x-route-token", "value": "t1"},
-            {"operation": "set", "name": "x-tier", "value": "gold"}
+            {"operation": "add", "target": "header", "key": "X-Api-Key", "value": "k1"},
+            {"operation": "add", "target": "header", "key": "x-tier", "value": "gold"},
+            {"operation": "add", "target": "header", "key": "x-env", "name": "x-route-token", "value": "t1"}
         ]}]});
         assert_eq!(
             dotted(short_credential_named_paths(
