@@ -235,8 +235,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   copies `/app/ferrum-edge` out of that digest. With that binary it runs the
   resource-label probe, `gitforgeops validate` for every environment and
   `tests/lifecycle/run.sh` (apply, diff and traffic against a loopback
-  gateway). A failure opens or updates one issue labelled `edge-main-drift`,
-  and a clean run closes it; the issue also names ferrum-contracts'
+  gateway). A failure, or a check that could not run (an unresolvable or
+  unsigned image, a failed install), opens or updates the one issue labelled
+  `edge-main-drift` whose body carries the workflow's marker, and only a
+  clean run closes it; the issue also names ferrum-contracts'
   `main_branch_delta` commit and whether it covers the checked commit. The
   job holds `contents: read` and never touches the digest allowlist or the
   release evidence; only the `edge-main-drift-issue` job, which checks out

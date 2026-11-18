@@ -89,7 +89,11 @@ class EdgeMainDriftTests(unittest.TestCase):
         self.assertEqual(issue["needs"], "edge-main-drift")
         self.assertEqual(issue["permissions"], {"contents": "read", "issues": "write"})
         condition = " ".join(issue["if"].split())
-        self.assertIn("needs.edge-main-drift.result == 'success'", condition)
+        # Any finished check reaches the issue, so a check that could not run
+        # is filed as `error` (dsf F1); only a clean run closes the issue.
+        self.assertIn("needs.edge-main-drift.result != 'cancelled'", condition)
+        self.assertNotIn("needs.edge-main-drift.result == 'success'", condition)
+        self.assertIn("github.event_name != 'pull_request'", condition)
         self.assertIn(
             "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
             condition,
@@ -102,7 +106,42 @@ class EdgeMainDriftTests(unittest.TestCase):
         self.assertEqual(writers, ["validator-pin-canary", "edge-main-drift-issue"])
         run = issue["steps"][0]["run"]
         self.assertIn("labels=$label", run)
-        self.assertIn("gh issue close", run)
+        self.assertIn("drift | error)", run)
+        self.assertEqual(run.count("gh issue close"), 1)
+        self.assertGreater(run.index("gh issue close"), run.index("\n  clean)"))
+        # Only an issue this workflow wrote, found by its marker on every page.
+        self.assertIn("--paginate", run)
+        self.assertIn('startswith("<!-- edge-main-drift -->")', run)
+
+    def test_a_check_that_could_not_run_is_reported_as_error(self):
+        steps = {step.get("name"): step for step in self.jobs["edge-main-drift"]["steps"]}
+        report = steps["Write the report"]
+        self.assertEqual(report["if"], "${{ !cancelled() }}")
+        for key, step_id in (
+            ("SETUP_CHECKOUT", "checkout"),
+            ("SETUP_COSIGN", "cosign"),
+            ("SETUP_EDGE", "edge"),
+            ("SETUP_TOOLCHAIN", "toolchain"),
+            ("SETUP_INSTALL", "install"),
+        ):
+            self.assertEqual(report["env"][key], f"${{{{ steps.{step_id}.outcome }}}}")
+        self.assertIn('[ -z "$failed_setup" ] || outcome=error', report["run"])
+
+    def test_resolve_reads_main_after_the_image_and_tolerates_contracts_metadata(self):
+        steps = {step.get("name"): step for step in self.jobs["edge-main-drift"]["steps"]}
+        resolve = steps["Resolve the Ferrum Edge main image"]["run"]
+        # dsf F4: main is read after the image's revision label, so a newer
+        # image is never mistaken for a commit off main's history.
+        main_read = resolve.index("git ls-remote https://github.com/ferrum-edge/ferrum-edge")
+        self.assertLess(resolve.index("org.opencontainers.image.revision"), main_read)
+        self.assertLess(main_read, resolve.index("compare/$commit...$main_head"))
+        # dsf F2: a missing vocabulary becomes a report note, not an abort.
+        self.assertIn('if catalog=$(curl -fsS "$vocabulary" 2>/dev/null) &&', resolve)
+        self.assertIn("could not be read from ferrum-contracts main", resolve)
+        # dsf F3: a failed compare call is reported as such.
+        self.assertIn('--jq .status 2>/dev/null || true)', resolve)
+        self.assertIn("the compare API call failed", resolve)
+        self.assertIn('diverged) delta_note="not on this commit\'s history"', resolve)
 
 
 if __name__ == "__main__":

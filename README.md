@@ -1086,7 +1086,7 @@ Its weekly `edge-main-drift` job is an early warning, not a pin: it copies the
 gateway binary out of Edge's signed `main` image (Cosign-verified against
 Edge's Main Latest Image workflow), runs the label probe, `gitforgeops validate`
 for every environment and the lifecycle suite with it, and opens or closes one
-issue labelled `edge-main-drift`. It never reads or changes the allowlist.
+issue labelled `edge-main-drift` (also opened when the check cannot run). It never reads or changes the allowlist.
 Dispatch it with `gh workflow run validator-pin-canary.yml -f check=edge-main`.
 
 ## Upgrading
