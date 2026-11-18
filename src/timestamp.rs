@@ -146,8 +146,8 @@ impl Timestamp {
         )?;
         match nanos {
             0 => {}
-            _ if nanos % 1_000_000 == 0 => write!(out, ".{:03}", nanos / 1_000_000)?,
-            _ if nanos % 1_000 == 0 => write!(out, ".{:06}", nanos / 1_000)?,
+            _ if nanos.is_multiple_of(1_000_000) => write!(out, ".{:03}", nanos / 1_000_000)?,
+            _ if nanos.is_multiple_of(1_000) => write!(out, ".{:06}", nanos / 1_000)?,
             _ => write!(out, ".{nanos:09}")?,
         }
         out.write_str(if use_z { "Z" } else { "+00:00" })
