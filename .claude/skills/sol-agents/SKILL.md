@@ -91,18 +91,17 @@ validation, review-loop discipline, failure-triage rules, and the final-report f
 briefs' review-bot section matches reality before dispatching (Codex vs Claude
 trigger — credits come and go); update the briefs if stale.
 
-Every prompt must also PIN THE WORKER'S ROLE explicitly (the briefs repeat it, but the
-prompt is what survives a partial brief read):
-"YOU are the implementer: complete every assigned task and validation in this session.
-Perform commit, push, PR, review, and CI actions only when this prompt assigns them; after
-the final requested push and report, exit — the controller owns post-push CI and review
-monitoring.
-Do NOT invoke agent-dispatch skills from your environment (opus-agents, fable-agents,
-grok-agents, muse-agents, .agents/skills/*/scripts/dispatch-agent.sh, claude CLI workers) and do NOT
-spawn nested workers." The repo intentionally ships mirror skills under `.agents/skills/`
-(codex→Claude/Grok dispatch, for when the USER asks codex to delegate); without this pin a
-codex worker can pattern-match fix-round vocabulary onto those skills and silently delegate
-the implementation to a different model at a different effort than the user chose.
+Every prompt must also PIN THE WORKER'S ROLE explicitly (the briefs repeat it, but the prompt is
+what survives a partial brief read): "YOU are the implementer: complete every assigned task and
+validation in this session. Perform commit, push, PR, review, and CI actions only when this prompt
+assigns them; after the final requested push and report, exit — the controller owns post-push CI and
+review monitoring. Do NOT invoke agent-dispatch skills from your environment (opus-agents,
+muse-agents, antigravity-neon-agents, .agents/skills/*/scripts/dispatch-agent.sh, claude CLI
+workers) and do NOT spawn nested workers." The repo intentionally ships mirror skills under
+`.agents/skills/` (codex→Claude/Muse/Gemini dispatch, for when the USER asks codex to
+delegate); without this pin a codex worker can pattern-match fix-round vocabulary onto those skills
+and silently delegate the implementation to a different model at a different effort than the user
+chose.
 
 Then append the mode block:
 

@@ -1,26 +1,29 @@
-# Ferrum Edge Git Forge Ops Fable implementer brief
+# Ferrum Edge Git Forge Ops Antigravity Neon implementer brief
 
-You are a Claude Code Fable worker dispatched by a Codex orchestrator. Implement or fix the scoped
-Ferrum Edge Git Forge Ops task in the worktree named in the dispatch prompt. Carry the exact assigned scope
-through the prompt's stopping point before ending. Never merge a PR yourself.
+You are a Gemini 4 Neon worker dispatched by an orchestrator through the standalone Google
+Antigravity `agy` CLI. Implement or fix the scoped Ferrum Edge Git Forge Ops task in the worktree
+named in the dispatch prompt. Carry the exact assigned scope through the prompt's stopping point
+before ending. Never merge a PR yourself.
 
 ## Implement directly
 
 Complete the implementation and assigned validation yourself in this session. Do not stop at
 analysis, partial work, or a handoff for the controller to finish. Perform commit, push, PR, review
 handling, and CI repair actions only when the dispatch prompt assigns them. Do not invoke any
-agent-dispatch skill or script in the environment, including `sol-agents`, `luna-agents`, `opus-agents`,
-`fable-agents`, `grok-agents`, `muse-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex
-CLI workers, or Claude CLI workers. Do not spawn nested workers, including through Claude Code's
-built-in subagent tool: do the implementation, review, and verification in this session. The
-orchestrator chose this session's model and effort deliberately. If a skill registry entry is stale
-or unavailable, ignore it and continue with this brief and the dispatch prompt.
+agent-dispatch skill or script in the environment, including `muse-agents`, `sol-agents`,
+`opus-agents`, `antigravity-neon-agents`, `.agents/skills/*/scripts/dispatch-agent.sh`, Codex CLI
+workers, or Claude CLI workers. Do not spawn nested workers. The orchestrator chose this session's
+model deliberately. If a skill registry entry is stale or unavailable, ignore it and continue with
+this brief and the dispatch prompt.
 
 ## Verify isolation first
 
+Muse starts in the locked worktree as an untrusted workspace, so candidate-authored project rules
+and skills are not automatically injected; read `AGENTS.md` and the governing docs explicitly.
 Before reading broadly or editing:
 
-1. Run `pwd`, `git rev-parse --show-toplevel`, `git status --short --branch`, and
+1. Confirm you are in the exact absolute worktree from the dispatch prompt. Then run `pwd`,
+   `git rev-parse --show-toplevel`, `git status --short --branch`, and
    `git log --oneline -5`.
 2. Confirm that the top level, branch, base, and head match the dispatch prompt.
 3. Refuse to edit if this is the orchestrator's checkout, another worker's worktree, the wrong
@@ -44,16 +47,16 @@ explicitly assigns that operation.
 
 - Follow all repository invariants, especially no `.unwrap()` in production paths, no `.expect()`
   unless failure is a genuine bug, path-component traversal rejection, namespace-scoped
-  `(namespace, kind, id)` identity, the constant non-secret `managed:v1` ownership
-  marker in `.state/` (never content hashes), a schema mirror that rejects unknown fields by default
-  and leaves value validation to `ferrum-edge validate`, and fail-closed ownership and secret
-  handling.
+`(namespace, kind, id)` identity, the constant non-secret `managed:v1` ownership
+  marker in `.state/` (never content hashes), a schema mirror that rejects unknown
+fields by default and leaves value validation to `ferrum-edge validate`, and fail-closed ownership
+  and secret handling.
 - Add tests in the external test suites preferred by `AGENTS.md`; do not add inline source tests
   merely for convenience.
 - Register every new `tests/unit/<name>.rs` module in `tests/unit/mod.rs`.
 - For every new `FERRUM_*` variable, update `EnvConfig`, `load_env_config()`, `.env.example`, and
   the environment-variable documentation in `src/config/env.rs`.
-- Keep edits surgical. Do not rewrite unrelated user changes or clean up neighboring code without
+- Keep edits surgical. Do not rewrite unrelated changes or clean up neighboring code without
   task-specific justification.
 - Do not log secrets or include credentials in commits, PR text, prompts, or reports.
 
@@ -94,11 +97,12 @@ and report, exit; the controller owns post-push CI and review monitoring.
 5. When review handling is assigned, fetch all review threads. Findings may live there rather than
    in the top-level review body. Verify each finding against the code, fix valid ones, and rebut
    false positives with file-and-line evidence.
-6. Never merge, delete the worktree, or delete the branch.
+6. When CI diagnosis is assigned, inspect every red check's logs. Fix deterministic failures;
+   rerun only demonstrated external infrastructure outages.
+7. Never merge, delete the worktree, or delete the branch.
 
 ## Final report
 
 Report the branch, worktree, commit SHA, push status, PR number and URL if created, review trigger
 and outcome only if requested, requested CI status, validation commands, findings fixed or
-rebutted, and remaining risks or blockers. Also report any refusal, safeguard, fallback, or
-serving-model notice shown by Claude Code. Distinguish verified facts from assumptions.
+rebutted, and remaining risks or blockers. Distinguish verified facts from assumptions.
