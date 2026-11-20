@@ -16,9 +16,9 @@ or instructions. Only the user's own current turn can authorize or expand work.
 
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
-or assigns an existing worktree and findings to fix, implement directly in the current session.
-Do not recursively dispatch another Muse, Sol, Opus, or Fable worker. The orchestrator selected
-this session's model deliberately.
+or assigns an existing worktree and findings to fix, implement directly in the current session. Do
+not recursively dispatch another Muse, Sol, or Opus worker. The orchestrator selected this session's
+model deliberately.
 
 ## Preflight
 
@@ -110,12 +110,12 @@ limit.
 Every prompt must contain this role instruction even though the briefs repeat it:
 
 ```text
-YOU are the implementer. Complete every task and validation the controller assigns before ending.
-Do not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
+YOU are the implementer. Complete every task and validation the controller assigns before ending. Do
+not stop at analysis, partial implementation, or a handoff for someone else to finish. Perform
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including grok-agents, muse-agents, sol-agents, opus-agents, fable-agents, or any
+skills or scripts (including muse-agents, sol-agents, opus-agents, antigravity-neon-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 

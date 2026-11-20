@@ -12,7 +12,6 @@ LAUNCHER = Path(__file__).with_name("dispatch-agent.sh")
 EFFORTS = ("medium", "high", "xhigh")
 LAUNCHERS = (
     (LAUNCHER, "gpt-6.2-sol"),
-    (Path(__file__).parents[2] / "luna-agents" / "scripts" / "dispatch-agent.sh", "gpt-6-luna"),
 )
 
 

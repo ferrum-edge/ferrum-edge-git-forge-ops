@@ -73,14 +73,12 @@ and follow it exactly`
 Use only those `.agents/skills/qwen-agents/references/` paths so Claude and Codex/GPT
 orchestrators share one source of truth.
 
-Every prompt must also PIN THE WORKER'S ROLE:
-"YOU are the implementer: complete every assigned task and validation in this session.
-Perform commit, push, PR, review, and CI actions only when this prompt assigns them; after
-the final requested push and report, exit — the controller owns post-push CI and review
-monitoring.
-Do NOT invoke agent-dispatch skills (qwen-agents, deepseek-pro-agents, deepseek-flash-agents,
-opencode-laguna-agents, grok-agents, muse-agents, sol-agents, opus-agents, fable-agents,
-composer-agents, .agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
+Every prompt must also PIN THE WORKER'S ROLE: "YOU are the implementer: complete every assigned task
+and validation in this session. Perform commit, push, PR, review, and CI actions only when this
+prompt assigns them; after the final requested push and report, exit — the controller owns post-push
+CI and review monitoring. Do NOT invoke agent-dispatch skills (qwen-agents, deepseek-flash-agents,
+muse-agents, sol-agents, opus-agents, antigravity-neon-agents,
+.agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
 
 Then append the mode block:
 

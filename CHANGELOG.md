@@ -242,6 +242,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The `antigravity-neon-agents` skill (canonical and Claude entrypoints,
+  briefs, agent metadata and launcher) dispatches Gemini 4 Neon
+  (`gemini-4-neon`) workers through the standalone Google Antigravity `agy`
+  CLI. `--effort` takes `low`, `medium`, `high` or `xhigh` (default `high`)
+  and refuses `max`, `ultra`, `--fast` and `--model`. Like the other
+  launchers it requires a linked worktree, holds the worktree dispatch lock,
+  forwards cancellation to the worker, passes the prompt as `--print` and
+  disables slash-command and skill expansion. `check_agent_setup.py` refuses
+  an `agy` launcher without `--disable-slash-commands` or `--print="$prompt"`,
+  or one that enables `--sandbox`.
 - A weekly **Edge main early warning** in `validator-pin-canary.yml`
   (job `edge-main-drift`, never a required check) runs the validator and the
   lifecycle suite with the gateway Ferrum Edge `main` would ship next
@@ -628,6 +638,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- The `composer-agents`, `deepseek-pro-agents`, `fable-agents` (Claude Fable
+  5.1), `grok-agents`, `luna-agents` and `opencode-laguna-agents` agent skills
+  and their launchers. The remaining skills' do-not-dispatch lists name
+  `antigravity-neon-agents` instead, and `check_agent_setup.py` no longer
+  exempts `fable-agents` from the Claude mirror requirement.
 - `release.yml`'s inert `paths-ignore` entries under its tag-only push
   trigger (#700). GitHub never applies path filters to tag pushes.
 - The unused `.claude/skills/sol-agents/agent-brief.md` and

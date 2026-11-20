@@ -438,17 +438,17 @@ class AgentSetupTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_valid_setup(root, "fable-agents", claude_mirror=False)
+            write_valid_setup(root, "opus-agents", claude_mirror=False)
             self.assertEqual(check_agent_setup.collect_violations(root), [])
 
     def test_rejects_unexpected_claude_mirror(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_valid_setup(root, "fable-agents", claude_mirror=False)
-            mirror = root / ".claude" / "skills" / "fable-agents"
+            write_valid_setup(root, "opus-agents", claude_mirror=False)
+            mirror = root / ".claude" / "skills" / "opus-agents"
             mirror.mkdir()
             (mirror / "SKILL.md").write_text(
-                skill_text("fable-agents", claude=True), encoding="utf-8"
+                skill_text("opus-agents", claude=True), encoding="utf-8"
             )
             violations = check_agent_setup.collect_violations(root)
         self.assertTrue(any("unexpected Claude mirror" in item for item in violations))
@@ -484,7 +484,7 @@ class AgentSetupTests(unittest.TestCase):
         self.assertTrue(any("Claude provider variables" in item for item in violations))
 
     def test_codex_opencode_and_cursor_launchers_require_provider_isolation(self):
-        for provider in ("codex", "opencode", "cursor-agent"):
+        for provider in ("codex", "opencode", "cursor-agent", "agy"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 agent = write_valid_setup(root)
@@ -499,6 +499,8 @@ class AgentSetupTests(unittest.TestCase):
                     (
                         "missing Cursor provider/project isolation"
                         if provider == "cursor-agent"
+                        else "missing Antigravity skill/prompt isolation"
+                        if provider == "agy"
                         else f"missing {provider if provider == 'opencode' else 'Codex'} provider isolation"
                     )
                     in item
@@ -534,6 +536,25 @@ class AgentSetupTests(unittest.TestCase):
         joined = "\n".join(violations)
         self.assertIn("does not enforce a linked worktree", joined)
         self.assertIn("does not lock its target worktree", joined)
+
+    def test_antigravity_launcher_may_not_enable_the_sandbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = write_valid_setup(root)
+            launcher = agent / "scripts" / "dispatch-agent.sh"
+            launcher.write_text(
+                valid_launcher("sample")
+                + "resolve_agent_bin agy\n"
+                + "\n".join(check_agent_setup.AGY_LAUNCHER_MARKERS)
+                + "\n# no --sandbox: comments may explain it\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+            launcher.write_text(
+                launcher.read_text(encoding="utf-8") + "  --sandbox\n", encoding="utf-8"
+            )
+            violations = check_agent_setup.collect_violations(root)
+        self.assertTrue(any("Antigravity sandboxing" in item for item in violations))
 
     def test_stale_delivery_and_state_instructions_are_refused(self):
         for marker in check_agent_setup.STALE_CONTRACT_MARKERS:
@@ -1110,86 +1131,78 @@ class AgentSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7, result.stderr)
 
     @unittest.skipUnless(shutil.which("git"), "git is required")
-    def test_cursor_launcher_uses_clean_control_workspace_and_scrubs_overrides(self):
+    def test_antigravity_launcher_passes_prompt_on_argv_in_a_linked_worktree(self):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             root = temp / "repo"
             linked = temp / "linked"
             init_repo_with_linked_worktree(root, linked)
-            fake_cursor = temp / "cursor-agent"
-            fake_cursor.write_text(
+            fake_agy = temp / "agy"
+            fake_agy.write_text(
                 "#!/usr/bin/env bash\n"
-                "prompt=$(cat)\n"
                 "if { : >&9; } 2>/dev/null; then fd9=open; else fd9=closed; fi\n"
                 "{\n"
                 "  printf 'cwd=%s\\n' \"$PWD\"\n"
                 "  printf 'arg=%s\\n' \"$@\"\n"
-                "  printf 'api-key=%s\\n' \"${CURSOR_API_KEY:+present}\"\n"
-                "  printf 'endpoint=%s\\n' \"${CURSOR_API_ENDPOINT-unset}\"\n"
-                "  printf 'config=%s\\n' \"${CURSOR_CONFIG_DIR-unset}\"\n"
-                "  printf 'credential-store=%s\\n' \"${AGENT_CLI_CREDENTIAL_STORE-unset}\"\n"
+                "  printf 'api-key=%s\\n' \"${GEMINI_API_KEY:+present}\"\n"
+                "  printf 'adc=%s\\n' \"${AGY_ADC_AUTH-unset}\"\n"
                 "  printf 'fd9=%s\\n' \"$fd9\"\n"
-                "  printf 'prompt=%s\\n' \"$prompt\"\n"
                 "} > \"$FAKE_CAPTURE\"\n",
                 encoding="utf-8",
             )
-            fake_cursor.chmod(0o755)
+            fake_agy.chmod(0o755)
             prompt = temp / "prompt.md"
             prompt.write_text("Review only.\n", encoding="utf-8")
             capture = temp / "capture.txt"
-            temp_root = temp / "tmp"
-            temp_root.mkdir()
             launcher = (
                 check_agent_setup.ROOT
-                / ".agents/skills/composer-agents/scripts/dispatch-agent.sh"
+                / ".agents/skills/antigravity-neon-agents/scripts/dispatch-agent.sh"
             )
-            result = subprocess.run(
-                [
-                    "bash",
-                    str(launcher),
-                    "--worktree",
-                    str(linked),
-                    "--prompt-file",
-                    str(prompt),
-                    "--effort",
-                    "high",
-                ],
-                cwd=temp,
-                env={
-                    **os.environ,
-                    "CURSOR_AGENT_BIN": str(fake_cursor),
-                    "CURSOR_API_KEY": "not-printed",
-                    "CURSOR_API_ENDPOINT": "https://attacker.invalid",
-                    "CURSOR_CONFIG_DIR": str(temp / "attacker-config"),
-                    "FAKE_CAPTURE": str(capture),
-                    "TMPDIR": str(temp_root),
-                },
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+
+            def launch(worktree: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        "bash",
+                        str(launcher),
+                        "--worktree",
+                        str(worktree),
+                        "--prompt-file",
+                        str(prompt),
+                        "--effort",
+                        "xhigh",
+                    ],
+                    cwd=temp,
+                    env={
+                        **os.environ,
+                        "AGY_BIN": str(fake_agy),
+                        "GEMINI_API_KEY": "not-printed",
+                        "AGY_ADC_AUTH": "1",
+                        "FAKE_CAPTURE": str(capture),
+                    },
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+
+            result = launch(root)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("dedicated linked git worktree", result.stderr)
+            self.assertFalse(capture.exists(), "the primary checkout must be refused")
+
+            result = launch(linked)
             self.assertEqual(result.returncode, 0, result.stderr)
             captured = capture.read_text(encoding="utf-8")
-            cwd = next(
-                line.removeprefix("cwd=")
-                for line in captured.splitlines()
-                if line.startswith("cwd=")
-            )
-            self.assertNotEqual(cwd, str(linked))
-            self.assertTrue(cwd.startswith(str(temp_root)))
-            self.assertFalse(Path(cwd).exists(), "control workspace must be removed")
+            self.assertIn(f"cwd={linked.resolve()}", captured)
+            self.assertIn("arg=gemini-4-neon", captured)
+            self.assertIn("arg=xhigh", captured)
+            self.assertIn("arg=--disable-slash-commands", captured)
             self.assertNotIn("arg=--sandbox", captured)
-            self.assertNotIn("arg=enabled", captured)
-            self.assertIn("arg=--add-dir", captured)
-            self.assertIn(f"arg={linked.resolve()}", captured)
-            self.assertIn(f"arg={cwd}", captured)
+            self.assertIn("arg=--print=Review only.", captured)
             self.assertIn("api-key=present", captured)
-            self.assertIn("endpoint=unset", captured)
-            self.assertIn("config=unset", captured)
-            self.assertIn("credential-store=memory", captured)
+            self.assertIn("adc=1", captured)
             self.assertIn("fd9=closed", captured)
-            self.assertIn("prompt=Review only.", captured)
-            self.assertNotIn("not-printed", captured)
+            self.assertNotIn("not-printed", captured + result.stderr)
 
     def test_claude_provider_scrubber_covers_future_and_foundry_overrides(self):
         helper = str(
@@ -1238,10 +1251,8 @@ class AgentSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     OPENCODE_LAUNCHERS = (
-        "deepseek-pro-agents",
         "deepseek-flash-agents",
         "qwen-agents",
-        "opencode-laguna-agents",
     )
     UNSUPPORTED_HELP = "FLAGS\n  --standalone  private server\n  --purely  no"
 
@@ -1356,7 +1367,7 @@ class AgentSetupTests(unittest.TestCase):
         ):
             with self.subTest(help_text=help_text):
                 result, captured, _ = self.run_opencode_launcher(
-                    "deepseek-pro-agents", "unsupported", help_text=help_text
+                    "deepseek-flash-agents", "unsupported", help_text=help_text
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(captured, "")
@@ -1406,7 +1417,7 @@ class AgentSetupTests(unittest.TestCase):
                 temp = self.opencode_launcher_fixture()
                 started = time.monotonic()
                 result, captured, _ = self.run_opencode_launcher(
-                    "deepseek-pro-agents", probe, temp=temp
+                    "deepseek-flash-agents", probe, temp=temp
                 )
                 self.assertLess(time.monotonic() - started, 30)
                 self.assertEqual(result.returncode, 2, result.stderr)
@@ -1421,7 +1432,7 @@ class AgentSetupTests(unittest.TestCase):
                 self.assertEqual(list((temp / "tmp").iterdir()), [])
                 # The refusal released the worktree lock: the next dispatch runs.
                 result, captured, _ = self.run_opencode_launcher(
-                    "deepseek-pro-agents", "pure", temp=temp
+                    "deepseek-flash-agents", "pure", temp=temp
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("spawn", captured)
