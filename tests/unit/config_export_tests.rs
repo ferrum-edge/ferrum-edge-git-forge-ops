@@ -605,6 +605,45 @@ fn whatwg_url_userinfo_in_plugin_config_is_an_uncompared_site() {
     }
 }
 
+/// The export comparison's own URL userinfo sweep, outside plugin config:
+/// a Consul `address` whose userinfo only a WHATWG parser finds is a
+/// secret-bearing site, so its fingerprint is uncompared, never drift.
+#[test]
+fn whatwg_url_userinfo_in_an_upstream_address_is_an_uncompared_site() {
+    for url in WHATWG_USERINFO_URLS {
+        let desired: GatewayConfig = serde_json::from_value(json!({
+            "upstreams": [{
+                "id": "pool",
+                "namespace": "ferrum",
+                "targets": [{"host": "10.0.0.1", "port": 8080}],
+                "service_discovery": {
+                    "provider": "consul",
+                    "consul": {"address": url, "service_name": "orders"},
+                },
+            }],
+        }))
+        .unwrap();
+        let mut body = document("ferrum", KEY_ID, json!([]), json!([]));
+        body["upstreams"] = serde_json::to_value(&desired.upstreams).unwrap();
+        body["counts"]["upstreams"] = json!(1);
+        body["upstreams"][0]["service_discovery"]["consul"]["address"] = json!(fp('e'));
+        let export = ConfigExport::from_response(&body.to_string(), "ferrum", false).unwrap();
+        let view = export.live_view_with(&desired, &desired).unwrap();
+
+        assert_eq!(
+            uncompared_sites(&view),
+            [(
+                "pool".to_string(),
+                "/service_discovery/consul/address".to_string()
+            )],
+            "{url:?}"
+        );
+        assert!(view.masked_ancestors.is_empty(), "{url:?}");
+        let diffs = compute_diff(&desired, &view.actual).unwrap();
+        assert!(diffs.is_empty(), "{url:?}: {diffs:?}");
+    }
+}
+
 #[test]
 fn a_whole_value_fingerprinted_around_a_secret_is_never_authoritative() {
     let desired: GatewayConfig = serde_json::from_value(json!({

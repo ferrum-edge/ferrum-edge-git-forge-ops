@@ -988,8 +988,10 @@ fn opa_host_stays_a_literal_endpoint() {
 }
 
 /// URL userinfo spellings Ferrum Edge's WHATWG parser reads as credentials.
-const WHATWG_USERINFO_URLS: [&str; 7] = [
+const WHATWG_USERINFO_URLS: [&str; 9] = [
     "https:///svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https:svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https:\\\\svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
     "https:/\\svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
     "https:\t//svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
     "https://svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181\\v1",
@@ -1110,20 +1112,40 @@ fn whatwg_url_userinfo_in_plugin_config_is_captured_gated_and_scrubbed() {
     }
 }
 
-/// An email address is not URL userinfo: a plugin setting that holds one is
-/// neither brokered nor gated.
+/// Free text with an `@` in it is not URL userinfo, even when it starts like
+/// a URL: a plugin setting that holds one is neither brokered, gated nor
+/// scrubbed.
 #[test]
-fn an_email_address_in_plugin_config_is_not_url_userinfo() {
+fn free_text_in_plugin_config_is_not_url_userinfo() {
     use gitforgeops::diff::security::{audit_security, security_blockers};
     use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
 
-    for value in ["ops@example.com", "mailto:ops@example.com"] {
-        let original = single_plugin_gateway("opa", serde_json::json!({"contact": value}));
-        let mut gateway = original.clone();
-        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
-        assert!(capture.captured.is_empty(), "{value}");
-        assert!(capture.unbrokered.is_empty(), "{value}");
-        assert!(security_blockers(&audit_security(&original)).is_empty());
+    for value in [
+        "ops@example.com",
+        "mailto:ops@example.com",
+        "https: contact ops@example.com for help",
+        "file:///app@v2/policy.rego",
+        "file: contact ops@example.com",
+    ] {
+        for (plugin_name, config) in [
+            ("opa", serde_json::json!({"contact": value})),
+            (
+                "response_mock",
+                serde_json::json!({"rules": [{"match": {"path": "/help"}, "body": value}]}),
+            ),
+        ] {
+            let original = single_plugin_gateway(plugin_name, config);
+            let mut gateway = original.clone();
+            let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+            assert!(capture.captured.is_empty(), "{plugin_name} {value}");
+            assert!(capture.unbrokered.is_empty(), "{plugin_name} {value}");
+            assert!(
+                security_blockers(&audit_security(&original)).is_empty(),
+                "{plugin_name} {value}"
+            );
+            let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
+            assert_eq!(scrubber.scrub(value), value, "{plugin_name}");
+        }
     }
 }
 

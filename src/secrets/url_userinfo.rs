@@ -3,55 +3,42 @@
 //! Ferrum Edge reads URLs with the WHATWG parser (`url::Url::parse`), which
 //! accepts far more spellings than `scheme://user@host`: it ignores leading
 //! and trailing whitespace and C0 controls, drops embedded tabs and line
-//! breaks, and for the special schemes (`http`, `https`, `ws`, `wss`, `ftp`,
-//! `file`) accepts any run of `/` and `\` (or none) after `scheme:` and ends
-//! the authority at `\` as well as `/`, `?` and `#`. A credential check that
-//! only splits on `://` misses every one of those spellings while Edge still
-//! sends the credential, so every check that asks "does this string carry URL
+//! breaks, and for the special schemes other than `file` accepts any run of
+//! `/` and `\` (or none) after `scheme:` and ends the authority at `\` as
+//! well as `/`, `?` and `#`. A credential check that only splits on `://`
+//! misses every one of those spellings while Edge still sends the
+//! credential, so every check that asks "does this string carry URL
 //! credentials" goes through this module.
 
-/// Schemes WHATWG parses with the special-scheme authority rules.
-const SPECIAL_SCHEMES: [&str; 6] = ["ftp", "file", "http", "https", "ws", "wss"];
-
-/// Whether `value` carries URL userinfo that a URL consumer would read, or
-/// looks enough like such a URL that it must be treated as one.
+/// Whether `value` carries URL userinfo.
 ///
-/// True when any of these holds:
+/// True when either holds:
 ///
-/// * `url::Url::parse` (what Ferrum Edge uses) yields a non-empty username or
-///   a password;
-/// * after WHATWG preprocessing, a special scheme's authority (any run of `/`
-///   and `\` after `scheme:`, ending at `/`, `\`, `?` or `#`) contains `@`.
-///   This also covers values Edge's parser would reject, and the empty
-///   userinfo of `https://@host`;
-/// * after the same preprocessing, the text after the first `://` contains `@`
-///   before any `/`, `?` or `#` — the generic authority of every other scheme,
-///   kept as broad as the original check so nothing it caught is lost (it
-///   still flags `https://host\x@y`, which WHATWG reads as a path).
+/// * `url::Url::parse(value)` yields a non-empty username or a password:
+///   exactly the credentials Ferrum Edge reads (and its own export projection
+///   strips), in every spelling its parser accepts;
+/// * the raw value, split at its first `://`, has an `@` before the next `/`,
+///   `?` or `#`: the original check, kept on the unmodified input so nothing it
+///   caught is lost (non-standard schemes, empty userinfo such as
+///   `https://@host`, hosts Edge's parser rejects).
 ///
-/// A value with no `://` and no special scheme is never a match, so an email
-/// address (`ops@example.com`), a `mailto:` URI or free text with a colon in
-/// it is not mistaken for URL credentials. For a non-special scheme only the
-/// `scheme://` authority counts, as it does for WHATWG: `redis:///u:p@h` has
-/// an empty host and `u:p@h` in its path.
+/// Free text is not normalized or reinterpreted, so an email address, a
+/// `mailto:` URI, a `file:` path with `@` in it or prose that merely starts
+/// with `https:` is not mistaken for URL credentials unless Edge's own parser
+/// would read a username or password from it.
 pub(crate) fn url_has_userinfo(value: &str) -> bool {
+    if !value.contains('@') {
+        return false;
+    }
     if url::Url::parse(value)
         .is_ok_and(|parsed| !parsed.username().is_empty() || parsed.password().is_some())
     {
         return true;
     }
-    let cleaned = strip_url_noise(value);
-    let special_authority = split_scheme(&cleaned)
-        .filter(|(scheme, _)| is_special_scheme(scheme))
-        .and_then(|(_, rest)| {
-            let rest = rest.trim_start_matches(['/', '\\']);
-            rest.split(['/', '\\', '?', '#']).next()
-        });
-    let generic_authority = cleaned
+    value
         .split_once("://")
-        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next());
-    let has_at = |authority: Option<&str>| authority.is_some_and(|text| text.contains('@'));
-    has_at(special_authority) || has_at(generic_authority)
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 /// A URL split around its userinfo by [`split_url_userinfo`].
@@ -110,12 +97,6 @@ fn is_url_scheme(candidate: &str) -> bool {
         && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
-fn is_special_scheme(scheme: &str) -> bool {
-    SPECIAL_SCHEMES
-        .iter()
-        .any(|special| special.eq_ignore_ascii_case(scheme))
-}
-
 #[cfg(test)]
 mod tests {
     use super::url_has_userinfo;
@@ -144,7 +125,6 @@ mod tests {
             "https://user@host.example",
             "https://:pass@host.example",
             "https://@host.example",
-            "https:///@host.example",
             // Non-special and non-standard schemes keep their `://` authority.
             "redis://user:pass@cache.internal:6379/0",
             "custom+scheme://user:pass@host.example",
@@ -154,6 +134,9 @@ mod tests {
             "://user:pass@host.example",
             "https://user:pass@bad host.example",
             "https://host.example\\user:pass@path",
+            // An earlier delimiter that only appears once a tab is removed does
+            // not hide the literal `://` authority after it.
+            "Reference :\t//local then https://alice@example.com",
         ] {
             assert!(url_has_userinfo(value), "{value:?}");
         }
@@ -181,6 +164,14 @@ mod tests {
             "user:pass@host.example",
             "mailto:ops@example.com",
             "note: contact ops@example.com",
+            "https: contact ops@example.com for help",
+            // `file` URLs never carry userinfo: `@` there is in a path.
+            "file:///app@v2/policy.rego",
+            "file:/a@b",
+            "file:bundle@2026.yaml",
+            "file: contact ops@example.com",
+            // An empty userinfo only a lenient reading finds; Edge reads none.
+            "https:///@host.example",
             "strict",
             "",
         ] {
