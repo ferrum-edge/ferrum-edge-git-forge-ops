@@ -607,8 +607,10 @@ pub struct PluginTriggerNode {
     pub any: Option<Vec<PluginTriggerNode>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not: Option<Box<PluginTriggerNode>>,
+    /// Boxed (serde-transparent) so a leaf with every predicate slot does not
+    /// inflate `PluginConfig`, and with it every `Resource`.
     #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
-    pub match_: Option<PluginTriggerMatch>,
+    pub match_: Option<Box<PluginTriggerMatch>>,
 }
 
 /// A leaf predicate. Exactly one field is expected to be set.
@@ -640,6 +642,14 @@ pub struct PluginTriggerMatch {
     pub listen_port: Option<Vec<u16>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumer: Option<PluginTriggerIdentityMatch>,
+    /// Unmapped external identity (present only when no gateway Consumer is
+    /// mapped). Edge after v0.9.20; the pinned validator rejects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_identity: Option<PluginTriggerIdentityMatch>,
+    /// Verifying authorities (64-hex realm digests) of the unmapped external
+    /// identity; the list is an OR. Edge after v0.9.20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_identity_authority: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1206,6 +1216,9 @@ pub struct MeshConfigSpec {
     pub destination_rules: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_service_cors_policies: Vec<serde_json::Value>,
+    /// Mesh bindings of VirtualService HTTP routes (Edge after v0.9.20).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_service_http_routes: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_configs: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1235,7 +1248,7 @@ impl MeshConfigSpec {
     /// admin API to diff against, so counts are all a preview can honestly
     /// report.
     pub fn summary(&self) -> String {
-        let counts: [(&str, usize); 14] = [
+        let counts: [(&str, usize); 15] = [
             ("workload", self.workloads.len()),
             ("service", self.services.len()),
             ("mesh policy", self.mesh_policies.len()),
@@ -1246,6 +1259,10 @@ impl MeshConfigSpec {
             ("telemetry resource", self.telemetry_resources.len()),
             ("destination rule", self.destination_rules.len()),
             ("CORS policy", self.virtual_service_cors_policies.len()),
+            (
+                "VirtualService HTTP route binding",
+                self.virtual_service_http_routes.len(),
+            ),
             ("proxy config", self.proxy_configs.len()),
             ("sidecar", self.sidecars.len()),
             ("waypoint binding", self.waypoint_bindings.len()),

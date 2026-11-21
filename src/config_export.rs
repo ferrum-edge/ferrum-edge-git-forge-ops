@@ -712,7 +712,7 @@ fn collect_tls_material_sites(
 const TRIGGER_CLIENT_FIELD_PREDICATES: [&str; 3] = ["header", "query", "cookie"];
 
 /// Trigger `match` predicates Edge leaves visible.
-const TRIGGER_VISIBLE_PREDICATES: [&str; 12] = [
+const TRIGGER_VISIBLE_PREDICATES: [&str; 14] = [
     "method",
     "path",
     "host",
@@ -723,6 +723,8 @@ const TRIGGER_VISIBLE_PREDICATES: [&str; 12] = [
     "proxy_id",
     "listen_port",
     "consumer",
+    "external_identity",
+    "external_identity_authority",
     "auth_method",
     "spiffe_id",
 ];

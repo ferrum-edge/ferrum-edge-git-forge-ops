@@ -1156,3 +1156,99 @@ fn resource_timestamps_round_trip_at_the_year_range_edges() {
         );
     }
 }
+
+const EXTERNAL_IDENTITY_AUTHORITY: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// Ferrum Edge after v0.9.20 splits unmapped external identities out of
+/// `consumer` into `external_identity`, scoped by
+/// `external_identity_authority`. Both are nested `PluginTriggerMatch` keys,
+/// which the escape hatch never covers, so the strict loader must model them.
+#[test]
+fn plugin_trigger_external_identity_predicates_load_strictly_and_roundtrip() {
+    let yaml = format!(
+        r#"kind: PluginConfig
+spec:
+  id: exempt-partner
+  plugin_name: rate_limiting
+  scope: global
+  config: {{}}
+  trigger:
+    when:
+      not:
+        match:
+          external_identity:
+            value:
+              exact: ["partner-service"]
+      all:
+        - match:
+            external_identity:
+              presence: present
+        - match:
+            external_identity_authority: ["{EXTERNAL_IDENTITY_AUTHORITY}"]
+"#
+    );
+    let tree = tempfile::tempdir().unwrap();
+    let file = tree.path().join("ferrum/plugins/exempt-partner.yaml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, yaml).unwrap();
+
+    let resources = gitforgeops::config::load_resources(tree.path())
+        .expect("strict load accepts the modeled trigger predicates");
+    let assembled = gitforgeops::config::assemble(resources).unwrap();
+    let plugin = &assembled.gateway.plugin_configs[0];
+    assert!(plugin.extra.is_empty(), "{:?}", plugin.extra);
+    let when = &plugin.trigger.as_ref().expect("trigger").when;
+
+    let exempt = when
+        .not
+        .as_ref()
+        .and_then(|node| node.match_.as_ref())
+        .and_then(|leaf| leaf.external_identity.as_ref())
+        .expect("external_identity under not");
+    assert_eq!(exempt.presence, PluginTriggerPresence::Present);
+    assert_eq!(
+        exempt.value.as_ref().and_then(|value| value.exact.clone()),
+        Some(vec!["partner-service".to_string()])
+    );
+    let all = when.all.as_ref().expect("all branch");
+    assert!(all[0]
+        .match_
+        .as_ref()
+        .and_then(|leaf| leaf.external_identity.as_ref())
+        .is_some_and(|identity| identity.value.is_none()));
+    assert_eq!(
+        all[1]
+            .match_
+            .as_ref()
+            .and_then(|leaf| leaf.external_identity_authority.clone()),
+        Some(vec![EXTERNAL_IDENTITY_AUTHORITY.to_string()])
+    );
+
+    // Edge's wire names survive the export, and the exported document reads
+    // back into the same configuration.
+    let exported = gitforgeops::apply::render_file_yaml(&assembled.gateway).unwrap();
+    assert!(exported.contains("external_identity:"), "{exported}");
+    assert!(
+        exported.contains("external_identity_authority:"),
+        "{exported}"
+    );
+    let reparsed: gitforgeops::config::GatewayConfig = serde_json::from_value(
+        gitforgeops::yaml::parse_value(&exported, gitforgeops::yaml::RESOURCE_LIMITS).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&reparsed).unwrap(),
+        serde_json::to_value(&assembled.gateway).unwrap()
+    );
+
+    // A misspelled sibling is still a nested unknown, and still fatal.
+    let typo = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace("external_identity_authority", "external_identity_authorty");
+    std::fs::write(&file, typo).unwrap();
+    let error = gitforgeops::config::load_resources(tree.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("external_identity_authorty"), "{error}");
+}

@@ -1251,3 +1251,78 @@ fn a_fingerprint_at_a_visible_trigger_predicate_is_still_drift() {
     assert_eq!(diffs[0].id, "gate");
     assert_eq!(diffs[0].details[0].field, "trigger");
 }
+
+/// Edge keeps `external_identity` and `external_identity_authority` visible
+/// (`TRIGGER_VISIBLE_PREDICATES`): they compare an authenticated principal and
+/// its verifying realm, which a client cannot assert. A fingerprint there is
+/// therefore a changed value, never a withheld secret site.
+#[test]
+fn external_identity_trigger_predicates_are_visible_not_secret_sites() {
+    let desired: GatewayConfig = serde_json::from_value(json!({
+        "plugin_configs": [{
+            "id": "partner",
+            "namespace": "ferrum",
+            "plugin_name": "rate_limiting",
+            "scope": "global",
+            "config": {},
+            "trigger": {"when": {"all": [
+                {"match": {"external_identity": {"value": {"exact": ["partner-service"]}}}},
+                {"match": {"external_identity_authority": [
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                ]}},
+                {"match": {"consumer": {"value": {"exact": ["partner"]}}}},
+            ]}},
+        }],
+    }))
+    .unwrap();
+    let live_view = |pointer: Option<&str>| {
+        let mut plugins = serde_json::to_value(&desired.plugin_configs).unwrap();
+        if let Some(pointer) = pointer {
+            *plugins.pointer_mut(pointer).unwrap() = json!(fp('a'));
+        }
+        let body = document("ferrum", KEY_ID, json!([]), plugins).to_string();
+        ConfigExport::from_response(&body, "ferrum", false)
+            .unwrap()
+            .live_view_with(&desired, &desired)
+    };
+
+    // Sent literally: compared, in sync, nothing uncompared.
+    let view = live_view(None).unwrap();
+    assert!(view.uncompared.is_empty(), "{:?}", view.uncompared);
+    assert!(view.masked_ancestors.is_empty());
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+
+    // A fingerprinted operand is drift on `trigger`.
+    for pointer in [
+        "/0/trigger/when/all/0/match/external_identity/value/exact/0",
+        "/0/trigger/when/all/1/match/external_identity_authority/0",
+    ] {
+        let view = live_view(Some(pointer)).unwrap();
+        assert!(
+            view.uncompared.is_empty(),
+            "{pointer}: {:?}",
+            view.uncompared
+        );
+        assert!(view.masked_ancestors.is_empty(), "{pointer}");
+        let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+        assert_eq!(diffs.len(), 1, "{pointer}: {diffs:?}");
+        assert_eq!(diffs[0].id, "partner");
+        assert_eq!(diffs[0].details[0].field, "trigger");
+    }
+
+    // A whole predicate (or its leaf) fingerprinted is not put back from the
+    // repository as a withheld value, so the typed decode refuses the row,
+    // exactly as for the long-visible `consumer` predicate. Were the new keys
+    // unknown, the declared value would be substituted and the row counted
+    // as uncompared (or a masked ancestor), hiding a changed authority.
+    for pointer in [
+        "/0/trigger/when/all/0/match/external_identity",
+        "/0/trigger/when/all/0/match",
+        "/0/trigger/when/all/1/match/external_identity_authority",
+        "/0/trigger/when/all/1/match",
+        "/0/trigger/when/all/2/match/consumer",
+    ] {
+        assert!(live_view(Some(pointer)).is_err(), "{pointer}");
+    }
+}
