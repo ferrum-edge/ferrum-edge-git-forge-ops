@@ -158,9 +158,11 @@ Consumer secret's. Field names, `presence`, `multi_value`, `case_insensitive`, t
 `auth_method`, `spiffe_id`) stay literal and reviewable; a
 placeholder in one of them is refused, because it has no slot and would reach
 the gateway as text, and `import` refuses a live trigger that has one.
-`import --from-api` also refuses a live operand that spells placeholder text
-(it is live data, not a declaration); file import keeps such a string, since
-the file may be an unmaterialized export. Trigger
+`import --from-api`, and file import of an Edge `/backup` document (one with
+its `ferrum_version` / `exported_at` / `source` / `counts` envelope), also
+refuse a live operand that spells placeholder text (it is live data, not a
+declaration); a GitForgeOps export keeps such a string as the placeholder it
+is. Trigger
 slots belong to the plugin's type like its config slots, so the type-change
 check below covers them too. Retiring a trigger operand means removing its
 list, predicate or branch (Edge refuses an empty list), so a stored trigger

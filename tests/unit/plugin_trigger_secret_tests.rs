@@ -453,6 +453,11 @@ fn malformed_trigger_decode_errors_withhold_the_value() {
             "scalar-value.yaml",
             "{when: {match: {cookie: {name: tier, value: zq9-scalar-operand}}}}",
         ),
+        // An operand that contains serde's own `, expected ` delimiter.
+        (
+            "delimiter.yaml",
+            "{when: {match: {header: {name: x-skip-waf, value: {exact: 'zq9-scalar-operand, expected a sequence zq9-tail'}}}}}",
+        ),
     ] {
         for entry in std::fs::read_dir(&directory).unwrap() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
@@ -468,9 +473,69 @@ fn malformed_trigger_decode_errors_withhold_the_value() {
         let error = gitforgeops::config::load_resources(root.path())
             .unwrap_err()
             .to_string();
-        assert!(!error.contains("zq9-scalar-operand"), "{name}: {error}");
-        assert!(error.contains(".spec.trigger"), "{name}: {error}");
+        assert!(!error.contains("zq9"), "{name}: {error}");
+        assert!(error.contains(".spec.trigger.when.match."), "{name}: {error}");
     }
+    let error = gitforgeops::config::load_resources(root.path())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("`.spec.trigger.when.match.header.value.exact` must be a list of strings"),
+        "{error}"
+    );
+}
+
+/// An Edge `/backup` saved to disk is live data like an API read, so a
+/// trigger operand in it that spells placeholder text is refused, naming the
+/// slot. The same row in a GitForgeOps document (no backup envelope) is a
+/// repository declaration and still round-trips as a placeholder.
+#[test]
+fn file_import_of_an_edge_backup_refuses_marker_shaped_trigger_operands() {
+    let trigger = serde_json::json!({"when": {"match": {"header": {
+        "name": "x-skip-waf", "value": {"exact": [PLACEHOLDER]}
+    }}}});
+    let mut document = serde_json::to_value(trigger_gateway(trigger)).unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+
+    let plain = source_dir.path().join("export.json");
+    std::fs::write(&plain, document.to_string()).unwrap();
+    let output = destination.path().join("from-export");
+    let result = gitforgeops::import::from_file::import_from_file(
+        &plain,
+        &output,
+        None,
+        &gitforgeops::import::ImportPassthroughPolicy::strict(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(result.redacted_plugin_trigger_values, 0);
+    let written = std::fs::read_to_string(output.join("ferrum/plugins/plugin.yaml")).unwrap();
+    assert!(written.contains(PLACEHOLDER), "{written}");
+
+    document["ferrum_version"] = serde_json::json!("0.9.20");
+    document["exported_at"] = serde_json::json!("2026-11-21T00:00:00Z");
+    document["source"] = serde_json::json!("database");
+    let backup = source_dir.path().join("backup.json");
+    std::fs::write(&backup, document.to_string()).unwrap();
+    let output = destination.path().join("from-backup");
+    let bundle = destination.path().join("bundle.json");
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup,
+        &output,
+        Some(&bundle),
+        &gitforgeops::import::ImportPassthroughPolicy::strict(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("placeholder text"), "{error}");
+    assert!(
+        error.contains("ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[0]"),
+        "{error}"
+    );
+    assert!(!output.exists());
+    assert!(!bundle.exists());
 }
 
 /// Without a bundle, an unresolved brokered operand is compared as its

@@ -120,9 +120,12 @@ pub fn import_from_file_selected(
             unsupported_sections: snapshot.unsupported_sections.clone(),
             sources: vec![source],
             unmodeled_nested_fields: snapshot.unmodeled_nested_fields.clone(),
-            // A file may be an unmaterialized export whose placeholders are
-            // repository declarations, so it keeps the round-trip behaviour.
-            live_source: false,
+            // An Edge `/backup` saved to disk carries its envelope metadata
+            // (`ferrum_version`, `exported_at`, `source`, `counts`); its rows
+            // are live data like an API read. A GitForgeOps artifact (an
+            // unmaterialized export, sealed only by `resource_counts`) never
+            // has them, and its placeholders stay repository declarations.
+            live_source: is_edge_backup_envelope(&snapshot),
         },
         credential_bundle_output,
         true,
@@ -161,4 +164,14 @@ fn source_namespaces(snapshot: &BackupSnapshot) -> Vec<String> {
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Whether a decoded import document is an Edge `GET /backup` envelope: it
+/// carries metadata only Edge's `BackupPayload` writes. GitForgeOps' own
+/// exports and file-mode documents carry none of it.
+fn is_edge_backup_envelope(snapshot: &crate::http_client::BackupSnapshot) -> bool {
+    snapshot.ferrum_version.is_some()
+        || snapshot.exported_at.is_some()
+        || snapshot.source.is_some()
+        || snapshot.counts.is_some()
 }

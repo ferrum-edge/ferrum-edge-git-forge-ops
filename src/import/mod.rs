@@ -102,9 +102,10 @@ pub(crate) struct ImportInventory {
     /// Nested fields the typed decode discarded; see
     /// [`reject_import_unmodeled_nested_fields`].
     pub unmodeled_nested_fields: Vec<UnmodeledNestedField>,
-    /// The source is a live gateway read (`import --from-api`), never an
-    /// authored document, so broker-placeholder text in it is live data, not
-    /// a repository declaration; see
+    /// The source is live gateway data (`import --from-api`, or an Edge
+    /// `/backup` envelope read from a file), never an authored document, so
+    /// broker-placeholder text in it is live data, not a repository
+    /// declaration; see
     /// [`reject_live_marker_trigger_operands`].
     pub live_source: bool,
 }
@@ -919,8 +920,8 @@ fn reject_import_trigger_placeholders(config: &GatewayConfig) -> crate::error::R
 /// Refuse a live trigger operand that spells broker-placeholder text.
 ///
 /// Capture keeps a valid `${gh-env-secret:…}` string as-is so an exported,
-/// unmaterialized file round-trips. A live gateway read has no such
-/// provenance: the operand is what clients must send, and keeping it would
+/// unmaterialized file round-trips. A live gateway read, or an Edge backup
+/// saved to disk, has no such provenance: the operand is what clients must send, and keeping it would
 /// publish it in the tree as a placeholder, capture nothing and later have
 /// apply resolve or allocate a different value. The resolver already refuses
 /// placeholder text as a trigger bundle value. Only trigger operands are
@@ -957,7 +958,7 @@ fn reject_live_marker_trigger_operands(config: &GatewayConfig) -> crate::error::
         return Ok(());
     }
     Err(crate::error::Error::Config(format!(
-        "refusing to import: the live gateway has plugin trigger operand(s) that spell \
+        "refusing to import: the gateway backup has plugin trigger operand(s) that spell \
          gh-env-secret placeholder text, which would be published as a placeholder instead of \
          being captured. Replace each operand at the gateway with a real value (and update the \
          clients that send it), then re-import. Nothing has been written.\n  {}",
