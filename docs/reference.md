@@ -436,7 +436,10 @@ no (or an empty) `aws_region` uses the region the gateway resolves from the
 same environment: the first non-empty of `AWS_DEFAULT_REGION` and
 `AWS_REGION`. When neither is set, or the selected one is not a valid region
 (a malformed `AWS_DEFAULT_REGION` wins over a valid `AWS_REGION`, as it does in
-the gateway, which then reports it), `us-east-1` stands in. A row whose
+the gateway), `us-east-1` stands in. The gateway reports a malformed environment
+region only when admission reaches its effective-region check; it can defer that
+check, for example for a `static` row whose access keys are not available on the
+validating node. A row whose
 configured `aws_region` is not a commercial, GovCloud or China region keeps
 the ordinary stand-in, so the gateway reports the region.
 
