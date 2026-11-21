@@ -780,6 +780,10 @@ fn brokered_standin_cases() -> Vec<(&'static str, serde_json::Value)> {
             "aws_endpoint_url": BROKERED
         });
         config["aws_credentials"] = credentials["aws_credentials"].clone();
+        cases.push(("serverless_function", config.clone()));
+        // The region left to the environment: the stand-in follows the
+        // validator's own region, or `us-east-1` when none is set.
+        config.as_object_mut().unwrap().remove("aws_region");
         cases.push(("serverless_function", config));
     }
     cases.push((
@@ -891,4 +895,38 @@ exit 0
     assert!(text.contains("env:http://localhost:4566/lambda"), "{text}");
     assert!(text.contains("overrides:1"), "{text}");
     assert!(text.contains("brokered:regional"), "{text}");
+}
+
+/// A Lambda row that leaves its region to the environment stands in with the
+/// region the validator will resolve from the same environment
+/// (`AWS_DEFAULT_REGION`, then `AWS_REGION`), or `us-east-1`, which Edge's
+/// any-region check accepts, when neither is set.
+#[test]
+fn an_unconfigured_lambda_region_stands_in_with_the_environment_region() {
+    let repo = Repo::new(&[], None, None);
+    repo.write(
+        "validator",
+        "#!/bin/sh\n[ \"$3\" = file ] || exit 0\nsed -n 's/.*aws_endpoint_url: /endpoint:/p' \"$7\"\nexit 0\n",
+    );
+    repo.write(
+        "resources/ferrum/plugins/lambda.yaml",
+        "kind: PluginConfig\nspec:\n  id: lambda\n  plugin_name: serverless_function\n  scope: global\n  config:\n    provider: aws_lambda\n    aws_credentials: default_chain\n    aws_function_name: fn\n    aws_endpoint_url: '${gh-env-secret:alloc=require}'\n",
+    );
+    for (env, expected) in [
+        (
+            &[("AWS_REGION", "eu-west-1")][..],
+            "endpoint:https://lambda.eu-west-1.amazonaws.com/",
+        ),
+        (
+            &[
+                ("AWS_DEFAULT_REGION", "ap-south-1"),
+                ("AWS_REGION", "eu-west-1"),
+            ][..],
+            "endpoint:https://lambda.ap-south-1.amazonaws.com/",
+        ),
+        (&[][..], "endpoint:https://lambda.us-east-1.amazonaws.com/"),
+    ] {
+        let text = output_text(&repo.run(&["validate"], env));
+        assert!(text.contains(expected), "{env:?}: {text}");
+    }
 }

@@ -219,6 +219,9 @@ pub(crate) fn with_validation_standins_for_report(
 
     let mut patched = config.clone();
     let mut changed = false;
+    // The validator inherits this process's AWS environment, so a Lambda row
+    // without a configured region resolves the same one there.
+    let env_region = aws_environment_region();
     for consumer in &mut patched.consumers {
         let namespace = consumer.namespace.clone();
         let consumer_id = consumer.id.clone();
@@ -255,7 +258,11 @@ pub(crate) fn with_validation_standins_for_report(
                 &plugin.config,
             ),
             client_keys,
-            lambda_origin: ambient_lambda_origin(plugin_name, &plugin.config),
+            lambda_origin: ambient_lambda_origin(
+                plugin_name,
+                &plugin.config,
+                env_region.as_deref(),
+            ),
         };
         let mut config = std::mem::take(&mut plugin.config);
         changed |= context.substitute(&mut config, &mut Vec::new(), &eligible);
@@ -279,16 +286,25 @@ const AWS_ENDPOINT_URL: &str = "aws_endpoint_url";
 /// other `aws_endpoint_url` unless `allow_custom_endpoint_with_ambient_credentials`
 /// is `true`. No `.invalid` host can pass, and leaving the field out would
 /// let Edge fall back to the caller's `AWS_LAMBDA_ENDPOINT_URL` and grade an
-/// endpoint the repository never named. So the stand-in is the row's own
-/// default regional origin, `https://lambda.<region>.amazonaws.com/`
+/// endpoint the repository never named. So the stand-in is the row's default
+/// regional origin, `https://lambda.<region>.amazonaws.com/`
 /// (`amazonaws.com.cn` for a `cn-*` region), exactly what Edge derives itself.
 /// It names a real AWS host, but like every stand-in it only ever reaches the
 /// 0600 temp spec, and `validate` dials nothing.
 ///
-/// A row whose configured `aws_region` is missing or not a commercial,
-/// GovCloud or China region keeps the ordinary stand-in, so Edge reports the
-/// region problem rather than a guessed endpoint hiding it.
-fn ambient_lambda_origin(plugin_name: &str, config: &serde_json::Value) -> Option<String> {
+/// The region is the configured `aws_region`. When that is absent or empty
+/// (Edge treats both as unset), it is the one Edge would resolve in the
+/// validator, which inherits this process's environment: `env_region`
+/// ([`aws_environment_region`]). Edge checks the endpoint against any region
+/// first in that case, so with no usable environment region `us-east-1`
+/// stands in. A configured region Edge would refuse (malformed, another
+/// partition, not a string) keeps the ordinary stand-in, so Edge reports the
+/// region rather than a guessed endpoint hiding it.
+fn ambient_lambda_origin(
+    plugin_name: &str,
+    config: &serde_json::Value,
+    env_region: Option<&str>,
+) -> Option<String> {
     if plugin_name != "serverless_function" {
         return None;
     }
@@ -307,9 +323,27 @@ fn ambient_lambda_origin(plugin_name: &str, config: &serde_json::Value) -> Optio
     {
         return None;
     }
-    let region = text("aws_region")?;
+    let region = match config.get("aws_region") {
+        Some(serde_json::Value::String(region)) if !region.is_empty() => region.as_str(),
+        None | Some(serde_json::Value::String(_)) => env_region
+            .filter(|region| aws_region_dns_suffix(region).is_some())
+            .unwrap_or(FALLBACK_AWS_REGION),
+        Some(_) => return None,
+    };
     let suffix = aws_region_dns_suffix(region)?;
     Some(format!("https://lambda.{region}.{suffix}/"))
+}
+
+/// The commercial region a Lambda stand-in uses when neither the row nor the
+/// environment names one; any modelled region passes Edge's any-region check.
+const FALLBACK_AWS_REGION: &str = "us-east-1";
+
+/// The region Edge resolves from the environment for a row without one:
+/// `AWS_DEFAULT_REGION`, then `AWS_REGION`, each only when non-empty.
+fn aws_environment_region() -> Option<String> {
+    ["AWS_DEFAULT_REGION", "AWS_REGION"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
 }
 
 /// The regional endpoint DNS suffix for a region of a partition Edge models
@@ -483,4 +517,71 @@ fn substitute_leaves(
         _ => {}
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin(config: serde_json::Value, env_region: Option<&str>) -> Option<String> {
+        ambient_lambda_origin("serverless_function", &config, env_region)
+    }
+
+    /// A row that leaves its region to the environment stands in with the
+    /// region Edge resolves in the validator, or `us-east-1` when there is
+    /// none Edge would accept; a configured region always wins.
+    #[test]
+    fn an_unconfigured_lambda_region_follows_the_environment() {
+        let row = |region: Option<serde_json::Value>| {
+            let mut config = serde_json::json!({
+                "provider": "aws_lambda",
+                "aws_credentials": "default_chain",
+                "aws_function_name": "fn"
+            });
+            if let Some(region) = region {
+                config["aws_region"] = region;
+            }
+            config
+        };
+        for (region, env_region, expected) in [
+            (
+                None,
+                Some("eu-west-1"),
+                Some("https://lambda.eu-west-1.amazonaws.com/"),
+            ),
+            (
+                None,
+                Some("cn-northwest-1"),
+                Some("https://lambda.cn-northwest-1.amazonaws.com.cn/"),
+            ),
+            (None, None, Some("https://lambda.us-east-1.amazonaws.com/")),
+            (
+                None,
+                Some("not-a-region"),
+                Some("https://lambda.us-east-1.amazonaws.com/"),
+            ),
+            (
+                Some(serde_json::json!("")),
+                Some("ap-south-1"),
+                Some("https://lambda.ap-south-1.amazonaws.com/"),
+            ),
+            (
+                Some(serde_json::json!("us-gov-east-1")),
+                Some("eu-west-1"),
+                Some("https://lambda.us-gov-east-1.amazonaws.com/"),
+            ),
+            (
+                Some(serde_json::json!("US-EAST-1")),
+                Some("eu-west-1"),
+                None,
+            ),
+            (Some(serde_json::json!(null)), Some("eu-west-1"), None),
+        ] {
+            assert_eq!(
+                origin(row(region.clone()), env_region).as_deref(),
+                expected,
+                "{region:?} {env_region:?}"
+            );
+        }
+    }
 }

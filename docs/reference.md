@@ -431,9 +431,12 @@ official regional endpoint, which no `.invalid` stand-in can be. Unless
 `https://lambda.<region>.amazonaws.com/` (`amazonaws.com.cn` for a `cn-*`
 region), only in the temporary file; the real endpoint is checked when it is
 resolved. The validator's environment is not changed, so another row that
-relies on `AWS_LAMBDA_ENDPOINT_URL` is still checked against it. A row whose
-`aws_region` is missing or not a commercial, GovCloud or China region keeps
-the ordinary stand-in, so the gateway reports the region.
+relies on `AWS_LAMBDA_ENDPOINT_URL` is still checked against it. A row with
+no (or an empty) `aws_region` uses the region the gateway resolves from the
+same environment (`AWS_DEFAULT_REGION`, then `AWS_REGION`), or `us-east-1`
+when neither names a valid region. A row whose configured `aws_region` is not
+a commercial, GovCloud or China region keeps the ordinary stand-in, so the
+gateway reports the region.
 
 `private_key_jwt_alg` and `aws_credentials` look like credentials by name, but
 when they hold a value the gateway accepts (`RS256`, `RS384`, `RS512`,
