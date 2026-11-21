@@ -520,9 +520,29 @@ struct DesiredRow {
     secret_pointers: BTreeSet<String>,
 }
 
+/// The part of a row Edge's projection sweeps for URL userinfo with its own
+/// parser: the whole Proxy and Upstream body, only `config` of a
+/// PluginConfig, nothing of a Consumer.
+#[derive(Clone, Copy)]
+enum UserinfoSweep {
+    WholeRow,
+    PluginConfig,
+    None,
+}
+
+impl UserinfoSweep {
+    fn covers(self, pointer: &str) -> bool {
+        match self {
+            Self::WholeRow => true,
+            Self::PluginConfig => pointer == "/config" || pointer.starts_with("/config/"),
+            Self::None => false,
+        }
+    }
+}
+
 impl DesiredRow {
-    fn new(value: Value, mut secret_pointers: BTreeSet<String>) -> Self {
-        collect_secret_values(&value, &mut String::new(), &mut secret_pointers);
+    fn new(value: Value, mut secret_pointers: BTreeSet<String>, sweep: UserinfoSweep) -> Self {
+        collect_secret_values(&value, &mut String::new(), sweep, &mut secret_pointers);
         Self {
             value,
             secret_pointers,
@@ -556,7 +576,10 @@ fn desired_comparison_rows(
         let value = serde_json::to_value(proxy)?;
         let mut secrets = BTreeSet::new();
         collect_tls_material_sites(&value, &mut String::new(), None, &mut secrets);
-        rows.insert(("Proxy", proxy.id.clone()), DesiredRow::new(value, secrets));
+        rows.insert(
+            ("Proxy", proxy.id.clone()),
+            DesiredRow::new(value, secrets, UserinfoSweep::WholeRow),
+        );
     }
     for consumer in &desired.consumers {
         let projected = project_consumer_for_export(consumer);
@@ -564,7 +587,7 @@ fn desired_comparison_rows(
         let secrets = consumer_secret_pointers(&projected);
         rows.insert(
             ("Consumer", consumer.id.clone()),
-            DesiredRow::new(value, secrets),
+            DesiredRow::new(value, secrets, UserinfoSweep::None),
         );
     }
     for plugin in &desired.plugin_configs {
@@ -585,13 +608,23 @@ fn desired_comparison_rows(
             let mut pointer = String::from("/config");
             collect_tls_material_sites(config, &mut pointer, None, &mut secrets);
         }
+        let mut visible = Vec::new();
         if let Some(trigger) = value.get("trigger") {
             collect_trigger_sites(trigger, &mut secrets);
+            collect_trigger_visible_subtrees(trigger, &mut visible);
         }
-        rows.insert(
-            ("PluginConfig", plugin.id.clone()),
-            DesiredRow::new(value, secrets),
-        );
+        let mut row = DesiredRow::new(value, secrets, UserinfoSweep::PluginConfig);
+        // Edge never withholds a visible predicate, so the generic
+        // placeholder/userinfo scan must not make one secret-bearing: a
+        // fingerprint-shaped literal there is a changed value, not a site.
+        row.secret_pointers.retain(|pointer| {
+            !visible.iter().any(|subtree| {
+                pointer
+                    .strip_prefix(subtree.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        });
+        rows.insert(("PluginConfig", plugin.id.clone()), row);
     }
     for upstream in &desired.upstreams {
         let value = serde_json::to_value(upstream)?;
@@ -606,7 +639,7 @@ fn desired_comparison_rows(
         collect_tls_material_sites(&value, &mut String::new(), None, &mut secrets);
         rows.insert(
             ("Upstream", upstream.id.clone()),
-            DesiredRow::new(value, secrets),
+            DesiredRow::new(value, secrets, UserinfoSweep::WholeRow),
         );
     }
     Ok(rows)
@@ -712,7 +745,7 @@ fn collect_tls_material_sites(
 const TRIGGER_CLIENT_FIELD_PREDICATES: [&str; 3] = ["header", "query", "cookie"];
 
 /// Trigger `match` predicates Edge leaves visible.
-const TRIGGER_VISIBLE_PREDICATES: [&str; 12] = [
+const TRIGGER_VISIBLE_PREDICATES: [&str; 14] = [
     "method",
     "path",
     "host",
@@ -723,6 +756,8 @@ const TRIGGER_VISIBLE_PREDICATES: [&str; 12] = [
     "proxy_id",
     "listen_port",
     "consumer",
+    "external_identity",
+    "external_identity_authority",
     "auth_method",
     "spiffe_id",
 ];
@@ -747,6 +782,48 @@ fn collect_trigger_sites(trigger: &Value, out: &mut BTreeSet<String>) {
             withheld_site(child, &pointer, out);
         }
         pointer.truncate(len);
+    }
+}
+
+/// Pointers of every visible predicate value (`TRIGGER_VISIBLE_PREDICATES`)
+/// in a PluginConfig `trigger`'s `all` / `any` / `not` / `match` tree. Edge
+/// skips these subtrees entirely when it projects the export.
+fn collect_trigger_visible_subtrees(trigger: &Value, out: &mut Vec<String>) {
+    fn walk(node: &Value, pointer: &mut String, out: &mut Vec<String>) {
+        let Some(map) = node.as_object() else {
+            return;
+        };
+        for (key, child) in map {
+            let len = pointer.len();
+            push_pointer_segment(pointer, key);
+            match (key.as_str(), child) {
+                ("all" | "any", Value::Array(items)) => {
+                    for (index, item) in items.iter().enumerate() {
+                        let item_len = pointer.len();
+                        push_pointer_segment(pointer, &index.to_string());
+                        walk(item, pointer, out);
+                        pointer.truncate(item_len);
+                    }
+                }
+                ("not", child) => walk(child, pointer, out),
+                ("match", Value::Object(leaf)) => {
+                    for key in leaf.keys() {
+                        if TRIGGER_VISIBLE_PREDICATES.contains(&key.as_str()) {
+                            let leaf_len = pointer.len();
+                            push_pointer_segment(pointer, key);
+                            out.push(pointer.clone());
+                            pointer.truncate(leaf_len);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            pointer.truncate(len);
+        }
+    }
+    if let Some(when) = trigger.get("when") {
+        let mut pointer = String::from("/trigger/when");
+        walk(when, &mut pointer, out);
     }
 }
 
@@ -854,11 +931,21 @@ fn trigger_operand_sites(value: &Value, pointer: &mut String, out: &mut BTreeSet
 }
 
 /// Add the pointer of every string that is a brokered placeholder or a URL
-/// carrying userinfo.
-fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
+/// carrying userinfo: a literal `scheme://` authority anywhere, and, inside
+/// the region Edge sweeps, whatever Edge's own URL parser reads userinfo from.
+fn collect_secret_values(
+    value: &Value,
+    pointer: &mut String,
+    sweep: UserinfoSweep,
+    out: &mut BTreeSet<String>,
+) {
+    use crate::secrets::url_userinfo::{legacy_url_has_userinfo, parsed_url_has_userinfo};
     match value {
         Value::String(text) => {
-            if crate::secrets::parse_placeholder(text).is_some() || has_url_userinfo(text) {
+            if crate::secrets::parse_placeholder(text).is_some()
+                || legacy_url_has_userinfo(text)
+                || (sweep.covers(pointer) && parsed_url_has_userinfo(text))
+            {
                 out.insert(pointer.clone());
             }
         }
@@ -866,7 +953,7 @@ fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet
             for (key, child) in map {
                 let len = pointer.len();
                 push_pointer_segment(pointer, key);
-                collect_secret_values(child, pointer, out);
+                collect_secret_values(child, pointer, sweep, out);
                 pointer.truncate(len);
             }
         }
@@ -874,21 +961,12 @@ fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet
             for (index, child) in items.iter().enumerate() {
                 let len = pointer.len();
                 push_pointer_segment(pointer, &index.to_string());
-                collect_secret_values(child, pointer, out);
+                collect_secret_values(child, pointer, sweep, out);
                 pointer.truncate(len);
             }
         }
         _ => {}
     }
-}
-
-/// True for `scheme://user[:password]@host…`.
-fn has_url_userinfo(value: &str) -> bool {
-    let Some((_, rest)) = value.split_once("://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    authority.contains('@')
 }
 
 /// Append one RFC 6901 reference token.

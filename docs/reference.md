@@ -227,7 +227,7 @@ any valid admin JWT. Edge v0.9.16 and later serve the tenant tier to a token
 with an `ns` claim. The minimal tier carries only `status` and `ready`. A gateway serves it
 to an unauthenticated probe, to a token it does not accept for detail, and to
 a namespace-scoped token when the build has no tenant tier. On the minimal
-tier the write state is unknown:
+tier the write state is unknown. For a ready gateway (HTTP 200):
 
 - `rotate` refuses before any broker or gateway write with
   `GatewayWriteStateUnknown`. Rotation publishes the new secret before its
@@ -238,6 +238,47 @@ tier the write state is unknown:
 - `apply` keeps its advisory preflight. It prints a warning with the same
   remedy and proceeds, and the first refused write reports the truth.
 - `doctor --scope gateway` reports `gateway-writable` as `UNKNOWN`.
+
+While Edge is not ready it answers `/health` with HTTP 503 and the same
+tiered document, with `ready: false` and `status` set to `starting`,
+`unavailable`, `draining`, or `degraded` when a listener failure withdraws
+readiness. GitForgeOps treats that document as the gateway's answer and does
+not retry it. It is recognized only as Edge v0.9.20 and later send it:
+`application/json`, valid UTF-8, no duplicate keys, and exactly one tier's
+shape. The minimal tier is exactly `status` and `ready`. The tenant tier adds
+exactly `mode`, `admin_writes_enabled` and the `namespace` block. The detailed
+tier carries an RFC 3339 `timestamp`, `mode`, `admin_writes_enabled`, the
+`namespace` block, the `fips` metadata (its `mode`, `build_profile` and
+`provider` labels within their documented sets, `certified` always `false`)
+and the `cached_config` summary (exactly `{"available": false}`, or
+`available: true` with `loaded_at` and both counts), and no `error` or
+`message` key. An optional `database` block must be an object whose `status`
+is `connected` or `disconnected`; no other optional diagnostic is validated. `mode` is one of Edge's operating
+modes. The `namespace` block is exactly `active`, `serving_scope` and
+`data_plane_single_namespace`, and `serving_scope` is the one Edge derives
+from `mode`: `single-namespace-data-plane` for `database`, `file`, `dp` and
+`mesh`, `control-plane` for `cp`, and `no-data-plane` for `node_agent`.
+`data_plane_single_namespace` is true exactly for a single-namespace data
+plane. Of the fields checked here, only `namespace.active` may be `null`: it is
+`null` on a control plane or node agent, and in the tenant tier also when the
+token cannot address the namespace the data plane routes. No other checked
+field may be `null` or wrongly typed. Any other 503, including an
+HTML maintenance page, unrelated JSON or `status: ok`, is not Edge's answer,
+and is retried by HTTP status like any other 5xx read:
+
+- `doctor --scope gateway` reports `gateway-reachable` as `PASS` and adds
+  `gateway-ready` as `FAIL` (exit `3`), because the gateway itself says it is
+  not serving. The write state and the token are still checked as on a ready
+  gateway. A 503 without Edge's document fails `gateway-reachable` with a
+  message that says something other than the gateway answered, and leaves
+  `gateway-token` `UNKNOWN`.
+- `apply`'s preflight still refuses on an explicit `admin_writes_enabled:
+  false` or a read-only mode in the 503 document. Otherwise it warns that the
+  gateway is not ready and proceeds.
+- `rotate` refuses before any broker or gateway write: `GatewayReadOnly` when
+  the document refuses writes, and otherwise an error naming the not-ready
+  status. That includes a minimal-tier 503, which is not
+  `GatewayWriteStateUnknown`.
 
 `doctor --scope gateway` mints the token the environment's runs send: its
 `ns` claim is the namespace list `apply`, `plan`, `review` and `diff`
@@ -544,7 +585,9 @@ with the admin credential.
   non-secret contents, so those are counted separately and keep the run
   non-authoritative (see exit codes above). The fingerprinted locations
   GitForgeOps predicts also cover what Ferrum Edge releases after v0.9.20
-  withhold: the `header`, `query` and `cookie` operands of a plugin `trigger`,
+  withhold: the `header`, `query` and `cookie` operands of a plugin `trigger`
+  (its other predicates, including `external_identity` and
+  `external_identity_authority`, stay visible and are compared),
   every string, number or boolean in a custom plugin's config, newer built-in
   plugin paths, and TLS private-key material in a Proxy, Upstream or plugin
   config; a gateway that still sends those values is compared as usual. Edge

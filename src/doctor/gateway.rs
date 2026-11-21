@@ -4,11 +4,19 @@
 //! transport configuration (scheme, CA, mTLS pairing) before a socket opens;
 //! then three questions are asked:
 //!
-//! * `GET /health` — is the gateway reachable over this transport, and does it
-//!   accept admin writes? Ferrum Edge serves `/health` **without
-//!   authentication**, so an answer here says nothing about the token. The
-//!   token only decides the tier: `admin_writes_enabled` is absent from the
-//!   minimal tier, and that is reported as unknown, never as writable.
+//! * `GET /health` — is the gateway reachable over this transport, is it
+//!   ready, and does it accept admin writes? Ferrum Edge serves `/health`
+//!   **without authentication**, so an answer here says nothing about the
+//!   token. The token only decides the tier: `admin_writes_enabled` is absent
+//!   from the minimal tier, and that is reported as unknown, never as
+//!   writable. While not ready (`starting`, `unavailable`, `draining`, or
+//!   `degraded` with readiness withdrawn) Edge answers HTTP 503 with the same
+//!   document and `ready: false`. That is still the gateway answering:
+//!   reachability passes, a separate `gateway-ready` check fails (the gateway
+//!   itself says it is not serving, so the environment is not ready to
+//!   deploy to), and every later check still runs. A 503 that is not Edge's
+//!   documented document (an intermediary's maintenance page, unrelated JSON)
+//!   fails reachability with a message that says something else answered.
 //! * `GET /cluster` — does the gateway accept the token we mint? It sits behind
 //!   the admin JWT gate with no role requirement, so a 401/403 there is the
 //!   signing secret or a claim being wrong, and a 200 proves the gateway
@@ -41,7 +49,7 @@
 use super::{Check, Scope, Status};
 use crate::config::env::GatewayMode;
 use crate::config::EnvConfig;
-use crate::http_client::{health_tier_remedy, AdminClient};
+use crate::http_client::{health_tier_remedy, AdminClient, HealthProbe};
 
 /// Reads only. Returns one group of checks for the given environment.
 ///
@@ -104,28 +112,43 @@ pub async fn run(environment: &str, env: &EnvConfig, token_namespaces: &[String]
     )
     .for_environment(environment)];
 
-    match client.get_health().await {
-        Ok(health) => {
+    match client.probe_health().await {
+        Ok(probe) => {
+            let health = &probe.health;
+            let fields = format!(
+                "mode={}, ready={}, admin_writes_enabled={}",
+                crate::display::peer_text(health.mode.as_deref().unwrap_or("unknown")),
+                health
+                    .ready
+                    .map(|ready| ready.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                health
+                    .admin_writes_enabled
+                    .map(|enabled| enabled.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            );
+            let detail = if probe.is_ready() {
+                format!("GET /health answered: {fields}")
+            } else {
+                format!(
+                    "GET /health answered HTTP {} with the gateway's not-ready health \
+                     document: status={}, {fields}",
+                    probe.http_status,
+                    crate::display::peer_text(health.status.as_deref().unwrap_or("unknown")),
+                )
+            };
             checks.push(
                 Check::pass(
                     "gateway-reachable",
                     "Gateway is reachable",
                     Scope::Gateway,
-                    format!(
-                        "GET /health answered: mode={}, ready={}, admin_writes_enabled={}",
-                        crate::display::peer_text(health.mode.as_deref().unwrap_or("unknown")),
-                        health
-                            .ready
-                            .map(|ready| ready.to_string())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        health
-                            .admin_writes_enabled
-                            .map(|enabled| enabled.to_string())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                    ),
+                    detail,
                 )
                 .for_environment(environment),
             );
+            if !probe.is_ready() {
+                checks.push(not_ready_check(&probe).for_environment(environment));
+            }
             // A read-only control plane accepts every read and refuses every
             // write, so an apply would get all the way to the first mutation
             // before finding out.
@@ -163,20 +186,48 @@ pub async fn run(environment: &str, env: &EnvConfig, token_namespaces: &[String]
             }
         }
         Err(error) => {
+            // An HTTP status without Edge's health document: something
+            // answered over this transport, so a URL, network or CA diagnosis
+            // would send the operator the wrong way. `probe_health` reports
+            // such an answer as an `ApiError` with its status, or, for the
+            // admin API's explicit read-only 403, as `GatewayReadOnly`.
+            let answer = match &error {
+                crate::error::Error::ApiError { .. } => Some(error.to_string()),
+                crate::error::Error::GatewayReadOnly(reason) => Some(reason.clone()),
+                _ => None,
+            };
+            let (detail, remedy, token_detail) = if let Some(answer) = answer {
+                (
+                    format!("GET /health answered without Ferrum Edge's health document: {answer}"),
+                    "Something answered over this transport, but not with Ferrum Edge's \
+                     /health document (an HTTP 503 counts as the gateway's not-ready answer \
+                     only when its body is that document). A proxy, load balancer or \
+                     maintenance page in front of the admin API, or a URL that names \
+                     another service, answers this way. Check FERRUM_GATEWAY_URL and what \
+                     sits between this runner and the gateway's admin listener. If the \
+                     gateway itself answered (for example 401 for a client certificate it \
+                     no longer trusts), the status and body above name the cause.",
+                    "not attempted: GET /health did not return Ferrum Edge's health document",
+                )
+            } else {
+                (
+                    format!("GET /health failed: {error}"),
+                    "The gateway was not reached. Check the URL, network path, and — \
+                     for a private CA — that FERRUM_GATEWAY_CA_CERT holds the \
+                     base64-encoded PEM that signs the gateway's certificate.",
+                    "not attempted: the gateway did not answer /health",
+                )
+            };
             checks.push(
                 Check::new(
                     "gateway-reachable",
                     "Gateway is reachable",
                     Scope::Gateway,
                     Status::Fail,
-                    format!("GET /health failed: {error}"),
+                    detail,
                 )
                 .for_environment(environment)
-                .remedy(
-                    "The gateway was not reached. Check the URL, network path, and — \
-                     for a private CA — that FERRUM_GATEWAY_CA_CERT holds the \
-                     base64-encoded PEM that signs the gateway's certificate.",
-                ),
+                .remedy(remedy),
             );
             // Nothing below can be answered once /health failed; say so rather
             // than leaving the token question silently absent.
@@ -186,7 +237,7 @@ pub async fn run(environment: &str, env: &EnvConfig, token_namespaces: &[String]
                     "Gateway accepts our admin token",
                     Scope::Gateway,
                     Status::Unknown,
-                    "not attempted: the gateway did not answer /health",
+                    token_detail,
                 )
                 .for_environment(environment),
             );
@@ -268,6 +319,48 @@ pub async fn run(environment: &str, env: &EnvConfig, token_namespaces: &[String]
             .map(|check| check.for_environment(environment)),
     );
     checks
+}
+
+/// `GET /health` answered with Edge's not-ready document (HTTP 503,
+/// `ready: false`).
+///
+/// A failure, not a warning: the gateway itself reports that it is not
+/// serving, so the environment is not ready to deploy to right now, and doctor
+/// answers for the moment it runs. Reachability and the token are reported
+/// separately, so the failure names readiness alone.
+fn not_ready_check(probe: &HealthProbe) -> Check {
+    let status = probe.health.status.as_deref().unwrap_or("unknown");
+    let remedy = match status {
+        "starting" => {
+            "The gateway has not finished startup. Re-run doctor once GET /health answers \
+             200; a deployment started now may be refused or reach a gateway that is not \
+             yet serving."
+        }
+        "draining" => {
+            "This gateway process received a shutdown signal and is terminating; draining \
+             never clears. Re-run doctor against its replacement once that is ready, or \
+             point FERRUM_GATEWAY_URL at a serving instance."
+        }
+        "unavailable" => {
+            "A serving listener or a dependency the gateway cannot serve without is \
+             unavailable. The detailed /health tier and the gateway's logs name the cause; \
+             some causes clear on their own, and a failed listener needs a restart. Re-run \
+             doctor once GET /health answers 200."
+        }
+        _ => {
+            "The gateway withdrew readiness for a failed listener. The detailed /health \
+             tier and the gateway's logs name it. Re-run doctor once GET /health answers \
+             200."
+        }
+    };
+    Check::new(
+        "gateway-ready",
+        "Gateway is ready",
+        Scope::Gateway,
+        Status::Fail,
+        format!("the gateway reports it is not ready: {}", probe.readiness()),
+    )
+    .remedy(remedy)
 }
 
 /// The four claim settings are the usual cause of a rejected token, and an

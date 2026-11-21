@@ -540,6 +540,151 @@ fn edge_0_9_19_redacted_plugin_values_are_not_false_drift() {
     }
 }
 
+/// URL userinfo spellings Ferrum Edge's WHATWG parser reads as credentials.
+const WHATWG_USERINFO_URLS: [&str; 5] = [
+    "https:///svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+    "https:/\\svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+    "https:\t//svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+    "https://svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318\\v1",
+    "https:\r\n//svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+];
+
+/// GHSA-m3hr-pvjr-278c: Edge withholds a credential-bearing URL anywhere in a
+/// plugin config, so a repository URL whose userinfo only a WHATWG parser
+/// finds is a secret-bearing site: the fingerprint is put back and counted
+/// as uncompared, never reported as drift. `a2a_gateway` `callback_url` is a
+/// leaf nothing but the URL userinfo check predicts; `opa_host` and a custom
+/// plugin's leaf are predicted sites as well.
+#[test]
+fn whatwg_url_userinfo_in_plugin_config_is_an_uncompared_site() {
+    for url in WHATWG_USERINFO_URLS {
+        let cases = [
+            (
+                "a2a_gateway",
+                json!({"callback_url": url}),
+                "/config/callback_url",
+            ),
+            (
+                "opa",
+                json!({"opa_host": url, "policy_path": "authz/allow"}),
+                "/config/opa_host",
+            ),
+            (
+                "acme_widget",
+                json!({"upstream": {"endpoint_url": url}}),
+                "/config/upstream/endpoint_url",
+            ),
+        ];
+        for (plugin_name, config, pointer) in cases {
+            let desired: GatewayConfig = serde_json::from_value(json!({
+                "plugin_configs": [{
+                    "id": "url-plugin",
+                    "namespace": "ferrum",
+                    "plugin_name": plugin_name,
+                    "scope": "global",
+                    "config": config,
+                }],
+            }))
+            .unwrap();
+            let mut live = serde_json::to_value(&desired.plugin_configs[0]).unwrap();
+            *live.pointer_mut(pointer).unwrap() = json!(fp('e'));
+            let body = document("ferrum", KEY_ID, json!([]), json!([live])).to_string();
+            let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+            let view = export.live_view_with(&desired, &desired).unwrap();
+
+            let uncompared: Vec<&str> = view
+                .uncompared
+                .iter()
+                .map(|site| site.pointer.as_str())
+                .collect();
+            assert_eq!(uncompared, [pointer], "{plugin_name} {url:?}");
+            assert!(view.masked_ancestors.is_empty(), "{plugin_name}");
+            let diffs = compute_diff(&desired, &view.actual).unwrap();
+            assert!(diffs.is_empty(), "{plugin_name} {url:?}: {diffs:?}");
+        }
+    }
+}
+
+/// The export comparison's own URL userinfo sweep, outside plugin config:
+/// a Consul `address` whose userinfo only a WHATWG parser finds is a
+/// secret-bearing site, so its fingerprint is uncompared, never drift.
+#[test]
+fn whatwg_url_userinfo_in_an_upstream_address_is_an_uncompared_site() {
+    for url in WHATWG_USERINFO_URLS {
+        let desired: GatewayConfig = serde_json::from_value(json!({
+            "upstreams": [{
+                "id": "pool",
+                "namespace": "ferrum",
+                "targets": [{"host": "10.0.0.1", "port": 8080}],
+                "service_discovery": {
+                    "provider": "consul",
+                    "consul": {"address": url, "service_name": "orders"},
+                },
+            }],
+        }))
+        .unwrap();
+        let mut body = document("ferrum", KEY_ID, json!([]), json!([]));
+        body["upstreams"] = serde_json::to_value(&desired.upstreams).unwrap();
+        body["counts"]["upstreams"] = json!(1);
+        body["upstreams"][0]["service_discovery"]["consul"]["address"] = json!(fp('e'));
+        let export = ConfigExport::from_response(&body.to_string(), "ferrum", false).unwrap();
+        let view = export.live_view_with(&desired, &desired).unwrap();
+
+        assert_eq!(
+            uncompared_sites(&view),
+            [(
+                "pool".to_string(),
+                "/service_discovery/consul/address".to_string()
+            )],
+            "{url:?}"
+        );
+        assert!(view.masked_ancestors.is_empty(), "{url:?}");
+        let diffs = compute_diff(&desired, &view.actual).unwrap();
+        assert!(diffs.is_empty(), "{url:?}: {diffs:?}");
+    }
+}
+
+/// Edge sweeps URL userinfo with its own parser only in a plugin's `config`,
+/// not its labels. Text the parser reads a username from is an uncompared
+/// site in `config`, but in a label a fingerprint-shaped live value is an
+/// ordinary change and must stay in the diff.
+#[test]
+fn parser_userinfo_sites_cover_plugin_config_but_not_labels() {
+    for text in [
+        "https: contact ops@example.com",
+        "https:///svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+    ] {
+        let desired: GatewayConfig = serde_json::from_value(json!({
+            "plugin_configs": [{
+                "id": "mock",
+                "namespace": "ferrum",
+                "plugin_name": "response_mock",
+                "scope": "global",
+                "labels": {"contact": text},
+                "config": {"rules": [{"path": "/help", "status_code": 200, "body": text}]},
+            }],
+        }))
+        .unwrap();
+        let mut live = serde_json::to_value(&desired.plugin_configs[0]).unwrap();
+        live["labels"]["contact"] = json!(fp('a'));
+        live["config"]["rules"][0]["body"] = json!(fp('b'));
+        let body = document("ferrum", KEY_ID, json!([]), json!([live])).to_string();
+        let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+        let view = export.live_view_with(&desired, &desired).unwrap();
+
+        assert_eq!(
+            uncompared_sites(&view),
+            [("mock".to_string(), "/config/rules/0/body".to_string())],
+            "{text:?}"
+        );
+        assert_eq!(view.actual.plugin_configs[0].labels["contact"], fp('a'));
+        let diffs = compute_diff(&desired, &view.actual).unwrap();
+        assert_eq!(diffs.len(), 1, "{text:?}: {diffs:?}");
+        assert_eq!(diffs[0].id, "mock");
+        assert_eq!(diffs[0].action, DiffAction::Modify);
+    }
+}
+
 #[test]
 fn a_whole_value_fingerprinted_around_a_secret_is_never_authoritative() {
     let desired: GatewayConfig = serde_json::from_value(json!({
@@ -1249,5 +1394,132 @@ fn a_fingerprint_at_a_visible_trigger_predicate_is_still_drift() {
     let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
     assert_eq!(diffs.len(), 1, "{diffs:?}");
     assert_eq!(diffs[0].id, "gate");
+    assert_eq!(diffs[0].details[0].field, "trigger");
+}
+
+/// Edge keeps `external_identity` and `external_identity_authority` visible
+/// (`TRIGGER_VISIBLE_PREDICATES`): they compare an authenticated principal and
+/// its verifying realm, which a client cannot assert. A fingerprint there is
+/// therefore a changed value, never a withheld secret site.
+#[test]
+fn external_identity_trigger_predicates_are_visible_not_secret_sites() {
+    let desired: GatewayConfig = serde_json::from_value(json!({
+        "plugin_configs": [{
+            "id": "partner",
+            "namespace": "ferrum",
+            "plugin_name": "rate_limiting",
+            "scope": "global",
+            "config": {},
+            "trigger": {"when": {"all": [
+                {"match": {"external_identity": {"value": {"exact": ["partner-service"]}}}},
+                {"match": {"external_identity_authority": [
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                ]}},
+                {"match": {"consumer": {"value": {"exact": ["partner"]}}}},
+            ]}},
+        }],
+    }))
+    .unwrap();
+    let live_view = |pointer: Option<&str>| {
+        let mut plugins = serde_json::to_value(&desired.plugin_configs).unwrap();
+        if let Some(pointer) = pointer {
+            *plugins.pointer_mut(pointer).unwrap() = json!(fp('a'));
+        }
+        let body = document("ferrum", KEY_ID, json!([]), plugins).to_string();
+        ConfigExport::from_response(&body, "ferrum", false)
+            .unwrap()
+            .live_view_with(&desired, &desired)
+    };
+
+    // Sent literally: compared, in sync, nothing uncompared.
+    let view = live_view(None).unwrap();
+    assert!(view.uncompared.is_empty(), "{:?}", view.uncompared);
+    assert!(view.masked_ancestors.is_empty());
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert!(diffs.is_empty(), "{diffs:?}");
+
+    // A fingerprinted operand is drift on `trigger`.
+    for pointer in [
+        "/0/trigger/when/all/0/match/external_identity/value/exact/0",
+        "/0/trigger/when/all/1/match/external_identity_authority/0",
+    ] {
+        let view = live_view(Some(pointer)).unwrap();
+        assert!(
+            view.uncompared.is_empty(),
+            "{pointer}: {:?}",
+            view.uncompared
+        );
+        assert!(view.masked_ancestors.is_empty(), "{pointer}");
+        let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+        assert_eq!(diffs.len(), 1, "{pointer}: {diffs:?}");
+        assert_eq!(diffs[0].id, "partner");
+        assert_eq!(diffs[0].details[0].field, "trigger");
+    }
+
+    // A whole predicate (or its leaf) fingerprinted is not put back from the
+    // repository as a withheld value, so the typed decode refuses the row,
+    // exactly as for the long-visible `consumer` predicate. Were the new keys
+    // unknown, the declared value would be substituted and the row counted
+    // as uncompared (or a masked ancestor), hiding a changed authority.
+    for pointer in [
+        "/0/trigger/when/all/0/match/external_identity",
+        "/0/trigger/when/all/0/match",
+        "/0/trigger/when/all/1/match/external_identity_authority",
+        "/0/trigger/when/all/1/match",
+        "/0/trigger/when/all/2/match/consumer",
+    ] {
+        assert!(live_view(Some(pointer)).is_err(), "{pointer}");
+    }
+}
+
+/// The generic placeholder/userinfo scan must not reach into a visible
+/// trigger predicate: Edge exports it verbatim, so a fingerprint-shaped live
+/// operand is a changed value even when the declared operand looks like a URL
+/// with userinfo. Client-field operands stay predicted sites.
+#[test]
+fn visible_trigger_predicates_are_excluded_from_the_generic_secret_scan() {
+    let desired: GatewayConfig = serde_json::from_value(json!({
+        "plugin_configs": [{
+            "id": "partner",
+            "namespace": "ferrum",
+            "plugin_name": "rate_limiting",
+            "scope": "global",
+            "config": {},
+            "trigger": {"when": {"all": [
+                {"match": {"external_identity": {"value": {"exact": ["https://alice@example.test"]}}}},
+                {"not": {"match": {"consumer": {"value": {"prefix": ["https://bob@example.test"]}}}}},
+                {"match": {"header": {"name": "x-skip", "value": {"exact": ["https://carol@example.test"]}}}},
+            ]}},
+        }],
+    }))
+    .unwrap();
+    let mut plugins = serde_json::to_value(&desired.plugin_configs).unwrap();
+    for pointer in [
+        "/0/trigger/when/all/0/match/external_identity/value/exact/0",
+        "/0/trigger/when/all/1/not/match/consumer/value/prefix/0",
+        "/0/trigger/when/all/2/match/header/value/exact/0",
+    ] {
+        *plugins.pointer_mut(pointer).unwrap() = json!(fp('b'));
+    }
+    let body = document("ferrum", KEY_ID, json!([]), plugins).to_string();
+    let view = ConfigExport::from_response(&body, "ferrum", false)
+        .unwrap()
+        .live_view_with(&desired, &desired)
+        .unwrap();
+
+    // Only the client-field operand is withheld (and so uncompared).
+    let uncompared: Vec<&str> = view
+        .uncompared
+        .iter()
+        .map(|site| site.pointer.as_str())
+        .collect();
+    assert_eq!(
+        uncompared,
+        ["/trigger/when/all/2/match/header/value/exact/0"]
+    );
+    assert!(view.masked_ancestors.is_empty());
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    assert_eq!(diffs[0].id, "partner");
     assert_eq!(diffs[0].details[0].field, "trigger");
 }

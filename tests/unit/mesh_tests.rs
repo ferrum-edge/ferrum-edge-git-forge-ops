@@ -808,6 +808,77 @@ fn summary_reports_only_non_empty_collections() {
     assert!(!summary.contains("sidecar"), "{summary}");
 }
 
+/// `virtual_service_http_routes` (Edge after v0.9.20) loads strictly,
+/// concatenates across fragments like the sibling namespaced lists (Edge's
+/// validator owns the `(namespace, name)` duplicate check), is counted by the
+/// plan summary, and reaches the published mesh document verbatim.
+#[test]
+fn virtual_service_http_routes_load_merge_summarize_and_render() {
+    let routes = |name: &str| {
+        format!(
+            r#"
+kind: MeshConfig
+spec:
+  virtual_service_http_routes:
+    - name: {name}
+      namespace: ferrum
+      export_to: ["*"]
+      proxy_ids: ["istio-vs-{name}-0", "istio-vs-{name}-1"]
+"#
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write_tree(
+        tmp.path(),
+        &[
+            ("ferrum/mesh/core.yaml", CORE_FRAGMENT),
+            ("ferrum/mesh/routes-a.yaml", &routes("checkout")),
+            ("ferrum/mesh/routes-b.yaml", &routes("payments")),
+        ],
+    );
+    let mesh = mesh_from(tmp.path()).expect("mesh document");
+
+    let names: Vec<&str> = mesh
+        .virtual_service_http_routes
+        .iter()
+        .map(|binding| binding["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["checkout", "payments"]);
+    assert_eq!(
+        mesh.virtual_service_http_routes[0],
+        serde_json::json!({
+            "name": "checkout",
+            "namespace": "ferrum",
+            "export_to": ["*"],
+            "proxy_ids": ["istio-vs-checkout-0", "istio-vs-checkout-1"],
+        })
+    );
+
+    let summary = mesh.summary();
+    assert!(
+        summary.contains("2 VirtualService HTTP route bindings"),
+        "{summary}"
+    );
+    let only_routes = MeshConfigSpec {
+        virtual_service_http_routes: vec![serde_json::json!({"name": "a", "namespace": "b"})],
+        ..Default::default()
+    };
+    assert_eq!(only_routes.summary(), "1 VirtualService HTTP route binding");
+    assert!(!only_routes.is_empty());
+
+    let document = render_mesh_yaml(&mesh).unwrap();
+    let value: serde_json::Value =
+        serde_json::to_value(serde_yaml::from_str::<serde_yaml::Value>(&document).unwrap())
+            .unwrap();
+    assert_eq!(
+        value["mesh"]["virtual_service_http_routes"],
+        serde_json::to_value(&mesh.virtual_service_http_routes).unwrap(),
+        "{document}"
+    );
+    let reparsed: MeshConfigSpec = serde_json::from_value(value["mesh"].clone()).unwrap();
+    assert_eq!(reparsed, mesh);
+}
+
 #[test]
 fn summary_of_an_empty_document_is_empty() {
     assert_eq!(MeshConfigSpec::default().summary(), "");

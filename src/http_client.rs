@@ -92,7 +92,10 @@ pub(crate) fn bounded_error_message(body: &str) -> String {
 }
 
 /// Read a response body with a hard byte cap, failing closed past it.
-async fn read_body_capped(mut resp: reqwest::Response) -> crate::error::Result<String> {
+///
+/// The body is decoded lossily; the flag says whether the bytes were valid
+/// UTF-8, for a caller that must not accept a repaired body as evidence.
+async fn read_body_capped(mut resp: reqwest::Response) -> crate::error::Result<(String, bool)> {
     let mut bytes = Vec::new();
     while let Some(chunk) = resp
         .chunk()
@@ -106,7 +109,13 @@ async fn read_body_capped(mut resp: reqwest::Response) -> crate::error::Result<S
         }
         bytes.extend_from_slice(&chunk);
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(match String::from_utf8(bytes) {
+        Ok(body) => (body, true),
+        Err(error) => (
+            String::from_utf8_lossy(error.as_bytes()).into_owned(),
+            false,
+        ),
+    })
 }
 
 /// Read at most [`MAX_ERROR_BODY_BYTES`] of an error response and reduce it
@@ -575,11 +584,29 @@ impl AdminClient {
     where
         F: Fn(&str) -> RequestBuilder,
     {
+        self.send_with_retry_policy(kind, build, RetryPolicy::Standard)
+            .await
+    }
+
+    /// [`AdminClient::send_with_retry`] under an explicit [`RetryPolicy`].
+    async fn send_with_retry_policy<F>(
+        &self,
+        kind: RequestKind,
+        build: F,
+        policy: RetryPolicy,
+    ) -> crate::error::Result<RawResponse>
+    where
+        F: Fn(&str) -> RequestBuilder,
+    {
         let max_attempts = self.max_retries.saturating_add(1);
         // Set once an attempt got an HTTP response and was retried anyway: the
         // gateway saw that attempt, which may have committed a write. A retry
         // after a connect error does not count; nothing was sent.
         let mut answered_before = false;
+        // Health reads only: the most recent HTTP answer, reported if every
+        // later attempt fails in transport, so "something answered" is not
+        // erased by a listener that closed between attempts.
+        let mut last_answer: Option<RawResponse> = None;
 
         // Every iteration returns, or retries only while `attempt <
         // max_attempts`, so the loop always ends in one of its returns.
@@ -602,6 +629,7 @@ impl AdminClient {
                     let location = header_string(&resp, "location");
                     let etag = header_string(&resp, "etag");
                     let cache_control = header_string(&resp, "cache-control");
+                    let content_type = header_string(&resp, "content-type");
                     let retry_after = parse_retry_after(header_string(&resp, "retry-after"));
                     let evidence_headers_valid = ["etag", "cache-control", "x-data-source"]
                         .iter()
@@ -616,56 +644,72 @@ impl AdminClient {
                     // it would let later writes proceed in a stale
                     // namespace. The placeholder parses as no envelope,
                     // which every consumer treats fail-closed.
-                    let body = read_body_capped(resp)
+                    let (body, body_utf8) = read_body_capped(resp)
                         .await
-                        .unwrap_or_else(|_| String::from("<no body>"));
+                        .unwrap_or_else(|_| (String::from("<no body>"), false));
+                    let raw = RawResponse {
+                        status,
+                        body,
+                        body_utf8,
+                        data_source,
+                        location,
+                        etag,
+                        cache_control,
+                        content_type,
+                        evidence_headers_valid,
+                        retried: answered_before,
+                    };
 
                     if is_success_status(status) {
-                        return Ok(RawResponse {
-                            status,
-                            body,
-                            data_source,
-                            location,
-                            etag,
-                            cache_control,
-                            evidence_headers_valid,
-                            retried: answered_before,
-                        });
+                        return Ok(raw);
                     }
 
-                    let retryable = match ApiErrorBody::parse_mutation(&body) {
-                        Ok(parsed) => classify_retry(status, &parsed, kind) == RetryDecision::Retry,
-                        Err(_) if kind == RequestKind::Read => {
+                    let retryable = match policy {
+                        RetryPolicy::Health => {
+                            // Edge's not-ready document is the answer itself.
+                            if not_ready_health(&raw).is_some() {
+                                return Ok(raw);
+                            }
+                            // A GET changes nothing, so a body's mutation
+                            // markers (`applied: false`, rollback state) say
+                            // nothing about retrying it: the status decides.
                             classify_retry(status, &ApiErrorBody::default(), kind)
                                 == RetryDecision::Retry
                         }
-                        // A malformed envelope may conceal applied:false or an
-                        // incomplete rollback. It cannot authorize another write.
-                        Err(_) => false,
+                        RetryPolicy::Standard => match ApiErrorBody::parse_mutation(&raw.body) {
+                            Ok(parsed) => {
+                                classify_retry(status, &parsed, kind) == RetryDecision::Retry
+                            }
+                            Err(_) if kind == RequestKind::Read => {
+                                classify_retry(status, &ApiErrorBody::default(), kind)
+                                    == RetryDecision::Retry
+                            }
+                            // A malformed envelope may conceal applied:false or
+                            // an incomplete rollback. It cannot authorize
+                            // another write.
+                            Err(_) => false,
+                        },
                     };
                     if retryable && attempt < max_attempts {
                         answered_before = true;
+                        if policy == RetryPolicy::Health {
+                            last_answer = Some(raw);
+                        }
                         match retry_after {
                             Some(delay) => tokio::time::sleep(delay).await,
                             None => backoff_sleep(attempt).await,
                         }
                         continue;
                     }
-                    return Ok(RawResponse {
-                        status,
-                        body,
-                        data_source,
-                        location,
-                        etag,
-                        cache_control,
-                        evidence_headers_valid,
-                        retried: answered_before,
-                    });
+                    return Ok(raw);
                 }
                 Err(e) if e.is_connect() && attempt < max_attempts => {
                     backoff_sleep(attempt).await;
                 }
                 Err(e) => {
+                    if let Some(answer) = last_answer {
+                        return Ok(answer);
+                    }
                     let message = transport_error("request to the gateway failed", e);
                     return Err(crate::error::Error::HttpClient(message));
                 }
@@ -720,32 +764,99 @@ impl AdminClient {
         if !matches!(error, crate::error::Error::ApiError { status: 403, .. }) {
             return error;
         }
-        match self.get_health().await {
-            Ok(health) => match write_block_reason(&health) {
+        match self.probe_health().await {
+            Ok(probe) => match write_block_reason(&probe.health) {
                 Some(reason) => crate::error::Error::GatewayReadOnly(format!(
                     "the gateway answered 403 to a config mutation and GET /health confirms it \
                      will not accept writes: {reason} No further resources were attempted."
                 )),
                 None => error,
             },
+            Err(crate::error::Error::GatewayReadOnly(reason)) => {
+                crate::error::Error::GatewayReadOnly(format!(
+                    "the gateway answered 403 to a config mutation and {reason} No further \
+                     resources were attempted."
+                ))
+            }
             Err(_) => error,
         }
     }
 
-    /// Authenticated `GET /health`. Carries `mode`, `ready` and
-    /// `admin_writes_enabled` — the ahead-of-time signal for read-only mode —
-    /// when the gateway serves this token more than its minimal tier. See
-    /// [`HealthStatus`] for the tiers.
+    /// Authenticated `GET /health`, for a caller that needs a **ready**
+    /// gateway. Carries `mode`, `ready` and `admin_writes_enabled` — the
+    /// ahead-of-time signal for read-only mode — when the gateway serves this
+    /// token more than its minimal tier. See [`HealthStatus`] for the tiers.
+    ///
+    /// A gateway that answers with its not-ready document (see
+    /// [`AdminClient::probe_health`]) is an error: one that explicitly refuses
+    /// writes is [`crate::error::Error::GatewayReadOnly`], and any other is an
+    /// `ApiError` naming its 503 status.
     pub async fn get_health(&self) -> crate::error::Result<HealthStatus> {
+        let probe = self.probe_health().await?;
+        if probe.is_ready() {
+            return Ok(probe.health);
+        }
+        if let Some(reason) = write_block_reason(&probe.health) {
+            return Err(crate::error::Error::GatewayReadOnly(reason));
+        }
+        Err(crate::error::Error::ApiError {
+            status: probe.http_status,
+            message: format!(
+                "GET /health reports the gateway is not ready: {}",
+                probe.readiness()
+            ),
+        })
+    }
+
+    /// Authenticated `GET /health`, keeping a not-ready answer.
+    ///
+    /// Ferrum Edge answers `/health` with HTTP 503 and `ready: false` while it
+    /// is `starting`, `unavailable` or `draining` (or `degraded` with readiness
+    /// withdrawn), in the same tiered document a ready gateway sends with 200.
+    /// That is the gateway answering, not a transport failure, and the
+    /// document can still carry an explicit `admin_writes_enabled: false`, so
+    /// it is returned with [`HealthProbe::is_ready`] false. Only a 503 whose
+    /// response is that documented shape ([`parse_not_ready_health`]) counts:
+    /// an intermediary's maintenance page or unrelated JSON is an `ApiError`
+    /// carrying its HTTP status ([`health_answer_error`]).
+    ///
+    /// Retries follow [`RetryPolicy::Health`]: a recognized not-ready document
+    /// ends them (it is the gateway's answer, and a draining gateway may close
+    /// its listener before a retry would land), any other answer is retried
+    /// by HTTP status alone, and the last HTTP answer survives a later
+    /// transport failure.
+    ///
+    /// A `403` carrying the admin API's explicit read-only refusal is
+    /// [`crate::error::Error::GatewayReadOnly`], as on any other admin call.
+    pub async fn probe_health(&self) -> crate::error::Result<HealthProbe> {
         let target = self.authorized("/health")?;
         let resp = self
-            .send_with_retry(RequestKind::Read, |bearer| {
-                target.request(Method::GET, bearer)
-            })
+            .send_with_retry_policy(
+                RequestKind::Read,
+                |bearer| target.request(Method::GET, bearer),
+                RetryPolicy::Health,
+            )
             .await?;
-        self.check(&resp, RequestKind::Read)?;
-        serde_json::from_str::<HealthStatus>(&resp.body)
-            .map_err(|e| malformed_response("GET /health", &e))
+        if let Some(health) = not_ready_health(&resp) {
+            return Ok(HealthProbe {
+                http_status: resp.status,
+                health,
+            });
+        }
+        if !is_success_status(resp.status) {
+            return Err(health_answer_error(
+                resp.status,
+                &resp.body,
+                resp.location.as_deref(),
+                self.gateway_url.as_str(),
+            ));
+        }
+        let health = serde_json::from_str::<HealthStatus>(&resp.body)
+            .map_err(|e| malformed_response("GET /health", &e))?;
+        Ok(HealthProbe {
+            http_status: resp.status,
+            health,
+        })
     }
 
     /// Authenticated `GET /cluster`. CP/DP connection state, used for the
@@ -1804,12 +1915,26 @@ pub enum DeleteOutcome {
 
 // --- Response plumbing -------------------------------------------------------
 
+/// How [`AdminClient::send_with_retry_policy`] treats a non-2xx answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPolicy {
+    /// Every admin call: the body can override the status ([`classify_retry`]).
+    Standard,
+    /// `GET /health`: Edge's not-ready document ([`not_ready_health`]) is
+    /// returned at once; any other answer is retried by HTTP status alone,
+    /// since mutation markers mean nothing on a read; and the most recent HTTP
+    /// answer is returned if every later attempt fails in transport.
+    Health,
+}
+
 /// A fully-read response. The body is buffered eagerly so the retry classifier
 /// can inspect it before deciding whether to re-send.
 #[derive(Clone)]
 struct RawResponse {
     status: u16,
     body: String,
+    /// Whether the body bytes were valid UTF-8 before lossy decoding.
+    body_utf8: bool,
     data_source: Option<String>,
     /// `Location`, kept only so a 3xx can name where the admin API is
     /// actually being served from. Redirects are never followed.
@@ -1817,6 +1942,9 @@ struct RawResponse {
     /// `ETag`, which a single-resource `GET` carries for a conditional write.
     etag: Option<String>,
     cache_control: Option<String>,
+    /// `Content-Type`, which decides whether a `503` can be Edge's not-ready
+    /// health document ([`not_ready_health`]).
+    content_type: Option<String>,
     evidence_headers_valid: bool,
     /// An earlier attempt got an HTTP response and was retried. A conditional
     /// write answered `412` after that may have been refused because its own
@@ -3299,6 +3427,345 @@ pub struct HealthStatus {
     /// `false` ⇒ config-database mutations are refused right now.
     #[serde(default)]
     pub admin_writes_enabled: Option<bool>,
+}
+
+/// The HTTP status Ferrum Edge answers `/health` with while not ready.
+const HEALTH_NOT_READY_STATUS: u16 = 503;
+
+/// The `status` values Ferrum Edge documents for a not-ready `/health`
+/// (HTTP 503, `ready: false`): `starting` before startup completes,
+/// `unavailable` after a lost listener or dependency, `draining` once the
+/// process is terminating, and `degraded` when a listener failure is
+/// configured to withdraw readiness. `ok` is never sent with 503.
+pub const NOT_READY_HEALTH_STATUSES: [&str; 4] =
+    ["starting", "unavailable", "draining", "degraded"];
+
+/// What `GET /health` answered with Ferrum Edge's health document: the
+/// document itself and the HTTP status that carried it, a 2xx when the gateway
+/// is ready or 503 when it is not.
+#[derive(Debug, Clone)]
+pub struct HealthProbe {
+    pub http_status: u16,
+    pub health: HealthStatus,
+}
+
+impl HealthProbe {
+    /// `false` for Edge's 503 not-ready document.
+    pub fn is_ready(&self) -> bool {
+        is_success_status(self.http_status)
+    }
+
+    /// `status=<status>, ready=<ready>, HTTP <code>` for display. The status
+    /// of a not-ready document is one of [`NOT_READY_HEALTH_STATUSES`]; a
+    /// ready one's is peer text and is scrubbed.
+    pub fn readiness(&self) -> String {
+        format!(
+            "status={}, ready={}, HTTP {}",
+            crate::display::peer_text(self.health.status.as_deref().unwrap_or("unknown")),
+            self.health
+                .ready
+                .map(|ready| ready.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.http_status,
+        )
+    }
+}
+
+/// The warnings `apply`'s advisory write preflight prints for a `/health`
+/// answer that does not refuse writes: one for a gateway that is not ready,
+/// and one for the minimal tier, whose write state is unknown. Empty for a
+/// ready gateway that reports writes enabled.
+pub fn health_preflight_warnings(probe: &HealthProbe, namespace_bounded: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !probe.is_ready() {
+        warnings.push(format!(
+            "Warning: admin preflight GET /health reports the gateway is not ready ({}); \
+             continuing, and the gateway enforces its own mutation controls.",
+            probe.readiness()
+        ));
+    }
+    // The minimal tier: the write state is unknown. The preflight stays
+    // advisory, and the first refused write reports it.
+    if probe.health.admin_writes_enabled.is_none() {
+        warnings.push(format!(
+            "Warning: admin preflight GET /health did not report admin_writes_enabled; \
+             continuing. {}",
+            health_tier_remedy(namespace_bounded)
+        ));
+    }
+    warnings
+}
+
+/// Ferrum Edge's not-ready `/health` document, or `None` when the response
+/// is not one.
+///
+/// Edge (v0.9.20 and later) serves every `/health` answer as
+/// `application/json`, and its body is one of three tiers, each a JSON object
+/// without duplicate keys whose `status` is one of
+/// [`NOT_READY_HEALTH_STATUSES`] and whose `ready` is the boolean `false`:
+///
+/// * **minimal** — exactly `status` and `ready`;
+/// * **tenant** — exactly those plus a string `mode`, a boolean
+///   `admin_writes_enabled` and the `namespace` serving report;
+/// * **detailed** — a string `mode`, a boolean `admin_writes_enabled`, an
+///   RFC 3339 `timestamp`, the `namespace` serving report, the `fips`
+///   metadata and the `cached_config` summary, among Edge's other
+///   diagnostics, and never an `error` or `message` envelope key.
+///
+/// In both authenticated tiers `mode` is one of Edge's operating modes and
+/// the `namespace` block's `serving_scope` is the one Edge derives from it.
+///
+/// Anything else — another media type, HTML, plain text, an error envelope,
+/// a `null` or wrongly typed documented field, duplicate keys, or a body that
+/// matches no tier — is not the gateway's health answer. The caller also
+/// requires the bytes to have been valid UTF-8 ([`not_ready_health`]).
+pub fn parse_not_ready_health(content_type: Option<&str>, body: &str) -> Option<HealthStatus> {
+    if !content_type.is_some_and(is_json_media_type) {
+        return None;
+    }
+    let value = conditional::parse_sensitive(body).ok()?;
+    let object = value.as_object()?;
+    let status = object.get("status")?.as_str()?;
+    if !NOT_READY_HEALTH_STATUSES.contains(&status) {
+        return None;
+    }
+    if object.get("ready")? != &serde_json::Value::Bool(false) {
+        return None;
+    }
+    // `status` and `ready` are present, so two keys is exactly the minimal tier.
+    if object.len() != 2 && !is_tenant_health(object) && !is_detailed_health(object) {
+        return None;
+    }
+    serde_json::from_value::<HealthStatus>(value).ok()
+}
+
+/// [`parse_not_ready_health`] over a response that was a `503` with valid
+/// UTF-8 bytes: a lossily repaired body is not Edge's document.
+fn not_ready_health(resp: &RawResponse) -> Option<HealthStatus> {
+    if resp.status != HEALTH_NOT_READY_STATUS || !resp.body_utf8 {
+        return None;
+    }
+    parse_not_ready_health(resp.content_type.as_deref(), &resp.body)
+}
+
+/// The write state the tenant and detailed tiers carry.
+fn has_health_write_state(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object.get("mode").is_some_and(serde_json::Value::is_string)
+        && object
+            .get("admin_writes_enabled")
+            .is_some_and(serde_json::Value::is_boolean)
+}
+
+/// The tenant tier: exactly `status`, `ready`, `mode`, `admin_writes_enabled`
+/// and `namespace`.
+fn is_tenant_health(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object.len() == 5 && has_health_write_state(object) && has_mode_namespace(object, false)
+}
+
+/// The detailed tier as both Edge v0.9.20 and later build it: from `status`,
+/// an RFC 3339 `timestamp` and `mode`, always adding `admin_writes_enabled`,
+/// `fips`, `namespace` and `cached_config`, and never an error envelope.
+/// The optional `database` block, when present, must be an object whose
+/// `status` is `connected` or `disconnected`; the other optional diagnostics
+/// are not inspected.
+fn is_detailed_health(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    has_health_write_state(object)
+        && object
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_rfc3339)
+        && has_mode_namespace(object, true)
+        && object.get("fips").is_some_and(is_fips_metadata)
+        && object.get("cached_config").is_some_and(is_cached_config)
+        && object.get("database").is_none_or(is_database_health)
+        && !object.contains_key("error")
+        && !object.contains_key("message")
+}
+
+/// Edge's `database` block: an object whose required `status` is one of the
+/// two labels the handler emits. Its other fields stay open.
+fn is_database_health(value: &serde_json::Value) -> bool {
+    value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| matches!(status, "connected" | "disconnected"))
+}
+
+fn is_rfc3339(stamp: &str) -> bool {
+    crate::timestamp::Timestamp::parse_rfc3339(stamp).is_ok()
+}
+
+/// The `serving_scope` Edge derives from its operating mode: a process with a
+/// proxy data plane (`database`, `file`, `dp`, `mesh`) serves one namespace,
+/// a control plane serves none itself, and a node agent has no data plane.
+/// `None` for a mode Edge does not have.
+fn serving_scope_for_mode(mode: &str) -> Option<&'static str> {
+    match mode {
+        "database" | "file" | "dp" | "mesh" => Some("single-namespace-data-plane"),
+        "cp" => Some("control-plane"),
+        "node_agent" => Some("no-data-plane"),
+        _ => None,
+    }
+}
+
+/// A `namespace` block consistent with the document's own `mode`.
+fn has_mode_namespace(object: &serde_json::Map<String, serde_json::Value>, detailed: bool) -> bool {
+    let Some(scope) = object
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(serving_scope_for_mode)
+    else {
+        return false;
+    };
+    object
+        .get("namespace")
+        .is_some_and(|block| is_namespace_serving_report(block, scope, detailed))
+}
+
+/// Edge's `fips` metadata: every documented field present with its type, the
+/// three labels within their documented sets, and `certified` always `false`.
+fn is_fips_metadata(value: &serde_json::Value) -> bool {
+    let Some(fips) = value.as_object() else {
+        return false;
+    };
+    let string = |key| fips.get(key).is_some_and(serde_json::Value::is_string);
+    let boolean = |key| fips.get(key).is_some_and(serde_json::Value::is_boolean);
+    let label = |key, allowed: &[&str]| {
+        fips.get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|label| allowed.contains(&label))
+    };
+    label("mode", &["off", "enforce"])
+        && boolean("enforcing")
+        && boolean("build_capable")
+        && label("build_profile", &["crypto-ring", "fips"])
+        && label("provider", &["ring", "aws-lc-fips"])
+        && boolean("module_self_test_passed")
+        && boolean("provider_algorithms_approved")
+        && fips.get("certified") == Some(&serde_json::Value::Bool(false))
+        && string("boundary_documentation")
+}
+
+/// Edge's `cached_config` summary, in one of the two shapes its handler
+/// emits: exactly `{"available": false}`, or `available: true` with exactly
+/// an RFC 3339 `loaded_at` and non-negative integer `proxy_count` and
+/// `consumer_count`.
+fn is_cached_config(value: &serde_json::Value) -> bool {
+    let Some(cached) = value.as_object() else {
+        return false;
+    };
+    match cached.get("available") {
+        Some(serde_json::Value::Bool(false)) => cached.len() == 1,
+        Some(serde_json::Value::Bool(true)) => {
+            let count = |key| {
+                cached
+                    .get(key)
+                    .is_some_and(|count| count.as_u64().is_some())
+            };
+            cached.len() == 4
+                && cached
+                    .get("loaded_at")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_rfc3339)
+                && count("proxy_count")
+                && count("consumer_count")
+        }
+        _ => false,
+    }
+}
+
+/// `application/json`, with or without parameters such as `charset`.
+fn is_json_media_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// Edge's `NamespaceServingReport`, exactly as its one builder emits it:
+/// `active`, `serving_scope` and `data_plane_single_namespace`, nothing else.
+///
+/// `serving_scope` must be `expected_scope`, the one the document's `mode`
+/// implies ([`serving_scope_for_mode`]); `data_plane_single_namespace` is true
+/// exactly for `single-namespace-data-plane`. `active` names the routed
+/// namespace only on a single-namespace data plane, and is `null` otherwise.
+/// The tenant tier may also null it on a data plane whose namespace the token
+/// cannot address, so only the `detailed` tier requires it there.
+fn is_namespace_serving_report(
+    value: &serde_json::Value,
+    expected_scope: &str,
+    detailed: bool,
+) -> bool {
+    let Some(block) = value.as_object() else {
+        return false;
+    };
+    if block.len() != 3 {
+        return false;
+    }
+    if block
+        .get("serving_scope")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_scope)
+    {
+        return false;
+    }
+    let single = expected_scope == "single-namespace-data-plane";
+    if block.get("data_plane_single_namespace") != Some(&serde_json::Value::Bool(single)) {
+        return false;
+    }
+    match block.get("active") {
+        Some(serde_json::Value::String(_)) => single,
+        Some(serde_json::Value::Null) => !(detailed && single),
+        _ => false,
+    }
+}
+
+/// A non-2xx `GET /health` that is not Edge's not-ready document, as an
+/// `ApiError` carrying its HTTP status.
+///
+/// Not the shared mutation mapper: a `GET` changes nothing, so a body that
+/// happens to carry `applied: false` must not become a mutation diagnosis. A
+/// redirect keeps the shared redirect explanation, and a `403` with the admin
+/// API's explicit read-only refusal is still
+/// [`crate::error::Error::GatewayReadOnly`].
+fn health_answer_error(
+    status: u16,
+    body: &str,
+    location: Option<&str>,
+    base: &str,
+) -> crate::error::Error {
+    if (300..=399).contains(&status) {
+        return map_api_error_with_redirect_base(
+            status,
+            body,
+            RequestKind::Read,
+            location,
+            Some(base),
+        );
+    }
+    let parsed = ApiErrorBody::parse(body);
+    // The admin API's explicit read-only refusal stops a run wherever it
+    // appears, as the shared mapper treats it on every other admin call.
+    if status == 403 && is_read_only_refusal(parsed.error.as_deref().unwrap_or(body)) {
+        return crate::error::Error::GatewayReadOnly(
+            "GET /health answered HTTP 403 with the admin API's read-only refusal (\"Admin API \
+             is in read-only mode\": FERRUM_ADMIN_READ_ONLY, an unavailable config database, or \
+             a file/dp/mesh/node_agent gateway), so the gateway will not accept config writes."
+                .to_string(),
+        );
+    }
+    let message = parsed
+        .error
+        .as_deref()
+        .map(bounded_error_message)
+        .unwrap_or_else(|| {
+            format!(
+                "the response is not Ferrum Edge's health document ({} bytes); its contents \
+                 are withheld",
+                body.len()
+            )
+        });
+    crate::error::Error::ApiError { status, message }
 }
 
 /// Reason the gateway will refuse config writes, or `None` when it accepts
