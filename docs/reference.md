@@ -243,13 +243,18 @@ While Edge is not ready it answers `/health` with HTTP 503 and the same
 tiered document, with `ready: false` and `status` set to `starting`,
 `unavailable`, `draining`, or `degraded` when a listener failure withdraws
 readiness. GitForgeOps treats that document as the gateway's answer and does
-not retry it. It is recognized only as Edge sends it: `application/json`, no
-duplicate keys, and exactly one tier's shape (the minimal `status` and
-`ready`; the tenant tier's `mode`, `admin_writes_enabled` and `namespace`
-block; or the detailed tier with `timestamp`, `mode` and
-`admin_writes_enabled`), with no `null` or wrongly typed documented field. Any
-other 503, including an HTML maintenance page, unrelated JSON or `status: ok`,
-is not, and is retried like any other 5xx read:
+not retry it. It is recognized only as Edge v0.9.20 and later send it:
+`application/json`, valid UTF-8, no duplicate keys, and exactly one tier's
+shape. The minimal tier is exactly `status` and `ready`. The tenant tier adds
+exactly `mode`, `admin_writes_enabled` and the `namespace` block. The detailed
+tier carries an RFC 3339 `timestamp`, `mode`, `admin_writes_enabled` and the
+`namespace` block, and no `error` or `message` key. The `namespace` block is
+exactly `active`, `serving_scope` (`single-namespace-data-plane`,
+`control-plane` or `no-data-plane`) and a consistent
+`data_plane_single_namespace`. No documented field may be `null` or wrongly
+typed. Any other 503, including an HTML maintenance page, unrelated JSON or
+`status: ok`, is not Edge's answer, and is retried by HTTP status like any
+other 5xx read:
 
 - `doctor --scope gateway` reports `gateway-reachable` as `PASS` and adds
   `gateway-ready` as `FAIL` (exit `3`), because the gateway itself says it is

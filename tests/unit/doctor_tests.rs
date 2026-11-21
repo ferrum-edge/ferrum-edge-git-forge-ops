@@ -1507,7 +1507,7 @@ async fn a_draining_gateway_on_the_detailed_tier_reports_its_write_state() {
     let url = not_ready_gateway(
         (
             503,
-            r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":true,"cached_config":{"available":true}}"#,
+            r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":true,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true},"cached_config":{"available":true}}"#,
         ),
         Arc::clone(&requests),
     );
@@ -1618,6 +1618,52 @@ async fn an_intermediary_503_is_not_mistaken_for_the_gateway() {
         assert!(!has(&checks, "gateway-ready"), "{body}");
         assert!(!saw(&requests, "GET /cluster"), "{body}");
     }
+}
+
+#[tokio::test]
+async fn an_http_answer_followed_by_a_closed_listener_is_still_an_answer() {
+    // The intermediary answers once, then the retry cannot connect: doctor
+    // still reports that something answered, with its status, rather than a
+    // network or CA problem.
+    let (url, _) = super::http_client_tests::spawn_scripted_health(vec![(
+        503,
+        "text/html",
+        b"<html>maintenance</html>",
+    )]);
+    let env = EnvConfig {
+        gateway_max_retries: 1,
+        ..stub_env(url)
+    };
+    let checks = doctor::gateway::run("production", &env, &[]).await;
+    let reachable = find(&checks, "gateway-reachable");
+    assert_eq!(reachable.status, Status::Fail);
+    assert!(
+        reachable
+            .detail
+            .contains("without Ferrum Edge's health document"),
+        "{}",
+        reachable.detail
+    );
+    assert!(reachable.detail.contains("503"), "{}", reachable.detail);
+}
+
+#[tokio::test]
+async fn a_read_only_refusal_on_health_is_an_answer_not_a_network_failure() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = not_ready_gateway(
+        (403, r#"{"error":"Admin API is in read-only mode"}"#),
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &no_retry_env(url), &[]).await;
+    let reachable = find(&checks, "gateway-reachable");
+    assert_eq!(reachable.status, Status::Fail);
+    assert!(
+        reachable.detail.contains("HTTP 403"),
+        "{}",
+        reachable.detail
+    );
+    let remedy = reachable.remediation.as_deref().expect("remediation");
+    assert!(!remedy.contains("FERRUM_GATEWAY_CA_CERT"), "{remedy}");
 }
 
 // -- doctor probes with the token the environment's runs mint --------------

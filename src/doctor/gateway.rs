@@ -188,11 +188,17 @@ pub async fn run(environment: &str, env: &EnvConfig, token_namespaces: &[String]
         Err(error) => {
             // An HTTP status without Edge's health document: something
             // answered over this transport, so a URL, network or CA diagnosis
-            // would send the operator the wrong way.
-            let answered = matches!(error, crate::error::Error::ApiError { .. });
-            let (detail, remedy, token_detail) = if answered {
+            // would send the operator the wrong way. `probe_health` reports
+            // such an answer as an `ApiError` with its status, or, for the
+            // admin API's explicit read-only 403, as `GatewayReadOnly`.
+            let answer = match &error {
+                crate::error::Error::ApiError { .. } => Some(error.to_string()),
+                crate::error::Error::GatewayReadOnly(reason) => Some(reason.clone()),
+                _ => None,
+            };
+            let (detail, remedy, token_detail) = if let Some(answer) = answer {
                 (
-                    format!("GET /health answered without Ferrum Edge's health document: {error}"),
+                    format!("GET /health answered without Ferrum Edge's health document: {answer}"),
                     "Something answered over this transport, but not with Ferrum Edge's \
                      /health document (an HTTP 503 counts as the gateway's not-ready answer \
                      only when its body is that document). A proxy, load balancer or \

@@ -2399,7 +2399,7 @@ async fn an_explicit_write_refusal_in_a_not_ready_health_document_still_fails_th
     let url = spawn_stub_gateway(vec![(
         "GET /health",
         503,
-        r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":false}"#,
+        r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":false,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
     )]);
     let client = stub_client(url);
 
@@ -2430,7 +2430,7 @@ async fn a_not_ready_gateway_that_accepts_writes_keeps_the_preflight_advisory() 
     let url = spawn_stub_gateway(vec![(
         "GET /health",
         503,
-        r#"{"status":"starting","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":true}"#,
+        r#"{"status":"starting","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":true,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
     )]);
     let client = stub_client(url);
 
@@ -2456,7 +2456,7 @@ async fn a_read_only_mode_in_a_not_ready_health_document_fails_the_preflight() {
     let url = spawn_stub_gateway(vec![(
         "GET /health",
         503,
-        r#"{"status":"starting","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"dp","admin_writes_enabled":true}"#,
+        r#"{"status":"starting","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"dp","admin_writes_enabled":true,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
     )]);
     let client = stub_client(url);
 
@@ -2488,7 +2488,7 @@ async fn a_not_ready_write_refusal_survives_retries_that_cannot_connect() {
     let (url, served) = super::http_client_tests::spawn_scripted_health(vec![(
         503,
         "application/json",
-        r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":false}"#,
+        br#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":false,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
     )]);
     let client = stub_client_with_retries(url, 3);
 
@@ -2510,6 +2510,36 @@ async fn a_not_ready_write_refusal_survives_retries_that_cannot_connect() {
         "{err:?}"
     );
     assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_read_only_refusal_on_health_fails_the_preflight() {
+    // The admin API's explicit read-only 403 on GET /health stops the run
+    // before credential handling, as it did before /health learned 503.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        403,
+        r#"{"error":"Admin API is in read-only mode"}"#,
+    )]);
+    let client = stub_client(url);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
 }
 
 // --- Shared-mode adoption of already-matching rows (issue #129) ---------------
