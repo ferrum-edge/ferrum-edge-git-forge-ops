@@ -388,11 +388,17 @@ matching private key: you decrypt with `age -d -i ~/.ssh/id_ed25519`.
 Install Rust and build this repository with `cargo build`, then run the CLI as
 `./target/debug/gitforgeops` (or install it with `cargo install --path .`).
 `validate` calls a separate Ferrum Edge validator. Use the approved Ferrum Edge
-v0.9.20 binary (SHA-256
-`9d357a41ae61cf85d697f01c84beff15f2b8af8bcfd70dd1c50f32397fee66ac`), either on
-`PATH` as `ferrum-edge` or selected with
-`FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge`. The bundled workflows check
-this digest against `.github/ferrum-edge-checksums.txt` before use.
+v0.9.20 binary, either on `PATH` as `ferrum-edge` or selected with
+`FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge`. The approved SHA-256
+`9d357a41ae61cf85d697f01c84beff15f2b8af8bcfd70dd1c50f32397fee66ac` is the
+digest of the Linux x86_64 asset, `ferrum-edge-linux-x86_64`, which the bundled
+workflows run and check against `.github/ferrum-edge-checksums.txt` before use.
+Other platforms have their own digests: on macOS or Linux ARM64, download the
+asset for your platform (`ferrum-edge-macos-aarch64`,
+`ferrum-edge-macos-x86_64` or `ferrum-edge-linux-aarch64`) from the
+[v0.9.20 release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.20)
+and check it against that asset's published `.sha256` file, not the Linux
+x86_64 digest above.
 
 Install `age` to decrypt the delivered credential in step 8, and install
 `python3` for the bootstrap script in step 3. To skip local validation, skip

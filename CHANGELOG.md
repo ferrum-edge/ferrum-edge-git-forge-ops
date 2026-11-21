@@ -654,6 +654,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Admin API examples use Ferrum Edge's default HTTPS admin port, `9443`
+  (#754): `README.md`'s import example used `8081`, and `.env.example`, the
+  `FERRUM_GATEWAY_URL` error text and its doc comment paired `https://` with
+  the plaintext admin port `9000`. The quickstart labels the approved
+  validator SHA-256 as the `ferrum-edge-linux-x86_64` asset's digest and sends
+  macOS and Linux ARM64 users to their platform asset's published `.sha256`.
 - Full-replace restore errors again show GitForgeOps' own remedy:
   `--confirm-api-spec-deletion` for API specs at risk,
   `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` for an oversized body, and "Do NOT

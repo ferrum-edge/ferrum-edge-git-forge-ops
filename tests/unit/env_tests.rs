@@ -503,12 +503,15 @@ fn gateway_transport_accepts_https_without_warnings() {
 #[test]
 fn gateway_transport_refuses_cleartext_http_by_default() {
     let error =
-        validate_gateway_transport(Some("http://secret.internal:9443"), false, false, false)
+        validate_gateway_transport(Some("http://secret.internal:19443"), false, false, false)
             .expect_err("http:// must not be accepted without the opt-in");
     let error = error.to_string();
     assert!(error.contains("FERRUM_GATEWAY_URL"), "{error}");
+    // 19443, not the documented example port 9443: the accepted-forms text
+    // quotes https://gateway.internal:9443, so only a port it never names
+    // proves the supplied URL is withheld.
     assert!(
-        !error.contains("secret.internal") && !error.contains("9443"),
+        !error.contains("secret.internal") && !error.contains("19443"),
         "the secret-backed URL must be withheld: {error}"
     );
     assert!(error.contains("environment secret"), "{error}");

@@ -43,7 +43,8 @@ pub enum ApplyStrategy {
 /// `Debug` is hand-written and redacts every secret field.
 #[derive(Clone)]
 pub struct EnvConfig {
-    /// URL of the Ferrum Edge admin API (e.g. `https://gateway.internal:9000`).
+    /// URL of the Ferrum Edge admin API (e.g. `https://gateway.internal:9443`,
+    /// Ferrum Edge's default HTTPS admin port).
     ///
     /// Validated at load: `https://` only, unless `allow_insecure_http` opts
     /// into a cleartext `http://` gateway. Every other scheme, and any URL
@@ -521,7 +522,7 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
 /// Accepted forms of `FERRUM_GATEWAY_URL`, quoted verbatim by every rejection
 /// so the error tells the operator what to type instead.
 const GATEWAY_URL_ACCEPTED: &str = "an absolute https:// URL with a host and no \
-     embedded credentials (for example https://gateway.internal:9000); an http:// URL is \
+     embedded credentials (for example https://gateway.internal:9443); an http:// URL is \
      accepted only with FERRUM_ALLOW_INSECURE_HTTP=true, and no other scheme is ever accepted";
 
 /// Rule drawn above and below an insecure-transport warning. The warning has
