@@ -2391,6 +2391,187 @@ async fn a_read_only_preflight_fails_before_any_mutation() {
     assert!(matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)));
 }
 
+#[tokio::test]
+async fn an_explicit_write_refusal_in_a_not_ready_health_document_still_fails_the_preflight() {
+    // Edge answers /health with HTTP 503 while draining, in the same document.
+    // Its explicit `admin_writes_enabled: false` is still the run-stopping
+    // verdict, not a "preflight failed; continuing" warning.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        503,
+        super::http_client_tests::edge_detailed_health("draining", "database", false),
+    )]);
+    let client = stub_client(url);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("status=draining"), "{err}");
+}
+
+#[tokio::test]
+async fn a_not_ready_gateway_that_accepts_writes_keeps_the_preflight_advisory() {
+    // Starting, writes enabled: the preflight warns (the warning itself is
+    // pinned by `the_preflight_warns_that_a_writable_gateway_is_not_ready`)
+    // and the apply goes on to write; the gateway enforces its own mutation
+    // controls.
+    let url = spawn_stub_gateway(vec![
+        (
+            "GET /health",
+            503,
+            super::http_client_tests::edge_detailed_health("starting", "database", true),
+        ),
+        // Force the per-resource path so the create is one observable POST.
+        ("POST /batch", 501, "{}"),
+        ("POST /upstreams", 201, "{}"),
+    ]);
+    let client = stub_client(url);
+
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "ferrum")],
+        ..Default::default()
+    };
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let result = apply_api(
+        &desired,
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("an advisory preflight does not stop the run");
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    assert_eq!(result.created, 1, "the write after the preflight happened");
+    assert_eq!(
+        result
+            .applied_incremental
+            .iter()
+            .map(|op| op.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["u1"]
+    );
+}
+
+#[tokio::test]
+async fn a_read_only_mode_in_a_not_ready_health_document_fails_the_preflight() {
+    // The mode gate alone: `admin_writes_enabled` is left `true` so only the
+    // `dp` mode can refuse.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        503,
+        super::http_client_tests::edge_detailed_health("starting", "dp", true),
+    )]);
+    let client = stub_client(url);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("`dp` mode"), "{err}");
+}
+
+#[tokio::test]
+async fn a_not_ready_write_refusal_survives_retries_that_cannot_connect() {
+    // With the default-style retry budget, a draining gateway that answers
+    // once and then closes its listener still stops the run: the recognized
+    // document is the answer, not a transient failure to retry past.
+    // The second, ready and writable answer would let the run through if it
+    // were ever requested.
+    let (url, served) = super::http_client_tests::spawn_scripted_health(vec![
+        (
+            503,
+            "application/json",
+            super::http_client_tests::edge_detailed_health("draining", "database", false)
+                .as_bytes(),
+        ),
+        (
+            200,
+            "application/json",
+            br#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+        ),
+    ]);
+    let client = stub_client_with_retries(url, 3);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_read_only_refusal_on_health_fails_the_preflight() {
+    // The admin API's explicit read-only 403 on GET /health stops the run
+    // before credential handling, as it did before /health learned 503.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        403,
+        r#"{"error":"Admin API is in read-only mode"}"#,
+    )]);
+    let client = stub_client(url);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+}
+
 // --- Shared-mode adoption of already-matching rows (issue #129) ---------------
 
 use gitforgeops::apply::{adoption_candidates, adoption_summary_line, AdoptionCandidate};
