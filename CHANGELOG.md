@@ -899,6 +899,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Cover the Trivy image findings for glibc `2.41-12+deb13u4` (CVE-2026-5435,
+  CVE-2026-6238, CVE-2026-6368, CVE-2026-6791, CVE-2026-8674, CVE-2026-18374,
+  CVE-2026-19499, CVE-2026-19542, CVE-2026-77117, CVE-2026-80489,
+  CVE-2026-86805, CVE-2026-89092, CVE-2026-95818 and CVE-2026-97399, MEDIUM
+  and LOW) with checksum-pinned Debian Trixie `libc6` and `libc-bin`
+  `2.41-12+deb13u5` updates for amd64 and arm64. Debian 13.8 shipped them
+  through the main archive, so each pinned package's pool path now names its
+  archive (`debian-security/...` or `debian/...`) under one
+  `https://deb.debian.org/` mirror. The `debian:trixie-slim` tag still
+  resolves to the pinned digest, so the base image is unchanged.
 - Update `quinn-udp` to 0.5.16 for RUSTSEC-2026-0538 (GHSA-6pp4-4cxf-xf88),
   a receive-loop spin after a truncated datagram on targets that read one
   datagram per `recvmsg`.
