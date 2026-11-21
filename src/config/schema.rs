@@ -594,6 +594,7 @@ pub struct StreamMatchArm {
 /// Conditional-execution predicate tree for a plugin instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginTrigger {
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_object")]
     pub when: PluginTriggerNode,
 }
 
@@ -602,14 +603,18 @@ pub struct PluginTrigger {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginTriggerNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object_vec")]
     pub all: Option<Vec<PluginTriggerNode>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object_vec")]
     pub any: Option<Vec<PluginTriggerNode>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub not: Option<Box<PluginTriggerNode>>,
     /// Boxed (serde-transparent) so a leaf with every predicate slot does not
     /// inflate `PluginConfig`, and with it every `Resource`.
     #[serde(default, rename = "match", skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub match_: Option<Box<PluginTriggerMatch>>,
 }
 
@@ -619,16 +624,22 @@ pub struct PluginTriggerMatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub method: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub path: Option<PluginTriggerStringMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub host: Option<PluginTriggerStringMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub sni: Option<PluginTriggerStringMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub header: Option<PluginTriggerFieldMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub query: Option<PluginTriggerFieldMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub cookie: Option<PluginTriggerFieldMatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<Vec<PluginTriggerProtocol>>,
@@ -641,10 +652,12 @@ pub struct PluginTriggerMatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_port: Option<Vec<u16>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub consumer: Option<PluginTriggerIdentityMatch>,
     /// Unmapped external identity (present only when no gateway Consumer is
     /// mapped). Edge after v0.9.20; the pinned validator rejects it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub external_identity: Option<PluginTriggerIdentityMatch>,
     /// Verifying authorities (64-hex realm digests) of the unmapped external
     /// identity; the list is an OR. Edge after v0.9.20.
@@ -653,6 +666,7 @@ pub struct PluginTriggerMatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub spiffe_id: Option<PluginTriggerIdentityMatch>,
 }
 
@@ -676,6 +690,7 @@ pub struct PluginTriggerFieldMatch {
     #[serde(default)]
     pub presence: PluginTriggerPresence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub value: Option<PluginTriggerStringMatch>,
     #[serde(default)]
     pub multi_value: PluginTriggerMultiValue,
@@ -687,6 +702,7 @@ pub struct PluginTriggerIdentityMatch {
     #[serde(default)]
     pub presence: PluginTriggerPresence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub value: Option<PluginTriggerStringMatch>,
 }
 
@@ -1098,6 +1114,7 @@ pub struct PluginConfig {
     pub priority_override: Option<u16>,
     /// Conditional-execution predicate tree for this plugin instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub trigger: Option<PluginTrigger>,
     /// Admin-only ownership tag set by the spec-import API.
     #[serde(default, skip_serializing_if = "Option::is_none")]

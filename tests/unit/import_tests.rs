@@ -3306,3 +3306,34 @@ fn import_accepts_external_identity_trigger_predicates_without_acknowledgement()
         Some(vec![authority.to_string()])
     );
 }
+
+/// The object-only trigger slots hand their map to the struct's own
+/// deserializer, so a nested unknown inside one is still recorded (with its
+/// full path) rather than silently dropped.
+#[test]
+fn backup_decode_records_unknown_keys_inside_identity_trigger_predicates() {
+    let backup = serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "partner",
+            "plugin_name": "rate_limiting",
+            "namespace": "ferrum",
+            "scope": "global",
+            "config": {},
+            "trigger": {"when": {"all": [
+                {"match": {"external_identity": {"future_identity_option": 1}}},
+                {"match": {"consumer": {"value": {"exact": ["a"], "future_operand": 2}}}}
+            ]}}
+        }]
+    });
+    assert_eq!(
+        unmodeled_paths(&backup),
+        [
+            "PluginConfig ferrum/partner .spec.trigger.when.all[0].match.external_identity.future_identity_option",
+            "PluginConfig ferrum/partner .spec.trigger.when.all[1].match.consumer.value.future_operand",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+    );
+}

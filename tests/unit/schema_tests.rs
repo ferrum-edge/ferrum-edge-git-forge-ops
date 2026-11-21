@@ -1252,3 +1252,73 @@ spec:
         .to_string();
     assert!(error.contains("external_identity_authorty"), "{error}");
 }
+
+/// Like Edge, every struct-valued trigger slot must be an object. serde's
+/// derived visitors would otherwise build the struct positionally from an
+/// array, so `external_identity: []` (or `consumer: []`) became a valid
+/// `presence: present` predicate matching every such principal.
+#[test]
+fn plugin_trigger_struct_slots_must_be_objects_and_keep_unknown_key_detection() {
+    let tree = tempfile::tempdir().unwrap();
+    let file = tree.path().join("ferrum/plugins/gate.yaml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let load = |trigger: &str| {
+        let yaml = format!(
+            "kind: PluginConfig\nspec:\n  id: gate\n  plugin_name: rate_limiting\n  \
+             scope: global\n  config: {{}}\n  trigger: {trigger}\n"
+        );
+        std::fs::write(&file, yaml).unwrap();
+        gitforgeops::config::load_resources(tree.path()).map(|_| ())
+    };
+
+    for (label, trigger) in [
+        (
+            "external_identity",
+            r#"{when: {match: {external_identity: []}}}"#,
+        ),
+        ("consumer", r#"{when: {match: {consumer: []}}}"#),
+        ("spiffe_id", r#"{when: {match: {spiffe_id: [present]}}}"#),
+        ("path", r#"{when: {match: {path: []}}}"#),
+        ("header", r#"{when: {match: {header: [x-a]}}}"#),
+        (
+            "identity value",
+            r#"{when: {match: {external_identity: {value: []}}}}"#,
+        ),
+        (
+            "field value",
+            r#"{when: {match: {header: {name: x-a, value: []}}}}"#,
+        ),
+        ("match", r#"{when: {match: []}}"#),
+        ("not", r#"{when: {not: []}}"#),
+        ("all element", r#"{when: {all: [[]]}}"#),
+        ("when", r#"{when: []}"#),
+        ("trigger", r#"[]"#),
+    ] {
+        let error = load(trigger).expect_err(label).to_string();
+        assert!(error.contains("a JSON object"), "{label}: {error}");
+    }
+
+    // Absent or null slots stay unset, and real objects still load.
+    for trigger in [
+        r#"null"#,
+        r#"{when: {match: {external_identity: null, method: [GET]}}}"#,
+        r#"{when: {all: [{match: {external_identity: {}}}, {not: {match: {consumer: {presence: absent}}}}]}}"#,
+    ] {
+        load(trigger).unwrap_or_else(|error| panic!("{trigger}: {error}"));
+    }
+
+    // A misspelled key inside an object slot is still a fatal unknown field.
+    for (trigger, field) in [
+        (
+            r#"{when: {match: {external_identity: {presense: absent}}}}"#,
+            ".spec.trigger.when.match.external_identity.presense",
+        ),
+        (
+            r#"{when: {any: [{match: {consumer: {value: {exactt: [a]}}}}]}}"#,
+            ".spec.trigger.when.any[0].match.consumer.value.exactt",
+        ),
+    ] {
+        let error = load(trigger).expect_err(trigger).to_string();
+        assert!(error.contains(field), "{trigger}: {error}");
+    }
+}

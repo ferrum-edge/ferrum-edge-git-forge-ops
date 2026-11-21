@@ -585,13 +585,23 @@ fn desired_comparison_rows(
             let mut pointer = String::from("/config");
             collect_tls_material_sites(config, &mut pointer, None, &mut secrets);
         }
+        let mut visible = Vec::new();
         if let Some(trigger) = value.get("trigger") {
             collect_trigger_sites(trigger, &mut secrets);
+            collect_trigger_visible_subtrees(trigger, &mut visible);
         }
-        rows.insert(
-            ("PluginConfig", plugin.id.clone()),
-            DesiredRow::new(value, secrets),
-        );
+        let mut row = DesiredRow::new(value, secrets);
+        // Edge never withholds a visible predicate, so the generic
+        // placeholder/userinfo scan must not make one secret-bearing: a
+        // fingerprint-shaped literal there is a changed value, not a site.
+        row.secret_pointers.retain(|pointer| {
+            !visible.iter().any(|subtree| {
+                pointer
+                    .strip_prefix(subtree.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        });
+        rows.insert(("PluginConfig", plugin.id.clone()), row);
     }
     for upstream in &desired.upstreams {
         let value = serde_json::to_value(upstream)?;
@@ -749,6 +759,48 @@ fn collect_trigger_sites(trigger: &Value, out: &mut BTreeSet<String>) {
             withheld_site(child, &pointer, out);
         }
         pointer.truncate(len);
+    }
+}
+
+/// Pointers of every visible predicate value (`TRIGGER_VISIBLE_PREDICATES`)
+/// in a PluginConfig `trigger`'s `all` / `any` / `not` / `match` tree. Edge
+/// skips these subtrees entirely when it projects the export.
+fn collect_trigger_visible_subtrees(trigger: &Value, out: &mut Vec<String>) {
+    fn walk(node: &Value, pointer: &mut String, out: &mut Vec<String>) {
+        let Some(map) = node.as_object() else {
+            return;
+        };
+        for (key, child) in map {
+            let len = pointer.len();
+            push_pointer_segment(pointer, key);
+            match (key.as_str(), child) {
+                ("all" | "any", Value::Array(items)) => {
+                    for (index, item) in items.iter().enumerate() {
+                        let item_len = pointer.len();
+                        push_pointer_segment(pointer, &index.to_string());
+                        walk(item, pointer, out);
+                        pointer.truncate(item_len);
+                    }
+                }
+                ("not", child) => walk(child, pointer, out),
+                ("match", Value::Object(leaf)) => {
+                    for key in leaf.keys() {
+                        if TRIGGER_VISIBLE_PREDICATES.contains(&key.as_str()) {
+                            let leaf_len = pointer.len();
+                            push_pointer_segment(pointer, key);
+                            out.push(pointer.clone());
+                            pointer.truncate(leaf_len);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            pointer.truncate(len);
+        }
+    }
+    if let Some(when) = trigger.get("when") {
+        let mut pointer = String::from("/trigger/when");
+        walk(when, &mut pointer, out);
     }
 }
 

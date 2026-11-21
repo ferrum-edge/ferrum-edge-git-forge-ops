@@ -1326,3 +1326,55 @@ fn external_identity_trigger_predicates_are_visible_not_secret_sites() {
         assert!(live_view(Some(pointer)).is_err(), "{pointer}");
     }
 }
+
+/// The generic placeholder/userinfo scan must not reach into a visible
+/// trigger predicate: Edge exports it verbatim, so a fingerprint-shaped live
+/// operand is a changed value even when the declared operand looks like a URL
+/// with userinfo. Client-field operands stay predicted sites.
+#[test]
+fn visible_trigger_predicates_are_excluded_from_the_generic_secret_scan() {
+    let desired: GatewayConfig = serde_json::from_value(json!({
+        "plugin_configs": [{
+            "id": "partner",
+            "namespace": "ferrum",
+            "plugin_name": "rate_limiting",
+            "scope": "global",
+            "config": {},
+            "trigger": {"when": {"all": [
+                {"match": {"external_identity": {"value": {"exact": ["https://alice@example.test"]}}}},
+                {"not": {"match": {"consumer": {"value": {"prefix": ["https://bob@example.test"]}}}}},
+                {"match": {"header": {"name": "x-skip", "value": {"exact": ["https://carol@example.test"]}}}},
+            ]}},
+        }],
+    }))
+    .unwrap();
+    let mut plugins = serde_json::to_value(&desired.plugin_configs).unwrap();
+    for pointer in [
+        "/0/trigger/when/all/0/match/external_identity/value/exact/0",
+        "/0/trigger/when/all/1/not/match/consumer/value/prefix/0",
+        "/0/trigger/when/all/2/match/header/value/exact/0",
+    ] {
+        *plugins.pointer_mut(pointer).unwrap() = json!(fp('b'));
+    }
+    let body = document("ferrum", KEY_ID, json!([]), plugins).to_string();
+    let view = ConfigExport::from_response(&body, "ferrum", false)
+        .unwrap()
+        .live_view_with(&desired, &desired)
+        .unwrap();
+
+    // Only the client-field operand is withheld (and so uncompared).
+    let uncompared: Vec<&str> = view
+        .uncompared
+        .iter()
+        .map(|site| site.pointer.as_str())
+        .collect();
+    assert_eq!(
+        uncompared,
+        ["/trigger/when/all/2/match/header/value/exact/0"]
+    );
+    assert!(view.masked_ancestors.is_empty());
+    let diffs = compute_diff(&project_desired_for_export(&desired), &view.actual).unwrap();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    assert_eq!(diffs[0].id, "partner");
+    assert_eq!(diffs[0].details[0].field, "trigger");
+}

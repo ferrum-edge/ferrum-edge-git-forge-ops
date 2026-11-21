@@ -143,12 +143,20 @@ the file and full YAML path. A typo such as `spec.plguins` therefore fails
 instead of disappearing. Deliberately opaque values are kept verbatim: plugin
 `config`, consumer credential maps, and per-item mesh objects.
 
-A few modeled fields exist only on Ferrum Edge after the pinned v0.9.20: the
-plugin `trigger` predicates `external_identity` and
-`external_identity_authority`, and the mesh list `virtual_service_http_routes`.
-GitForgeOps loads, imports, diffs, merges and applies them, but the pinned
-`ferrum-edge validate` rejects them until the validator pin moves to a release
-that has them.
+A few modeled fields exist only on Ferrum Edge after the pinned v0.9.20, and
+the pinned release treats them differently:
+
+- The plugin `trigger` predicates `external_identity` and
+  `external_identity_authority`. GitForgeOps loads, imports, diffs and applies
+  them, but the pinned `ferrum-edge validate` (and a v0.9.20 gateway)
+  **rejects** them, so a repository using them needs a validator and gateway
+  that support them.
+- The mesh list `virtual_service_http_routes`. GitForgeOps loads it, merges it
+  across fragments and publishes it in the mesh document (mesh has no import or
+  diff). The v0.9.20 mesh parser **ignores** it: `ferrum-edge validate -m mesh`
+  passes without checking it, and a v0.9.20 mesh node runs without those route
+  bindings. It is only validated by a supporting validator and only takes
+  effect on a supporting mesh node.
 
 A gateway release that adds a field is unusable until GitForgeOps models it.
 `FERRUM_ALLOW_UNKNOWN_FIELDS=true` unblocks that for **top-level** `spec`
