@@ -1124,6 +1124,7 @@ fn free_text_in_plugin_config_is_not_url_userinfo() {
         "ops@example.com",
         "mailto:ops@example.com",
         "https: contact ops@example.com for help",
+        "https: contact ops@example.com",
         "file:///app@v2/policy.rego",
         "file: contact ops@example.com",
     ] {
@@ -1131,7 +1132,7 @@ fn free_text_in_plugin_config_is_not_url_userinfo() {
             ("opa", serde_json::json!({"contact": value})),
             (
                 "response_mock",
-                serde_json::json!({"rules": [{"match": {"path": "/help"}, "body": value}]}),
+                serde_json::json!({"rules": [{"path": "/help", "status_code": 200, "body": value}]}),
             ),
         ] {
             let original = single_plugin_gateway(plugin_name, config);

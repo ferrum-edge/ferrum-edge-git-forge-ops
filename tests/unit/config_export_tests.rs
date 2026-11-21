@@ -644,6 +644,47 @@ fn whatwg_url_userinfo_in_an_upstream_address_is_an_uncompared_site() {
     }
 }
 
+/// Edge sweeps URL userinfo with its own parser only in a plugin's `config`,
+/// not its labels. Text the parser reads a username from is an uncompared
+/// site in `config`, but in a label a fingerprint-shaped live value is an
+/// ordinary change and must stay in the diff.
+#[test]
+fn parser_userinfo_sites_cover_plugin_config_but_not_labels() {
+    for text in [
+        "https: contact ops@example.com",
+        "https:///svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+    ] {
+        let desired: GatewayConfig = serde_json::from_value(json!({
+            "plugin_configs": [{
+                "id": "mock",
+                "namespace": "ferrum",
+                "plugin_name": "response_mock",
+                "scope": "global",
+                "labels": {"contact": text},
+                "config": {"rules": [{"path": "/help", "status_code": 200, "body": text}]},
+            }],
+        }))
+        .unwrap();
+        let mut live = serde_json::to_value(&desired.plugin_configs[0]).unwrap();
+        live["labels"]["contact"] = json!(fp('a'));
+        live["config"]["rules"][0]["body"] = json!(fp('b'));
+        let body = document("ferrum", KEY_ID, json!([]), json!([live])).to_string();
+        let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+        let view = export.live_view_with(&desired, &desired).unwrap();
+
+        assert_eq!(
+            uncompared_sites(&view),
+            [("mock".to_string(), "/config/rules/0/body".to_string())],
+            "{text:?}"
+        );
+        assert_eq!(view.actual.plugin_configs[0].labels["contact"], fp('a'));
+        let diffs = compute_diff(&desired, &view.actual).unwrap();
+        assert_eq!(diffs.len(), 1, "{text:?}: {diffs:?}");
+        assert_eq!(diffs[0].id, "mock");
+        assert_eq!(diffs[0].action, DiffAction::Modify);
+    }
+}
+
 #[test]
 fn a_whole_value_fingerprinted_around_a_secret_is_never_authoritative() {
     let desired: GatewayConfig = serde_json::from_value(json!({

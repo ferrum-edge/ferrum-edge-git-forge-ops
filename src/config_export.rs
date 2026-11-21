@@ -520,9 +520,29 @@ struct DesiredRow {
     secret_pointers: BTreeSet<String>,
 }
 
+/// The part of a row Edge's projection sweeps for URL userinfo with its own
+/// parser: the whole Proxy and Upstream body, only `config` of a
+/// PluginConfig, nothing of a Consumer.
+#[derive(Clone, Copy)]
+enum UserinfoSweep {
+    WholeRow,
+    PluginConfig,
+    None,
+}
+
+impl UserinfoSweep {
+    fn covers(self, pointer: &str) -> bool {
+        match self {
+            Self::WholeRow => true,
+            Self::PluginConfig => pointer == "/config" || pointer.starts_with("/config/"),
+            Self::None => false,
+        }
+    }
+}
+
 impl DesiredRow {
-    fn new(value: Value, mut secret_pointers: BTreeSet<String>) -> Self {
-        collect_secret_values(&value, &mut String::new(), &mut secret_pointers);
+    fn new(value: Value, mut secret_pointers: BTreeSet<String>, sweep: UserinfoSweep) -> Self {
+        collect_secret_values(&value, &mut String::new(), sweep, &mut secret_pointers);
         Self {
             value,
             secret_pointers,
@@ -556,7 +576,10 @@ fn desired_comparison_rows(
         let value = serde_json::to_value(proxy)?;
         let mut secrets = BTreeSet::new();
         collect_tls_material_sites(&value, &mut String::new(), None, &mut secrets);
-        rows.insert(("Proxy", proxy.id.clone()), DesiredRow::new(value, secrets));
+        rows.insert(
+            ("Proxy", proxy.id.clone()),
+            DesiredRow::new(value, secrets, UserinfoSweep::WholeRow),
+        );
     }
     for consumer in &desired.consumers {
         let projected = project_consumer_for_export(consumer);
@@ -564,7 +587,7 @@ fn desired_comparison_rows(
         let secrets = consumer_secret_pointers(&projected);
         rows.insert(
             ("Consumer", consumer.id.clone()),
-            DesiredRow::new(value, secrets),
+            DesiredRow::new(value, secrets, UserinfoSweep::None),
         );
     }
     for plugin in &desired.plugin_configs {
@@ -590,7 +613,7 @@ fn desired_comparison_rows(
             collect_trigger_sites(trigger, &mut secrets);
             collect_trigger_visible_subtrees(trigger, &mut visible);
         }
-        let mut row = DesiredRow::new(value, secrets);
+        let mut row = DesiredRow::new(value, secrets, UserinfoSweep::PluginConfig);
         // Edge never withholds a visible predicate, so the generic
         // placeholder/userinfo scan must not make one secret-bearing: a
         // fingerprint-shaped literal there is a changed value, not a site.
@@ -616,7 +639,7 @@ fn desired_comparison_rows(
         collect_tls_material_sites(&value, &mut String::new(), None, &mut secrets);
         rows.insert(
             ("Upstream", upstream.id.clone()),
-            DesiredRow::new(value, secrets),
+            DesiredRow::new(value, secrets, UserinfoSweep::WholeRow),
         );
     }
     Ok(rows)
@@ -908,12 +931,20 @@ fn trigger_operand_sites(value: &Value, pointer: &mut String, out: &mut BTreeSet
 }
 
 /// Add the pointer of every string that is a brokered placeholder or a URL
-/// carrying userinfo.
-fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
+/// carrying userinfo: a literal `scheme://` authority anywhere, and, inside
+/// the region Edge sweeps, whatever Edge's own URL parser reads userinfo from.
+fn collect_secret_values(
+    value: &Value,
+    pointer: &mut String,
+    sweep: UserinfoSweep,
+    out: &mut BTreeSet<String>,
+) {
+    use crate::secrets::url_userinfo::{legacy_url_has_userinfo, parsed_url_has_userinfo};
     match value {
         Value::String(text) => {
             if crate::secrets::parse_placeholder(text).is_some()
-                || crate::secrets::url_userinfo::url_has_userinfo(text)
+                || legacy_url_has_userinfo(text)
+                || (sweep.covers(pointer) && parsed_url_has_userinfo(text))
             {
                 out.insert(pointer.clone());
             }
@@ -922,7 +953,7 @@ fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet
             for (key, child) in map {
                 let len = pointer.len();
                 push_pointer_segment(pointer, key);
-                collect_secret_values(child, pointer, out);
+                collect_secret_values(child, pointer, sweep, out);
                 pointer.truncate(len);
             }
         }
@@ -930,7 +961,7 @@ fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet
             for (index, child) in items.iter().enumerate() {
                 let len = pointer.len();
                 push_pointer_segment(pointer, &index.to_string());
-                collect_secret_values(child, pointer, out);
+                collect_secret_values(child, pointer, sweep, out);
                 pointer.truncate(len);
             }
         }
