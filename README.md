@@ -529,8 +529,8 @@ required permission.
 
 ## Credential broker: `${gh-env-secret:...}` placeholders
 
-Consumer credentials (and secret plugin-config and service-discovery values)
-never live in the repository:
+Consumer credentials (and secret plugin-config and service-discovery values,
+and inline TLS private keys) never live in the repository:
 
 ```yaml
 kind: Consumer

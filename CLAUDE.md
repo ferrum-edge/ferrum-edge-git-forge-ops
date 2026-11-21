@@ -225,8 +225,9 @@ distinct effective resource namespace, in lexical order.
 **Stand-ins** (`validate::with_validation_standins`). Credential leaves that are
 *still* `${gh-env-secret:…}` placeholders after resolution get a deterministic
 fake derived from the slot path: `gitforgeops-validation-standin-<64 hex>`,
-`hmac_sha256:<64 hex>` for a `basicauth` `password_hash`, or
-`<scheme>://…standin.invalid/<hash>` for endpoint-typed plugin fields. Reason:
+`hmac_sha256:<64 hex>` for a `basicauth` `password_hash`,
+`<scheme>://…standin.invalid/<hash>` for endpoint-typed plugin fields, or a
+PEM-shaped marker block for a TLS private-key field (`validate::pem_standin`). Reason:
 `${gh-env-secret:alloc=generate}` is 30 characters and Edge's floor for
 `jwt`/`hmac_auth` is 32, so a bundle-less fork PR would fail on the placeholder.
 
@@ -242,7 +243,7 @@ fake derived from the slot path: `gitforgeops-validation-standin-<64 hex>`,
 **Scrubbing** (`secrets::SecretScrubber`). It collects every non-placeholder
 Consumer credential leaf (minus literal identities), every
 `sensitive_string_paths` plugin-config leaf, modeled service-discovery secrets,
-and — when paired with a `ResolveReport` — the value at every resolved slot,
+inline TLS private keys in Proxy/Upstream bodies, and — when paired with a `ResolveReport` — the value at every resolved slot,
 even if it looks like a placeholder or has a nonsensitive field name. Those
 bytes and their single-line re-encodings (base64, percent, JSON-escape,
 single-quoted YAML) become `[REDACTED]` in the child's stdout/stderr;
@@ -1760,7 +1761,7 @@ literal.
 
 #### Secrets outside `Consumer.credentials`
 
-Two more places hold brokered secrets, each with a reserved slot kind (the `@`
+Three more places hold brokered secrets, each with a reserved slot kind (the `@`
 prefix keeps them out of the credential-type keyspace):
 
 - `PluginConfig.config` → `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>`,
@@ -1779,6 +1780,15 @@ prefix keeps them out of the credential-type keyspace):
   `kubernetes` and `mesh` have no secret field. `diff` redacts these leaves
   individually; `is_sensitive_diff_field` deliberately omits
   `service_discovery` so address and service-name drift stay reviewable.
+- Inline PEM in Proxy/Upstream `backend_tls_client_key_path` →
+  `<ns>/<id>/@proxy|@upstream/backend_tls_client_key_path`
+  (`src/secrets/backend_tls.rs`; never generated). `src/secrets/tls_material.rs`
+  is the one detector (Edge's `contains_inline_private_key` and
+  `tls_material_field`) for import, the literal gate, scrubbing, diff and
+  plugin-config classification: inline keys in plugin key fields
+  (`dtls_key_path`, `client_key_path`, `private_key`) are brokered under
+  `@plugin`; a key in any other field (a cert+key bundle) is refused by import
+  and blocks apply. Paths and provider URIs stay literal.
 
 #### Bundle storage and sharding
 

@@ -380,8 +380,9 @@ and only a completed pass is `PASSED`.
 
 **Secrets are scrubbed from validator output, not hidden wholesale.**
 Credentials are resolved before validation, and the validator may echo them.
-Every resolved or literal credential, sensitive plugin-config value and modeled
-service-discovery secret, plus its base64 and percent-encoded forms, is
+Every resolved or literal credential, sensitive plugin-config value, modeled
+service-discovery secret and inline TLS private key, plus its base64 and
+percent-encoded forms, is
 replaced with `[REDACTED]`. Identities (`basicauth` usernames, `mtls_auth`
 identities) stay readable. The whole stream is withheld instead when:
 
@@ -402,6 +403,7 @@ gets a fake value of the right shape:
 | `basicauth` `password_hash` | `hmac_sha256:<64 hex>` |
 | other credentials, and token/header/secret plugin config | `gitforgeops-validation-standin-<64 hex>` |
 | endpoint plugin config (`ldap_url`, `redis_url`, `jwks_uri`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
+| TLS private key (`backend_tls_client_key_path`, `dtls_key_path`, `client_key_path`, `private_key`) | a `PRIVATE KEY` PEM block whose body is a marker and a hash, not a key |
 
 The scheme follows the field (`ldaps://`, `redis://`, otherwise `https://`).
 Resolved values are always validated unchanged. Stand-ins are never exported,
@@ -627,8 +629,14 @@ unchanged. File-mode drift jobs still skip before receiving gateway credentials.
   imports do not claim exact provenance.
 - Every recognized secret becomes `${gh-env-secret:alloc=require}`: Consumer
   credential secrets, built-in plugin-config secrets covered by the broker
-  rules, custom-plugin values the heuristics flag, and Consul tokens.
-  Identities stay literal.
+  rules, custom-plugin values the heuristics flag, Consul tokens, and inline
+  TLS private keys in private-key fields (Proxy and Upstream
+  `backend_tls_client_key_path`, plugin `dtls_key_path`, `client_key_path`,
+  `private_key`). Identities and key file paths stay literal.
+- A TLS private key in any other field (a certificate-plus-key bundle in a
+  certificate or CA field) **fails the import** with the resource and field
+  named; no flag accepts it. Remove the key block from that field at the
+  source and re-run.
 - A secret-looking value outside those rules, or any custom-plugin string the
   heuristics do not flag, **fails the import** before anything is written.
   After confirming the named paths hold no credentials, re-run with

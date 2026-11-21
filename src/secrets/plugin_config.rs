@@ -634,6 +634,35 @@ pub(crate) struct PluginConfigClassification {
     /// and cannot be scrubbed, so import and the security audit warn about
     /// each one instead of staying silent.
     pub short_credential_named: Vec<Vec<ConfigPathComponent>>,
+    /// TLS private-key material ([`super::tls_material`]) outside a
+    /// private-key source field and outside every brokered leaf: a
+    /// certificate-plus-key bundle in a certificate or CA field, or a PEM key
+    /// in an arbitrary string. Never brokered (the field also holds material
+    /// that must stay reviewable, and no validator stand-in can reproduce
+    /// it) and never accepted as plaintext: import refuses it outright, and
+    /// it is redacted, scrubbed and literal-gated like a secret.
+    pub unbrokerable_private_keys: Vec<Vec<ConfigPathComponent>>,
+}
+
+/// Fold TLS private-key material into a classification: material at a
+/// private-key source field (`dtls_key_path`, `client_key_path`,
+/// `private_key`, `backend_tls_client_key_path`) is brokered like any other
+/// secret, whatever the rules or heuristics said; material anywhere else that
+/// no rule already brokers is unbrokerable. A path or provider URI in a
+/// private-key field is a reference and is left to the other rules.
+fn classify_private_key_material(
+    config: &Value,
+    sensitive: &mut BTreeSet<Vec<ConfigPathComponent>>,
+) -> BTreeSet<Vec<ConfigPathComponent>> {
+    let mut unbrokerable = BTreeSet::new();
+    for site in super::tls_material::private_key_sites(config) {
+        if site.key_source {
+            sensitive.insert(site.path);
+        } else if !sensitive.contains(&site.path) {
+            unbrokerable.insert(site.path);
+        }
+    }
+    unbrokerable
 }
 
 /// Classify a plugin config's string leaves.
@@ -654,6 +683,10 @@ pub(crate) struct PluginConfigClassification {
 ///   applied until someone hand-seeds a slot for the word "strict", and the
 ///   resource file no longer says what the plugin does. The unflagged leaves
 ///   are returned in `unbrokered` so the operator reviews them instead.
+///
+/// In the last two cases TLS private-key material is classified by
+/// [`classify_private_key_material`] first, so a PEM key never depends on a
+/// key-name heuristic or a plaintext allowance.
 pub(crate) fn classify_plugin_config(
     plugin_name: &str,
     config: &Value,
@@ -667,18 +700,25 @@ pub(crate) fn classify_plugin_config(
             sensitive: sensitive.into_iter().collect(),
             unbrokered: Vec::new(),
             short_credential_named: Vec::new(),
+            unbrokerable_private_keys: Vec::new(),
         };
     }
 
     if !is_builtin(plugin_name) {
         collect_heuristic_paths(config, &root, &mut sensitive, false);
+        let unbrokerable = classify_private_key_material(config, &mut sensitive);
         let mut all = BTreeSet::new();
         collect_string_paths(config, &root, &mut all);
-        let unbrokered = all.difference(&sensitive).cloned().collect();
+        let unbrokered = all
+            .difference(&sensitive)
+            .filter(|path| !unbrokerable.contains(*path))
+            .cloned()
+            .collect();
         return PluginConfigClassification {
             sensitive: sensitive.into_iter().collect(),
             unbrokered,
             short_credential_named: Vec::new(),
+            unbrokerable_private_keys: unbrokerable.into_iter().collect(),
         };
     }
 
@@ -707,17 +747,21 @@ pub(crate) fn classify_plugin_config(
             apply_rule(config, rule.path, rule.kind, &root, &mut sensitive);
         }
     }
+    let unbrokerable = classify_private_key_material(config, &mut sensitive);
     let mut heuristic = BTreeSet::new();
     collect_heuristic_paths(config, &root, &mut heuristic, true);
     collect_credential_named_parameters(plugin_name, config, &mut heuristic);
     let unbrokered = heuristic
         .into_iter()
-        .filter(|path| !sensitive.contains(path) && !ordinary.contains(path))
+        .filter(|path| {
+            !sensitive.contains(path) && !ordinary.contains(path) && !unbrokerable.contains(path)
+        })
         .collect();
     PluginConfigClassification {
         sensitive: sensitive.into_iter().collect(),
         unbrokered,
         short_credential_named: short_credential_named.into_iter().collect(),
+        unbrokerable_private_keys: unbrokerable.into_iter().collect(),
     }
 }
 
@@ -804,7 +848,9 @@ pub(crate) fn short_credential_named_paths(
 }
 
 /// Return every sensitive string for redaction and security checks, including
-/// builtin heuristic matches that import gates instead of automatically brokering.
+/// builtin heuristic matches that import gates instead of automatically
+/// brokering, and TLS private-key material import refuses
+/// ([`PluginConfigClassification::unbrokerable_private_keys`]).
 pub(crate) fn sensitive_string_paths(
     plugin_name: &str,
     config: &Value,
@@ -814,6 +860,7 @@ pub(crate) fn sensitive_string_paths(
     if is_builtin(plugin_name) {
         sensitive.extend(classification.unbrokered);
     }
+    sensitive.extend(classification.unbrokerable_private_keys);
     sensitive.into_iter().collect()
 }
 

@@ -131,6 +131,27 @@ pub fn mask_indeterminate_secret_values(
             }
         }
     }
+
+    // A brokered `backend_tls_client_key_path` the bundle did not resolve is
+    // compared the same way: the gateway's real key is not drift the run can
+    // prove. A path on either side, and every sibling field, stays
+    // authoritative.
+    let desired_keys: HashMap<(&str, &str, &str), &String> =
+        crate::secrets::backend_tls::client_keys(desired)
+            .into_iter()
+            .map(|key| ((key.owner.kind(), key.namespace, key.id), key.value))
+            .collect();
+    for live in crate::secrets::backend_tls::client_keys_mut(actual) {
+        let Some(placeholder) =
+            desired_keys.get(&(live.owner.kind(), live.namespace.as_str(), live.id.as_str()))
+        else {
+            continue;
+        };
+        let slot = crate::secrets::backend_tls::slot(live.owner, &live.namespace, &live.id);
+        if unresolved.contains(slot.as_str()) && live.value.is_some() {
+            *live.value = Some((*placeholder).clone());
+        }
+    }
 }
 
 fn mask_unresolved_leaves(
@@ -192,6 +213,9 @@ pub fn is_sensitive_diff_field(kind: &str, field: &str) -> bool {
 /// Redact even placeholder-shaped strings: the field diff has no resolution
 /// provenance, and either side may hold accepted secret material with that shape.
 fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
+    if kind == "Proxy" || kind == "Upstream" {
+        redact_private_key_changes(changes);
+    }
     if kind != "Upstream" {
         return;
     }
@@ -205,6 +229,63 @@ fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
             }
         }
     }
+}
+
+/// Replace TLS private-key material ([`crate::secrets::tls_material`]) in
+/// Proxy and Upstream field changes with [`crate::secrets::REDACTION`], leaf
+/// by leaf: inline PEM in `backend_tls_client_key_path`, or a key block in a
+/// certificate field. A path or provider URI stays visible, so moving a key
+/// file or switching between a file and the broker is still reviewable.
+///
+/// At the brokered field a placeholder-shaped value is redacted too, as for
+/// service discovery: the field diff has no resolution provenance, and a
+/// seeded bundle value may have that shape.
+fn redact_private_key_changes(changes: &mut [FieldChange]) {
+    for change in changes.iter_mut() {
+        for side in [&mut change.old_value, &mut change.new_value] {
+            if let Some(redacted) = redact_private_key_json(&change.field, side) {
+                *side = redacted;
+            }
+        }
+    }
+}
+
+/// One serialized field value with its private-key leaves redacted, or
+/// `None` when nothing needed replacing.
+fn redact_private_key_json(field: &str, serialized: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(serialized).ok()?;
+    let mut redacted = false;
+    if field == crate::secrets::backend_tls::CLIENT_KEY_FIELD {
+        if let serde_json::Value::String(text) = &mut value {
+            if crate::secrets::parse_placeholder(text).is_some() {
+                *text = crate::secrets::REDACTION.to_string();
+                redacted = true;
+            }
+        }
+    }
+    for site in crate::secrets::tls_material::private_key_sites_in_field(field, &value) {
+        if let Some(serde_json::Value::String(text)) = value_at_mut(&mut value, &site.path) {
+            *text = crate::secrets::REDACTION.to_string();
+            redacted = true;
+        }
+    }
+    if !redacted {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn value_at_mut<'a>(
+    mut value: &'a mut serde_json::Value,
+    path: &[ConfigPathComponent],
+) -> Option<&'a mut serde_json::Value> {
+    for part in path {
+        value = match part {
+            ConfigPathComponent::Key(key) => value.as_object_mut()?.get_mut(key)?,
+            ConfigPathComponent::Index(index) => value.as_array_mut()?.get_mut(*index)?,
+        };
+    }
+    Some(value)
 }
 
 /// Redact the modeled secret leaves of one serialized `service_discovery`

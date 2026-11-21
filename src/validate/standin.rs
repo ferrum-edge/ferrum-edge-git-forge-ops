@@ -31,6 +31,8 @@ use crate::secrets::parse_placeholder;
 use crate::secrets::plugin_config::ConfigPathComponent;
 use crate::secrets::resolver::{consumer_credential_slot, ResolveReport, SlotStatus};
 
+use super::pem_standin::validation_private_key_standin;
+
 /// Fixed marker every opaque stand-in starts with. It is deliberately
 /// unmistakable: a value carrying this prefix anywhere but a validator temp
 /// spec is a bug, and greppable as one.
@@ -102,7 +104,7 @@ pub fn validation_url_standin(slot: &str, scheme: &str) -> String {
 /// overwhelmingly common bundle-loaded case, which then validates the config
 /// as-is with no clone).
 ///
-/// Two sources covered by the stand-in contract (modeled service-discovery
+/// Three sources covered by the stand-in contract (modeled service-discovery
 /// fields remain byte-for-byte unchanged):
 ///
 /// * **`Consumer.credentials`** — shape-checked by ferrum-edge (the
@@ -117,6 +119,10 @@ pub fn validation_url_standin(slot: &str, scheme: &str) -> String {
 ///   scheme, and everything else gets the opaque token form. Header maps are
 ///   rewritten value-side only, so `headers.x-honeycomb-team` keeps its key
 ///   and a plugin that validates required header *names* still sees them.
+///   A private-key source field gets a PEM-shaped stand-in
+///   ([`super::pem_standin`]).
+/// * **Proxy and Upstream `backend_tls_client_key_path`** — Edge parses an
+///   inline key as PEM, so it gets the PEM-shaped stand-in too.
 ///
 /// Nothing outside the 0600 temp spec handed to `ferrum-edge validate` ever
 /// sees the result: the caller's `config` is untouched, and export, apply,
@@ -162,7 +168,10 @@ pub(crate) fn with_validation_standins_for_report(
         .plugin_configs
         .iter()
         .any(|plugin| has_placeholder(&plugin.config));
-    if !credentials_brokered && !plugin_config_brokered {
+    let backend_keys_brokered = crate::secrets::backend_tls::client_keys(config)
+        .iter()
+        .any(|key| matches!(parse_placeholder(key.value), Some(Ok(_))));
+    if !credentials_brokered && !plugin_config_brokered && !backend_keys_brokered {
         return None;
     }
 
@@ -207,6 +216,23 @@ pub(crate) fn with_validation_standins_for_report(
         );
     }
 
+    // A brokered `backend_tls_client_key_path` gets a PEM-shaped stand-in:
+    // Edge parses the inline key (and would read the placeholder as a missing
+    // file), but does not pair it with the certificate.
+    for key in crate::secrets::backend_tls::client_keys_mut(&mut patched) {
+        let Some(text) = key.value.as_mut() else {
+            continue;
+        };
+        if !matches!(parse_placeholder(text), Some(Ok(_))) {
+            continue;
+        }
+        let slot = crate::secrets::backend_tls::slot(key.owner, &key.namespace, &key.id);
+        if eligible(&slot) {
+            *text = validation_private_key_standin(&slot);
+            changed = true;
+        }
+    }
+
     changed.then_some(patched)
 }
 
@@ -238,7 +264,14 @@ fn substitute_plugin_leaves(
             if !eligible(&slot) {
                 return false;
             }
-            *text = if endpoints.contains(path) {
+            *text = if crate::secrets::tls_material::is_key_source_path(path) {
+                // A private-key source field (`dtls_key_path`,
+                // `client_key_path`, ...) is parsed as PEM. `udp_logging`
+                // also pairs its DTLS key with the certificate, which no
+                // stand-in can satisfy; that identity validates only with
+                // the bundle, like a key file absent from the runner.
+                validation_private_key_standin(&slot)
+            } else if endpoints.contains(path) {
                 validation_url_standin(
                     &slot,
                     scheme.unwrap_or_else(|| {

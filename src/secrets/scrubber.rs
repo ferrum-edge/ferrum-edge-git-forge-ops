@@ -59,6 +59,7 @@ use super::resolver::{
     consumer_credential_slot, is_identity_credential_leaf, plugin_config_slot, ResolveReport,
     SlotStatus,
 };
+use super::tls_material::private_key_sites;
 
 /// Text substituted for every secret occurrence.
 pub const REDACTION: &str = "[REDACTED]";
@@ -190,7 +191,7 @@ pub struct ScrubbedOutput {
 impl SecretScrubber {
     /// Collect every secret string reachable from `config`.
     ///
-    /// Two sources, matching what the broker itself manages:
+    /// The sources match what the broker itself manages:
     ///
     /// * **Consumer credentials** — every string leaf under
     ///   `Consumer.credentials` that is not a well-formed
@@ -208,6 +209,13 @@ impl SecretScrubber {
     ///   `Upstream.service_discovery` ([`super::service_discovery`]), today the
     ///   Consul ACL token. The validator is handed the resolved upstream, so
     ///   an error quoting the discovery block quotes the token with it.
+    /// * **TLS private keys** — inline private-key material anywhere in a
+    ///   Proxy or Upstream body ([`super::tls_material`]): a brokered or
+    ///   literal `backend_tls_client_key_path`, or a key block in a
+    ///   certificate field. Plugin-config keys arrive through
+    ///   [`sensitive_string_paths`]. Each is registered with its embedded key
+    ///   blocks and LF/CRLF spellings; being multi-line, it withholds the
+    ///   validator's streams.
     pub fn from_gateway_config(config: &GatewayConfig) -> Self {
         Self::from_gateway_config_with_report(config, &ResolveReport::default())
     }
@@ -422,6 +430,7 @@ pub(crate) fn gateway_secret_values(
     collect_consumer_secrets(config, &mut values);
     collect_plugin_config_secrets(config, &mut values);
     collect_service_discovery_secrets(config, &mut values);
+    collect_backend_private_keys(config, &mut values);
     let mut values = values.0;
     collect_resolved_secrets(config, report, &mut values);
     values
@@ -451,6 +460,7 @@ pub(crate) fn live_secret_leaves(config: &GatewayConfig) -> Vec<LiveSecretLeaf> 
     collect_consumer_secrets(config, &mut leaves);
     collect_plugin_config_secrets(config, &mut leaves);
     collect_service_discovery_secrets(config, &mut leaves);
+    collect_backend_private_keys(config, &mut leaves);
     leaves
         .0
         .into_iter()
@@ -550,6 +560,13 @@ fn collect_resolved_secrets(
                 plugin_config_slot(&plugin.namespace, &plugin.id, &plugin.plugin_name, path);
             resolved.contains(plugin_slot.as_str())
         });
+    }
+    for key in super::backend_tls::client_keys(config) {
+        let slot = super::backend_tls::slot(key.owner, key.namespace, key.id);
+        if resolved.contains(slot.as_str()) && !key.value.is_empty() {
+            out.insert(key.value.clone());
+            out.extend(super::tls_material::line_ending_variants(key.value));
+        }
     }
     for upstream in &config.upstreams {
         let Some(discovery) = &upstream.service_discovery else {
@@ -735,17 +752,68 @@ fn collect_credential_leaves(
 fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
     for plugin in &config.plugin_configs {
         let declared = rule_declared_paths(&plugin.plugin_name, &plugin.config);
+        let private_keys: BTreeSet<Vec<ConfigPathComponent>> = private_key_sites(&plugin.config)
+            .into_iter()
+            .map(|site| site.path)
+            .collect();
         for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
             if let Some(serde_json::Value::String(text)) = value_at(&plugin.config, &path) {
-                out.leaf(text, declared.contains(&path), &|| {
+                let location = || {
                     leaf_location(
                         "PluginConfig",
                         &plugin.namespace,
                         &plugin.id,
                         &format!("config.{}", render_config_path(&path)),
                     )
-                });
+                };
+                if private_keys.contains(&path) {
+                    private_key_leaf(text, out, &location);
+                } else {
+                    out.leaf(text, declared.contains(&path), &location);
+                }
             }
+        }
+    }
+}
+
+/// One TLS private-key value: the stored bytes, required, plus each key block
+/// inside a larger value such as a certificate-plus-key bundle
+/// ([`super::tls_material::embedded_private_key_blocks`]), each with its
+/// line-ending variants ([`super::tls_material::line_ending_variants`]), so a
+/// copy whose line endings were rewritten, or that holds only the key, is
+/// still matched whole. A PEM block
+/// is multi-line, which [`is_reencoding_hazard`] treats as unscrubbable: the
+/// validator's streams are withheld while one is registered, and the display
+/// sink withholds any line that keeps an eight-byte run of it.
+fn private_key_leaf(text: &str, out: &mut dyn LeafSink, location: &dyn Fn() -> String) {
+    let mut spellings = vec![text.to_string()];
+    spellings.extend(super::tls_material::embedded_private_key_blocks(text));
+    for spelling in spellings {
+        for variant in super::tls_material::line_ending_variants(&spelling) {
+            out.leaf(&variant, true, location);
+        }
+        out.leaf(&spelling, true, location);
+    }
+}
+
+/// TLS private-key material anywhere in a Proxy or Upstream body: inline PEM
+/// in `backend_tls_client_key_path` (brokered or literal), or a key block in
+/// another field (refused by import and the audit, but `validate` runs
+/// without the audit, and a live row can hold one). Paths, provider URIs and
+/// placeholders are references and stay readable.
+fn collect_backend_private_keys(config: &GatewayConfig, out: &mut dyn LeafSink) {
+    let Ok(rows) = super::backend_tls::resource_bodies(config) else {
+        return;
+    };
+    for row in rows {
+        for site in private_key_sites(&row.body) {
+            let Some(serde_json::Value::String(text)) = value_at(&row.body, &site.path) else {
+                continue;
+            };
+            let path = render_config_path(&site.path);
+            private_key_leaf(text, out, &|| {
+                leaf_location(row.owner.kind(), row.namespace, row.id, &path)
+            });
         }
     }
 }

@@ -131,6 +131,8 @@ PluginConfig.config leaf     ->  <ns>/<plugin-id>/@plugin/<plugin_name>/config/<
                                  ferrum/ldap/@plugin/ldap_auth/config/ldap_url
 Upstream.service_discovery   ->  <ns>/<upstream-id>/@service-discovery/<path>
                                  ferrum/orders/@service-discovery/consul/token
+Proxy backend TLS client key ->  <ns>/<proxy-id>/@proxy/backend_tls_client_key_path
+Upstream backend TLS client key -> <ns>/<upstream-id>/@upstream/backend_tls_client_key_path
 ```
 
 Plugin-config array paths keep every index, including `[0]`.
@@ -160,6 +162,39 @@ credentials (`https://user:password@host`): a committed one is a blocking
 finding, `import` refuses a gateway whose address has them rather than writing
 them to the tree, `diff` shows such a live address as
 `https://[REDACTED]@host`, and validator output is scrubbed of them. Put a Consul ACL token in `consul.token` instead.
+
+TLS private keys are brokered when they are inline. Ferrum Edge reads a TLS
+source field as inline PEM when it starts with `-----BEGIN `, so
+`backend_tls_client_key_path` on a Proxy or Upstream, `udp_logging`
+`dtls_key_path`, and the other private-key fields (`client_key_path`,
+`private_key`) can hold the key itself. Inline key material is detected the
+way Edge detects it: a PEM block whose label names a private key, anywhere in
+the value, or any PEM armour or control character in a private-key field. A
+filesystem path (`/etc/ferrum/tls/client.key`), a provider URI (`vault://`,
+`k8s://`) or a placeholder is a reference and stays literal everywhere.
+
+- `import` moves an inline key into the credential import bundle and writes
+  `${gh-env-secret:alloc=require}`: Proxy and Upstream keys under the slots
+  above, plugin-config keys under their `@plugin` slot.
+- A private key anywhere else (a certificate-plus-key bundle in
+  `backend_tls_client_cert_path`, a CA field or a plugin's certificate field)
+  is never brokered, because the field also holds a certificate that must stay
+  reviewable. `import` refuses it, naming the resource and field, and no
+  plaintext allowance applies. Remove the key block from that field on the
+  gateway (Edge reads only the certificates there) and re-run.
+- A committed inline key, in any of these places, is a blocking finding.
+- `diff`, `plan` and the review comment print `[REDACTED]` for the key and keep
+  paths visible. Validator output and everything the CLI displays are scrubbed
+  of it, including its LF and CRLF spellings; because a PEM block is
+  multi-line, validator diagnostics are withheld while one is resolved.
+- The broker never generates a TLS key (`alloc=generate` is refused): it must
+  match the configured certificate. Seed the slot with the PEM key.
+- Without a bundle, the validator gets a PEM-shaped stand-in for an unresolved
+  key. Edge parses an inline Proxy or Upstream key but does not pair it with
+  the certificate, so that validates. `udp_logging` pairs its DTLS key with
+  `dtls_cert_path`, which no stand-in can satisfy: like a key file missing
+  from the runner, a brokered DTLS key validates only where the bundle is
+  loaded.
 
 Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,
 the final `Error:` line and the review comment. Every value a run resolves
@@ -457,8 +492,8 @@ Rules:
 
 - Only Consumer `keyauth/key`, `jwt/secret`, `hmac_auth/secret` and api-mode
   `basicauth/password` (including indexed entries) can be rotated. Hashes,
-  identities, unknown fields and `@plugin` / `@service-discovery` slots
-  are refused before anything is written.
+  identities, unknown fields and `@plugin` / `@service-discovery` /
+  `@proxy` / `@upstream` slots are refused before anything is written.
 - Rotation is refused in file mode; use materialization instead.
 - The target must be a placeholder on a declared Consumer in the namespace,
   and its sibling slots must already resolve.

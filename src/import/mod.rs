@@ -17,7 +17,8 @@ use crate::config::schema::{
 use crate::http_client::{describe_unmodeled_nested_fields, BackupSnapshot, UnmodeledNestedField};
 use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
-    capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
+    capture_and_redact_import_backend_tls_keys, capture_and_redact_import_credentials,
+    capture_and_redact_import_plugin_config_secrets,
     capture_and_redact_import_service_discovery_secrets, CredentialBundle, UnbrokeredPluginConfig,
     IMPORT_REQUIRED_PLACEHOLDER,
 };
@@ -139,6 +140,9 @@ pub struct ImportResult {
     /// Number of modeled `Upstream.service_discovery` secrets (the Consul ACL
     /// token) replaced with broker placeholders.
     pub redacted_service_discovery_values: usize,
+    /// Number of inline Proxy/Upstream `backend_tls_client_key_path` private
+    /// keys replaced with broker placeholders.
+    pub redacted_backend_tls_key_values: usize,
     /// Future/unknown top-level backup sections that this build cannot import.
     pub unsupported_sections: Vec<String>,
     /// Validated, non-secret provenance retained in the import manifest.
@@ -182,6 +186,7 @@ impl ImportResult {
             && self.redacted_credential_values == 0
             && self.redacted_plugin_config_values == 0
             && self.redacted_service_discovery_values == 0
+            && self.redacted_backend_tls_key_values == 0
             && self.unsupported_sections.is_empty()
         {
             return None;
@@ -231,6 +236,15 @@ impl ImportResult {
             notice.push_str(&format!(
                 "{} service-discovery secret(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
                 self.redacted_service_discovery_values
+            ));
+        }
+        if self.redacted_backend_tls_key_values > 0 {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "{} inline backend TLS client key(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
+                self.redacted_backend_tls_key_values
             ));
         }
         if !self.unsupported_sections.is_empty() {
@@ -517,6 +531,7 @@ pub(crate) fn split_config_with_inventory(
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
     let captured_discovery = capture_and_redact_import_service_discovery_secrets(&mut safe_config)?;
+    let captured_backend_tls = capture_and_redact_import_backend_tls_keys(&mut safe_config)?;
     let unbrokered_plugin_config = enforce_plaintext_plugin_config_allowance(
         plugin_capture.unbrokered,
         allow_plaintext_plugin_config,
@@ -524,6 +539,7 @@ pub(crate) fn split_config_with_inventory(
     let credential_count = captured_credentials.len();
     let plugin_config_count = plugin_capture.captured.len();
     let service_discovery_count = captured_discovery.len();
+    let backend_tls_key_count = captured_backend_tls.len();
     let mut captured_secrets = captured_credentials;
     for (slot, value) in plugin_capture.captured {
         if captured_secrets.insert(slot.clone(), value).is_some() {
@@ -539,6 +555,13 @@ pub(crate) fn split_config_with_inventory(
             )));
         }
     }
+    for (slot, value) in captured_backend_tls {
+        if captured_secrets.insert(slot.clone(), value).is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "secret slot '{slot}' is produced by a backend TLS client key and another resource"
+            )));
+        }
+    }
     let mut result = ImportResult {
         skipped_api_specs: inventory.skipped_api_specs,
         skipped_trust_bundles: inventory.skipped_trust_bundles,
@@ -547,6 +570,7 @@ pub(crate) fn split_config_with_inventory(
         redacted_credential_values: credential_count,
         redacted_plugin_config_values: plugin_config_count,
         redacted_service_discovery_values: service_discovery_count,
+        redacted_backend_tls_key_values: backend_tls_key_count,
         unbrokered_plugin_config,
         short_credential_plugin_config: plugin_capture.short_credential_named,
         acknowledged_passthrough,
@@ -557,7 +581,7 @@ pub(crate) fn split_config_with_inventory(
         && credential_bundle_output.is_none()
     {
         return Err(crate::error::Error::Config(format!(
-            "the source contains {} live secret value(s) across consumer credentials and plugin config; re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
+            "the source contains {} live secret value(s) across consumer credentials, plugin config, service discovery and backend TLS client keys; re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
             captured_secrets.len()
         )));
     }
