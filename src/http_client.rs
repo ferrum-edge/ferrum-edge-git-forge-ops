@@ -3471,6 +3471,31 @@ impl HealthProbe {
     }
 }
 
+/// The warnings `apply`'s advisory write preflight prints for a `/health`
+/// answer that does not refuse writes: one for a gateway that is not ready,
+/// and one for the minimal tier, whose write state is unknown. Empty for a
+/// ready gateway that reports writes enabled.
+pub fn health_preflight_warnings(probe: &HealthProbe, namespace_bounded: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !probe.is_ready() {
+        warnings.push(format!(
+            "Warning: admin preflight GET /health reports the gateway is not ready ({}); \
+             continuing, and the gateway enforces its own mutation controls.",
+            probe.readiness()
+        ));
+    }
+    // The minimal tier: the write state is unknown. The preflight stays
+    // advisory, and the first refused write reports it.
+    if probe.health.admin_writes_enabled.is_none() {
+        warnings.push(format!(
+            "Warning: admin preflight GET /health did not report admin_writes_enabled; \
+             continuing. {}",
+            health_tier_remedy(namespace_bounded)
+        ));
+    }
+    warnings
+}
+
 /// Ferrum Edge's not-ready `/health` document, or `None` when the response
 /// is not one.
 ///
@@ -3483,8 +3508,12 @@ impl HealthProbe {
 /// * **tenant** — exactly those plus a string `mode`, a boolean
 ///   `admin_writes_enabled` and the `namespace` serving report;
 /// * **detailed** — a string `mode`, a boolean `admin_writes_enabled`, an
-///   RFC 3339 `timestamp` and the `namespace` serving report, among Edge's
-///   other diagnostics, and never an `error` or `message` envelope key.
+///   RFC 3339 `timestamp`, the `namespace` serving report, the `fips`
+///   metadata and the `cached_config` summary, among Edge's other
+///   diagnostics, and never an `error` or `message` envelope key.
+///
+/// In both authenticated tiers `mode` is one of Edge's operating modes and
+/// the `namespace` block's `serving_scope` is the one Edge derives from it.
 ///
 /// Anything else — another media type, HTML, plain text, an error envelope,
 /// a `null` or wrongly typed documented field, duplicate keys, or a body that
@@ -3530,27 +3559,91 @@ fn has_health_write_state(object: &serde_json::Map<String, serde_json::Value>) -
 /// The tenant tier: exactly `status`, `ready`, `mode`, `admin_writes_enabled`
 /// and `namespace`.
 fn is_tenant_health(object: &serde_json::Map<String, serde_json::Value>) -> bool {
-    object.len() == 5
-        && has_health_write_state(object)
-        && object
-            .get("namespace")
-            .is_some_and(|block| is_namespace_serving_report(block, false))
+    object.len() == 5 && has_health_write_state(object) && has_mode_namespace(object, false)
 }
 
-/// The detailed tier: Edge's handler starts it from `status`, an RFC 3339
-/// `timestamp` and `mode`, always adds `admin_writes_enabled` and the
-/// `namespace` block, and never an error envelope.
+/// The detailed tier as both Edge v0.9.20 and later build it: from `status`,
+/// an RFC 3339 `timestamp` and `mode`, always adding `admin_writes_enabled`,
+/// `fips`, `namespace` and `cached_config`, and never an error envelope.
+/// Other diagnostics are optional and are not inspected.
 fn is_detailed_health(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     has_health_write_state(object)
         && object
             .get("timestamp")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|stamp| crate::timestamp::Timestamp::parse_rfc3339(stamp).is_ok())
-        && object
-            .get("namespace")
-            .is_some_and(|block| is_namespace_serving_report(block, true))
+            .is_some_and(is_rfc3339)
+        && has_mode_namespace(object, true)
+        && object.get("fips").is_some_and(is_fips_metadata)
+        && object.get("cached_config").is_some_and(is_cached_config)
         && !object.contains_key("error")
         && !object.contains_key("message")
+}
+
+fn is_rfc3339(stamp: &str) -> bool {
+    crate::timestamp::Timestamp::parse_rfc3339(stamp).is_ok()
+}
+
+/// The `serving_scope` Edge derives from its operating mode: a process with a
+/// proxy data plane (`database`, `file`, `dp`, `mesh`) serves one namespace,
+/// a control plane serves none itself, and a node agent has no data plane.
+/// `None` for a mode Edge does not have.
+fn serving_scope_for_mode(mode: &str) -> Option<&'static str> {
+    match mode {
+        "database" | "file" | "dp" | "mesh" => Some("single-namespace-data-plane"),
+        "cp" => Some("control-plane"),
+        "node_agent" => Some("no-data-plane"),
+        _ => None,
+    }
+}
+
+/// A `namespace` block consistent with the document's own `mode`.
+fn has_mode_namespace(object: &serde_json::Map<String, serde_json::Value>, detailed: bool) -> bool {
+    let Some(scope) = object
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(serving_scope_for_mode)
+    else {
+        return false;
+    };
+    object
+        .get("namespace")
+        .is_some_and(|block| is_namespace_serving_report(block, scope, detailed))
+}
+
+/// Edge's `fips` metadata: every documented field present with its type, and
+/// `certified` always `false`.
+fn is_fips_metadata(value: &serde_json::Value) -> bool {
+    let Some(fips) = value.as_object() else {
+        return false;
+    };
+    let string = |key| fips.get(key).is_some_and(serde_json::Value::is_string);
+    let boolean = |key| fips.get(key).is_some_and(serde_json::Value::is_boolean);
+    string("mode")
+        && boolean("enforcing")
+        && boolean("build_capable")
+        && string("build_profile")
+        && string("provider")
+        && boolean("module_self_test_passed")
+        && boolean("provider_algorithms_approved")
+        && fips.get("certified") == Some(&serde_json::Value::Bool(false))
+        && string("boundary_documentation")
+}
+
+/// Edge's `cached_config` summary: a boolean `available`, and the documented
+/// types for `loaded_at`, `proxy_count` and `consumer_count` when present.
+fn is_cached_config(value: &serde_json::Value) -> bool {
+    let Some(cached) = value.as_object() else {
+        return false;
+    };
+    let count = |key| cached.get(key).is_none_or(|count| count.as_u64().is_some());
+    cached
+        .get("available")
+        .is_some_and(serde_json::Value::is_boolean)
+        && cached
+            .get("loaded_at")
+            .is_none_or(|stamp| stamp.as_str().is_some_and(is_rfc3339))
+        && count("proxy_count")
+        && count("consumer_count")
 }
 
 /// `application/json`, with or without parameters such as `charset`.
@@ -3564,27 +3657,31 @@ fn is_json_media_type(content_type: &str) -> bool {
 /// Edge's `NamespaceServingReport`, exactly as its one builder emits it:
 /// `active`, `serving_scope` and `data_plane_single_namespace`, nothing else.
 ///
-/// `serving_scope` is the closed set `single-namespace-data-plane`,
-/// `control-plane` or `no-data-plane`; `data_plane_single_namespace` is true
-/// exactly for the first. `active` names the routed namespace only on a
-/// single-namespace data plane, and is `null` otherwise. The tenant tier may
-/// also null it on a data plane whose namespace the token cannot address, so
-/// only the `detailed` tier requires it there.
-fn is_namespace_serving_report(value: &serde_json::Value, detailed: bool) -> bool {
+/// `serving_scope` must be `expected_scope`, the one the document's `mode`
+/// implies ([`serving_scope_for_mode`]); `data_plane_single_namespace` is true
+/// exactly for `single-namespace-data-plane`. `active` names the routed
+/// namespace only on a single-namespace data plane, and is `null` otherwise.
+/// The tenant tier may also null it on a data plane whose namespace the token
+/// cannot address, so only the `detailed` tier requires it there.
+fn is_namespace_serving_report(
+    value: &serde_json::Value,
+    expected_scope: &str,
+    detailed: bool,
+) -> bool {
     let Some(block) = value.as_object() else {
         return false;
     };
     if block.len() != 3 {
         return false;
     }
-    let single = match block
+    if block
         .get("serving_scope")
         .and_then(serde_json::Value::as_str)
+        != Some(expected_scope)
     {
-        Some("single-namespace-data-plane") => true,
-        Some("control-plane" | "no-data-plane") => false,
-        _ => return false,
-    };
+        return false;
+    }
+    let single = expected_scope == "single-namespace-data-plane";
     if block.get("data_plane_single_namespace") != Some(&serde_json::Value::Bool(single)) {
         return false;
     }

@@ -1290,23 +1290,10 @@ async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
         Ok(probe) => match http_client::write_block_reason(&probe.health) {
             Some(reason) => Err(crate::error::Error::GatewayReadOnly(reason)),
             None => {
-                let health = &probe.health;
-                if !probe.is_ready() {
-                    crate::eoutln!(
-                        "Warning: admin preflight GET /health reports the gateway is not \
-                         ready ({}); continuing, and the gateway enforces its own mutation \
-                         controls.",
-                        probe.readiness()
-                    );
-                }
-                // The minimal tier: the write state is unknown. The preflight
-                // stays advisory, and the first refused write reports it.
-                if health.admin_writes_enabled.is_none() {
-                    crate::eoutln!(
-                        "Warning: admin preflight GET /health did not report \
-                         admin_writes_enabled; continuing. {}",
-                        http_client::health_tier_remedy(client.is_namespace_bounded())
-                    );
+                for warning in
+                    http_client::health_preflight_warnings(&probe, client.is_namespace_bounded())
+                {
+                    crate::eoutln!("{warning}");
                 }
                 Ok(())
             }

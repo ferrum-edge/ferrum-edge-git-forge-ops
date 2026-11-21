@@ -1507,7 +1507,7 @@ async fn a_draining_gateway_on_the_detailed_tier_reports_its_write_state() {
     let url = not_ready_gateway(
         (
             503,
-            r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":true,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true},"cached_config":{"available":true}}"#,
+            super::http_client_tests::edge_detailed_health("draining", "database", true),
         ),
         Arc::clone(&requests),
     );

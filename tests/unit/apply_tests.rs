@@ -2399,7 +2399,7 @@ async fn an_explicit_write_refusal_in_a_not_ready_health_document_still_fails_th
     let url = spawn_stub_gateway(vec![(
         "GET /health",
         503,
-        r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":false,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
+        super::http_client_tests::edge_detailed_health("draining", "database", false),
     )]);
     let client = stub_client(url);
 
@@ -2425,18 +2425,29 @@ async fn an_explicit_write_refusal_in_a_not_ready_health_document_still_fails_th
 
 #[tokio::test]
 async fn a_not_ready_gateway_that_accepts_writes_keeps_the_preflight_advisory() {
-    // Starting, writes enabled: the preflight warns and the apply proceeds;
-    // the gateway enforces its own mutation controls.
-    let url = spawn_stub_gateway(vec![(
-        "GET /health",
-        503,
-        r#"{"status":"starting","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":true,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
-    )]);
+    // Starting, writes enabled: the preflight warns (the warning itself is
+    // pinned by `the_preflight_warns_that_a_writable_gateway_is_not_ready`)
+    // and the apply goes on to write; the gateway enforces its own mutation
+    // controls.
+    let url = spawn_stub_gateway(vec![
+        (
+            "GET /health",
+            503,
+            super::http_client_tests::edge_detailed_health("starting", "database", true),
+        ),
+        // Force the per-resource path so the create is one observable POST.
+        ("POST /batch", 501, "{}"),
+        ("POST /upstreams", 201, "{}"),
+    ]);
     let client = stub_client(url);
 
+    let desired = GatewayConfig {
+        upstreams: vec![upstream("u1", "ferrum")],
+        ..Default::default()
+    };
     let planned_actuals = empty_actuals(&["ferrum"]);
     let result = apply_api(
-        &GatewayConfig::default(),
+        &desired,
         &client,
         &["ferrum".to_string()],
         OwnershipScope::Exclusive,
@@ -2447,6 +2458,15 @@ async fn a_not_ready_gateway_that_accepts_writes_keeps_the_preflight_advisory() 
     .await
     .expect("an advisory preflight does not stop the run");
     assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+    assert_eq!(result.created, 1, "the write after the preflight happened");
+    assert_eq!(
+        result
+            .applied_incremental
+            .iter()
+            .map(|op| op.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["u1"]
+    );
 }
 
 #[tokio::test]
@@ -2456,7 +2476,7 @@ async fn a_read_only_mode_in_a_not_ready_health_document_fails_the_preflight() {
     let url = spawn_stub_gateway(vec![(
         "GET /health",
         503,
-        r#"{"status":"starting","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"dp","admin_writes_enabled":true,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
+        super::http_client_tests::edge_detailed_health("starting", "dp", true),
     )]);
     let client = stub_client(url);
 
@@ -2485,11 +2505,21 @@ async fn a_not_ready_write_refusal_survives_retries_that_cannot_connect() {
     // With the default-style retry budget, a draining gateway that answers
     // once and then closes its listener still stops the run: the recognized
     // document is the answer, not a transient failure to retry past.
-    let (url, served) = super::http_client_tests::spawn_scripted_health(vec![(
-        503,
-        "application/json",
-        br#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":false,"namespace":{"active":"ferrum","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
-    )]);
+    // The second, ready and writable answer would let the run through if it
+    // were ever requested.
+    let (url, served) = super::http_client_tests::spawn_scripted_health(vec![
+        (
+            503,
+            "application/json",
+            super::http_client_tests::edge_detailed_health("draining", "database", false)
+                .as_bytes(),
+        ),
+        (
+            200,
+            "application/json",
+            br#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+        ),
+    ]);
     let client = stub_client_with_retries(url, 3);
 
     let planned_actuals = empty_actuals(&["ferrum"]);

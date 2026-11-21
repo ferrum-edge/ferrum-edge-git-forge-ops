@@ -2399,7 +2399,71 @@ fn loopback_backup_bypasses_environment_proxies() {
 /// ready (abridged where the detailed tier carries more).
 const NOT_READY_MINIMAL: &str = r#"{"status":"starting","ready":false}"#;
 const NOT_READY_TENANT: &str = r#"{"status":"draining","ready":false,"mode":"database","admin_writes_enabled":false,"namespace":{"active":"team-alpha","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#;
-const NOT_READY_DETAILED: &str = r#"{"status":"unavailable","ready":false,"timestamp":"2026-11-21T00:00:00.123456+00:00","mode":"cp","admin_writes_enabled":true,"namespace":{"active":null,"serving_scope":"control-plane","data_plane_single_namespace":false},"cached_config":{"available":true},"jwks_trust":{"fresh":0,"grace":0,"expired":0}}"#;
+/// A complete detailed-tier `/health` document as both Edge v0.9.20 and
+/// `origin/main` build it for a not-ready gateway: the handler's always-present
+/// fields (`timestamp`, `mode`, `admin_writes_enabled`, `fips`, `namespace`,
+/// `cached_config`), the namespace block its builder derives from `mode`, and
+/// the database block of a database-backed mode. Optional diagnostics vary by
+/// deployment; `jwks_trust` stands in for them.
+pub(super) fn edge_detailed_health(
+    status: &str,
+    mode: &str,
+    admin_writes_enabled: bool,
+) -> &'static str {
+    use serde_json::json;
+    let namespace = match mode {
+        "cp" => {
+            json!({"active": null, "serving_scope": "control-plane", "data_plane_single_namespace": false})
+        }
+        "node_agent" => {
+            json!({"active": null, "serving_scope": "no-data-plane", "data_plane_single_namespace": false})
+        }
+        _ => {
+            json!({"active": "ferrum", "serving_scope": "single-namespace-data-plane", "data_plane_single_namespace": true})
+        }
+    };
+    let mut document = json!({
+        "status": status,
+        "ready": false,
+        "timestamp": "2026-11-21T00:00:00.123456+00:00",
+        "mode": mode,
+        "admin_writes_enabled": admin_writes_enabled,
+        "fips": {
+            "mode": "off",
+            "enforcing": false,
+            "build_capable": false,
+            "build_profile": "crypto-ring",
+            "provider": "ring",
+            "module_self_test_passed": false,
+            "provider_algorithms_approved": false,
+            "certified": false,
+            "boundary_documentation": "docs/fips.md"
+        },
+        "namespace": namespace,
+        "cached_config": {
+            "available": true,
+            "loaded_at": "2026-11-20T23:59:00+00:00",
+            "proxy_count": 3,
+            "consumer_count": 2
+        },
+        "jwks_trust": {
+            "fresh": 0,
+            "grace": 0,
+            "expired": 0,
+            "max_age_seconds": {"fresh": null, "grace": null, "expired": null}
+        }
+    });
+    if matches!(mode, "database" | "cp") {
+        document["database"] = json!({"status": "connected", "type": "postgres"});
+    }
+    Box::leak(document.to_string().into_boxed_str())
+}
+
+/// [`edge_detailed_health`] for an unavailable control plane that accepts
+/// writes.
+fn not_ready_detailed() -> &'static str {
+    edge_detailed_health("unavailable", "cp", true)
+}
 
 /// The media type Edge serves `/health` with.
 const JSON: Option<&str> = Some("application/json");
@@ -2417,7 +2481,7 @@ fn every_documented_not_ready_health_document_is_recognized() {
     let tenant = parse_not_ready_health(JSON, NOT_READY_TENANT).expect("tenant tier");
     assert_eq!(tenant.admin_writes_enabled, Some(false));
     assert_eq!(tenant.mode.as_deref(), Some("database"));
-    let detailed = parse_not_ready_health(JSON, NOT_READY_DETAILED).expect("detailed tier");
+    let detailed = parse_not_ready_health(JSON, not_ready_detailed()).expect("detailed tier");
     assert_eq!(detailed.admin_writes_enabled, Some(true));
     assert!(parse_not_ready_health(JSON, NOT_READY_MINIMAL).is_some());
     // Media-type parameters and case do not matter.
@@ -2498,7 +2562,7 @@ fn each_documented_tier_field_is_validated() {
         move |value: &mut serde_json::Value| value["namespace"][key] = to
     };
 
-    for document in [NOT_READY_DETAILED, NOT_READY_TENANT] {
+    for document in [not_ready_detailed(), NOT_READY_TENANT] {
         assert!(recognized_after(document, |_| {}), "{document}");
         // `mode` and `admin_writes_enabled`: present, typed, never null.
         assert!(!recognized_after(document, set("mode", json!(null))));
@@ -2545,30 +2609,78 @@ fn each_documented_tier_field_is_validated() {
         ));
     }
 
-    // Scope relationships, per tier.
+    // `serving_scope` follows `mode`, as Edge's builder derives it.
     let control_plane = json!({"active": null, "serving_scope": "control-plane", "data_plane_single_namespace": false});
+    let no_data_plane = json!({"active": null, "serving_scope": "no-data-plane", "data_plane_single_namespace": false});
     let single = |active: serde_json::Value| json!({"active": active, "serving_scope": "single-namespace-data-plane", "data_plane_single_namespace": true});
-    for document in [NOT_READY_DETAILED, NOT_READY_TENANT] {
+    let with = |mode: &'static str, block: serde_json::Value| {
+        move |value: &mut serde_json::Value| {
+            value["mode"] = json!(mode);
+            value["namespace"] = block;
+        }
+    };
+    for document in [not_ready_detailed(), NOT_READY_TENANT] {
+        // Paired cases: each mode with its own scope is recognized, and the
+        // same mode with another mode's scope is not.
         assert!(recognized_after(
             document,
-            set("namespace", control_plane.clone())
+            with("cp", control_plane.clone())
         ));
-        assert!(recognized_after(
-            document,
-            set("namespace", single(json!("ferrum")))
-        ));
-        // A control plane routes no namespace and is not single-namespace.
         assert!(!recognized_after(
             document,
-            set(
-                "namespace",
+            with("cp", single(json!("ferrum")))
+        ));
+        assert!(!recognized_after(
+            document,
+            with("cp", no_data_plane.clone())
+        ));
+        assert!(recognized_after(
+            document,
+            with("node_agent", no_data_plane.clone())
+        ));
+        assert!(!recognized_after(
+            document,
+            with("node_agent", control_plane.clone())
+        ));
+        assert!(!recognized_after(
+            document,
+            with("node_agent", single(json!("ferrum")))
+        ));
+        for mode in ["database", "file", "dp", "mesh"] {
+            assert!(
+                recognized_after(document, with(mode, single(json!("ferrum")))),
+                "{mode}"
+            );
+            assert!(
+                !recognized_after(document, with(mode, control_plane.clone())),
+                "{mode}"
+            );
+            assert!(
+                !recognized_after(document, with(mode, no_data_plane.clone())),
+                "{mode}"
+            );
+        }
+        // A mode Edge does not have has no scope to match.
+        assert!(!recognized_after(
+            document,
+            with("gateway", control_plane.clone())
+        ));
+        assert!(!recognized_after(
+            document,
+            with("CP", control_plane.clone())
+        ));
+        // Within the right scope, the block must still agree with itself.
+        assert!(!recognized_after(
+            document,
+            with(
+                "cp",
                 json!({"active": "ferrum", "serving_scope": "control-plane", "data_plane_single_namespace": false})
             )
         ));
         assert!(!recognized_after(
             document,
-            set(
-                "namespace",
+            with(
+                "node_agent",
                 json!({"active": null, "serving_scope": "no-data-plane", "data_plane_single_namespace": true})
             )
         ));
@@ -2577,16 +2689,69 @@ fn each_documented_tier_field_is_validated() {
     // not admit; the detailed tier always names it.
     assert!(recognized_after(
         NOT_READY_TENANT,
-        set("namespace", single(json!(null)))
+        with("dp", single(json!(null)))
     ));
     assert!(!recognized_after(
-        NOT_READY_DETAILED,
-        set("namespace", single(json!(null)))
+        not_ready_detailed(),
+        with("dp", single(json!(null)))
+    ));
+
+    // The detailed tier's always-present `fips` and `cached_config`, with
+    // their documented types. Other diagnostics are not inspected.
+    let fips = |key: &'static str, to: serde_json::Value| {
+        move |value: &mut serde_json::Value| value["fips"][key] = to
+    };
+    let cached = |key: &'static str, to: serde_json::Value| {
+        move |value: &mut serde_json::Value| value["cached_config"][key] = to
+    };
+    let detailed = not_ready_detailed();
+    assert!(!recognized_after(detailed, remove("fips")));
+    assert!(!recognized_after(detailed, set("fips", json!("off"))));
+    assert!(!recognized_after(detailed, fips("certified", json!(true))));
+    assert!(!recognized_after(detailed, fips("enforcing", json!("no"))));
+    assert!(!recognized_after(detailed, fips("provider", json!(null))));
+    assert!(!recognized_after(detailed, |value| {
+        value["fips"].as_object_mut().unwrap().remove("mode");
+    }));
+    assert!(!recognized_after(detailed, remove("cached_config")));
+    assert!(!recognized_after(
+        detailed,
+        set("cached_config", json!(true))
+    ));
+    assert!(!recognized_after(
+        detailed,
+        cached("available", json!("unknown"))
+    ));
+    assert!(!recognized_after(detailed, |value| {
+        value["cached_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("available");
+    }));
+    assert!(!recognized_after(
+        detailed,
+        cached("proxy_count", json!(-1))
+    ));
+    assert!(!recognized_after(
+        detailed,
+        cached("consumer_count", json!("2"))
+    ));
+    assert!(!recognized_after(
+        detailed,
+        cached("loaded_at", json!("yesterday"))
+    ));
+    assert!(recognized_after(
+        detailed,
+        set("cached_config", json!({"available": false}))
+    ));
+    assert!(recognized_after(
+        detailed,
+        set("listener_failures", json!({"failures_total": 1}))
     ));
 
     // The detailed tier's RFC 3339 timestamp.
     assert!(recognized_after(
-        NOT_READY_DETAILED,
+        not_ready_detailed(),
         set("timestamp", json!("2026-11-21T00:00:00Z"))
     ));
     for stamp in [
@@ -2597,11 +2762,11 @@ fn each_documented_tier_field_is_validated() {
         json!(null),
     ] {
         assert!(
-            !recognized_after(NOT_READY_DETAILED, set("timestamp", stamp.clone())),
+            !recognized_after(not_ready_detailed(), set("timestamp", stamp.clone())),
             "{stamp}"
         );
     }
-    assert!(!recognized_after(NOT_READY_DETAILED, remove("timestamp")));
+    assert!(!recognized_after(not_ready_detailed(), remove("timestamp")));
     // The tenant tier has exactly five keys.
     assert!(!recognized_after(
         NOT_READY_TENANT,
@@ -2613,7 +2778,7 @@ fn each_documented_tier_field_is_validated() {
 async fn probe_health_keeps_a_not_ready_answer_and_get_health_refuses_it() {
     // Unavailable, writes enabled: the probe sees the gateway; a caller that
     // needs a ready gateway gets a 503 error naming the state.
-    let url = spawn_stub_gateway(vec![("GET /health", 503, NOT_READY_DETAILED)]);
+    let url = spawn_stub_gateway(vec![("GET /health", 503, not_ready_detailed())]);
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
     let probe = client.probe_health().await.expect("Edge's document");
     assert!(!probe.is_ready());
@@ -2728,11 +2893,18 @@ pub(super) fn spawn_scripted_health(
 
 #[tokio::test]
 async fn a_recognized_not_ready_document_is_not_retried_away() {
-    // A draining read-only gateway answers once and then closes its listener.
-    // With retries enabled, the refusal from the first answer must survive:
-    // a retry would only meet a refused connection.
-    let (url, served) =
-        spawn_scripted_health(vec![(503, "application/json", NOT_READY_TENANT.as_bytes())]);
+    // A draining read-only gateway's answer is final: with retries enabled it
+    // is requested once, and its refusal is what the caller sees.
+    // A second, ready and writable answer would change the result if it
+    // were ever requested.
+    let (url, served) = spawn_scripted_health(vec![
+        (503, "application/json", NOT_READY_TENANT.as_bytes()),
+        (
+            200,
+            "application/json",
+            br#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+        ),
+    ]);
     let mut env = stub_env(url);
     env.gateway_max_retries = 3;
     let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
@@ -2841,13 +3013,37 @@ async fn a_later_connection_failure_does_not_erase_an_http_answer() {
 
 #[tokio::test]
 async fn a_health_body_that_is_not_utf8_is_not_recognized() {
-    // An invalid byte inside a diagnostic string would decode lossily into a
-    // valid document; the raw bytes decide.
-    let mut body = br#"{"status":"unavailable","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"cp","admin_writes_enabled":false,"namespace":{"active":null,"serving_scope":"control-plane","data_plane_single_namespace":false},"logging":{"detail":"x"#.to_vec();
-    body.push(0xff);
-    body.extend_from_slice(br#""}}"#);
-    let body: &'static [u8] = Box::leak(body.into_boxed_slice());
-    let (url, _) = spawn_scripted_health(vec![(503, "application/json", body)]);
+    // A complete document with a correctly encoded U+FFFD in a diagnostic
+    // string: valid UTF-8, and Edge may send one in a sanitized detail.
+    let mut document: serde_json::Value =
+        serde_json::from_str(edge_detailed_health("unavailable", "cp", false)).unwrap();
+    document["logging"] = serde_json::json!({"detail": "x\u{FFFD}"});
+    let encoded = document.to_string();
+    assert!(
+        encoded.contains('\u{FFFD}'),
+        "serde_json keeps it unescaped"
+    );
+    let encoded: &'static str = Box::leak(encoded.into_boxed_str());
+    let (url, _) = spawn_scripted_health(vec![(503, "application/json", encoded.as_bytes())]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let probe = client.probe_health().await.expect("valid UTF-8 document");
+    assert_eq!(probe.health.admin_writes_enabled, Some(false));
+
+    // The same document with a raw invalid byte where the U+FFFD was: lossy
+    // decoding would turn it back into the document above, so the raw bytes
+    // decide.
+    let invalid = encoded
+        .as_bytes()
+        .windows(3)
+        .position(|bytes| bytes == "\u{FFFD}".as_bytes())
+        .map(|at| {
+            let mut bytes = encoded.as_bytes().to_vec();
+            bytes.splice(at..at + 3, [0xff]);
+            bytes
+        })
+        .expect("the encoded replacement character");
+    let invalid: &'static [u8] = Box::leak(invalid.into_boxed_slice());
+    let (url, _) = spawn_scripted_health(vec![(503, "application/json", invalid)]);
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
     let error = client.probe_health().await.unwrap_err();
     assert!(
@@ -2857,14 +3053,6 @@ async fn a_health_body_that_is_not_utf8_is_not_recognized() {
         ),
         "{error:?}"
     );
-
-    // A correctly encoded U+FFFD is valid UTF-8, and Edge may send one in a
-    // sanitized diagnostic.
-    let encoded = "{\"status\":\"unavailable\",\"ready\":false,\"timestamp\":\"2026-11-21T00:00:00Z\",\"mode\":\"cp\",\"admin_writes_enabled\":false,\"namespace\":{\"active\":null,\"serving_scope\":\"control-plane\",\"data_plane_single_namespace\":false},\"logging\":{\"detail\":\"x\u{FFFD}\"}}";
-    let (url, _) = spawn_scripted_health(vec![(503, "application/json", encoded.as_bytes())]);
-    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
-    let probe = client.probe_health().await.expect("valid UTF-8 document");
-    assert_eq!(probe.health.admin_writes_enabled, Some(false));
 }
 
 #[tokio::test]
@@ -2905,4 +3093,55 @@ async fn unclassified_mutation_403_is_upgraded_via_a_read_only_health_refusal() 
         matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+async fn a_complete_document_with_a_malformed_diagnostic_is_an_http_error() {
+    let mut document: serde_json::Value =
+        serde_json::from_str(edge_detailed_health("unavailable", "database", false)).unwrap();
+    document["cached_config"]["available"] = serde_json::json!("unknown");
+    let body: &'static str = Box::leak(document.to_string().into_boxed_str());
+    let url = spawn_stub_gateway(vec![("GET /health", 503, body)]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn the_preflight_warns_that_a_writable_gateway_is_not_ready() {
+    use gitforgeops::http_client::{
+        health_preflight_warnings, parse_not_ready_health, HealthProbe,
+    };
+    let not_ready = HealthProbe {
+        http_status: 503,
+        health: parse_not_ready_health(JSON, edge_detailed_health("starting", "database", true))
+            .expect("Edge's document"),
+    };
+    let warnings = health_preflight_warnings(&not_ready, false);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("not ready (status=starting, ready=false, HTTP 503)"),
+        "{warnings:?}"
+    );
+    // The minimal tier adds the unknown-write-state warning.
+    let minimal = HealthProbe {
+        http_status: 503,
+        health: parse_not_ready_health(JSON, NOT_READY_MINIMAL).expect("minimal tier"),
+    };
+    assert_eq!(health_preflight_warnings(&minimal, false).len(), 2);
+    // A ready, writable gateway warns about nothing.
+    let ready = HealthProbe {
+        http_status: 200,
+        health: serde_json::from_str::<HealthStatus>(
+            r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+        )
+        .unwrap(),
+    };
+    assert!(health_preflight_warnings(&ready, false).is_empty());
 }
