@@ -2147,8 +2147,12 @@ fn ws_logging_endpoint_stand_in_is_a_websocket_url() {
 fn aws_endpoint_stand_in_is_an_origin_and_function_url_keeps_its_path() {
     use gitforgeops::validate::VALIDATION_STANDIN_HOST;
 
+    // The row carries its own (brokered) key pair, so the endpoint is not
+    // scoped to official AWS hosts.
     let config = serde_json::json!({
         "provider": "aws_lambda",
+        "aws_access_key_id": BROKERED,
+        "aws_secret_access_key": BROKERED,
         "aws_endpoint_url": BROKERED,
         "function_url": BROKERED
     });
@@ -2168,6 +2172,76 @@ fn aws_endpoint_stand_in_is_an_origin_and_function_url_keeps_its_path() {
         function.len(),
         format!("https://{VALIDATION_STANDIN_HOST}/").len() + 64
     );
+}
+
+/// A Lambda row that signs with ambient AWS credentials may only send them to
+/// an official regional endpoint, and Edge's shape-only admission refuses any
+/// other `aws_endpoint_url`, so no `.invalid` stand-in can pass. The
+/// unresolved override is left out of the validator copy instead, keeping the
+/// region and credential mode; a row with its own key pair, or that opts out
+/// of the scope, still gets the origin stand-in.
+#[test]
+fn an_ambient_credential_lambda_endpoint_is_omitted_rather_than_stood_in() {
+    let lambda = |extra: serde_json::Value| {
+        let mut config = serde_json::json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": BROKERED
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        let gateway = plugin_config_for("lambda", "serverless_function", config);
+        gitforgeops::validate::with_validation_standins(&gateway)
+            .map(|patched| patched.plugin_configs[0].config.clone())
+    };
+
+    for ambient in [
+        serde_json::json!({"aws_credentials": "default_chain"}),
+        serde_json::json!({}),
+        serde_json::json!({"aws_credentials": "static", "aws_access_key_id": "AKIATEST"}),
+        serde_json::json!({"aws_secret_access_key": BROKERED}),
+    ] {
+        let patched = lambda(ambient.clone()).expect("the copy changed");
+        assert!(patched.get("aws_endpoint_url").is_none(), "{ambient}");
+        assert_eq!(patched["aws_region"], "us-east-1", "{ambient}");
+        assert_eq!(
+            patched.get("aws_credentials"),
+            ambient.get("aws_credentials"),
+            "{ambient}"
+        );
+    }
+
+    for scoped_out in [
+        serde_json::json!({"aws_access_key_id": "AKIATEST", "aws_secret_access_key": BROKERED}),
+        serde_json::json!({
+            "aws_credentials": "default_chain",
+            "allow_custom_endpoint_with_ambient_credentials": true
+        }),
+    ] {
+        let patched = lambda(scoped_out.clone()).expect("the copy changed");
+        let endpoint = patched["aws_endpoint_url"].as_str().expect("a stand-in");
+        assert_eq!(
+            url::Url::parse(endpoint).unwrap().path(),
+            "/",
+            "{scoped_out}"
+        );
+    }
+
+    // A resolved endpoint is validated exactly as configured.
+    let gateway = plugin_config_for(
+        "lambda",
+        "serverless_function",
+        serde_json::json!({
+            "provider": "aws_lambda",
+            "aws_credentials": "default_chain",
+            "aws_region": "us-east-1",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": "https://lambda-fips.us-east-1.amazonaws.com"
+        }),
+    );
+    assert!(gitforgeops::validate::with_validation_standins(&gateway).is_none());
 }
 
 /// A `google_gemini` provider routes the model only through its endpoint, so
@@ -2215,7 +2289,7 @@ fn pem_key_kind(pem: &str) -> KeyKind {
     let body = pem
         .strip_prefix("-----BEGIN PRIVATE KEY-----\n")
         .and_then(|rest| rest.strip_suffix("-----END PRIVATE KEY-----\n"))
-        .unwrap_or_else(|| panic!("not a PKCS#8 PRIVATE KEY PEM: {pem}"));
+        .expect("PKCS#8 PRIVATE KEY armour");
     let der = base64::engine::general_purpose::STANDARD
         .decode(body.replace('\n', ""))
         .expect("base64 body");
@@ -2305,9 +2379,10 @@ fn private_key_jwt_stand_ins_are_keys_of_the_selected_algorithm_family() {
     // byte as the gateway's own YAML reader sees it.
     let rendered = gitforgeops::yaml::to_string(&patched).unwrap();
     let reread: serde_json::Value = serde_yaml::from_str(&rendered).unwrap();
-    assert_eq!(
-        reread["plugin_configs"][0]["config"]["providers"][0]["client_auth"]["private_key_pem"],
-        serde_json::json!(leaf(0, "private_key_pem"))
+    assert!(
+        reread["plugin_configs"][0]["config"]["providers"][0]["client_auth"]["private_key_pem"]
+            == serde_json::json!(leaf(0, "private_key_pem")),
+        "the key changed through the YAML rendering"
     );
     // Never applied to the caller's document.
     assert_eq!(
@@ -2318,11 +2393,15 @@ fn private_key_jwt_stand_ins_are_keys_of_the_selected_algorithm_family() {
 
 /// The key stand-in reaches the validator through the 0600 temp spec intact,
 /// and, like every stand-in, it is not a scrubber value: a multi-line PEM
-/// registered there would withhold every diagnostic, but the scrubber is
-/// built from the placeholder document, so diagnostics stay readable.
+/// registered there would withhold every diagnostic. A wrapper that echoes
+/// the key from its input still never puts it in the report: its body is
+/// masked on its own, and the ordinary diagnostic beside it stays readable.
+/// (The echo is limited to the key's line: the literal `private_key_jwt_alg`
+/// beside it is a short heuristic secret, which withholds any output that
+/// repeats it.)
 #[cfg(unix)]
 #[test]
-fn a_private_key_stand_in_reaches_the_validator_without_withholding_output() {
+fn a_private_key_stand_in_is_masked_in_echoed_output_without_withholding_it() {
     let config = plugin_config_for(
         "introspect",
         "oauth2_introspection",
@@ -2342,6 +2421,8 @@ mode=$(stat -c %a "$7" 2>/dev/null || stat -f %Lp "$7")
 [ "$mode" = 600 ] || { echo "error: spec mode $mode" >&2; exit 1; }
 grep -q 'BEGIN PRIVATE KEY' "$7" || { echo 'error: private_key_pem is invalid EC PEM' >&2; exit 1; }
 if grep -q 'gh-env-secret' "$7"; then echo 'error: placeholder reached the validator' >&2; exit 1; fi
+grep 'private_key_pem' "$7"
+sed -n 's/.*private_key_pem: //p' "$7" | sed 's/\\n/\n/g' >&2
 echo 'error: proxy httpbin: unknown field `listen_path_typo`' >&2
 exit 1
 "#,
@@ -2352,8 +2433,29 @@ exit 1
     assert!(!result.success);
     assert!(
         result.stderr.contains("unknown field `listen_path_typo`"),
-        "the diagnostic must not be withheld: {}",
-        result.stderr
+        "the diagnostic must not be withheld"
     );
-    assert!(!result.stderr.contains("withheld"), "{}", result.stderr);
+    assert!(!result.stderr.contains("withheld"), "output was withheld");
+    let output = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        output.contains("[VALIDATION-STANDIN-KEY]"),
+        "no key was masked"
+    );
+    assert!(output.contains("BEGIN PRIVATE KEY"), "the echo did not run");
+    // Every 64-character base64 line of the key was masked in both the
+    // quoted YAML line and the unescaped PEM.
+    let unmasked_key_line = output.lines().any(|line| {
+        line.trim_matches(|c: char| c == '"' || c.is_whitespace())
+            .len()
+            == 64
+            && line
+                .trim()
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    });
+    assert!(!unmasked_key_line, "a key body line reached the report");
+    assert!(
+        !output.contains("MIG") && !output.contains("MII"),
+        "a DER prefix reached the report"
+    );
 }

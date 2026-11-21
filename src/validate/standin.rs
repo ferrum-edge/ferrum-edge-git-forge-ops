@@ -122,6 +122,9 @@ const HOST_LABEL_HEX: usize = 32;
 ///   `/{model}`, the routing placeholder a `google_gemini` provider endpoint
 ///   must carry and every other provider type accepts.
 fn shaped_url_standin(slot: &str, scheme: &str, form: EndpointForm) -> String {
+    if form == EndpointForm::DigestPath {
+        return validation_url_standin(slot, scheme);
+    }
     let digest = slot_digest(slot);
     let label = digest.get(..HOST_LABEL_HEX).unwrap_or(&digest);
     match form {
@@ -160,7 +163,8 @@ fn slot_digest(slot: &str) -> String {
 ///   (`shaped_url_standin`), a `private_key_jwt` key gets a throwaway key of
 ///   the sibling `private_key_jwt_alg`'s family
 ///   (`validate::client_key_standin`), and everything else gets the
-///   opaque token form. Header maps are
+///   opaque token form. One leaf is omitted instead: an ambient-credential
+///   Lambda `aws_endpoint_url`, which only an official AWS host can satisfy. Header maps are
 ///   rewritten value-side only, so `headers.x-honeycomb-team` keeps its key
 ///   and a plugin that validates required header *names* still sees them.
 ///
@@ -251,12 +255,61 @@ pub(crate) fn with_validation_standins_for_report(
             ),
             client_keys,
         };
+        let omit_lambda_endpoint = omits_ambient_lambda_endpoint(plugin_name, &plugin.config)
+            && eligible(&crate::secrets::resolver::plugin_config_slot(
+                &plugin.namespace,
+                &plugin.id,
+                plugin_name,
+                &[ConfigPathComponent::Key(AWS_ENDPOINT_URL.to_string())],
+            ));
         let mut config = std::mem::take(&mut plugin.config);
         changed |= context.substitute(&mut config, &mut Vec::new(), &eligible);
+        if omit_lambda_endpoint {
+            if let Some(object) = config.as_object_mut() {
+                changed |= object.remove(AWS_ENDPOINT_URL).is_some();
+            }
+        }
         plugin.config = config;
     }
 
     changed.then_some(patched)
+}
+
+/// `serverless_function`'s Lambda endpoint override.
+const AWS_ENDPOINT_URL: &str = "aws_endpoint_url";
+
+/// Whether an unresolved `serverless_function` `aws_endpoint_url` must be
+/// left out of the validator copy rather than stood in for.
+///
+/// A row that signs with ambient AWS credentials (`aws_credentials:
+/// default_chain`, or `static` with either half of the key pair left to the
+/// environment) may only send them to an official Lambda endpoint of its
+/// region: Edge's shape-only admission
+/// (`screen_shape_only_ambient_lambda_config`, v0.9.20 and later) refuses any
+/// other `aws_endpoint_url` unless `allow_custom_endpoint_with_ambient_credentials`
+/// is `true`. No `.invalid` stand-in can pass that check, and imitating an AWS
+/// host would give up the stand-in's fail-closed property, so the override is
+/// omitted and Edge validates the row against its default regional endpoint,
+/// keeping the region and credential-mode checks. A resolved endpoint is
+/// never touched: it is validated exactly as configured.
+fn omits_ambient_lambda_endpoint(plugin_name: &str, config: &serde_json::Value) -> bool {
+    if plugin_name != "serverless_function" {
+        return false;
+    }
+    let text = |field: &str| config.get(field).and_then(serde_json::Value::as_str);
+    let present = |field: &str| text(field).is_some_and(|value| !value.is_empty());
+    let ambient = match text("aws_credentials") {
+        Some("default_chain") => true,
+        None | Some("static") => !present("aws_access_key_id") || !present("aws_secret_access_key"),
+        // Edge refuses any other spelling outright.
+        Some(_) => false,
+    };
+    text("provider") == Some("aws_lambda")
+        && ambient
+        && config.get("allow_custom_endpoint_with_ambient_credentials")
+            != Some(&serde_json::Value::Bool(true))
+        && text(AWS_ENDPOINT_URL)
+            .is_some_and(|value| matches!(parse_placeholder(value), Some(Ok(_))))
 }
 
 /// The `private_key_jwt_alg` beside a client-assertion key, when it is a

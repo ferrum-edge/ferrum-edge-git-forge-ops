@@ -728,8 +728,7 @@ fn brokered_standin_cases() -> Vec<(&'static str, serde_json::Value)> {
         (
             "rate_limiting",
             serde_json::json!({
-                "window_seconds": 60,
-                "max_requests": 1,
+                "limits": [{"scope": "default", "requests_per_minute": 10}],
                 "sync_mode": "redis",
                 "redis_url": BROKERED
             }),
@@ -768,10 +767,43 @@ fn brokered_standin_cases() -> Vec<(&'static str, serde_json::Value)> {
             }),
         ),
     ];
+    // Ambient AWS credentials: the unresolved override is omitted, so Edge
+    // validates the row against its default regional endpoint.
+    for credentials in [
+        serde_json::json!({"aws_credentials": "default_chain"}),
+        serde_json::json!({"aws_credentials": "static"}),
+    ] {
+        let mut config = serde_json::json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": BROKERED
+        });
+        config["aws_credentials"] = credentials["aws_credentials"].clone();
+        cases.push(("serverless_function", config));
+    }
+    cases.push((
+        "ai_stream_router",
+        serde_json::json!({"providers": [{
+            "name": "gemini",
+            "provider_type": "google_gemini",
+            "endpoint": BROKERED,
+            "api_key": BROKERED,
+            "model_patterns": ["gemini-*"]
+        }]}),
+    ));
     for alg in ["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"] {
         cases.push(("oauth2_introspection", introspection(alg)));
         cases.push(("oidc_relying_party", relying_party(alg)));
     }
+    // Every brokered OIDC field at once: the session secret and the provider
+    // endpoints share the stand-in host, the key follows its algorithm.
+    let mut brokered = relying_party("ES256");
+    for field in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        brokered["providers"][0][field] = serde_json::json!(BROKERED);
+    }
+    brokered["session"]["encryption_secret"] = serde_json::json!(BROKERED);
+    cases.push(("oidc_relying_party", brokered));
     cases
 }
 

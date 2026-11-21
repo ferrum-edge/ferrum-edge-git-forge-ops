@@ -418,7 +418,16 @@ for the run (RSA 2048 for `RS256`/`RS384`/`RS512` and when the algorithm is
 unset or unsupported, P-256 for `ES256`, P-384 for `ES384`, Ed25519 for
 `EdDSA`), held only in memory and in the temporary validation file. It is the
 only stand-in that differs between runs. Stand-ins are not secrets and are not
-scrubbed from validator output.
+scrubbed from validator output, but a generated key's body is masked there as
+`[VALIDATION-STANDIN-KEY]` in case a wrapper around the validator echoes it.
+
+A Lambda row that signs with ambient AWS credentials (`aws_credentials:
+default_chain`, or either key left to the environment) may only use an
+official regional endpoint, which no stand-in can be. Unless
+`allow_custom_endpoint_with_ambient_credentials` is `true`, its unresolved
+`aws_endpoint_url` is left out of the temporary file, so the gateway checks
+the row against its default endpoint; the real endpoint is checked when it is
+resolved.
 
 Resolved values are always validated unchanged. Stand-ins are never exported,
 applied, delivered or stored.

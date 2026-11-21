@@ -15,7 +15,10 @@
 //! Edge's own admission probe. It is also not a scrubber value, like every
 //! other stand-in: the scrubber is built from the placeholder document, and a
 //! multi-line PEM registered there would withhold every validator diagnostic
-//! (see [`crate::secrets::is_reencoding_hazard`]).
+//! (see [`crate::secrets::is_reencoding_hazard`]). Edge's key diagnostics never
+//! quote the key, but a wrapper around the validator could echo its input, so
+//! [`mask_generated_keys`] masks every generated key body in the captured
+//! output separately, without withholding anything.
 //!
 //! Unlike the other stand-ins it is not deterministic across runs: AWS-LC
 //! cannot derive an RSA key from a seed, and Edge never reports a key back, so
@@ -81,15 +84,55 @@ impl ClientKeyFamily {
 /// entropy source); the caller then falls back to the opaque token stand-in,
 /// which Edge reports as malformed PEM, exactly as before keys were generated.
 pub(crate) fn client_assertion_key_pem(family: ClientKeyFamily) -> Option<&'static str> {
-    static KEYS: [OnceLock<Option<String>>; 4] = [
-        OnceLock::new(),
-        OnceLock::new(),
-        OnceLock::new(),
-        OnceLock::new(),
-    ];
     KEYS[family.index()]
         .get_or_init(|| generate_pkcs8(family).map(|der| pem_private_key(&der)))
         .as_deref()
+}
+
+/// One generated key per [`ClientKeyFamily`], in [`ClientKeyFamily::index`]
+/// order.
+static KEYS: [OnceLock<Option<String>>; 4] = [
+    OnceLock::new(),
+    OnceLock::new(),
+    OnceLock::new(),
+    OnceLock::new(),
+];
+
+/// Text that replaces a generated key's body in captured validator output.
+pub(crate) const GENERATED_KEY_MASK: &str = "[VALIDATION-STANDIN-KEY]";
+
+/// Shortest PEM body line masked on its own. A key's last base64 line can be
+/// a few characters long (`AA==`), short enough to occur in ordinary text;
+/// every other line is the full 64 characters.
+const MIN_MASKED_LINE: usize = 16;
+
+/// `text` with the body of every key this process generated masked.
+///
+/// The temp spec renders a key as one quoted YAML line with `\n` escapes; a
+/// wrapper echoing that line, the PEM itself, a block scalar or JSON keeps the
+/// same 64-character base64 lines. So the contiguous body (a re-encoding that
+/// dropped the line breaks) is masked first, then each body line. Families
+/// never generated cost nothing.
+pub(crate) fn mask_generated_keys(text: &str) -> String {
+    let mut masked = text.to_string();
+    for pem in KEYS.iter().filter_map(|key| key.get()?.as_deref()) {
+        let lines: Vec<&str> = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let needles = std::iter::once(lines.concat()).chain(
+            lines
+                .iter()
+                .filter(|line| line.len() >= MIN_MASKED_LINE)
+                .map(|line| line.to_string()),
+        );
+        for needle in needles {
+            if masked.contains(&needle) {
+                masked = masked.replace(&needle, GENERATED_KEY_MASK);
+            }
+        }
+    }
+    masked
 }
 
 /// PKCS#8 v1 DER for a fresh key. v1 everywhere: `jsonwebtoken`'s PEM reader
@@ -159,15 +202,51 @@ mod tests {
             first,
             client_assertion_key_pem(ClientKeyFamily::P256).expect("cached key")
         ));
-        assert_ne!(
-            first,
-            client_assertion_key_pem(ClientKeyFamily::Ed25519).expect("Ed25519 key")
+        assert!(
+            first != client_assertion_key_pem(ClientKeyFamily::Ed25519).expect("Ed25519 key"),
+            "two families share a key"
         );
+        // Failure messages name the check, never the key.
         assert!(
             first.starts_with("-----BEGIN PRIVATE KEY-----\n"),
-            "{first}"
+            "missing BEGIN armour"
         );
-        assert!(first.ends_with("\n-----END PRIVATE KEY-----\n"), "{first}");
-        assert!(first.lines().all(|line| line.len() <= 64), "{first}");
+        assert!(
+            first.ends_with("\n-----END PRIVATE KEY-----\n"),
+            "missing END armour"
+        );
+        assert!(
+            first.lines().all(|line| line.len() <= 64),
+            "a PEM line exceeds 64 characters"
+        );
+    }
+
+    #[test]
+    fn generated_key_bodies_are_masked_in_every_rendering() {
+        let pem = client_assertion_key_pem(ClientKeyFamily::Rsa2048).expect("RSA key");
+        let body: Vec<&str> = pem
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let renderings = [
+            format!("error: echo\n{pem}"),
+            format!("private_key_pem: \"{}\"", pem.replace('\n', "\\n")),
+            serde_json::to_string(pem).expect("JSON"),
+            format!("key: |\n  {}", pem.replace('\n', "\n  ")),
+            format!("der={}", body.concat()),
+        ];
+        for (index, rendering) in renderings.iter().enumerate() {
+            let masked = mask_generated_keys(rendering);
+            assert!(
+                body.iter()
+                    .filter(|line| line.len() >= MIN_MASKED_LINE)
+                    .all(|line| !masked.contains(line)),
+                "rendering {index} left a key line unmasked"
+            );
+            assert!(masked.contains(GENERATED_KEY_MASK), "rendering {index}");
+        }
+        // Ordinary diagnostics pass through untouched.
+        let plain = "error: proxy httpbin: unknown field `listen_path_typo`";
+        assert_eq!(mask_generated_keys(plain), plain);
     }
 }

@@ -136,9 +136,11 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         // DPoP replay protection (`jwks_auth`) and `replay_scope: "shared"`
         // nonce tracking (`hmac_auth`) read the root Redis fields through
         // Edge's shared `RedisConfig::from_plugin_config`, exactly like the
-        // rate limiters. Edge v0.9.20 and later withhold `redis_url` from
-        // `/config/export` on any plugin by name, so it is an export site
-        // here as it is for `rate_limiting`.
+        // rate limiters. Edge v0.9.20 projects `redis_url` on any plugin by
+        // name (later Edge also declares it for both plugins), fingerprinting
+        // it in `/config/export` whenever projection changes it (userinfo,
+        // query or fragment), so it is an export site here as it is for
+        // `rate_limiting`.
         "jwks_auth" => {
             let mut rules = vec![
                 endpoint(&["providers", "*", "discovery_url"]),

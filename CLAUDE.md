@@ -223,12 +223,14 @@ distinct effective resource namespace, in lexical order.
   nonzero, never as passed or skipped.
 
 **Stand-ins** (`validate::with_validation_standins`). Credential leaves that are
-*still* `${gh-env-secret:…}` placeholders after resolution get a deterministic
-fake derived from the slot path: `gitforgeops-validation-standin-<64 hex>`,
-`hmac_sha256:<64 hex>` for a `basicauth` `password_hash`, a URL on the
-`.invalid` stand-in host shaped by `endpoint_scheme` / `endpoint_form` for
-endpoint-typed plugin fields, or a throwaway per-process key for a
-`private_key_jwt` `private_key_pem` (`validate::client_key_standin`). Reason:
+*still* `${gh-env-secret:…}` placeholders after resolution get a fake value:
+deterministic in the slot path for `gitforgeops-validation-standin-<64 hex>`,
+`hmac_sha256:<64 hex>` (a `basicauth` `password_hash`) and a URL on the
+`.invalid` stand-in host shaped by `endpoint_scheme` / `endpoint_form`
+(endpoint-typed plugin fields); a throwaway per-process key, masked in
+validator output, for a `private_key_jwt` `private_key_pem`
+(`validate::client_key_standin`). An ambient-credential Lambda
+`aws_endpoint_url` is omitted instead. Reason:
 `${gh-env-secret:alloc=generate}` is 30 characters and Edge's floor for
 `jwt`/`hmac_auth` is 32, so a bundle-less fork PR would fail on the placeholder.
 
