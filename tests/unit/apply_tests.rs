@@ -2391,6 +2391,64 @@ async fn a_read_only_preflight_fails_before_any_mutation() {
     assert!(matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)));
 }
 
+#[tokio::test]
+async fn an_explicit_write_refusal_in_a_not_ready_health_document_still_fails_the_preflight() {
+    // Edge answers /health with HTTP 503 while draining, in the same document.
+    // Its explicit `admin_writes_enabled: false` is still the run-stopping
+    // verdict, not a "preflight failed; continuing" warning.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        503,
+        r#"{"status":"draining","ready":false,"mode":"database","admin_writes_enabled":false}"#,
+    )]);
+    let client = stub_client(url);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("status=draining"), "{err}");
+}
+
+#[tokio::test]
+async fn a_not_ready_gateway_that_accepts_writes_keeps_the_preflight_advisory() {
+    // Starting, writes enabled: the preflight warns and the apply proceeds;
+    // the gateway enforces its own mutation controls.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        503,
+        r#"{"status":"starting","ready":false,"mode":"database","admin_writes_enabled":true}"#,
+    )]);
+    let client = stub_client(url);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let result = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .expect("an advisory preflight does not stop the run");
+    assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+}
+
 // --- Shared-mode adoption of already-matching rows (issue #129) ---------------
 
 use gitforgeops::apply::{adoption_candidates, adoption_summary_line, AdoptionCandidate};

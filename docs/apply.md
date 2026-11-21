@@ -95,7 +95,10 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
 - **`GatewayReadOnly`.** An authenticated `GET /health` preflight runs before
   the first write. A gateway with `admin_writes_enabled: false`, or in `file`,
   `dp`, `mesh` or `node_agent` mode, fails the run once instead of producing a
-  403 per resource. An unreachable `/health` only prints a warning. So does a
+  403 per resource. Edge's not-ready answer (HTTP 503 with its health
+  document) is read the same way, so its explicit `admin_writes_enabled:
+  false` still stops the run; a not-ready gateway that accepts writes only
+  prints a warning. An unreachable `/health` only prints a warning. So does a
   minimal-tier body without `admin_writes_enabled`; `rotate` refuses that one
   (see [Namespace-scoped admin tokens](reference.md#namespace-scoped-admin-tokens)).
 - **`ApiSpecsAtRisk`** (409 with `api_specs_at_risk`) points at

@@ -239,6 +239,25 @@ tier the write state is unknown:
   remedy and proceeds, and the first refused write reports the truth.
 - `doctor --scope gateway` reports `gateway-writable` as `UNKNOWN`.
 
+While Edge is not ready it answers `/health` with HTTP 503 and the same
+tiered document, with `ready: false` and `status` set to `starting`,
+`unavailable`, `draining`, or `degraded` when a listener failure withdraws
+readiness. GitForgeOps treats that document as the gateway's answer. Any other
+503 body, including an HTML maintenance page, unrelated JSON or `status: ok`,
+is not:
+
+- `doctor --scope gateway` reports `gateway-reachable` as `PASS` and adds
+  `gateway-ready` as `FAIL` (exit `3`), because the gateway itself says it is
+  not serving. The write state and the token are still checked as on a ready
+  gateway. A 503 without Edge's document fails `gateway-reachable` with a
+  message that says something other than the gateway answered, and leaves
+  `gateway-token` `UNKNOWN`.
+- `apply`'s preflight still refuses on an explicit `admin_writes_enabled:
+  false` or a read-only mode in the 503 document. Otherwise it warns that the
+  gateway is not ready and proceeds.
+- `rotate` refuses: `GatewayReadOnly` when the document refuses writes, and an
+  error naming the not-ready status otherwise.
+
 `doctor --scope gateway` mints the token the environment's runs send: its
 `ns` claim is the namespace list `apply`, `plan`, `review` and `diff`
 reconcile. With a namespace filter that is the filter. Without one it is the

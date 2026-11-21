@@ -1280,11 +1280,25 @@ fn is_fatal(error: &crate::error::Error) -> bool {
 /// older builds and restricted deployments may not serve the authenticated
 /// projection, and failing an apply on a preflight that is itself advisory
 /// would be worse than letting the first real mutation report the truth.
+///
+/// A gateway that answers with Edge's not-ready document (HTTP 503,
+/// `ready: false`) did answer: an explicit `admin_writes_enabled: false` or a
+/// read-only mode in it still refuses the run, and otherwise the not-ready
+/// state is a warning, because Edge enforces its own mutation controls.
 async fn preflight_writes(client: &AdminClient) -> crate::error::Result<()> {
-    match client.get_health().await {
-        Ok(health) => match http_client::write_block_reason(&health) {
+    match client.probe_health().await {
+        Ok(probe) => match http_client::write_block_reason(&probe.health) {
             Some(reason) => Err(crate::error::Error::GatewayReadOnly(reason)),
             None => {
+                let health = &probe.health;
+                if !probe.is_ready() {
+                    crate::eoutln!(
+                        "Warning: admin preflight GET /health reports the gateway is not \
+                         ready ({}); continuing, and the gateway enforces its own mutation \
+                         controls.",
+                        probe.readiness()
+                    );
+                }
                 // The minimal tier: the write state is unknown. The preflight
                 // stays advisory, and the first refused write reports it.
                 if health.admin_writes_enabled.is_none() {

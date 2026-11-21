@@ -720,8 +720,8 @@ impl AdminClient {
         if !matches!(error, crate::error::Error::ApiError { status: 403, .. }) {
             return error;
         }
-        match self.get_health().await {
-            Ok(health) => match write_block_reason(&health) {
+        match self.probe_health().await {
+            Ok(probe) => match write_block_reason(&probe.health) {
                 Some(reason) => crate::error::Error::GatewayReadOnly(format!(
                     "the gateway answered 403 to a config mutation and GET /health confirms it \
                      will not accept writes: {reason} No further resources were attempted."
@@ -732,20 +732,65 @@ impl AdminClient {
         }
     }
 
-    /// Authenticated `GET /health`. Carries `mode`, `ready` and
-    /// `admin_writes_enabled` — the ahead-of-time signal for read-only mode —
-    /// when the gateway serves this token more than its minimal tier. See
-    /// [`HealthStatus`] for the tiers.
+    /// Authenticated `GET /health`, for a caller that needs a **ready**
+    /// gateway. Carries `mode`, `ready` and `admin_writes_enabled` — the
+    /// ahead-of-time signal for read-only mode — when the gateway serves this
+    /// token more than its minimal tier. See [`HealthStatus`] for the tiers.
+    ///
+    /// A gateway that answers with its not-ready document (see
+    /// [`AdminClient::probe_health`]) is an error: one that explicitly refuses
+    /// writes is [`crate::error::Error::GatewayReadOnly`], and any other is an
+    /// `ApiError` naming its 503 status.
     pub async fn get_health(&self) -> crate::error::Result<HealthStatus> {
+        let probe = self.probe_health().await?;
+        if probe.is_ready() {
+            return Ok(probe.health);
+        }
+        if let Some(reason) = write_block_reason(&probe.health) {
+            return Err(crate::error::Error::GatewayReadOnly(reason));
+        }
+        Err(crate::error::Error::ApiError {
+            status: probe.http_status,
+            message: format!(
+                "GET /health reports the gateway is not ready: {}",
+                probe.readiness()
+            ),
+        })
+    }
+
+    /// Authenticated `GET /health`, keeping a not-ready answer.
+    ///
+    /// Ferrum Edge answers `/health` with HTTP 503 and `ready: false` while it
+    /// is `starting`, `unavailable` or `draining` (or `degraded` with readiness
+    /// withdrawn), in the same tiered document a ready gateway sends with 200.
+    /// That is the gateway answering, not a transport failure, and the
+    /// document can still carry an explicit `admin_writes_enabled: false`, so
+    /// it is returned with [`HealthProbe::is_ready`] false. Only a 503 whose body
+    /// is that documented shape ([`parse_not_ready_health`]) counts: an
+    /// intermediary's maintenance page or unrelated JSON stays the
+    /// `ApiError` every other non-2xx status is.
+    pub async fn probe_health(&self) -> crate::error::Result<HealthProbe> {
         let target = self.authorized("/health")?;
         let resp = self
             .send_with_retry(RequestKind::Read, |bearer| {
                 target.request(Method::GET, bearer)
             })
             .await?;
+        if resp.status == HEALTH_NOT_READY_STATUS {
+            if let Some(health) = parse_not_ready_health(&resp.body) {
+                return Ok(HealthProbe {
+                    http_status: resp.status,
+                    health,
+                });
+            }
+        }
         self.check(&resp, RequestKind::Read)?;
-        serde_json::from_str::<HealthStatus>(&resp.body)
-            .map_err(|e| malformed_response("GET /health", &e))
+        let health = serde_json::from_str::<HealthStatus>(&resp.body)
+            .map_err(|e| malformed_response("GET /health", &e))?;
+        Ok(HealthProbe {
+            http_status: resp.status,
+            health,
+        })
     }
 
     /// Authenticated `GET /cluster`. CP/DP connection state, used for the
@@ -3299,6 +3344,69 @@ pub struct HealthStatus {
     /// `false` ⇒ config-database mutations are refused right now.
     #[serde(default)]
     pub admin_writes_enabled: Option<bool>,
+}
+
+/// The HTTP status Ferrum Edge answers `/health` with while not ready.
+const HEALTH_NOT_READY_STATUS: u16 = 503;
+
+/// The `status` values Ferrum Edge documents for a not-ready `/health`
+/// (HTTP 503, `ready: false`): `starting` before startup completes,
+/// `unavailable` after a lost listener or dependency, `draining` once the
+/// process is terminating, and `degraded` when a listener failure is
+/// configured to withdraw readiness. `ok` is never sent with 503.
+pub const NOT_READY_HEALTH_STATUSES: [&str; 4] =
+    ["starting", "unavailable", "draining", "degraded"];
+
+/// What `GET /health` answered with Ferrum Edge's health document: the
+/// document itself and the HTTP status that carried it, a 2xx when the gateway
+/// is ready or 503 when it is not.
+#[derive(Debug, Clone)]
+pub struct HealthProbe {
+    pub http_status: u16,
+    pub health: HealthStatus,
+}
+
+impl HealthProbe {
+    /// `false` for Edge's 503 not-ready document.
+    pub fn is_ready(&self) -> bool {
+        is_success_status(self.http_status)
+    }
+
+    /// `status=<status>, ready=<ready>, HTTP <code>` for display. The status
+    /// of a not-ready document is one of [`NOT_READY_HEALTH_STATUSES`]; a
+    /// ready one's is peer text and is scrubbed.
+    pub fn readiness(&self) -> String {
+        format!(
+            "status={}, ready={}, HTTP {}",
+            crate::display::peer_text(self.health.status.as_deref().unwrap_or("unknown")),
+            self.health
+                .ready
+                .map(|ready| ready.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            self.http_status,
+        )
+    }
+}
+
+/// Ferrum Edge's not-ready `/health` document, or `None` when `body` is not
+/// one.
+///
+/// Every tier (minimal, tenant, detailed) is a JSON object whose `status` is
+/// one of [`NOT_READY_HEALTH_STATUSES`] and whose `ready` is the boolean
+/// `false`; the fields this build models must also have their documented
+/// types. Anything else — HTML, plain text, `{"error": ...}`, or a JSON object
+/// that only resembles the shape — is not the gateway's health answer.
+pub fn parse_not_ready_health(body: &str) -> Option<HealthStatus> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let object = value.as_object()?;
+    let status = object.get("status")?.as_str()?;
+    if !NOT_READY_HEALTH_STATUSES.contains(&status) {
+        return None;
+    }
+    if object.get("ready")?.as_bool()? {
+        return None;
+    }
+    serde_json::from_value::<HealthStatus>(value).ok()
 }
 
 /// Reason the gateway will refuse config writes, or `None` when it accepts

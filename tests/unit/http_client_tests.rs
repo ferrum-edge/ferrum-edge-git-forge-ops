@@ -2392,3 +2392,141 @@ fn loopback_backup_bypasses_environment_proxies() {
         "a proxy must never receive loopback credentials"
     );
 }
+
+// --- Edge's not-ready /health (HTTP 503) -------------------------------------
+
+/// Ferrum Edge's three `/health` tiers as it sends them with HTTP 503 while not
+/// ready (abridged where the detailed tier carries more).
+const NOT_READY_MINIMAL: &str = r#"{"status":"starting","ready":false}"#;
+const NOT_READY_TENANT: &str = r#"{"status":"draining","ready":false,"mode":"database","admin_writes_enabled":false,"namespace":{"active":"team-alpha","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#;
+const NOT_READY_DETAILED: &str = r#"{"status":"unavailable","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"cp","admin_writes_enabled":true,"cached_config":{"available":true}}"#;
+
+#[test]
+fn every_documented_not_ready_health_document_is_recognized() {
+    use gitforgeops::http_client::{parse_not_ready_health, NOT_READY_HEALTH_STATUSES};
+    for status in NOT_READY_HEALTH_STATUSES {
+        let body = format!(r#"{{"status":"{status}","ready":false}}"#);
+        let health = parse_not_ready_health(&body).unwrap_or_else(|| panic!("{body}"));
+        assert_eq!(health.status.as_deref(), Some(status));
+        assert_eq!(health.ready, Some(false));
+        assert_eq!(health.admin_writes_enabled, None, "minimal tier");
+    }
+    let tenant = parse_not_ready_health(NOT_READY_TENANT).expect("tenant tier");
+    assert_eq!(tenant.admin_writes_enabled, Some(false));
+    assert_eq!(tenant.mode.as_deref(), Some("database"));
+    let detailed = parse_not_ready_health(NOT_READY_DETAILED).expect("detailed tier");
+    assert_eq!(detailed.admin_writes_enabled, Some(true));
+    assert!(parse_not_ready_health(NOT_READY_MINIMAL).is_some());
+}
+
+#[test]
+fn a_503_body_that_only_resembles_edges_health_document_is_not_recognized() {
+    use gitforgeops::http_client::parse_not_ready_health;
+    for body in [
+        "",
+        "<html><body>Service temporarily unavailable</body></html>",
+        "Service Unavailable",
+        r#"{"error":"upstream maintenance"}"#,
+        r#"["starting",false]"#,
+        // `ok` is never sent with 503, nor is `ready: true`.
+        r#"{"status":"ok","ready":false}"#,
+        r#"{"status":"starting","ready":true}"#,
+        // Both fields are required, with their documented types.
+        r#"{"status":"starting"}"#,
+        r#"{"ready":false}"#,
+        r#"{"status":"starting","ready":"false"}"#,
+        r#"{"status":"maintenance","ready":false}"#,
+        r#"{"status":"STARTING","ready":false}"#,
+        // A modeled field with the wrong type is not Edge's document either.
+        r#"{"status":"draining","ready":false,"admin_writes_enabled":"no"}"#,
+        r#"{"status":"draining","ready":false,"mode":7}"#,
+    ] {
+        assert!(parse_not_ready_health(body).is_none(), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn probe_health_keeps_a_not_ready_answer_and_get_health_refuses_it() {
+    // Starting, writes enabled: the probe sees the gateway; a caller that
+    // needs a ready gateway gets a 503 error naming the state.
+    let url = spawn_stub_gateway(vec![("GET /health", 503, NOT_READY_DETAILED)]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let probe = client.probe_health().await.expect("Edge's document");
+    assert!(!probe.is_ready());
+    assert_eq!(probe.http_status, 503);
+    assert_eq!(probe.health.admin_writes_enabled, Some(true));
+    let error = client.get_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("status=unavailable"), "{error}");
+
+    // An explicit `admin_writes_enabled: false` on a 503 is kept.
+    let url = spawn_stub_gateway(vec![("GET /health", 503, NOT_READY_TENANT)]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.get_health().await.unwrap_err();
+    assert!(
+        matches!(error, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("status=draining"), "{error}");
+}
+
+#[tokio::test]
+async fn probe_health_of_a_ready_gateway_is_unchanged() {
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        200,
+        r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+    )]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let probe = client.probe_health().await.expect("ready");
+    assert!(probe.is_ready());
+    assert_eq!(probe.http_status, 200);
+    let health = client.get_health().await.expect("ready");
+    assert_eq!(health.admin_writes_enabled, Some(true));
+}
+
+#[tokio::test]
+async fn an_intermediary_503_stays_an_api_error() {
+    for body in [
+        "<html>maintenance</html>",
+        r#"{"error":"maintenance window"}"#,
+        r#"{"status":"ok","ready":false}"#,
+    ] {
+        let url = spawn_stub_gateway(vec![("GET /health", 503, body)]);
+        let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+        let error = client.probe_health().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                gitforgeops::error::Error::ApiError { status: 503, .. }
+            ),
+            "{body}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unclassified_mutation_403_is_upgraded_via_a_not_ready_health_document() {
+    // The health re-check reads the explicit write flag from Edge's 503
+    // document too, so a draining read-only plane still stops the run once.
+    let url = spawn_stub_gateway(vec![
+        ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
+        ("GET /health", 503, NOT_READY_TENANT),
+    ]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let err = client
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("admin_writes_enabled=false"));
+}
