@@ -2450,7 +2450,7 @@ pub(super) fn edge_detailed_health(
             "fresh": 0,
             "grace": 0,
             "expired": 0,
-            "max_age_seconds": {"fresh": null, "grace": null, "expired": null}
+            "max_age_seconds": {"fresh": 0, "grace": 0, "expired": 0}
         }
     });
     if matches!(mode, "database" | "cp") {
@@ -2748,6 +2748,53 @@ fn each_documented_tier_field_is_validated() {
         detailed,
         set("listener_failures", json!({"failures_total": 1}))
     ));
+    // Only the two cache shapes Edge emits: an unavailable cache carries
+    // nothing else, and an available one carries its timestamp and both
+    // counts.
+    assert!(!recognized_after(
+        detailed,
+        cached("available", json!(false))
+    ));
+    assert!(!recognized_after(
+        detailed,
+        set(
+            "cached_config",
+            json!({"available": false, "proxy_count": 0})
+        )
+    ));
+    assert!(!recognized_after(
+        detailed,
+        set("cached_config", json!({"available": true}))
+    ));
+    assert!(!recognized_after(detailed, |value| {
+        value["cached_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("loaded_at");
+    }));
+    assert!(!recognized_after(detailed, cached("extra", json!(1))));
+    // The documented FIPS labels.
+    for (key, label) in [
+        ("mode", "maintenance"),
+        ("build_profile", "custom"),
+        ("provider", "openssl"),
+    ] {
+        assert!(
+            !recognized_after(detailed, fips(key, json!(label))),
+            "{key}"
+        );
+    }
+    assert!(recognized_after(detailed, |value| {
+        value["fips"]["mode"] = json!("enforce");
+        value["fips"]["build_profile"] = json!("fips");
+        value["fips"]["provider"] = json!("aws-lc-fips");
+    }));
+    // The optional `database` block is an object when present.
+    assert!(!recognized_after(
+        detailed,
+        set("database", json!("maintenance"))
+    ));
+    assert!(recognized_after(detailed, remove("database")));
 
     // The detailed tier's RFC 3339 timestamp.
     assert!(recognized_after(

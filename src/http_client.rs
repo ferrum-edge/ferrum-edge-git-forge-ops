@@ -3565,7 +3565,8 @@ fn is_tenant_health(object: &serde_json::Map<String, serde_json::Value>) -> bool
 /// The detailed tier as both Edge v0.9.20 and later build it: from `status`,
 /// an RFC 3339 `timestamp` and `mode`, always adding `admin_writes_enabled`,
 /// `fips`, `namespace` and `cached_config`, and never an error envelope.
-/// Other diagnostics are optional and are not inspected.
+/// The optional `database` block must be an object when present; the other
+/// optional diagnostics are not inspected.
 fn is_detailed_health(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     has_health_write_state(object)
         && object
@@ -3575,6 +3576,9 @@ fn is_detailed_health(object: &serde_json::Map<String, serde_json::Value>) -> bo
         && has_mode_namespace(object, true)
         && object.get("fips").is_some_and(is_fips_metadata)
         && object.get("cached_config").is_some_and(is_cached_config)
+        && object
+            .get("database")
+            .is_none_or(serde_json::Value::is_object)
         && !object.contains_key("error")
         && !object.contains_key("message")
 }
@@ -3610,40 +3614,56 @@ fn has_mode_namespace(object: &serde_json::Map<String, serde_json::Value>, detai
         .is_some_and(|block| is_namespace_serving_report(block, scope, detailed))
 }
 
-/// Edge's `fips` metadata: every documented field present with its type, and
-/// `certified` always `false`.
+/// Edge's `fips` metadata: every documented field present with its type, the
+/// three labels within their documented sets, and `certified` always `false`.
 fn is_fips_metadata(value: &serde_json::Value) -> bool {
     let Some(fips) = value.as_object() else {
         return false;
     };
     let string = |key| fips.get(key).is_some_and(serde_json::Value::is_string);
     let boolean = |key| fips.get(key).is_some_and(serde_json::Value::is_boolean);
-    string("mode")
+    let label = |key, allowed: &[&str]| {
+        fips.get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|label| allowed.contains(&label))
+    };
+    label("mode", &["off", "enforce"])
         && boolean("enforcing")
         && boolean("build_capable")
-        && string("build_profile")
-        && string("provider")
+        && label("build_profile", &["crypto-ring", "fips"])
+        && label("provider", &["ring", "aws-lc-fips"])
         && boolean("module_self_test_passed")
         && boolean("provider_algorithms_approved")
         && fips.get("certified") == Some(&serde_json::Value::Bool(false))
         && string("boundary_documentation")
 }
 
-/// Edge's `cached_config` summary: a boolean `available`, and the documented
-/// types for `loaded_at`, `proxy_count` and `consumer_count` when present.
+/// Edge's `cached_config` summary, in one of the two shapes its handler
+/// emits: exactly `{"available": false}`, or `available: true` with exactly
+/// an RFC 3339 `loaded_at` and non-negative integer `proxy_count` and
+/// `consumer_count`.
 fn is_cached_config(value: &serde_json::Value) -> bool {
     let Some(cached) = value.as_object() else {
         return false;
     };
-    let count = |key| cached.get(key).is_none_or(|count| count.as_u64().is_some());
-    cached
-        .get("available")
-        .is_some_and(serde_json::Value::is_boolean)
-        && cached
-            .get("loaded_at")
-            .is_none_or(|stamp| stamp.as_str().is_some_and(is_rfc3339))
-        && count("proxy_count")
-        && count("consumer_count")
+    match cached.get("available") {
+        Some(serde_json::Value::Bool(false)) => cached.len() == 1,
+        Some(serde_json::Value::Bool(true)) => {
+            let count = |key| {
+                cached
+                    .get(key)
+                    .is_some_and(|count| count.as_u64().is_some())
+            };
+            cached.len() == 4
+                && cached
+                    .get("loaded_at")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_rfc3339)
+                && count("proxy_count")
+                && count("consumer_count")
+        }
+        _ => false,
+    }
 }
 
 /// `application/json`, with or without parameters such as `charset`.

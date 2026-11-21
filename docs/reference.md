@@ -248,18 +248,21 @@ not retry it. It is recognized only as Edge v0.9.20 and later send it:
 shape. The minimal tier is exactly `status` and `ready`. The tenant tier adds
 exactly `mode`, `admin_writes_enabled` and the `namespace` block. The detailed
 tier carries an RFC 3339 `timestamp`, `mode`, `admin_writes_enabled`, the
-`namespace` block, the `fips` metadata and the `cached_config` summary, each
-with its documented types, and no `error` or `message` key; its other
-diagnostics are optional and not inspected. `mode` is one of Edge's operating
+`namespace` block, the `fips` metadata (its `mode`, `build_profile` and
+`provider` labels within their documented sets, `certified` always `false`)
+and the `cached_config` summary (exactly `{"available": false}`, or
+`available: true` with `loaded_at` and both counts), and no `error` or
+`message` key. An optional `database` block must be an object; no other
+optional diagnostic is validated. `mode` is one of Edge's operating
 modes. The `namespace` block is exactly `active`, `serving_scope` and
 `data_plane_single_namespace`, and `serving_scope` is the one Edge derives
 from `mode`: `single-namespace-data-plane` for `database`, `file`, `dp` and
 `mesh`, `control-plane` for `cp`, and `no-data-plane` for `node_agent`.
 `data_plane_single_namespace` is true exactly for a single-namespace data
-plane. `namespace.active` is the only documented field that may be `null`: it
-is `null` on a control plane or node agent, and in the tenant tier also when
-the token cannot address the namespace the data plane routes. No other
-documented field may be `null` or wrongly typed. Any other 503, including an
+plane. Of the fields checked here, only `namespace.active` may be `null`: it is
+`null` on a control plane or node agent, and in the tenant tier also when the
+token cannot address the namespace the data plane routes. No other checked
+field may be `null` or wrongly typed. Any other 503, including an
 HTML maintenance page, unrelated JSON or `status: ok`, is not Edge's answer,
 and is retried by HTTP status like any other 5xx read:
 

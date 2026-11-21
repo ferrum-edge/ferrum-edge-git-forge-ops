@@ -342,10 +342,10 @@ fn not_ready_check(probe: &HealthProbe) -> Check {
              point FERRUM_GATEWAY_URL at a serving instance."
         }
         "unavailable" => {
-            "The gateway was ready and then lost a serving listener or a dependency it \
-             cannot serve without. The detailed /health tier and the gateway's logs name \
-             the cause; some causes clear on their own, and a failed listener needs a \
-             restart. Re-run doctor once GET /health answers 200."
+            "A serving listener or a dependency the gateway cannot serve without is \
+             unavailable. The detailed /health tier and the gateway's logs name the cause; \
+             some causes clear on their own, and a failed listener needs a restart. Re-run \
+             doctor once GET /health answers 200."
         }
         _ => {
             "The gateway withdrew readiness for a failed listener. The detailed /health \

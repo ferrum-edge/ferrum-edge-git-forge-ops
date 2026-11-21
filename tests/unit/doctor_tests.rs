@@ -1561,6 +1561,11 @@ async fn an_explicit_write_refusal_on_a_not_ready_tenant_tier_is_kept() {
         "{}",
         ready.detail
     );
+    // Edge can report `unavailable` before it was ever ready, so the remedy
+    // claims no readiness history.
+    let remedy = ready.remediation.as_deref().expect("remediation");
+    assert!(remedy.contains("unavailable"), "{remedy}");
+    assert!(!remedy.contains("was ready"), "{remedy}");
     let writable = find(&checks, "gateway-writable");
     assert_eq!(writable.status, Status::Fail);
     assert!(
