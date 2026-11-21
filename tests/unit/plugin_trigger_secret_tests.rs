@@ -365,26 +365,40 @@ fn short_trigger_operands_are_secrets_too() {
         assert!(side.contains("x-skip-waf"), "{side}");
     }
 
-    let output = SecretScrubber::from_gateway_config(&original).scrub_streams("validated", "");
-    assert!(output.suppressed.is_none());
+    // A live read is not refused over a short operand (it is kept out of
+    // output by position instead).
     gitforgeops::display::register_gateway_config(&original).unwrap();
 
-    // A short operand cannot be substring-replaced, but validator output that
-    // echoes it is withheld rather than printed (standalone `validate` runs no
-    // literal gate).
+    // A short literal operand has no encoding needles or fragment windows,
+    // so validator streams are withheld outright (standalone `validate` runs
+    // no literal gate): a verbatim echo, a base64-only echo, or none at all.
+    use base64::Engine as _;
     let echoed = trigger_gateway(serde_json::json!({"when": {"match": {"header": {
         "name": "x-skip-waf", "value": {"exact": ["zq9tok"]}
     }}}}));
-    let output = SecretScrubber::from_gateway_config(&echoed).scrub_streams(
-        "trigger.when.match.header.value.exact[0] = zq9tok is not allowed",
-        "",
-    );
-    assert_eq!(
-        output.suppressed,
-        Some(gitforgeops::secrets::SuppressionReason::ResidualValue)
-    );
-    assert!(!output.stdout.contains("zq9tok"));
-    assert!(!output.stderr.contains("zq9tok"));
+    let encoded = base64::engine::general_purpose::STANDARD.encode("zq9tok");
+    let scrubber = SecretScrubber::from_gateway_config(&echoed);
+    for diagnostic in [
+        "trigger.when.match.header.value.exact[0] = zq9tok is not allowed".to_string(),
+        format!("operand (base64) {encoded} is not allowed"),
+        "validated".to_string(),
+    ] {
+        let output = scrubber.scrub_streams(&diagnostic, &diagnostic);
+        assert_eq!(
+            output.suppressed,
+            Some(gitforgeops::secrets::SuppressionReason::ShortTriggerOperand),
+            "{diagnostic}"
+        );
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(!stream.contains("zq9tok"), "{stream}");
+            assert!(!stream.contains(&encoded), "{stream}");
+        }
+    }
+    // A brokered (long) trigger does not trigger this withholding.
+    let mut brokered = echoed.clone();
+    capture_and_redact_import_plugin_trigger_secrets(&mut brokered).unwrap();
+    let output = SecretScrubber::from_gateway_config(&brokered).scrub_streams("validated", "");
+    assert!(output.suppressed.is_none());
 }
 
 /// `apply` resolves twice when it allocates: once against the bundle it

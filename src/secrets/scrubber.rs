@@ -130,6 +130,9 @@ pub struct SecretScrubber {
     /// [`is_reencoding_hazard`]. Every stream is withheld while this is set,
     /// because a partial substitution reads exactly like a complete one.
     unsafe_to_scrub: bool,
+    /// The document holds a literal trigger operand shorter than
+    /// [`MIN_SCRUB_LENGTH`] ([`SuppressionReason::ShortTriggerOperand`]).
+    short_trigger_operand: bool,
 }
 
 /// Why a validator's output was withheld instead of scrubbed.
@@ -145,6 +148,11 @@ pub enum SuppressionReason {
     /// A [`FRAGMENT_SCAN_LENGTH`]-byte run of a secret survived scrubbing, so
     /// the value reached the output in some encoding the needles do not cover.
     ResidualFragment,
+    /// The document carries a literal plugin trigger operand shorter than
+    /// [`MIN_SCRUB_LENGTH`] bytes. It has no encoding needles or fragment
+    /// windows, so an encoded echo (base64, percent) could not be recognized;
+    /// decided before the child runs.
+    ShortTriggerOperand,
 }
 
 impl SuppressionReason {
@@ -167,6 +175,12 @@ impl SuppressionReason {
                  the output could not be shown without leaking it. Credentials shorter than 8 \
                  bytes cannot be redacted from a diagnostic without mangling it — lengthen the \
                  credential, or move the literal value into the ${gh-env-secret:...} broker.\n"
+            }
+            Self::ShortTriggerOperand => {
+                "Validator diagnostics were withheld: a plugin trigger header, query or cookie \
+                 operand is shorter than 8 bytes, so it could not be redacted from the output in \
+                 every encoding. Trigger operands are secrets; use one of at least 8 bytes held in \
+                 ${gh-env-secret:alloc=require} to get diagnostics back.\n"
             }
             Self::ResidualFragment => {
                 "Validator diagnostics were withheld: a run of a resolved secret survived \
@@ -225,6 +239,7 @@ impl SecretScrubber {
     /// No bundle values or unused slots are retained in the report.
     pub fn from_gateway_config_with_report(config: &GatewayConfig, report: &ResolveReport) -> Self {
         let mut scrubber = Self::from_values(gateway_secret_values(config, report));
+        scrubber.short_trigger_operand = has_short_trigger_operand(config);
         // The document with every secret removed. Serialization failure is not
         // worth failing validation over: an empty `public_text` only makes the
         // fragment scan stricter, never laxer.
@@ -282,6 +297,7 @@ impl SecretScrubber {
             fragments,
             public_text: String::new(),
             unsafe_to_scrub,
+            short_trigger_operand: false,
         }
     }
 
@@ -397,6 +413,9 @@ impl SecretScrubber {
 
         if self.unsafe_to_scrub {
             return withheld(SuppressionReason::NotSafelyScrubbable);
+        }
+        if self.short_trigger_operand {
+            return withheld(SuppressionReason::ShortTriggerOperand);
         }
 
         let stdout = self.scrub(stdout);
@@ -767,6 +786,19 @@ fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink)
             }
         }
     }
+}
+
+/// Whether any plugin trigger operand in `config` is a non-empty value
+/// shorter than [`MIN_SCRUB_LENGTH`] bytes (a placeholder never is).
+fn has_short_trigger_operand(config: &GatewayConfig) -> bool {
+    config.plugin_configs.iter().any(|plugin| {
+        plugin.trigger.as_ref().is_some_and(|trigger| {
+            let json = plugin_trigger::trigger_json(trigger);
+            plugin_trigger::secret_trigger_operands(&json)
+                .iter()
+                .any(|(_, text)| text.len() < MIN_SCRUB_LENGTH)
+        })
+    })
 }
 
 /// Which trigger operands a collector reports.

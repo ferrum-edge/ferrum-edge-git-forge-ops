@@ -144,8 +144,8 @@ Ferrum Edge withholds every one of them, whatever its length, and so does
 GitForgeOps: `import` captures it, `diff` and `plan` show it as `[REDACTED]`
 inside an otherwise readable trigger, and a committed literal is a blocking
 finding. Validator output and the review comment are scrubbed of every
-operand of at least 8 bytes; validator output that still contains a shorter
-one is withheld. A trigger that does not decode is reported by field and
+operand of at least 8 bytes; while the document holds a shorter literal
+operand, validator output is withheld outright. A trigger that does not decode is reported by field and
 expected shape only, never with the decoder's quote of the value. A brokered operand must be at least 8 bytes,
 because a shorter value cannot be removed from free text: `import` still
 captures a short one (and names its slot), but resolution refuses it until
