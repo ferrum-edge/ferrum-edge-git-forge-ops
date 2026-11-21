@@ -837,7 +837,7 @@ bundle.
    destination.
 
    ```bash
-   export FERRUM_GATEWAY_URL=https://gateway.internal:8081
+   export FERRUM_GATEWAY_URL=https://gateway.internal:9443
    export FERRUM_ADMIN_JWT_SECRET=...            # >= 32 chars, matches the gateway
    export FERRUM_NAMESPACE=ferrum
 
