@@ -49,6 +49,14 @@ Retried:
 
 Never retried:
 
+- **Edge's not-ready `/health` document** (HTTP 503 with the documented
+  health body). It is the gateway's answer, and a draining gateway may close
+  its listener before a retry would land; see
+  [Namespace-scoped admin tokens](reference.md#namespace-scoped-admin-tokens).
+  Any other `/health` answer is retried by HTTP status alone (408, 429, 5xx
+  except 501): mutation markers such as `applied: false` mean nothing on a
+  read. If a later attempt then fails to connect, the last HTTP answer is
+  reported, not the connection error.
 - **501** — for example a standalone-MongoDB gateway without transactions.
   `POST /batch` then falls back to per-resource creates.
 - **Any error from a create or batch `POST`.** The write may have committed.
@@ -95,7 +103,12 @@ Backoff is full-jitter, up to `500ms · 2^(attempt-1)` and capped at 8 s. A
 - **`GatewayReadOnly`.** An authenticated `GET /health` preflight runs before
   the first write. A gateway with `admin_writes_enabled: false`, or in `file`,
   `dp`, `mesh` or `node_agent` mode, fails the run once instead of producing a
-  403 per resource. An unreachable `/health` only prints a warning. So does a
+  403 per resource. So does a `403` to `GET /health` carrying the admin API's
+  explicit "Admin API is in read-only mode" refusal. Edge's not-ready answer
+  (HTTP 503 with its health
+  document) is read the same way, so its explicit `admin_writes_enabled:
+  false` still stops the run; a not-ready gateway that accepts writes only
+  prints a warning. An unreachable `/health` only prints a warning. So does a
   minimal-tier body without `admin_writes_enabled`; `rotate` refuses that one
   (see [Namespace-scoped admin tokens](reference.md#namespace-scoped-admin-tokens)).
 - **`ApiSpecsAtRisk`** (409 with `api_specs_at_risk`) points at

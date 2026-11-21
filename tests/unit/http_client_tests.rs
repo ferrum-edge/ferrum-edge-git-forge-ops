@@ -2392,3 +2392,817 @@ fn loopback_backup_bypasses_environment_proxies() {
         "a proxy must never receive loopback credentials"
     );
 }
+
+// --- Edge's not-ready /health (HTTP 503) -------------------------------------
+
+/// Ferrum Edge's three `/health` tiers as it sends them with HTTP 503 while not
+/// ready (abridged where the detailed tier carries more).
+const NOT_READY_MINIMAL: &str = r#"{"status":"starting","ready":false}"#;
+const NOT_READY_TENANT: &str = r#"{"status":"draining","ready":false,"mode":"database","admin_writes_enabled":false,"namespace":{"active":"team-alpha","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#;
+/// A complete detailed-tier `/health` document as both Edge v0.9.20 and
+/// `origin/main` build it for a not-ready gateway: the handler's always-present
+/// fields (`timestamp`, `mode`, `admin_writes_enabled`, `fips`, `namespace`,
+/// `cached_config`), the namespace block its builder derives from `mode`, and
+/// the database block of a database-backed mode. Optional diagnostics vary by
+/// deployment; `jwks_trust` stands in for them.
+pub(super) fn edge_detailed_health(
+    status: &str,
+    mode: &str,
+    admin_writes_enabled: bool,
+) -> &'static str {
+    use serde_json::json;
+    let namespace = match mode {
+        "cp" => {
+            json!({"active": null, "serving_scope": "control-plane", "data_plane_single_namespace": false})
+        }
+        "node_agent" => {
+            json!({"active": null, "serving_scope": "no-data-plane", "data_plane_single_namespace": false})
+        }
+        _ => {
+            json!({"active": "ferrum", "serving_scope": "single-namespace-data-plane", "data_plane_single_namespace": true})
+        }
+    };
+    let mut document = json!({
+        "status": status,
+        "ready": false,
+        "timestamp": "2026-11-21T00:00:00.123456+00:00",
+        "mode": mode,
+        "admin_writes_enabled": admin_writes_enabled,
+        "fips": {
+            "mode": "off",
+            "enforcing": false,
+            "build_capable": false,
+            "build_profile": "crypto-ring",
+            "provider": "ring",
+            "module_self_test_passed": false,
+            "provider_algorithms_approved": false,
+            "certified": false,
+            "boundary_documentation": "docs/fips.md"
+        },
+        "namespace": namespace,
+        "cached_config": {
+            "available": true,
+            "loaded_at": "2026-11-20T23:59:00+00:00",
+            "proxy_count": 3,
+            "consumer_count": 2
+        },
+        "jwks_trust": {
+            "fresh": 0,
+            "grace": 0,
+            "expired": 0,
+            "max_age_seconds": {"fresh": 0, "grace": 0, "expired": 0}
+        }
+    });
+    if matches!(mode, "database" | "cp") {
+        document["database"] = json!({"status": "connected", "type": "postgres"});
+    }
+    Box::leak(document.to_string().into_boxed_str())
+}
+
+/// [`edge_detailed_health`] for an unavailable control plane that accepts
+/// writes.
+fn not_ready_detailed() -> &'static str {
+    edge_detailed_health("unavailable", "cp", true)
+}
+
+/// The media type Edge serves `/health` with.
+const JSON: Option<&str> = Some("application/json");
+
+#[test]
+fn every_documented_not_ready_health_document_is_recognized() {
+    use gitforgeops::http_client::{parse_not_ready_health, NOT_READY_HEALTH_STATUSES};
+    for status in NOT_READY_HEALTH_STATUSES {
+        let body = format!(r#"{{"status":"{status}","ready":false}}"#);
+        let health = parse_not_ready_health(JSON, &body).unwrap_or_else(|| panic!("{body}"));
+        assert_eq!(health.status.as_deref(), Some(status));
+        assert_eq!(health.ready, Some(false));
+        assert_eq!(health.admin_writes_enabled, None, "minimal tier");
+    }
+    let tenant = parse_not_ready_health(JSON, NOT_READY_TENANT).expect("tenant tier");
+    assert_eq!(tenant.admin_writes_enabled, Some(false));
+    assert_eq!(tenant.mode.as_deref(), Some("database"));
+    let detailed = parse_not_ready_health(JSON, not_ready_detailed()).expect("detailed tier");
+    assert_eq!(detailed.admin_writes_enabled, Some(true));
+    assert!(parse_not_ready_health(JSON, NOT_READY_MINIMAL).is_some());
+    // Media-type parameters and case do not matter.
+    assert!(
+        parse_not_ready_health(Some("Application/JSON; charset=utf-8"), NOT_READY_MINIMAL)
+            .is_some()
+    );
+    // A tenant token whose bound does not admit the routed namespace gets a
+    // `null` `active`, which is Edge's documented shape.
+    let unserved = r#"{"status":"starting","ready":false,"mode":"dp","admin_writes_enabled":false,"namespace":{"active":null,"serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#;
+    assert!(parse_not_ready_health(JSON, unserved).is_some());
+}
+
+#[test]
+fn a_503_body_that_only_resembles_edges_health_document_is_not_recognized() {
+    use gitforgeops::http_client::parse_not_ready_health;
+    for body in [
+        "",
+        "<html><body>Service temporarily unavailable</body></html>",
+        "Service Unavailable",
+        r#"{"error":"upstream maintenance"}"#,
+        r#"["starting",false]"#,
+        // `ok` is never sent with 503, nor is `ready: true`.
+        r#"{"status":"ok","ready":false}"#,
+        r#"{"status":"starting","ready":true}"#,
+        // Both fields are required, with their documented types.
+        r#"{"status":"starting"}"#,
+        r#"{"ready":false}"#,
+        r#"{"status":"starting","ready":"false"}"#,
+        r#"{"status":"maintenance","ready":false}"#,
+        r#"{"status":"STARTING","ready":false}"#,
+        // Duplicate keys: the last `ready` must not win over the first.
+        r#"{"status":"starting","ready":true,"ready":false}"#,
+        r#"{"status":"ok","status":"starting","ready":false}"#,
+        // A maintenance envelope that borrowed `status` and `ready`.
+        r#"{"status":"starting","ready":false,"error":"scheduled maintenance"}"#,
+        r#"{"status":"unavailable","ready":false,"error":"scheduled maintenance","namespace":17,"admin_writes_enabled":null}"#,
+        r#"{"status":"unavailable","ready":false,"mode":"cp","admin_writes_enabled":false,"timestamp":"maintenance","error":"scheduled maintenance"}"#,
+        r#"{"status":"draining","ready":false,"mode":"cp","admin_writes_enabled":false}"#,
+    ] {
+        assert!(parse_not_ready_health(JSON, body).is_none(), "{body}");
+    }
+    // The body alone is not enough: Edge always sends `application/json`.
+    for content_type in [
+        None,
+        Some("text/html"),
+        Some("text/plain"),
+        Some("application/jsonx"),
+    ] {
+        assert!(
+            parse_not_ready_health(content_type, NOT_READY_MINIMAL).is_none(),
+            "{content_type:?}"
+        );
+    }
+}
+
+/// Apply `change` to a copy of `document` and say whether the result is still
+/// recognized, so each negative case below breaks exactly one rule of an
+/// otherwise valid tier.
+fn recognized_after(document: &str, change: impl FnOnce(&mut serde_json::Value)) -> bool {
+    let mut value: serde_json::Value = serde_json::from_str(document).unwrap();
+    change(&mut value);
+    gitforgeops::http_client::parse_not_ready_health(JSON, &value.to_string()).is_some()
+}
+
+#[test]
+fn each_documented_tier_field_is_validated() {
+    use serde_json::json;
+    let set = |key: &'static str, to: serde_json::Value| {
+        move |value: &mut serde_json::Value| value[key] = to
+    };
+    let remove = |key: &'static str| {
+        move |value: &mut serde_json::Value| {
+            value.as_object_mut().unwrap().remove(key);
+        }
+    };
+    let scope = |key: &'static str, to: serde_json::Value| {
+        move |value: &mut serde_json::Value| value["namespace"][key] = to
+    };
+
+    for document in [not_ready_detailed(), NOT_READY_TENANT] {
+        assert!(recognized_after(document, |_| {}), "{document}");
+        // `mode` and `admin_writes_enabled`: present, typed, never null.
+        assert!(!recognized_after(document, set("mode", json!(null))));
+        assert!(!recognized_after(document, set("mode", json!(7))));
+        assert!(!recognized_after(document, remove("mode")));
+        assert!(!recognized_after(
+            document,
+            set("admin_writes_enabled", json!(null))
+        ));
+        assert!(!recognized_after(
+            document,
+            set("admin_writes_enabled", json!("no"))
+        ));
+        assert!(!recognized_after(document, remove("admin_writes_enabled")));
+        // The namespace block: present, exactly Edge's three fields, the
+        // closed scope set, and consistent with itself.
+        assert!(!recognized_after(document, remove("namespace")));
+        assert!(!recognized_after(document, set("namespace", json!(17))));
+        assert!(!recognized_after(
+            document,
+            scope("serving_scope", json!("anything"))
+        ));
+        assert!(!recognized_after(
+            document,
+            scope("serving_scope", json!(null))
+        ));
+        assert!(!recognized_after(
+            document,
+            scope("data_plane_single_namespace", json!("yes"))
+        ));
+        assert!(!recognized_after(document, scope("active", json!(3))));
+        assert!(!recognized_after(document, scope("extra", json!(true))));
+        assert!(!recognized_after(document, |value| {
+            value["namespace"].as_object_mut().unwrap().remove("active");
+        }));
+        // An error envelope is never part of Edge's health document.
+        assert!(!recognized_after(
+            document,
+            set("error", json!("maintenance"))
+        ));
+        assert!(!recognized_after(
+            document,
+            set("message", json!("maintenance"))
+        ));
+    }
+
+    // `serving_scope` follows `mode`, as Edge's builder derives it.
+    let control_plane = json!({"active": null, "serving_scope": "control-plane", "data_plane_single_namespace": false});
+    let no_data_plane = json!({"active": null, "serving_scope": "no-data-plane", "data_plane_single_namespace": false});
+    let single = |active: serde_json::Value| json!({"active": active, "serving_scope": "single-namespace-data-plane", "data_plane_single_namespace": true});
+    let with = |mode: &'static str, block: serde_json::Value| {
+        move |value: &mut serde_json::Value| {
+            value["mode"] = json!(mode);
+            value["namespace"] = block;
+        }
+    };
+    for document in [not_ready_detailed(), NOT_READY_TENANT] {
+        // Paired cases: each mode with its own scope is recognized, and the
+        // same mode with another mode's scope is not.
+        assert!(recognized_after(
+            document,
+            with("cp", control_plane.clone())
+        ));
+        assert!(!recognized_after(
+            document,
+            with("cp", single(json!("ferrum")))
+        ));
+        assert!(!recognized_after(
+            document,
+            with("cp", no_data_plane.clone())
+        ));
+        assert!(recognized_after(
+            document,
+            with("node_agent", no_data_plane.clone())
+        ));
+        assert!(!recognized_after(
+            document,
+            with("node_agent", control_plane.clone())
+        ));
+        assert!(!recognized_after(
+            document,
+            with("node_agent", single(json!("ferrum")))
+        ));
+        for mode in ["database", "file", "dp", "mesh"] {
+            assert!(
+                recognized_after(document, with(mode, single(json!("ferrum")))),
+                "{mode}"
+            );
+            assert!(
+                !recognized_after(document, with(mode, control_plane.clone())),
+                "{mode}"
+            );
+            assert!(
+                !recognized_after(document, with(mode, no_data_plane.clone())),
+                "{mode}"
+            );
+        }
+        // A mode Edge does not have has no scope to match.
+        assert!(!recognized_after(
+            document,
+            with("gateway", control_plane.clone())
+        ));
+        assert!(!recognized_after(
+            document,
+            with("CP", control_plane.clone())
+        ));
+        // Within the right scope, the block must still agree with itself.
+        assert!(!recognized_after(
+            document,
+            with(
+                "cp",
+                json!({"active": "ferrum", "serving_scope": "control-plane", "data_plane_single_namespace": false})
+            )
+        ));
+        assert!(!recognized_after(
+            document,
+            with(
+                "node_agent",
+                json!({"active": null, "serving_scope": "no-data-plane", "data_plane_single_namespace": true})
+            )
+        ));
+    }
+    // Only the tenant tier hides the routed namespace from a token it does
+    // not admit; the detailed tier always names it.
+    assert!(recognized_after(
+        NOT_READY_TENANT,
+        with("dp", single(json!(null)))
+    ));
+    assert!(!recognized_after(
+        not_ready_detailed(),
+        with("dp", single(json!(null)))
+    ));
+
+    // The detailed tier's always-present `fips` and `cached_config`, with
+    // their documented types. Other diagnostics are not inspected.
+    let fips = |key: &'static str, to: serde_json::Value| {
+        move |value: &mut serde_json::Value| value["fips"][key] = to
+    };
+    let cached = |key: &'static str, to: serde_json::Value| {
+        move |value: &mut serde_json::Value| value["cached_config"][key] = to
+    };
+    let detailed = not_ready_detailed();
+    assert!(!recognized_after(detailed, remove("fips")));
+    assert!(!recognized_after(detailed, set("fips", json!("off"))));
+    assert!(!recognized_after(detailed, fips("certified", json!(true))));
+    assert!(!recognized_after(detailed, fips("enforcing", json!("no"))));
+    assert!(!recognized_after(detailed, fips("provider", json!(null))));
+    assert!(!recognized_after(detailed, |value| {
+        value["fips"].as_object_mut().unwrap().remove("mode");
+    }));
+    assert!(!recognized_after(detailed, remove("cached_config")));
+    assert!(!recognized_after(
+        detailed,
+        set("cached_config", json!(true))
+    ));
+    assert!(!recognized_after(
+        detailed,
+        cached("available", json!("unknown"))
+    ));
+    assert!(!recognized_after(detailed, |value| {
+        value["cached_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("available");
+    }));
+    assert!(!recognized_after(
+        detailed,
+        cached("proxy_count", json!(-1))
+    ));
+    assert!(!recognized_after(
+        detailed,
+        cached("consumer_count", json!("2"))
+    ));
+    assert!(!recognized_after(
+        detailed,
+        cached("loaded_at", json!("yesterday"))
+    ));
+    assert!(recognized_after(
+        detailed,
+        set("cached_config", json!({"available": false}))
+    ));
+    assert!(recognized_after(
+        detailed,
+        set("listener_failures", json!({"failures_total": 1}))
+    ));
+    // Only the two cache shapes Edge emits: an unavailable cache carries
+    // nothing else, and an available one carries its timestamp and both
+    // counts.
+    assert!(!recognized_after(
+        detailed,
+        cached("available", json!(false))
+    ));
+    assert!(!recognized_after(
+        detailed,
+        set(
+            "cached_config",
+            json!({"available": false, "proxy_count": 0})
+        )
+    ));
+    assert!(!recognized_after(
+        detailed,
+        set("cached_config", json!({"available": true}))
+    ));
+    assert!(!recognized_after(detailed, |value| {
+        value["cached_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("loaded_at");
+    }));
+    assert!(!recognized_after(detailed, cached("extra", json!(1))));
+    // The documented FIPS labels.
+    for (key, label) in [
+        ("mode", "maintenance"),
+        ("build_profile", "custom"),
+        ("provider", "openssl"),
+    ] {
+        assert!(
+            !recognized_after(detailed, fips(key, json!(label))),
+            "{key}"
+        );
+    }
+    assert!(recognized_after(detailed, |value| {
+        value["fips"]["mode"] = json!("enforce");
+        value["fips"]["build_profile"] = json!("fips");
+        value["fips"]["provider"] = json!("aws-lc-fips");
+    }));
+    // The optional `database` block is an object with a documented `status`.
+    for database in [
+        json!("maintenance"),
+        json!({}),
+        json!({"status": null}),
+        json!({"status": 7}),
+        json!({"status": "maintenance"}),
+    ] {
+        assert!(
+            !recognized_after(detailed, set("database", database.clone())),
+            "{database}"
+        );
+    }
+    for status in ["connected", "disconnected"] {
+        assert!(recognized_after(
+            detailed,
+            set("database", json!({"status": status, "type": "postgres"}))
+        ));
+    }
+    assert!(recognized_after(detailed, remove("database")));
+
+    // The detailed tier's RFC 3339 timestamp.
+    assert!(recognized_after(
+        not_ready_detailed(),
+        set("timestamp", json!("2026-11-21T00:00:00Z"))
+    ));
+    for stamp in [
+        json!("maintenance"),
+        json!("2026-11-21"),
+        json!("2026-13-01T00:00:00Z"),
+        json!(1_763_683_200),
+        json!(null),
+    ] {
+        assert!(
+            !recognized_after(not_ready_detailed(), set("timestamp", stamp.clone())),
+            "{stamp}"
+        );
+    }
+    assert!(!recognized_after(not_ready_detailed(), remove("timestamp")));
+    // The tenant tier has exactly five keys.
+    assert!(!recognized_after(
+        NOT_READY_TENANT,
+        set("cached_config", json!({}))
+    ));
+}
+
+#[tokio::test]
+async fn probe_health_keeps_a_not_ready_answer_and_get_health_refuses_it() {
+    // Unavailable, writes enabled: the probe sees the gateway; a caller that
+    // needs a ready gateway gets a 503 error naming the state.
+    let url = spawn_stub_gateway(vec![("GET /health", 503, not_ready_detailed())]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let probe = client.probe_health().await.expect("Edge's document");
+    assert!(!probe.is_ready());
+    assert_eq!(probe.http_status, 503);
+    assert_eq!(probe.health.admin_writes_enabled, Some(true));
+    let error = client.get_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("status=unavailable"), "{error}");
+
+    // An explicit `admin_writes_enabled: false` on a 503 is kept.
+    let url = spawn_stub_gateway(vec![("GET /health", 503, NOT_READY_TENANT)]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.get_health().await.unwrap_err();
+    assert!(
+        matches!(error, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("status=draining"), "{error}");
+}
+
+#[tokio::test]
+async fn probe_health_of_a_ready_gateway_is_unchanged() {
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        200,
+        r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+    )]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let probe = client.probe_health().await.expect("ready");
+    assert!(probe.is_ready());
+    assert_eq!(probe.http_status, 200);
+    let health = client.get_health().await.expect("ready");
+    assert_eq!(health.admin_writes_enabled, Some(true));
+}
+
+#[tokio::test]
+async fn an_intermediary_503_stays_an_api_error() {
+    for body in [
+        "<html>maintenance</html>",
+        r#"{"error":"maintenance window"}"#,
+        r#"{"status":"ok","ready":false}"#,
+    ] {
+        let url = spawn_stub_gateway(vec![("GET /health", 503, body)]);
+        let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+        let error = client.probe_health().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                gitforgeops::error::Error::ApiError { status: 503, .. }
+            ),
+            "{body}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unclassified_mutation_403_is_upgraded_via_a_not_ready_health_document() {
+    // The health re-check reads the explicit write flag from Edge's 503
+    // document too, so a draining read-only plane still stops the run once.
+    let url = spawn_stub_gateway(vec![
+        ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
+        ("GET /health", 503, NOT_READY_TENANT),
+    ]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let err = client
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("admin_writes_enabled=false"));
+}
+
+/// A one-connection-per-request `/health` responder that answers each request
+/// from `script` in turn, `(status, content type, body)`, and then closes its
+/// listener, so any further attempt fails to connect. Returns the URL and the
+/// number of requests it answered.
+pub(super) fn spawn_scripted_health(
+    script: Vec<(u16, &'static str, &'static [u8])>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for (status, content_type, body) in script {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0_u8; 8192];
+            let _ = stream.read(&mut buf);
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} STUB\r\ncontent-type: {content_type}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(body);
+        }
+        // `listener` drops here: later attempts are refused.
+    });
+    (format!("http://{addr}"), served)
+}
+
+#[tokio::test]
+async fn a_recognized_not_ready_document_is_not_retried_away() {
+    // A draining read-only gateway's answer is final: with retries enabled it
+    // is requested once, and its refusal is what the caller sees.
+    // A second, ready and writable answer would change the result if it
+    // were ever requested.
+    let (url, served) = spawn_scripted_health(vec![
+        (503, "application/json", NOT_READY_TENANT.as_bytes()),
+        (
+            200,
+            "application/json",
+            br#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+        ),
+    ]);
+    let mut env = stub_env(url);
+    env.gateway_max_retries = 3;
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+    let probe = client.probe_health().await.expect("Edge's document");
+    assert!(!probe.is_ready());
+    assert_eq!(probe.health.admin_writes_enabled, Some(false));
+    assert_eq!(served.load(Ordering::SeqCst), 1, "not retried");
+}
+
+#[tokio::test]
+async fn an_unrecognized_503_is_still_retried() {
+    // An intermediary's maintenance page is transient as far as this client
+    // knows, so the read-retry policy still applies to it.
+    let (url, served) = spawn_scripted_health(vec![
+        (503, "text/html", b"<html>maintenance</html>"),
+        (503, "application/json", NOT_READY_MINIMAL.as_bytes()),
+    ]);
+    let mut env = stub_env(url);
+    env.gateway_max_retries = 1;
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+    let probe = client
+        .probe_health()
+        .await
+        .expect("second answer is Edge's");
+    assert_eq!(probe.health.status.as_deref(), Some("starting"));
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn an_unrecognized_503_with_a_mutation_marker_is_a_plain_read_error() {
+    // `applied: false` describes a write; on a GET it is just a body that is
+    // not Edge's health document, and it must not become CommittedNotLive.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        503,
+        r#"{"error":"deployment pending","applied":false,"reason":"config_rejected"}"#,
+    )]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+    assert!(!error.to_string().contains("committed"), "{error}");
+}
+
+#[tokio::test]
+async fn edges_document_under_another_media_type_is_not_recognized() {
+    let (url, _) = spawn_scripted_health(vec![(503, "text/plain", NOT_READY_MINIMAL.as_bytes())]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_mutation_marker_does_not_stop_a_health_retry() {
+    // `applied: false` would stop a write's retry; on a GET it is just a body
+    // that is not Edge's document, and the 503 status is retried.
+    let (url, served) = spawn_scripted_health(vec![
+        (
+            503,
+            "application/json",
+            br#"{"error":"deployment pending","applied":false}"#,
+        ),
+        (503, "application/json", NOT_READY_MINIMAL.as_bytes()),
+    ]);
+    let mut env = stub_env(url);
+    env.gateway_max_retries = 1;
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+    let probe = client
+        .probe_health()
+        .await
+        .expect("second answer is Edge's");
+    assert_eq!(probe.health.status.as_deref(), Some("starting"));
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_later_connection_failure_does_not_erase_an_http_answer() {
+    // An intermediary answers 503 once and closes its listener: the retry
+    // cannot connect, and the report must still say an HTTP answer arrived.
+    let (url, served) =
+        spawn_scripted_health(vec![(503, "text/html", b"<html>maintenance</html>")]);
+    let mut env = stub_env(url);
+    env.gateway_max_retries = 1;
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_health_body_that_is_not_utf8_is_not_recognized() {
+    // A complete document with a correctly encoded U+FFFD in a diagnostic
+    // string: valid UTF-8, and Edge may send one in a sanitized detail.
+    let mut document: serde_json::Value =
+        serde_json::from_str(edge_detailed_health("unavailable", "cp", false)).unwrap();
+    document["logging"] = serde_json::json!({"detail": "x\u{FFFD}"});
+    let encoded = document.to_string();
+    assert!(
+        encoded.contains('\u{FFFD}'),
+        "serde_json keeps it unescaped"
+    );
+    let encoded: &'static str = Box::leak(encoded.into_boxed_str());
+    let (url, _) = spawn_scripted_health(vec![(503, "application/json", encoded.as_bytes())]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let probe = client.probe_health().await.expect("valid UTF-8 document");
+    assert_eq!(probe.health.admin_writes_enabled, Some(false));
+
+    // The same document with a raw invalid byte where the U+FFFD was: lossy
+    // decoding would turn it back into the document above, so the raw bytes
+    // decide.
+    let invalid = encoded
+        .as_bytes()
+        .windows(3)
+        .position(|bytes| bytes == "\u{FFFD}".as_bytes())
+        .map(|at| {
+            let mut bytes = encoded.as_bytes().to_vec();
+            bytes.splice(at..at + 3, [0xff]);
+            bytes
+        })
+        .expect("the encoded replacement character");
+    let invalid: &'static [u8] = Box::leak(invalid.into_boxed_slice());
+    let (url, _) = spawn_scripted_health(vec![(503, "application/json", invalid)]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_only_refusal_on_health_is_still_a_read_only_plane() {
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        403,
+        r#"{"error":"Admin API is in read-only mode"}"#,
+    )]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(error, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("GET /health answered HTTP 403"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn unclassified_mutation_403_is_upgraded_via_a_read_only_health_refusal() {
+    let url = spawn_stub_gateway(vec![
+        ("DELETE /proxies/", 403, r#"{"error":"forbidden"}"#),
+        (
+            "GET /health",
+            403,
+            r#"{"error":"Admin API is in read-only mode"}"#,
+        ),
+    ]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let err = client
+        .delete_if_match("Proxy", "p1", "team-alpha", "\"tag\"", None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_complete_document_with_a_malformed_diagnostic_is_an_http_error() {
+    let mut document: serde_json::Value =
+        serde_json::from_str(edge_detailed_health("unavailable", "database", false)).unwrap();
+    document["cached_config"]["available"] = serde_json::json!("unknown");
+    let body: &'static str = Box::leak(document.to_string().into_boxed_str());
+    let url = spawn_stub_gateway(vec![("GET /health", 503, body)]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn the_preflight_warns_that_a_writable_gateway_is_not_ready() {
+    use gitforgeops::http_client::{
+        health_preflight_warnings, parse_not_ready_health, HealthProbe,
+    };
+    let not_ready = HealthProbe {
+        http_status: 503,
+        health: parse_not_ready_health(JSON, edge_detailed_health("starting", "database", true))
+            .expect("Edge's document"),
+    };
+    let warnings = health_preflight_warnings(&not_ready, false);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("not ready (status=starting, ready=false, HTTP 503)"),
+        "{warnings:?}"
+    );
+    // The minimal tier adds the unknown-write-state warning.
+    let minimal = HealthProbe {
+        http_status: 503,
+        health: parse_not_ready_health(JSON, NOT_READY_MINIMAL).expect("minimal tier"),
+    };
+    assert_eq!(health_preflight_warnings(&minimal, false).len(), 2);
+    // A ready, writable gateway warns about nothing.
+    let ready = HealthProbe {
+        http_status: 200,
+        health: serde_json::from_str::<HealthStatus>(
+            r#"{"status":"ok","ready":true,"mode":"database","admin_writes_enabled":true}"#,
+        )
+        .unwrap(),
+    };
+    assert!(health_preflight_warnings(&ready, false).is_empty());
+}
