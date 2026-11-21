@@ -42,15 +42,20 @@ pub fn mask_indeterminate_secret_values(
         {
             for (credential_type, desired_value) in &expected.credentials {
                 if let Some(live_value) = live.credentials.get_mut(credential_type) {
-                    mask_unresolved_leaves(desired_value, live_value, &mut Vec::new(), &|path| {
-                        let slot = consumer_credential_slot(
-                            &expected.namespace,
-                            &expected.id,
-                            credential_type,
-                            path,
-                        );
-                        unresolved.contains(slot.as_str())
-                    });
+                    mask_unresolved_leaves(
+                        desired_value,
+                        live_value,
+                        &mut Vec::new(),
+                        &|path, _| {
+                            let slot = consumer_credential_slot(
+                                &expected.namespace,
+                                &expected.id,
+                                credential_type,
+                                path,
+                            );
+                            unresolved.contains(slot.as_str())
+                        },
+                    );
                 }
             }
         }
@@ -71,7 +76,18 @@ pub fn mask_indeterminate_secret_values(
                 &expected.config,
                 &mut live.config,
                 &mut Vec::new(),
-                &|path| {
+                &|path, live_text| {
+                    // At a schema TLS key source only live key material is
+                    // masked: a live key file or provider URI stays compared.
+                    if crate::secrets::tls_material::is_plugin_key_source(
+                        &expected.plugin_name,
+                        path,
+                    ) && !crate::secrets::tls_material::is_private_key_material(
+                        live_text,
+                        Some(crate::secrets::tls_material::TlsMaterialField::PrivateKey),
+                    ) {
+                        return false;
+                    }
                     let slot = plugin_config_slot(
                         &expected.namespace,
                         &expected.id,
@@ -165,11 +181,11 @@ fn mask_unresolved_leaves(
     desired: &serde_json::Value,
     live: &mut serde_json::Value,
     path: &mut Vec<ConfigPathComponent>,
-    is_unresolved: &impl Fn(&[ConfigPathComponent]) -> bool,
+    is_unresolved: &impl Fn(&[ConfigPathComponent], &str) -> bool,
 ) {
     match (desired, live) {
         (serde_json::Value::String(expected), serde_json::Value::String(actual))
-            if is_unresolved(path) =>
+            if is_unresolved(path, actual) =>
         {
             *actual = expected.clone();
         }
@@ -220,7 +236,9 @@ pub fn is_sensitive_diff_field(kind: &str, field: &str) -> bool {
 /// Redact even placeholder-shaped strings: the field diff has no resolution
 /// provenance, and either side may hold accepted secret material with that shape.
 fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
-    if kind == "Proxy" || kind == "Upstream" {
+    // Proxy/Upstream TLS fields, and a PluginConfig's undeclared top-level
+    // fields (its `config` is suppressed whole by `is_sensitive_diff_field`).
+    if matches!(kind, "Proxy" | "Upstream" | "PluginConfig") {
         redact_private_key_changes(changes);
     }
     if kind != "Upstream" {

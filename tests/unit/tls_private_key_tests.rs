@@ -917,3 +917,299 @@ fn review_comment_loses_live_private_keys() {
         }
     }
 }
+
+fn plugin_with_extra(field: &str, value: serde_json::Value) -> GatewayConfig {
+    let mut entry = plugin(
+        "udp_logging",
+        serde_json::json!({"host": "logs.internal", "port": 5514}),
+    );
+    entry[field] = value;
+    gateway(serde_json::json!({"plugin_configs": [entry]}))
+}
+
+/// An undeclared PluginConfig top-level field (kept only when the operator
+/// acknowledges the unknown field) is unmodeled, so key material there is
+/// refused, blocked, scrubbed and redacted, never brokered.
+#[test]
+fn plugin_passthrough_fields_are_swept_for_private_keys() {
+    let bundle = format!(
+        "{}{}",
+        synthetic_cert("public-extra-cert"),
+        synthetic_key("zq7-extra-field-key")
+    );
+    let mut cfg = plugin_with_extra("future_tls_bundle", serde_json::json!(bundle));
+    assert!(cfg.plugin_configs[0]
+        .extra
+        .contains_key("future_tls_bundle"));
+
+    let message = capture_all(&mut cfg.clone()).unwrap_err().to_string();
+    assert!(message.contains("future_tls_bundle"), "{message}");
+    assert!(message.contains("undeclared top-level field"), "{message}");
+    assert!(!message.contains(&body("zq7-extra-field-key")), "{message}");
+
+    let findings = audit_security(&cfg);
+    assert!(security_blockers(&findings).iter().any(|finding| finding
+        .message
+        .contains("undeclared field 'future_tls_bundle'")));
+
+    let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&cfg);
+    let scrubbed = scrubber.scrub(&synthetic_key("zq7-extra-field-key"));
+    assert!(
+        !scrubbed.contains(&body("zq7-extra-field-key")),
+        "{scrubbed}"
+    );
+
+    let desired = cfg.clone();
+    cfg.plugin_configs[0].extra.insert(
+        "future_tls_bundle".to_string(),
+        serde_json::json!(format!(
+            "{}{}",
+            synthetic_cert("public-extra-cert"),
+            synthetic_key("zq7-extra-field-live")
+        )),
+    );
+    let diffs = gitforgeops::diff::compute_diff(&desired, &cfg).unwrap();
+    assert_eq!(diffs.len(), 1, "{diffs:?}");
+    let rendered = format!("{diffs:?}");
+    for canary in ["zq7-extra-field-key", "zq7-extra-field-live"] {
+        assert!(!rendered.contains(&body(canary)), "{rendered}");
+    }
+    assert!(rendered.contains("future_tls_bundle"), "{rendered}");
+}
+
+/// The DTLS pair is omitted only when Edge would load it: DTLS enabled and a
+/// certificate source present. Otherwise the declared shape reaches Edge.
+#[test]
+fn dtls_pair_is_omitted_only_when_enabled_with_a_certificate() {
+    for (name, config, omitted) in [
+        (
+            "enabled with certificate",
+            serde_json::json!({"dtls": true, "dtls_cert_path": CERT_PATH, "dtls_key_path": PLACEHOLDER}),
+            true,
+        ),
+        (
+            "dtls disabled",
+            serde_json::json!({"dtls": false, "dtls_cert_path": CERT_PATH, "dtls_key_path": PLACEHOLDER}),
+            false,
+        ),
+        (
+            "dtls absent",
+            serde_json::json!({"dtls_cert_path": CERT_PATH, "dtls_key_path": PLACEHOLDER}),
+            false,
+        ),
+        (
+            "certificate missing",
+            serde_json::json!({"dtls": true, "dtls_key_path": PLACEHOLDER}),
+            false,
+        ),
+        (
+            "certificate empty",
+            serde_json::json!({"dtls": true, "dtls_cert_path": "", "dtls_key_path": PLACEHOLDER}),
+            false,
+        ),
+        (
+            "certificate not a string",
+            serde_json::json!({"dtls": true, "dtls_cert_path": 7, "dtls_key_path": PLACEHOLDER}),
+            false,
+        ),
+    ] {
+        let mut config = config;
+        config["host"] = serde_json::json!("logs.internal");
+        config["port"] = serde_json::json!(5514);
+        let cfg =
+            gateway(serde_json::json!({"plugin_configs": [plugin("udp_logging", config.clone())]}));
+        let patched = gitforgeops::validate::with_validation_standins(&cfg).unwrap();
+        let object = patched.plugin_configs[0].config.as_object().unwrap();
+        if omitted {
+            assert!(!object.contains_key("dtls_key_path"), "{name}");
+            assert!(!object.contains_key("dtls_cert_path"), "{name}");
+        } else {
+            let key = object["dtls_key_path"].as_str().unwrap();
+            assert!(
+                key.starts_with("-----BEGIN PRIVATE KEY-----"),
+                "{name}: {key}"
+            );
+            assert_eq!(
+                object.get("dtls_cert_path"),
+                config.get("dtls_cert_path"),
+                "{name}"
+            );
+        }
+    }
+}
+
+/// A seeded value is checked like the literal import would be: a
+/// certificate-plus-key bundle at a certificate source or in an ordinary
+/// string, or placeholder text at a TLS key source, is refused without
+/// echoing the seed. A seeded key file path stays a valid reference.
+#[test]
+fn seeded_tls_values_are_checked_like_literals() {
+    let bundle_value = format!(
+        "{}{}",
+        synthetic_cert("public-seeded-cert"),
+        synthetic_key("zq7-seeded-bundle-key")
+    );
+    for (name, cfg, slot, seed) in [
+        (
+            "dtls certificate source",
+            gateway(
+                serde_json::json!({"plugin_configs": [plugin("udp_logging", serde_json::json!({
+                    "host": "logs.internal", "port": 5514, "dtls": true,
+                    "dtls_cert_path": PLACEHOLDER, "dtls_key_path": KEY_PATH,
+                }))]}),
+            ),
+            "ferrum/edge-plugin/@plugin/udp_logging/config/dtls_cert_path",
+            bundle_value.clone(),
+        ),
+        (
+            "ordinary plugin string",
+            gateway(
+                serde_json::json!({"plugin_configs": [plugin("acme_custom_tls", serde_json::json!({
+                    "material": PLACEHOLDER,
+                }))]}),
+            ),
+            "ferrum/edge-plugin/@plugin/acme_custom_tls/config/material",
+            bundle_value.clone(),
+        ),
+        (
+            "proxy key placeholder text",
+            brokered_gateway("require"),
+            PROXY_SLOT,
+            "${gh-env-secret:alloc=generate}".to_string(),
+        ),
+        (
+            "dtls key placeholder text",
+            brokered_gateway("require"),
+            DTLS_SLOT,
+            PLACEHOLDER.to_string(),
+        ),
+    ] {
+        let mut cfg = cfg;
+        let mut bundle = BTreeMap::from([(slot.to_string(), seed.clone())]);
+        if slot == PROXY_SLOT || slot == DTLS_SLOT {
+            for other in [PROXY_SLOT, UPSTREAM_SLOT, DTLS_SLOT] {
+                bundle
+                    .entry(other.to_string())
+                    .or_insert_with(|| synthetic_key("zq7-other-seed"));
+            }
+        }
+        let message = super::resolver_fixtures::resolve_secrets(&mut cfg, &bundle)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(slot), "{name}: {message}");
+        assert!(!message.contains(&body("zq7-seeded-bundle-key")), "{name}");
+        assert!(!message.contains("${gh-env-secret"), "{name}: {message}");
+        let report = super::resolver_fixtures::report_secrets(&cfg, &bundle);
+        assert!(report.is_err(), "{name}: the read-only walk refuses too");
+    }
+
+    // A seeded key file path at a key source is a reference, not text.
+    let mut cfg = brokered_gateway("require");
+    let bundle = BTreeMap::from([
+        (PROXY_SLOT.to_string(), KEY_PATH.to_string()),
+        (
+            UPSTREAM_SLOT.to_string(),
+            synthetic_key("zq7-seeded-upstream"),
+        ),
+        (DTLS_SLOT.to_string(), synthetic_key("zq7-seeded-dtls")),
+    ]);
+    super::resolver_fixtures::resolve_secrets(&mut cfg, &bundle).unwrap();
+    assert_eq!(
+        cfg.proxies[0].backend_tls_client_key_path.as_deref(),
+        Some(KEY_PATH)
+    );
+}
+
+/// At a plugin TLS key source, an unresolved declaration masks only live key
+/// material; a live key file or provider URI stays compared.
+#[test]
+fn plugin_key_source_masking_keeps_live_references_visible() {
+    for (plugin_name, desired_config, pointer) in [
+        (
+            "udp_logging",
+            serde_json::json!({"host": "logs.internal", "port": 5514, "dtls": true,
+                "dtls_cert_path": CERT_PATH, "dtls_key_path": PLACEHOLDER}),
+            "/dtls_key_path",
+        ),
+        (
+            "mesh_route_dispatch",
+            serde_json::json!({"rules": [{"destination": {"backend_tls": {
+                "client_cert_path": CERT_PATH, "client_key_path": PLACEHOLDER}}}]}),
+            "/rules/0/destination/backend_tls/client_key_path",
+        ),
+    ] {
+        let desired =
+            gateway(serde_json::json!({"plugin_configs": [plugin(plugin_name, desired_config)]}));
+        for (live, visible) in [
+            (synthetic_key("zq7-live-plugin-key"), false),
+            (KEY_PATH.to_string(), true),
+            ("vault://secret/tls#client.key".to_string(), true),
+        ] {
+            let mut actual = desired.clone();
+            *actual.plugin_configs[0]
+                .config
+                .pointer_mut(pointer)
+                .unwrap() = serde_json::json!(live);
+            mask_without_bundle(&desired, &mut actual);
+            let diffs = gitforgeops::diff::compute_diff(&desired, &actual).unwrap();
+            assert_eq!(
+                !diffs.is_empty(),
+                visible,
+                "{plugin_name} {live}: {diffs:?}"
+            );
+            assert!(!format!("{diffs:?}").contains(&body("zq7-live-plugin-key")));
+        }
+    }
+}
+
+/// Edge's other certificate sources (`mtls_auth` issuer CAs, SOAP trusted
+/// certificates) never broker a key and refuse a redacted value; an intact
+/// certificate there is left alone.
+#[test]
+fn edge_certificate_sources_refuse_keys_and_sentinels() {
+    type Shape = fn(serde_json::Value) -> serde_json::Value;
+    let shapes: [(&str, Shape); 3] = [
+        (
+            "mtls_auth",
+            |v| serde_json::json!({"allowed_issuers": [{"ca_certificate_pem": v}]}),
+        ),
+        (
+            "soap_ws_security",
+            |v| serde_json::json!({"x509_signature": {"trusted_certs": [v]}}),
+        ),
+        (
+            "soap_ws_security",
+            |v| serde_json::json!({"saml": {"trusted_signing_certs": [v]}}),
+        ),
+    ];
+    for (plugin_name, value) in shapes {
+        let wrap = |text: String| {
+            gateway(
+                serde_json::json!({"plugin_configs": [plugin(plugin_name, value(serde_json::json!(text)))]}),
+            )
+        };
+        let mut bare_key = wrap(synthetic_key("zq7-cert-source-key"));
+        let message = capture_all(&mut bare_key).unwrap_err().to_string();
+        assert!(
+            message.contains("TLS private-key material"),
+            "{plugin_name}: {message}"
+        );
+        assert!(
+            security_blockers(&audit_security(&wrap(synthetic_key("zq7-cert-source-key"))))
+                .iter()
+                .any(|finding| finding.message.contains("keep only certificates"))
+        );
+
+        let mut redacted = wrap("[REDACTED]".to_string());
+        let message = capture_all(&mut redacted).unwrap_err().to_string();
+        assert!(
+            message.contains("reserved redaction sentinel"),
+            "{plugin_name}: {message}"
+        );
+
+        let mut intact = wrap(synthetic_cert("public-issuer"));
+        let before = serde_json::to_value(&intact).unwrap();
+        assert!(capture_all(&mut intact).unwrap().is_empty());
+        assert_eq!(serde_json::to_value(&intact).unwrap(), before);
+    }
+}

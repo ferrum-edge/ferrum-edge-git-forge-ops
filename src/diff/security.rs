@@ -756,6 +756,18 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
             message,
         ));
     }
+    for path in crate::secrets::tls_material::passthrough_private_key_sites(&plugin.extra) {
+        let path = render_config_path(&path);
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            &plugin.id,
+            &plugin.namespace,
+            format!(
+                "Literal TLS private key in undeclared field '{path}' on plugin {} ({}) in namespace {} (an unmodeled field is never brokered; remove the key or move it to the plugin's key field as ${{gh-env-secret:alloc=require}})",
+                plugin.id, plugin.plugin_name, plugin.namespace
+            ),
+        ));
+    }
     // A header or query value too short to broker or redact (so never a
     // placeholder) is an ordinary setting, and nothing above gates it; when
     // its name looks like a credential, say so (never the value) instead of

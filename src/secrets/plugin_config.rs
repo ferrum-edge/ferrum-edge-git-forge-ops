@@ -661,18 +661,11 @@ fn classify_private_key_material(
     config: &Value,
     sensitive: &mut BTreeSet<Vec<ConfigPathComponent>>,
 ) -> BTreeSet<Vec<ConfigPathComponent>> {
-    use super::tls_material::KeyPlacement;
     let mut unbrokerable = BTreeSet::new();
     for site in super::tls_material::plugin_private_key_sites(plugin_name, config) {
-        let bundle = || {
-            matches!(value_at(config, &site.path), Some(Value::String(text))
-                if super::tls_material::contains_public_pem_block(text))
-        };
-        let refuse = match site.placement {
-            KeyPlacement::Certificate => true,
-            KeyPlacement::Other => bundle(),
-            KeyPlacement::KeySource => false,
-        };
+        // The verdict the resolver also applies to a value seeded for this slot.
+        let refuse = matches!(value_at(config, &site.path), Some(Value::String(text))
+            if super::tls_material::is_unbrokerable_plugin_value(plugin_name, &site.path, text));
         if refuse {
             sensitive.remove(&site.path);
             unbrokerable.insert(site.path);

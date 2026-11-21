@@ -757,6 +757,15 @@ fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink)
                 .into_iter()
                 .map(|site| site.path)
                 .collect();
+        for path in super::tls_material::passthrough_private_key_sites(&plugin.extra) {
+            let Some(serde_json::Value::String(text)) = value_at_extra(&plugin.extra, &path) else {
+                continue;
+            };
+            let rendered = render_config_path(&path);
+            private_key_leaf(text, out, &|| {
+                leaf_location("PluginConfig", &plugin.namespace, &plugin.id, &rendered)
+            });
+        }
         for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
             if let Some(serde_json::Value::String(text)) = value_at(&plugin.config, &path) {
                 let location = || {
@@ -775,6 +784,17 @@ fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink)
             }
         }
     }
+}
+
+/// The value at `path` (field name first) in a passthrough map.
+fn value_at_extra<'a>(
+    extra: &'a std::collections::BTreeMap<String, serde_json::Value>,
+    path: &[ConfigPathComponent],
+) -> Option<&'a serde_json::Value> {
+    let (ConfigPathComponent::Key(field), rest) = path.split_first()? else {
+        return None;
+    };
+    value_at(extra.get(field)?, rest)
 }
 
 /// One TLS private-key value: the stored bytes, required, plus each key block

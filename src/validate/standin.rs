@@ -360,6 +360,20 @@ fn unresolved_paired_key(
     let (_, key_field, cert_field) = PAIRED_KEY_SOURCES
         .iter()
         .find(|(name, _, _)| *name == plugin_name)?;
+    // Omit the pair only when Edge would actually load it: DTLS enabled and
+    // a certificate source present as a non-empty string. Otherwise the copy
+    // keeps the declared shape, so Edge's own enablement, pairing and type
+    // checks still run (on the PEM-shaped key stand-in).
+    if config.get("dtls").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    if !config
+        .get(*cert_field)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|cert| !cert.trim().is_empty())
+    {
+        return None;
+    }
     let text = config.get(*key_field)?.as_str()?;
     if !matches!(parse_placeholder(text), Some(Ok(_))) {
         return None;

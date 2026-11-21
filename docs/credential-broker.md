@@ -181,9 +181,11 @@ be named `private_key` keeps its ordinary handling.
   above, plugin-config keys under their `@plugin` slot. A bare key in another
   plugin string (for example inside `ai_federation`
   `google_service_account_json`) is brokered the same way.
-- A private key in a certificate or CA field, or a certificate-plus-key bundle
-  outside a private-key field, is never brokered, because the value also holds
-  a certificate that must stay reviewable. `import` refuses it, naming the
+- A private key in a certificate or CA field (including `mtls_auth` issuer CAs
+  and `soap_ws_security` trusted certificates), a certificate-plus-key bundle
+  outside a private-key field, or a key in a PluginConfig's undeclared
+  top-level field (even an acknowledged one) is never brokered: the value also
+  holds a certificate that must stay reviewable, or the field is unmodeled. `import` refuses it, naming the
   resource and field, and no plaintext allowance applies. Remove the key block
   from that field on the gateway (Edge reads only the certificates there) and
   re-run.
@@ -197,14 +199,18 @@ be named `private_key` keeps its ordinary handling.
   and each encoded body line; because a PEM block is multi-line, validator
   diagnostics are withheld while one is resolved.
 - The broker never generates a TLS key (`alloc=generate` is refused): it must
-  match the configured certificate. Seed the slot with the PEM key.
+  match the configured certificate. Seed the slot with the PEM key. A seed is
+  checked like a literal: placeholder text at a key slot, or a
+  certificate-plus-key bundle seeded for a certificate field or an ordinary
+  plugin string, is refused, naming the slot but never the value.
 - Where a key is unresolved (no bundle, or file-mode `apply`, which validates
   the publication document), the validator gets a PEM-shaped stand-in. Edge
   parses an inline Proxy, Upstream or `mesh_route_dispatch` key but does not
   pair it with the certificate, so that validates. `udp_logging` pairs its
-  DTLS key with `dtls_cert_path`, which no stand-in can satisfy, so the
-  validation copy omits both and Edge validates the rest of the plugin with
-  an ephemeral identity. The real pair is validated wherever the bundle is
+  DTLS key with `dtls_cert_path`, which no stand-in can satisfy, so when DTLS
+  is enabled and `dtls_cert_path` is a non-empty string the validation copy
+  omits both and Edge validates the rest of the plugin with an ephemeral
+  identity; otherwise the declared shape reaches Edge's own checks. The real pair is validated wherever the bundle is
   loaded (`validate`, `plan`, `review`).
 
 Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,

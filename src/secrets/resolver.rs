@@ -709,22 +709,70 @@ fn check_consumer_secret_not_placeholder_text(
     committed: &str,
     value: &str,
 ) -> crate::error::Result<()> {
-    const PLACEHOLDER_PREFIX: &str = "${gh-env-secret:";
-    let trimmed = value.trim();
-    let has_placeholder_prefix = trimmed
-        .get(..PLACEHOLDER_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PLACEHOLDER_PREFIX));
-    let reason = if trimmed == committed {
-        "equals the placeholder text committed for this slot"
-    } else if parse_placeholder(trimmed).is_some() || has_placeholder_prefix {
-        "matches the gh-env-secret placeholder grammar"
-    } else {
+    let Some(reason) = placeholder_text_reason(committed, value) else {
         return Ok(());
     };
     Err(crate::error::Error::Config(format!(
         "credential slot '{slot}' holds a bundle value that {reason}, not a secret. \
          Placeholder text is repository-known and cannot be a live Consumer credential; \
          re-seed the slot with the real secret or rotate it with 'gitforgeops rotate'."
+    )))
+}
+
+/// Why a bundle value is placeholder text rather than a value, or `None`.
+/// Shared by the Consumer guard and the TLS private-key guard.
+fn placeholder_text_reason(committed: &str, value: &str) -> Option<&'static str> {
+    const PLACEHOLDER_PREFIX: &str = "${gh-env-secret:";
+    let trimmed = value.trim();
+    let has_placeholder_prefix = trimmed
+        .get(..PLACEHOLDER_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PLACEHOLDER_PREFIX));
+    if trimmed == committed {
+        Some("equals the placeholder text committed for this slot")
+    } else if parse_placeholder(trimmed).is_some() || has_placeholder_prefix {
+        Some("matches the gh-env-secret placeholder grammar")
+    } else {
+        None
+    }
+}
+
+/// Refuse a bundle value seeded for a TLS private-key slot (Proxy/Upstream
+/// `backend_tls_client_key_path`, a schema plugin key source) that is
+/// placeholder text. Edge would read it as a filesystem path, so a
+/// materialized file would ship a broken key source, while the API write
+/// path refuses the same row. Names the slot and the reason, never the value.
+fn check_tls_key_not_placeholder_text(
+    slot: &str,
+    committed: &str,
+    value: &str,
+) -> crate::error::Result<()> {
+    let Some(reason) = placeholder_text_reason(committed, value) else {
+        return Ok(());
+    };
+    Err(crate::error::Error::Config(format!(
+        "secret slot '{slot}' holds a bundle value that {reason}, not a TLS private key; \
+         re-seed the slot with the PEM key."
+    )))
+}
+
+/// Refuse a bundle value seeded for a plugin-config slot that the broker must
+/// never hold ([`super::tls_material::is_unbrokerable_plugin_value`]): private-key
+/// material in a certificate or CA source, or a certificate-plus-key bundle
+/// outside a key source. Import refuses the same literal. Names the slot,
+/// never the value.
+fn check_plugin_seed_brokerable(
+    slot: &str,
+    plugin_name: &str,
+    path: &[ConfigPathComponent],
+    value: &str,
+) -> crate::error::Result<()> {
+    if !super::tls_material::is_unbrokerable_plugin_value(plugin_name, path, value) {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "plugin config slot '{slot}' holds TLS private-key material that is never brokered \
+         (a key in a certificate or CA field, or a certificate-plus-key bundle). Keep only \
+         certificates in this field and seed the key in the plugin's key field."
     )))
 }
 
@@ -1061,6 +1109,15 @@ pub fn capture_and_redact_import_plugin_config_secrets(
                 safe_line(render_config_path(path))
             )));
         }
+        for path in super::tls_material::passthrough_private_key_sites(&plugin.extra) {
+            unbrokerable_private_keys.push(format!(
+                "PluginConfig {}/{} ({}): {} (undeclared top-level field)",
+                safe_line(&plugin.namespace),
+                safe_line(&plugin.id),
+                safe_line(&plugin.plugin_name),
+                safe_line(render_config_path(&path))
+            ));
+        }
         let classification = classify_plugin_config(&plugin.plugin_name, &plugin.config);
         for path in &classification.unbrokerable_private_keys {
             unbrokerable_private_keys.push(format!(
@@ -1115,7 +1172,7 @@ pub fn capture_and_redact_import_plugin_config_secrets(
     // a private key.
     if !unbrokerable_private_keys.is_empty() {
         return Err(crate::error::Error::Config(format!(
-            "refusing to import TLS private-key material outside a private-key field of plugin config; it would be committed to the repository as written. Keep only the certificates in certificate and CA fields and put the key in the plugin's key field (which import brokers) or reference a key file, then re-run import. Nothing has been written.\n  {}",
+            "refusing to import TLS private-key material that plugin config cannot broker (a key in a certificate or CA field, a certificate-plus-key bundle, or a key in an undeclared top-level field); it would be committed to the repository as written. Keep only the certificates in certificate and CA fields and put the key in the plugin's key field (which import brokers) or reference a key file, then re-run import. Nothing has been written.\n  {}",
             unbrokerable_private_keys.join("\n  ")
         )));
     }
@@ -2629,6 +2686,9 @@ fn resolve_backend_tls_leaf(
     let placeholder = parsed?;
     let slot = super::backend_tls::slot(owner, namespace, id);
     let existing = lookup_exact_slot_value(&slot, bundle)?;
+    if let Some(value) = existing {
+        check_tls_key_not_placeholder_text(&slot, text, value)?;
+    }
     let status = classify_status(&placeholder, existing);
 
     if matches!(constraints, ConstraintMode::Enforce)
@@ -2772,6 +2832,12 @@ impl<'a> PluginWalk<'a> {
         let placeholder = parsed?;
         let slot = plugin_config_slot(self.namespace, self.plugin_id, self.plugin_name, path);
         let existing = lookup_exact_slot_value(&slot, self.bundle)?;
+        if let Some(value) = existing {
+            check_plugin_seed_brokerable(&slot, self.plugin_name, path, value)?;
+            if super::tls_material::is_plugin_key_source(self.plugin_name, path) {
+                check_tls_key_not_placeholder_text(&slot, text, value)?;
+            }
+        }
         let status = classify_status(&placeholder, existing);
         let endpoint = self.endpoints.contains(path);
         if matches!(self.constraints, ConstraintMode::Enforce)

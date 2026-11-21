@@ -118,6 +118,12 @@ const PLUGIN_KEY_SOURCES: &[(&str, &[&str])] = &[
 const PLUGIN_CERTIFICATE_SOURCES: &[(&str, &[&str])] = &[
     ("udp_logging", &["dtls_cert_path"]),
     ("udp_logging", &["dtls_ca_cert_path"]),
+    ("mtls_auth", &["allowed_issuers", "*", "ca_certificate_pem"]),
+    (
+        "soap_ws_security",
+        &["x509_signature", "trusted_certs", "*"],
+    ),
+    ("soap_ws_security", &["saml", "trusted_signing_certs", "*"]),
 ];
 
 /// Whether `path` matches a schema `pattern` (see [`PLUGIN_KEY_SOURCES`]).
@@ -218,18 +224,68 @@ pub(crate) fn plugin_private_key_sites(plugin_name: &str, config: &Value) -> Vec
     found
         .into_iter()
         .map(|path| {
-            let placement = if is_plugin_key_source(plugin_name, &path) {
-                KeyPlacement::KeySource
-            } else if is_plugin_certificate_source(plugin_name, &path)
-                || placement_by_name(nearest_field(&path)) == KeyPlacement::Certificate
-            {
-                KeyPlacement::Certificate
-            } else {
-                KeyPlacement::Other
-            };
+            let placement = plugin_placement(plugin_name, &path);
             PrivateKeySite { path, placement }
         })
         .collect()
+}
+
+/// TLS private-key material in a resource's undeclared top-level fields (the
+/// flattened passthrough map an acknowledged unknown field lands in). Those
+/// fields are unmodeled, so material there is never brokered: import refuses
+/// it even when the field name is acknowledged, the audit blocks it, and it
+/// is scrubbed and redacted. Paths start with the field name.
+pub(crate) fn passthrough_private_key_sites(
+    extra: &std::collections::BTreeMap<String, Value>,
+) -> Vec<Vec<ConfigPathComponent>> {
+    let object: serde_json::Map<String, Value> = extra
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    private_key_sites(&Value::Object(object))
+        .into_iter()
+        .map(|site| site.path)
+        .collect()
+}
+
+/// Where `path` sits in a `plugin_name` config: a schema key source, a
+/// certificate source (by schema or by name), or anything else.
+pub(crate) fn plugin_placement(plugin_name: &str, path: &[ConfigPathComponent]) -> KeyPlacement {
+    if is_plugin_key_source(plugin_name, path) {
+        KeyPlacement::KeySource
+    } else if is_plugin_certificate_source(plugin_name, path)
+        || placement_by_name(nearest_field(path)) == KeyPlacement::Certificate
+    {
+        KeyPlacement::Certificate
+    } else {
+        KeyPlacement::Other
+    }
+}
+
+/// Whether `value` at `path` in a `plugin_name` config is private-key
+/// material the broker must never hold: material in a certificate or CA
+/// source, or a certificate-plus-key bundle outside a key source. Import
+/// refuses such a literal ([`super::plugin_config`]); the resolver refuses a
+/// bundle value seeded for such a slot the same way.
+pub(crate) fn is_unbrokerable_plugin_value(
+    plugin_name: &str,
+    path: &[ConfigPathComponent],
+    value: &str,
+) -> bool {
+    let placement = plugin_placement(plugin_name, path);
+    let field = if placement == KeyPlacement::KeySource {
+        Some(TlsMaterialField::PrivateKey)
+    } else {
+        nearest_field(path)
+    };
+    if !is_private_key_material(value, field) {
+        return false;
+    }
+    match placement {
+        KeyPlacement::Certificate => true,
+        KeyPlacement::Other => contains_public_pem_block(value),
+        KeyPlacement::KeySource => false,
+    }
 }
 
 /// [`tls_material_field`] of the nearest object key on `path`.
