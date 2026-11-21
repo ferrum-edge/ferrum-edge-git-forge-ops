@@ -2049,3 +2049,441 @@ fn review_validates_gateway_and_mesh_before_reporting_passed() {
     assert!(result.output.contains("gateway validator execution error"));
     assert!(result.output.contains("mesh validator execution error"));
 }
+
+// ---------------------------------------------------------------------------
+// Endpoint and key stand-ins shaped for the gateway's own checks (#745). Each
+// shape mirrors a Ferrum Edge v0.9.20 (and current main) admission rule, so a
+// brokered leaf fails validation only when its configuration is wrong.
+// ---------------------------------------------------------------------------
+
+const BROKERED: &str = "${gh-env-secret:alloc=require}";
+
+/// The stand-in that replaced a single brokered leaf of `plugin_name`.
+fn plugin_standin(plugin_name: &str, config: serde_json::Value, path: &[&str]) -> String {
+    let gateway = plugin_config_for("standin", plugin_name, config);
+    let patched =
+        gitforgeops::validate::with_validation_standins(&gateway).expect("a brokered leaf");
+    let mut cursor = &patched.plugin_configs[0].config;
+    for part in path {
+        cursor = match part.parse::<usize>() {
+            Ok(index) => &cursor[index],
+            Err(_) => &cursor[*part],
+        };
+    }
+    cursor.as_str().expect("string stand-in").to_string()
+}
+
+/// The host label in front of the reserved stand-in host.
+fn standin_host_label(url: &url::Url) -> String {
+    use gitforgeops::validate::VALIDATION_STANDIN_HOST;
+
+    let host = url.host_str().expect("host");
+    let label = host
+        .strip_suffix(&format!(".{VALIDATION_STANDIN_HOST}"))
+        .unwrap_or_else(|| panic!("{host} is not under the stand-in host"));
+    assert_eq!(label.len(), 32, "{host}");
+    assert!(label.bytes().all(|byte| byte.is_ascii_hexdigit()), "{host}");
+    label.to_string()
+}
+
+/// Edge's `validate_redis_database_selector` admits only an empty path, `/`,
+/// or a canonical database number, so the digest path the generic URL
+/// stand-in carries was refused for every Redis-backed plugin. Uniqueness
+/// moves into a host label and the path selects database 0.
+#[test]
+fn redis_stand_ins_select_a_database_and_keep_slots_distinct_in_the_host() {
+    let mut labels = std::collections::BTreeSet::new();
+    for plugin_name in [
+        "rate_limiting",
+        "ws_rate_limiting",
+        "udp_rate_limiting",
+        "ai_rate_limiter",
+        "graphql",
+        "grpc_method_router",
+        "request_deduplication",
+        "ai_semantic_cache",
+        "soap_ws_security",
+        "jwks_auth",
+        "hmac_auth",
+    ] {
+        let standin = plugin_standin(
+            plugin_name,
+            serde_json::json!({"sync_mode": "redis", "redis_url": BROKERED}),
+            &["redis_url"],
+        );
+        let parsed = url::Url::parse(&standin).expect("a URL");
+        assert_eq!(parsed.scheme(), "redis", "{standin}");
+        // The raw selector Edge inspects, not the parser's normalization.
+        assert!(standin.ends_with(".invalid/0"), "{standin}");
+        assert_eq!(parsed.path(), "/0", "{standin}");
+        assert!(parsed.query().is_none() && parsed.fragment().is_none());
+        assert!(parsed.username().is_empty() && parsed.password().is_none());
+        assert!(
+            labels.insert(standin_host_label(&parsed)),
+            "{plugin_name}: {standin}"
+        );
+    }
+}
+
+/// `ws_logging` refuses anything but `ws://` / `wss://`.
+#[test]
+fn ws_logging_endpoint_stand_in_is_a_websocket_url() {
+    use gitforgeops::validate::VALIDATION_STANDIN_HOST;
+
+    let standin = plugin_standin(
+        "ws_logging",
+        serde_json::json!({"endpoint_url": BROKERED}),
+        &["endpoint_url"],
+    );
+    assert!(
+        standin.starts_with(&format!("wss://{VALIDATION_STANDIN_HOST}/")),
+        "{standin}"
+    );
+}
+
+/// `serverless_function` refuses an `aws_endpoint_url` with any path but `/`
+/// (or a query); `function_url` takes any path and keeps the digest there.
+#[test]
+fn aws_endpoint_stand_in_is_an_origin_and_function_url_keeps_its_path() {
+    use gitforgeops::validate::VALIDATION_STANDIN_HOST;
+
+    // The row carries its own (brokered) key pair, so the endpoint is not
+    // scoped to official AWS hosts.
+    let config = serde_json::json!({
+        "provider": "aws_lambda",
+        "aws_access_key_id": BROKERED,
+        "aws_secret_access_key": BROKERED,
+        "aws_endpoint_url": BROKERED,
+        "function_url": BROKERED
+    });
+    let origin = plugin_standin("serverless_function", config.clone(), &["aws_endpoint_url"]);
+    let parsed = url::Url::parse(&origin).expect("a URL");
+    assert_eq!(parsed.scheme(), "https", "{origin}");
+    assert_eq!(parsed.path(), "/", "{origin}");
+    assert!(parsed.query().is_none() && parsed.fragment().is_none());
+    standin_host_label(&parsed);
+
+    let function = plugin_standin("serverless_function", config, &["function_url"]);
+    assert!(
+        function.starts_with(&format!("https://{VALIDATION_STANDIN_HOST}/")),
+        "{function}"
+    );
+    assert_eq!(
+        function.len(),
+        format!("https://{VALIDATION_STANDIN_HOST}/").len() + 64
+    );
+}
+
+/// A Lambda row that signs with ambient AWS credentials may only send them to
+/// an official regional endpoint, and Edge's shape-only admission refuses any
+/// other `aws_endpoint_url`, so no `.invalid` stand-in can pass. The stand-in
+/// is the row's own default regional Lambda origin instead (the field stays
+/// present, so Edge never falls back to the caller's
+/// `AWS_LAMBDA_ENDPOINT_URL`). A row with its own key pair, that opts out of
+/// the scope, or whose region Edge would refuse, gets the ordinary origin.
+#[test]
+fn an_ambient_credential_lambda_endpoint_stands_in_as_the_regional_origin() {
+    use gitforgeops::validate::VALIDATION_STANDIN_HOST;
+
+    let lambda = |extra: serde_json::Value| {
+        let mut config = serde_json::json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": BROKERED
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            config[key] = value.clone();
+        }
+        let gateway = plugin_config_for("lambda", "serverless_function", config);
+        gitforgeops::validate::with_validation_standins(&gateway)
+            .map(|patched| patched.plugin_configs[0].config.clone())
+    };
+
+    for (ambient, origin) in [
+        (
+            serde_json::json!({"aws_credentials": "default_chain"}),
+            "https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({}),
+            "https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({"aws_credentials": "static", "aws_access_key_id": "AKIATEST"}),
+            "https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({"aws_secret_access_key": BROKERED}),
+            "https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({"aws_credentials": "default_chain", "aws_region": "us-gov-west-1"}),
+            "https://lambda.us-gov-west-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({"aws_credentials": "default_chain", "aws_region": "cn-north-1"}),
+            "https://lambda.cn-north-1.amazonaws.com.cn/",
+        ),
+    ] {
+        let patched = lambda(ambient.clone()).expect("the copy changed");
+        assert_eq!(patched["aws_endpoint_url"], origin, "{ambient}");
+        assert_eq!(
+            patched.get("aws_credentials"),
+            ambient.get("aws_credentials"),
+            "{ambient}"
+        );
+    }
+
+    for ordinary in [
+        serde_json::json!({"aws_access_key_id": "AKIATEST", "aws_secret_access_key": BROKERED}),
+        serde_json::json!({
+            "aws_credentials": "default_chain",
+            "allow_custom_endpoint_with_ambient_credentials": true
+        }),
+        // Edge reports these regions itself; no guessed endpoint hides that.
+        serde_json::json!({"aws_credentials": "default_chain", "aws_region": "us-iso-east-1"}),
+        serde_json::json!({"aws_credentials": "default_chain", "aws_region": "US-EAST-1"}),
+        serde_json::json!({"aws_credentials": "default_chain", "aws_region": null}),
+    ] {
+        let patched = lambda(ordinary.clone()).expect("the copy changed");
+        let endpoint = patched["aws_endpoint_url"].as_str().expect("a stand-in");
+        let parsed = url::Url::parse(endpoint).unwrap();
+        assert_eq!(parsed.path(), "/", "{ordinary}");
+        assert!(
+            parsed
+                .host_str()
+                .unwrap()
+                .ends_with(VALIDATION_STANDIN_HOST),
+            "{ordinary}"
+        );
+    }
+
+    // A resolved endpoint is validated exactly as configured.
+    let gateway = plugin_config_for(
+        "lambda",
+        "serverless_function",
+        serde_json::json!({
+            "provider": "aws_lambda",
+            "aws_credentials": "default_chain",
+            "aws_region": "us-east-1",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": "https://lambda-fips.us-east-1.amazonaws.com"
+        }),
+    );
+    assert!(gitforgeops::validate::with_validation_standins(&gateway).is_none());
+}
+
+/// A `google_gemini` provider routes the model only through its endpoint, so
+/// Edge refuses an endpoint without the `{model}` placeholder; every other
+/// provider type accepts it.
+#[test]
+fn ai_stream_router_endpoint_stand_in_carries_the_model_placeholder() {
+    use gitforgeops::validate::VALIDATION_STANDIN_HOST;
+
+    let standin = plugin_standin(
+        "ai_stream_router",
+        serde_json::json!({"providers": [{
+            "name": "gemini",
+            "provider_type": "google_gemini",
+            "endpoint": BROKERED
+        }]}),
+        &["providers", "0", "endpoint"],
+    );
+    assert!(
+        standin.starts_with(&format!("https://{VALIDATION_STANDIN_HOST}/")),
+        "{standin}"
+    );
+    assert!(standin.ends_with("/{model}"), "{standin}");
+    // Edge swaps the placeholder for a parse-safe token before parsing.
+    assert!(url::Url::parse(&standin.replace("{model}", "m")).is_ok());
+}
+
+/// Which AWS-LC key type a PKCS#8 `PRIVATE KEY` PEM parses as and signs with.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyKind {
+    Rsa2048,
+    P256,
+    P384,
+    Ed25519,
+}
+
+fn pem_key_kind(pem: &str) -> KeyKind {
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{
+        EcdsaKeyPair, Ed25519KeyPair, RsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
+        ECDSA_P384_SHA384_FIXED_SIGNING, RSA_PKCS1_SHA256,
+    };
+    use base64::Engine;
+
+    let body = pem
+        .strip_prefix("-----BEGIN PRIVATE KEY-----\n")
+        .and_then(|rest| rest.strip_suffix("-----END PRIVATE KEY-----\n"))
+        .expect("PKCS#8 PRIVATE KEY armour");
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body.replace('\n', ""))
+        .expect("base64 body");
+    let rng = SystemRandom::new();
+    let message = b"edge admission probe";
+
+    if let Ok(key) = RsaKeyPair::from_pkcs8(&der) {
+        assert_eq!(key.public_modulus_len(), 256, "a 2048-bit modulus");
+        let mut signature = vec![0; key.public_modulus_len()];
+        key.sign(&RSA_PKCS1_SHA256, &rng, message, &mut signature)
+            .expect("RSA signs");
+        return KeyKind::Rsa2048;
+    }
+    for (alg, kind) in [
+        (&ECDSA_P256_SHA256_FIXED_SIGNING, KeyKind::P256),
+        (&ECDSA_P384_SHA384_FIXED_SIGNING, KeyKind::P384),
+    ] {
+        if let Ok(key) = EcdsaKeyPair::from_pkcs8(alg, &der) {
+            key.sign(&rng, message).expect("ECDSA signs");
+            return kind;
+        }
+    }
+    let key = Ed25519KeyPair::from_pkcs8(&der).expect("an RSA, P-256, P-384 or Ed25519 key");
+    assert_eq!(key.sign(message).as_ref().len(), 64);
+    KeyKind::Ed25519
+}
+
+/// Edge parses a `private_key_jwt` key for the sibling `private_key_jwt_alg`
+/// and signs a throwaway assertion with it at admission, so an opaque token
+/// stand-in was refused as malformed PEM. The stand-in is a throwaway key of
+/// the algorithm's family; an absent algorithm is Edge's `RS256` default, and
+/// one Edge refuses on its own gets an RSA key so the validator reports the
+/// algorithm.
+#[test]
+fn private_key_jwt_stand_ins_are_keys_of_the_selected_algorithm_family() {
+    for plugin_name in ["oauth2_introspection", "oidc_relying_party"] {
+        for (alg, expected) in [
+            (None, KeyKind::Rsa2048),
+            (Some("RS256"), KeyKind::Rsa2048),
+            (Some("RS384"), KeyKind::Rsa2048),
+            (Some("RS512"), KeyKind::Rsa2048),
+            (Some("ES256"), KeyKind::P256),
+            (Some("ES384"), KeyKind::P384),
+            (Some("EdDSA"), KeyKind::Ed25519),
+            (Some("HS256"), KeyKind::Rsa2048),
+        ] {
+            let mut client_auth = serde_json::json!({
+                "method": "private_key_jwt",
+                "client_id": "gateway",
+                "private_key_pem": BROKERED
+            });
+            if let Some(alg) = alg {
+                client_auth["private_key_jwt_alg"] = serde_json::json!(alg);
+            }
+            let pem = plugin_standin(
+                plugin_name,
+                serde_json::json!({"providers": [{"client_auth": client_auth}]}),
+                &["providers", "0", "client_auth", "private_key_pem"],
+            );
+            assert_eq!(pem_key_kind(&pem), expected, "{plugin_name} {alg:?}");
+        }
+    }
+
+    // Each provider's key follows its own sibling algorithm, and the client
+    // secret beside a different provider keeps the opaque token shape.
+    let gateway = plugin_config_for(
+        "oidc",
+        "oidc_relying_party",
+        serde_json::json!({"providers": [
+            {"client_auth": {"private_key_pem": BROKERED, "private_key_jwt_alg": "ES384"}},
+            {"client_auth": {"private_key_pem": BROKERED, "private_key_jwt_alg": "EdDSA"}},
+            {"client_auth": {"client_secret": BROKERED}}
+        ]}),
+    );
+    let patched = gitforgeops::validate::with_validation_standins(&gateway).unwrap();
+    let providers = &patched.plugin_configs[0].config["providers"];
+    let leaf = |index: usize, field: &str| {
+        providers[index]["client_auth"][field]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(pem_key_kind(&leaf(0, "private_key_pem")), KeyKind::P384);
+    assert_eq!(pem_key_kind(&leaf(1, "private_key_pem")), KeyKind::Ed25519);
+    assert!(leaf(2, "client_secret").starts_with(VALIDATION_STANDIN_PREFIX));
+    // The multi-line key survives the temp spec's YAML rendering byte for
+    // byte as the gateway's own YAML reader sees it.
+    let rendered = gitforgeops::yaml::to_string(&patched).unwrap();
+    let reread: serde_json::Value = serde_yaml::from_str(&rendered).unwrap();
+    assert!(
+        reread["plugin_configs"][0]["config"]["providers"][0]["client_auth"]["private_key_pem"]
+            == serde_json::json!(leaf(0, "private_key_pem")),
+        "the key changed through the YAML rendering"
+    );
+    // Never applied to the caller's document.
+    assert_eq!(
+        gateway.plugin_configs[0].config["providers"][0]["client_auth"]["private_key_pem"],
+        serde_json::json!(BROKERED)
+    );
+}
+
+/// The key stand-in reaches the validator through the 0600 temp spec intact,
+/// and, like every stand-in, it is not a scrubber value: a multi-line PEM
+/// registered there would withhold every diagnostic. A wrapper that echoes
+/// its input still never puts the key in the report: its body is
+/// masked on its own, and the ordinary diagnostic beside it stays readable,
+/// even though the echoed spec also repeats the literal `private_key_jwt_alg`.
+#[cfg(unix)]
+#[test]
+fn a_private_key_stand_in_is_masked_in_echoed_output_without_withholding_it() {
+    let config = plugin_config_for(
+        "introspect",
+        "oauth2_introspection",
+        serde_json::json!({"providers": [{"client_auth": {
+            "method": "private_key_jwt",
+            "client_id": "gateway",
+            "private_key_pem": BROKERED,
+            "private_key_jwt_alg": "ES256"
+        }}]}),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let validator = echo_validator(
+        dir.path(),
+        "pem-validator",
+        r#"#!/bin/sh
+mode=$(stat -c %a "$7" 2>/dev/null || stat -f %Lp "$7")
+[ "$mode" = 600 ] || { echo "error: spec mode $mode" >&2; exit 1; }
+grep -q 'BEGIN PRIVATE KEY' "$7" || { echo 'error: private_key_pem is invalid EC PEM' >&2; exit 1; }
+if grep -q 'gh-env-secret' "$7"; then echo 'error: placeholder reached the validator' >&2; exit 1; fi
+cat "$7"
+sed -n 's/.*private_key_pem: //p' "$7" | sed 's/\\n/\n/g' >&2
+echo 'error: proxy httpbin: unknown field `listen_path_typo`' >&2
+exit 1
+"#,
+    );
+
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+
+    assert!(!result.success);
+    assert!(
+        result.stderr.contains("unknown field `listen_path_typo`"),
+        "the diagnostic must not be withheld"
+    );
+    assert!(!result.stderr.contains("withheld"), "output was withheld");
+    let output = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        output.contains("[VALIDATION-STANDIN-KEY]"),
+        "no key was masked"
+    );
+    assert!(output.contains("BEGIN PRIVATE KEY"), "the echo did not run");
+    // Every 64-character base64 line of the key was masked in both the
+    // quoted YAML line and the unescaped PEM.
+    let unmasked_key_line = output.lines().any(|line| {
+        line.trim_matches(|c: char| c == '"' || c.is_whitespace())
+            .len()
+            == 64
+            && line
+                .trim()
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    });
+    assert!(!unmasked_key_line, "a key body line reached the report");
+    assert!(
+        !output.contains("MIG") && !output.contains("MII"),
+        "a DER prefix reached the report"
+    );
+}

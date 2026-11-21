@@ -31,6 +31,13 @@ walkdir = "2"
 # RSA implementation into the admin-token path; RSA remains solely behind
 # `age`'s SSH-recipient support (see docs/dependency-security.md).
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+# Already in the tree as `jsonwebtoken`'s `aws_lc_rs` provider (same version and
+# default features, so the lockfile gains no package). Taken directly to
+# generate the throwaway `private_key_jwt` key a secretless validation run
+# hands `ferrum-edge validate` in place of a brokered `private_key_pem`
+# (src/validate/client_key_standin.rs). Key generation is AWS-LC's, not the
+# RustCrypto `rsa` crate's, so it adds no RUSTSEC-2023-0071 path.
+aws-lc-rs = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 # Already in the tree as a `reqwest` dependency. Taken directly so
 # `FERRUM_GATEWAY_URL` is checked for scheme, host, and embedded credentials by

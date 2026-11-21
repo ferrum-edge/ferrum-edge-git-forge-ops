@@ -442,9 +442,55 @@ gets a fake value of the right shape:
 |---|---|
 | `basicauth` `password_hash` | `hmac_sha256:<64 hex>` |
 | other credentials, and token/header/secret plugin config | `gitforgeops-validation-standin-<64 hex>` |
-| endpoint plugin config (`ldap_url`, `redis_url`, `jwks_uri`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
+| endpoint plugin config (`ldap_url`, `jwks_uri`, `endpoint_url`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
+| a Redis-backed plugin's `redis_url` | `redis://<32 hex>.gitforgeops-validation-standin.invalid/0` |
+| `serverless_function` `aws_endpoint_url` | `https://<32 hex>.gitforgeops-validation-standin.invalid/` |
+| `ai_stream_router` provider `endpoint` | `https://gitforgeops-validation-standin.invalid/<64 hex>/{model}` |
+| `oauth2_introspection` / `oidc_relying_party` `client_auth.private_key_pem` | a throwaway PKCS#8 key for the sibling `private_key_jwt_alg` |
 
-The scheme follows the field (`ldaps://`, `redis://`, otherwise `https://`).
+The scheme follows the field (`ldaps://`, `redis://`, `wss://` for
+`ws_logging`, otherwise `https://`). The shapes follow the gateway's own
+checks: a Redis URL path must be empty, `/` or a database number, an AWS
+Lambda endpoint override must be a bare origin, and a `google_gemini` endpoint
+must carry the `{model}` placeholder (or name its single exact model), so
+those carry the per-slot hash in a host label or before the placeholder
+instead. Edge parses a `private_key_jwt` key and signs
+a test assertion with it at admission, so its stand-in is a real key generated
+for the run (RSA 2048 for `RS256`/`RS384`/`RS512` and when the algorithm is
+unset or unsupported, P-256 for `ES256`, P-384 for `ES384`, Ed25519 for
+`EdDSA`), held only in memory and in the temporary validation file. It is the
+only stand-in that differs between runs. Stand-ins are not secrets and are not
+scrubbed from validator output, but a generated key's body is masked there as
+`[VALIDATION-STANDIN-KEY]` (across line breaks, at any wrap width) in case a
+wrapper around the validator echoes it.
+
+A Lambda row that signs with ambient AWS credentials (`aws_credentials:
+default_chain`, or either key left to the environment) may only use an
+official regional endpoint, which no `.invalid` stand-in can be. Unless
+`allow_custom_endpoint_with_ambient_credentials` is `true`, its unresolved
+`aws_endpoint_url` stands in as the row's default regional endpoint,
+`https://lambda.<region>.amazonaws.com/` (`amazonaws.com.cn` for a `cn-*`
+region), only in the temporary file; the real endpoint is checked when it is
+resolved. The validator's environment is not changed, so another row that
+relies on `AWS_LAMBDA_ENDPOINT_URL` is still checked against it. A row with
+no (or an empty) `aws_region` uses the region the gateway resolves from the
+same environment: the first non-empty of `AWS_DEFAULT_REGION` and
+`AWS_REGION`. When neither is set, or the selected one is not a valid region
+(a malformed `AWS_DEFAULT_REGION` wins over a valid `AWS_REGION`, as it does in
+the gateway), `us-east-1` stands in. The gateway reports a malformed environment
+region only when admission reaches its effective-region check; it can defer that
+check, for example for a `static` row whose access keys are not available on the
+validating node. A row whose
+configured `aws_region` is not a commercial, GovCloud or China region keeps
+the ordinary stand-in, so the gateway reports the region.
+
+`private_key_jwt_alg` and `aws_credentials` look like credentials by name, but
+when they hold a value the gateway accepts (`RS256`, `RS384`, `RS512`,
+`ES256`, `ES384`, `EdDSA`; `static`, `default_chain`) they are ordinary
+settings: import keeps them, the literal-secret check passes them, and they
+are not scrubbed from validator output. Any other value is still treated as a
+possible secret.
+
 Resolved values are always validated unchanged. Stand-ins are never exported,
 applied, delivered or stored.
 

@@ -245,6 +245,171 @@ fn edge_0_9_19_redacted_plugins() -> Vec<(&'static str, serde_json::Value, Vec<&
     ]
 }
 
+/// `jwks_auth` and `hmac_auth` read `redis_url` / `redis_password` through
+/// Edge's shared `RedisConfig::from_plugin_config` exactly like
+/// `rate_limiting` (#744). A literal `redis_url` with no userinfo is brokered
+/// on import, scrubbed, refused by the literal-secret gate, and a brokered one
+/// reaches the validator as a Redis URL stand-in, identically for all of them.
+#[test]
+fn redis_backed_plugins_treat_redis_url_like_rate_limiting() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+    use gitforgeops::validate::{with_validation_standins, VALIDATION_STANDIN_HOST};
+
+    const REDIS_URL: &str = "redis://synthetic-cache.example:6379/0";
+    for (plugin_name, password_declared) in [
+        ("rate_limiting", false),
+        ("jwks_auth", true),
+        ("hmac_auth", true),
+    ] {
+        let config = serde_json::json!({"sync_mode": "redis", "redis_url": REDIS_URL});
+        let original = single_plugin_gateway(plugin_name, config);
+
+        let mut imported = original.clone();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut imported).unwrap();
+        let slots: Vec<&str> = capture.captured.keys().map(String::as_str).collect();
+        let slot = format!("ferrum/builtin/@plugin/{plugin_name}/config/redis_url");
+        assert_eq!(slots, [slot.as_str()], "{plugin_name}");
+        assert!(capture.unbrokered.is_empty(), "{plugin_name}");
+        assert_eq!(
+            imported.plugin_configs[0].config["redis_url"],
+            serde_json::json!("${gh-env-secret:alloc=require}"),
+            "{plugin_name}"
+        );
+
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
+        assert_eq!(
+            scrubber.scrub(&format!("dial {REDIS_URL} failed")),
+            "dial [REDACTED] failed",
+            "{plugin_name}"
+        );
+
+        let findings = audit_security(&original);
+        assert!(
+            security_blockers(&findings).iter().any(|finding| finding
+                .message
+                .contains("Literal plugin-config secret")
+                && finding.message.contains("redis_url")),
+            "{plugin_name}: {findings:?}"
+        );
+        for finding in &findings {
+            assert!(!finding.message.contains("synthetic-"), "{plugin_name}");
+        }
+
+        let standin = with_validation_standins(&imported).expect("a brokered redis_url");
+        let url = standin.plugin_configs[0].config["redis_url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(url.starts_with("redis://"), "{plugin_name}: {url}");
+        assert!(
+            url.ends_with(&format!(".{VALIDATION_STANDIN_HOST}/0")),
+            "{plugin_name}: {url}"
+        );
+
+        // `redis_password` is a declared secret beside it (brokered outright)
+        // where `rate_limiting` leaves it to the key-name heuristic (a
+        // plaintext allowance); both are scrubbed and gated.
+        let mut with_password = single_plugin_gateway(
+            plugin_name,
+            serde_json::json!({"redis_url": REDIS_URL, "redis_password": "synthetic-redis-password"}),
+        );
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&with_password);
+        assert_eq!(
+            scrubber.scrub("synthetic-redis-password"),
+            "[REDACTED]",
+            "{plugin_name}"
+        );
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut with_password).unwrap();
+        let password_slot = format!("ferrum/builtin/@plugin/{plugin_name}/config/redis_password");
+        assert_eq!(
+            capture.captured.contains_key(&password_slot),
+            password_declared,
+            "{plugin_name}"
+        );
+        let unbrokered: Vec<&str> = capture
+            .unbrokered
+            .iter()
+            .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+            .collect();
+        if password_declared {
+            assert!(unbrokered.is_empty(), "{plugin_name}: {unbrokered:?}");
+        } else {
+            assert_eq!(unbrokered, ["redis_password"], "{plugin_name}");
+        }
+    }
+}
+
+/// The rows the new stand-ins validate must also pass the literal-secret
+/// gate: with only the key or the endpoint brokered, the literal
+/// `private_key_jwt_alg` / `aws_credentials` selectors beside them are
+/// ordinary settings, not demanded into the broker (they could never be
+/// seeded: every algorithm name is under the 8-byte minimum), and a validator
+/// diagnostic naming the algorithm is not withheld.
+#[test]
+fn stand_in_selectors_pass_the_literal_secret_gate() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    const BROKERED: &str = "${gh-env-secret:alloc=require}";
+    for (plugin_name, config) in [
+        (
+            "oauth2_introspection",
+            serde_json::json!({"providers": [{
+                "introspection_endpoint": BROKERED,
+                "client_auth": {
+                    "method": "private_key_jwt",
+                    "client_id": "ferrum-edge",
+                    "private_key_jwt_alg": "ES256",
+                    "private_key_pem": BROKERED
+                }
+            }]}),
+        ),
+        (
+            "oidc_relying_party",
+            serde_json::json!({
+                "providers": [{
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": BROKERED,
+                    "client_id": "ferrum-gateway",
+                    "client_auth": {
+                        "method": "private_key_jwt",
+                        "private_key_jwt_alg": "RS256",
+                        "private_key_pem": BROKERED
+                    }
+                }],
+                "session": {"encryption_secret": BROKERED}
+            }),
+        ),
+        (
+            "serverless_function",
+            serde_json::json!({
+                "provider": "aws_lambda",
+                "aws_credentials": "default_chain",
+                "aws_region": "us-east-1",
+                "aws_function_name": "fn",
+                "aws_endpoint_url": BROKERED
+            }),
+        ),
+    ] {
+        let gateway = single_plugin_gateway(plugin_name, config);
+        let findings = audit_security(&gateway);
+        assert!(
+            security_blockers(&findings).is_empty(),
+            "{plugin_name}: {findings:?}"
+        );
+
+        let mut imported = gateway.clone();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut imported).unwrap();
+        assert!(capture.captured.is_empty(), "{plugin_name}");
+        assert!(capture.unbrokered.is_empty(), "{plugin_name}");
+
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+        let output = scrubber.scrub_streams("", "error: cannot sign private_key_jwt_alg \"ES256\"");
+        assert!(output.suppressed.is_none(), "{plugin_name}");
+    }
+}
+
 fn single_plugin_gateway(plugin_name: &str, config: serde_json::Value) -> GatewayConfig {
     serde_json::from_value(serde_json::json!({
         "version": "1",
