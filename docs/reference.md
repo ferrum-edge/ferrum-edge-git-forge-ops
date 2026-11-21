@@ -401,9 +401,25 @@ gets a fake value of the right shape:
 |---|---|
 | `basicauth` `password_hash` | `hmac_sha256:<64 hex>` |
 | other credentials, and token/header/secret plugin config | `gitforgeops-validation-standin-<64 hex>` |
-| endpoint plugin config (`ldap_url`, `redis_url`, `jwks_uri`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
+| endpoint plugin config (`ldap_url`, `jwks_uri`, `endpoint_url`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
+| a Redis-backed plugin's `redis_url` | `redis://<32 hex>.gitforgeops-validation-standin.invalid/0` |
+| `serverless_function` `aws_endpoint_url` | `https://<32 hex>.gitforgeops-validation-standin.invalid/` |
+| `ai_stream_router` provider `endpoint` | `https://gitforgeops-validation-standin.invalid/<64 hex>/{model}` |
+| `oauth2_introspection` / `oidc_relying_party` `client_auth.private_key_pem` | a throwaway PKCS#8 key for the sibling `private_key_jwt_alg` |
 
-The scheme follows the field (`ldaps://`, `redis://`, otherwise `https://`).
+The scheme follows the field (`ldaps://`, `redis://`, `wss://` for
+`ws_logging`, otherwise `https://`). The shapes follow the gateway's own
+checks: a Redis URL path must be a database number, an AWS Lambda endpoint
+override must be a bare origin, and a `google_gemini` endpoint must carry the
+`{model}` placeholder, so those carry the per-slot hash in a host label or
+before the placeholder instead. Edge parses a `private_key_jwt` key and signs
+a test assertion with it at admission, so its stand-in is a real key generated
+for the run (RSA 2048 for `RS256`/`RS384`/`RS512` and when the algorithm is
+unset or unsupported, P-256 for `ES256`, P-384 for `ES384`, Ed25519 for
+`EdDSA`), held only in memory and in the temporary validation file. It is the
+only stand-in that differs between runs. Stand-ins are not secrets and are not
+scrubbed from validator output.
+
 Resolved values are always validated unchanged. Stand-ins are never exported,
 applied, delivered or stored.
 

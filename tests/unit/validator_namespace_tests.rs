@@ -678,3 +678,140 @@ fn real_edge_multiple_namespaces_excluding_ferrum() {
         assert_command_contract(&["zeta", "alpha"], invalid, Some(&binary));
     }
 }
+
+/// A brokered leaf of each plugin whose stand-in shape #744 / #745 fixed. The
+/// non-brokered settings are taken from Ferrum Edge's own accepted test
+/// configurations, so a failure here is a verdict on the stand-in.
+fn brokered_standin_cases() -> Vec<(&'static str, serde_json::Value)> {
+    const BROKERED: &str = "${gh-env-secret:alloc=require}";
+    let introspection = |alg: &str| {
+        serde_json::json!({"providers": [{
+            "introspection_endpoint": "https://idp.example.com/introspect",
+            "client_auth": {
+                "method": "private_key_jwt",
+                "client_id": "ferrum-edge",
+                "private_key_jwt_alg": alg,
+                "private_key_pem": BROKERED
+            }
+        }]})
+    };
+    let relying_party = |alg: &str| {
+        serde_json::json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "authorization_endpoint": "https://issuer.example.com/authorize",
+                "token_endpoint": "https://issuer.example.com/token",
+                "jwks_uri": "https://issuer.example.com/jwks",
+                "client_id": "ferrum-gateway",
+                "client_auth": {
+                    "method": "private_key_jwt",
+                    "private_key_jwt_alg": alg,
+                    "private_key_pem": BROKERED
+                },
+                "scopes": ["openid", "profile"],
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "callback_path": "/oauth/callback",
+                "logout_path": "/oauth/logout"
+            }],
+            "session": {
+                "store": "cookie",
+                "cookie_name": "ferrum_session",
+                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486"
+            },
+            "behavior": {
+                "trusted_redirect_hosts": ["app.example.com"],
+                "post_login_redirect_param": "rd"
+            }
+        })
+    };
+    let mut cases = vec![
+        (
+            "rate_limiting",
+            serde_json::json!({
+                "window_seconds": 60,
+                "max_requests": 1,
+                "sync_mode": "redis",
+                "redis_url": BROKERED
+            }),
+        ),
+        (
+            "hmac_auth",
+            serde_json::json!({
+                "replay_scope": "shared",
+                "sync_mode": "redis",
+                "redis_url": BROKERED
+            }),
+        ),
+        (
+            "jwks_auth",
+            serde_json::json!({
+                "providers": [{
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "shared"
+                }],
+                "sync_mode": "redis",
+                "redis_url": BROKERED
+            }),
+        ),
+        ("ws_logging", serde_json::json!({"endpoint_url": BROKERED})),
+        (
+            "serverless_function",
+            serde_json::json!({
+                "provider": "aws_lambda",
+                "aws_region": "us-east-1",
+                "aws_access_key_id": "AKIATEST",
+                "aws_secret_access_key": "synthetic-aws-secret-access-key",
+                "aws_function_name": "fn",
+                "aws_endpoint_url": BROKERED
+            }),
+        ),
+    ];
+    for alg in ["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"] {
+        cases.push(("oauth2_introspection", introspection(alg)));
+        cases.push(("oidc_relying_party", relying_party(alg)));
+    }
+    cases
+}
+
+fn single_plugin(plugin_name: &str, config: serde_json::Value) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "plugin_configs": [{
+            "id": "standin-contract",
+            "namespace": "ferrum",
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "config": config
+        }]
+    }))
+    .unwrap()
+}
+
+/// #744 / #745: the real gateway accepts every reshaped stand-in, so a
+/// secretless PR run grades the configuration rather than the brokering.
+#[test]
+fn real_edge_accepts_brokered_plugin_stand_ins() {
+    let Some(binary) = real_validator() else {
+        return;
+    };
+    let binary = binary.to_str().unwrap();
+
+    // Control: the validator really runs the plugin's admission checks.
+    let control = single_plugin(
+        "ws_logging",
+        serde_json::json!({"endpoint_url": "https://collector.example/logs"}),
+    );
+    let result = run_validation(&control, binary).unwrap();
+    assert!(!result.success, "a non-WebSocket URL must fail: {result:?}");
+
+    for (plugin_name, config) in brokered_standin_cases() {
+        let gateway = single_plugin(plugin_name, config.clone());
+        let result = run_validation(&gateway, binary).unwrap();
+        assert!(
+            result.success,
+            "{plugin_name} {config}: {}{}",
+            result.stdout, result.stderr
+        );
+    }
+}

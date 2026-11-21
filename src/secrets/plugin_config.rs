@@ -66,6 +66,12 @@ const fn operator_value(path: &'static [&'static str]) -> Rule {
 
 const REDIS_URL: &[Rule] = &[endpoint(&["redis_url"])];
 
+/// Redis sync fields of a plugin that reads them through Edge's shared
+/// `RedisConfig::from_plugin_config` beside its own credential settings.
+/// `redis_password` is declared outright so import brokers it instead of
+/// asking for a plaintext allowance on the key-name heuristic.
+const REDIS_URL_AND_PASSWORD: &[Rule] = &[endpoint(&["redis_url"]), secret(&["redis_password"])];
+
 const KAFKA_SAFE_PROPERTIES: &[&str] = &[
     "acks",
     "batch.num.messages",
@@ -127,15 +133,26 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         | "ws_rate_limiting"
         | "udp_rate_limiting"
         | "ai_rate_limiter" => REDIS_URL.to_vec(),
-        "jwks_auth" => vec![
-            endpoint(&["providers", "*", "discovery_url"]),
-            endpoint(&["providers", "*", "jwks_uri"]),
-            endpoint(&["discovery_url"]),
-            endpoint(&["jwks_uri"]),
-        ],
+        // DPoP replay protection (`jwks_auth`) and `replay_scope: "shared"`
+        // nonce tracking (`hmac_auth`) read the root Redis fields through
+        // Edge's shared `RedisConfig::from_plugin_config`, exactly like the
+        // rate limiters. Edge v0.9.20 and later withhold `redis_url` from
+        // `/config/export` on any plugin by name, so it is an export site
+        // here as it is for `rate_limiting`.
+        "jwks_auth" => {
+            let mut rules = vec![
+                endpoint(&["providers", "*", "discovery_url"]),
+                endpoint(&["providers", "*", "jwks_uri"]),
+                endpoint(&["discovery_url"]),
+                endpoint(&["jwks_uri"]),
+            ];
+            rules.extend_from_slice(REDIS_URL_AND_PASSWORD);
+            rules
+        }
+        "hmac_auth" => REDIS_URL_AND_PASSWORD.to_vec(),
         "oauth2_introspection" => vec![
             secret(&["providers", "*", "client_auth", "client_secret"]),
-            secret(&["providers", "*", "client_auth", "private_key_pem"]),
+            secret(CLIENT_ASSERTION_KEY),
             endpoint(&["providers", "*", "discovery_url"]),
             endpoint(&["providers", "*", "introspection_endpoint"]),
             endpoint(&["discovery_url"]),
@@ -143,7 +160,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         ],
         "oidc_relying_party" => vec![
             secret(&["providers", "*", "client_auth", "client_secret"]),
-            secret(&["providers", "*", "client_auth", "private_key_pem"]),
+            secret(CLIENT_ASSERTION_KEY),
             secret(&["session", "encryption_secret"]),
             secret(&["session", "encryption_secret_previous"]),
             endpoint(&["providers", "*", "discovery_url"]),
@@ -164,11 +181,11 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             endpoint(&["failover_ldap_urls"]),
             secret(&["service_account_password"]),
         ],
-        "soap_ws_security" => vec![
-            endpoint(&["redis_url"]),
-            secret(&["redis_password"]),
-            secret(&["username_token", "credentials", "*", "password"]),
-        ],
+        "soap_ws_security" => {
+            let mut rules = REDIS_URL_AND_PASSWORD.to_vec();
+            rules.push(secret(&["username_token", "credentials", "*", "password"]));
+            rules
+        }
         "opa" => vec![operator_value(&["headers", "*"])],
         "ai_transcript_audit" => vec![
             endpoint(&["sink", "endpoint_url"]),
@@ -996,20 +1013,14 @@ pub(crate) fn rule_declared_paths(
 ///
 /// ferrum-edge does not merely check that an endpoint parses; several plugins
 /// require a specific scheme (`ldap_auth` accepts `ldap`/`ldaps`, the Redis
-/// clients want a `redis` URL). The rule table keys endpoints by field name,
-/// so the field name is what decides here too, with the plugin name as the
-/// tiebreaker for a generically named field on a protocol-specific plugin.
-/// `https` is the fallback: every remaining builtin endpoint is an HTTP
-/// collector, webhook, or discovery document.
+/// clients want `redis`/`rediss`, `ws_logging` wants `ws`/`wss`). The rule
+/// table keys endpoints by field name, so the field name is what decides here
+/// too, with the plugin name as the tiebreaker for a generically named field
+/// on a protocol-specific plugin. `https` is the fallback: every remaining
+/// builtin endpoint is an HTTP collector, webhook, provider, or discovery
+/// document.
 pub(crate) fn endpoint_scheme(plugin_name: &str, path: &[ConfigPathComponent]) -> &'static str {
-    let leaf = path
-        .iter()
-        .rev()
-        .find_map(|part| match part {
-            ConfigPathComponent::Key(key) => Some(normalize_key(key)),
-            ConfigPathComponent::Index(_) => None,
-        })
-        .unwrap_or_default();
+    let leaf = endpoint_leaf(path);
     let plugin = normalize_key(plugin_name);
     let says = |needle: &str| leaf.contains(needle) || plugin.contains(needle);
 
@@ -1017,9 +1028,88 @@ pub(crate) fn endpoint_scheme(plugin_name: &str, path: &[ConfigPathComponent]) -
         "ldaps"
     } else if says("redis") {
         "redis"
+    } else if plugin == "wslogging" {
+        // The only `ws_logging` endpoint is the collector's WebSocket URL.
+        "wss"
     } else {
         "https"
     }
+}
+
+/// How much of a URL stand-in beyond its scheme an endpoint field constrains.
+///
+/// Most builtin endpoints accept any path, so their stand-in carries the
+/// slot digest there. A few validate the path itself, and a stand-in that
+/// parses but fails that check would swap one spurious CI failure for
+/// another; for those the digest moves into a host label on the reserved
+/// `.invalid` host instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointForm {
+    /// Any path: `<scheme>://<host>/<digest>`.
+    DigestPath,
+    /// A Redis URL, whose path Edge's `validate_redis_database_selector`
+    /// admits only when empty, `/`, or a canonical database number.
+    RedisDatabase,
+    /// An origin with no path, query or fragment (`serverless_function`
+    /// `aws_endpoint_url`, which Edge refuses with any path but `/`).
+    Origin,
+    /// An `ai_stream_router` provider endpoint. A `google_gemini` provider
+    /// routes the model only through the URL, so Edge refuses its endpoint
+    /// unless the path carries the `{model}` placeholder (or names the single
+    /// exact model the provider admits); every provider type accepts it.
+    ModelTemplate,
+}
+
+/// The [`EndpointForm`] a stand-in for this endpoint field must take.
+pub(crate) fn endpoint_form(plugin_name: &str, path: &[ConfigPathComponent]) -> EndpointForm {
+    let leaf = endpoint_leaf(path);
+    match normalize_key(plugin_name).as_str() {
+        _ if endpoint_scheme(plugin_name, path) == "redis" => EndpointForm::RedisDatabase,
+        "serverlessfunction" if leaf == "awsendpointurl" => EndpointForm::Origin,
+        "aistreamrouter" if leaf == "endpoint" => EndpointForm::ModelTemplate,
+        _ => EndpointForm::DigestPath,
+    }
+}
+
+/// The nearest object key of a classified endpoint path, normalized.
+fn endpoint_leaf(path: &[ConfigPathComponent]) -> String {
+    path.iter()
+        .rev()
+        .find_map(|part| match part {
+            ConfigPathComponent::Key(key) => Some(normalize_key(key)),
+            ConfigPathComponent::Index(_) => None,
+        })
+        .unwrap_or_default()
+}
+
+/// `private_key_jwt` client-assertion keys: an inline PEM the gateway parses
+/// for the sibling `private_key_jwt_alg` and signs a throwaway assertion with
+/// at admission (`oauth2_introspection`, `oidc_relying_party`).
+const CLIENT_ASSERTION_KEY: &[&str] = &["providers", "*", "client_auth", "private_key_pem"];
+
+/// The sibling of a [`client_assertion_key_paths`] leaf that selects its
+/// signing algorithm.
+pub(crate) const CLIENT_ASSERTION_ALG_FIELD: &str = "private_key_jwt_alg";
+
+/// Rule-declared secret leaves that hold a `private_key_jwt` signing key,
+/// which the validator stand-in generator ([`crate::validate::standin`])
+/// replaces with a throwaway key of the selected algorithm's family rather
+/// than an opaque token Edge would refuse as malformed PEM.
+pub(crate) fn client_assertion_key_paths(
+    plugin_name: &str,
+    config: &Value,
+) -> BTreeSet<Vec<ConfigPathComponent>> {
+    let mut found = BTreeSet::new();
+    if matches!(plugin_name, "oauth2_introspection" | "oidc_relying_party") && config.is_object() {
+        apply_rule(
+            config,
+            CLIENT_ASSERTION_KEY,
+            RuleKind::Secret,
+            &[],
+            &mut found,
+        );
+    }
+    found
 }
 
 /// Render a classified path the way an operator reads it: `headers.x-api-key`,
@@ -2212,6 +2302,160 @@ mod tests {
             ]
         );
         assert_eq!(endpoint_scheme("ldap_auth", &endpoints[0]), "ldaps");
+    }
+
+    /// `jwks_auth` and `hmac_auth` read the root Redis fields through Edge's
+    /// shared `RedisConfig::from_plugin_config`, like the rate limiters
+    /// (#744), so their `redis_url` is an endpoint everywhere
+    /// `rate_limiting.redis_url` is, and `redis_password` a declared secret.
+    #[test]
+    fn redis_backed_auth_plugins_classify_redis_fields_like_the_rate_limiters() {
+        let config = serde_json::json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.example:6379/0",
+            "redis_password": "synthetic-redis-password"
+        });
+        for plugin in [
+            "jwks_auth",
+            "hmac_auth",
+            "rate_limiting",
+            "soap_ws_security",
+        ] {
+            assert_eq!(
+                dotted(endpoint_paths(plugin, &config).into_iter().collect()),
+                vec!["redis_url"],
+                "{plugin}"
+            );
+            let url = [ConfigPathComponent::Key("redis_url".to_string())];
+            assert_eq!(endpoint_scheme(plugin, &url), "redis", "{plugin}");
+            assert_eq!(
+                endpoint_form(plugin, &url),
+                EndpointForm::RedisDatabase,
+                "{plugin}"
+            );
+            let export = export_redacted_paths(plugin, &config);
+            for field in ["redis_url", "redis_password"] {
+                assert!(
+                    export.contains(&vec![ConfigPathComponent::Key(field.to_string())]),
+                    "{plugin} {field}"
+                );
+            }
+        }
+        for plugin in ["jwks_auth", "hmac_auth", "soap_ws_security"] {
+            assert_eq!(
+                dotted(rule_declared_paths(plugin, &config).into_iter().collect()),
+                vec!["redis_password", "redis_url"],
+                "{plugin}"
+            );
+            let classification = classify_plugin_config(plugin, &config);
+            assert_eq!(
+                dotted(classification.sensitive),
+                vec!["redis_password", "redis_url"],
+                "{plugin}"
+            );
+            assert!(classification.unbrokered.is_empty(), "{plugin}");
+        }
+        // The identity endpoints are unchanged beside them.
+        let jwks = serde_json::json!({
+            "providers": [{"jwks_uri": "https://idp.example/jwks"}],
+            "redis_url": "redis://cache.example:6379"
+        });
+        assert_eq!(
+            dotted(endpoint_paths("jwks_auth", &jwks).into_iter().collect()),
+            vec!["providers.[0].jwks_uri", "redis_url"]
+        );
+    }
+
+    /// The stand-in shape follows each endpoint's own Edge validation (#745).
+    #[test]
+    fn endpoint_stand_in_shapes_follow_the_gateway_checks() {
+        let key = |name: &str| vec![ConfigPathComponent::Key(name.to_string())];
+        let provider_endpoint = vec![
+            ConfigPathComponent::Key("providers".to_string()),
+            ConfigPathComponent::Index(0),
+            ConfigPathComponent::Key("endpoint".to_string()),
+        ];
+        for (plugin, path, scheme, form) in [
+            (
+                "ws_logging",
+                key("endpoint_url"),
+                "wss",
+                EndpointForm::DigestPath,
+            ),
+            (
+                "http_logging",
+                key("endpoint_url"),
+                "https",
+                EndpointForm::DigestPath,
+            ),
+            (
+                "serverless_function",
+                key("aws_endpoint_url"),
+                "https",
+                EndpointForm::Origin,
+            ),
+            (
+                "serverless_function",
+                key("function_url"),
+                "https",
+                EndpointForm::DigestPath,
+            ),
+            (
+                "ai_stream_router",
+                provider_endpoint.clone(),
+                "https",
+                EndpointForm::ModelTemplate,
+            ),
+            (
+                "ai_semantic_cache",
+                key("redis_url"),
+                "redis",
+                EndpointForm::RedisDatabase,
+            ),
+            (
+                "ai_semantic_cache",
+                key("semantic_embedding_endpoint"),
+                "https",
+                EndpointForm::DigestPath,
+            ),
+            (
+                "ldap_auth",
+                key("ldap_url"),
+                "ldaps",
+                EndpointForm::DigestPath,
+            ),
+            (
+                "otel_tracing",
+                key("endpoint"),
+                "https",
+                EndpointForm::DigestPath,
+            ),
+        ] {
+            assert_eq!(endpoint_scheme(plugin, &path), scheme, "{plugin}");
+            assert_eq!(endpoint_form(plugin, &path), form, "{plugin}");
+        }
+    }
+
+    #[test]
+    fn client_assertion_keys_are_the_declared_private_key_pem_secrets() {
+        let config = serde_json::json!({"providers": [
+            {"client_auth": {"method": "private_key_jwt", "private_key_pem": "x", "private_key_jwt_alg": "ES256"}},
+            {"client_auth": {"method": "client_secret_basic", "client_secret": "y"}}
+        ]});
+        for plugin in ["oauth2_introspection", "oidc_relying_party"] {
+            let keys = client_assertion_key_paths(plugin, &config);
+            assert_eq!(
+                dotted(keys.iter().cloned().collect()),
+                vec!["providers.[0].client_auth.private_key_pem"],
+                "{plugin}"
+            );
+            let declared = rule_declared_paths(plugin, &config);
+            assert!(keys.is_subset(&declared), "{plugin}");
+        }
+        assert!(client_assertion_key_paths("jwks_auth", &config).is_empty());
+        assert!(
+            client_assertion_key_paths("oidc_relying_party", &serde_json::json!(null)).is_empty()
+        );
     }
 
     #[test]

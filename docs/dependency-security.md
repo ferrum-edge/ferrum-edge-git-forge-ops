@@ -255,7 +255,10 @@ gitforgeops -> age 0.11.5 (ssh feature) -> rsa 0.9.10
 
 The `jsonwebtoken` dependency uses its `aws_lc_rs` provider with default
 features disabled. Admin JWTs are HS256-only, so it does not pull in the
-RustCrypto RSA implementation.
+RustCrypto RSA implementation. `aws-lc-rs` is also a direct dependency: it
+generates the throwaway RSA, ECDSA and Ed25519 keys that stand in for a
+brokered `private_key_jwt` key during validation. That is AWS-LC code, not
+the `rsa` crate, so it adds no path to this advisory.
 
 The remaining path is in `src/secrets/delivery.rs`. GitHub supplies an SSH
 *public* key, `age::ssh::Recipient` parses it, and gitforgeops encrypts a

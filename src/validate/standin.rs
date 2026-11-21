@@ -15,21 +15,26 @@
 //! back as "'ldap_url' is not a valid URL: relative URL without a base", which
 //! is a verdict on the brokering rather than on the configuration.
 //!
-//! So the validator gets stand-ins instead: a deterministic, obviously fake
-//! value of adequate *shape* — a 64-hex token, an `hmac_sha256:` digest, or a
-//! syntactically valid URL on a reserved `.invalid` host, whichever the field
-//! calls for — derived from the leaf's own broker slot. They exist for exactly
-//! one file — the 0600 temp spec handed to `ferrum-edge validate` — and are
-//! never exported, applied, written to state, or delivered.
+//! So the validator gets stand-ins instead: an obviously fake value of
+//! adequate *shape* — a 64-hex token, an `hmac_sha256:` digest, a
+//! syntactically valid URL on a reserved `.invalid` host, or (for a
+//! `private_key_jwt` key Edge signs with at admission) a throwaway key of the
+//! selected algorithm's family, whichever the field calls for. Every shape but
+//! the key is deterministic in the leaf's own broker slot. They exist for
+//! exactly one file — the 0600 temp spec handed to `ferrum-edge validate` —
+//! and are never exported, applied, written to state, or delivered.
 //! `export --materialize` still refuses to run while any slot is unresolved;
 //! `apply` still fails on `alloc=require` with no value.
 
 use sha2::{Digest, Sha256};
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::config::GatewayConfig;
 use crate::secrets::parse_placeholder;
-use crate::secrets::plugin_config::ConfigPathComponent;
+use crate::secrets::plugin_config::{ConfigPathComponent, EndpointForm};
 use crate::secrets::resolver::{consumer_credential_slot, ResolveReport, SlotStatus};
+use crate::validate::client_key_standin::{client_assertion_key_pem, ClientKeyFamily};
 
 /// Fixed marker every opaque stand-in starts with. It is deliberately
 /// unmistakable: a value carrying this prefix anywhere but a validator temp
@@ -69,9 +74,7 @@ const PASSWORD_HASH_LEAF: &str = "password_hash";
 ///   characters, 95 in total. Comfortably past the 32-character floor
 ///   `jwt`/`hmac_auth` impose and well under the 4096-character ceiling.
 pub fn validation_standin(slot: &str, leaf: Option<&str>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(slot.as_bytes());
-    let digest = hex::encode(hasher.finalize());
+    let digest = slot_digest(slot);
 
     if leaf == Some(PASSWORD_HASH_LEAF) {
         return format!("{BASIC_AUTH_HASH_PREFIX}{digest}");
@@ -88,13 +91,53 @@ pub fn validation_standin(slot: &str, leaf: Option<&str>) -> String {
 /// [`validation_standin`] is. The scheme comes from the field
 /// ([`crate::secrets::plugin_config::endpoint_scheme`]) because several
 /// plugins check it — `ldap_auth` wants `ldap`/`ldaps`, the Redis-backed
-/// plugins want `redis` — and a stand-in that parses but fails the scheme
-/// check would swap one spurious CI failure for another.
+/// plugins want `redis`, `ws_logging` wants `wss` — and a stand-in that parses
+/// but fails the scheme check would swap one spurious CI failure for another.
+///
+/// This is the shape for a field that accepts any path. A field whose path
+/// the gateway constrains gets another `EndpointForm` instead.
 pub fn validation_url_standin(slot: &str, scheme: &str) -> String {
+    let digest = slot_digest(slot);
+    format!("{scheme}://{VALIDATION_STANDIN_HOST}/{digest}")
+}
+
+/// Hex characters of the slot digest carried in a host label when the path
+/// cannot carry it: 128 bits, comfortably distinct per slot and well inside
+/// the 63-byte DNS label limit.
+const HOST_LABEL_HEX: usize = 32;
+
+/// The URL stand-in for an endpoint field of the given [`EndpointForm`].
+///
+/// * [`EndpointForm::DigestPath`] — [`validation_url_standin`].
+/// * [`EndpointForm::RedisDatabase`] —
+///   `redis://<32 hex>.gitforgeops-validation-standin.invalid/0`. Edge admits
+///   a Redis URL path only when empty, `/`, or a canonical database number,
+///   so per-slot uniqueness moves into a host label and the path selects
+///   database 0. `redis` rather than `rediss`: Edge accepts either, and
+///   `redis_tls: true` upgrades a `redis://` URL itself.
+/// * [`EndpointForm::Origin`] —
+///   `https://<32 hex>.gitforgeops-validation-standin.invalid/`, an origin with
+///   the root path, the only path Edge admits there.
+/// * [`EndpointForm::ModelTemplate`] — the digest path followed by
+///   `/{model}`, the routing placeholder a `google_gemini` provider endpoint
+///   must carry and every other provider type accepts.
+fn shaped_url_standin(slot: &str, scheme: &str, form: EndpointForm) -> String {
+    let digest = slot_digest(slot);
+    let label = digest.get(..HOST_LABEL_HEX).unwrap_or(&digest);
+    match form {
+        EndpointForm::DigestPath => validation_url_standin(slot, scheme),
+        EndpointForm::RedisDatabase => format!("{scheme}://{label}.{VALIDATION_STANDIN_HOST}/0"),
+        EndpointForm::Origin => format!("{scheme}://{label}.{VALIDATION_STANDIN_HOST}/"),
+        EndpointForm::ModelTemplate => {
+            format!("{scheme}://{VALIDATION_STANDIN_HOST}/{digest}/{{model}}")
+        }
+    }
+}
+
+fn slot_digest(slot: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(slot.as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    format!("{scheme}://{VALIDATION_STANDIN_HOST}/{digest}")
+    hex::encode(hasher.finalize())
 }
 
 /// Return a copy of `config` whose unresolved broker placeholders have been
@@ -113,8 +156,11 @@ pub fn validation_url_standin(slot: &str, scheme: &str) -> String {
 ///   sensitivity classifier brokers credential-bearing *endpoints* as well as
 ///   tokens, and the gateway parses those: `ldap_auth` rejects
 ///   `${gh-env-secret:alloc=require}` with "not a valid URL". Endpoint-typed
-///   leaves therefore get [`validation_url_standin`] with the field's own
-///   scheme, and everything else gets the opaque token form. Header maps are
+///   leaves therefore get a URL with the field's own scheme and path shape
+///   (`shaped_url_standin`), a `private_key_jwt` key gets a throwaway key of
+///   the sibling `private_key_jwt_alg`'s family
+///   (`validate::client_key_standin`), and everything else gets the
+///   opaque token form. Header maps are
 ///   rewritten value-side only, so `headers.x-honeycomb-team` keeps its key
 ///   and a plugin that validates required header *names* still sees them.
 ///
@@ -182,109 +228,125 @@ pub(crate) fn with_validation_standins_for_report(
 
     for plugin in &mut patched.plugin_configs {
         // Classified before the walk mutates anything: the rules key on paths,
-        // and replacing a string leaf never moves one.
-        let endpoints = crate::secrets::plugin_config::endpoint_paths(
-            plugin.plugin_name.as_str(),
-            &plugin.config,
-        );
-        let scheme = crate::secrets::plugin_config::declared_ldap_scheme(
-            plugin.plugin_name.as_str(),
-            &plugin.config,
-        );
-        let namespace = plugin.namespace.clone();
-        let plugin_id = plugin.id.clone();
-        let plugin_name = plugin.plugin_name.clone();
-        let mut path = Vec::new();
-        changed |= substitute_plugin_leaves(
-            &mut plugin.config,
-            &namespace,
-            &plugin_id,
-            &plugin_name,
-            &endpoints,
-            scheme,
-            &mut path,
-            &eligible,
-        );
+        // and replacing a string leaf never moves one. A client key's
+        // algorithm is read from its sibling now for the same reason.
+        let plugin_name = plugin.plugin_name.as_str();
+        let client_keys =
+            crate::secrets::plugin_config::client_assertion_key_paths(plugin_name, &plugin.config)
+                .into_iter()
+                .map(|path| {
+                    let family =
+                        ClientKeyFamily::for_alg(client_assertion_alg(&plugin.config, &path));
+                    (path, family)
+                })
+                .collect();
+        let context = PluginStandins {
+            namespace: &plugin.namespace,
+            plugin_id: &plugin.id,
+            plugin_name,
+            endpoints: crate::secrets::plugin_config::endpoint_paths(plugin_name, &plugin.config),
+            ldap_scheme: crate::secrets::plugin_config::declared_ldap_scheme(
+                plugin_name,
+                &plugin.config,
+            ),
+            client_keys,
+        };
+        let mut config = std::mem::take(&mut plugin.config);
+        changed |= context.substitute(&mut config, &mut Vec::new(), &eligible);
+        plugin.config = config;
     }
 
     changed.then_some(patched)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn substitute_plugin_leaves(
-    value: &mut serde_json::Value,
-    namespace: &str,
-    plugin_id: &str,
-    plugin_name: &str,
-    endpoints: &std::collections::BTreeSet<Vec<ConfigPathComponent>>,
-    scheme: Option<&'static str>,
-    path: &mut Vec<ConfigPathComponent>,
-    eligible: &impl Fn(&str) -> bool,
-) -> bool {
-    let mut changed = false;
-    match value {
-        serde_json::Value::String(text) => {
-            if !matches!(parse_placeholder(text), Some(Ok(_))) {
-                return false;
-            }
-            // The canonical broker slot, so a stand-in is distinct per leaf
-            // and stable across runs for the same repository.
-            let slot = crate::secrets::resolver::plugin_config_slot(
-                namespace,
-                plugin_id,
-                plugin_name,
-                path,
-            );
-            if !eligible(&slot) {
-                return false;
-            }
-            *text = if endpoints.contains(path) {
-                validation_url_standin(
-                    &slot,
-                    scheme.unwrap_or_else(|| {
-                        crate::secrets::plugin_config::endpoint_scheme(plugin_name, path)
-                    }),
-                )
-            } else {
-                validation_standin(&slot, None)
-            };
-            changed = true;
-        }
-        serde_json::Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                path.push(ConfigPathComponent::Key(key.clone()));
-                changed |= substitute_plugin_leaves(
-                    child,
-                    namespace,
-                    plugin_id,
-                    plugin_name,
-                    endpoints,
-                    scheme,
+/// The `private_key_jwt_alg` beside a client-assertion key, when it is a
+/// string.
+fn client_assertion_alg<'a>(
+    config: &'a serde_json::Value,
+    key_path: &[ConfigPathComponent],
+) -> Option<&'a str> {
+    let (_, parent) = key_path.split_last()?;
+    crate::secrets::plugin_config::value_at(config, parent)?
+        .get(crate::secrets::plugin_config::CLIENT_ASSERTION_ALG_FIELD)?
+        .as_str()
+}
+
+/// What one plugin config's stand-ins are derived from, classified before the
+/// walk replaces anything.
+struct PluginStandins<'a> {
+    namespace: &'a str,
+    plugin_id: &'a str,
+    plugin_name: &'a str,
+    endpoints: BTreeSet<Vec<ConfigPathComponent>>,
+    /// The LDAP scheme the config already commits to, which overrides the
+    /// field's default (Edge refuses mixed `ldap` / `ldaps` endpoints).
+    ldap_scheme: Option<&'static str>,
+    client_keys: BTreeMap<Vec<ConfigPathComponent>, ClientKeyFamily>,
+}
+
+impl PluginStandins<'_> {
+    fn substitute(
+        &self,
+        value: &mut serde_json::Value,
+        path: &mut Vec<ConfigPathComponent>,
+        eligible: &impl Fn(&str) -> bool,
+    ) -> bool {
+        let mut changed = false;
+        match value {
+            serde_json::Value::String(text) => {
+                if !matches!(parse_placeholder(text), Some(Ok(_))) {
+                    return false;
+                }
+                // The canonical broker slot, so a stand-in is distinct per
+                // leaf and stable across runs for the same repository.
+                let slot = crate::secrets::resolver::plugin_config_slot(
+                    self.namespace,
+                    self.plugin_id,
+                    self.plugin_name,
                     path,
-                    eligible,
                 );
-                path.pop();
+                if !eligible(&slot) {
+                    return false;
+                }
+                *text = self.standin(&slot, path);
+                changed = true;
             }
-        }
-        serde_json::Value::Array(items) => {
-            for (index, child) in items.iter_mut().enumerate() {
-                path.push(ConfigPathComponent::Index(index));
-                changed |= substitute_plugin_leaves(
-                    child,
-                    namespace,
-                    plugin_id,
-                    plugin_name,
-                    endpoints,
-                    scheme,
-                    path,
-                    eligible,
-                );
-                path.pop();
+            serde_json::Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    path.push(ConfigPathComponent::Key(key.clone()));
+                    changed |= self.substitute(child, path, eligible);
+                    path.pop();
+                }
             }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter_mut().enumerate() {
+                    path.push(ConfigPathComponent::Index(index));
+                    changed |= self.substitute(child, path, eligible);
+                    path.pop();
+                }
+            }
+            _ => {}
         }
-        _ => {}
+        changed
     }
-    changed
+
+    fn standin(&self, slot: &str, path: &[ConfigPathComponent]) -> String {
+        if self.endpoints.contains(path) {
+            let scheme = self.ldap_scheme.unwrap_or_else(|| {
+                crate::secrets::plugin_config::endpoint_scheme(self.plugin_name, path)
+            });
+            let form = crate::secrets::plugin_config::endpoint_form(self.plugin_name, path);
+            return shaped_url_standin(slot, scheme, form);
+        }
+        if let Some(pem) = self
+            .client_keys
+            .get(path)
+            .and_then(|family| client_assertion_key_pem(*family))
+        {
+            return pem.to_string();
+        }
+        validation_standin(slot, None)
+    }
 }
 
 fn has_placeholder(value: &serde_json::Value) -> bool {
