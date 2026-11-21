@@ -282,9 +282,12 @@ pub(crate) fn resource_from_json_value(
         "Upstream" => Ok(Resource::Upstream {
             spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
-        "PluginConfig" => Ok(Resource::PluginConfig {
-            spec: deserialize_gateway_spec(spec, source_path, options)?,
-        }),
+        "PluginConfig" => {
+            check_plugin_trigger_shape(&spec, source_path)?;
+            Ok(Resource::PluginConfig {
+                spec: deserialize_gateway_spec(spec, source_path, options)?,
+            })
+        }
         "MeshConfig" => {
             let id = match object.get("id") {
                 None | Some(serde_json::Value::Null) => None,
@@ -355,6 +358,77 @@ fn check_passthrough_fields(
         safe_line(fields.join(", ")),
     );
     Ok(())
+}
+
+/// Decode a PluginConfig's `trigger` on its own first, so a malformed one is
+/// reported without the input value.
+///
+/// serde's type errors quote the offending scalar (`invalid type: string
+/// "...", expected a sequence`), and a `header` / `query` / `cookie` operand
+/// is a secret ([`crate::secrets::plugin_trigger`]) whatever shape it was
+/// mistakenly written in. This runs before the generic resource decode, whose
+/// error would otherwise print it ahead of every redaction boundary. The
+/// message keeps the field, the kind of input and what was expected
+/// ([`withhold_decoder_input`]). Unknown keys inside the trigger are still
+/// reported by the strict decode, by path only.
+fn check_plugin_trigger_shape(
+    spec: &serde_json::Value,
+    source_path: &Path,
+) -> crate::error::Result<()> {
+    /// The `PluginConfig.trigger` field alone, with its object-only decoder.
+    #[derive(serde::Deserialize)]
+    struct TriggerField {
+        #[serde(
+            default,
+            deserialize_with = "crate::config::json_object::deserialize_optional_object"
+        )]
+        #[allow(dead_code)]
+        trigger: Option<crate::config::schema::PluginTrigger>,
+    }
+    let Some(trigger) = spec.get("trigger").filter(|trigger| !trigger.is_null()) else {
+        return Ok(());
+    };
+    let field = serde_json::json!({ "trigger": trigger });
+    match serde_json::from_value::<TriggerField>(field) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(crate::error::Error::Config(format!(
+            "invalid resource spec in {}: `.spec.trigger`: {} (the input value is withheld \
+             because a trigger operand is a secret)",
+            source_path.display(),
+            withhold_decoder_input(&error.to_string())
+        ))),
+    }
+}
+
+/// A serde decode message with every quoted piece of input removed: the kind
+/// of input and the expectation stay (`invalid type: string, expected a
+/// sequence`), the value does not. A message shape this does not recognize
+/// is replaced whole if it quotes anything.
+fn withhold_decoder_input(message: &str) -> String {
+    let expected = message
+        .find(", expected ")
+        .map(|at| &message[at + ", ".len()..]);
+    let expected_tail = |prefix: &str| match expected {
+        Some(expected) => format!("{prefix}, {expected}"),
+        None => prefix.to_string(),
+    };
+    if let Some(rest) = message.strip_prefix("invalid type: ") {
+        let kind = rest
+            .split([' ', ','])
+            .next()
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or("value");
+        return expected_tail(&format!("invalid type: {kind}"));
+    }
+    for prefix in ["invalid value", "unknown variant"] {
+        if message.starts_with(prefix) {
+            return expected_tail(prefix);
+        }
+    }
+    if message.contains(['"', '`', '\'']) && !message.starts_with("missing field `") {
+        return "it does not match the trigger schema".to_string();
+    }
+    message.to_string()
 }
 
 fn deserialize_spec<T: DeserializeOwned>(

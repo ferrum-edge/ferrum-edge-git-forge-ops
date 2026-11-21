@@ -102,6 +102,11 @@ pub(crate) struct ImportInventory {
     /// Nested fields the typed decode discarded; see
     /// [`reject_import_unmodeled_nested_fields`].
     pub unmodeled_nested_fields: Vec<UnmodeledNestedField>,
+    /// The source is a live gateway read (`import --from-api`), never an
+    /// authored document, so broker-placeholder text in it is live data, not
+    /// a repository declaration; see
+    /// [`reject_live_marker_trigger_operands`].
+    pub live_source: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -564,6 +569,9 @@ pub(crate) fn split_config_with_inventory(
     reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
     reject_import_unknown_credential_types(&safe_config)?;
     reject_import_trigger_placeholders(&safe_config)?;
+    if inventory.live_source {
+        reject_live_marker_trigger_operands(&safe_config)?;
+    }
     let acknowledged_passthrough = acknowledged_passthrough_review(&safe_config);
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
@@ -906,6 +914,59 @@ fn reject_import_trigger_placeholders(config: &GatewayConfig) -> crate::error::R
         })?;
     }
     Ok(())
+}
+
+/// Refuse a live trigger operand that spells broker-placeholder text.
+///
+/// Capture keeps a valid `${gh-env-secret:…}` string as-is so an exported,
+/// unmaterialized file round-trips. A live gateway read has no such
+/// provenance: the operand is what clients must send, and keeping it would
+/// publish it in the tree as a placeholder, capture nothing and later have
+/// apply resolve or allocate a different value. The resolver already refuses
+/// placeholder text as a trigger bundle value. Only trigger operands are
+/// checked here; Consumer and plugin-config secrets keep the shared
+/// round-trip behaviour. Names slots, never values.
+fn reject_live_marker_trigger_operands(config: &GatewayConfig) -> crate::error::Result<()> {
+    use crate::secrets::plugin_trigger::{secret_trigger_operands, trigger_json};
+    let mut slots = Vec::new();
+    for plugin in config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.api_spec_id.is_none())
+    {
+        let Some(trigger) = plugin.trigger.as_ref() else {
+            continue;
+        };
+        let json = trigger_json(trigger);
+        for (path, text) in secret_trigger_operands(&json) {
+            if text
+                .trim()
+                .get(.."${gh-env-secret:".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("${gh-env-secret:"))
+            {
+                slots.push(crate::secrets::resolver::plugin_trigger_slot(
+                    &plugin.namespace,
+                    &plugin.id,
+                    &plugin.plugin_name,
+                    &path,
+                ));
+            }
+        }
+    }
+    if slots.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "refusing to import: the live gateway has plugin trigger operand(s) that spell \
+         gh-env-secret placeholder text, which would be published as a placeholder instead of \
+         being captured. Replace each operand at the gateway with a real value (and update the \
+         clients that send it), then re-import. Nothing has been written.\n  {}",
+        slots
+            .iter()
+            .map(|slot| diagnostic_metadata(slot))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    )))
 }
 
 fn reject_import_unknown_credential_types(config: &GatewayConfig) -> crate::error::Result<()> {

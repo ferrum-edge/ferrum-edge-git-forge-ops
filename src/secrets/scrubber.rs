@@ -205,10 +205,11 @@ impl SecretScrubber {
     ///   set `import` moves into the private bundle. A plugin secret such as
     ///   an `otel_tracing` `headers.x-honeycomb-team` value is resolved into
     ///   the validator input exactly like a consumer credential.
-    /// * **Plugin triggers** — the `header` / `query` / `cookie` operands of a
-    ///   `trigger` ([`super::plugin_trigger`]) of at least
-    ///   [`MIN_SCRUB_LENGTH`] bytes: a shared token that decides whether the
-    ///   plugin runs.
+    /// * **Plugin triggers** — every non-empty `header` / `query` / `cookie`
+    ///   operand of a `trigger` ([`super::plugin_trigger`]): a shared token
+    ///   that decides whether the plugin runs. One shorter than
+    ///   [`MIN_SCRUB_LENGTH`] is not substring-replaced, but output that
+    ///   still contains it is withheld.
     /// * **Service discovery** — the modeled secret leaves of
     ///   `Upstream.service_discovery` ([`super::service_discovery`]), today the
     ///   Consul ACL token. The validator is handed the resolved upstream, so
@@ -426,7 +427,7 @@ pub(crate) fn gateway_secret_values(
     let mut values = ManifestValues::default();
     collect_consumer_secrets(config, &mut values);
     collect_plugin_config_secrets(config, &mut values);
-    collect_plugin_trigger_secrets(config, &mut values);
+    collect_plugin_trigger_secrets(config, TriggerOperands::All, &mut values);
     collect_service_discovery_secrets(config, &mut values);
     let mut values = values.0;
     collect_resolved_secrets(config, report, &mut values);
@@ -457,7 +458,7 @@ pub(crate) fn live_secret_leaves(config: &GatewayConfig) -> Vec<LiveSecretLeaf> 
     let mut leaves = LiveLeaves::default();
     collect_consumer_secrets(config, &mut leaves);
     collect_plugin_config_secrets(config, &mut leaves);
-    collect_plugin_trigger_secrets(config, &mut leaves);
+    collect_plugin_trigger_secrets(config, TriggerOperands::Scrubbable, &mut leaves);
     collect_service_discovery_secrets(config, &mut leaves);
     leaves
         .0
@@ -768,20 +769,40 @@ fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink)
     }
 }
 
+/// Which trigger operands a collector reports.
+#[derive(Clone, Copy)]
+enum TriggerOperands {
+    /// Every non-empty operand. For repository and resolved documents (the
+    /// validator scrubber): a short one cannot be substring-replaced, but it
+    /// is still checked verbatim, so validator output that echoes it is
+    /// withheld ([`SuppressionReason::ResidualValue`]) instead of printed.
+    All,
+    /// Operands of at least [`MIN_SCRUB_LENGTH`] bytes. For live documents
+    /// (display admission): a shorter value can be neither registered nor
+    /// scrubbed from free text, and treating it as required would refuse
+    /// every admin read, the import that migrates it included. It is kept out
+    /// of output structurally instead: diffs, plans and the review comment
+    /// redact every operand by position.
+    Scrubbable,
+}
+
 /// The `header` / `query` / `cookie` operands of every plugin `trigger`
-/// ([`super::plugin_trigger`]) long enough for free-text scrubbing. They are
-/// never required for display admission. A shorter one is still a secret,
-/// but substring replacement of a few bytes would mangle unrelated text, so
-/// it is kept out of output structurally instead (import brokers it, the
-/// literal gate blocks it, diffs redact it by position, and the broker
-/// refuses to resolve it).
-fn collect_plugin_trigger_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
+/// ([`super::plugin_trigger`]), never required for display admission.
+fn collect_plugin_trigger_secrets(
+    config: &GatewayConfig,
+    which: TriggerOperands,
+    out: &mut dyn LeafSink,
+) {
     for plugin in &config.plugin_configs {
         let Some(trigger) = plugin.trigger.as_ref() else {
             continue;
         };
         let json = plugin_trigger::trigger_json(trigger);
-        for (path, text) in plugin_trigger::scrubbable_trigger_operands(&json) {
+        let operands = match which {
+            TriggerOperands::All => plugin_trigger::secret_trigger_operands(&json),
+            TriggerOperands::Scrubbable => plugin_trigger::scrubbable_trigger_operands(&json),
+        };
+        for (path, text) in operands {
             out.leaf(text, false, &|| {
                 leaf_location(
                     "PluginConfig",

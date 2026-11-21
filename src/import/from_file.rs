@@ -120,6 +120,9 @@ pub fn import_from_file_selected(
             unsupported_sections: snapshot.unsupported_sections.clone(),
             sources: vec![source],
             unmodeled_nested_fields: snapshot.unmodeled_nested_fields.clone(),
+            // A file may be an unmaterialized export whose placeholders are
+            // repository declarations, so it keeps the round-trip behaviour.
+            live_source: false,
         },
         credential_bundle_output,
         true,

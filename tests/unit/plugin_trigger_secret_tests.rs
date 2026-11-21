@@ -368,6 +368,109 @@ fn short_trigger_operands_are_secrets_too() {
     let output = SecretScrubber::from_gateway_config(&original).scrub_streams("validated", "");
     assert!(output.suppressed.is_none());
     gitforgeops::display::register_gateway_config(&original).unwrap();
+
+    // A short operand cannot be substring-replaced, but validator output that
+    // echoes it is withheld rather than printed (standalone `validate` runs no
+    // literal gate).
+    let echoed = trigger_gateway(serde_json::json!({"when": {"match": {"header": {
+        "name": "x-skip-waf", "value": {"exact": ["zq9tok"]}
+    }}}}));
+    let output = SecretScrubber::from_gateway_config(&echoed).scrub_streams(
+        "trigger.when.match.header.value.exact[0] = zq9tok is not allowed",
+        "",
+    );
+    assert_eq!(
+        output.suppressed,
+        Some(gitforgeops::secrets::SuppressionReason::ResidualValue)
+    );
+    assert!(!output.stdout.contains("zq9tok"));
+    assert!(!output.stderr.contains("zq9tok"));
+}
+
+/// `apply` resolves twice when it allocates: once against the bundle it
+/// read, then again on the already-resolved document after the allocator
+/// added new slots. A resolved trigger operand no longer spells a placeholder
+/// but still owns its slot, so the second pass must not call it orphaned.
+#[test]
+fn trigger_retirement_survives_the_post_allocation_re_resolve() {
+    let mut desired: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [{
+            "id": "app", "username": "app", "namespace": "ferrum",
+            "credentials": {"keyauth": [{"key": "${gh-env-secret:alloc=generate}"}]}
+        }],
+        "plugin_configs": [{
+            "id": "plugin", "namespace": "ferrum", "plugin_name": "waf", "scope": "global",
+            "config": {"mode": "enforce"},
+            "trigger": {"when": {"match": {"header": {"name": "x-skip-waf", "value": {"exact": [
+                PLACEHOLDER, "${gh-env-secret:alloc=generate}"
+            ]}}}}}
+        }]
+    }))
+    .unwrap();
+    let seeded = "ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[0]";
+    let generated = "ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[1]";
+    let mut bundle = CredentialBundle::new();
+    bundle.insert(seeded.to_string(), "seeded-trigger-token".to_string());
+
+    // First pass: the seeded operand resolves, two slots need allocation.
+    let report = super::resolver_fixtures::resolve_secrets(&mut desired, &bundle).unwrap();
+    assert_eq!(report.needs_allocation().len(), 2);
+    assert!(report.slot_remaps.is_empty());
+
+    // The allocator commits the new slots; the re-resolve runs on the
+    // already-resolved document under the default (refusing) remap policy.
+    bundle.insert(
+        generated.to_string(),
+        "generated-trigger-token-value".to_string(),
+    );
+    bundle.insert(
+        "ferrum/app/keyauth/key".to_string(),
+        "generated-consumer-key-value-0123456789".to_string(),
+    );
+    let report = super::resolver_fixtures::resolve_secrets(&mut desired, &bundle).unwrap();
+    assert!(report.slot_remaps.is_empty());
+    let text = trigger_text(&desired);
+    assert!(text.contains("seeded-trigger-token"), "{text}");
+    assert!(text.contains("generated-trigger-token-value"), "{text}");
+    assert!(unresolved_placeholder_slots(&desired).unwrap().is_empty());
+}
+
+/// A repository author who writes an operand as a scalar where a list is
+/// expected gets a decode error that names the field and the expected shape,
+/// never the value: serde's own message would quote it.
+#[test]
+fn malformed_trigger_decode_errors_withhold_the_value() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("ferrum").join("plugins");
+    std::fs::create_dir_all(&directory).unwrap();
+    for (name, trigger) in [
+        (
+            "scalar-exact.yaml",
+            "{when: {match: {header: {name: x-skip-waf, value: {exact: zq9-scalar-operand}}}}}",
+        ),
+        (
+            "scalar-value.yaml",
+            "{when: {match: {cookie: {name: tier, value: zq9-scalar-operand}}}}",
+        ),
+    ] {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        std::fs::write(
+            directory.join(name),
+            format!(
+                "kind: PluginConfig\nspec:\n  id: plugin\n  plugin_name: waf\n  scope: global\n  \
+                 config: {{}}\n  trigger: {trigger}\n"
+            ),
+        )
+        .unwrap();
+        let error = gitforgeops::config::load_resources(root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("zq9-scalar-operand"), "{name}: {error}");
+        assert!(error.contains(".spec.trigger"), "{name}: {error}");
+    }
 }
 
 /// Without a bundle, an unresolved brokered operand is compared as its

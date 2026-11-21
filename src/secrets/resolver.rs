@@ -1626,7 +1626,8 @@ fn report_secrets_with_mode_inner(
 /// here was never given a value, and writing its row would send the
 /// placeholder text as the credential. Walks the same leaves as
 /// [`report_secrets_with_mode_and_options`] (Consumer credentials,
-/// `PluginConfig.config`, modeled service-discovery secrets) against an empty
+/// `PluginConfig.config`, `PluginConfig.trigger` operands, modeled
+/// service-discovery secrets) against an empty
 /// bundle, so every placeholder reports regardless of what the bundle holds.
 pub fn unresolved_placeholder_slots(cfg: &GatewayConfig) -> crate::error::Result<Vec<String>> {
     let report = report_secrets_with_mode_inner(
@@ -2390,8 +2391,9 @@ fn enforce_slot_remap_policy(
     }
     Err(crate::error::Error::CredentialSlotRemap(format!(
         "Refusing to resolve credentials: {} credential slot(s) would be reassigned or \
-         revived by a credential shape change, a retired Consumer, or a PluginConfig that \
-         changed `plugin_name` (or still has retired type-less `@plugin-config` keys):\n  {}",
+         revived by a credential shape change, a retired Consumer or plugin trigger operand, \
+         or a PluginConfig that changed `plugin_name` (or still has retired type-less \
+         `@plugin-config` keys):\n  {}",
         report.slot_remaps.len(),
         report.slot_remaps.join("\n  ")
     )))
@@ -2749,15 +2751,15 @@ impl<'a> PluginWalk<'a> {
         }
     }
 
-    /// Refuse stored `trigger` slots that no brokered operand of this
-    /// plugin's declared trigger uses any more.
+    /// Refuse stored `trigger` slots whose operand path this plugin's declared
+    /// trigger no longer has.
     ///
     /// A trigger operand cannot be emptied (Edge refuses an empty `exact` /
     /// `prefix` list), so retiring the last one means removing its list, its
     /// predicate, its branch or the whole trigger; an array-length check on
     /// the arrays still present never sees that. Each stored slot under this
     /// plugin type's `trigger` prefix that is not the slot of a current
-    /// placeholder operand is therefore a proven remap under the same
+    /// operand position is therefore a proven remap under the same
     /// [`SlotRemapPolicy`]: re-adding an operand at that path (with
     /// `alloc=generate`, say) would otherwise resurrect a retired value.
     /// Runs for every declared plugin, with or without a trigger.
@@ -2777,11 +2779,15 @@ impl<'a> PluginWalk<'a> {
         if stored.peek().is_none() {
             return;
         }
-        let brokered: std::collections::BTreeSet<String> = trigger
+        // Structural, so a second pass over an already-resolved document
+        // (`allocate_if_needed` re-resolves after allocation) sees the same
+        // owned slots: a resolved operand no longer spells a placeholder but
+        // still sits at its slot's path. A literal at that path is refused
+        // by the literal-secret gate instead.
+        let owned: std::collections::BTreeSet<String> = trigger
             .map(|json| {
                 trigger_operand_strings(json)
                     .into_iter()
-                    .filter(|(_, text)| parse_placeholder(text).is_some())
                     .map(|(path, _)| {
                         plugin_trigger_slot(self.namespace, self.plugin_id, self.plugin_name, &path)
                     })
@@ -2791,12 +2797,12 @@ impl<'a> PluginWalk<'a> {
         let namespace = self.namespace;
         let plugin_id = self.plugin_id;
         let orphans: Vec<String> = stored
-            .filter(|slot| !brokered.contains(slot.as_str()))
+            .filter(|slot| !owned.contains(slot.as_str()))
             .map(|slot| {
                 format!(
                     "plugin trigger slot '{slot}' is orphaned: the credential bundle still holds \
-                     a value for it, but no brokered operand of plugin \
-                     '{namespace}/{plugin_id}''s trigger uses that path any more (the operand, \
+                     a value for it, but plugin '{namespace}/{plugin_id}''s trigger has no \
+                     operand at that path any more (the operand, \
                      its list, its predicate or the trigger was removed or moved). Re-adding an \
                      operand at that path would resurrect the retired value. Retire this slot \
                      from the credential bundle, keeping every other entry — or pass \

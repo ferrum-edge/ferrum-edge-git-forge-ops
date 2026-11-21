@@ -184,7 +184,8 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               attachments after namespace inference)
   → secrets::resolve_secrets  ${gh-env-secret:...} → values, in memory only, from
                               FERRUM_CREDS_JSON_FILE or FERRUM_CREDS_JSON; covers
-                              consumer credentials, plugin config and modeled
+                              consumer credentials, plugin config, plugin
+                              trigger operands and modeled
                               Upstream.service_discovery secrets; never written
                               back to disk
   → policy::evaluate_policies
@@ -233,7 +234,7 @@ fake derived from the slot path: `gitforgeops-validation-standin-<64 hex>`,
 - Substitution happens on a **copy**, written only to the 0600 temp spec. No
   stand-in is ever exported, applied, delivered or written to state.
 - On resolved snapshots, only slots the `ResolveReport` marks unresolved (canonical
-  consumer and plugin slots) get stand-ins. Resolved or unreported values stay
+  consumer, plugin config and plugin trigger slots) get stand-ins. Resolved or unreported values stay
   byte-for-byte, even with placeholder syntax. Consumer paths share the
   resolver's escaping and index-zero elision.
 - The report-free API and file apply keep syntax-based stand-ins for unresolved
@@ -241,8 +242,9 @@ fake derived from the slot path: `gitforgeops-validation-standin-<64 hex>`,
 
 **Scrubbing** (`secrets::SecretScrubber`). It collects every non-placeholder
 Consumer credential leaf (minus literal identities), every
-`sensitive_string_paths` plugin-config leaf, modeled service-discovery secrets,
-and — when paired with a `ResolveReport` — the value at every resolved slot,
+`sensitive_string_paths` plugin-config leaf, every non-empty plugin trigger
+`header`/`query`/`cookie` operand, modeled service-discovery secrets, and —
+when paired with a `ResolveReport` — the value at every resolved slot,
 even if it looks like a placeholder or has a nonsensitive field name. Those
 bytes and their single-line re-encodings (base64, percent, JSON-escape,
 single-quoted YAML) become `[REDACTED]` in the child's stdout/stderr;
@@ -1777,10 +1779,12 @@ prefix keeps them out of the credential-type keyspace):
   `src/secrets/plugin_trigger.rs::visit_trigger_sites`, mirrors Edge's
   `project_plugin_trigger_with` for every boundary and for export site
   prediction. Like Edge, every non-empty operand is a secret at any length
-  (import, literal gate, resolution, diff redaction by position); only
-  free-text scrubbing keeps the 8-byte floor, and a bundle value under 8 bytes
-  or one that is placeholder text is refused. A stored trigger slot no
-  brokered operand uses is a remap (`check_trigger_slot_retirement`). Other
+  (import, literal gate, resolution, diff redaction by position, validator
+  stream withholding); only substring replacement and live display admission
+  keep the 8-byte floor, and a bundle value under 8 bytes or one that is
+  placeholder text is refused. A stored trigger slot whose
+  operand path is gone is a remap (`check_trigger_slot_retirement`,
+  structural so `apply`'s post-allocation re-resolve agrees). Other
   predicates and field names stay literal; broker syntax there is refused at
   load and import (`validate_trigger_placeholders`).
 - `Upstream.service_discovery` → `<ns>/<upstream-id>/@service-discovery/<path>`
