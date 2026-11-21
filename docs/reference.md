@@ -252,8 +252,8 @@ tier carries an RFC 3339 `timestamp`, `mode`, `admin_writes_enabled`, the
 `provider` labels within their documented sets, `certified` always `false`)
 and the `cached_config` summary (exactly `{"available": false}`, or
 `available: true` with `loaded_at` and both counts), and no `error` or
-`message` key. An optional `database` block must be an object; no other
-optional diagnostic is validated. `mode` is one of Edge's operating
+`message` key. An optional `database` block must be an object whose `status`
+is `connected` or `disconnected`; no other optional diagnostic is validated. `mode` is one of Edge's operating
 modes. The `namespace` block is exactly `active`, `serving_scope` and
 `data_plane_single_namespace`, and `serving_scope` is the one Edge derives
 from `mode`: `single-namespace-data-plane` for `database`, `file`, `dp` and

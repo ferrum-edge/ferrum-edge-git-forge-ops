@@ -3565,8 +3565,9 @@ fn is_tenant_health(object: &serde_json::Map<String, serde_json::Value>) -> bool
 /// The detailed tier as both Edge v0.9.20 and later build it: from `status`,
 /// an RFC 3339 `timestamp` and `mode`, always adding `admin_writes_enabled`,
 /// `fips`, `namespace` and `cached_config`, and never an error envelope.
-/// The optional `database` block must be an object when present; the other
-/// optional diagnostics are not inspected.
+/// The optional `database` block, when present, must be an object whose
+/// `status` is `connected` or `disconnected`; the other optional diagnostics
+/// are not inspected.
 fn is_detailed_health(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     has_health_write_state(object)
         && object
@@ -3576,11 +3577,18 @@ fn is_detailed_health(object: &serde_json::Map<String, serde_json::Value>) -> bo
         && has_mode_namespace(object, true)
         && object.get("fips").is_some_and(is_fips_metadata)
         && object.get("cached_config").is_some_and(is_cached_config)
-        && object
-            .get("database")
-            .is_none_or(serde_json::Value::is_object)
+        && object.get("database").is_none_or(is_database_health)
         && !object.contains_key("error")
         && !object.contains_key("message")
+}
+
+/// Edge's `database` block: an object whose required `status` is one of the
+/// two labels the handler emits. Its other fields stay open.
+fn is_database_health(value: &serde_json::Value) -> bool {
+    value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| matches!(status, "connected" | "disconnected"))
 }
 
 fn is_rfc3339(stamp: &str) -> bool {

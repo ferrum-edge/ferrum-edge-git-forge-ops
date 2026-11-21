@@ -2789,11 +2789,25 @@ fn each_documented_tier_field_is_validated() {
         value["fips"]["build_profile"] = json!("fips");
         value["fips"]["provider"] = json!("aws-lc-fips");
     }));
-    // The optional `database` block is an object when present.
-    assert!(!recognized_after(
-        detailed,
-        set("database", json!("maintenance"))
-    ));
+    // The optional `database` block is an object with a documented `status`.
+    for database in [
+        json!("maintenance"),
+        json!({}),
+        json!({"status": null}),
+        json!({"status": 7}),
+        json!({"status": "maintenance"}),
+    ] {
+        assert!(
+            !recognized_after(detailed, set("database", database.clone())),
+            "{database}"
+        );
+    }
+    for status in ["connected", "disconnected"] {
+        assert!(recognized_after(
+            detailed,
+            set("database", json!({"status": status, "type": "postgres"}))
+        ));
+    }
     assert!(recognized_after(detailed, remove("database")));
 
     // The detailed tier's RFC 3339 timestamp.
