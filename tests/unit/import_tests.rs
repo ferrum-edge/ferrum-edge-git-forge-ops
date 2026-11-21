@@ -2543,8 +2543,9 @@ fn builtin_plugins_without_secret_looking_leaves_import_silently() {
 }
 
 /// URL userinfo spellings Ferrum Edge's WHATWG parser reads as credentials.
-const WHATWG_USERINFO_URLS: [&str; 5] = [
+const WHATWG_USERINFO_URLS: [&str; 6] = [
     "https:///svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https:///svc user:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
     "https:/\\svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
     "https:\t//svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
     "https://svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181\\v1",

@@ -10,34 +10,17 @@
 //! credential, so every check that asks "does this string carry URL
 //! credentials" goes through this module.
 
-/// Whether `value` carries URL userinfo, for classifying an arbitrary string
-/// (import capture, the literal-secret gate, the scrubber).
+/// Whether `value` carries URL userinfo: [`legacy_url_has_userinfo`] or
+/// [`parsed_url_has_userinfo`].
 ///
-/// True when either holds:
-///
-/// * [`legacy_url_has_userinfo`]: the raw value has a literal `scheme://`
-///   authority containing `@`. This is the original check, kept on the
-///   unmodified input so nothing it caught is lost (non-standard schemes,
-///   empty userinfo such as `https://@host`, hosts Edge's parser rejects).
-/// * [`parsed_url_has_userinfo`], for a value that reads as a single URL
-///   token: once WHATWG's leading and trailing C0-and-space trim is applied,
-///   nothing before the first `@` is an ASCII space. Tabs and line breaks
-///   still count as URL noise (WHATWG drops them; they are the bypass
-///   spellings), but a space is not, so prose such as
-///   `https: contact ops@example.com`, which the parser would accept with a
-///   percent-encoded username, stays free text.
-///
-/// So an email address, a `mailto:` URI, a `file:` path with `@` in it or
-/// prose that starts with `https:` is not mistaken for URL credentials.
+/// The parser half is exactly what Ferrum Edge reads, so an email address, a
+/// `mailto:` URI or a `file:` path with `@` in it never matches. It does read
+/// a username from some prose (`https: contact ops@example.com` parses with a
+/// percent-encoded username): a caller that knows a field is a literal
+/// payload rather than a URL can fall back to the legacy half alone there,
+/// as the plugin-config heuristic does.
 pub(crate) fn url_has_userinfo(value: &str) -> bool {
-    if legacy_url_has_userinfo(value) {
-        return true;
-    }
-    let trimmed = value.trim_matches(|c: char| c <= ' ');
-    let single_token = trimmed
-        .split_once('@')
-        .is_some_and(|(before, _)| !before.contains(' '));
-    single_token && parsed_url_has_userinfo(value)
+    legacy_url_has_userinfo(value) || parsed_url_has_userinfo(value)
 }
 
 /// Whether Ferrum Edge's own URL parser reads a username or password from
@@ -50,7 +33,9 @@ pub(crate) fn parsed_url_has_userinfo(value: &str) -> bool {
 }
 
 /// The original check on the raw value: `@` after the first `://` and before
-/// the next `/`, `?` or `#`.
+/// the next `/`, `?` or `#`. Kept on the unmodified input so nothing it caught
+/// is lost (non-standard schemes, empty userinfo such as `https://@host`,
+/// hosts Edge's parser rejects).
 pub(crate) fn legacy_url_has_userinfo(value: &str) -> bool {
     value
         .split_once("://")
@@ -116,7 +101,7 @@ fn is_url_scheme(candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parsed_url_has_userinfo, url_has_userinfo};
+    use super::{legacy_url_has_userinfo, parsed_url_has_userinfo, url_has_userinfo};
 
     #[test]
     fn whatwg_userinfo_spellings_are_detected() {
@@ -134,6 +119,11 @@ mod tests {
             "https:/\n/user:pass@host.example",
             "https://user:pass@host.example\\path",
             "https:///user:pass@host.example/a path with spaces",
+            // A literal space in userinfo is percent-encoded, not refused.
+            "https:/// :pass@host.example",
+            "https:///svc:my pass@host.example",
+            "https:\t//svc:my pass@host.example",
+            "redis:\t// :pass@cache.internal:6379/0",
             " https://user:pass@host.example",
             "\u{1}\u{1f} https://user:pass@host.example \u{0}",
             "HTTPS:///user:pass@host.example",
@@ -183,8 +173,6 @@ mod tests {
             "mailto:ops@example.com",
             "note: contact ops@example.com",
             "https: contact ops@example.com for help",
-            "https: contact ops@example.com",
-            " \u{1}https: contact ops@example.com",
             // `file` URLs never carry userinfo: `@` there is in a path.
             "file:///app@v2/policy.rego",
             "file:/a@b",
@@ -199,12 +187,18 @@ mod tests {
         }
     }
 
-    /// Edge's own parser does read a username from that prose; only the
-    /// classifier declines it.
+    /// Edge's own parser reads a username from some prose; only a caller
+    /// that knows the field is a literal payload can tell them apart.
     #[test]
-    fn the_parser_check_alone_matches_edge() {
-        assert!(parsed_url_has_userinfo("https: contact ops@example.com"));
-        assert!(parsed_url_has_userinfo("https:\t//user:pass@host.example"));
+    fn the_parser_reads_userinfo_from_some_prose() {
+        for value in [
+            "https: contact ops@example.com",
+            "https:\tContact\tops@example.com",
+            "https:ops@example.com or backup@example.org",
+        ] {
+            assert!(parsed_url_has_userinfo(value), "{value:?}");
+            assert!(!legacy_url_has_userinfo(value), "{value:?}");
+        }
         assert!(!parsed_url_has_userinfo("file:///app@v2/policy.rego"));
         assert!(!parsed_url_has_userinfo("https://@host.example"));
     }
