@@ -781,6 +781,8 @@ pub(crate) fn classify_plugin_config(
         }
     }
     let unbrokerable = classify_private_key_material(plugin_name, config, &mut sensitive);
+    // A leaf TLS classification brokered or refused is not an ordinary setting.
+    short_credential_named.retain(|path| !sensitive.contains(path) && !unbrokerable.contains(path));
     let mut heuristic = BTreeSet::new();
     let literal_payloads = literal_payload_paths(plugin_name, config);
     collect_heuristic_paths(config, &root, &mut heuristic, true, &literal_payloads);

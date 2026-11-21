@@ -1505,3 +1505,74 @@ fn multiline_broker_declarations_at_the_backend_key_field_are_declarations() {
         Some(seeds[PROXY_SLOT].as_str())
     );
 }
+
+/// A well-formed multi-line placeholder at a TLS key source is repository
+/// data: neither the validator scrubber nor display registration takes it
+/// (or any fragment of it) as a secret.
+#[test]
+fn multiline_placeholders_register_nothing_in_repository_sinks() {
+    for declaration in [
+        "${gh-env-secret:\n  alloc=require}",
+        "${gh-env-secret: alloc=require\n}",
+    ] {
+        assert!(matches!(
+            gitforgeops::secrets::parse_placeholder(declaration),
+            Some(Ok(_))
+        ));
+        let cfg = gateway(serde_json::json!({
+            "proxies": [proxy(serde_json::json!({
+                "backend_tls_client_cert_path": CERT_PATH,
+                "backend_tls_client_key_path": declaration,
+            }))],
+            "upstreams": [upstream(serde_json::json!({
+                "backend_tls_client_cert_path": CERT_PATH,
+                "backend_tls_client_key_path": declaration,
+            }))],
+            "plugin_configs": [plugin("udp_logging", serde_json::json!({
+                "host": "logs.internal", "port": 5514, "dtls": true,
+                "dtls_cert_path": CERT_PATH, "dtls_key_path": declaration,
+            }))]
+        }));
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&cfg);
+        assert!(scrubber.is_empty(), "{declaration:?}");
+        let output =
+            scrubber.scrub_streams("error: dtls_key_path ${gh-env-secret: alloc=require", "");
+        assert!(output.suppressed.is_none(), "{declaration:?}");
+        assert!(output.stdout.contains("alloc=require"), "{declaration:?}");
+
+        gitforgeops::display::enable_display_scrubbing_on_this_thread();
+        gitforgeops::display::register_resolved(
+            &cfg,
+            &gitforgeops::secrets::ResolveReport::default(),
+        )
+        .unwrap();
+        let shown = gitforgeops::display::scrub_text("remedy: use ${gh-env-secret:alloc=require}");
+        assert_eq!(
+            shown, "remedy: use ${gh-env-secret:alloc=require}",
+            "{declaration:?}"
+        );
+    }
+}
+
+/// A short leaf that TLS classification brokers (a control character under a
+/// key-named header) is not also reported as a short ordinary setting.
+#[test]
+fn tls_promoted_leaves_are_not_short_credential_named() {
+    let cfg = gateway(
+        serde_json::json!({"plugin_configs": [plugin("http_logging", serde_json::json!({
+            "endpoint_url": "https://collector.example/logs",
+            "custom_headers": {"private_key": "a\nb"},
+        }))]}),
+    );
+    let findings = audit_security(&cfg);
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.message.contains("Short credential-named")),
+        "{findings:?}"
+    );
+    let capture =
+        gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets(&mut cfg.clone())
+            .unwrap();
+    assert!(capture.short_credential_named.is_empty());
+}

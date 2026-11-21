@@ -505,6 +505,14 @@ trait LeafSink {
     /// `required` as in [`LiveSecretLeaf::required`]. `location` renders the
     /// leaf's resource and field path; it is called only when needed.
     fn leaf(&mut self, text: &str, required: bool, location: &dyn Fn() -> String);
+
+    /// Whether this sink treats `text` as repository data rather than a
+    /// secret, so a collector must not decompose it into pieces (key blocks,
+    /// body lines) that no longer look like it. Live documents have no such
+    /// exemption.
+    fn skips(&self, _text: &str) -> bool {
+        false
+    }
 }
 
 /// Repository and resolved documents: skip what is repository data rather
@@ -513,8 +521,12 @@ trait LeafSink {
 struct ManifestValues(BTreeSet<String>);
 
 impl LeafSink for ManifestValues {
+    fn skips(&self, text: &str) -> bool {
+        text.is_empty() || matches!(parse_placeholder(text), Some(Ok(_)))
+    }
+
     fn leaf(&mut self, text: &str, _required: bool, _location: &dyn Fn() -> String) {
-        if text.is_empty() || matches!(parse_placeholder(text), Some(Ok(_))) {
+        if self.skips(text) {
             return;
         }
         self.0.insert(text.to_string());
@@ -848,6 +860,12 @@ fn value_at_extra<'a>(
 /// validator's streams are withheld while one is registered, and the display
 /// sink withholds any line that keeps an eight-byte run of it.
 fn private_key_leaf(text: &str, out: &mut dyn LeafSink, location: &dyn Fn() -> String) {
+    // A well-formed placeholder (even a multi-line one, which counts as
+    // material at a key field) is repository data: never split it into
+    // fragments a repository sink would register as secrets.
+    if out.skips(text) {
+        return;
+    }
     let mut spellings = vec![text.to_string()];
     spellings.extend(super::tls_material::embedded_private_key_blocks(text));
     for spelling in spellings {
