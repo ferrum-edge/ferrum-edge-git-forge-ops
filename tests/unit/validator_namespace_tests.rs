@@ -767,8 +767,8 @@ fn brokered_standin_cases() -> Vec<(&'static str, serde_json::Value)> {
             }),
         ),
     ];
-    // Ambient AWS credentials: the unresolved override is omitted, so Edge
-    // validates the row against its default regional endpoint.
+    // Ambient AWS credentials: the unresolved override stands in as the
+    // row's default regional Lambda origin, which Edge's ambient scope admits.
     for credentials in [
         serde_json::json!({"aws_credentials": "default_chain"}),
         serde_json::json!({"aws_credentials": "static"}),
@@ -848,41 +848,47 @@ fn real_edge_accepts_brokered_plugin_stand_ins() {
     }
 }
 
-/// Leaving an ambient-credential Lambda override out of the validator copy
-/// must not let Edge fall back to the caller's `AWS_LAMBDA_ENDPOINT_URL`
-/// (Edge reads it whenever `aws_endpoint_url` is absent), so the variable is
-/// removed from the validator's environment then, and only then: a resolved
-/// override reaches the validator as configured, beside whatever the caller
-/// exported.
+/// The ambient-credential Lambda stand-in is scoped to its own row: the
+/// validator's environment is untouched, so another row that relies on the
+/// caller's `AWS_LAMBDA_ENDPOINT_URL` is still graded against it, while only
+/// the brokered row's override becomes its regional origin.
 #[test]
-fn an_omitted_lambda_override_does_not_inherit_the_endpoint_environment() {
+fn an_ambient_lambda_stand_in_leaves_the_endpoint_environment_to_other_rows() {
     let repo = Repo::new(&[], None, None);
     repo.write(
         "validator",
-        "#!/bin/sh\n[ \"$3\" = file ] || exit 0\necho \"env:${AWS_LAMBDA_ENDPOINT_URL-unset}\"\nif grep -q aws_endpoint_url \"$7\"; then echo override:present; else echo override:absent; fi\nexit 0\n",
+        "#!/bin/sh
+[ \"$3\" = file ] || exit 0
+echo \"env:${AWS_LAMBDA_ENDPOINT_URL-unset}\"
+echo \"overrides:$(grep -c aws_endpoint_url \"$7\")\"
+grep -q 'aws_endpoint_url: https://lambda.us-east-1.amazonaws.com/' \"$7\" && echo brokered:regional
+exit 0
+",
     );
-    let lambda = |endpoint: &str| {
-        format!(
-            "kind: PluginConfig\nspec:\n  id: lambda\n  plugin_name: serverless_function\n  scope: global\n  config:\n    provider: aws_lambda\n    aws_credentials: default_chain\n    aws_region: us-east-1\n    aws_function_name: fn\n    aws_endpoint_url: '{endpoint}'\n"
-        )
+    let lambda = |id: &str, endpoint: Option<&str>| {
+        let mut yaml = format!(
+            "kind: PluginConfig\nspec:\n  id: {id}\n  plugin_name: serverless_function\n  scope: global\n  config:\n    provider: aws_lambda\n    aws_credentials: default_chain\n    aws_region: us-east-1\n    aws_function_name: fn\n"
+        );
+        if let Some(endpoint) = endpoint {
+            yaml.push_str(&format!("    aws_endpoint_url: '{endpoint}'\n"));
+        }
+        yaml
     };
-    let inherited = [("AWS_LAMBDA_ENDPOINT_URL", "http://localhost:4566/lambda")];
-
     repo.write(
-        "resources/ferrum/plugins/lambda.yaml",
-        &lambda("${gh-env-secret:alloc=require}"),
+        "resources/ferrum/plugins/inherited.yaml",
+        &lambda("inherited", None),
     );
-    let output = repo.run(&["validate"], &inherited);
-    let text = output_text(&output);
-    assert!(text.contains("env:unset"), "{text}");
-    assert!(text.contains("override:absent"), "{text}");
-
     repo.write(
-        "resources/ferrum/plugins/lambda.yaml",
-        &lambda("https://lambda-fips.us-east-1.amazonaws.com"),
+        "resources/ferrum/plugins/brokered.yaml",
+        &lambda("brokered", Some("${gh-env-secret:alloc=require}")),
     );
-    let output = repo.run(&["validate"], &inherited);
+
+    let output = repo.run(
+        &["validate"],
+        &[("AWS_LAMBDA_ENDPOINT_URL", "http://localhost:4566/lambda")],
+    );
     let text = output_text(&output);
     assert!(text.contains("env:http://localhost:4566/lambda"), "{text}");
-    assert!(text.contains("override:present"), "{text}");
+    assert!(text.contains("overrides:1"), "{text}");
+    assert!(text.contains("brokered:regional"), "{text}");
 }

@@ -163,8 +163,9 @@ fn slot_digest(slot: &str) -> String {
 ///   (`shaped_url_standin`), a `private_key_jwt` key gets a throwaway key of
 ///   the sibling `private_key_jwt_alg`'s family
 ///   (`validate::client_key_standin`), and everything else gets the
-///   opaque token form. One leaf is omitted instead: an ambient-credential
-///   Lambda `aws_endpoint_url`, which only an official AWS host can satisfy. Header maps are
+///   opaque token form. An ambient-credential Lambda `aws_endpoint_url`,
+///   which only an official AWS host can satisfy, gets the row's default
+///   regional Lambda origin. Header maps are
 ///   rewritten value-side only, so `headers.x-honeycomb-team` keeps its key
 ///   and a plugin that validates required header *names* still sees them.
 ///
@@ -175,24 +176,8 @@ fn slot_digest(slot: &str) -> String {
 /// snapshots must use [`crate::validate::run_validation_with_report`] so actual
 /// values with placeholder syntax remain subject to validation.
 pub fn with_validation_standins(config: &GatewayConfig) -> Option<GatewayConfig> {
-    with_validation_standins_for_report(config, None).map(|input| input.config)
+    with_validation_standins_for_report(config, None)
 }
-
-/// The validator input a stand-in pass produced.
-pub(crate) struct StandinDocument {
-    /// The patched copy written to the temp spec.
-    pub(crate) config: GatewayConfig,
-    /// Environment variables the validator process must not inherit for this
-    /// document. Leaving an ambient-credential Lambda override out of the copy
-    /// would otherwise let Edge fall back to the caller's
-    /// `AWS_LAMBDA_ENDPOINT_URL` and grade an endpoint the repository never
-    /// named.
-    pub(crate) env_remove: Vec<&'static str>,
-}
-
-/// The variable Edge reads a Lambda endpoint from when a row sets no
-/// `aws_endpoint_url`.
-const AWS_LAMBDA_ENDPOINT_URL_ENV: &str = "AWS_LAMBDA_ENDPOINT_URL";
 
 /// A report must describe the supplied resolved snapshot. Only explicitly
 /// unresolved canonical slots are eligible; resolved or unreported values
@@ -202,7 +187,7 @@ const AWS_LAMBDA_ENDPOINT_URL_ENV: &str = "AWS_LAMBDA_ENDPOINT_URL";
 pub(crate) fn with_validation_standins_for_report(
     config: &GatewayConfig,
     report: Option<&ResolveReport>,
-) -> Option<StandinDocument> {
+) -> Option<GatewayConfig> {
     let unresolved = report.map(|report| {
         let mut slots = std::collections::HashMap::new();
         for result in &report.results {
@@ -234,7 +219,6 @@ pub(crate) fn with_validation_standins_for_report(
 
     let mut patched = config.clone();
     let mut changed = false;
-    let mut omitted_lambda_endpoint = false;
     for consumer in &mut patched.consumers {
         let namespace = consumer.namespace.clone();
         let consumer_id = consumer.id.clone();
@@ -271,56 +255,42 @@ pub(crate) fn with_validation_standins_for_report(
                 &plugin.config,
             ),
             client_keys,
+            lambda_origin: ambient_lambda_origin(plugin_name, &plugin.config),
         };
-        let omit_lambda_endpoint = omits_ambient_lambda_endpoint(plugin_name, &plugin.config)
-            && eligible(&crate::secrets::resolver::plugin_config_slot(
-                &plugin.namespace,
-                &plugin.id,
-                plugin_name,
-                &[ConfigPathComponent::Key(AWS_ENDPOINT_URL.to_string())],
-            ));
         let mut config = std::mem::take(&mut plugin.config);
         changed |= context.substitute(&mut config, &mut Vec::new(), &eligible);
-        if omit_lambda_endpoint {
-            if let Some(object) = config.as_object_mut() {
-                let omitted = object.remove(AWS_ENDPOINT_URL).is_some();
-                omitted_lambda_endpoint |= omitted;
-                changed |= omitted;
-            }
-        }
         plugin.config = config;
     }
 
-    changed.then(|| StandinDocument {
-        config: patched,
-        env_remove: if omitted_lambda_endpoint {
-            vec![AWS_LAMBDA_ENDPOINT_URL_ENV]
-        } else {
-            Vec::new()
-        },
-    })
+    changed.then_some(patched)
 }
 
 /// `serverless_function`'s Lambda endpoint override.
 const AWS_ENDPOINT_URL: &str = "aws_endpoint_url";
 
-/// Whether an unresolved `serverless_function` `aws_endpoint_url` must be
-/// left out of the validator copy rather than stood in for.
+/// The validation-only `aws_endpoint_url` stand-in for a Lambda row that signs
+/// with ambient AWS credentials, or `None` when the row gets the ordinary
+/// origin stand-in.
 ///
-/// A row that signs with ambient AWS credentials (`aws_credentials:
-/// default_chain`, or `static` with either half of the key pair left to the
-/// environment) may only send them to an official Lambda endpoint of its
-/// region: Edge's shape-only admission
+/// Such a row (`aws_credentials: default_chain`, or `static` with either half
+/// of the key pair left to the environment) may only send its credentials to
+/// an official Lambda endpoint of its region: Edge's shape-only admission
 /// (`screen_shape_only_ambient_lambda_config`, v0.9.20 and later) refuses any
 /// other `aws_endpoint_url` unless `allow_custom_endpoint_with_ambient_credentials`
-/// is `true`. No `.invalid` stand-in can pass that check, and imitating an AWS
-/// host would give up the stand-in's fail-closed property, so the override is
-/// omitted and Edge validates the row against its default regional endpoint,
-/// keeping the region and credential-mode checks. A resolved endpoint is
-/// never touched: it is validated exactly as configured.
-fn omits_ambient_lambda_endpoint(plugin_name: &str, config: &serde_json::Value) -> bool {
+/// is `true`. No `.invalid` host can pass, and leaving the field out would
+/// let Edge fall back to the caller's `AWS_LAMBDA_ENDPOINT_URL` and grade an
+/// endpoint the repository never named. So the stand-in is the row's own
+/// default regional origin, `https://lambda.<region>.amazonaws.com/`
+/// (`amazonaws.com.cn` for a `cn-*` region), exactly what Edge derives itself.
+/// It names a real AWS host, but like every stand-in it only ever reaches the
+/// 0600 temp spec, and `validate` dials nothing.
+///
+/// A row whose configured `aws_region` is missing or not a commercial,
+/// GovCloud or China region keeps the ordinary stand-in, so Edge reports the
+/// region problem rather than a guessed endpoint hiding it.
+fn ambient_lambda_origin(plugin_name: &str, config: &serde_json::Value) -> Option<String> {
     if plugin_name != "serverless_function" {
-        return false;
+        return None;
     }
     let text = |field: &str| config.get(field).and_then(serde_json::Value::as_str);
     let present = |field: &str| text(field).is_some_and(|value| !value.is_empty());
@@ -330,12 +300,43 @@ fn omits_ambient_lambda_endpoint(plugin_name: &str, config: &serde_json::Value) 
         // Edge refuses any other spelling outright.
         Some(_) => false,
     };
-    text("provider") == Some("aws_lambda")
-        && ambient
-        && config.get("allow_custom_endpoint_with_ambient_credentials")
-            != Some(&serde_json::Value::Bool(true))
-        && text(AWS_ENDPOINT_URL)
-            .is_some_and(|value| matches!(parse_placeholder(value), Some(Ok(_))))
+    if text("provider") != Some("aws_lambda")
+        || !ambient
+        || config.get("allow_custom_endpoint_with_ambient_credentials")
+            == Some(&serde_json::Value::Bool(true))
+    {
+        return None;
+    }
+    let region = text("aws_region")?;
+    let suffix = aws_region_dns_suffix(region)?;
+    Some(format!("https://lambda.{region}.{suffix}/"))
+}
+
+/// The regional endpoint DNS suffix for a region of a partition Edge models
+/// (its `aws_region_partition` grammar: `^(us|eu|ap|sa|ca|me|af|il|mx)-[a-z]+-\d+$`,
+/// `^cn-[a-z]+-\d+$`, `^us-gov-[a-z]+-\d+$`, at most 63 bytes), or `None`.
+fn aws_region_dns_suffix(region: &str) -> Option<&'static str> {
+    const COMMERCIAL: &[&str] = &["us", "eu", "ap", "sa", "ca", "me", "af", "il", "mx"];
+    if region.len() > 63 {
+        return None;
+    }
+    let (suffix, rest) = if let Some(rest) = region.strip_prefix("us-gov-") {
+        ("amazonaws.com", rest)
+    } else if let Some(rest) = region.strip_prefix("cn-") {
+        ("amazonaws.com.cn", rest)
+    } else {
+        let (prefix, rest) = region.split_once('-')?;
+        if !COMMERCIAL.contains(&prefix) {
+            return None;
+        }
+        ("amazonaws.com", rest)
+    };
+    let (area, number) = rest.split_once('-')?;
+    let well_formed = !area.is_empty()
+        && area.bytes().all(|byte| byte.is_ascii_lowercase())
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit());
+    well_formed.then_some(suffix)
 }
 
 /// The `private_key_jwt_alg` beside a client-assertion key, when it is a
@@ -361,6 +362,9 @@ struct PluginStandins<'a> {
     /// field's default (Edge refuses mixed `ldap` / `ldaps` endpoints).
     ldap_scheme: Option<&'static str>,
     client_keys: BTreeMap<Vec<ConfigPathComponent>, ClientKeyFamily>,
+    /// The ambient-credential Lambda stand-in for `aws_endpoint_url`
+    /// ([`ambient_lambda_origin`]).
+    lambda_origin: Option<String>,
 }
 
 impl PluginStandins<'_> {
@@ -410,6 +414,11 @@ impl PluginStandins<'_> {
     }
 
     fn standin(&self, slot: &str, path: &[ConfigPathComponent]) -> String {
+        if let (Some(origin), [ConfigPathComponent::Key(key)]) = (&self.lambda_origin, path) {
+            if key == AWS_ENDPOINT_URL {
+                return origin.clone();
+            }
+        }
         if self.endpoints.contains(path) {
             let scheme = self.ldap_scheme.unwrap_or_else(|| {
                 crate::secrets::plugin_config::endpoint_scheme(self.plugin_name, path)

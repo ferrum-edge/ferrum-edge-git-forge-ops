@@ -2176,12 +2176,15 @@ fn aws_endpoint_stand_in_is_an_origin_and_function_url_keeps_its_path() {
 
 /// A Lambda row that signs with ambient AWS credentials may only send them to
 /// an official regional endpoint, and Edge's shape-only admission refuses any
-/// other `aws_endpoint_url`, so no `.invalid` stand-in can pass. The
-/// unresolved override is left out of the validator copy instead, keeping the
-/// region and credential mode; a row with its own key pair, or that opts out
-/// of the scope, still gets the origin stand-in.
+/// other `aws_endpoint_url`, so no `.invalid` stand-in can pass. The stand-in
+/// is the row's own default regional Lambda origin instead (the field stays
+/// present, so Edge never falls back to the caller's
+/// `AWS_LAMBDA_ENDPOINT_URL`). A row with its own key pair, that opts out of
+/// the scope, or whose region Edge would refuse, gets the ordinary origin.
 #[test]
-fn an_ambient_credential_lambda_endpoint_is_omitted_rather_than_stood_in() {
+fn an_ambient_credential_lambda_endpoint_stands_in_as_the_regional_origin() {
+    use gitforgeops::validate::VALIDATION_STANDIN_HOST;
+
     let lambda = |extra: serde_json::Value| {
         let mut config = serde_json::json!({
             "provider": "aws_lambda",
@@ -2197,15 +2200,34 @@ fn an_ambient_credential_lambda_endpoint_is_omitted_rather_than_stood_in() {
             .map(|patched| patched.plugin_configs[0].config.clone())
     };
 
-    for ambient in [
-        serde_json::json!({"aws_credentials": "default_chain"}),
-        serde_json::json!({}),
-        serde_json::json!({"aws_credentials": "static", "aws_access_key_id": "AKIATEST"}),
-        serde_json::json!({"aws_secret_access_key": BROKERED}),
+    for (ambient, origin) in [
+        (
+            serde_json::json!({"aws_credentials": "default_chain"}),
+            "https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({}),
+            "https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({"aws_credentials": "static", "aws_access_key_id": "AKIATEST"}),
+            "https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({"aws_secret_access_key": BROKERED}),
+            "https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({"aws_credentials": "default_chain", "aws_region": "us-gov-west-1"}),
+            "https://lambda.us-gov-west-1.amazonaws.com/",
+        ),
+        (
+            serde_json::json!({"aws_credentials": "default_chain", "aws_region": "cn-north-1"}),
+            "https://lambda.cn-north-1.amazonaws.com.cn/",
+        ),
     ] {
         let patched = lambda(ambient.clone()).expect("the copy changed");
-        assert!(patched.get("aws_endpoint_url").is_none(), "{ambient}");
-        assert_eq!(patched["aws_region"], "us-east-1", "{ambient}");
+        assert_eq!(patched["aws_endpoint_url"], origin, "{ambient}");
         assert_eq!(
             patched.get("aws_credentials"),
             ambient.get("aws_credentials"),
@@ -2213,19 +2235,27 @@ fn an_ambient_credential_lambda_endpoint_is_omitted_rather_than_stood_in() {
         );
     }
 
-    for scoped_out in [
+    for ordinary in [
         serde_json::json!({"aws_access_key_id": "AKIATEST", "aws_secret_access_key": BROKERED}),
         serde_json::json!({
             "aws_credentials": "default_chain",
             "allow_custom_endpoint_with_ambient_credentials": true
         }),
+        // Edge reports these regions itself; no guessed endpoint hides that.
+        serde_json::json!({"aws_credentials": "default_chain", "aws_region": "us-iso-east-1"}),
+        serde_json::json!({"aws_credentials": "default_chain", "aws_region": "US-EAST-1"}),
+        serde_json::json!({"aws_credentials": "default_chain", "aws_region": null}),
     ] {
-        let patched = lambda(scoped_out.clone()).expect("the copy changed");
+        let patched = lambda(ordinary.clone()).expect("the copy changed");
         let endpoint = patched["aws_endpoint_url"].as_str().expect("a stand-in");
-        assert_eq!(
-            url::Url::parse(endpoint).unwrap().path(),
-            "/",
-            "{scoped_out}"
+        let parsed = url::Url::parse(endpoint).unwrap();
+        assert_eq!(parsed.path(), "/", "{ordinary}");
+        assert!(
+            parsed
+                .host_str()
+                .unwrap()
+                .ends_with(VALIDATION_STANDIN_HOST),
+            "{ordinary}"
         );
     }
 

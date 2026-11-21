@@ -102,22 +102,29 @@ static KEYS: [OnceLock<Option<String>>; 4] = [
 /// Text that replaces a generated key's body in captured validator output.
 pub(crate) const GENERATED_KEY_MASK: &str = "[VALIDATION-STANDIN-KEY]";
 
-/// Shortest base64 run masked. A key's last line, after any rewrapping, can
-/// be a few characters long (`AA==`); a run this short could occur in
+/// Shortest stretch of key material masked. A run this short could occur in
 /// ordinary text, and leaving at most 15 characters of a synthetic key is
-/// harmless. Every longer run of the key is masked.
+/// harmless; a stretch of short lines counts as one (see
+/// [`mask_generated_keys`]).
 const MIN_MASKED_RUN: usize = 16;
 
 /// `text` with the body of every key this process generated masked.
 ///
-/// The output is split into maximal runs of base64 characters (`A-Z`, `a-z`,
-/// `0-9`, `+`, `/`; padding `=` ends a run, so `der=MII...` still splits),
-/// and every run of at least [`MIN_MASKED_RUN`] characters that occurs in a
-/// generated key's body is masked. That covers the raw PEM, the quoted YAML
-/// line with `\n` escapes in the temp spec (the escape's `n` is dropped
-/// from the run after a backslash), JSON, block scalars, a body rewrapped at
-/// any width or indentation, and one with its line breaks removed. Families
-/// never generated cost nothing.
+/// The output is split into runs of base64 characters (`A-Z`, `a-z`, `0-9`,
+/// `+`, `/`; padding `=` ends a run, so `der=MII...` still splits). Runs
+/// separated only by whitespace or an escaped line break (`\n`, `\r`, `\t`)
+/// form one stretch, the way a PEM body continues across lines, and every
+/// sequence of consecutive runs in a stretch whose concatenation is at least
+/// [`MIN_MASKED_RUN`] characters and occurs in a generated key's body is
+/// masked run by run. That covers the raw PEM, the quoted YAML line with
+/// `\n` escapes in the temp spec, JSON, block scalars, a body with its line
+/// breaks removed, and one rewrapped at any width (short lines join up) or
+/// indentation. Any other character between runs ends the stretch, so text
+/// beside the key is untouched. Families never generated cost nothing.
+///
+/// The key is a per-process throwaway that only Edge's admission probe ever
+/// signs with, so this is defence in depth for the validation-only contract,
+/// not a credential boundary.
 pub(crate) fn mask_generated_keys(text: &str) -> String {
     let bodies: Vec<String> = KEYS
         .iter()
@@ -133,29 +140,63 @@ pub(crate) fn mask_generated_keys(text: &str) -> String {
     }
     let is_base64 = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/';
     let bytes = text.as_bytes();
-    let mut masked = String::with_capacity(text.len());
-    let mut copied = 0;
+
+    // Base64 runs as byte ranges, each tagged with the stretch it belongs to.
+    let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+    let mut stretch = 0;
     let mut index = 0;
     while index < bytes.len() {
-        if !is_base64(bytes[index]) {
+        let byte = bytes[index];
+        if is_base64(byte) {
+            let start = index;
+            while index < bytes.len() && is_base64(bytes[index]) {
+                index += 1;
+            }
+            runs.push((start, index, stretch));
+        } else if byte.is_ascii_whitespace() {
             index += 1;
-            continue;
-        }
-        let mut start = index;
-        while index < bytes.len() && is_base64(bytes[index]) {
+        } else if byte == b'\\' && matches!(bytes.get(index + 1), Some(b'n' | b'r' | b't')) {
+            index += 2;
+        } else {
+            stretch += 1;
             index += 1;
         }
-        // `\n`, `\r`, `\t` escapes: the letter belongs to the escape.
-        if start > 0 && bytes[start - 1] == b'\\' && matches!(bytes[start], b'n' | b'r' | b't') {
-            start += 1;
+    }
+
+    // Greedily mask the longest key-body sequence starting at each run.
+    // Every byte of a run is ASCII, so run ends are char boundaries.
+    let mut masked_runs = vec![false; runs.len()];
+    let mut first = 0;
+    while first < runs.len() {
+        let mut joined = String::new();
+        let mut best = None;
+        for (last, &(start, end, group)) in runs.iter().enumerate().skip(first) {
+            if group != runs[first].2 {
+                break;
+            }
+            joined.push_str(&text[start..end]);
+            if !bodies.iter().any(|body| body.contains(joined.as_str())) {
+                break;
+            }
+            if joined.len() >= MIN_MASKED_RUN {
+                best = Some(last);
+            }
         }
-        // Every byte of a run is ASCII, so both ends are char boundaries.
-        let run = &text[start..index];
-        if run.len() >= MIN_MASKED_RUN && bodies.iter().any(|body| body.contains(run)) {
-            masked.push_str(&text[copied..start]);
-            masked.push_str(GENERATED_KEY_MASK);
-            copied = index;
+        match best {
+            Some(last) => {
+                masked_runs[first..=last].fill(true);
+                first = last + 1;
+            }
+            None => first += 1,
         }
+    }
+
+    let mut masked = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (&(start, end, _), _) in runs.iter().zip(&masked_runs).filter(|(_, hit)| **hit) {
+        masked.push_str(&text[copied..start]);
+        masked.push_str(GENERATED_KEY_MASK);
+        copied = end;
     }
     masked.push_str(&text[copied..]);
     masked
@@ -266,19 +307,52 @@ mod tests {
                 .chunks(48)
                 .map(|chunk| format!("    {}\n", String::from_utf8_lossy(chunk)))
                 .collect::<String>(),
+            // Rewrapped at 12 columns, every line shorter than the threshold.
+            format!(
+                "error: echo\n{}error: done\n",
+                body.concat()
+                    .as_bytes()
+                    .chunks(12)
+                    .map(|chunk| format!("{}\n", String::from_utf8_lossy(chunk)))
+                    .collect::<String>()
+            ),
+            // Rewrapped at 5 columns inside an escaped one-line rendering.
+            body.concat()
+                .as_bytes()
+                .chunks(5)
+                .map(|chunk| format!("{}\\n", String::from_utf8_lossy(chunk)))
+                .collect::<String>(),
         ];
+        let base64_only = |text: &str| -> String {
+            text.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/')
+                .collect()
+        };
         for (index, rendering) in renderings.iter().enumerate() {
             let masked = mask_generated_keys(rendering);
+            // With every separator and escape removed, no 16-character stretch
+            // of the key body survives: the body cannot be rejoined from the
+            // output.
+            let residue = base64_only(&masked.replace(GENERATED_KEY_MASK, "~"));
             assert!(
                 body.concat()
                     .as_bytes()
-                    .chunks(MIN_MASKED_RUN)
-                    .filter(|chunk| chunk.len() == MIN_MASKED_RUN)
-                    .all(|chunk| !masked.contains(&*String::from_utf8_lossy(chunk))),
+                    .windows(MIN_MASKED_RUN)
+                    .all(|window| !residue.contains(&*String::from_utf8_lossy(window))),
                 "rendering {index} left key material unmasked"
             );
             assert!(masked.contains(GENERATED_KEY_MASK), "rendering {index}");
         }
+        // Text beside the key survives.
+        let masked = mask_generated_keys(&renderings[6]);
+        assert!(
+            masked.starts_with("error: echo\n"),
+            "leading diagnostic lost"
+        );
+        assert!(
+            masked.ends_with("error: done\n"),
+            "trailing diagnostic lost"
+        );
         // Ordinary diagnostics pass through untouched.
         let plain = "error: proxy httpbin: unknown field `listen_path_typo`";
         assert_eq!(mask_generated_keys(plain), plain);

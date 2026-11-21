@@ -229,8 +229,8 @@ deterministic in the slot path for `gitforgeops-validation-standin-<64 hex>`,
 `.invalid` stand-in host shaped by `endpoint_scheme` / `endpoint_form`
 (endpoint-typed plugin fields); a throwaway per-process key, masked in
 validator output, for a `private_key_jwt` `private_key_pem`
-(`validate::client_key_standin`). An ambient-credential Lambda
-`aws_endpoint_url` is omitted instead. Reason:
+(`validate::client_key_standin`); the row's default regional Lambda origin
+for an ambient-credential Lambda `aws_endpoint_url`. Reason:
 `${gh-env-secret:alloc=generate}` is 30 characters and Edge's floor for
 `jwt`/`hmac_auth` is 32, so a bundle-less fork PR would fail on the placeholder.
 
