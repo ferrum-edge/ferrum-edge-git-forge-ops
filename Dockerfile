@@ -68,10 +68,16 @@ RUN cargo build --release --locked
 
 # Debian point-release security updates for CVE-2026-103111 (HIGH),
 # DSA-6549-1 / GHSA-5qpq-xqfv-j9pg, and CVE-2026-76844 / CVE-2026-85091 (HIGH,
-# zlib). Pin each .deb by version and SHA-256 from
-# its content-immutable security pool path; never consult a mutable package
-# index here. The security pool drops a version once a newer update supersedes
-# it; the build then fails closed (404) and the base-image pin canary reports it.
+# zlib), plus the glibc (libc6, libc-bin) 2.41-12+deb13u5 fixes for
+# CVE-2026-5435, CVE-2026-6238, CVE-2026-6368, CVE-2026-6791, CVE-2026-8674,
+# CVE-2026-18374, CVE-2026-19499, CVE-2026-19542, CVE-2026-77117,
+# CVE-2026-80489, CVE-2026-86805, CVE-2026-89092, CVE-2026-95818 and
+# CVE-2026-97399 (MEDIUM/LOW), which Debian 13.8 shipped through the main
+# archive rather than the security archive. Pin each .deb by version and
+# SHA-256 from its content-immutable pool path (`debian-security/` or
+# `debian/`); never consult a mutable package index here. A pool drops a
+# version once a newer update supersedes it; the build then fails closed (404)
+# and the base-image pin canary reports it.
 # Pool file names omit a Debian epoch, so a package that has one declares it
 # beside its pool (`epoch=N`), and the build refuses a .deb whose control
 # `Version` is not exactly the reviewed `N:<file-name version>`. The canary
@@ -86,27 +92,32 @@ RUN set -eu; \
         e226f661d918f04daf38cdbc4806b7ed7d6ef95c7eb0ade692fc350e31970040 libpcre2-8-0_10.46-1~deb13u3_amd64.deb \
         b38acab30f295bf1066a6632e31cbd0a1980f2924b38040cda131d5dea5384ec liblzma5_5.8.1-1+deb13u2_amd64.deb \
         8c27c342230503b73dfde629642c3b352e87b554e06d60cf58772f236a305ceb zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_amd64.deb \
+        b59b0625cd1a791375d40dab23a4d5d3d0641e3d0a773501becdc3725b7f99cf libc6_2.41-12+deb13u5_amd64.deb \
+        f30ee7381a9c6a3936165259bcd58e65f4b288e351606d200c8435724c5876dd libc-bin_2.41-12+deb13u5_amd64.deb \
         > SHA256SUMS ;; \
       arm64) printf '%s  %s\n' \
         1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7 libpcre2-8-0_10.46-1~deb13u3_arm64.deb \
         88f3aa499dc30edf01b9209ab40f11e37edfbecef971f84f4721de1874ed4827 liblzma5_5.8.1-1+deb13u2_arm64.deb \
         0e41b3d7ad8ad7fcd36dd4d61ca91a70018478fc4af652e044f4be770784ddff zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_arm64.deb \
+        0966fc3da1a26cc57647c68b5736f791b6e7eb498173a7993f63b6c89b4ed4f5 libc6_2.41-12+deb13u5_arm64.deb \
+        889850625c686a6d0b26a8baee5fb96f33e9f3305882f3a6751bb4c9433063e1 libc-bin_2.41-12+deb13u5_arm64.deb \
         > SHA256SUMS ;; \
       *) echo "unsupported target architecture: $arch" >&2; exit 1 ;; \
     esac; \
     while read -r digest file; do \
       epoch=''; \
       case "$file" in \
-        libpcre2-8-0_*) pool=pool/updates/main/p/pcre2 ;; \
-        liblzma5_*) pool=pool/updates/main/x/xz-utils ;; \
-        zlib1g_*) pool=pool/updates/main/z/zlib epoch=1 ;; \
+        libpcre2-8-0_*) pool=debian-security/pool/updates/main/p/pcre2 ;; \
+        liblzma5_*) pool=debian-security/pool/updates/main/x/xz-utils ;; \
+        zlib1g_*) pool=debian-security/pool/updates/main/z/zlib epoch=1 ;; \
+        libc6_*|libc-bin_*) pool=debian/pool/main/g/glibc ;; \
         *) echo "unexpected package: $file" >&2; exit 1 ;; \
       esac; \
       version="${file#*_}"; version="${version%_*}"; \
       printf '%s %s\n' "$file" "${epoch:+$epoch:}$version" >> VERSIONS; \
       curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
         --retry 3 --retry-connrefused \
-        "https://deb.debian.org/debian-security/$pool/$file" --output "$file"; \
+        "https://deb.debian.org/$pool/$file" --output "$file"; \
     done < SHA256SUMS; \
     sha256sum --check --strict SHA256SUMS; \
     while read -r file version; do \
@@ -126,8 +137,9 @@ RUN set -eu; \
 # 10.46-1~deb13u2 on amd64 and arm64; the reviewed security fix is u3. The
 # pinned base carries liblzma5 5.8.1-1+deb13u1 from the xz-utils source package;
 # the reviewed security fix is u2. It also carries zlib1g
-# 1:1.3.dfsg+really1.3.1-1+b1; the reviewed security fix is +deb13u1. Keep the
-# exact-version, SHA-256-verified
+# 1:1.3.dfsg+really1.3.1-1+b1; the reviewed security fix is +deb13u1. It
+# carries libc6 and libc-bin 2.41-12+deb13u4; the reviewed point-release fix is
+# +deb13u5. Keep the exact-version, SHA-256-verified
 # package updates until the base's installed package metadata confirms it
 # already carries the fixes. Never `apt-get`.
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
