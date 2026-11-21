@@ -1151,44 +1151,91 @@ fn free_text_in_plugin_config_is_not_url_userinfo() {
     }
 }
 
-/// `(plugin_name, config)` with `text` at each builtin literal-payload field:
-/// a body or message Edge serves verbatim, never parses as a URL.
-fn literal_payload_plugins(text: &str) -> [(&'static str, serde_json::Value); 4] {
+/// `(plugin_name, config, dotted path)` with `text` at each builtin
+/// literal-text field: a body, message or close reason Edge serves verbatim,
+/// never parses as a URL.
+fn literal_payload_plugins(text: &str) -> [(&'static str, serde_json::Value, &'static str); 11] {
+    use serde_json::json;
     [
         (
             "response_mock",
-            serde_json::json!({"rules": [{"path": "/help", "status_code": 200, "body": text}]}),
+            json!({"rules": [{"path": "/help", "status_code": 200, "body": text}]}),
+            "rules.[0].body",
         ),
         (
             "fault_injection",
-            serde_json::json!({"abort": {"status_code": 503, "percentage": 100, "body": text}}),
+            json!({"abort": {"status_code": 503, "percentage": 100, "body": text}}),
+            "abort.body",
         ),
         (
             "request_termination",
-            serde_json::json!({"status_code": 503, "body": text}),
+            json!({"status_code": 503, "body": text}),
+            "body",
         ),
         (
             "request_termination",
-            serde_json::json!({"status_code": 503, "message": text}),
+            json!({"status_code": 503, "message": text}),
+            "message",
+        ),
+        (
+            "opa",
+            json!({"opa_host": "http://opa.internal:8181", "deny_body": text}),
+            "deny_body",
+        ),
+        (
+            "opa",
+            json!({"opa_host": "http://opa.internal:8181", "fail_closed_body": text}),
+            "fail_closed_body",
+        ),
+        (
+            "waf",
+            json!({"mode": "enforce", "default_rule_action": "enforce", "reject_body": text}),
+            "reject_body",
+        ),
+        (
+            "ws_rate_limiting",
+            json!({"frames_per_second": 10, "close_reason": text}),
+            "close_reason",
+        ),
+        (
+            "ws_message_size_limiting",
+            json!({"max_frame_bytes": 65536, "close_reason": text}),
+            "close_reason",
+        ),
+        (
+            "ws_message_size_limiting",
+            json!({"max_frame_bytes": 65536, "client_to_backend": {"close_reason": text}}),
+            "client_to_backend.close_reason",
+        ),
+        (
+            "ws_message_size_limiting",
+            json!({"max_frame_bytes": 65536, "backend_to_client": {"close_reason": text}}),
+            "backend_to_client.close_reason",
         ),
     ]
 }
 
 /// Prose the WHATWG parser happens to read a username from (it percent-encodes
-/// spaces and drops tabs) is still prose in a response body: only a literal
-/// `scheme://` authority counts there.
+/// spaces and drops tabs) is still prose in a literal-text field.
 #[test]
 fn prose_in_a_literal_payload_field_is_not_url_userinfo() {
     for text in [
         "https: contact ops@example.com",
         "https:\tContact\tops@example.com",
         "https:ops@example.com or backup@example.org",
+        "https: ops@example.com\r\nSee you",
     ] {
-        for (plugin_name, config) in literal_payload_plugins(text) {
+        for (plugin_name, config, _) in literal_payload_plugins(text) {
             let gateway = single_plugin_gateway(plugin_name, config);
             assert_plugin_config_stays_literal(&gateway, text);
         }
-        // The same text in an ordinary field is classified by the full parser.
+    }
+    // The same text in an ordinary field is classified by the full parser.
+    for text in [
+        "https: contact ops@example.com",
+        "https:\tContact\tops@example.com",
+        "https:ops@example.com or backup@example.org",
+    ] {
         let gateway = single_plugin_gateway("opa", serde_json::json!({"opa_host": text}));
         let findings = gitforgeops::diff::security::audit_security(&gateway);
         assert!(
@@ -1200,33 +1247,49 @@ fn prose_in_a_literal_payload_field_is_not_url_userinfo() {
     }
 }
 
-/// In a literal-payload field a credential URL counts only with a literal
-/// `scheme://` authority (the original check): `https://user:pass@host` is
-/// gated, while a spelling only the WHATWG parser reads as a URL is served as
-/// the bytes it is, like the prose it cannot be told apart from.
+/// A complete credential URL token in a literal-text field is still a
+/// credential, whether it has a literal `scheme://` authority or a spelling
+/// only the WHATWG parser reads: import needs a plaintext allowance, the
+/// literal-secret gate blocks it and the scrubber removes it.
 #[test]
-fn literal_payload_fields_keep_the_literal_url_check() {
+fn credential_url_tokens_in_literal_payload_fields_are_caught() {
     use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
 
-    let credential = "https://svc:SYNTHETIC-URL-PASSWORD@vendor.example/hook";
-    for (plugin_name, config) in literal_payload_plugins(credential) {
-        let gateway = single_plugin_gateway(plugin_name, config);
-        assert!(
-            security_blockers(&audit_security(&gateway))
+    for credential in [
+        "https://svc:SYNTHETIC-URL-PASSWORD@vendor.example/hook",
+        "https:///svc:SYNTHETIC-URL-PASSWORD@vendor.example/hook",
+        "https:/\\svc:SYNTHETIC-URL-PASSWORD@vendor.example/hook",
+        " https:svc:SYNTHETIC-URL-PASSWORD@vendor.example/hook ",
+    ] {
+        for (plugin_name, config, path) in literal_payload_plugins(credential) {
+            let gateway = single_plugin_gateway(plugin_name, config);
+
+            let mut captured = gateway.clone();
+            let capture = capture_and_redact_import_plugin_config_secrets(&mut captured).unwrap();
+            let unbrokered: Vec<&str> = capture
+                .unbrokered
                 .iter()
-                .any(|finding| finding.message.contains("Literal plugin-config secret")),
-            "{plugin_name}"
-        );
-        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
-        assert!(!scrubber
-            .scrub(&format!("body: {credential}"))
-            .contains("SYNTHETIC-URL-PASSWORD"));
-    }
+                .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+                .collect();
+            assert_eq!(unbrokered, [path], "{plugin_name} {credential:?}");
 
-    let parser_only = "https:///svc:synthetic-url-material@vendor.example/hook";
-    for (plugin_name, config) in literal_payload_plugins(parser_only) {
-        let gateway = single_plugin_gateway(plugin_name, config);
-        assert_plugin_config_stays_literal(&gateway, parser_only);
+            let findings = audit_security(&gateway);
+            assert!(
+                security_blockers(&findings).iter().any(|finding| finding
+                    .message
+                    .contains("Literal plugin-config secret")
+                    && finding.message.contains(path)),
+                "{plugin_name} {path} {credential:?}: {findings:?}"
+            );
+            let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+            assert!(
+                !scrubber
+                    .scrub(&format!("body: {credential}"))
+                    .contains("SYNTHETIC-URL-PASSWORD"),
+                "{plugin_name} {path}"
+            );
+        }
     }
 }
 

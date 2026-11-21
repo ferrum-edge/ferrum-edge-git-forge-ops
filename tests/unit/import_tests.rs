@@ -2640,6 +2640,46 @@ fn whatwg_url_userinfo_in_plugin_config_never_reaches_the_resource_tree() {
     }
 }
 
+/// A complete credential URL in a literal-text field (here a mock response
+/// body) still makes import refuse the plaintext value, in a parser-only
+/// spelling too; prose beside it in another rule does not.
+#[test]
+fn credential_url_tokens_in_a_mock_body_block_the_import() {
+    for credential in [
+        "https://svc:SYNTHETIC-URL-PASSWORD@vendor.example/hook",
+        "https:///svc:SYNTHETIC-URL-PASSWORD@vendor.example/hook",
+    ] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let backup_path = single_plugin_backup(
+            source.path(),
+            "response_mock",
+            serde_json::json!({"rules": [
+                {"path": "/help", "status_code": 200, "body": "https: contact ops@example.com"},
+                {"path": "/hook", "status_code": 200, "body": credential}
+            ]}),
+        );
+        let output = destination.path().join("resources");
+        let error = gitforgeops::import::from_file::import_from_file(
+            &backup_path,
+            &output,
+            None,
+            &strict_passthrough(),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("refusing to import plaintext plugin config"),
+            "{credential:?}: {error}"
+        );
+        assert!(error.contains("rules.[1].body"), "{error}");
+        assert!(!error.contains("rules.[0].body"), "{error}");
+        assert!(!error.contains("SYNTHETIC-URL-PASSWORD"), "{error}");
+        assert!(!output.exists());
+    }
+}
+
 fn builtin_plugin_backup(source: &std::path::Path, plugin_name: &str) -> PathBuf {
     let backup_path = source.join("backup.yaml");
     let mut config = make_test_config();

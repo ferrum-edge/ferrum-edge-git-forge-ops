@@ -1137,17 +1137,29 @@ fn collect_kafka_properties(
     }
 }
 
-/// Builtin string fields Ferrum Edge treats as literal payload bytes (a
-/// response body or message it serves verbatim), never as a URL. Free text
-/// there can still parse as a WHATWG URL with a username
-/// (`https: contact ops@example.com`), so the URL-userinfo heuristic uses only
-/// its literal `scheme://` half at these paths. Everywhere else, and in every
-/// custom plugin, Edge's full parser match applies.
+/// Builtin string fields Ferrum Edge treats as literal text it serves
+/// verbatim (a response body or message, a WebSocket close reason), never as
+/// a URL. Free text there can still parse as a WHATWG URL with a username
+/// (`https: contact ops@example.com`), so the URL-userinfo heuristic uses
+/// [`url_token_has_userinfo`](super::url_userinfo::url_token_has_userinfo)
+/// at these paths: a complete credential URL token is still caught, prose is
+/// not. Everywhere else, and in every custom plugin, Edge's full parser match
+/// applies.
+///
+/// Checked against the Edge v0.9.20 and `main` plugin constructors.
 fn literal_payload_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]] {
     match plugin_name {
         "response_mock" => &[&["rules", "*", "body"]],
         "fault_injection" => &[&["abort", "body"]],
         "request_termination" => &[&["body"], &["message"]],
+        "opa" => &[&["deny_body"], &["fail_closed_body"]],
+        "waf" => &[&["reject_body"]],
+        "ws_rate_limiting" => &[&["close_reason"]],
+        "ws_message_size_limiting" => &[
+            &["close_reason"],
+            &["client_to_backend", "close_reason"],
+            &["backend_to_client", "close_reason"],
+        ],
         _ => &[],
     }
 }
@@ -1201,7 +1213,7 @@ fn collect_heuristic_paths(
         }
         Value::String(text) => {
             let userinfo = if literal_payloads.contains(current) {
-                super::url_userinfo::legacy_url_has_userinfo(text)
+                super::url_userinfo::url_token_has_userinfo(text)
             } else {
                 super::url_userinfo::url_has_userinfo(text)
             };

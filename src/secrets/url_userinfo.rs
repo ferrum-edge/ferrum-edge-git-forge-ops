@@ -16,11 +16,24 @@
 /// The parser half is exactly what Ferrum Edge reads, so an email address, a
 /// `mailto:` URI or a `file:` path with `@` in it never matches. It does read
 /// a username from some prose (`https: contact ops@example.com` parses with a
-/// percent-encoded username): a caller that knows a field is a literal
-/// payload rather than a URL can fall back to the legacy half alone there,
-/// as the plugin-config heuristic does.
+/// percent-encoded username): a caller that knows a field holds literal text
+/// rather than a URL uses [`url_token_has_userinfo`] there instead.
 pub(crate) fn url_has_userinfo(value: &str) -> bool {
     legacy_url_has_userinfo(value) || parsed_url_has_userinfo(value)
+}
+
+/// [`url_has_userinfo`] for a field that holds literal text rather than a
+/// URL: the legacy check, or the parser check when the whole value is one
+/// URL token (no ASCII whitespace once WHATWG's leading and trailing C0 and
+/// space trim is applied). A complete credential URL in any spelling is still
+/// caught, while prose the parser happens to read a username from
+/// (`https: contact ops@example.com`, a tab-separated row) is not.
+pub(crate) fn url_token_has_userinfo(value: &str) -> bool {
+    legacy_url_has_userinfo(value)
+        || (!value
+            .trim_matches(|c: char| c <= ' ')
+            .contains(|c: char| c.is_ascii_whitespace())
+            && parsed_url_has_userinfo(value))
 }
 
 /// Whether Ferrum Edge's own URL parser reads a username or password from
@@ -101,7 +114,9 @@ fn is_url_scheme(candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{legacy_url_has_userinfo, parsed_url_has_userinfo, url_has_userinfo};
+    use super::{
+        legacy_url_has_userinfo, parsed_url_has_userinfo, url_has_userinfo, url_token_has_userinfo,
+    };
 
     #[test]
     fn whatwg_userinfo_spellings_are_detected() {
@@ -198,6 +213,16 @@ mod tests {
         ] {
             assert!(parsed_url_has_userinfo(value), "{value:?}");
             assert!(!legacy_url_has_userinfo(value), "{value:?}");
+            assert!(!url_token_has_userinfo(value), "{value:?}");
+        }
+        // A complete credential URL token is caught in a literal-text field.
+        for value in [
+            "https://user:pass@host.example/hook",
+            "https:///user:pass@host.example/hook",
+            " \u{1}https:/\\user:pass@host.example/hook ",
+            "https:user:pass@host.example",
+        ] {
+            assert!(url_token_has_userinfo(value), "{value:?}");
         }
         assert!(!parsed_url_has_userinfo("file:///app@v2/policy.rego"));
         assert!(!parsed_url_has_userinfo("https://@host.example"));
