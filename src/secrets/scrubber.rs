@@ -752,10 +752,11 @@ fn collect_credential_leaves(
 fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
     for plugin in &config.plugin_configs {
         let declared = rule_declared_paths(&plugin.plugin_name, &plugin.config);
-        let private_keys: BTreeSet<Vec<ConfigPathComponent>> = private_key_sites(&plugin.config)
-            .into_iter()
-            .map(|site| site.path)
-            .collect();
+        let private_keys: BTreeSet<Vec<ConfigPathComponent>> =
+            super::tls_material::plugin_private_key_sites(&plugin.plugin_name, &plugin.config)
+                .into_iter()
+                .map(|site| site.path)
+                .collect();
         for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
             if let Some(serde_json::Value::String(text)) = value_at(&plugin.config, &path) {
                 let location = || {
@@ -781,7 +782,10 @@ fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink)
 /// ([`super::tls_material::embedded_private_key_blocks`]), each with its
 /// line-ending variants ([`super::tls_material::line_ending_variants`]), so a
 /// copy whose line endings were rewritten, or that holds only the key, is
-/// still matched whole. A PEM block
+/// still matched whole, and each encoded body line of at least
+/// [`MIN_SCRUB_LENGTH`] bytes on its own
+/// ([`super::tls_material::private_key_body_lines`]), so a copy whose line
+/// breaks were re-wrapped or escaped loses its key text too. A PEM block
 /// is multi-line, which [`is_reencoding_hazard`] treats as unscrubbable: the
 /// validator's streams are withheld while one is registered, and the display
 /// sink withholds any line that keeps an eight-byte run of it.
@@ -793,6 +797,9 @@ fn private_key_leaf(text: &str, out: &mut dyn LeafSink, location: &dyn Fn() -> S
             out.leaf(&variant, true, location);
         }
         out.leaf(&spelling, true, location);
+    }
+    for line in super::tls_material::private_key_body_lines(text, MIN_SCRUB_LENGTH) {
+        out.leaf(&line, true, location);
     }
 }
 

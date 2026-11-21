@@ -16,7 +16,7 @@ use crate::secrets::plugin_config::{
     render_config_path, sensitive_string_paths, short_credential_named_paths, value_at,
 };
 use crate::secrets::resolver::is_identity_credential_leaf;
-use crate::secrets::tls_material::{is_key_source_path, private_key_sites};
+use crate::secrets::tls_material::{plugin_private_key_sites, private_key_sites, KeyPlacement};
 
 #[derive(Debug, Clone)]
 pub struct SecurityFinding {
@@ -714,10 +714,11 @@ fn is_broker_placeholder(value: &str) -> bool {
 /// Disabled plugins are included because their config is still published.
 /// Findings identify the resource and field, never the classified value.
 fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
-    let private_key_paths: std::collections::BTreeSet<_> = private_key_sites(&plugin.config)
-        .into_iter()
-        .map(|site| site.path)
-        .collect();
+    let private_keys: std::collections::BTreeMap<_, _> =
+        plugin_private_key_sites(&plugin.plugin_name, &plugin.config)
+            .into_iter()
+            .map(|site| (site.path, site.placement))
+            .collect();
     for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
         let Some(serde_json::Value::String(value)) = value_at(&plugin.config, &path) else {
             continue;
@@ -725,19 +726,25 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
         if is_broker_placeholder(value) {
             continue;
         }
-        let key_source = is_key_source_path(&path);
-        let private_key = private_key_paths.contains(&path);
+        let placement = match private_keys.get(&path).copied() {
+            Some(KeyPlacement::Other)
+                if crate::secrets::tls_material::contains_public_pem_block(value) =>
+            {
+                Some(KeyPlacement::Certificate)
+            }
+            placement => placement,
+        };
         let path = render_config_path(&path);
-        let message = match (private_key, key_source) {
-            (true, true) => format!(
+        let message = match placement {
+            Some(KeyPlacement::KeySource | KeyPlacement::Other) => format!(
                 "Literal TLS private key in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot with the PEM key, or reference a key file)",
                 plugin.id, plugin.plugin_name, plugin.namespace
             ),
-            (true, false) => format!(
+            Some(KeyPlacement::Certificate) => format!(
                 "Literal TLS private key in 'config.{path}' on plugin {} ({}) in namespace {} (keep only certificates in this field; put the key in the plugin's key field as ${{gh-env-secret:alloc=require}}, or reference a key file)",
                 plugin.id, plugin.plugin_name, plugin.namespace
             ),
-            _ => format!(
+            None => format!(
                 "Literal plugin-config secret in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
                 plugin.id, plugin.plugin_name, plugin.namespace
             ),

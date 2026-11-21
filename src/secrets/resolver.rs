@@ -1046,6 +1046,21 @@ pub fn capture_and_redact_import_plugin_config_secrets(
         if plugin.api_spec_id.is_some() {
             continue;
         }
+        if let Some(path) = super::tls_material::redacted_material_sites(
+            Some(&plugin.plugin_name),
+            &plugin.config,
+            REDACTED_SENTINEL,
+        )
+        .first()
+        {
+            return Err(crate::error::Error::Config(format!(
+                "PluginConfig {}/{} ({}) field 'config.{}' contains the reserved redaction sentinel; import requires an unredacted GET /backup source",
+                safe_line(&plugin.namespace),
+                safe_line(&plugin.id),
+                safe_line(&plugin.plugin_name),
+                safe_line(render_config_path(path))
+            )));
+        }
         let classification = classify_plugin_config(&plugin.plugin_name, &plugin.config);
         for path in &classification.unbrokerable_private_keys {
             unbrokerable_private_keys.push(format!(
@@ -1203,6 +1218,17 @@ fn reject_unbrokerable_backend_private_keys(cfg: &GatewayConfig) -> crate::error
     for row in super::backend_tls::resource_bodies(cfg)? {
         if row.api_spec_owned {
             continue;
+        }
+        if let Some(path) =
+            super::tls_material::redacted_material_sites(None, &row.body, REDACTED_SENTINEL).first()
+        {
+            return Err(crate::error::Error::Config(format!(
+                "{} {}/{} field '{}' contains the reserved redaction sentinel; import requires an unredacted GET /backup source",
+                row.owner.kind(),
+                safe_line(row.namespace),
+                safe_line(row.id),
+                safe_line(render_config_path(path))
+            )));
         }
         for site in super::tls_material::private_key_sites(&row.body) {
             if !super::backend_tls::is_brokered_site(&site.path) {
@@ -1769,18 +1795,22 @@ pub fn check_generation_allowed(
         )));
     }
     if cred_type == PLUGIN_CONFIG_SLOT_KIND {
-        let field = path
-            .iter()
-            .rev()
-            .find(|part| parse_index_segment(part).is_none())
-            .map(String::as_str)
-            .unwrap_or_default();
-        if super::tls_material::is_key_source_field(field) {
-            return Err(crate::error::Error::Config(format!(
-                "plugin config slot '{slot}': the broker cannot generate a TLS private key — \
-                 random bytes are not a PEM key and cannot match the configured certificate. \
-                 Use '${{gh-env-secret:alloc=require}}' and seed the slot with the real PEM key."
-            )));
+        if let [plugin_name, config, field @ ..] = path.as_slice() {
+            let field: Vec<ConfigPathComponent> = field
+                .iter()
+                .map(|part| match parse_index_segment(part) {
+                    Some(index) => ConfigPathComponent::Index(index),
+                    None => ConfigPathComponent::Key(part.clone()),
+                })
+                .collect();
+            if config == "config" && super::tls_material::is_plugin_key_source(plugin_name, &field)
+            {
+                return Err(crate::error::Error::Config(format!(
+                    "plugin config slot '{slot}': the broker cannot generate a TLS private key — \
+                     random bytes are not a PEM key and cannot match the configured certificate. \
+                     Use '${{gh-env-secret:alloc=require}}' and seed the slot with the real PEM key."
+                )));
+            }
         }
     }
     if cred_type == SERVICE_DISCOVERY_SLOT_KIND {

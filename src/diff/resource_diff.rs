@@ -148,7 +148,14 @@ pub fn mask_indeterminate_secret_values(
             continue;
         };
         let slot = crate::secrets::backend_tls::slot(live.owner, &live.namespace, &live.id);
-        if unresolved.contains(slot.as_str()) && live.value.is_some() {
+        // Only live key *material* is masked: a live path or provider URI is
+        // a reference the run can compare, so a move between a key file and
+        // the broker stays visible.
+        let live_is_material = live
+            .value
+            .as_deref()
+            .is_some_and(crate::secrets::backend_tls::is_client_key_material);
+        if unresolved.contains(slot.as_str()) && live_is_material {
             *live.value = Some((*placeholder).clone());
         }
     }

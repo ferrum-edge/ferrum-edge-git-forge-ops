@@ -634,32 +634,50 @@ pub(crate) struct PluginConfigClassification {
     /// and cannot be scrubbed, so import and the security audit warn about
     /// each one instead of staying silent.
     pub short_credential_named: Vec<Vec<ConfigPathComponent>>,
-    /// TLS private-key material ([`super::tls_material`]) outside a
-    /// private-key source field and outside every brokered leaf: a
-    /// certificate-plus-key bundle in a certificate or CA field, or a PEM key
-    /// in an arbitrary string. Never brokered (the field also holds material
-    /// that must stay reviewable, and no validator stand-in can reproduce
-    /// it) and never accepted as plaintext: import refuses it outright, and
-    /// it is redacted, scrubbed and literal-gated like a secret.
+    /// TLS private-key material ([`super::tls_material`]) that cannot be
+    /// brokered: material in a certificate or CA field, or a
+    /// certificate-plus-key bundle outside a private-key source field.
+    /// Brokering would hide the public certificate, and no validator stand-in
+    /// can reproduce one. Never accepted as plaintext: import refuses it
+    /// outright, and it is redacted, scrubbed and literal-gated like a secret.
     pub unbrokerable_private_keys: Vec<Vec<ConfigPathComponent>>,
 }
 
-/// Fold TLS private-key material into a classification: material at a
-/// private-key source field (`dtls_key_path`, `client_key_path`,
-/// `private_key`, `backend_tls_client_key_path`) is brokered like any other
-/// secret, whatever the rules or heuristics said; material anywhere else that
-/// no rule already brokers is unbrokerable. A path or provider URI in a
-/// private-key field is a reference and is left to the other rules.
+/// Fold TLS private-key material into a classification, ahead of the rules
+/// and heuristics ([`super::tls_material::plugin_private_key_sites`]):
+///
+/// * material in a certificate or CA field is unbrokerable, even under a
+///   parent the rules or heuristics would broker;
+/// * a certificate-plus-key bundle anywhere but a private-key source field is
+///   unbrokerable;
+/// * any other material (a schema private-key source such as `dtls_key_path`,
+///   a credential field such as `google_service_account_json`, an arbitrary
+///   string holding a bare key) is brokered like any other secret, with no
+///   plaintext allowance.
+///
+/// A path or provider URI is a reference and is left to the other rules.
 fn classify_private_key_material(
+    plugin_name: &str,
     config: &Value,
     sensitive: &mut BTreeSet<Vec<ConfigPathComponent>>,
 ) -> BTreeSet<Vec<ConfigPathComponent>> {
+    use super::tls_material::KeyPlacement;
     let mut unbrokerable = BTreeSet::new();
-    for site in super::tls_material::private_key_sites(config) {
-        if site.key_source {
-            sensitive.insert(site.path);
-        } else if !sensitive.contains(&site.path) {
+    for site in super::tls_material::plugin_private_key_sites(plugin_name, config) {
+        let bundle = || {
+            matches!(value_at(config, &site.path), Some(Value::String(text))
+                if super::tls_material::contains_public_pem_block(text))
+        };
+        let refuse = match site.placement {
+            KeyPlacement::Certificate => true,
+            KeyPlacement::Other => bundle(),
+            KeyPlacement::KeySource => false,
+        };
+        if refuse {
+            sensitive.remove(&site.path);
             unbrokerable.insert(site.path);
+        } else {
+            sensitive.insert(site.path);
         }
     }
     unbrokerable
@@ -706,7 +724,7 @@ pub(crate) fn classify_plugin_config(
 
     if !is_builtin(plugin_name) {
         collect_heuristic_paths(config, &root, &mut sensitive, false);
-        let unbrokerable = classify_private_key_material(config, &mut sensitive);
+        let unbrokerable = classify_private_key_material(plugin_name, config, &mut sensitive);
         let mut all = BTreeSet::new();
         collect_string_paths(config, &root, &mut all);
         let unbrokered = all
@@ -747,7 +765,7 @@ pub(crate) fn classify_plugin_config(
             apply_rule(config, rule.path, rule.kind, &root, &mut sensitive);
         }
     }
-    let unbrokerable = classify_private_key_material(config, &mut sensitive);
+    let unbrokerable = classify_private_key_material(plugin_name, config, &mut sensitive);
     let mut heuristic = BTreeSet::new();
     collect_heuristic_paths(config, &root, &mut heuristic, true);
     collect_credential_named_parameters(plugin_name, config, &mut heuristic);

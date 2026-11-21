@@ -203,6 +203,13 @@ pub(crate) fn with_validation_standins_for_report(
         let namespace = plugin.namespace.clone();
         let plugin_id = plugin.id.clone();
         let plugin_name = plugin.plugin_name.clone();
+        let paired_key_unresolved = unresolved_paired_key(
+            &plugin_name,
+            &namespace,
+            &plugin_id,
+            &plugin.config,
+            &eligible,
+        );
         let mut path = Vec::new();
         changed |= substitute_plugin_leaves(
             &mut plugin.config,
@@ -214,6 +221,13 @@ pub(crate) fn with_validation_standins_for_report(
             &mut path,
             &eligible,
         );
+        if let Some((key_field, cert_field)) = paired_key_unresolved {
+            if let Some(object) = plugin.config.as_object_mut() {
+                object.remove(key_field);
+                object.remove(cert_field);
+                changed = true;
+            }
+        }
     }
 
     // A brokered `backend_tls_client_key_path` gets a PEM-shaped stand-in:
@@ -264,12 +278,10 @@ fn substitute_plugin_leaves(
             if !eligible(&slot) {
                 return false;
             }
-            *text = if crate::secrets::tls_material::is_key_source_path(path) {
-                // A private-key source field (`dtls_key_path`,
-                // `client_key_path`, ...) is parsed as PEM. `udp_logging`
-                // also pairs its DTLS key with the certificate, which no
-                // stand-in can satisfy; that identity validates only with
-                // the bundle, like a key file absent from the runner.
+            *text = if crate::secrets::tls_material::is_plugin_key_source(plugin_name, path) {
+                // A schema private-key source is parsed as PEM. A paired
+                // DTLS key is then omitted with its certificate
+                // ([`PAIRED_KEY_SOURCES`]).
                 validation_private_key_standin(&slot)
             } else if endpoints.contains(path) {
                 validation_url_standin(
@@ -318,6 +330,47 @@ fn substitute_plugin_leaves(
         _ => {}
     }
     changed
+}
+
+/// Private-key sources Edge's `validate` pairs with a certificate, as
+/// `(plugin_name, key field, certificate field)`, top-level in the config.
+///
+/// `udp_logging`'s DTLS identity is loaded in the plugin file-dependency
+/// phase, which requires the key to sign and to match `dtls_cert_path`
+/// (`CertifiedKey::keys_match`). No stand-in can satisfy that, and a stand-in
+/// that fails it would fail every bundle-less validation of the whole
+/// document and every file-mode apply (which validates the publication
+/// document). So while the key is unresolved the validation copy omits the
+/// pair; Edge then uses an ephemeral DTLS identity and still validates the
+/// rest of the plugin (host, port, CA source, batching). The pair itself is
+/// validated wherever the bundle resolves the key (`validate`, `plan`,
+/// `review` with a bundle).
+const PAIRED_KEY_SOURCES: &[(&str, &str, &str)] =
+    &[("udp_logging", "dtls_key_path", "dtls_cert_path")];
+
+/// The `(key field, certificate field)` to omit from `config`'s validation
+/// copy, when its paired private key is an eligible unresolved placeholder.
+fn unresolved_paired_key(
+    plugin_name: &str,
+    namespace: &str,
+    plugin_id: &str,
+    config: &serde_json::Value,
+    eligible: &impl Fn(&str) -> bool,
+) -> Option<(&'static str, &'static str)> {
+    let (_, key_field, cert_field) = PAIRED_KEY_SOURCES
+        .iter()
+        .find(|(name, _, _)| *name == plugin_name)?;
+    let text = config.get(*key_field)?.as_str()?;
+    if !matches!(parse_placeholder(text), Some(Ok(_))) {
+        return None;
+    }
+    let slot = crate::secrets::resolver::plugin_config_slot(
+        namespace,
+        plugin_id,
+        plugin_name,
+        &[ConfigPathComponent::Key((*key_field).to_string())],
+    );
+    eligible(&slot).then_some((*key_field, *cert_field))
 }
 
 fn has_placeholder(value: &serde_json::Value) -> bool {

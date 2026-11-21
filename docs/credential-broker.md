@@ -166,35 +166,46 @@ them to the tree, `diff` shows such a live address as
 TLS private keys are brokered when they are inline. Ferrum Edge reads a TLS
 source field as inline PEM when it starts with `-----BEGIN `, so
 `backend_tls_client_key_path` on a Proxy or Upstream, `udp_logging`
-`dtls_key_path`, and the other private-key fields (`client_key_path`,
-`private_key`) can hold the key itself. Inline key material is detected the
-way Edge detects it: a PEM block whose label names a private key, anywhere in
-the value, or any PEM armour or control character in a private-key field. A
-filesystem path (`/etc/ferrum/tls/client.key`), a provider URI (`vault://`,
-`k8s://`) or a placeholder is a reference and stays literal everywhere.
+`dtls_key_path` and `mesh_route_dispatch`
+`rules[].destination.backend_tls.client_key_path` can hold the key itself.
+Inline key material is detected the way Edge detects it: a PEM block whose
+label names a private key, anywhere in the value, or any PEM armour or control
+character in a private-key field. A filesystem path
+(`/etc/ferrum/tls/client.key`), a provider URI (`vault://`, `k8s://`) or a
+placeholder is a reference and stays literal everywhere. Private-key fields in
+plugin config are located by schema, so a header or map entry that happens to
+be named `private_key` keeps its ordinary handling.
 
 - `import` moves an inline key into the credential import bundle and writes
   `${gh-env-secret:alloc=require}`: Proxy and Upstream keys under the slots
-  above, plugin-config keys under their `@plugin` slot.
-- A private key anywhere else (a certificate-plus-key bundle in
-  `backend_tls_client_cert_path`, a CA field or a plugin's certificate field)
-  is never brokered, because the field also holds a certificate that must stay
-  reviewable. `import` refuses it, naming the resource and field, and no
-  plaintext allowance applies. Remove the key block from that field on the
-  gateway (Edge reads only the certificates there) and re-run.
+  above, plugin-config keys under their `@plugin` slot. A bare key in another
+  plugin string (for example inside `ai_federation`
+  `google_service_account_json`) is brokered the same way.
+- A private key in a certificate or CA field, or a certificate-plus-key bundle
+  outside a private-key field, is never brokered, because the value also holds
+  a certificate that must stay reviewable. `import` refuses it, naming the
+  resource and field, and no plaintext allowance applies. Remove the key block
+  from that field on the gateway (Edge reads only the certificates there) and
+  re-run.
+- `import` also refuses `[REDACTED]` in a TLS material field: the backup was
+  read through a redacting endpoint.
 - A committed inline key, in any of these places, is a blocking finding.
 - `diff`, `plan` and the review comment print `[REDACTED]` for the key and keep
-  paths visible. Validator output and everything the CLI displays are scrubbed
-  of it, including its LF and CRLF spellings; because a PEM block is
-  multi-line, validator diagnostics are withheld while one is resolved.
+  paths visible. A live key file or provider URI is compared even when the
+  repository's brokered key is unresolved. Validator output and everything the
+  CLI displays are scrubbed of the key, including its LF and CRLF spellings
+  and each encoded body line; because a PEM block is multi-line, validator
+  diagnostics are withheld while one is resolved.
 - The broker never generates a TLS key (`alloc=generate` is refused): it must
   match the configured certificate. Seed the slot with the PEM key.
-- Without a bundle, the validator gets a PEM-shaped stand-in for an unresolved
-  key. Edge parses an inline Proxy or Upstream key but does not pair it with
-  the certificate, so that validates. `udp_logging` pairs its DTLS key with
-  `dtls_cert_path`, which no stand-in can satisfy: like a key file missing
-  from the runner, a brokered DTLS key validates only where the bundle is
-  loaded.
+- Where a key is unresolved (no bundle, or file-mode `apply`, which validates
+  the publication document), the validator gets a PEM-shaped stand-in. Edge
+  parses an inline Proxy, Upstream or `mesh_route_dispatch` key but does not
+  pair it with the certificate, so that validates. `udp_logging` pairs its
+  DTLS key with `dtls_cert_path`, which no stand-in can satisfy, so the
+  validation copy omits both and Edge validates the rest of the plugin with
+  an ephemeral identity. The real pair is validated wherever the bundle is
+  loaded (`validate`, `plan`, `review`).
 
 Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,
 the final `Error:` line and the review comment. Every value a run resolves
