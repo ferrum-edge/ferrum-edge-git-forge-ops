@@ -2399,7 +2399,7 @@ async fn an_explicit_write_refusal_in_a_not_ready_health_document_still_fails_th
     let url = spawn_stub_gateway(vec![(
         "GET /health",
         503,
-        r#"{"status":"draining","ready":false,"mode":"database","admin_writes_enabled":false}"#,
+        r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":false}"#,
     )]);
     let client = stub_client(url);
 
@@ -2430,7 +2430,7 @@ async fn a_not_ready_gateway_that_accepts_writes_keeps_the_preflight_advisory() 
     let url = spawn_stub_gateway(vec![(
         "GET /health",
         503,
-        r#"{"status":"starting","ready":false,"mode":"database","admin_writes_enabled":true}"#,
+        r#"{"status":"starting","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":true}"#,
     )]);
     let client = stub_client(url);
 
@@ -2447,6 +2447,69 @@ async fn a_not_ready_gateway_that_accepts_writes_keeps_the_preflight_advisory() 
     .await
     .expect("an advisory preflight does not stop the run");
     assert!(result.fatal_error.is_none(), "{:?}", result.fatal_error);
+}
+
+#[tokio::test]
+async fn a_read_only_mode_in_a_not_ready_health_document_fails_the_preflight() {
+    // The mode gate alone: `admin_writes_enabled` is left `true` so only the
+    // `dp` mode can refuse.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        503,
+        r#"{"status":"starting","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"dp","admin_writes_enabled":true}"#,
+    )]);
+    let client = stub_client(url);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("`dp` mode"), "{err}");
+}
+
+#[tokio::test]
+async fn a_not_ready_write_refusal_survives_retries_that_cannot_connect() {
+    // With the default-style retry budget, a draining gateway that answers
+    // once and then closes its listener still stops the run: the recognized
+    // document is the answer, not a transient failure to retry past.
+    let (url, served) = super::http_client_tests::spawn_scripted_health(vec![(
+        503,
+        "application/json",
+        r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":false}"#,
+    )]);
+    let client = stub_client_with_retries(url, 3);
+
+    let planned_actuals = empty_actuals(&["ferrum"]);
+    let err = apply_api(
+        &GatewayConfig::default(),
+        &client,
+        &["ferrum".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&planned_actuals),
+        Some(&no_extras(&planned_actuals)),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(err, gitforgeops::error::Error::GatewayReadOnly(_)),
+        "{err:?}"
+    );
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 // --- Shared-mode adoption of already-matching rows (issue #129) ---------------

@@ -1419,7 +1419,7 @@ async fn a_minimal_health_tier_leaves_the_write_state_unknown() {
 
 // -- Edge's not-ready /health (HTTP 503) -----------------------------------
 
-/// [`stub_env`] without retries, so a 503 is answered once.
+/// [`stub_env`] without retries, so an unrecognized 503 fails at once.
 fn no_retry_env(url: String) -> EnvConfig {
     EnvConfig {
         gateway_max_retries: 0,
@@ -1464,7 +1464,16 @@ async fn a_starting_gateway_on_the_minimal_tier_is_reachable_but_not_ready() {
         (503, r#"{"status":"starting","ready":false}"#),
         Arc::clone(&requests),
     );
-    let checks = doctor::gateway::run("production", &no_retry_env(url), &[]).await;
+    // Default retry budget: Edge's not-ready document is the answer, so it is
+    // requested once rather than retried.
+    let checks = doctor::gateway::run("production", &stub_env(url), &[]).await;
+    let health_requests = requests
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|request| request.starts_with("GET /health"))
+        .count();
+    assert_eq!(health_requests, 1);
 
     let reachable = find(&checks, "gateway-reachable");
     assert_eq!(reachable.status, Status::Pass, "{reachable:?}");
@@ -1498,7 +1507,7 @@ async fn a_draining_gateway_on_the_detailed_tier_reports_its_write_state() {
     let url = not_ready_gateway(
         (
             503,
-            r#"{"status":"draining","ready":false,"mode":"database","admin_writes_enabled":true,"cached_config":{"available":true}}"#,
+            r#"{"status":"draining","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"database","admin_writes_enabled":true,"cached_config":{"available":true}}"#,
         ),
         Arc::clone(&requests),
     );
@@ -1571,6 +1580,9 @@ async fn an_intermediary_503_is_not_mistaken_for_the_gateway() {
         r#"{"error":"service unavailable"}"#,
         r#"{"status":"ok","ready":false}"#,
         r#"{"status":"starting"}"#,
+        r#"{"status":"starting","ready":false,"error":"maintenance"}"#,
+        // A mutation marker on a GET is not a committed change.
+        r#"{"error":"deployment pending","applied":false,"reason":"config_rejected"}"#,
     ] {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let url = not_ready_gateway((503, body), Arc::clone(&requests));
@@ -1583,6 +1595,12 @@ async fn an_intermediary_503_is_not_mistaken_for_the_gateway() {
                 .detail
                 .contains("without Ferrum Edge's health document"),
             "{body}: {}",
+            reachable.detail
+        );
+        assert!(reachable.detail.contains("503"), "{}", reachable.detail);
+        assert!(
+            !reachable.detail.contains("committed"),
+            "{}",
             reachable.detail
         );
         let remedy = reachable.remediation.as_deref().expect("remediation");

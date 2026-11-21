@@ -2401,22 +2401,34 @@ const NOT_READY_MINIMAL: &str = r#"{"status":"starting","ready":false}"#;
 const NOT_READY_TENANT: &str = r#"{"status":"draining","ready":false,"mode":"database","admin_writes_enabled":false,"namespace":{"active":"team-alpha","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#;
 const NOT_READY_DETAILED: &str = r#"{"status":"unavailable","ready":false,"timestamp":"2026-11-21T00:00:00Z","mode":"cp","admin_writes_enabled":true,"cached_config":{"available":true}}"#;
 
+/// The media type Edge serves `/health` with.
+const JSON: Option<&str> = Some("application/json");
+
 #[test]
 fn every_documented_not_ready_health_document_is_recognized() {
     use gitforgeops::http_client::{parse_not_ready_health, NOT_READY_HEALTH_STATUSES};
     for status in NOT_READY_HEALTH_STATUSES {
         let body = format!(r#"{{"status":"{status}","ready":false}}"#);
-        let health = parse_not_ready_health(&body).unwrap_or_else(|| panic!("{body}"));
+        let health = parse_not_ready_health(JSON, &body).unwrap_or_else(|| panic!("{body}"));
         assert_eq!(health.status.as_deref(), Some(status));
         assert_eq!(health.ready, Some(false));
         assert_eq!(health.admin_writes_enabled, None, "minimal tier");
     }
-    let tenant = parse_not_ready_health(NOT_READY_TENANT).expect("tenant tier");
+    let tenant = parse_not_ready_health(JSON, NOT_READY_TENANT).expect("tenant tier");
     assert_eq!(tenant.admin_writes_enabled, Some(false));
     assert_eq!(tenant.mode.as_deref(), Some("database"));
-    let detailed = parse_not_ready_health(NOT_READY_DETAILED).expect("detailed tier");
+    let detailed = parse_not_ready_health(JSON, NOT_READY_DETAILED).expect("detailed tier");
     assert_eq!(detailed.admin_writes_enabled, Some(true));
-    assert!(parse_not_ready_health(NOT_READY_MINIMAL).is_some());
+    assert!(parse_not_ready_health(JSON, NOT_READY_MINIMAL).is_some());
+    // Media-type parameters and case do not matter.
+    assert!(
+        parse_not_ready_health(Some("Application/JSON; charset=utf-8"), NOT_READY_MINIMAL)
+            .is_some()
+    );
+    // A tenant token whose bound does not admit the routed namespace gets a
+    // `null` `active`, which is Edge's documented shape.
+    let unserved = r#"{"status":"starting","ready":false,"mode":"dp","admin_writes_enabled":false,"namespace":{"active":null,"serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#;
+    assert!(parse_not_ready_health(JSON, unserved).is_some());
 }
 
 #[test]
@@ -2437,17 +2449,45 @@ fn a_503_body_that_only_resembles_edges_health_document_is_not_recognized() {
         r#"{"status":"starting","ready":"false"}"#,
         r#"{"status":"maintenance","ready":false}"#,
         r#"{"status":"STARTING","ready":false}"#,
-        // A modeled field with the wrong type is not Edge's document either.
-        r#"{"status":"draining","ready":false,"admin_writes_enabled":"no"}"#,
-        r#"{"status":"draining","ready":false,"mode":7}"#,
+        // A documented field with the wrong type, or `null`, is not Edge's
+        // document either.
+        r#"{"status":"draining","ready":false,"timestamp":"t","mode":"cp","admin_writes_enabled":"no"}"#,
+        r#"{"status":"draining","ready":false,"timestamp":"t","mode":7,"admin_writes_enabled":true}"#,
+        r#"{"status":"draining","ready":false,"timestamp":"t","mode":null,"admin_writes_enabled":true}"#,
+        r#"{"status":"draining","ready":false,"timestamp":"t","mode":"cp","admin_writes_enabled":null}"#,
+        r#"{"status":"draining","ready":false,"timestamp":7,"mode":"cp","admin_writes_enabled":true}"#,
+        r#"{"status":"draining","ready":false,"timestamp":"t","mode":"cp","admin_writes_enabled":true,"namespace":17}"#,
+        r#"{"status":"draining","ready":false,"mode":"cp","admin_writes_enabled":true,"namespace":{"active":"a","serving_scope":"s"}}"#,
+        r#"{"status":"draining","ready":false,"mode":"cp","admin_writes_enabled":true,"namespace":{"active":3,"serving_scope":"s","data_plane_single_namespace":true}}"#,
+        // Duplicate keys: the last `ready` must not win over the first.
+        r#"{"status":"starting","ready":true,"ready":false}"#,
+        r#"{"status":"ok","status":"starting","ready":false}"#,
+        // Extra fields that belong to no tier: a maintenance envelope that
+        // borrowed `status` and `ready`.
+        r#"{"status":"starting","ready":false,"error":"scheduled maintenance"}"#,
+        r#"{"status":"unavailable","ready":false,"error":"scheduled maintenance","namespace":17,"admin_writes_enabled":null}"#,
+        r#"{"status":"draining","ready":false,"mode":"cp","admin_writes_enabled":false}"#,
+        r#"{"status":"draining","ready":false,"mode":"cp","admin_writes_enabled":false,"namespace":{"active":null,"serving_scope":"s","data_plane_single_namespace":true},"error":"x"}"#,
     ] {
-        assert!(parse_not_ready_health(body).is_none(), "{body}");
+        assert!(parse_not_ready_health(JSON, body).is_none(), "{body}");
+    }
+    // The body alone is not enough: Edge always sends `application/json`.
+    for content_type in [
+        None,
+        Some("text/html"),
+        Some("text/plain"),
+        Some("application/jsonx"),
+    ] {
+        assert!(
+            parse_not_ready_health(content_type, NOT_READY_MINIMAL).is_none(),
+            "{content_type:?}"
+        );
     }
 }
 
 #[tokio::test]
 async fn probe_health_keeps_a_not_ready_answer_and_get_health_refuses_it() {
-    // Starting, writes enabled: the probe sees the gateway; a caller that
+    // Unavailable, writes enabled: the probe sees the gateway; a caller that
     // needs a ready gateway gets a 503 error naming the state.
     let url = spawn_stub_gateway(vec![("GET /health", 503, NOT_READY_DETAILED)]);
     let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
@@ -2529,4 +2569,103 @@ async fn unclassified_mutation_403_is_upgraded_via_a_not_ready_health_document()
         "{err:?}"
     );
     assert!(err.to_string().contains("admin_writes_enabled=false"));
+}
+
+/// A one-connection-per-request `/health` responder that answers each request
+/// from `script` in turn, `(status, content type, body)`, and then closes its
+/// listener, so any further attempt fails to connect. Returns the URL and the
+/// number of requests it answered.
+pub(super) fn spawn_scripted_health(
+    script: Vec<(u16, &'static str, &'static str)>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for (status, content_type, body) in script {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0_u8; 8192];
+            let _ = stream.read(&mut buf);
+            counter.fetch_add(1, Ordering::SeqCst);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} STUB\r\ncontent-type: {content_type}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        }
+        // `listener` drops here: later attempts are refused.
+    });
+    (format!("http://{addr}"), served)
+}
+
+#[tokio::test]
+async fn a_recognized_not_ready_document_is_not_retried_away() {
+    // A draining read-only gateway answers once and then closes its listener.
+    // With retries enabled, the refusal from the first answer must survive:
+    // a retry would only meet a refused connection.
+    let (url, served) = spawn_scripted_health(vec![(503, "application/json", NOT_READY_TENANT)]);
+    let mut env = stub_env(url);
+    env.gateway_max_retries = 3;
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+    let probe = client.probe_health().await.expect("Edge's document");
+    assert!(!probe.is_ready());
+    assert_eq!(probe.health.admin_writes_enabled, Some(false));
+    assert_eq!(served.load(Ordering::SeqCst), 1, "not retried");
+}
+
+#[tokio::test]
+async fn an_unrecognized_503_is_still_retried() {
+    // An intermediary's maintenance page is transient as far as this client
+    // knows, so the read-retry policy still applies to it.
+    let (url, served) = spawn_scripted_health(vec![
+        (503, "text/html", "<html>maintenance</html>"),
+        (503, "application/json", NOT_READY_MINIMAL),
+    ]);
+    let mut env = stub_env(url);
+    env.gateway_max_retries = 1;
+    let client = AdminClient::new_scoped(&env, TEST_NAMESPACES).unwrap();
+    let probe = client
+        .probe_health()
+        .await
+        .expect("second answer is Edge's");
+    assert_eq!(probe.health.status.as_deref(), Some("starting"));
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn an_unrecognized_503_with_a_mutation_marker_is_a_plain_read_error() {
+    // `applied: false` describes a write; on a GET it is just a body that is
+    // not Edge's health document, and it must not become CommittedNotLive.
+    let url = spawn_stub_gateway(vec![(
+        "GET /health",
+        503,
+        r#"{"error":"deployment pending","applied":false,"reason":"config_rejected"}"#,
+    )]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+    assert!(!error.to_string().contains("committed"), "{error}");
+}
+
+#[tokio::test]
+async fn edges_document_under_another_media_type_is_not_recognized() {
+    let (url, _) = spawn_scripted_health(vec![(503, "text/plain", NOT_READY_MINIMAL)]);
+    let client = AdminClient::new_scoped(&stub_env(url), TEST_NAMESPACES).unwrap();
+    let error = client.probe_health().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
 }

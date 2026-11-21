@@ -49,6 +49,11 @@ Retried:
 
 Never retried:
 
+- **Edge's not-ready `/health` document** (HTTP 503 with the documented
+  health body). It is the gateway's answer, and a draining gateway may close
+  its listener before a retry would land; see
+  [Namespace-scoped admin tokens](reference.md#namespace-scoped-admin-tokens).
+  Any other 503 from `/health` is retried as a 5xx read.
 - **501** — for example a standalone-MongoDB gateway without transactions.
   `POST /batch` then falls back to per-resource creates.
 - **Any error from a create or batch `POST`.** The write may have committed.
