@@ -1,4 +1,5 @@
 pub mod allocator;
+pub(crate) mod backend_tls;
 pub mod bundle;
 pub mod delivery;
 pub mod github_api;
@@ -8,6 +9,7 @@ pub(crate) mod plugin_trigger;
 pub mod resolver;
 pub mod scrubber;
 pub(crate) mod service_discovery;
+pub(crate) mod tls_material;
 pub(crate) mod url_userinfo;
 
 pub use allocator::{
@@ -30,15 +32,17 @@ pub use github_api::{
 };
 pub use placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
 pub use resolver::{
-    capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
+    capture_and_redact_import_backend_tls_keys, capture_and_redact_import_credentials,
+    capture_and_redact_import_plugin_config_secrets,
     capture_and_redact_import_plugin_trigger_secrets,
-    capture_and_redact_import_service_discovery_secrets, report_secrets_lenient,
-    report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options,
-    resolve_secrets_with_options, slot_path, unresolved_placeholder_slots,
-    validate_known_credential_types, ConsumerCoverage, ConsumerLedger, PluginConfigCapture,
-    ResolveOptions, ResolveReport, ResolveResult, SlotRemapPolicy, SlotStatus,
-    UnbrokeredPluginConfig, IMPORT_REQUIRED_PLACEHOLDER, MAX_CREDENTIAL_VALUE_CHARS,
-    MIN32_CREDENTIAL_TYPES, MIN_ENTROPY_BYTES_FOR_32_CHARS, REDACTED_SENTINEL,
+    capture_and_redact_import_service_discovery_secrets, reject_unbrokerable_backend_private_keys,
+    report_secrets_lenient, report_secrets_with_mode_and_options,
+    resolve_secrets_with_mode_and_options, resolve_secrets_with_options, slot_path,
+    unresolved_placeholder_slots, validate_known_credential_types, ConsumerCoverage,
+    ConsumerLedger, PluginConfigCapture, ResolveOptions, ResolveReport, ResolveResult,
+    SlotRemapPolicy, SlotStatus, UnbrokeredPluginConfig, IMPORT_REQUIRED_PLACEHOLDER,
+    MAX_CREDENTIAL_VALUE_CHARS, MIN32_CREDENTIAL_TYPES, MIN_ENTROPY_BYTES_FOR_32_CHARS,
+    REDACTED_SENTINEL,
 };
 pub use scrubber::{
     is_reencoding_hazard, ScrubbedOutput, SecretScrubber, SuppressionReason, FRAGMENT_SCAN_LENGTH,

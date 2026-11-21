@@ -1,9 +1,11 @@
 mod client_key_standin;
 mod compatibility;
+pub mod pem_standin;
 pub mod reporter;
 pub mod runner;
 pub mod standin;
 
+pub use pem_standin::{validation_private_key_standin, PEM_STANDIN_MARKER};
 pub use reporter::{format_result, format_results, workflow_annotation, OutputFormat};
 pub use runner::{
     build_validate_args_for_mode, run_mesh_validation, run_validation, run_validation_with_report,

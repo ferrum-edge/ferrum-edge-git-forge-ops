@@ -43,15 +43,20 @@ pub fn mask_indeterminate_secret_values(
         {
             for (credential_type, desired_value) in &expected.credentials {
                 if let Some(live_value) = live.credentials.get_mut(credential_type) {
-                    mask_unresolved_leaves(desired_value, live_value, &mut Vec::new(), &|path| {
-                        let slot = consumer_credential_slot(
-                            &expected.namespace,
-                            &expected.id,
-                            credential_type,
-                            path,
-                        );
-                        unresolved.contains(slot.as_str())
-                    });
+                    mask_unresolved_leaves(
+                        desired_value,
+                        live_value,
+                        &mut Vec::new(),
+                        &|path, _| {
+                            let slot = consumer_credential_slot(
+                                &expected.namespace,
+                                &expected.id,
+                                credential_type,
+                                path,
+                            );
+                            unresolved.contains(slot.as_str())
+                        },
+                    );
                 }
             }
         }
@@ -72,7 +77,18 @@ pub fn mask_indeterminate_secret_values(
                 &expected.config,
                 &mut live.config,
                 &mut Vec::new(),
-                &|path| {
+                &|path, live_text| {
+                    // At a schema TLS key source only live key material is
+                    // masked: a live key file or provider URI stays compared.
+                    if crate::secrets::tls_material::is_plugin_key_source(
+                        &expected.plugin_name,
+                        path,
+                    ) && !crate::secrets::tls_material::is_private_key_material(
+                        live_text,
+                        Some(crate::secrets::tls_material::TlsMaterialField::PrivateKey),
+                    ) {
+                        return false;
+                    }
                     let slot = plugin_config_slot(
                         &expected.namespace,
                         &expected.id,
@@ -133,6 +149,34 @@ pub fn mask_indeterminate_secret_values(
             }
         }
     }
+
+    // A brokered `backend_tls_client_key_path` the bundle did not resolve is
+    // compared the same way: the gateway's real key is not drift the run can
+    // prove. A path on either side, and every sibling field, stays
+    // authoritative.
+    let desired_keys: HashMap<(&str, &str, &str), &String> =
+        crate::secrets::backend_tls::client_keys(desired)
+            .into_iter()
+            .map(|key| ((key.owner.kind(), key.namespace, key.id), key.value))
+            .collect();
+    for live in crate::secrets::backend_tls::client_keys_mut(actual) {
+        let Some(placeholder) =
+            desired_keys.get(&(live.owner.kind(), live.namespace.as_str(), live.id.as_str()))
+        else {
+            continue;
+        };
+        let slot = crate::secrets::backend_tls::slot(live.owner, &live.namespace, &live.id);
+        // Only live key *material* is masked: a live path or provider URI is
+        // a reference the run can compare, so a move between a key file and
+        // the broker stays visible.
+        let live_is_material = live
+            .value
+            .as_deref()
+            .is_some_and(crate::secrets::backend_tls::is_client_key_material);
+        if unresolved.contains(slot.as_str()) && live_is_material {
+            *live.value = Some((*placeholder).clone());
+        }
+    }
 }
 
 /// Align the unresolved brokered `trigger` operands of one plugin with the
@@ -182,11 +226,11 @@ fn mask_unresolved_leaves(
     desired: &serde_json::Value,
     live: &mut serde_json::Value,
     path: &mut Vec<ConfigPathComponent>,
-    is_unresolved: &impl Fn(&[ConfigPathComponent]) -> bool,
+    is_unresolved: &impl Fn(&[ConfigPathComponent], &str) -> bool,
 ) {
     match (desired, live) {
         (serde_json::Value::String(expected), serde_json::Value::String(actual))
-            if is_unresolved(path) =>
+            if is_unresolved(path, actual) =>
         {
             *actual = expected.clone();
         }
@@ -242,6 +286,11 @@ pub fn is_sensitive_diff_field(kind: &str, field: &str) -> bool {
 /// paths, methods, protocols and identity predicates beside them are exactly
 /// what a reviewer needs to read, so only the sensitive operands are replaced.
 fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
+    // Proxy/Upstream TLS fields, and a PluginConfig's undeclared top-level
+    // fields (its `config` is suppressed whole by `is_sensitive_diff_field`).
+    if matches!(kind, "Proxy" | "Upstream" | "PluginConfig") {
+        redact_private_key_changes(changes);
+    }
     let (field, redact): (&str, fn(&str) -> Option<String>) = match kind {
         "Upstream" => ("service_discovery", redact_service_discovery_json),
         "PluginConfig" => ("trigger", redact_trigger_json),
@@ -254,6 +303,63 @@ fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
             }
         }
     }
+}
+
+/// Replace TLS private-key material ([`crate::secrets::tls_material`]) in
+/// Proxy and Upstream field changes with [`crate::secrets::REDACTION`], leaf
+/// by leaf: inline PEM in `backend_tls_client_key_path`, or a key block in a
+/// certificate field. A path or provider URI stays visible, so moving a key
+/// file or switching between a file and the broker is still reviewable.
+///
+/// At the brokered field a placeholder-shaped value is redacted too, as for
+/// service discovery: the field diff has no resolution provenance, and a
+/// seeded bundle value may have that shape.
+fn redact_private_key_changes(changes: &mut [FieldChange]) {
+    for change in changes.iter_mut() {
+        for side in [&mut change.old_value, &mut change.new_value] {
+            if let Some(redacted) = redact_private_key_json(&change.field, side) {
+                *side = redacted;
+            }
+        }
+    }
+}
+
+/// One serialized field value with its private-key leaves redacted, or
+/// `None` when nothing needed replacing.
+fn redact_private_key_json(field: &str, serialized: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(serialized).ok()?;
+    let mut redacted = false;
+    if field == crate::secrets::backend_tls::CLIENT_KEY_FIELD {
+        if let serde_json::Value::String(text) = &mut value {
+            if crate::secrets::parse_placeholder(text).is_some() {
+                *text = crate::secrets::REDACTION.to_string();
+                redacted = true;
+            }
+        }
+    }
+    for site in crate::secrets::tls_material::private_key_sites_in_field(field, &value) {
+        if let Some(serde_json::Value::String(text)) = value_at_mut(&mut value, &site.path) {
+            *text = crate::secrets::REDACTION.to_string();
+            redacted = true;
+        }
+    }
+    if !redacted {
+        return None;
+    }
+    serde_json::to_string(&value).ok()
+}
+
+fn value_at_mut<'a>(
+    mut value: &'a mut serde_json::Value,
+    path: &[ConfigPathComponent],
+) -> Option<&'a mut serde_json::Value> {
+    for part in path {
+        value = match part {
+            ConfigPathComponent::Key(key) => value.as_object_mut()?.get_mut(key)?,
+            ConfigPathComponent::Index(index) => value.as_array_mut()?.get_mut(*index)?,
+        };
+    }
+    Some(value)
 }
 
 /// Redact every non-empty client-field operand of one serialized `trigger`

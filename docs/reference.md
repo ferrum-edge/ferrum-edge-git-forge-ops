@@ -423,8 +423,8 @@ and only a completed pass is `PASSED`.
 Credentials are resolved before validation, and the validator may echo them.
 Every resolved or literal credential, sensitive plugin-config value, plugin
 trigger `header`/`query`/`cookie` operand (of at least 8 bytes; `diff` and
-`plan` redact shorter ones by position) and modeled service-discovery secret,
-plus its base64 and percent-encoded forms, is
+`plan` redact shorter ones by position), modeled service-discovery secret and
+inline TLS private key, plus its base64 and percent-encoded forms, is
 replaced with `[REDACTED]`. Identities (`basicauth` usernames, `mtls_auth`
 identities) stay readable. The whole stream is withheld instead when:
 
@@ -449,6 +449,8 @@ gets a fake value of the right shape:
 | `serverless_function` `aws_endpoint_url` | `https://<32 hex>.gitforgeops-validation-standin.invalid/` |
 | `ai_stream_router` provider `endpoint` | `https://gitforgeops-validation-standin.invalid/<64 hex>/{model}` |
 | `oauth2_introspection` / `oidc_relying_party` `client_auth.private_key_pem` | a throwaway PKCS#8 key for the sibling `private_key_jwt_alg` |
+| TLS private key (Proxy/Upstream `backend_tls_client_key_path`, `mesh_route_dispatch` `client_key_path`) | a `PRIVATE KEY` PEM block whose body is a marker and a hash, not a key |
+| `udp_logging` `dtls_key_path` | omitted with `dtls_cert_path` (Edge pairs them; an ephemeral identity is validated instead) |
 
 The scheme follows the field (`ldaps://`, `redis://`, `wss://` for
 `ws_logging`, otherwise `https://`). The shapes follow the gateway's own
@@ -719,10 +721,18 @@ unchanged. File-mode drift jobs still skip before receiving gateway credentials.
 - Every recognized secret becomes `${gh-env-secret:alloc=require}`: Consumer
   credential secrets, built-in plugin-config secrets covered by the broker
   rules, custom-plugin values the heuristics flag, every non-empty plugin
-  trigger `header`/`query`/`cookie` `value` operand, and Consul tokens.
-  Identities, trigger field names and every other trigger predicate stay
-  literal. A trigger operand shorter than 8 bytes is captured but listed for
-  re-seeding with a longer value, since the broker will not resolve it.
+  trigger `header`/`query`/`cookie` `value` operand, Consul tokens, and inline
+  TLS private keys (Proxy and Upstream `backend_tls_client_key_path`,
+  `udp_logging` `dtls_key_path`, `mesh_route_dispatch` backend `client_key_path`,
+  or a bare key in another plugin string). Identities, key file paths, trigger
+  field names and every other trigger predicate stay literal. A trigger operand
+  shorter than 8 bytes is captured but listed for re-seeding with a longer
+  value, since the broker will not resolve it.
+- A TLS private key in a certificate or CA field, a certificate-plus-key
+  bundle outside a key field, or `[REDACTED]` in a TLS material field **fails
+  the import** with the resource and field named; no flag accepts it. Remove
+  the key block from that field at the source (or import from an unredacted
+  `GET /backup`) and re-run.
 - A secret-looking value outside those rules, or any custom-plugin string the
   heuristics do not flag, **fails the import** before anything is written.
   After confirming the named paths hold no credentials, re-run with

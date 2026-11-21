@@ -365,7 +365,8 @@ impl ResolveReport {
             format!(
                 "{count} broker-controlled leaf/leaves remain unresolved. Authoritative live \
                  comparisons exclude only unresolved leaves in Consumer credentials, plugin \
-                 config, plugin trigger operands and service-discovery secrets; resolved values, literal siblings, \
+                 config, plugin trigger operands, service-discovery secrets and backend TLS \
+                 client keys; resolved values, literal siblings, \
                  extra entries, shape changes and nonsecret fields are still compared."
             )
         })
@@ -699,7 +700,8 @@ fn lookup_slot_value<'a>(
 
 /// Why a bundle value is placeholder text rather than a secret, if it is:
 /// it equals the placeholder committed at its slot, or matches (or starts
-/// like) the `${gh-env-secret:…}` grammar.
+/// like) the `${gh-env-secret:…}` grammar. Shared by the Consumer, plugin
+/// trigger and TLS private-key guards.
 fn placeholder_text_reason(committed: &str, value: &str) -> Option<&'static str> {
     const PLACEHOLDER_PREFIX: &str = "${gh-env-secret:";
     let trimmed = value.trim();
@@ -774,6 +776,58 @@ fn check_consumer_secret_not_placeholder_text(
         "credential slot '{slot}' holds a bundle value that {reason}, not a secret. \
          Placeholder text is repository-known and cannot be a live Consumer credential; \
          re-seed the slot with the real secret or rotate it with 'gitforgeops rotate'."
+    )))
+}
+
+/// Refuse a malformed broker declaration at a TLS key source: a value with
+/// the reserved `${gh-env-secret:` prefix that does not parse. Edge would read
+/// it as a filesystem path, so materialization would ship a broken key
+/// source. Names the slot, never the value.
+fn malformed_tls_key_declaration(slot: &str) -> crate::error::Error {
+    crate::error::Error::Config(format!(
+        "secret slot '{slot}' is declared with a malformed gh-env-secret placeholder at a TLS \
+         private-key field; fix the declaration (for example \
+         '${{gh-env-secret:alloc=require}}') or use a key file path"
+    ))
+}
+
+/// Refuse a bundle value seeded for a TLS private-key slot (Proxy/Upstream
+/// `backend_tls_client_key_path`, a schema plugin key source) that is
+/// placeholder text. Edge would read it as a filesystem path, so a
+/// materialized file would ship a broken key source, while the API write
+/// path refuses the same row. Names the slot and the reason, never the value.
+fn check_tls_key_not_placeholder_text(
+    slot: &str,
+    committed: &str,
+    value: &str,
+) -> crate::error::Result<()> {
+    let Some(reason) = placeholder_text_reason(committed, value) else {
+        return Ok(());
+    };
+    Err(crate::error::Error::Config(format!(
+        "secret slot '{slot}' holds a bundle value that {reason}, not a TLS private key; \
+         re-seed the slot with the PEM key."
+    )))
+}
+
+/// Refuse a bundle value seeded for a plugin-config slot that the broker must
+/// never hold ([`super::tls_material::is_unbrokerable_plugin_value`]): private-key
+/// material in a certificate or CA source, or a certificate-plus-key bundle
+/// outside a key source. Import refuses the same literal. Names the slot,
+/// never the value.
+fn check_plugin_seed_brokerable(
+    slot: &str,
+    plugin_name: &str,
+    path: &[ConfigPathComponent],
+    value: &str,
+) -> crate::error::Result<()> {
+    if !super::tls_material::is_unbrokerable_plugin_value(plugin_name, path, value) {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "plugin config slot '{slot}' holds TLS private-key material that is never brokered \
+         (a key in a certificate or CA field, or a certificate-plus-key bundle). Keep only \
+         certificates in this field and seed the key in the plugin's key field."
     )))
 }
 
@@ -1093,12 +1147,59 @@ pub fn capture_and_redact_import_plugin_config_secrets(
 ) -> crate::error::Result<PluginConfigCapture> {
     let mut capture = PluginConfigCapture::default();
     let captured = &mut capture.captured;
+    let mut unbrokerable_private_keys = Vec::new();
 
     for plugin in &mut cfg.plugin_configs {
         if plugin.api_spec_id.is_some() {
             continue;
         }
+        if let Some(path) = super::tls_material::redacted_material_sites(
+            Some(&plugin.plugin_name),
+            &plugin.config,
+            REDACTED_SENTINEL,
+        )
+        .first()
+        {
+            return Err(crate::error::Error::Config(format!(
+                "PluginConfig {}/{} ({}) field 'config.{}' contains the reserved redaction sentinel; import requires an unredacted GET /backup source",
+                safe_line(&plugin.namespace),
+                safe_line(&plugin.id),
+                safe_line(&plugin.plugin_name),
+                safe_line(render_config_path(path))
+            )));
+        }
+        for path in super::tls_material::passthrough_private_key_sites(&plugin.extra) {
+            unbrokerable_private_keys.push(format!(
+                "PluginConfig {}/{} ({}): {} (undeclared top-level field)",
+                safe_line(&plugin.namespace),
+                safe_line(&plugin.id),
+                safe_line(&plugin.plugin_name),
+                safe_line(render_config_path(&path))
+            ));
+        }
+        if let Some(path) = super::tls_material::malformed_key_source_declarations(
+            &plugin.plugin_name,
+            &plugin.config,
+        )
+        .first()
+        {
+            return Err(malformed_tls_key_declaration(&plugin_config_slot(
+                &plugin.namespace,
+                &plugin.id,
+                &plugin.plugin_name,
+                path,
+            )));
+        }
         let classification = classify_plugin_config(&plugin.plugin_name, &plugin.config);
+        for path in &classification.unbrokerable_private_keys {
+            unbrokerable_private_keys.push(format!(
+                "PluginConfig {}/{} ({}): config.{}",
+                safe_line(&plugin.namespace),
+                safe_line(&plugin.id),
+                safe_line(&plugin.plugin_name),
+                safe_line(render_config_path(path))
+            ));
+        }
         if !classification.short_credential_named.is_empty() {
             capture.short_credential_named.push(UnbrokeredPluginConfig {
                 namespace: plugin.namespace.clone(),
@@ -1136,6 +1237,16 @@ pub fn capture_and_redact_import_plugin_config_secrets(
             };
             capture_and_redact_string(text, &slot, captured, "plugin config")?;
         }
+    }
+
+    // Checked after the walk so one refusal lists every site, and before the
+    // caller publishes anything. No plaintext allowance applies: the value is
+    // a private key.
+    if !unbrokerable_private_keys.is_empty() {
+        return Err(crate::error::Error::Config(format!(
+            "refusing to import TLS private-key material that plugin config cannot broker (a key in a certificate or CA field, a certificate-plus-key bundle, or a key in an undeclared top-level field); it would be committed to the repository as written. Keep only the certificates in certificate and CA fields and put the key in the plugin's key field (which import brokers) or reference a key file, then re-run import. Nothing has been written.\n  {}",
+            unbrokerable_private_keys.join("\n  ")
+        )));
     }
 
     Ok(capture)
@@ -1261,6 +1372,89 @@ pub fn capture_and_redact_import_service_discovery_secrets(
     }
 
     Ok(captured)
+}
+
+/// Capture inline backend TLS client keys from Proxy and Upstream rows and
+/// replace them with broker placeholders before import writes any resource
+/// file.
+///
+/// Ferrum Edge reads `backend_tls_client_key_path` as inline PEM when it
+/// starts with `-----BEGIN `, and `GET /backup` returns it verbatim. Inline
+/// key material ([`super::tls_material::is_private_key_material`]) is moved to
+/// `<ns>/<id>/@proxy|@upstream/backend_tls_client_key_path`
+/// ([`super::backend_tls::slot`]); a filesystem path or provider URI is a
+/// reference and stays literal.
+///
+/// Private-key material anywhere else in a Proxy or Upstream body (a
+/// certificate-plus-key bundle in `backend_tls_client_cert_path` or
+/// `backend_tls_server_ca_cert_path`, say) is refused rather than brokered:
+/// the field also carries a certificate that must stay reviewable, and a
+/// secretless validator stand-in could not reproduce it. The refusal names
+/// the resource and field, never the value, and nothing is written.
+pub fn capture_and_redact_import_backend_tls_keys(
+    cfg: &mut GatewayConfig,
+) -> crate::error::Result<CredentialBundle> {
+    reject_unbrokerable_backend_private_keys(cfg)?;
+    let mut captured = CredentialBundle::new();
+    for key in super::backend_tls::client_keys_mut(cfg) {
+        if key.api_spec_owned {
+            continue;
+        }
+        let Some(text) = key.value.as_mut() else {
+            continue;
+        };
+        let slot = super::backend_tls::slot(key.owner, &key.namespace, &key.id);
+        if super::tls_material::is_malformed_broker_declaration(text) {
+            return Err(malformed_tls_key_declaration(&slot));
+        }
+        if !super::backend_tls::is_client_key_material(text) {
+            continue;
+        }
+        capture_and_redact_string(text, &slot, &mut captured, "backend TLS client key")?;
+    }
+    Ok(captured)
+}
+
+/// Refuse private-key material in a Proxy or Upstream field the broker does
+/// not hold (see [`capture_and_redact_import_backend_tls_keys`]). Import runs
+/// it on the original document before any capture replaces a leaf, so a key
+/// in a field another capture brokers (a Consul token) is refused too.
+pub fn reject_unbrokerable_backend_private_keys(cfg: &GatewayConfig) -> crate::error::Result<()> {
+    let mut refused = Vec::new();
+    for row in super::backend_tls::resource_bodies(cfg)? {
+        if row.api_spec_owned {
+            continue;
+        }
+        if let Some(path) =
+            super::tls_material::redacted_material_sites(None, &row.body, REDACTED_SENTINEL).first()
+        {
+            return Err(crate::error::Error::Config(format!(
+                "{} {}/{} field '{}' contains the reserved redaction sentinel; import requires an unredacted GET /backup source",
+                row.owner.kind(),
+                safe_line(row.namespace),
+                safe_line(row.id),
+                safe_line(render_config_path(path))
+            )));
+        }
+        for site in super::tls_material::private_key_sites(&row.body) {
+            if !super::backend_tls::is_brokered_site(&site.path) {
+                refused.push(format!(
+                    "{} {}/{}: {}",
+                    row.owner.kind(),
+                    safe_line(row.namespace),
+                    safe_line(row.id),
+                    safe_line(render_config_path(&site.path))
+                ));
+            }
+        }
+    }
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "refusing to import TLS private-key material outside backend_tls_client_key_path; it would be committed to the repository as written. Edge's backend certificate loaders read only the certificate records from a certificate or CA field, so remove the private-key block from these fields on the gateway (keep the key in backend_tls_client_key_path, which import brokers, or reference a key file), then re-run import. Nothing has been written.\n  {}",
+        refused.join("\n  ")
+    )))
 }
 
 fn capture_and_redact_value<'a>(
@@ -1609,6 +1803,17 @@ fn report_secrets_with_mode_inner(
             )?;
         }
     }
+    for key in super::backend_tls::client_keys(cfg) {
+        resolve_backend_tls_leaf(
+            key.value,
+            key.owner,
+            key.namespace,
+            key.id,
+            bundle,
+            constraints,
+            &mut report,
+        )?;
+    }
     // Defense-in-depth: detect any duplicate slot strings. With the escape
     // function being injective, structurally-distinct tree locations can't
     // produce the same slot — but if a future refactor breaks the
@@ -1627,7 +1832,8 @@ fn report_secrets_with_mode_inner(
 /// placeholder text as the credential. Walks the same leaves as
 /// [`report_secrets_with_mode_and_options`] (Consumer credentials,
 /// `PluginConfig.config`, `PluginConfig.trigger` operands, modeled
-/// service-discovery secrets) against an empty
+/// service-discovery secrets, Proxy and Upstream `backend_tls_client_key_path`)
+/// against an empty
 /// bundle, so every placeholder reports regardless of what the bundle holds.
 pub fn unresolved_placeholder_slots(cfg: &GatewayConfig) -> crate::error::Result<Vec<String>> {
     let report = report_secrets_with_mode_inner(
@@ -1775,6 +1981,24 @@ fn resolve_secrets_in_place(
         }
     }
 
+    for key in super::backend_tls::client_keys_mut(cfg) {
+        let Some(text) = key.value.as_ref() else {
+            continue;
+        };
+        let resolved = resolve_backend_tls_leaf(
+            text,
+            key.owner,
+            &key.namespace,
+            &key.id,
+            bundle,
+            ConstraintMode::Enforce,
+            &mut report,
+        )?;
+        if let Some(value) = resolved {
+            *key.value = Some(value);
+        }
+    }
+
     detect_slot_collisions(&report)?;
     enforce_slot_remap_policy(&report, &options)?;
     Ok(report)
@@ -1855,6 +2079,32 @@ pub fn check_generation_allowed(
         return Err(crate::error::Error::Config(format!(
             "credential slot '{slot}': identity fields must be supplied literally, never generated"
         )));
+    }
+    if super::backend_tls::is_slot_kind(cred_type) {
+        return Err(crate::error::Error::Config(format!(
+            "secret slot '{slot}': the broker cannot generate a TLS private key — {}. Use \
+             '${{gh-env-secret:alloc=require}}' and seed the slot with the real PEM key.",
+            super::backend_tls::UNGENERATABLE_REASON
+        )));
+    }
+    if cred_type == PLUGIN_CONFIG_SLOT_KIND {
+        if let [plugin_name, config, field @ ..] = path.as_slice() {
+            let field: Vec<ConfigPathComponent> = field
+                .iter()
+                .map(|part| match parse_index_segment(part) {
+                    Some(index) => ConfigPathComponent::Index(index),
+                    None => ConfigPathComponent::Key(part.clone()),
+                })
+                .collect();
+            if config == "config" && super::tls_material::is_plugin_key_source(plugin_name, &field)
+            {
+                return Err(crate::error::Error::Config(format!(
+                    "plugin config slot '{slot}': the broker cannot generate a TLS private key — \
+                     random bytes are not a PEM key and cannot match the configured certificate. \
+                     Use '${{gh-env-secret:alloc=require}}' and seed the slot with the real PEM key."
+                )));
+            }
+        }
     }
     if cred_type == SERVICE_DISCOVERY_SLOT_KIND {
         let field = service_discovery::SD_SECRET_FIELDS
@@ -2640,6 +2890,14 @@ fn resolve_service_discovery_leaf(
     let placeholder = parsed?;
     let slot = service_discovery::slot(namespace, upstream_id, field.path);
     let existing = lookup_exact_slot_value(&slot, bundle)?;
+    // A discovery credential is never TLS key material; the audit refuses the
+    // same value as a literal anywhere in an Upstream outside its key field.
+    if existing.is_some_and(|value| super::tls_material::is_private_key_material(value, None)) {
+        return Err(crate::error::Error::Config(format!(
+            "secret slot '{slot}' holds TLS private-key material, which a service-discovery \
+             credential never is; re-seed the slot with the provider's token"
+        )));
+    }
     let status = classify_status(&placeholder, existing);
 
     if matches!(constraints, ConstraintMode::Enforce)
@@ -2660,6 +2918,61 @@ fn resolve_service_discovery_leaf(
         consumer_id: upstream_id.to_string(),
         namespace: namespace.to_string(),
         cred_key: service_discovery::cred_key(field.path),
+        slot,
+        placeholder,
+        status,
+    });
+    Ok(existing.cloned())
+}
+
+/// Report (and optionally resolve) one Proxy or Upstream
+/// `backend_tls_client_key_path`. A value that is not a placeholder (a path,
+/// a provider URI, or literal material the security audit refuses) is not a
+/// slot. Generation is refused ([`check_generation_allowed`]); a seeded slot
+/// resolves whatever its alloc mode.
+fn resolve_backend_tls_leaf(
+    text: &str,
+    owner: super::backend_tls::BackendTlsOwner,
+    namespace: &str,
+    id: &str,
+    bundle: &CredentialBundle,
+    constraints: ConstraintMode,
+    report: &mut ResolveReport,
+) -> crate::error::Result<Option<String>> {
+    if super::tls_material::is_malformed_broker_declaration(text) {
+        return Err(malformed_tls_key_declaration(&super::backend_tls::slot(
+            owner, namespace, id,
+        )));
+    }
+    let Some(parsed) = parse_placeholder(text) else {
+        return Ok(None);
+    };
+    let placeholder = parsed?;
+    let slot = super::backend_tls::slot(owner, namespace, id);
+    let existing = lookup_exact_slot_value(&slot, bundle)?;
+    if let Some(value) = existing {
+        check_tls_key_not_placeholder_text(&slot, text, value)?;
+    }
+    let status = classify_status(&placeholder, existing);
+
+    if matches!(constraints, ConstraintMode::Enforce)
+        && matches!(status, SlotStatus::NeedsAllocation)
+    {
+        check_generation_allowed(
+            &slot,
+            Some(owner.slot_kind()),
+            placeholder.length_bytes,
+            &GatewayMode::Api,
+        )?;
+    }
+
+    report
+        .slot_credential_types
+        .insert(slot.clone(), owner.slot_kind().to_string());
+    report.results.push(ResolveResult {
+        consumer_id: id.to_string(),
+        namespace: namespace.to_string(),
+        cred_key: super::backend_tls::cred_key(owner),
         slot,
         placeholder,
         status,
@@ -2868,6 +3181,21 @@ impl<'a> PluginWalk<'a> {
         path: &[ConfigPathComponent],
         report: &mut ResolveReport,
     ) -> crate::error::Result<Option<String>> {
+        // TLS key-source and seed checks classify config paths only; a
+        // trigger operand is never TLS material.
+        let config_section = section == PluginSlotSection::Config;
+        if config_section
+            && super::tls_material::is_malformed_broker_declaration(text)
+            && super::tls_material::plugin_placement(self.plugin_name, path)
+                == super::tls_material::KeyPlacement::KeySource
+        {
+            return Err(malformed_tls_key_declaration(&plugin_config_slot(
+                self.namespace,
+                self.plugin_id,
+                self.plugin_name,
+                path,
+            )));
+        }
         let Some(parsed) = parse_placeholder(text) else {
             return Ok(None);
         };
@@ -2885,6 +3213,12 @@ impl<'a> PluginWalk<'a> {
             }
         }
         let existing = lookup_exact_slot_value(&slot, self.bundle)?;
+        if let Some(value) = existing.filter(|_| config_section) {
+            check_plugin_seed_brokerable(&slot, self.plugin_name, path, value)?;
+            if super::tls_material::is_plugin_key_source(self.plugin_name, path) {
+                check_tls_key_not_placeholder_text(&slot, text, value)?;
+            }
+        }
         let status = classify_status(&placeholder, existing);
         // Endpoint rules classify config paths; a trigger operand is never a
         // URL the gateway dials.

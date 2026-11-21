@@ -60,6 +60,7 @@ use super::resolver::{
     consumer_credential_slot, is_identity_credential_leaf, plugin_config_slot, plugin_trigger_slot,
     ResolveReport, SlotStatus,
 };
+use super::tls_material::private_key_sites;
 
 /// Text substituted for every secret occurrence.
 pub const REDACTION: &str = "[REDACTED]";
@@ -205,7 +206,7 @@ pub struct ScrubbedOutput {
 impl SecretScrubber {
     /// Collect every secret string reachable from `config`.
     ///
-    /// Two sources, matching what the broker itself manages:
+    /// The sources match what the broker itself manages:
     ///
     /// * **Consumer credentials** — every string leaf under
     ///   `Consumer.credentials` that is not a well-formed
@@ -228,6 +229,13 @@ impl SecretScrubber {
     ///   `Upstream.service_discovery` ([`super::service_discovery`]), today the
     ///   Consul ACL token. The validator is handed the resolved upstream, so
     ///   an error quoting the discovery block quotes the token with it.
+    /// * **TLS private keys** — inline private-key material anywhere in a
+    ///   Proxy or Upstream body ([`super::tls_material`]): a brokered or
+    ///   literal `backend_tls_client_key_path`, or a key block in a
+    ///   certificate field. Plugin-config keys arrive through
+    ///   [`sensitive_string_paths`]. Each is registered with its embedded key
+    ///   blocks and LF/CRLF spellings; being multi-line, it withholds the
+    ///   validator's streams.
     pub fn from_gateway_config(config: &GatewayConfig) -> Self {
         Self::from_gateway_config_with_report(config, &ResolveReport::default())
     }
@@ -448,6 +456,7 @@ pub(crate) fn gateway_secret_values(
     collect_plugin_config_secrets(config, &mut values);
     collect_plugin_trigger_secrets(config, TriggerOperands::All, &mut values);
     collect_service_discovery_secrets(config, &mut values);
+    collect_backend_private_keys(config, &mut values);
     let mut values = values.0;
     collect_resolved_secrets(config, report, &mut values);
     values
@@ -479,6 +488,7 @@ pub(crate) fn live_secret_leaves(config: &GatewayConfig) -> Vec<LiveSecretLeaf> 
     collect_plugin_config_secrets(config, &mut leaves);
     collect_plugin_trigger_secrets(config, TriggerOperands::Scrubbable, &mut leaves);
     collect_service_discovery_secrets(config, &mut leaves);
+    collect_backend_private_keys(config, &mut leaves);
     leaves
         .0
         .into_iter()
@@ -495,6 +505,14 @@ trait LeafSink {
     /// `required` as in [`LiveSecretLeaf::required`]. `location` renders the
     /// leaf's resource and field path; it is called only when needed.
     fn leaf(&mut self, text: &str, required: bool, location: &dyn Fn() -> String);
+
+    /// Whether this sink treats `text` as repository data rather than a
+    /// secret, so a collector must not decompose it into pieces (key blocks,
+    /// body lines) that no longer look like it. Live documents have no such
+    /// exemption.
+    fn skips(&self, _text: &str) -> bool {
+        false
+    }
 }
 
 /// Repository and resolved documents: skip what is repository data rather
@@ -503,8 +521,12 @@ trait LeafSink {
 struct ManifestValues(BTreeSet<String>);
 
 impl LeafSink for ManifestValues {
+    fn skips(&self, text: &str) -> bool {
+        text.is_empty() || matches!(parse_placeholder(text), Some(Ok(_)))
+    }
+
     fn leaf(&mut self, text: &str, _required: bool, _location: &dyn Fn() -> String) {
-        if text.is_empty() || matches!(parse_placeholder(text), Some(Ok(_))) {
+        if self.skips(text) {
             return;
         }
         self.0.insert(text.to_string());
@@ -587,6 +609,13 @@ fn collect_resolved_secrets(
                     out.insert(text.to_string());
                 }
             }
+        }
+    }
+    for key in super::backend_tls::client_keys(config) {
+        let slot = super::backend_tls::slot(key.owner, key.namespace, key.id);
+        if resolved.contains(slot.as_str()) && !key.value.is_empty() {
+            out.insert(key.value.clone());
+            out.extend(super::tls_material::line_ending_variants(key.value));
         }
     }
     for upstream in &config.upstreams {
@@ -773,17 +802,101 @@ fn collect_credential_leaves(
 fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
     for plugin in &config.plugin_configs {
         let declared = rule_declared_paths(&plugin.plugin_name, &plugin.config);
+        let private_keys: BTreeSet<Vec<ConfigPathComponent>> =
+            super::tls_material::plugin_private_key_sites(&plugin.plugin_name, &plugin.config)
+                .into_iter()
+                .map(|site| site.path)
+                .collect();
+        for path in super::tls_material::passthrough_private_key_sites(&plugin.extra) {
+            let Some(serde_json::Value::String(text)) = value_at_extra(&plugin.extra, &path) else {
+                continue;
+            };
+            let rendered = render_config_path(&path);
+            private_key_leaf(text, out, &|| {
+                leaf_location("PluginConfig", &plugin.namespace, &plugin.id, &rendered)
+            });
+        }
         for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
             if let Some(serde_json::Value::String(text)) = value_at(&plugin.config, &path) {
-                out.leaf(text, declared.contains(&path), &|| {
+                let location = || {
                     leaf_location(
                         "PluginConfig",
                         &plugin.namespace,
                         &plugin.id,
                         &format!("config.{}", render_config_path(&path)),
                     )
-                });
+                };
+                if private_keys.contains(&path) {
+                    private_key_leaf(text, out, &location);
+                } else {
+                    out.leaf(text, declared.contains(&path), &location);
+                }
             }
+        }
+    }
+}
+
+/// The value at `path` (field name first) in a passthrough map.
+fn value_at_extra<'a>(
+    extra: &'a std::collections::BTreeMap<String, serde_json::Value>,
+    path: &[ConfigPathComponent],
+) -> Option<&'a serde_json::Value> {
+    let (ConfigPathComponent::Key(field), rest) = path.split_first()? else {
+        return None;
+    };
+    value_at(extra.get(field)?, rest)
+}
+
+/// One TLS private-key value: the stored bytes, required, plus each key block
+/// inside a larger value such as a certificate-plus-key bundle
+/// ([`super::tls_material::embedded_private_key_blocks`]), each with its
+/// line-ending variants ([`super::tls_material::line_ending_variants`]), so a
+/// copy whose line endings were rewritten, or that holds only the key, is
+/// still matched whole, and each encoded body line of at least
+/// [`MIN_SCRUB_LENGTH`] bytes on its own
+/// ([`super::tls_material::private_key_body_lines`]), so a copy whose line
+/// breaks were re-wrapped or escaped loses its key text too. A PEM block
+/// is multi-line, which [`is_reencoding_hazard`] treats as unscrubbable: the
+/// validator's streams are withheld while one is registered, and the display
+/// sink withholds any line that keeps an eight-byte run of it.
+fn private_key_leaf(text: &str, out: &mut dyn LeafSink, location: &dyn Fn() -> String) {
+    // A well-formed placeholder (even a multi-line one, which counts as
+    // material at a key field) is repository data: never split it into
+    // fragments a repository sink would register as secrets.
+    if out.skips(text) {
+        return;
+    }
+    let mut spellings = vec![text.to_string()];
+    spellings.extend(super::tls_material::embedded_private_key_blocks(text));
+    for spelling in spellings {
+        for variant in super::tls_material::line_ending_variants(&spelling) {
+            out.leaf(&variant, true, location);
+        }
+        out.leaf(&spelling, true, location);
+    }
+    for line in super::tls_material::private_key_body_lines(text, MIN_SCRUB_LENGTH) {
+        out.leaf(&line, true, location);
+    }
+}
+
+/// TLS private-key material anywhere in a Proxy or Upstream body: inline PEM
+/// in `backend_tls_client_key_path` (brokered or literal), or a key block in
+/// another field (refused by import and the audit, but `validate` runs
+/// without the audit, and a live row can hold one). Paths, provider URIs and
+/// placeholders are references and stay readable.
+fn collect_backend_private_keys(config: &GatewayConfig, out: &mut dyn LeafSink) {
+    let Ok(rows) = super::backend_tls::resource_bodies(config) else {
+        return;
+    };
+    for row in rows {
+        for site in private_key_sites(&row.body) {
+            let Some(serde_json::Value::String(text)) = value_at(&row.body, &site.path) else {
+                continue;
+            };
+            let path = render_config_path(&site.path);
+            private_key_leaf(text, out, &|| {
+                leaf_location(row.owner.kind(), row.namespace, row.id, &path)
+            });
         }
     }
 }

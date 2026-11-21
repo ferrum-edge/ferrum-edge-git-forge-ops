@@ -740,8 +740,8 @@ fn with_registry_mut<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
 /// credentials here; unlike repository declarations they get no exemption.
 ///
 /// Empty leaves are skipped: there is nothing to protect. A credential,
-/// rule-declared plugin secret or endpoint, or modeled service-discovery
-/// secret shorter than [`MIN_SCRUB_LENGTH`] bytes refuses the run, naming the
+/// rule-declared plugin secret or endpoint, modeled service-discovery
+/// secret or TLS private key shorter than [`MIN_SCRUB_LENGTH`] bytes refuses the run, naming the
 /// resource and field path (never the value). A leaf flagged only by the
 /// key-name heuristics (`*key`, a header map) that is too short to protect is
 /// not registered: it may be an ordinary setting such as a header name, and a

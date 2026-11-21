@@ -37,6 +37,8 @@ use crate::secrets::plugin_trigger;
 use crate::secrets::resolver::{consumer_credential_slot, ResolveReport, SlotStatus};
 use crate::validate::client_key_standin::{client_assertion_key_pem, ClientKeyFamily};
 
+use super::pem_standin::validation_private_key_standin;
+
 /// Fixed marker every opaque stand-in starts with. It is deliberately
 /// unmistakable: a value carrying this prefix anywhere but a validator temp
 /// spec is a bug, and greppable as one.
@@ -169,6 +171,10 @@ fn slot_digest(slot: &str) -> String {
 ///   regional Lambda origin. Header maps are
 ///   rewritten value-side only, so `headers.x-honeycomb-team` keeps its key
 ///   and a plugin that validates required header *names* still sees them.
+///   A private-key source field gets a PEM-shaped stand-in
+///   ([`super::pem_standin`]).
+/// * **Proxy and Upstream `backend_tls_client_key_path`** — Edge parses an
+///   inline key as PEM, so it gets the PEM-shaped stand-in too.
 /// * **`PluginConfig.trigger`** — a brokered `header` / `query` / `cookie`
 ///   operand gets the opaque token form, which is also a valid literal
 ///   `regex`.
@@ -220,7 +226,10 @@ pub(crate) fn with_validation_standins_for_report(
                 .as_ref()
                 .is_some_and(|trigger| has_placeholder(&plugin_trigger::trigger_json(trigger)))
     });
-    if !credentials_brokered && !plugin_config_brokered {
+    let backend_keys_brokered = crate::secrets::backend_tls::client_keys(config)
+        .iter()
+        .any(|key| matches!(parse_placeholder(key.value), Some(Ok(_))));
+    if !credentials_brokered && !plugin_config_brokered && !backend_keys_brokered {
         return None;
     }
 
@@ -271,10 +280,41 @@ pub(crate) fn with_validation_standins_for_report(
                 env_region.as_deref(),
             ),
         };
+        let paired_key_unresolved = unresolved_paired_key(
+            plugin_name,
+            &plugin.namespace,
+            &plugin.id,
+            &plugin.config,
+            &eligible,
+        );
         let mut config = std::mem::take(&mut plugin.config);
         changed |= context.substitute(&mut config, &mut Vec::new(), &eligible);
         plugin.config = config;
+        if let Some((key_field, cert_field)) = paired_key_unresolved {
+            if let Some(object) = plugin.config.as_object_mut() {
+                object.remove(key_field);
+                object.remove(cert_field);
+                changed = true;
+            }
+        }
         changed |= substitute_trigger_operands(plugin, &eligible);
+    }
+
+    // A brokered `backend_tls_client_key_path` gets a PEM-shaped stand-in:
+    // Edge parses the inline key (and would read the placeholder as a missing
+    // file), but does not pair it with the certificate.
+    for key in crate::secrets::backend_tls::client_keys_mut(&mut patched) {
+        let Some(text) = key.value.as_mut() else {
+            continue;
+        };
+        if !matches!(parse_placeholder(text), Some(Ok(_))) {
+            continue;
+        }
+        let slot = crate::secrets::backend_tls::slot(key.owner, &key.namespace, &key.id);
+        if eligible(&slot) {
+            *text = validation_private_key_standin(&slot);
+            changed = true;
+        }
     }
 
     changed.then_some(patched)
@@ -527,8 +567,70 @@ impl PluginStandins<'_> {
         {
             return pem.to_string();
         }
+        // A schema TLS private-key source (`dtls_key_path`,
+        // `mesh_route_dispatch` backend `client_key_path`) is only PEM-framed
+        // by Edge, so the deterministic marker PEM suffices; a paired DTLS key
+        // is then omitted with its certificate ([`PAIRED_KEY_SOURCES`]).
+        if crate::secrets::tls_material::is_plugin_key_source(self.plugin_name, path) {
+            return validation_private_key_standin(slot);
+        }
         validation_standin(slot, None)
     }
+}
+
+/// Private-key sources Edge's `validate` pairs with a certificate, as
+/// `(plugin_name, key field, certificate field)`, top-level in the config.
+///
+/// `udp_logging`'s DTLS identity is loaded in the plugin file-dependency
+/// phase, which requires the key to sign and to match `dtls_cert_path`
+/// (`CertifiedKey::keys_match`). No stand-in can satisfy that, and a stand-in
+/// that fails it would fail every bundle-less validation of the whole
+/// document and every file-mode apply (which validates the publication
+/// document). So while the key is unresolved the validation copy omits the
+/// pair; Edge then uses an ephemeral DTLS identity and still validates the
+/// rest of the plugin (host, port, CA source, batching). The pair itself is
+/// validated wherever the bundle resolves the key (`validate`, `plan`,
+/// `review` with a bundle).
+const PAIRED_KEY_SOURCES: &[(&str, &str, &str)] =
+    &[("udp_logging", "dtls_key_path", "dtls_cert_path")];
+
+/// The `(key field, certificate field)` to omit from `config`'s validation
+/// copy, when its paired private key is an eligible unresolved placeholder.
+fn unresolved_paired_key(
+    plugin_name: &str,
+    namespace: &str,
+    plugin_id: &str,
+    config: &serde_json::Value,
+    eligible: &impl Fn(&str) -> bool,
+) -> Option<(&'static str, &'static str)> {
+    let (_, key_field, cert_field) = PAIRED_KEY_SOURCES
+        .iter()
+        .find(|(name, _, _)| *name == plugin_name)?;
+    // Omit the pair only when Edge would actually load it: DTLS enabled and
+    // a certificate source present as a non-empty string. Otherwise the copy
+    // keeps the declared shape, so Edge's own enablement, pairing and type
+    // checks still run (on the PEM-shaped key stand-in).
+    if config.get("dtls").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    if !config
+        .get(*cert_field)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|cert| !cert.trim().is_empty())
+    {
+        return None;
+    }
+    let text = config.get(*key_field)?.as_str()?;
+    if !matches!(parse_placeholder(text), Some(Ok(_))) {
+        return None;
+    }
+    let slot = crate::secrets::resolver::plugin_config_slot(
+        namespace,
+        plugin_id,
+        plugin_name,
+        &[ConfigPathComponent::Key((*key_field).to_string())],
+    );
+    eligible(&slot).then_some((*key_field, *cert_field))
 }
 
 fn has_placeholder(value: &serde_json::Value) -> bool {

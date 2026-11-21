@@ -133,6 +133,8 @@ PluginConfig.trigger operand ->  <ns>/<plugin-id>/@plugin/<plugin_name>/trigger/
                                  ferrum/waf/@plugin/waf/trigger/when/not/match/header/value/exact/[0]
 Upstream.service_discovery   ->  <ns>/<upstream-id>/@service-discovery/<path>
                                  ferrum/orders/@service-discovery/consul/token
+Proxy backend TLS client key ->  <ns>/<proxy-id>/@proxy/backend_tls_client_key_path
+Upstream backend TLS client key -> <ns>/<upstream-id>/@upstream/backend_tls_client_key_path
 ```
 
 Plugin-config and trigger array paths keep every index, including `[0]`.
@@ -196,6 +198,64 @@ credentials (`https://user:password@host`): a committed one is a blocking
 finding, `import` refuses a gateway whose address has them rather than writing
 them to the tree, `diff` shows such a live address as
 `https://[REDACTED]@host`, and validator output is scrubbed of them. Put a Consul ACL token in `consul.token` instead.
+
+TLS private keys are brokered when they are inline. Ferrum Edge reads a TLS
+source field as inline PEM when it starts with `-----BEGIN `, so
+`backend_tls_client_key_path` on a Proxy or Upstream, `udp_logging`
+`dtls_key_path` and `mesh_route_dispatch`
+`rules[].destination.backend_tls.client_key_path` can hold the key itself.
+Inline key material is detected the way Edge detects it: a PEM block whose
+label names a private key, anywhere in the value, or any PEM armour or control
+character in a private-key field. A filesystem path
+(`/etc/ferrum/tls/client.key`), a provider URI (`vault://`, `k8s://`) or a
+placeholder is a reference and stays literal everywhere. Private-key fields in
+plugin config are located by schema, so a header or map entry that happens to
+be named `private_key` keeps its ordinary handling.
+
+- `import` moves an inline key into the credential import bundle and writes
+  `${gh-env-secret:alloc=require}`: Proxy and Upstream keys under the slots
+  above, plugin-config keys under their `@plugin` slot. A bare key in another
+  plugin string (for example inside `ai_federation`
+  `google_service_account_json`) is brokered the same way.
+- A private key in a certificate or CA field (including `mtls_auth` issuer CAs
+  and `soap_ws_security` trusted certificates), a certificate-plus-key bundle
+  outside a private-key field, or a key in a PluginConfig's undeclared
+  top-level field (even an acknowledged one) is never brokered: the value also
+  holds a certificate that must stay reviewable, or the field is unmodeled. `import` refuses it, naming the
+  resource and field, and no plaintext allowance applies. Remove the key block
+  from that field on the gateway and re-run. Edge's backend and DTLS
+  certificate loaders read only the certificate records there, and some fields
+  (`mtls_auth` `ca_certificate_pem`) reject any extra record, so the key block
+  is not needed.
+- `import` also refuses `[REDACTED]` in a TLS material field: the backup was
+  read through a redacting endpoint.
+- A committed inline key, in any of these places, is a blocking finding.
+- `diff`, `plan` and the review comment print `[REDACTED]` for the key and keep
+  paths visible. A live key file or provider URI is compared even when the
+  repository's brokered key is unresolved. Validator output and everything the
+  CLI displays are scrubbed of the key, including its LF and CRLF spellings
+  and each encoded body line; because a PEM block is multi-line, validator
+  diagnostics are withheld while one is resolved.
+- The broker never generates a TLS key: `alloc=generate` or `alloc=rotate`
+  is refused when the slot has no value, because the key must match the
+  configured certificate (an existing seed is reused under either label).
+  Seed the slot with the PEM key. A seed is
+  checked like a literal: placeholder text at a key slot, or a
+  certificate-plus-key bundle seeded for a certificate field or an ordinary
+  plugin string, is refused, naming the slot but never the value. A
+  declaration at a key field that starts with `${gh-env-secret:` but does not
+  parse (a missing `}`, say) is refused too, since Edge would read it as a
+  file path. A `PUBLIC KEY` record after a signing key (`client_auth`
+  `private_key_pem`) does not make a bundle; only certificate records do.
+- Where a key is unresolved (no bundle, or file-mode `apply`, which validates
+  the publication document), the validator gets a PEM-shaped stand-in. Edge
+  parses an inline Proxy, Upstream or `mesh_route_dispatch` key but does not
+  pair it with the certificate, so that validates. `udp_logging` pairs its
+  DTLS key with `dtls_cert_path`, which no stand-in can satisfy, so when DTLS
+  is enabled and `dtls_cert_path` is a non-empty string the validation copy
+  omits both and Edge validates the rest of the plugin with an ephemeral
+  identity; otherwise the declared shape reaches Edge's own checks. The real pair is validated wherever the bundle is
+  loaded (`validate`, `plan`, `review`).
 
 Everything the CLI displays is scrubbed too: stdout, stderr, JSON output,
 the final `Error:` line and the review comment. Every value a run resolves
@@ -493,8 +553,8 @@ Rules:
 
 - Only Consumer `keyauth/key`, `jwt/secret`, `hmac_auth/secret` and api-mode
   `basicauth/password` (including indexed entries) can be rotated. Hashes,
-  identities, unknown fields and `@plugin` / `@service-discovery` slots
-  are refused before anything is written.
+  identities, unknown fields and `@plugin` / `@service-discovery` /
+  `@proxy` / `@upstream` slots are refused before anything is written.
 - Rotation is refused in file mode; use materialization instead.
 - The target must be a placeholder on a declared Consumer in the namespace,
   and its sibling slots must already resolve.

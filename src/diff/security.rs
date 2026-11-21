@@ -17,6 +17,7 @@ use crate::secrets::plugin_config::{
 };
 use crate::secrets::plugin_trigger;
 use crate::secrets::resolver::is_identity_credential_leaf;
+use crate::secrets::tls_material::{plugin_private_key_sites, private_key_sites, KeyPlacement};
 
 #[derive(Debug, Clone)]
 pub struct SecurityFinding {
@@ -174,6 +175,8 @@ pub fn audit_security_with_scope(
             );
         }
     }
+
+    check_literal_backend_private_keys(config, &mut findings);
 
     let enabled = EnabledPlugins::new(config);
     for proxy in &config.proxies {
@@ -713,6 +716,11 @@ fn is_broker_placeholder(value: &str) -> bool {
 /// Disabled plugins are included because their config is still published.
 /// Findings identify the resource and field, never the classified value.
 fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
+    let private_keys: std::collections::BTreeMap<_, _> =
+        plugin_private_key_sites(&plugin.plugin_name, &plugin.config)
+            .into_iter()
+            .map(|site| (site.path, site.placement))
+            .collect();
     for path in sensitive_string_paths(&plugin.plugin_name, &plugin.config) {
         let Some(serde_json::Value::String(value)) = value_at(&plugin.config, &path) else {
             continue;
@@ -720,13 +728,44 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
         if is_broker_placeholder(value) {
             continue;
         }
+        let placement = match private_keys.get(&path).copied() {
+            Some(KeyPlacement::Other)
+                if crate::secrets::tls_material::contains_certificate_block(value) =>
+            {
+                Some(KeyPlacement::Certificate)
+            }
+            placement => placement,
+        };
+        let path = render_config_path(&path);
+        let message = match placement {
+            Some(KeyPlacement::KeySource | KeyPlacement::Other) => format!(
+                "Literal TLS private key in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot with the PEM key, or reference a key file)",
+                plugin.id, plugin.plugin_name, plugin.namespace
+            ),
+            Some(KeyPlacement::Certificate) => format!(
+                "Literal TLS private key in 'config.{path}' on plugin {} ({}) in namespace {} (keep only certificates in this field; put the key in the plugin's key field as ${{gh-env-secret:alloc=require}}, or reference a key file)",
+                plugin.id, plugin.plugin_name, plugin.namespace
+            ),
+            None => format!(
+                "Literal plugin-config secret in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
+                plugin.id, plugin.plugin_name, plugin.namespace
+            ),
+        };
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            &plugin.id,
+            &plugin.namespace,
+            message,
+        ));
+    }
+    for path in crate::secrets::tls_material::passthrough_private_key_sites(&plugin.extra) {
         let path = render_config_path(&path);
         findings.push(SecurityFinding::error(
             "PluginConfig",
             &plugin.id,
             &plugin.namespace,
             format!(
-                "Literal plugin-config secret in 'config.{path}' on plugin {} ({}) in namespace {} (use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
+                "Literal TLS private key in undeclared field '{path}' on plugin {} ({}) in namespace {} (an unmodeled field is never brokered; remove the key or move it to the plugin's key field as ${{gh-env-secret:alloc=require}})",
                 plugin.id, plugin.plugin_name, plugin.namespace
             ),
         ));
@@ -746,6 +785,58 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
                 plugin.id, plugin.plugin_name, plugin.namespace
             ),
         ));
+    }
+}
+
+/// TLS private-key material committed in a Proxy or Upstream: inline PEM in
+/// `backend_tls_client_key_path`, or a certificate-plus-key bundle (or any
+/// other private-key block) in another field. `apply` would publish it to the
+/// gateway, so it blocks exactly like a literal consumer credential. The
+/// whole body is swept, undeclared passthrough fields included, the way Edge
+/// sweeps it. A filesystem path, provider URI or broker placeholder is a
+/// reference and passes. The finding names the field, never the value.
+fn check_literal_backend_private_keys(config: &GatewayConfig, findings: &mut Vec<SecurityFinding>) {
+    let Ok(rows) = crate::secrets::backend_tls::resource_bodies(config) else {
+        // Serializing a typed row cannot fail; if it ever did, fail closed.
+        findings.push(SecurityFinding::error(
+            "Proxy",
+            "",
+            "",
+            "could not serialize a Proxy or Upstream to check it for literal TLS private keys"
+                .to_string(),
+        ));
+        return;
+    };
+    for row in rows {
+        let kind = row.owner.kind();
+        let noun = kind.to_ascii_lowercase();
+        for site in private_key_sites(&row.body) {
+            // A well-formed broker declaration at the brokered field (even one
+            // with a line break the placeholder parser trims) is not material.
+            if crate::secrets::backend_tls::is_brokered_site(&site.path)
+                && matches!(
+                    crate::secrets::plugin_config::value_at(&row.body, &site.path),
+                    Some(serde_json::Value::String(text)) if is_broker_placeholder(text)
+                )
+            {
+                continue;
+            }
+            let path = render_config_path(&site.path);
+            let remedy = if crate::secrets::backend_tls::is_brokered_site(&site.path) {
+                "use ${gh-env-secret:alloc=require} and seed the derived broker slot with the PEM key, or reference a key file"
+            } else {
+                "keep only certificates in this field; put the key in backend_tls_client_key_path as ${gh-env-secret:alloc=require}, or reference a key file"
+            };
+            findings.push(SecurityFinding::error(
+                kind,
+                row.id,
+                row.namespace,
+                format!(
+                    "Literal TLS private key in '{path}' on {noun} {} in namespace {} ({remedy})",
+                    row.id, row.namespace
+                ),
+            ));
+        }
     }
 }
 

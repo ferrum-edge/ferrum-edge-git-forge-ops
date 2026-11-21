@@ -226,9 +226,12 @@ distinct effective resource namespace, in lexical order.
 **Stand-ins** (`validate::with_validation_standins`). Credential leaves that are
 *still* `${gh-env-secret:…}` placeholders after resolution get a fake value:
 deterministic in the slot path for `gitforgeops-validation-standin-<64 hex>`,
-`hmac_sha256:<64 hex>` (a `basicauth` `password_hash`) and a URL on the
+`hmac_sha256:<64 hex>` (a `basicauth` `password_hash`), a URL on the
 `.invalid` stand-in host shaped by `endpoint_scheme` / `endpoint_form`
-(endpoint-typed plugin fields); a throwaway per-process key, masked in
+(endpoint-typed plugin fields) and a PEM-shaped marker block for a TLS
+private-key source Edge only PEM-frames (`validate::pem_standin`; an
+unresolved `udp_logging` DTLS key, which Edge pairs with its certificate, is
+omitted with `dtls_cert_path` instead); a throwaway per-process key, masked in
 validator output, for a `private_key_jwt` `private_key_pem`
 (`validate::client_key_standin`); the row's default regional Lambda origin
 for an ambient-credential Lambda `aws_endpoint_url`. Reason:
@@ -238,7 +241,7 @@ for an ambient-credential Lambda `aws_endpoint_url`. Reason:
 - Substitution happens on a **copy**, written only to the 0600 temp spec. No
   stand-in is ever exported, applied, delivered or written to state.
 - On resolved snapshots, only slots the `ResolveReport` marks unresolved (canonical
-  consumer, plugin config and plugin trigger slots) get stand-ins. Resolved or unreported values stay
+  consumer, plugin config, plugin trigger and backend TLS key slots) get stand-ins. Resolved or unreported values stay
   byte-for-byte, even with placeholder syntax. Consumer paths share the
   resolver's escaping and index-zero elision.
 - The report-free API and file apply keep syntax-based stand-ins for unresolved
@@ -247,8 +250,9 @@ for an ambient-credential Lambda `aws_endpoint_url`. Reason:
 **Scrubbing** (`secrets::SecretScrubber`). It collects every non-placeholder
 Consumer credential leaf (minus literal identities), every
 `sensitive_string_paths` plugin-config leaf, every non-empty plugin trigger
-`header`/`query`/`cookie` operand, modeled service-discovery secrets, and —
-when paired with a `ResolveReport` — the value at every resolved slot,
+`header`/`query`/`cookie` operand, modeled service-discovery secrets, inline
+TLS private keys in Proxy/Upstream bodies, and — when paired with a
+`ResolveReport` — the value at every resolved slot,
 even if it looks like a placeholder or has a nonsensitive field name. Those
 bytes and their single-line re-encodings (base64, percent, JSON-escape,
 single-quoted YAML) become `[REDACTED]` in the child's stdout/stderr;
@@ -640,8 +644,9 @@ Resolved-secret and sibling drift stay visible. Masking uses canonical slots
 from the resolution report, not value syntax, so seeded secrets that look like
 placeholders remain comparable. Modeled service-discovery diff values are
 redacted even when they look like placeholders. The same rule covers plugin
-config, plugin trigger and service-discovery secrets in `diff`, `plan` and
-`review`. Missing
+config, plugin trigger and service-discovery secrets, and backend TLS client
+keys (live key material only; a live path stays compared) in `diff`, `plan`
+and `review`. Missing
 required values still block apply. Review markdown is bounded below GitHub's
 API limit.
 
@@ -1768,7 +1773,7 @@ literal.
 
 #### Secrets outside `Consumer.credentials`
 
-Three more places hold brokered secrets under a reserved slot kind (the `@`
+Four more places hold brokered secrets under a reserved slot kind (the `@`
 prefix keeps them out of the credential-type keyspace):
 
 - `PluginConfig.config` → `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>`,
@@ -1801,6 +1806,17 @@ prefix keeps them out of the credential-type keyspace):
   `kubernetes` and `mesh` have no secret field. `diff` redacts these leaves
   individually; `is_sensitive_diff_field` deliberately omits
   `service_discovery` so address and service-name drift stay reviewable.
+- Inline PEM in Proxy/Upstream `backend_tls_client_key_path` →
+  `<ns>/<id>/@proxy|@upstream/backend_tls_client_key_path`
+  (`src/secrets/backend_tls.rs`; never generated). `src/secrets/tls_material.rs`
+  is the one detector (Edge's `contains_inline_private_key` and
+  `tls_material_field`) for import, the literal gate, scrubbing, diff and
+  plugin-config classification. Plugin key sources are located by schema
+  (`udp_logging` `dtls_key_path`, `mesh_route_dispatch` backend
+  `client_key_path`); inline keys there or bare keys in other plugin strings
+  are brokered under `@plugin`; a key in a certificate/CA field or a cert+key
+  bundle elsewhere is refused by import and blocks apply. Paths and provider
+  URIs stay literal.
 
 #### Bundle storage and sharding
 

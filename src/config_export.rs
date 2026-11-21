@@ -575,7 +575,7 @@ fn desired_comparison_rows(
     for proxy in &desired.proxies {
         let value = serde_json::to_value(proxy)?;
         let mut secrets = BTreeSet::new();
-        collect_tls_material_sites(&value, &mut String::new(), None, &mut secrets);
+        collect_tls_material_sites(&value, "", &mut secrets);
         rows.insert(
             ("Proxy", proxy.id.clone()),
             DesiredRow::new(value, secrets, UserinfoSweep::WholeRow),
@@ -605,8 +605,7 @@ fn desired_comparison_rows(
             secrets.insert(pointer);
         }
         if let Some(config) = value.get("config") {
-            let mut pointer = String::from("/config");
-            collect_tls_material_sites(config, &mut pointer, None, &mut secrets);
+            collect_tls_material_sites(config, "/config", &mut secrets);
         }
         let mut visible = Vec::new();
         if let Some(trigger) = value.get("trigger") {
@@ -636,7 +635,7 @@ fn desired_comparison_rows(
             }
             secrets.insert(pointer);
         }
-        collect_tls_material_sites(&value, &mut String::new(), None, &mut secrets);
+        collect_tls_material_sites(&value, "", &mut secrets);
         rows.insert(
             ("Upstream", upstream.id.clone()),
             DesiredRow::new(value, secrets, UserinfoSweep::WholeRow),
@@ -664,79 +663,24 @@ fn consumer_secret_pointers(projected: &Consumer) -> BTreeSet<String> {
     pointers
 }
 
-/// How a field name classifies the TLS material it holds, after Edge's
-/// `tls_material_field` (`plugin_config_projection`, after v0.9.20).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TlsMaterialField {
-    PrivateKey,
-    Public,
-}
-
-fn tls_material_field(name: &str) -> Option<TlsMaterialField> {
-    match name {
-        "backend_tls_client_key_path" | "client_key_path" | "private_key" => {
-            Some(TlsMaterialField::PrivateKey)
-        }
-        "backend_tls_client_cert_path"
-        | "backend_tls_server_ca_cert_path"
-        | "client_cert_path"
-        | "server_ca_cert_path"
-        | "client_certificate"
-        | "ca_certificates" => Some(TlsMaterialField::Public),
-        _ => None,
-    }
-}
-
-/// A PEM block whose label names a private key, anywhere in `value`
-/// (Edge's `contains_inline_private_key`).
-fn contains_inline_private_key(value: &str) -> bool {
-    const BANNER: &str = "-----BEGIN";
-    let normalized = value.to_ascii_uppercase();
-    normalized.match_indices(BANNER).any(|(start, _)| {
-        let after = &normalized[start + BANNER.len()..];
-        let label = after.find("-----").map_or(after, |end| &after[..end]);
-        label.contains("PRIVATE KEY")
-    })
-}
-
 /// Add every string Edge after v0.9.20 withholds as TLS private-key material
 /// (its TLS-material sweep over whole Proxy and Upstream bodies and over
-/// plugin configs): one carrying a private-key PEM block anywhere, or, under a
-/// private-key field, any PEM armour or control character. A certificate-plus-
-/// key bundle pasted into a certificate field is caught by the first rule.
-/// Array entries inherit their field's classification.
-fn collect_tls_material_sites(
-    value: &Value,
-    pointer: &mut String,
-    field: Option<TlsMaterialField>,
-    out: &mut BTreeSet<String>,
-) {
-    match value {
-        Value::String(text) => {
-            let private_key_field = field == Some(TlsMaterialField::PrivateKey)
-                && (text.to_ascii_uppercase().contains("-----BEGIN")
-                    || text.chars().any(char::is_control));
-            if contains_inline_private_key(text) || private_key_field {
-                out.insert(pointer.clone());
-            }
+/// plugin configs; [`crate::secrets::tls_material`] is the shared detector):
+/// one carrying a private-key PEM block anywhere, or, under a private-key
+/// field, any PEM armour or control character. A certificate-plus-key bundle
+/// pasted into a certificate field is caught by the first rule. Array entries
+/// inherit their field's classification.
+fn collect_tls_material_sites(value: &Value, root: &str, out: &mut BTreeSet<String>) {
+    for site in crate::secrets::tls_material::private_key_sites(value) {
+        let mut pointer = root.to_string();
+        for component in &site.path {
+            let segment = match component {
+                ConfigPathComponent::Key(key) => key.clone(),
+                ConfigPathComponent::Index(index) => index.to_string(),
+            };
+            push_pointer_segment(&mut pointer, &segment);
         }
-        Value::Object(map) => {
-            for (key, child) in map {
-                let len = pointer.len();
-                push_pointer_segment(pointer, key);
-                collect_tls_material_sites(child, pointer, tls_material_field(key), out);
-                pointer.truncate(len);
-            }
-        }
-        Value::Array(items) => {
-            for (index, child) in items.iter().enumerate() {
-                let len = pointer.len();
-                push_pointer_segment(pointer, &index.to_string());
-                collect_tls_material_sites(child, pointer, field, out);
-                pointer.truncate(len);
-            }
-        }
-        _ => {}
+        out.insert(pointer);
     }
 }
 
