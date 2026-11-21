@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::config::schema::{Consumer, PassthroughFields, PluginConfig, Upstream};
 use crate::config::GatewayConfig;
 use crate::secrets::plugin_config::ConfigPathComponent;
-use crate::secrets::resolver::{consumer_credential_slot, plugin_config_slot};
+use crate::secrets::plugin_trigger;
+use crate::secrets::resolver::{consumer_credential_slot, plugin_config_slot, plugin_trigger_slot};
 use crate::secrets::{ResolveReport, SlotStatus};
 
 /// Exclude only unresolved broker-controlled leaves from a live comparison
@@ -81,6 +82,7 @@ pub fn mask_indeterminate_secret_values(
                     unresolved.contains(slot.as_str())
                 },
             );
+            mask_unresolved_trigger_operands(expected, live, &unresolved);
         }
     }
 
@@ -130,6 +132,49 @@ pub fn mask_indeterminate_secret_values(
                 }
             }
         }
+    }
+}
+
+/// Align the unresolved brokered `trigger` operands of one plugin with the
+/// live trigger, operand by operand ([`plugin_trigger`]). Every other
+/// predicate, an operand at a path the live trigger does not have, and a
+/// live shape difference stay visible.
+fn mask_unresolved_trigger_operands(
+    expected: &PluginConfig,
+    live: &mut PluginConfig,
+    unresolved: &HashSet<&str>,
+) {
+    let (Some(desired_trigger), Some(live_trigger)) =
+        (expected.trigger.as_ref(), live.trigger.as_ref())
+    else {
+        return;
+    };
+    let desired_json = plugin_trigger::trigger_json(desired_trigger);
+    let mut live_json = plugin_trigger::trigger_json(live_trigger);
+    let mut changed = false;
+    for (path, text) in plugin_trigger::trigger_operand_strings(&desired_json) {
+        let slot = plugin_trigger_slot(
+            &expected.namespace,
+            &expected.id,
+            &expected.plugin_name,
+            &path,
+        );
+        if !unresolved.contains(slot.as_str()) {
+            continue;
+        }
+        if let Some(serde_json::Value::String(actual)) =
+            plugin_trigger::trigger_value_mut(&mut live_json, &path)
+        {
+            *actual = text.to_string();
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    // Only operand strings changed, so the live trigger keeps its shape.
+    if let Ok(masked) = plugin_trigger::trigger_from_json(live, live_json) {
+        live.trigger = Some(masked);
     }
 }
 
@@ -191,20 +236,48 @@ pub fn is_sensitive_diff_field(kind: &str, field: &str) -> bool {
 ///
 /// Redact even placeholder-shaped strings: the field diff has no resolution
 /// provenance, and either side may hold accepted secret material with that shape.
+///
+/// `PluginConfig.trigger` is the same case: its `header` / `query` / `cookie`
+/// operands can be shared tokens ([`plugin_trigger`]), while the field names,
+/// paths, methods, protocols and identity predicates beside them are exactly
+/// what a reviewer needs to read, so only the sensitive operands are replaced.
 fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
-    if kind != "Upstream" {
-        return;
-    }
-    for change in changes
-        .iter_mut()
-        .filter(|c| c.field == "service_discovery")
-    {
+    let (field, redact): (&str, fn(&str) -> Option<String>) = match kind {
+        "Upstream" => ("service_discovery", redact_service_discovery_json),
+        "PluginConfig" => ("trigger", redact_trigger_json),
+        _ => return,
+    };
+    for change in changes.iter_mut().filter(|c| c.field == field) {
         for side in [&mut change.old_value, &mut change.new_value] {
-            if let Some(redacted) = redact_service_discovery_json(side) {
+            if let Some(redacted) = redact(side) {
                 *side = redacted;
             }
         }
     }
+}
+
+/// Redact the sensitive client-field operands of one serialized `trigger`
+/// value (placeholder-shaped ones included), or `None` when nothing needed
+/// replacing. A value that is not JSON is left to the caller, as above.
+fn redact_trigger_json(serialized: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(serialized).ok()?;
+    if value.is_null() {
+        return None;
+    }
+    let sensitive: Vec<Vec<ConfigPathComponent>> =
+        plugin_trigger::sensitive_trigger_operands(&value)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+    if sensitive.is_empty() {
+        return None;
+    }
+    for path in &sensitive {
+        if let Some(leaf) = plugin_trigger::trigger_value_mut(&mut value, path) {
+            *leaf = serde_json::Value::String(crate::secrets::REDACTION.to_string());
+        }
+    }
+    serde_json::to_string(&value).ok()
 }
 
 /// Redact the modeled secret leaves of one serialized `service_discovery`

@@ -18,6 +18,7 @@ use crate::http_client::{describe_unmodeled_nested_fields, BackupSnapshot, Unmod
 use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
+    capture_and_redact_import_plugin_trigger_secrets,
     capture_and_redact_import_service_discovery_secrets, CredentialBundle, UnbrokeredPluginConfig,
     IMPORT_REQUIRED_PLACEHOLDER,
 };
@@ -136,6 +137,10 @@ pub struct ImportResult {
     /// placeholders. This includes schema-declared endpoints/header maps and
     /// fail-closed strings from custom plugin configs.
     pub redacted_plugin_config_values: usize,
+    /// Number of sensitive `PluginConfig.trigger` operands (the values a
+    /// `header` / `query` / `cookie` predicate compares) replaced with broker
+    /// placeholders.
+    pub redacted_plugin_trigger_values: usize,
     /// Number of modeled `Upstream.service_discovery` secrets (the Consul ACL
     /// token) replaced with broker placeholders.
     pub redacted_service_discovery_values: usize,
@@ -181,6 +186,7 @@ impl ImportResult {
             && self.skipped_spec_owned == 0
             && self.redacted_credential_values == 0
             && self.redacted_plugin_config_values == 0
+            && self.redacted_plugin_trigger_values == 0
             && self.redacted_service_discovery_values == 0
             && self.unsupported_sections.is_empty()
         {
@@ -222,6 +228,15 @@ impl ImportResult {
             notice.push_str(&format!(
                 "{} sensitive plugin config value(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
                 self.redacted_plugin_config_values
+            ));
+        }
+        if self.redacted_plugin_trigger_values > 0 {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "{} plugin trigger header/query/cookie operand(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
+                self.redacted_plugin_trigger_values
             ));
         }
         if self.redacted_service_discovery_values > 0 {
@@ -516,6 +531,7 @@ pub(crate) fn split_config_with_inventory(
     let acknowledged_passthrough = acknowledged_passthrough_review(&safe_config);
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
+    let captured_triggers = capture_and_redact_import_plugin_trigger_secrets(&mut safe_config)?;
     let captured_discovery = capture_and_redact_import_service_discovery_secrets(&mut safe_config)?;
     let unbrokered_plugin_config = enforce_plaintext_plugin_config_allowance(
         plugin_capture.unbrokered,
@@ -523,12 +539,20 @@ pub(crate) fn split_config_with_inventory(
     )?;
     let credential_count = captured_credentials.len();
     let plugin_config_count = plugin_capture.captured.len();
+    let plugin_trigger_count = captured_triggers.len();
     let service_discovery_count = captured_discovery.len();
     let mut captured_secrets = captured_credentials;
     for (slot, value) in plugin_capture.captured {
         if captured_secrets.insert(slot.clone(), value).is_some() {
             return Err(crate::error::Error::Config(format!(
                 "secret slot '{slot}' is produced by both a consumer credential and plugin config"
+            )));
+        }
+    }
+    for (slot, value) in captured_triggers {
+        if captured_secrets.insert(slot.clone(), value).is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "secret slot '{slot}' is produced by a plugin trigger operand and another resource"
             )));
         }
     }
@@ -546,6 +570,7 @@ pub(crate) fn split_config_with_inventory(
         sources: inventory.sources,
         redacted_credential_values: credential_count,
         redacted_plugin_config_values: plugin_config_count,
+        redacted_plugin_trigger_values: plugin_trigger_count,
         redacted_service_discovery_values: service_discovery_count,
         unbrokered_plugin_config,
         short_credential_plugin_config: plugin_capture.short_credential_named,
@@ -557,7 +582,7 @@ pub(crate) fn split_config_with_inventory(
         && credential_bundle_output.is_none()
     {
         return Err(crate::error::Error::Config(format!(
-            "the source contains {} live secret value(s) across consumer credentials and plugin config; re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
+            "the source contains {} live secret value(s) across consumer credentials, plugin config and plugin triggers; re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
             captured_secrets.len()
         )));
     }

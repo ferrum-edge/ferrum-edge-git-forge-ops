@@ -15,6 +15,7 @@ use crate::policy::PolicyConfig;
 use crate::secrets::plugin_config::{
     render_config_path, sensitive_string_paths, short_credential_named_paths, value_at,
 };
+use crate::secrets::plugin_trigger;
 use crate::secrets::resolver::is_identity_credential_leaf;
 
 #[derive(Debug, Clone)]
@@ -204,6 +205,7 @@ pub fn audit_security_with_scope(
 
     for plugin in &config.plugin_configs {
         check_literal_plugin_config_secrets(plugin, &mut findings);
+        check_literal_plugin_trigger_secrets(plugin, &mut findings);
         check_plugin(plugin, &mut findings);
     }
 
@@ -741,6 +743,38 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
             &plugin.namespace,
             format!(
                 "Short credential-named plugin-config value in 'config.{path}' on plugin {} ({}) in namespace {}: it is under 8 bytes, so it is kept as an ordinary setting, committed and applied literally, and cannot be brokered or redacted; if it is a credential, use a longer one through ${{gh-env-secret:alloc=require}}",
+                plugin.id, plugin.plugin_name, plugin.namespace
+            ),
+        ));
+    }
+}
+
+/// A `PluginConfig.trigger` `header` / `query` / `cookie` operand long enough
+/// to broker ([`crate::secrets::plugin_trigger`]) that is not a broker
+/// placeholder is a shared token committed to the repository: whoever knows it
+/// decides whether the plugin runs. Blocking, like a literal plugin-config
+/// secret, with the same remedy. Field names, shorter operands and every other
+/// predicate stay reviewable literals. Disabled plugins are included because
+/// their trigger is still published. Names the path, never the value.
+fn check_literal_plugin_trigger_secrets(
+    plugin: &PluginConfig,
+    findings: &mut Vec<SecurityFinding>,
+) {
+    let Some(trigger) = plugin.trigger.as_ref() else {
+        return;
+    };
+    let json = plugin_trigger::trigger_json(trigger);
+    for (path, value) in plugin_trigger::sensitive_trigger_operands(&json) {
+        if is_broker_placeholder(value) {
+            continue;
+        }
+        let path = plugin_trigger::render_trigger_path(&path);
+        findings.push(SecurityFinding::error(
+            "PluginConfig",
+            &plugin.id,
+            &plugin.namespace,
+            format!(
+                "Literal plugin-trigger secret in '{path}' on plugin {} ({}) in namespace {} (a client that knows this operand decides whether the plugin runs; use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
                 plugin.id, plugin.plugin_name, plugin.namespace
             ),
         ));

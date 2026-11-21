@@ -634,7 +634,8 @@ Resolved-secret and sibling drift stay visible. Masking uses canonical slots
 from the resolution report, not value syntax, so seeded secrets that look like
 placeholders remain comparable. Modeled service-discovery diff values are
 redacted even when they look like placeholders. The same rule covers plugin
-config and service-discovery secrets in `diff`, `plan` and `review`. Missing
+config, plugin trigger and service-discovery secrets in `diff`, `plan` and
+`review`. Missing
 required values still block apply. Review markdown is bounded below GitHub's
 API limit.
 
@@ -1737,7 +1738,7 @@ consequences by evidence:
 - **Plugin type change**: `PluginWalk::check_type_slot_identity` runs for
   every declared plugin in both walks. A bundle key under the same `ns/id`
   with another `@plugin/<type>/…`, anything under its own type outside
-  `config`, or the retired type-less `@plugin-config/…` kind is a remap. The
+  `config` and `trigger`, or the retired type-less `@plugin-config/…` kind is a remap. The
   value is never resolved even when accepted. Remedy: seed the new type's
   slots, remove the old keys.
 
@@ -1760,7 +1761,7 @@ literal.
 
 #### Secrets outside `Consumer.credentials`
 
-Two more places hold brokered secrets, each with a reserved slot kind (the `@`
+Three more places hold brokered secrets under a reserved slot kind (the `@`
 prefix keeps them out of the credential-type keyspace):
 
 - `PluginConfig.config` → `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>`,
@@ -1769,6 +1770,14 @@ prefix keeps them out of the credential-type keyspace):
   both walks, diff masking, stand-ins and scrubbing), so a retyped plugin
   never resolves the old type's values. Never add the retired type-less
   `@plugin-config/config/…` form to any lookup.
+- `PluginConfig.trigger` `header`/`query`/`cookie` `value` operands →
+  `<ns>/<plugin-id>/@plugin/<plugin_name>/trigger/<path>` (`<path>` from
+  `when`, every index kept; `resolver::plugin_trigger_slot`). One walk,
+  `src/secrets/plugin_trigger.rs::visit_trigger_sites`, mirrors Edge's
+  `project_plugin_trigger_with` for every boundary and for export site
+  prediction. Operands of ≥8 bytes are secrets like `RuleKind::Value`; other
+  predicates and field names stay literal, and broker syntax there is refused
+  (`validate_trigger_placeholders`).
 - `Upstream.service_discovery` → `<ns>/<upstream-id>/@service-discovery/<path>`
   (e.g. `ferrum/orders/@service-discovery/consul/token`). Modeled secret leaves
   live in one table, `src/secrets/service_discovery.rs::SD_SECRET_FIELDS`, read

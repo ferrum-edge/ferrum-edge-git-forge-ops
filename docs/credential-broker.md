@@ -129,11 +129,29 @@ Secrets outside `Consumer.credentials` get a reserved `@` segment:
 ```text
 PluginConfig.config leaf     ->  <ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>
                                  ferrum/ldap/@plugin/ldap_auth/config/ldap_url
+PluginConfig.trigger operand ->  <ns>/<plugin-id>/@plugin/<plugin_name>/trigger/<path>
+                                 ferrum/waf/@plugin/waf/trigger/when/not/match/header/value/exact/[0]
 Upstream.service_discovery   ->  <ns>/<upstream-id>/@service-discovery/<path>
                                  ferrum/orders/@service-discovery/consul/token
 ```
 
-Plugin-config array paths keep every index, including `[0]`.
+Plugin-config and trigger array paths keep every index, including `[0]`.
+
+A plugin `trigger` is brokered operand by operand. The values a `header`,
+`query` or `cookie` predicate compares (`value.exact[]`, `value.prefix[]`,
+`value.regex`) are what a client sends to make the plugin run or skip, so
+Ferrum Edge withholds them and GitForgeOps treats each one of at least 8 bytes
+as a secret: `import` captures it, `diff` and `plan` show it as `[REDACTED]`
+inside an otherwise readable trigger, validator output and the review comment
+are scrubbed of it, and a committed literal is a blocking finding. A shorter
+operand (`exact: ["1"]`) cannot be stored or scrubbed, so it stays an ordinary
+setting. Field names, `presence`, `multi_value`, `case_insensitive`, the tree
+(`all`, `any`, `not`) and every other predicate (`path`, `method`, `host`,
+`sni`, `protocol`, `source_cidr`, `namespace`, `proxy_id`, `listen_port`,
+`consumer`, `auth_method`, `spiffe_id`) stay literal and reviewable; a
+placeholder in one of them is refused, because it has no slot and would reach
+the gateway as text. Trigger slots belong to the plugin's type like its config
+slots, so the type-change and shrink checks below cover them too.
 
 A plugin-config slot names the plugin type as well as its id, because what a
 config path means, and where the plugin sends it, depends on the type (the

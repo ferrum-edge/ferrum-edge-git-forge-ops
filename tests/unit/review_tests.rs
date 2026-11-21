@@ -2028,3 +2028,56 @@ fn review_formatter_spellings_of_live_credentials_are_redacted() {
         assert!(published.contains("changed"), "{published}");
     }
 }
+
+/// GHSA-vxj2-vppp-782j: a live `PluginConfig.trigger` header, query or cookie
+/// operand is registered from the live snapshot, so a review comment that
+/// echoes it loses it at the sink; the text around it survives.
+#[test]
+fn review_comment_loses_live_trigger_operands() {
+    gitforgeops::display::enable_display_scrubbing_on_this_thread();
+    for (label, value, trigger) in [
+        (
+            "header",
+            "zq8-trigger-header-operand",
+            serde_json::json!({"when": {"match": {"header": {"name": "x-skip-waf",
+                "value": {"exact": ["zq8-trigger-header-operand"]}}}}}),
+        ),
+        (
+            "query",
+            "zq8-trigger-query-operand",
+            serde_json::json!({"when": {"any": [{"match": {"query": {"name": "debug-mode",
+                "value": {"prefix": ["zq8-trigger-query-operand"]}}}}]}}),
+        ),
+        (
+            "cookie",
+            "zq8-trigger-cookie-operand",
+            serde_json::json!({"when": {"not": {"match": {"cookie": {"name": "session-tier",
+                "value": {"regex": "zq8-trigger-cookie-operand"}}}}}}),
+        ),
+    ] {
+        let config: gitforgeops::config::schema::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "plugin_configs": [{"id": "plugin", "namespace": "ferrum", "plugin_name": "waf",
+                    "scope": "global", "config": {}, "trigger": trigger}]
+            }))
+            .unwrap();
+        gitforgeops::display::register_gateway_config(&config).unwrap();
+        let diffs = vec![ResourceDiff {
+            action: DiffAction::Modify,
+            kind: "PluginConfig".to_string(),
+            id: "plugin".to_string(),
+            namespace: "ferrum".to_string(),
+            details: vec![FieldChange {
+                field: format!("trigger {value} session-name"),
+                old_value: value.to_string(),
+                new_value: "changed".to_string(),
+            }],
+        }];
+        let comment = review_comment(true, "", &diffs, &[], &[], &[], None);
+        assert!(comment.contains("zq8"), "{label}: the comment must echo it");
+        let published = gitforgeops::display::scrub_text(&comment);
+        assert!(!published.contains("zq8"), "{label}: {published}");
+        assert!(published.contains("[REDACTED]"), "{label}: {published}");
+        assert!(published.contains("session"), "{label}: {published}");
+    }
+}

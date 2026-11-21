@@ -55,9 +55,10 @@ use super::placeholder::parse_placeholder;
 use super::plugin_config::{
     render_config_path, rule_declared_paths, sensitive_string_paths, value_at, ConfigPathComponent,
 };
+use super::plugin_trigger;
 use super::resolver::{
-    consumer_credential_slot, is_identity_credential_leaf, plugin_config_slot, ResolveReport,
-    SlotStatus,
+    consumer_credential_slot, is_identity_credential_leaf, plugin_config_slot, plugin_trigger_slot,
+    ResolveReport, SlotStatus,
 };
 
 /// Text substituted for every secret occurrence.
@@ -204,6 +205,9 @@ impl SecretScrubber {
     ///   set `import` moves into the private bundle. A plugin secret such as
     ///   an `otel_tracing` `headers.x-honeycomb-team` value is resolved into
     ///   the validator input exactly like a consumer credential.
+    /// * **Plugin triggers** — the `header` / `query` / `cookie` operands of a
+    ///   `trigger` long enough to broker ([`super::plugin_trigger`]): a shared
+    ///   token that decides whether the plugin runs.
     /// * **Service discovery** — the modeled secret leaves of
     ///   `Upstream.service_discovery` ([`super::service_discovery`]), today the
     ///   Consul ACL token. The validator is handed the resolved upstream, so
@@ -421,6 +425,7 @@ pub(crate) fn gateway_secret_values(
     let mut values = ManifestValues::default();
     collect_consumer_secrets(config, &mut values);
     collect_plugin_config_secrets(config, &mut values);
+    collect_plugin_trigger_secrets(config, &mut values);
     collect_service_discovery_secrets(config, &mut values);
     let mut values = values.0;
     collect_resolved_secrets(config, report, &mut values);
@@ -435,7 +440,8 @@ pub(crate) struct LiveSecretLeaf {
     /// secret: it must be protectable, or the run is refused. `false` when
     /// only the key-name heuristics flag it (`*key`, a header map, a Kafka
     /// producer property not named like a credential, a custom plugin's
-    /// field): such a leaf may be an ordinary setting, such as a header name.
+    /// field) or it is a plugin trigger operand: such a leaf may be an
+    /// ordinary setting, such as a header name.
     pub required: bool,
     /// `<Kind> <namespace>/<id> <field path>`, sanitized for display; never
     /// the value. For a value found at several leaves, a required one.
@@ -450,6 +456,7 @@ pub(crate) fn live_secret_leaves(config: &GatewayConfig) -> Vec<LiveSecretLeaf> 
     let mut leaves = LiveLeaves::default();
     collect_consumer_secrets(config, &mut leaves);
     collect_plugin_config_secrets(config, &mut leaves);
+    collect_plugin_trigger_secrets(config, &mut leaves);
     collect_service_discovery_secrets(config, &mut leaves);
     leaves
         .0
@@ -550,6 +557,16 @@ fn collect_resolved_secrets(
                 plugin_config_slot(&plugin.namespace, &plugin.id, &plugin.plugin_name, path);
             resolved.contains(plugin_slot.as_str())
         });
+        if let Some(trigger) = plugin.trigger.as_ref() {
+            let json = plugin_trigger::trigger_json(trigger);
+            for (path, text) in plugin_trigger::trigger_operand_strings(&json) {
+                let slot =
+                    plugin_trigger_slot(&plugin.namespace, &plugin.id, &plugin.plugin_name, &path);
+                if !text.is_empty() && resolved.contains(slot.as_str()) {
+                    out.insert(text.to_string());
+                }
+            }
+        }
     }
     for upstream in &config.upstreams {
         let Some(discovery) = &upstream.service_discovery else {
@@ -746,6 +763,29 @@ fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink)
                     )
                 });
             }
+        }
+    }
+}
+
+/// The sensitive `header` / `query` / `cookie` operands of every plugin
+/// `trigger` ([`super::plugin_trigger`]). Like a plugin-config operator value
+/// they are never required for display admission: a shorter one is an
+/// ordinary setting and is not reported at all.
+fn collect_plugin_trigger_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
+    for plugin in &config.plugin_configs {
+        let Some(trigger) = plugin.trigger.as_ref() else {
+            continue;
+        };
+        let json = plugin_trigger::trigger_json(trigger);
+        for (path, text) in plugin_trigger::sensitive_trigger_operands(&json) {
+            out.leaf(text, false, &|| {
+                leaf_location(
+                    "PluginConfig",
+                    &plugin.namespace,
+                    &plugin.id,
+                    &plugin_trigger::render_trigger_path(&path),
+                )
+            });
         }
     }
 }

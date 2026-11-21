@@ -380,7 +380,8 @@ and only a completed pass is `PASSED`.
 
 **Secrets are scrubbed from validator output, not hidden wholesale.**
 Credentials are resolved before validation, and the validator may echo them.
-Every resolved or literal credential, sensitive plugin-config value and modeled
+Every resolved or literal credential, sensitive plugin-config value, plugin
+trigger `header`/`query`/`cookie` operand of at least 8 bytes and modeled
 service-discovery secret, plus its base64 and percent-encoded forms, is
 replaced with `[REDACTED]`. Identities (`basicauth` usernames, `mtls_auth`
 identities) stay readable. The whole stream is withheld instead when:
@@ -400,7 +401,7 @@ gets a fake value of the right shape:
 | Brokered leaf | Stand-in |
 |---|---|
 | `basicauth` `password_hash` | `hmac_sha256:<64 hex>` |
-| other credentials, and token/header/secret plugin config | `gitforgeops-validation-standin-<64 hex>` |
+| other credentials, token/header/secret plugin config, and plugin trigger operands (also a valid literal `regex`) | `gitforgeops-validation-standin-<64 hex>` |
 | endpoint plugin config (`ldap_url`, `redis_url`, `jwks_uri`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
 
 The scheme follows the field (`ldaps://`, `redis://`, otherwise `https://`).
@@ -629,8 +630,10 @@ unchanged. File-mode drift jobs still skip before receiving gateway credentials.
   imports do not claim exact provenance.
 - Every recognized secret becomes `${gh-env-secret:alloc=require}`: Consumer
   credential secrets, built-in plugin-config secrets covered by the broker
-  rules, custom-plugin values the heuristics flag, and Consul tokens.
-  Identities stay literal.
+  rules, custom-plugin values the heuristics flag, plugin trigger
+  `header`/`query`/`cookie` `value` operands of at least 8 bytes, and Consul
+  tokens. Identities, trigger field names and every other trigger predicate
+  stay literal.
 - A secret-looking value outside those rules, or any custom-plugin string the
   heuristics do not flag, **fails the import** before anything is written.
   After confirming the named paths hold no credentials, re-run with
