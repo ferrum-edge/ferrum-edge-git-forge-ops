@@ -4,6 +4,7 @@ pub mod delivery;
 pub mod github_api;
 pub mod placeholder;
 pub(crate) mod plugin_config;
+pub(crate) mod plugin_trigger;
 pub mod resolver;
 pub mod scrubber;
 pub(crate) mod service_discovery;
@@ -30,6 +31,7 @@ pub use github_api::{
 pub use placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder};
 pub use resolver::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
+    capture_and_redact_import_plugin_trigger_secrets,
     capture_and_redact_import_service_discovery_secrets, report_secrets_lenient,
     report_secrets_with_mode_and_options, resolve_secrets_with_mode_and_options,
     resolve_secrets_with_options, slot_path, unresolved_placeholder_slots,

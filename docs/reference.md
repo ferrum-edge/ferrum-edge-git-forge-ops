@@ -421,8 +421,10 @@ and only a completed pass is `PASSED`.
 
 **Secrets are scrubbed from validator output, not hidden wholesale.**
 Credentials are resolved before validation, and the validator may echo them.
-Every resolved or literal credential, sensitive plugin-config value and modeled
-service-discovery secret, plus its base64 and percent-encoded forms, is
+Every resolved or literal credential, sensitive plugin-config value, plugin
+trigger `header`/`query`/`cookie` operand (of at least 8 bytes; `diff` and
+`plan` redact shorter ones by position) and modeled service-discovery secret,
+plus its base64 and percent-encoded forms, is
 replaced with `[REDACTED]`. Identities (`basicauth` usernames, `mtls_auth`
 identities) stay readable. The whole stream is withheld instead when:
 
@@ -441,7 +443,7 @@ gets a fake value of the right shape:
 | Brokered leaf | Stand-in |
 |---|---|
 | `basicauth` `password_hash` | `hmac_sha256:<64 hex>` |
-| other credentials, and token/header/secret plugin config | `gitforgeops-validation-standin-<64 hex>` |
+| other credentials, token/header/secret plugin config, and plugin trigger operands (also a valid literal `regex`) | `gitforgeops-validation-standin-<64 hex>` |
 | endpoint plugin config (`ldap_url`, `jwks_uri`, `endpoint_url`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
 | a Redis-backed plugin's `redis_url` | `redis://<32 hex>.gitforgeops-validation-standin.invalid/0` |
 | `serverless_function` `aws_endpoint_url` | `https://<32 hex>.gitforgeops-validation-standin.invalid/` |
@@ -716,8 +718,11 @@ unchanged. File-mode drift jobs still skip before receiving gateway credentials.
   imports do not claim exact provenance.
 - Every recognized secret becomes `${gh-env-secret:alloc=require}`: Consumer
   credential secrets, built-in plugin-config secrets covered by the broker
-  rules, custom-plugin values the heuristics flag, and Consul tokens.
-  Identities stay literal.
+  rules, custom-plugin values the heuristics flag, every non-empty plugin
+  trigger `header`/`query`/`cookie` `value` operand, and Consul tokens.
+  Identities, trigger field names and every other trigger predicate stay
+  literal. A trigger operand shorter than 8 bytes is captured but listed for
+  re-seeding with a longer value, since the broker will not resolve it.
 - A secret-looking value outside those rules, or any custom-plugin string the
   heuristics do not flag, **fails the import** before anything is written.
   After confirming the named paths hold no credentials, re-run with

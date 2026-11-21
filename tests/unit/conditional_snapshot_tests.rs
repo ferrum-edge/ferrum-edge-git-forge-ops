@@ -1721,6 +1721,46 @@ async fn exact_import_refuses_unsupported_credentials_before_tree_or_bundle_publ
     assert!(!bundle.exists());
 }
 
+/// GHSA-vxj2-vppp-782j: a live trigger operand that spells placeholder text
+/// is live data, not a repository declaration. API import refuses it, naming
+/// the slot, instead of publishing it as a placeholder with nothing captured.
+#[tokio::test]
+async fn api_import_refuses_live_trigger_operands_that_spell_placeholders() {
+    let mut cfg = config();
+    cfg.plugin_configs.push(
+        serde_json::from_value(json!({
+            "id": "waf", "namespace": NS, "plugin_name": "waf", "scope": "global",
+            "config": {},
+            "trigger": {"when": {"not": {"match": {"header": {"name": "x-skip-waf",
+                "value": {"exact": ["${gh-env-secret:alloc=require}"]}}}}}}
+        }))
+        .unwrap(),
+    );
+    let raw = envelope(&cfg, &BackupExtras::default(), NS_TAG);
+    let (client, _requests) = gateway(move |_, _| verified(&raw, NS_TAG));
+    let output = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    let bundle = private.path().join("credentials.json");
+    let error = gitforgeops::import::from_api::import_from_api(
+        &client,
+        output.path(),
+        Some(NS),
+        Some(&bundle),
+        &gitforgeops::import::ImportPassthroughPolicy::default(),
+        &[],
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("placeholder text"), "{error}");
+    assert!(
+        error.contains("team-alpha/waf/@plugin/waf/trigger/when/not/match/header/value/exact/[0]"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 0);
+    assert!(!bundle.exists());
+}
+
 #[tokio::test]
 async fn exact_api_import_records_provenance_and_conditional_file_import_refuses_headers_absent() {
     let raw = envelope(&config(), &BackupExtras::default(), NS_TAG);

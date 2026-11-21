@@ -18,6 +18,7 @@ use crate::http_client::{describe_unmodeled_nested_fields, BackupSnapshot, Unmod
 use crate::secrets::bundle::{shard_ceiling_error, MAX_BUNDLE_SHARDS};
 use crate::secrets::{
     capture_and_redact_import_credentials, capture_and_redact_import_plugin_config_secrets,
+    capture_and_redact_import_plugin_trigger_secrets,
     capture_and_redact_import_service_discovery_secrets, CredentialBundle, UnbrokeredPluginConfig,
     IMPORT_REQUIRED_PLACEHOLDER,
 };
@@ -101,6 +102,12 @@ pub(crate) struct ImportInventory {
     /// Nested fields the typed decode discarded; see
     /// [`reject_import_unmodeled_nested_fields`].
     pub unmodeled_nested_fields: Vec<UnmodeledNestedField>,
+    /// The source is live gateway data (`import --from-api`, or an Edge
+    /// `/backup` envelope read from a file), never an authored document, so
+    /// broker-placeholder text in it is live data, not a repository
+    /// declaration; see
+    /// [`reject_live_marker_trigger_operands`].
+    pub live_source: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -136,6 +143,10 @@ pub struct ImportResult {
     /// placeholders. This includes schema-declared endpoints/header maps and
     /// fail-closed strings from custom plugin configs.
     pub redacted_plugin_config_values: usize,
+    /// Number of sensitive `PluginConfig.trigger` operands (the values a
+    /// `header` / `query` / `cookie` predicate compares) replaced with broker
+    /// placeholders.
+    pub redacted_plugin_trigger_values: usize,
     /// Number of modeled `Upstream.service_discovery` secrets (the Consul ACL
     /// token) replaced with broker placeholders.
     pub redacted_service_discovery_values: usize,
@@ -163,6 +174,14 @@ pub struct ImportResult {
     #[serde(skip)]
     pub short_credential_plugin_config: Vec<UnbrokeredPluginConfig>,
 
+    /// Captured plugin trigger operand slots whose value is shorter than 8
+    /// bytes. The broker refuses to resolve them until re-seeded with a
+    /// longer value; surfaced by [`ImportResult::short_plugin_trigger_notice`].
+    /// Slot names only. Kept out of the manifest like
+    /// `unbrokered_plugin_config`.
+    #[serde(skip)]
+    pub short_plugin_trigger_slots: Vec<String>,
+
     /// `Kind id: field, field` for every resource carrying an unmodelled
     /// top-level field the operator acknowledged with `--accept-unknown-field`.
     /// Surfaced by [`ImportResult::acknowledged_passthrough_notice`]. Kept out
@@ -181,6 +200,7 @@ impl ImportResult {
             && self.skipped_spec_owned == 0
             && self.redacted_credential_values == 0
             && self.redacted_plugin_config_values == 0
+            && self.redacted_plugin_trigger_values == 0
             && self.redacted_service_discovery_values == 0
             && self.unsupported_sections.is_empty()
         {
@@ -222,6 +242,15 @@ impl ImportResult {
             notice.push_str(&format!(
                 "{} sensitive plugin config value(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
                 self.redacted_plugin_config_values
+            ));
+        }
+        if self.redacted_plugin_trigger_values > 0 {
+            if !notice.is_empty() {
+                notice.push(' ');
+            }
+            notice.push_str(&format!(
+                "{} plugin trigger header/query/cookie operand(s) were replaced with `{IMPORT_REQUIRED_PLACEHOLDER}`; seed the derived GitHub Environment Secret slots before apply.",
+                self.redacted_plugin_trigger_values
             ));
         }
         if self.redacted_service_discovery_values > 0 {
@@ -286,6 +315,33 @@ impl ImportResult {
                 diagnostic_metadata(&plugin.namespace),
                 diagnostic_metadata(&plugin.plugin_name),
                 paths.join(", ")
+            ));
+        }
+        Some(notice)
+    }
+
+    /// Warning for captured plugin trigger operands shorter than 8 bytes.
+    /// They are secrets and left the tree like every operand, but the broker
+    /// will not resolve a value that short (it could not be removed from this
+    /// tool's output), so apply refuses until each slot is re-seeded.
+    pub fn short_plugin_trigger_notice(&self) -> Option<String> {
+        if self.short_plugin_trigger_slots.is_empty() {
+            return None;
+        }
+        let mut notice = String::from(
+            "WARNING: these plugin trigger header/query/cookie operands are shorter than 8 bytes. They were moved to the migration bundle like every trigger operand, but the broker refuses to resolve a value that short, so apply refuses until each slot is re-seeded with an operand of at least 8 bytes (update the clients that send it first):",
+        );
+        for slot in self
+            .short_plugin_trigger_slots
+            .iter()
+            .take(MAX_PATHS_PER_PLUGIN)
+        {
+            notice.push_str(&format!("\n  {}", diagnostic_metadata(slot)));
+        }
+        if self.short_plugin_trigger_slots.len() > MAX_PATHS_PER_PLUGIN {
+            notice.push_str(&format!(
+                "\n  [{} more]",
+                self.short_plugin_trigger_slots.len() - MAX_PATHS_PER_PLUGIN
             ));
         }
         Some(notice)
@@ -513,9 +569,14 @@ pub(crate) fn split_config_with_inventory(
     let mut safe_config = config.clone();
     reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
     reject_import_unknown_credential_types(&safe_config)?;
+    reject_import_trigger_placeholders(&safe_config)?;
+    if inventory.live_source {
+        reject_live_marker_trigger_operands(&safe_config)?;
+    }
     let acknowledged_passthrough = acknowledged_passthrough_review(&safe_config);
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
+    let captured_triggers = capture_and_redact_import_plugin_trigger_secrets(&mut safe_config)?;
     let captured_discovery = capture_and_redact_import_service_discovery_secrets(&mut safe_config)?;
     let unbrokered_plugin_config = enforce_plaintext_plugin_config_allowance(
         plugin_capture.unbrokered,
@@ -523,12 +584,20 @@ pub(crate) fn split_config_with_inventory(
     )?;
     let credential_count = captured_credentials.len();
     let plugin_config_count = plugin_capture.captured.len();
+    let plugin_trigger_count = captured_triggers.captured.len();
     let service_discovery_count = captured_discovery.len();
     let mut captured_secrets = captured_credentials;
     for (slot, value) in plugin_capture.captured {
         if captured_secrets.insert(slot.clone(), value).is_some() {
             return Err(crate::error::Error::Config(format!(
                 "secret slot '{slot}' is produced by both a consumer credential and plugin config"
+            )));
+        }
+    }
+    for (slot, value) in captured_triggers.captured {
+        if captured_secrets.insert(slot.clone(), value).is_some() {
+            return Err(crate::error::Error::Config(format!(
+                "secret slot '{slot}' is produced by a plugin trigger operand and another resource"
             )));
         }
     }
@@ -546,6 +615,8 @@ pub(crate) fn split_config_with_inventory(
         sources: inventory.sources,
         redacted_credential_values: credential_count,
         redacted_plugin_config_values: plugin_config_count,
+        redacted_plugin_trigger_values: plugin_trigger_count,
+        short_plugin_trigger_slots: captured_triggers.short,
         redacted_service_discovery_values: service_discovery_count,
         unbrokered_plugin_config,
         short_credential_plugin_config: plugin_capture.short_credential_named,
@@ -557,7 +628,7 @@ pub(crate) fn split_config_with_inventory(
         && credential_bundle_output.is_none()
     {
         return Err(crate::error::Error::Config(format!(
-            "the source contains {} live secret value(s) across consumer credentials and plugin config; re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
+            "the source contains {} live secret value(s) across consumer credentials, plugin config and plugin triggers; re-run import with --credential-bundle-output PATH to write their canonical broker slots to a private mode-0600 migration bundle outside the resource tree",
             captured_secrets.len()
         )));
     }
@@ -825,6 +896,80 @@ fn reject_import_unmodeled_nested_fields(
 /// namespace, and recognized set, and suggest the canonical spelling for
 /// known misspellings. There is no acknowledgement flag: a type that never
 /// authenticates has nothing worth migrating.
+/// Refuse broker syntax in a trigger predicate that has no broker slot, on
+/// every row import would write, before any tree file or migration bundle is
+/// planned. The repository load boundary refuses the same document
+/// ([`crate::secrets::plugin_trigger::validate_trigger_placeholders`]), so
+/// writing it would publish a tree no later command accepts. Spec-owned rows
+/// are not written and are skipped. Names the path, never a value.
+fn reject_import_trigger_placeholders(config: &GatewayConfig) -> crate::error::Result<()> {
+    for plugin in config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.api_spec_id.is_none())
+    {
+        crate::secrets::plugin_trigger::check_trigger_placeholders(plugin).map_err(|error| {
+            crate::error::Error::Config(format!(
+                "refusing to import: {error}. Nothing has been written."
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Refuse a live trigger operand that spells broker-placeholder text.
+///
+/// Capture keeps a valid `${gh-env-secret:…}` string as-is so an exported,
+/// unmaterialized file round-trips. A live gateway read, or an Edge backup
+/// saved to disk, has no such provenance: the operand is what clients must send, and keeping it would
+/// publish it in the tree as a placeholder, capture nothing and later have
+/// apply resolve or allocate a different value. The resolver already refuses
+/// placeholder text as a trigger bundle value. Only trigger operands are
+/// checked here; Consumer and plugin-config secrets keep the shared
+/// round-trip behaviour. Names slots, never values.
+fn reject_live_marker_trigger_operands(config: &GatewayConfig) -> crate::error::Result<()> {
+    use crate::secrets::plugin_trigger::{secret_trigger_operands, trigger_json};
+    let mut slots = Vec::new();
+    for plugin in config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.api_spec_id.is_none())
+    {
+        let Some(trigger) = plugin.trigger.as_ref() else {
+            continue;
+        };
+        let json = trigger_json(trigger);
+        for (path, text) in secret_trigger_operands(&json) {
+            if text
+                .trim()
+                .get(.."${gh-env-secret:".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("${gh-env-secret:"))
+            {
+                slots.push(crate::secrets::resolver::plugin_trigger_slot(
+                    &plugin.namespace,
+                    &plugin.id,
+                    &plugin.plugin_name,
+                    &path,
+                ));
+            }
+        }
+    }
+    if slots.is_empty() {
+        return Ok(());
+    }
+    Err(crate::error::Error::Config(format!(
+        "refusing to import: the gateway backup has plugin trigger operand(s) that spell \
+         gh-env-secret placeholder text, which would be published as a placeholder instead of \
+         being captured. Replace each operand at the gateway with a real value (and update the \
+         clients that send it), then re-import. Nothing has been written.\n  {}",
+        slots
+            .iter()
+            .map(|slot| diagnostic_metadata(slot))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    )))
+}
+
 fn reject_import_unknown_credential_types(config: &GatewayConfig) -> crate::error::Result<()> {
     let mut offenders: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
     for consumer in &config.consumers {

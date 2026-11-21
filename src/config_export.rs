@@ -740,49 +740,24 @@ fn collect_tls_material_sites(
     }
 }
 
-/// Trigger `match` predicates whose operands a client presents, so Edge after
-/// v0.9.20 withholds them (`TRIGGER_CLIENT_FIELD_PREDICATES`).
-const TRIGGER_CLIENT_FIELD_PREDICATES: [&str; 3] = ["header", "query", "cookie"];
-
-/// Trigger `match` predicates Edge leaves visible.
-const TRIGGER_VISIBLE_PREDICATES: [&str; 14] = [
-    "method",
-    "path",
-    "host",
-    "sni",
-    "protocol",
-    "source_cidr",
-    "namespace",
-    "proxy_id",
-    "listen_port",
-    "consumer",
-    "external_identity",
-    "external_identity_authority",
-    "auth_method",
-    "spiffe_id",
-];
-
 /// Add every site of a PluginConfig `trigger` that Edge after v0.9.20
 /// withholds from the export (`project_plugin_trigger_with`): each operand
 /// (`exact[]` and `prefix[]` entries, `regex`) of a `header` / `query` /
 /// `cookie` predicate, anywhere in the `all` / `any` / `not` tree. Like Edge,
-/// any shape a trigger cannot have is a site as a whole.
+/// any shape a trigger cannot have is a site as a whole. The walk is shared
+/// with the broker ([`crate::secrets::plugin_trigger::visit_trigger_sites`]).
 fn collect_trigger_sites(trigger: &Value, out: &mut BTreeSet<String>) {
-    let mut pointer = String::from("/trigger");
-    let Some(map) = trigger.as_object().filter(|map| map.contains_key("when")) else {
-        withheld_site(trigger, &pointer, out);
-        return;
-    };
-    for (key, child) in map {
-        let len = pointer.len();
-        push_pointer_segment(&mut pointer, key);
-        if key == "when" {
-            trigger_node_sites(child, &mut pointer, out);
-        } else {
-            withheld_site(child, &pointer, out);
+    crate::secrets::plugin_trigger::visit_trigger_sites(trigger, &mut |path, _, _| {
+        let mut pointer = String::from("/trigger");
+        for component in path {
+            let segment = match component {
+                ConfigPathComponent::Key(key) => key.clone(),
+                ConfigPathComponent::Index(index) => index.to_string(),
+            };
+            push_pointer_segment(&mut pointer, &segment);
         }
-        pointer.truncate(len);
-    }
+        out.insert(pointer);
+    });
 }
 
 /// Pointers of every visible predicate value (`TRIGGER_VISIBLE_PREDICATES`)
@@ -808,7 +783,9 @@ fn collect_trigger_visible_subtrees(trigger: &Value, out: &mut Vec<String>) {
                 ("not", child) => walk(child, pointer, out),
                 ("match", Value::Object(leaf)) => {
                     for key in leaf.keys() {
-                        if TRIGGER_VISIBLE_PREDICATES.contains(&key.as_str()) {
+                        if crate::secrets::plugin_trigger::TRIGGER_VISIBLE_PREDICATES
+                            .contains(&key.as_str())
+                        {
                             let leaf_len = pointer.len();
                             push_pointer_segment(pointer, key);
                             out.push(pointer.clone());
@@ -824,109 +801,6 @@ fn collect_trigger_visible_subtrees(trigger: &Value, out: &mut Vec<String>) {
     if let Some(when) = trigger.get("when") {
         let mut pointer = String::from("/trigger/when");
         walk(when, &mut pointer, out);
-    }
-}
-
-/// A site Edge withholds as a whole (it leaves `null` alone).
-fn withheld_site(value: &Value, pointer: &str, out: &mut BTreeSet<String>) {
-    if !value.is_null() {
-        out.insert(pointer.to_string());
-    }
-}
-
-fn trigger_node_sites(node: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
-    let Some(map) = node.as_object() else {
-        withheld_site(node, pointer, out);
-        return;
-    };
-    for (key, child) in map {
-        let len = pointer.len();
-        push_pointer_segment(pointer, key);
-        match (key.as_str(), child) {
-            ("all" | "any", Value::Array(items)) => {
-                for (index, item) in items.iter().enumerate() {
-                    let item_len = pointer.len();
-                    push_pointer_segment(pointer, &index.to_string());
-                    trigger_node_sites(item, pointer, out);
-                    pointer.truncate(item_len);
-                }
-            }
-            ("not", child) => trigger_node_sites(child, pointer, out),
-            ("match", child) => trigger_leaf_sites(child, pointer, out),
-            (_, child) => withheld_site(child, pointer, out),
-        }
-        pointer.truncate(len);
-    }
-}
-
-fn trigger_leaf_sites(leaf: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
-    let Some(map) = leaf.as_object() else {
-        withheld_site(leaf, pointer, out);
-        return;
-    };
-    for (key, predicate) in map {
-        if TRIGGER_VISIBLE_PREDICATES.contains(&key.as_str()) {
-            continue;
-        }
-        let len = pointer.len();
-        push_pointer_segment(pointer, key);
-        if TRIGGER_CLIENT_FIELD_PREDICATES.contains(&key.as_str()) {
-            trigger_field_predicate_sites(predicate, pointer, out);
-        } else {
-            withheld_site(predicate, pointer, out);
-        }
-        pointer.truncate(len);
-    }
-}
-
-fn trigger_field_predicate_sites(
-    predicate: &Value,
-    pointer: &mut String,
-    out: &mut BTreeSet<String>,
-) {
-    let Some(map) = predicate.as_object() else {
-        withheld_site(predicate, pointer, out);
-        return;
-    };
-    for (key, child) in map {
-        if matches!(key.as_str(), "name" | "presence" | "multi_value") {
-            continue;
-        }
-        let len = pointer.len();
-        push_pointer_segment(pointer, key);
-        if key == "value" {
-            trigger_operand_sites(child, pointer, out);
-        } else {
-            withheld_site(child, pointer, out);
-        }
-        pointer.truncate(len);
-    }
-}
-
-/// A trigger string match: every operand except a boolean `case_insensitive`
-/// flag, entry by entry for the `exact` / `prefix` lists.
-fn trigger_operand_sites(value: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
-    let Some(map) = value.as_object() else {
-        withheld_site(value, pointer, out);
-        return;
-    };
-    for (key, operand) in map {
-        if key == "case_insensitive" && operand.is_boolean() {
-            continue;
-        }
-        let len = pointer.len();
-        push_pointer_segment(pointer, key);
-        if let Value::Array(items) = operand {
-            for (index, item) in items.iter().enumerate() {
-                let item_len = pointer.len();
-                push_pointer_segment(pointer, &index.to_string());
-                withheld_site(item, pointer, out);
-                pointer.truncate(item_len);
-            }
-        } else {
-            withheld_site(operand, pointer, out);
-        }
-        pointer.truncate(len);
     }
 }
 

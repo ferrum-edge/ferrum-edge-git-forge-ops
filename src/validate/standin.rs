@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::config::GatewayConfig;
 use crate::secrets::parse_placeholder;
 use crate::secrets::plugin_config::{ConfigPathComponent, EndpointForm};
+use crate::secrets::plugin_trigger;
 use crate::secrets::resolver::{consumer_credential_slot, ResolveReport, SlotStatus};
 use crate::validate::client_key_standin::{client_assertion_key_pem, ClientKeyFamily};
 
@@ -148,7 +149,7 @@ fn slot_digest(slot: &str) -> String {
 /// overwhelmingly common bundle-loaded case, which then validates the config
 /// as-is with no clone).
 ///
-/// Two sources covered by the stand-in contract (modeled service-discovery
+/// Three sources covered by the stand-in contract (modeled service-discovery
 /// fields remain byte-for-byte unchanged):
 ///
 /// * **`Consumer.credentials`** — shape-checked by ferrum-edge (the
@@ -168,6 +169,9 @@ fn slot_digest(slot: &str) -> String {
 ///   regional Lambda origin. Header maps are
 ///   rewritten value-side only, so `headers.x-honeycomb-team` keeps its key
 ///   and a plugin that validates required header *names* still sees them.
+/// * **`PluginConfig.trigger`** — a brokered `header` / `query` / `cookie`
+///   operand gets the opaque token form, which is also a valid literal
+///   `regex`.
 ///
 /// Nothing outside the 0600 temp spec handed to `ferrum-edge validate` ever
 /// sees the result: the caller's `config` is untouched, and export, apply,
@@ -209,10 +213,13 @@ pub(crate) fn with_validation_standins_for_report(
         .consumers
         .iter()
         .any(|consumer| consumer.credentials.values().any(has_placeholder));
-    let plugin_config_brokered = config
-        .plugin_configs
-        .iter()
-        .any(|plugin| has_placeholder(&plugin.config));
+    let plugin_config_brokered = config.plugin_configs.iter().any(|plugin| {
+        has_placeholder(&plugin.config)
+            || plugin
+                .trigger
+                .as_ref()
+                .is_some_and(|trigger| has_placeholder(&plugin_trigger::trigger_json(trigger)))
+    });
     if !credentials_brokered && !plugin_config_brokered {
         return None;
     }
@@ -267,9 +274,62 @@ pub(crate) fn with_validation_standins_for_report(
         let mut config = std::mem::take(&mut plugin.config);
         changed |= context.substitute(&mut config, &mut Vec::new(), &eligible);
         plugin.config = config;
+        changed |= substitute_trigger_operands(plugin, &eligible);
     }
 
     changed.then_some(patched)
+}
+
+/// Replace each eligible brokered `trigger` operand
+/// ([`crate::secrets::plugin_trigger`]) with the opaque [`validation_standin`]
+/// of its trigger slot. That one form fits every operator Edge's trigger
+/// admission checks: a non-empty `exact` / `prefix` entry under its
+/// 1024-byte cap, and a `regex` under its 512-byte cap that compiles, since
+/// the stand-in is lowercase letters, digits and `-` only, all literals.
+/// Placeholder text would fail the regex check outright (`${` is not a valid
+/// pattern), a verdict on the brokering rather than on the trigger.
+fn substitute_trigger_operands(
+    plugin: &mut crate::config::schema::PluginConfig,
+    eligible: &impl Fn(&str) -> bool,
+) -> bool {
+    let Some(trigger) = plugin.trigger.as_ref() else {
+        return false;
+    };
+    let mut json = plugin_trigger::trigger_json(trigger);
+    let operands: Vec<Vec<ConfigPathComponent>> = plugin_trigger::trigger_operand_strings(&json)
+        .into_iter()
+        .filter(|(_, text)| matches!(parse_placeholder(text), Some(Ok(_))))
+        .map(|(path, _)| path)
+        .collect();
+    let mut changed = false;
+    for path in operands {
+        let slot = crate::secrets::resolver::plugin_trigger_slot(
+            &plugin.namespace,
+            &plugin.id,
+            &plugin.plugin_name,
+            &path,
+        );
+        if !eligible(&slot) {
+            continue;
+        }
+        if let Some(leaf) = plugin_trigger::trigger_value_mut(&mut json, &path) {
+            *leaf = serde_json::Value::String(validation_standin(&slot, None));
+            changed = true;
+        }
+    }
+    if !changed {
+        return false;
+    }
+    // Replacing one string with another never changes the trigger's shape, so
+    // this cannot fail; if it somehow did, the validator would see the
+    // placeholder and report it rather than a stand-in being lost silently.
+    match plugin_trigger::trigger_from_json(plugin, json) {
+        Ok(trigger) => {
+            plugin.trigger = Some(trigger);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// `serverless_function`'s Lambda endpoint override.

@@ -1131,8 +1131,8 @@ pub fn build_review_comment_with_preview(
         md.push_str("### Credential Slot Remaps\n\n");
         md.push_str(
             "A Consumer credential or plugin-config array changed shape in a way that reassigns \
-             a stored broker slot, a retired Consumer's slot is still in the credential bundle, \
-             or a PluginConfig changed `plugin_name` (or still has retired type-less \
+             a stored broker slot, a retired Consumer's or plugin trigger operand's slot is still \
+             in the credential bundle, or a PluginConfig changed `plugin_name` (or still has retired type-less \
              `@plugin-config` keys). Slot identity is the entry's array index under the Consumer \
              id, so the entry that shifted into a vacated index, or a Consumer that reuses a \
              retired id, inherits a credential that was meant to be retired. A plugin type change \
@@ -1151,8 +1151,8 @@ pub fn build_review_comment_with_preview(
             "> **Apply is blocked.** Rotation replaces the value and sends it at its current slot \
              but does not remove the bundle key. Before shrinking or shifting a Consumer array, move \
              surviving rotated values to their new canonical slots in the private bundle and \
-             remove vacated keys, preserving unrelated entries. Reseed plugin-config slots and \
-             retire orphaned keys from the bundle, or re-run with `--allow-credential-slot-remap` \
+             remove vacated keys, preserving unrelated entries. Reseed plugin-config and trigger \
+             slots and retire orphaned keys from the bundle, or re-run with `--allow-credential-slot-remap` \
              to accept the reassignment.\n\n"
         });
     }

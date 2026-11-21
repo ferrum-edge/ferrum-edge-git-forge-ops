@@ -184,7 +184,8 @@ resources/<ns>/{proxies,consumers,upstreams,plugins,mesh}/*.yaml
                               attachments after namespace inference)
   → secrets::resolve_secrets  ${gh-env-secret:...} → values, in memory only, from
                               FERRUM_CREDS_JSON_FILE or FERRUM_CREDS_JSON; covers
-                              consumer credentials, plugin config and modeled
+                              consumer credentials, plugin config, plugin
+                              trigger operands and modeled
                               Upstream.service_discovery secrets; never written
                               back to disk
   → policy::evaluate_policies
@@ -237,7 +238,7 @@ for an ambient-credential Lambda `aws_endpoint_url`. Reason:
 - Substitution happens on a **copy**, written only to the 0600 temp spec. No
   stand-in is ever exported, applied, delivered or written to state.
 - On resolved snapshots, only slots the `ResolveReport` marks unresolved (canonical
-  consumer and plugin slots) get stand-ins. Resolved or unreported values stay
+  consumer, plugin config and plugin trigger slots) get stand-ins. Resolved or unreported values stay
   byte-for-byte, even with placeholder syntax. Consumer paths share the
   resolver's escaping and index-zero elision.
 - The report-free API and file apply keep syntax-based stand-ins for unresolved
@@ -245,8 +246,9 @@ for an ambient-credential Lambda `aws_endpoint_url`. Reason:
 
 **Scrubbing** (`secrets::SecretScrubber`). It collects every non-placeholder
 Consumer credential leaf (minus literal identities), every
-`sensitive_string_paths` plugin-config leaf, modeled service-discovery secrets,
-and — when paired with a `ResolveReport` — the value at every resolved slot,
+`sensitive_string_paths` plugin-config leaf, every non-empty plugin trigger
+`header`/`query`/`cookie` operand, modeled service-discovery secrets, and —
+when paired with a `ResolveReport` — the value at every resolved slot,
 even if it looks like a placeholder or has a nonsensitive field name. Those
 bytes and their single-line re-encodings (base64, percent, JSON-escape,
 single-quoted YAML) become `[REDACTED]` in the child's stdout/stderr;
@@ -638,7 +640,8 @@ Resolved-secret and sibling drift stay visible. Masking uses canonical slots
 from the resolution report, not value syntax, so seeded secrets that look like
 placeholders remain comparable. Modeled service-discovery diff values are
 redacted even when they look like placeholders. The same rule covers plugin
-config and service-discovery secrets in `diff`, `plan` and `review`. Missing
+config, plugin trigger and service-discovery secrets in `diff`, `plan` and
+`review`. Missing
 required values still block apply. Review markdown is bounded below GitHub's
 API limit.
 
@@ -1666,7 +1669,8 @@ generation agree:
   repository-known, low-entropy, and kept readable by the scrubber. Every
   Consumer lookup goes through it: validate, plan, diff, review, apply,
   `export --materialize`, and rotate's sibling resolve and publisher.
-  Plugin-config and service-discovery slots keep provenance semantics.
+  Plugin trigger operands get the same refusal; plugin-config and
+  service-discovery slots keep provenance semantics.
 - The allocator validates the whole candidate batch before GitHub key discovery,
   including direct callers and lenient reports. Structural types must match the
   slot. Non-generatable discovery secrets (`SD_SECRET_FIELDS`) and public
@@ -1741,7 +1745,7 @@ consequences by evidence:
 - **Plugin type change**: `PluginWalk::check_type_slot_identity` runs for
   every declared plugin in both walks. A bundle key under the same `ns/id`
   with another `@plugin/<type>/…`, anything under its own type outside
-  `config`, or the retired type-less `@plugin-config/…` kind is a remap. The
+  `config` and `trigger`, or the retired type-less `@plugin-config/…` kind is a remap. The
   value is never resolved even when accepted. Remedy: seed the new type's
   slots, remove the old keys.
 
@@ -1764,7 +1768,7 @@ literal.
 
 #### Secrets outside `Consumer.credentials`
 
-Two more places hold brokered secrets, each with a reserved slot kind (the `@`
+Three more places hold brokered secrets under a reserved slot kind (the `@`
 prefix keeps them out of the credential-type keyspace):
 
 - `PluginConfig.config` → `<ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>`,
@@ -1773,6 +1777,20 @@ prefix keeps them out of the credential-type keyspace):
   both walks, diff masking, stand-ins and scrubbing), so a retyped plugin
   never resolves the old type's values. Never add the retired type-less
   `@plugin-config/config/…` form to any lookup.
+- `PluginConfig.trigger` `header`/`query`/`cookie` `value` operands →
+  `<ns>/<plugin-id>/@plugin/<plugin_name>/trigger/<path>` (`<path>` from
+  `when`, every index kept; `resolver::plugin_trigger_slot`). One walk,
+  `src/secrets/plugin_trigger.rs::visit_trigger_sites`, mirrors Edge's
+  `project_plugin_trigger_with` for every boundary and for export site
+  prediction. Like Edge, every non-empty operand is a secret at any length
+  (import, literal gate, resolution, diff redaction by position, validator
+  stream withholding); only substring replacement and live display admission
+  keep the 8-byte floor, and a bundle value under 8 bytes or one that is
+  placeholder text is refused. A stored trigger slot whose
+  operand path is gone is a remap (`check_trigger_slot_retirement`,
+  structural so `apply`'s post-allocation re-resolve agrees). Other
+  predicates and field names stay literal; broker syntax there is refused at
+  load and import (`validate_trigger_placeholders`).
 - `Upstream.service_discovery` → `<ns>/<upstream-id>/@service-discovery/<path>`
   (e.g. `ferrum/orders/@service-discovery/consul/token`). Modeled secret leaves
   live in one table, `src/secrets/service_discovery.rs::SD_SECRET_FIELDS`, read

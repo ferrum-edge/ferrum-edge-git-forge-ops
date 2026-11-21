@@ -282,9 +282,12 @@ pub(crate) fn resource_from_json_value(
         "Upstream" => Ok(Resource::Upstream {
             spec: deserialize_gateway_spec(spec, source_path, options)?,
         }),
-        "PluginConfig" => Ok(Resource::PluginConfig {
-            spec: deserialize_gateway_spec(spec, source_path, options)?,
-        }),
+        "PluginConfig" => {
+            check_plugin_trigger_shape(&spec, source_path)?;
+            Ok(Resource::PluginConfig {
+                spec: deserialize_gateway_spec(spec, source_path, options)?,
+            })
+        }
         "MeshConfig" => {
             let id = match object.get("id") {
                 None | Some(serde_json::Value::Null) => None,
@@ -355,6 +358,210 @@ fn check_passthrough_fields(
         safe_line(fields.join(", ")),
     );
     Ok(())
+}
+
+/// Decode a PluginConfig's `trigger` on its own first, so a malformed one is
+/// reported without any of its input.
+///
+/// serde's type errors quote the offending scalar (`invalid type: string
+/// "...", expected a sequence`), and a `header` / `query` / `cookie` operand
+/// is a secret ([`crate::secrets::plugin_trigger`]) whatever shape it was
+/// mistakenly written in. This runs before the generic resource decode, whose
+/// error would otherwise print it ahead of every redaction boundary. The
+/// message is built from the trigger schema alone ([`trigger_shape_error`]):
+/// the first structural path whose JSON type is wrong and the shape expected
+/// there, never text taken from the decoder's error or the input. Unknown keys
+/// inside the trigger are still reported by the strict decode, by path only.
+fn check_plugin_trigger_shape(
+    spec: &serde_json::Value,
+    source_path: &Path,
+) -> crate::error::Result<()> {
+    /// The `PluginConfig.trigger` field alone, with its object-only decoder.
+    #[derive(serde::Deserialize)]
+    struct TriggerField {
+        #[serde(
+            default,
+            deserialize_with = "crate::config::json_object::deserialize_optional_object"
+        )]
+        #[allow(dead_code)]
+        trigger: Option<crate::config::schema::PluginTrigger>,
+    }
+    let Some(trigger) = spec.get("trigger").filter(|trigger| !trigger.is_null()) else {
+        return Ok(());
+    };
+    let field = serde_json::json!({ "trigger": trigger });
+    if serde_json::from_value::<TriggerField>(field).is_ok() {
+        return Ok(());
+    }
+    let (path, expected) = trigger_shape_error(trigger).unwrap_or_else(|| {
+        (
+            String::new(),
+            "a valid trigger: a required field such as `when` or a field `name` may be \
+             missing, or an enum value (`presence`, `multi_value`, `protocol`) or a port \
+             is out of range"
+                .to_string(),
+        )
+    });
+    Err(crate::error::Error::Config(format!(
+        "invalid resource spec in {}: `.spec.trigger{path}` must be {expected} (the input \
+         value is withheld because a trigger operand is a secret)",
+        source_path.display()
+    )))
+}
+
+/// The first path (relative to `.spec.trigger`, in the strict loader's
+/// `.key[index]` spelling) whose JSON type does not fit the trigger schema,
+/// and the shape expected there. Built from JSON types only; returns `None`
+/// when every type fits (the failure is then a missing field or a value
+/// range, reported generically).
+fn trigger_shape_error(trigger: &serde_json::Value) -> Option<(String, String)> {
+    use serde_json::Value;
+
+    const OBJECT: &str = "a JSON object";
+
+    fn push_key(path: &str, key: &str) -> String {
+        format!("{path}.{key}")
+    }
+
+    fn object<'a>(
+        value: &'a Value,
+        path: &str,
+        what: &str,
+    ) -> Result<&'a serde_json::Map<String, Value>, (String, String)> {
+        value
+            .as_object()
+            .ok_or_else(|| (path.to_string(), format!("{OBJECT} ({what})")))
+    }
+
+    fn strings(value: &Value, path: &str) -> Result<(), (String, String)> {
+        let items = value
+            .as_array()
+            .ok_or_else(|| (path.to_string(), "a list of strings".to_string()))?;
+        for (index, item) in items.iter().enumerate() {
+            if !item.is_string() {
+                return Err((format!("{path}[{index}]"), "a string".to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    fn string_match(value: &Value, path: &str) -> Result<(), (String, String)> {
+        let map = object(
+            value,
+            path,
+            "with an `exact` or `prefix` list of strings, or a `regex` string",
+        )?;
+        for (key, child) in map {
+            let at = push_key(path, key);
+            match key.as_str() {
+                _ if child.is_null() => {}
+                "exact" | "prefix" => strings(child, &at)?,
+                "regex" if !child.is_string() => return Err((at, "a string".to_string())),
+                "case_insensitive" if !child.is_boolean() => {
+                    return Err((at, "a boolean".to_string()))
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn scalar_string(child: &Value, at: String) -> Result<(), (String, String)> {
+        if child.is_null() || child.is_string() {
+            Ok(())
+        } else {
+            Err((at, "a string".to_string()))
+        }
+    }
+
+    fn field_match(value: &Value, path: &str, identity: bool) -> Result<(), (String, String)> {
+        let what = if identity {
+            "an identity match with optional `presence` and `value`"
+        } else {
+            "a field match with `name` and optional `presence`, `value`, `multi_value`"
+        };
+        let map = object(value, path, what)?;
+        for (key, child) in map {
+            let at = push_key(path, key);
+            match key.as_str() {
+                "value" if !child.is_null() => string_match(child, &at)?,
+                "name" | "presence" | "multi_value" => scalar_string(child, at)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn leaf(value: &Value, path: &str) -> Result<(), (String, String)> {
+        let map = object(value, path, "a `match` leaf")?;
+        for (key, child) in map {
+            if child.is_null() {
+                continue;
+            }
+            let at = push_key(path, key);
+            match key.as_str() {
+                "method"
+                | "protocol"
+                | "source_cidr"
+                | "namespace"
+                | "proxy_id"
+                | "auth_method"
+                | "external_identity_authority" => strings(child, &at)?,
+                "listen_port" => {
+                    let items = child
+                        .as_array()
+                        .ok_or_else(|| (at.clone(), "a list of port numbers".to_string()))?;
+                    for (index, item) in items.iter().enumerate() {
+                        if !item.is_u64() {
+                            return Err((format!("{at}[{index}]"), "a port number".to_string()));
+                        }
+                    }
+                }
+                "path" | "host" | "sni" => string_match(child, &at)?,
+                "header" | "query" | "cookie" => field_match(child, &at, false)?,
+                "consumer" | "spiffe_id" | "external_identity" => field_match(child, &at, true)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn node(value: &Value, path: &str) -> Result<(), (String, String)> {
+        let map = object(
+            value,
+            path,
+            "a trigger node with `all`, `any`, `not` or `match`",
+        )?;
+        for (key, child) in map {
+            if child.is_null() {
+                continue;
+            }
+            let at = push_key(path, key);
+            match key.as_str() {
+                "all" | "any" => {
+                    let items = child
+                        .as_array()
+                        .ok_or_else(|| (at.clone(), "a list of JSON objects".to_string()))?;
+                    for (index, item) in items.iter().enumerate() {
+                        node(item, &format!("{at}[{index}]"))?;
+                    }
+                }
+                "not" => node(child, &at)?,
+                "match" => leaf(child, &at)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    let check = || -> Result<(), (String, String)> {
+        let map = object(trigger, "", "with `when`")?;
+        match map.get("when") {
+            Some(when) => node(when, ".when"),
+            None => Ok(()),
+        }
+    };
+    check().err()
 }
 
 fn deserialize_spec<T: DeserializeOwned>(
