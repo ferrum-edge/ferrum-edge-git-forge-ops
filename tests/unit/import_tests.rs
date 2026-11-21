@@ -3235,3 +3235,105 @@ fn import_refuses_a_rendered_resource_over_the_loader_size_cap() {
         2
     );
 }
+
+/// `external_identity` / `external_identity_authority` (Edge after v0.9.20)
+/// are modeled `PluginTriggerMatch` predicates: a backup carrying them is not
+/// an unmodeled nested field, imports with no acknowledgement flag, and the
+/// written tree loads under the strict loader.
+#[test]
+fn import_accepts_external_identity_trigger_predicates_without_acknowledgement() {
+    let authority = "ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
+    let backup = serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "partner-limit",
+            "plugin_name": "rate_limiting",
+            "namespace": "ferrum",
+            "scope": "global",
+            "config": {},
+            "trigger": {"when": {"all": [
+                {"match": {"external_identity": {
+                    "presence": "present",
+                    "value": {"prefix": ["partner-"]}
+                }}},
+                {"match": {"external_identity_authority": [authority]}}
+            ]}}
+        }]
+    });
+    assert!(unmodeled_paths(&backup).is_empty());
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.json");
+    std::fs::write(&backup_path, backup.to_string()).unwrap();
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        None,
+        &strict_passthrough(),
+        &[],
+    )
+    .expect("import needs no acknowledgement for modeled trigger predicates");
+
+    let resources = gitforgeops::config::load_resources(&output)
+        .expect("imported tree loads under the strict loader");
+    let assembled = gitforgeops::config::assemble(resources).unwrap();
+    let plugin = &assembled.gateway.plugin_configs[0];
+    assert!(plugin.extra.is_empty(), "{:?}", plugin.extra);
+    let all = plugin
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.when.all.as_ref())
+        .expect("all branch");
+    let identity = all[0]
+        .match_
+        .as_ref()
+        .and_then(|leaf| leaf.external_identity.as_ref())
+        .expect("external_identity imported");
+    assert_eq!(
+        identity
+            .value
+            .as_ref()
+            .and_then(|value| value.prefix.clone()),
+        Some(vec!["partner-".to_string()])
+    );
+    assert_eq!(
+        all[1]
+            .match_
+            .as_ref()
+            .and_then(|leaf| leaf.external_identity_authority.clone()),
+        Some(vec![authority.to_string()])
+    );
+}
+
+/// The object-only trigger slots hand their map to the struct's own
+/// deserializer, so a nested unknown inside one is still recorded (with its
+/// full path) rather than silently dropped.
+#[test]
+fn backup_decode_records_unknown_keys_inside_identity_trigger_predicates() {
+    let backup = serde_json::json!({
+        "version": "1",
+        "plugin_configs": [{
+            "id": "partner",
+            "plugin_name": "rate_limiting",
+            "namespace": "ferrum",
+            "scope": "global",
+            "config": {},
+            "trigger": {"when": {"all": [
+                {"match": {"external_identity": {"future_identity_option": 1}}},
+                {"match": {"consumer": {"value": {"exact": ["a"], "future_operand": 2}}}}
+            ]}}
+        }]
+    });
+    assert_eq!(
+        unmodeled_paths(&backup),
+        [
+            "PluginConfig ferrum/partner .spec.trigger.when.all[0].match.external_identity.future_identity_option",
+            "PluginConfig ferrum/partner .spec.trigger.when.all[1].match.consumer.value.future_operand",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+    );
+}

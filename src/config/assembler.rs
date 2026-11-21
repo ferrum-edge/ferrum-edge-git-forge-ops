@@ -258,6 +258,7 @@ pub fn merge_mesh_fragments(
             telemetry_resources,
             destination_rules,
             virtual_service_cors_policies,
+            virtual_service_http_routes,
             proxy_configs,
             sidecars,
             waypoint_bindings,
@@ -298,6 +299,9 @@ pub fn merge_mesh_fragments(
         merged
             .virtual_service_cors_policies
             .extend(virtual_service_cors_policies);
+        merged
+            .virtual_service_http_routes
+            .extend(virtual_service_http_routes);
         merged.proxy_configs.extend(proxy_configs);
         merged.sidecars.extend(sidecars);
         merged.waypoint_bindings.extend(waypoint_bindings);

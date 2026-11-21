@@ -70,6 +70,11 @@ spec:
     - name: checkout-cors
       namespace: ferrum
       allow_origins: ["https://app.example.test"]
+  virtual_service_http_routes:
+    - name: checkout-routes
+      namespace: ferrum
+      export_to: ["*"]
+      proxy_ids: ["istio-vs-checkout-routes-0"]
   proxy_configs:
     - name: default-proxy-config
       namespace: istio-system

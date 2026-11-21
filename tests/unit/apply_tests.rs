@@ -6479,3 +6479,76 @@ async fn full_replace_registers_the_secrets_of_preserved_live_rows() {
         "convergence: mode=database (echo [REDACTED])"
     );
 }
+
+/// A live PluginConfig whose trigger uses Edge's `external_identity` /
+/// `external_identity_authority` predicates decodes with no unmodeled nested
+/// field, so apply rewrites it (carrying both predicates) instead of refusing
+/// the namespace.
+#[tokio::test]
+async fn incremental_apply_rewrites_a_row_with_external_identity_trigger_predicates() {
+    let trigger = serde_json::json!({"when": {"all": [
+        {"match": {"external_identity": {
+            "presence": "present",
+            "value": {"exact": ["partner-service"]}
+        }}},
+        {"match": {"external_identity_authority": [
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ]}}
+    ]}});
+    let row = serde_json::json!({
+        "id": "partner-limit",
+        "namespace": "team-alpha",
+        "plugin_name": "rate_limiting",
+        "config": {},
+        "scope": "global",
+        "enabled": true,
+        "trigger": trigger,
+    });
+    let (live, extras) = decoded_live(
+        "team-alpha",
+        serde_json::json!({"version": "1", "plugin_configs": [row]}),
+    );
+    assert!(
+        extras.unmodeled_nested_fields.is_empty(),
+        "{:?}",
+        extras.unmodeled_nested_fields
+    );
+
+    let mut desired = live.clone();
+    desired.plugin_configs[0].enabled = false;
+
+    let mut routes = vec![
+        ("GET /health".into(), 200, HEALTHY.into(), vec![]),
+        (
+            "PUT /plugins/config/partner-limit".into(),
+            200,
+            "{}".into(),
+            vec![],
+        ),
+    ];
+    routes.extend(tagged_rows(&live));
+    let (url, requests) = spawn_recording_gateway(routes);
+    let result = apply_api(
+        &desired,
+        &stub_client(url),
+        &["team-alpha".to_string()],
+        OwnershipScope::Exclusive,
+        Some(&BTreeMap::from([("team-alpha".to_string(), live)])),
+        Some(&BTreeMap::from([("team-alpha".to_string(), extras)])),
+        &ApplyOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.updated, 1);
+    let requests = requests.lock().unwrap();
+    let put = requests
+        .iter()
+        .find(|request| request.starts_with("PUT /plugins/config/partner-limit"))
+        .expect("plugin rewrite");
+    let body: serde_json::Value =
+        serde_json::from_str(put.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["trigger"], trigger);
+    assert_eq!(body["enabled"], false);
+}
