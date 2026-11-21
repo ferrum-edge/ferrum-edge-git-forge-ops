@@ -1169,7 +1169,7 @@ fn collect_heuristic_paths(
                 collect_heuristic_paths(child, &next, found, builtin);
             }
         }
-        Value::String(text) if url_has_userinfo(text) => {
+        Value::String(text) if super::url_userinfo::url_has_userinfo(text) => {
             found.insert(current.to_vec());
         }
         _ => {}
@@ -1236,16 +1236,6 @@ fn is_header_container(key: &str) -> bool {
         normalize_key(key).as_str(),
         "headers" | "customheaders" | "staticheaders" | "requestheaders"
     )
-}
-
-fn url_has_userinfo(value: &str) -> bool {
-    let Some((_, remainder)) = value.split_once("://") else {
-        return false;
-    };
-    remainder
-        .split(['/', '?', '#'])
-        .next()
-        .is_some_and(|authority| authority.contains('@'))
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@
 //! Adding a provider secret is one entry here plus its accessor arm in
 //! [`secret_leaf`] / [`secret_leaf_mut`]; nothing else changes.
 
+use super::url_userinfo::split_url_userinfo;
 use crate::config::schema::{ServiceDiscoveryConfig, Upstream};
 
 /// Reserved third slot component for brokered service-discovery strings.
@@ -122,46 +123,6 @@ pub(crate) fn redact_url_userinfo(text: &str) -> Option<String> {
         Some(scheme) => format!("{scheme}://{redacted}"),
         None => redacted,
     })
-}
-
-struct UrlUserinfo {
-    scheme: Option<String>,
-    userinfo: String,
-    after: String,
-}
-
-/// Find a URL's userinfo the way a lenient (WHATWG-style) parser would, and
-/// err towards finding one: surrounding whitespace and control characters
-/// and embedded tabs and newlines are ignored, any number of `/` or `\`
-/// may follow the scheme (`https:///u:p@h`, `https:u:p@h`), and an `@`
-/// anywhere before the first `/`, `\`, `?` or `#` counts, with or without a
-/// scheme.
-fn split_url_userinfo(text: &str) -> Option<UrlUserinfo> {
-    let cleaned: String = text
-        .trim_matches(|c: char| c <= ' ')
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect();
-    let (scheme, rest) = match cleaned.find(':') {
-        Some(colon) if is_url_scheme(&cleaned[..colon]) => {
-            (Some(cleaned[..colon].to_string()), &cleaned[colon + 1..])
-        }
-        _ => (None, cleaned.as_str()),
-    };
-    let rest = rest.trim_start_matches(['/', '\\']);
-    let authority_end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
-    let at = rest[..authority_end].rfind('@')?;
-    Some(UrlUserinfo {
-        scheme,
-        userinfo: rest[..at].to_string(),
-        after: rest[at + 1..].to_string(),
-    })
-}
-
-fn is_url_scheme(candidate: &str) -> bool {
-    let mut characters = candidate.chars();
-    characters.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Every modeled secret leaf that this upstream actually carries a value for.

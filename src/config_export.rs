@@ -912,7 +912,9 @@ fn trigger_operand_sites(value: &Value, pointer: &mut String, out: &mut BTreeSet
 fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
     match value {
         Value::String(text) => {
-            if crate::secrets::parse_placeholder(text).is_some() || has_url_userinfo(text) {
+            if crate::secrets::parse_placeholder(text).is_some()
+                || crate::secrets::url_userinfo::url_has_userinfo(text)
+            {
                 out.insert(pointer.clone());
             }
         }
@@ -934,15 +936,6 @@ fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet
         }
         _ => {}
     }
-}
-
-/// True for `scheme://user[:password]@host…`.
-fn has_url_userinfo(value: &str) -> bool {
-    let Some((_, rest)) = value.split_once("://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    authority.contains('@')
 }
 
 /// Append one RFC 6901 reference token.

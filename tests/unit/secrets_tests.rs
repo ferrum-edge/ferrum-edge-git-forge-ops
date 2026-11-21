@@ -987,6 +987,146 @@ fn opa_host_stays_a_literal_endpoint() {
     assert!(security_blockers(&audit_security(&original)).is_empty());
 }
 
+/// URL userinfo spellings Ferrum Edge's WHATWG parser reads as credentials.
+const WHATWG_USERINFO_URLS: [&str; 7] = [
+    "https:///svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https:/\\svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https:\t//svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https://svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181\\v1",
+    "https:\r\n//svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "ht\ntps://svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    " \u{1}https://svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+];
+
+/// The same spellings without userinfo.
+const WHATWG_CREDENTIAL_FREE_URLS: [&str; 6] = [
+    "https:///opa.internal:8181/v1",
+    "https:/\\opa.internal:8181/v1",
+    "https:\t//opa.internal:8181/v1",
+    "https://opa.internal:8181\\v1",
+    "https:\r\n//opa.internal:8181/v1",
+    " \u{1}https://opa.internal:8181/v1",
+];
+
+/// `(plugin_name, config, dotted path)` with `url` at a field only the URL
+/// userinfo heuristic can flag: the builtin `opa` `opa_host` and a custom
+/// plugin's endpoint.
+fn url_heuristic_plugins(url: &str) -> [(&'static str, serde_json::Value, &'static str); 2] {
+    [
+        (
+            "opa",
+            serde_json::json!({"opa_host": url, "policy_path": "authz/allow"}),
+            "opa_host",
+        ),
+        (
+            "acme_widget",
+            serde_json::json!({"upstream": {"endpoint_url": url}}),
+            "upstream.endpoint_url",
+        ),
+    ]
+}
+
+/// GHSA-m3hr-pvjr-278c: URL userinfo in a spelling only a WHATWG parser
+/// accepts is still caught by import, the literal-secret gate and the
+/// diagnostic scrubber.
+#[test]
+fn whatwg_url_userinfo_in_plugin_config_is_captured_gated_and_scrubbed() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for url in WHATWG_USERINFO_URLS {
+        for (plugin_name, config, path) in url_heuristic_plugins(url) {
+            let original = single_plugin_gateway(plugin_name, config);
+
+            let mut gateway = original.clone();
+            let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+            let unbrokered: Vec<&str> = capture
+                .unbrokered
+                .iter()
+                .flat_map(|plugin| plugin.paths.iter().map(String::as_str))
+                .collect();
+            if plugin_name == "opa" {
+                // A builtin heuristic match needs an explicit plaintext allowance.
+                assert!(capture.captured.is_empty(), "{url:?}");
+                assert_eq!(unbrokered, [path], "{url:?}");
+            } else {
+                // A custom plugin's heuristic match is brokered outright.
+                let slots: Vec<&str> = capture.captured.keys().map(String::as_str).collect();
+                assert_eq!(
+                    slots,
+                    [format!(
+                        "ferrum/builtin/@plugin/{plugin_name}/config/upstream/endpoint_url"
+                    )],
+                    "{url:?}"
+                );
+                assert!(!unbrokered.contains(&path), "{url:?}");
+                let written = gateway.plugin_configs[0].config.to_string();
+                assert!(!written.contains("SYNTHETIC-URL-PASSWORD"), "{written}");
+            }
+
+            let findings = audit_security(&original);
+            assert!(
+                security_blockers(&findings).iter().any(|finding| finding
+                    .message
+                    .contains("Literal plugin-config secret")
+                    && finding.message.contains(path)),
+                "{plugin_name} {url:?}: {findings:?}"
+            );
+            for finding in &findings {
+                assert!(!finding.message.contains("SYNTHETIC-URL-PASSWORD"));
+            }
+
+            let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
+            let scrubbed = scrubber.scrub(&format!("validator: {url} unreachable"));
+            assert!(
+                !scrubbed.contains("SYNTHETIC-URL-PASSWORD"),
+                "{plugin_name}: {scrubbed:?}"
+            );
+        }
+    }
+
+    // The same spellings without userinfo stay ordinary settings.
+    for url in WHATWG_CREDENTIAL_FREE_URLS {
+        for (plugin_name, config, path) in url_heuristic_plugins(url) {
+            let original = single_plugin_gateway(plugin_name, config);
+            let mut gateway = original.clone();
+            let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+            assert!(capture.captured.is_empty(), "{plugin_name} {url:?}");
+            assert_eq!(
+                gateway.plugin_configs[0].config, original.plugin_configs[0].config,
+                "{plugin_name} {url:?}"
+            );
+            let findings = audit_security(&original);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|finding| finding.message.contains(path)),
+                "{plugin_name} {url:?}: {findings:?}"
+            );
+            let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&original);
+            let line = format!("validator: {url} unreachable");
+            assert_eq!(scrubber.scrub(&line), line, "{plugin_name} {url:?}");
+        }
+    }
+}
+
+/// An email address is not URL userinfo: a plugin setting that holds one is
+/// neither brokered nor gated.
+#[test]
+fn an_email_address_in_plugin_config_is_not_url_userinfo() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    for value in ["ops@example.com", "mailto:ops@example.com"] {
+        let original = single_plugin_gateway("opa", serde_json::json!({"contact": value}));
+        let mut gateway = original.clone();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut gateway).unwrap();
+        assert!(capture.captured.is_empty(), "{value}");
+        assert!(capture.unbrokered.is_empty(), "{value}");
+        assert!(security_blockers(&audit_security(&original)).is_empty());
+    }
+}
+
 const TEST_RSA_PUBLIC_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCeBwh5uUsN7IUDwwsg1tMZsRAknSr77S2N+DoEBkLvMTIB9ox8MIx1XeFyJpKLIaXR3WvRW49zKGPqgR8cIoWPzwdnKAFLwjYA+MDDsjDqFTU3DO1msuj0v5M74MXriVCEMZjRY7DiEnSnIpHyySyddkwm8TQDTDFxc3kRGRDMh0L5UjWb3Y18uQgmU08gF/2Liwg0Pl35D3AyKR6rxegxvolHu/g+h2+qvnwiy/lhwXyTfVhqRJ4k/lbRxAKZINJwUlRqmGiXnnppQ90UJS775L47I65bJ7LdI2FRI4iJVej2mRNE7dv+0G+ntPVeqKR8XuokO8FnZj7/Y0IYZ/zN";
 
 #[test]

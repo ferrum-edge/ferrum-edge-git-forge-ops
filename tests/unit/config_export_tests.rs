@@ -540,6 +540,71 @@ fn edge_0_9_19_redacted_plugin_values_are_not_false_drift() {
     }
 }
 
+/// URL userinfo spellings Ferrum Edge's WHATWG parser reads as credentials.
+const WHATWG_USERINFO_URLS: [&str; 5] = [
+    "https:///svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+    "https:/\\svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+    "https:\t//svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+    "https://svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318\\v1",
+    "https:\r\n//svc:SYNTHETIC-URL-PASSWORD@collector.internal:4318/v1",
+];
+
+/// GHSA-m3hr-pvjr-278c: Edge withholds a credential-bearing URL anywhere in a
+/// plugin config, so a repository URL whose userinfo only a WHATWG parser
+/// finds is a secret-bearing site: the fingerprint is put back and counted
+/// as uncompared, never reported as drift. `a2a_gateway` `callback_url` is a
+/// leaf nothing but the URL userinfo check predicts; `opa_host` and a custom
+/// plugin's leaf are predicted sites as well.
+#[test]
+fn whatwg_url_userinfo_in_plugin_config_is_an_uncompared_site() {
+    for url in WHATWG_USERINFO_URLS {
+        let cases = [
+            (
+                "a2a_gateway",
+                json!({"callback_url": url}),
+                "/config/callback_url",
+            ),
+            (
+                "opa",
+                json!({"opa_host": url, "policy_path": "authz/allow"}),
+                "/config/opa_host",
+            ),
+            (
+                "acme_widget",
+                json!({"upstream": {"endpoint_url": url}}),
+                "/config/upstream/endpoint_url",
+            ),
+        ];
+        for (plugin_name, config, pointer) in cases {
+            let desired: GatewayConfig = serde_json::from_value(json!({
+                "plugin_configs": [{
+                    "id": "url-plugin",
+                    "namespace": "ferrum",
+                    "plugin_name": plugin_name,
+                    "scope": "global",
+                    "config": config,
+                }],
+            }))
+            .unwrap();
+            let mut live = serde_json::to_value(&desired.plugin_configs[0]).unwrap();
+            *live.pointer_mut(pointer).unwrap() = json!(fp('e'));
+            let body = document("ferrum", KEY_ID, json!([]), json!([live])).to_string();
+            let export = ConfigExport::from_response(&body, "ferrum", false).unwrap();
+            let view = export.live_view_with(&desired, &desired).unwrap();
+
+            let uncompared: Vec<&str> = view
+                .uncompared
+                .iter()
+                .map(|site| site.pointer.as_str())
+                .collect();
+            assert_eq!(uncompared, [pointer], "{plugin_name} {url:?}");
+            assert!(view.masked_ancestors.is_empty(), "{plugin_name}");
+            let diffs = compute_diff(&desired, &view.actual).unwrap();
+            assert!(diffs.is_empty(), "{plugin_name} {url:?}: {diffs:?}");
+        }
+    }
+}
+
 #[test]
 fn a_whole_value_fingerprinted_around_a_secret_is_never_authoritative() {
     let desired: GatewayConfig = serde_json::from_value(json!({

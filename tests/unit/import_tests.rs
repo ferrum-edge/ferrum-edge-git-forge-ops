@@ -2542,6 +2542,103 @@ fn builtin_plugins_without_secret_looking_leaves_import_silently() {
     assert!(plugin_yaml.contains("sample_rate"), "{plugin_yaml}");
 }
 
+/// URL userinfo spellings Ferrum Edge's WHATWG parser reads as credentials.
+const WHATWG_USERINFO_URLS: [&str; 5] = [
+    "https:///svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https:/\\svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https:\t//svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+    "https://svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181\\v1",
+    "https:\r\n//svc:SYNTHETIC-URL-PASSWORD@opa.internal:8181/v1",
+];
+
+fn single_plugin_backup(
+    source: &std::path::Path,
+    plugin_name: &str,
+    plugin_config: serde_json::Value,
+) -> PathBuf {
+    let backup_path = source.join("backup.yaml");
+    let mut config = make_test_config();
+    config.plugin_configs.push(PluginConfig {
+        labels: Default::default(),
+        extra: Default::default(),
+        id: "url-plugin".to_string(),
+        plugin_name: plugin_name.to_string(),
+        namespace: "ferrum".to_string(),
+        config: plugin_config,
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        trigger: None,
+        api_spec_id: None,
+        created_at: Some(gitforgeops::timestamp::Timestamp::now()),
+        updated_at: Some(gitforgeops::timestamp::Timestamp::now()),
+    });
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
+    backup_path
+}
+
+/// GHSA-m3hr-pvjr-278c: URL userinfo in `opa` `opa_host` spelled the way only
+/// a WHATWG parser accepts still makes import refuse the plaintext value, and
+/// in a custom plugin's endpoint it is brokered out of the resource tree.
+#[test]
+fn whatwg_url_userinfo_in_plugin_config_never_reaches_the_resource_tree() {
+    for url in WHATWG_USERINFO_URLS {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+
+        let backup_path = single_plugin_backup(
+            source.path(),
+            "opa",
+            serde_json::json!({"opa_host": url, "policy_path": "authz/allow"}),
+        );
+        let output = destination.path().join("opa-resources");
+        let bundle_path = destination.path().join("opa-migration.json");
+        let error = gitforgeops::import::from_file::import_from_file(
+            &backup_path,
+            &output,
+            Some(&bundle_path),
+            &strict_passthrough(),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("refusing to import plaintext plugin config"),
+            "{url:?}: {error}"
+        );
+        assert!(error.contains("plugin_name=opa"), "{error}");
+        assert!(error.contains("opa_host"), "{error}");
+        assert!(!error.contains("SYNTHETIC-URL-PASSWORD"), "{error}");
+        assert!(!output.exists());
+        assert!(!bundle_path.exists());
+
+        let backup_path = single_plugin_backup(
+            source.path(),
+            "acme_widget",
+            serde_json::json!({"upstream": {"endpoint_url": url}}),
+        );
+        let output = destination.path().join("custom-resources");
+        let bundle_path = destination.path().join("custom-migration.json");
+        let result = gitforgeops::import::from_file::import_from_file(
+            &backup_path,
+            &output,
+            Some(&bundle_path),
+            &strict_passthrough(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.redacted_plugin_config_values, 1, "{url:?}");
+        let plugin_yaml =
+            std::fs::read_to_string(output.join("ferrum/plugins/url-plugin.yaml")).unwrap();
+        assert!(
+            !plugin_yaml.contains("SYNTHETIC-URL-PASSWORD"),
+            "{plugin_yaml}"
+        );
+        assert!(plugin_yaml.contains("${gh-env-secret:"), "{plugin_yaml}");
+    }
+}
+
 fn builtin_plugin_backup(source: &std::path::Path, plugin_name: &str) -> PathBuf {
     let backup_path = source.join("backup.yaml");
     let mut config = make_test_config();
