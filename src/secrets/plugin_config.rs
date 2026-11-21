@@ -671,7 +671,7 @@ pub(crate) fn classify_plugin_config(
     }
 
     if !is_builtin(plugin_name) {
-        collect_heuristic_paths(config, &root, &mut sensitive, false);
+        collect_heuristic_paths(config, &root, &mut sensitive, false, &BTreeSet::new());
         let mut all = BTreeSet::new();
         collect_string_paths(config, &root, &mut all);
         let unbrokered = all.difference(&sensitive).cloned().collect();
@@ -708,7 +708,8 @@ pub(crate) fn classify_plugin_config(
         }
     }
     let mut heuristic = BTreeSet::new();
-    collect_heuristic_paths(config, &root, &mut heuristic, true);
+    let literal_payloads = literal_payload_paths(plugin_name, config);
+    collect_heuristic_paths(config, &root, &mut heuristic, true, &literal_payloads);
     collect_credential_named_parameters(plugin_name, config, &mut heuristic);
     let unbrokered = heuristic
         .into_iter()
@@ -1136,11 +1137,52 @@ fn collect_kafka_properties(
     }
 }
 
+/// Builtin string fields Ferrum Edge treats as literal text it serves
+/// verbatim (a response body or message, a WebSocket close reason), never as
+/// a URL. Free text there can still parse as a WHATWG URL with a username
+/// (`https: contact ops@example.com`), so the URL-userinfo heuristic uses
+/// [`url_token_has_userinfo`](super::url_userinfo::url_token_has_userinfo)
+/// at these paths: a complete credential URL token is still caught, prose is
+/// not. Everywhere else, and in every custom plugin, Edge's full parser match
+/// applies.
+///
+/// Checked against the Edge v0.9.20 and `main` plugin constructors.
+fn literal_payload_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]] {
+    match plugin_name {
+        "response_mock" => &[&["rules", "*", "body"]],
+        "fault_injection" => &[&["abort", "body"]],
+        "request_termination" => &[&["body"], &["message"]],
+        "opa" => &[&["deny_body"], &["fail_closed_body"]],
+        "waf" => &[&["reject_body"]],
+        "ws_rate_limiting" => &[&["close_reason"]],
+        "ws_message_size_limiting" => &[
+            &["close_reason"],
+            &["client_to_backend", "close_reason"],
+            &["backend_to_client", "close_reason"],
+        ],
+        _ => &[],
+    }
+}
+
+/// The paths of `config` that [`literal_payload_rules_for`] names.
+fn literal_payload_paths(plugin_name: &str, config: &Value) -> BTreeSet<Vec<ConfigPathComponent>> {
+    let mut found = BTreeSet::new();
+    for path in literal_payload_rules_for(plugin_name) {
+        walk_rule(config, path, &[], &mut |_, at, complete| {
+            if complete {
+                found.insert(at.to_vec());
+            }
+        });
+    }
+    found
+}
+
 fn collect_heuristic_paths(
     value: &Value,
     current: &[ConfigPathComponent],
     found: &mut BTreeSet<Vec<ConfigPathComponent>>,
     builtin: bool,
+    literal_payloads: &BTreeSet<Vec<ConfigPathComponent>>,
 ) {
     match value {
         Value::Object(map) => {
@@ -1158,7 +1200,7 @@ fn collect_heuristic_paths(
                 if is_sensitive_key(key) || is_header_container(key) || builtin_match {
                     collect_string_paths(child, &next, found);
                 } else {
-                    collect_heuristic_paths(child, &next, found, builtin);
+                    collect_heuristic_paths(child, &next, found, builtin, literal_payloads);
                 }
             }
         }
@@ -1166,11 +1208,18 @@ fn collect_heuristic_paths(
             for (index, child) in items.iter().enumerate() {
                 let mut next = current.to_vec();
                 next.push(ConfigPathComponent::Index(index));
-                collect_heuristic_paths(child, &next, found, builtin);
+                collect_heuristic_paths(child, &next, found, builtin, literal_payloads);
             }
         }
-        Value::String(text) if url_has_userinfo(text) => {
-            found.insert(current.to_vec());
+        Value::String(text) => {
+            let userinfo = if literal_payloads.contains(current) {
+                super::url_userinfo::url_token_has_userinfo(text)
+            } else {
+                super::url_userinfo::url_has_userinfo(text)
+            };
+            if userinfo {
+                found.insert(current.to_vec());
+            }
         }
         _ => {}
     }
@@ -1236,16 +1285,6 @@ fn is_header_container(key: &str) -> bool {
         normalize_key(key).as_str(),
         "headers" | "customheaders" | "staticheaders" | "requestheaders"
     )
-}
-
-fn url_has_userinfo(value: &str) -> bool {
-    let Some((_, remainder)) = value.split_once("://") else {
-        return false;
-    };
-    remainder
-        .split(['/', '?', '#'])
-        .next()
-        .is_some_and(|authority| authority.contains('@'))
 }
 
 #[cfg(test)]

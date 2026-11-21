@@ -7,6 +7,7 @@ pub(crate) mod plugin_config;
 pub mod resolver;
 pub mod scrubber;
 pub(crate) mod service_discovery;
+pub(crate) mod url_userinfo;
 
 pub use allocator::{
     allocate_and_deliver, allocate_and_deliver_at, generate_credential_value,
