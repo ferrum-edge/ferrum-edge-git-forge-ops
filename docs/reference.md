@@ -381,8 +381,9 @@ and only a completed pass is `PASSED`.
 **Secrets are scrubbed from validator output, not hidden wholesale.**
 Credentials are resolved before validation, and the validator may echo them.
 Every resolved or literal credential, sensitive plugin-config value, plugin
-trigger `header`/`query`/`cookie` operand of at least 8 bytes and modeled
-service-discovery secret, plus its base64 and percent-encoded forms, is
+trigger `header`/`query`/`cookie` operand (of at least 8 bytes; `diff` and
+`plan` redact shorter ones by position) and modeled service-discovery secret,
+plus its base64 and percent-encoded forms, is
 replaced with `[REDACTED]`. Identities (`basicauth` usernames, `mtls_auth`
 identities) stay readable. The whole stream is withheld instead when:
 
@@ -630,10 +631,11 @@ unchanged. File-mode drift jobs still skip before receiving gateway credentials.
   imports do not claim exact provenance.
 - Every recognized secret becomes `${gh-env-secret:alloc=require}`: Consumer
   credential secrets, built-in plugin-config secrets covered by the broker
-  rules, custom-plugin values the heuristics flag, plugin trigger
-  `header`/`query`/`cookie` `value` operands of at least 8 bytes, and Consul
-  tokens. Identities, trigger field names and every other trigger predicate
-  stay literal.
+  rules, custom-plugin values the heuristics flag, every non-empty plugin
+  trigger `header`/`query`/`cookie` `value` operand, and Consul tokens.
+  Identities, trigger field names and every other trigger predicate stay
+  literal. A trigger operand shorter than 8 bytes is captured but listed for
+  re-seeding with a longer value, since the broker will not resolve it.
 - A secret-looking value outside those rules, or any custom-plugin string the
   heuristics do not flag, **fails the import** before anything is written.
   After confirming the named paths hold no credentials, re-run with

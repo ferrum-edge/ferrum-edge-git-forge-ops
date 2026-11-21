@@ -206,8 +206,9 @@ impl SecretScrubber {
     ///   an `otel_tracing` `headers.x-honeycomb-team` value is resolved into
     ///   the validator input exactly like a consumer credential.
     /// * **Plugin triggers** — the `header` / `query` / `cookie` operands of a
-    ///   `trigger` long enough to broker ([`super::plugin_trigger`]): a shared
-    ///   token that decides whether the plugin runs.
+    ///   `trigger` ([`super::plugin_trigger`]) of at least
+    ///   [`MIN_SCRUB_LENGTH`] bytes: a shared token that decides whether the
+    ///   plugin runs.
     /// * **Service discovery** — the modeled secret leaves of
     ///   `Upstream.service_discovery` ([`super::service_discovery`]), today the
     ///   Consul ACL token. The validator is handed the resolved upstream, so
@@ -767,17 +768,20 @@ fn collect_plugin_config_secrets(config: &GatewayConfig, out: &mut dyn LeafSink)
     }
 }
 
-/// The sensitive `header` / `query` / `cookie` operands of every plugin
-/// `trigger` ([`super::plugin_trigger`]). Like a plugin-config operator value
-/// they are never required for display admission: a shorter one is an
-/// ordinary setting and is not reported at all.
+/// The `header` / `query` / `cookie` operands of every plugin `trigger`
+/// ([`super::plugin_trigger`]) long enough for free-text scrubbing. They are
+/// never required for display admission. A shorter one is still a secret,
+/// but substring replacement of a few bytes would mangle unrelated text, so
+/// it is kept out of output structurally instead (import brokers it, the
+/// literal gate blocks it, diffs redact it by position, and the broker
+/// refuses to resolve it).
 fn collect_plugin_trigger_secrets(config: &GatewayConfig, out: &mut dyn LeafSink) {
     for plugin in &config.plugin_configs {
         let Some(trigger) = plugin.trigger.as_ref() else {
             continue;
         };
         let json = plugin_trigger::trigger_json(trigger);
-        for (path, text) in plugin_trigger::sensitive_trigger_operands(&json) {
+        for (path, text) in plugin_trigger::scrubbable_trigger_operands(&json) {
             out.leaf(text, false, &|| {
                 leaf_location(
                     "PluginConfig",

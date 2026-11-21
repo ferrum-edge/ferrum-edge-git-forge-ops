@@ -140,18 +140,27 @@ Plugin-config and trigger array paths keep every index, including `[0]`.
 A plugin `trigger` is brokered operand by operand. The values a `header`,
 `query` or `cookie` predicate compares (`value.exact[]`, `value.prefix[]`,
 `value.regex`) are what a client sends to make the plugin run or skip, so
-Ferrum Edge withholds them and GitForgeOps treats each one of at least 8 bytes
-as a secret: `import` captures it, `diff` and `plan` show it as `[REDACTED]`
-inside an otherwise readable trigger, validator output and the review comment
-are scrubbed of it, and a committed literal is a blocking finding. A shorter
-operand (`exact: ["1"]`) cannot be stored or scrubbed, so it stays an ordinary
-setting. Field names, `presence`, `multi_value`, `case_insensitive`, the tree
+Ferrum Edge withholds every one of them, whatever its length, and so does
+GitForgeOps: `import` captures it, `diff` and `plan` show it as `[REDACTED]`
+inside an otherwise readable trigger, and a committed literal is a blocking
+finding. Validator output and the review comment are scrubbed of every
+operand of at least 8 bytes. A brokered operand must be at least 8 bytes,
+because a shorter value cannot be removed from free text: `import` still
+captures a short one (and names its slot), but resolution refuses it until
+the slot is re-seeded with a longer operand and the clients sending it are
+updated. A slot seeded with placeholder text is refused the same way as a
+Consumer secret's. Field names, `presence`, `multi_value`, `case_insensitive`, the tree
 (`all`, `any`, `not`) and every other predicate (`path`, `method`, `host`,
 `sni`, `protocol`, `source_cidr`, `namespace`, `proxy_id`, `listen_port`,
 `consumer`, `auth_method`, `spiffe_id`) stay literal and reviewable; a
 placeholder in one of them is refused, because it has no slot and would reach
-the gateway as text. Trigger slots belong to the plugin's type like its config
-slots, so the type-change and shrink checks below cover them too.
+the gateway as text, and `import` refuses a live trigger that has one. Trigger
+slots belong to the plugin's type like its config slots, so the type-change
+check below covers them too. Retiring a trigger operand means removing its
+list, predicate or branch (Edge refuses an empty list), so a stored trigger
+slot that no brokered operand uses any more is refused as a slot remap: remove
+it from the bundle, or re-adding an operand at that path would resurrect the
+retired value.
 
 A plugin-config slot names the plugin type as well as its id, because what a
 config path means, and where the plugin sends it, depends on the type (the

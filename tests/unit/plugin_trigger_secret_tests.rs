@@ -60,13 +60,16 @@ fn trigger_cases() -> Vec<(
             vec!["ferrum/plugin/@plugin/waf/trigger/when/any/[2]/not/match/cookie/value/regex"],
         ),
         (
-            "a short exact entry stays an ordinary setting beside a long one",
+            "every entry of a multi-entry exact list",
             serde_json::json!({"when": {"match": {"header": {
                 "name": "x-env",
-                "value": {"exact": ["on", "synthetic-trigger-second"]}
+                "value": {"exact": ["synthetic-trigger-first", "synthetic-trigger-second"]}
             }}}}),
-            vec!["x-env", "\"on\""],
-            vec!["ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[1]"],
+            vec!["x-env"],
+            vec![
+                "ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[0]",
+                "ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[1]",
+            ],
         ),
     ]
 }
@@ -94,7 +97,9 @@ fn trigger_text(gateway: &GatewayConfig) -> String {
 fn trigger_operands_are_brokered_on_import() {
     for (label, trigger, visible, expected) in trigger_cases() {
         let mut gateway = trigger_gateway(trigger);
-        let captured = capture_and_redact_import_plugin_trigger_secrets(&mut gateway).unwrap();
+        let capture = capture_and_redact_import_plugin_trigger_secrets(&mut gateway).unwrap();
+        assert!(capture.short.is_empty(), "{label}");
+        let captured = capture.captured;
         let slots: Vec<&str> = captured.keys().map(String::as_str).collect();
         assert_eq!(slots, expected, "{label}");
         assert!(
@@ -124,7 +129,9 @@ fn trigger_operands_resolve_from_the_bundle_and_fail_closed() {
     for (label, trigger, _, expected) in trigger_cases() {
         let original = trigger_gateway(trigger);
         let mut gateway = original.clone();
-        let captured = capture_and_redact_import_plugin_trigger_secrets(&mut gateway).unwrap();
+        let captured = capture_and_redact_import_plugin_trigger_secrets(&mut gateway)
+            .unwrap()
+            .captured;
 
         let mut resolved = gateway.clone();
         let report = super::resolver_fixtures::resolve_secrets(&mut resolved, &captured).unwrap();
@@ -294,25 +301,70 @@ fn literal_trigger_operands_are_gated_and_scrubbed() {
     }
 }
 
-/// Short operands (`exact: ["on"]`) could be neither brokered nor scrubbed,
-/// so like a short plugin-config operator value they are ordinary settings:
-/// import keeps them, the gate lets them through, and validator output and a
-/// live read are not refused over them.
+/// Edge withholds every client-field operand whatever its length, so a short
+/// one (`exact: ["on"]`) is a secret too: import brokers it (and lists its slot
+/// for re-seeding), the literal gate blocks it, a diff redacts it by position,
+/// and the broker refuses to resolve a value that short (it could not be
+/// removed from free text). Free-text scrubbing keeps its 8-byte floor, so
+/// validator output and a live read are not refused over a short operand.
 #[test]
-fn short_trigger_operands_stay_ordinary_settings() {
+fn short_trigger_operands_are_secrets_too() {
     gitforgeops::display::enable_display_scrubbing_on_this_thread();
     let original = trigger_gateway(serde_json::json!({"when": {"any": [
-        {"match": {"header": {"name": "x-env", "value": {"exact": ["on"]}}}},
-        {"match": {"query": {"name": "v", "value": {"prefix": ["2"]}}}},
-        {"match": {"cookie": {"name": "ab", "value": {"regex": "^b$"}}}}
+        {"match": {"header": {"name": "x-skip-waf", "value": {"exact": ["on"]}}}},
+        {"match": {"query": {"name": "debug-mode", "value": {"prefix": ["2"]}}}},
+        {"match": {"cookie": {"name": "session-tier", "value": {"regex": "^b$"}}}}
     ]}}));
+    let expected = [
+        "ferrum/plugin/@plugin/waf/trigger/when/any/[0]/match/header/value/exact/[0]",
+        "ferrum/plugin/@plugin/waf/trigger/when/any/[1]/match/query/value/prefix/[0]",
+        "ferrum/plugin/@plugin/waf/trigger/when/any/[2]/match/cookie/value/regex",
+    ];
+
     let mut gateway = original.clone();
-    let captured = capture_and_redact_import_plugin_trigger_secrets(&mut gateway).unwrap();
-    assert!(captured.is_empty());
-    assert_eq!(trigger_text(&gateway), trigger_text(&original));
-    assert!(!audit_security(&original)
-        .iter()
-        .any(|finding| finding.message.contains("plugin-trigger")));
+    let capture = capture_and_redact_import_plugin_trigger_secrets(&mut gateway).unwrap();
+    let slots: Vec<&str> = capture.captured.keys().map(String::as_str).collect();
+    assert_eq!(slots, expected);
+    assert_eq!(capture.short, expected);
+    let written = trigger_text(&gateway);
+    assert!(!written.contains("\"on\""), "{written}");
+    assert!(!written.contains("^b$"), "{written}");
+    assert!(written.contains("session-tier"), "{written}");
+
+    let blockers: Vec<String> = security_blockers(&audit_security(&original))
+        .into_iter()
+        .filter(|finding| finding.message.contains("Literal plugin-trigger secret"))
+        .map(|finding| finding.message.clone())
+        .collect();
+    assert_eq!(blockers.len(), 3, "{blockers:?}");
+    assert!(blockers[0].contains("at least 8 bytes"), "{blockers:?}");
+
+    // The captured short value is refused at resolution, naming the slot only.
+    let mut resolved = gateway.clone();
+    let error = super::resolver_fixtures::resolve_secrets(&mut resolved, &capture.captured)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("plugin trigger slot"), "{error}");
+    assert!(error.contains("shorter than 8 bytes"), "{error}");
+    assert!(!error.contains("\"on\""), "{error}");
+
+    // A diff that touches the trigger redacts the short live operands.
+    let desired = trigger_gateway(serde_json::json!({"when": {"any": [
+        {"match": {"header": {"name": "x-skip-waf", "value": {"exact": ["off"]}}}},
+        {"match": {"query": {"name": "debug-mode", "value": {"prefix": ["2"]}}}},
+        {"match": {"cookie": {"name": "session-tier", "value": {"regex": "^b$"}}}}
+    ]}}));
+    let diffs = compute_diff(&desired, &original).unwrap();
+    let change = &diffs[0].details[0];
+    assert_eq!(change.field, "trigger");
+    for side in [&change.old_value, &change.new_value] {
+        assert!(!side.contains("\"on\""), "{side}");
+        assert!(!side.contains("\"off\""), "{side}");
+        assert!(!side.contains("\"2\""), "{side}");
+        assert!(!side.contains("^b$"), "{side}");
+        assert!(side.contains("x-skip-waf"), "{side}");
+    }
+
     let output = SecretScrubber::from_gateway_config(&original).scrub_streams("validated", "");
     assert!(output.suppressed.is_none());
     gitforgeops::display::register_gateway_config(&original).unwrap();
@@ -380,9 +432,10 @@ fn mask_without_bundle(desired: &GatewayConfig, actual: &mut GatewayConfig) {
 }
 
 /// Trigger slots share the plugin's typed keyspace: a slot stored for another
-/// plugin type is a remap, and an array that shrank under a stored slot is a
-/// remap too, both under the same policy as plugin-config slots. A trigger
-/// slot of the plugin's own type is not foreign.
+/// plugin type is a remap whose remedy names the declared type's `trigger`
+/// prefix, and an array that shrank under a stored slot is a remap too, both
+/// under the same policy as plugin-config slots. A trigger slot of the
+/// plugin's own type is not foreign.
 #[test]
 fn trigger_slots_follow_plugin_slot_identity() {
     let gateway = trigger_gateway(serde_json::json!({"when": {"match": {"header": {
@@ -404,6 +457,12 @@ fn trigger_slots_follow_plugin_slot_identity() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("@plugin/cors/trigger"), "{error}");
+    assert!(error.contains("plugin trigger slot"), "{error}");
+    // The remedy names the declared type's trigger prefix, not its config one.
+    assert!(
+        error.contains("prefix 'ferrum/plugin/@plugin/waf/trigger/'"),
+        "{error}"
+    );
     assert!(!error.contains("old-type-trigger-token"), "{error}");
 
     let mut shrunk = bundle;
@@ -416,6 +475,109 @@ fn trigger_slots_follow_plugin_slot_identity() {
         .to_string();
     assert!(error.contains("plugin trigger slot"), "{error}");
     assert!(!error.contains("retired-trigger-token"), "{error}");
+    // Reported once, not by both the array and the retirement checks.
+    let report = super::resolver_fixtures::report_secrets_with_options(
+        &gateway,
+        &shrunk,
+        gitforgeops::secrets::ResolveOptions::allowing_slot_remap(true),
+    )
+    .unwrap();
+    assert_eq!(report.slot_remaps.len(), 1);
+}
+
+/// Retiring an operand means removing its list, predicate, branch or the
+/// whole trigger (Edge refuses an empty list), which an array-length check
+/// never sees. A stored slot that no brokered operand uses any more is a
+/// remap, so re-adding an operand at that path cannot silently resurrect a
+/// retired value.
+#[test]
+fn removed_trigger_operands_leave_slots_that_must_be_retired() {
+    let own = "ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[0]";
+    let mut bundle = CredentialBundle::new();
+    bundle.insert(own.to_string(), "retired-trigger-token".to_string());
+
+    let presence_only = trigger_gateway(serde_json::json!({"when": {"match": {"header": {
+        "name": "x-skip-waf"
+    }}}}));
+    let mut no_trigger = presence_only.clone();
+    no_trigger.plugin_configs[0].trigger = None;
+    let moved = trigger_gateway(serde_json::json!({"when": {"not": {"match": {"header": {
+        "name": "x-skip-waf", "value": {"exact": [PLACEHOLDER]}
+    }}}}}));
+    for (label, gateway) in [
+        ("presence-only predicate", presence_only),
+        ("trigger removed", no_trigger),
+        ("operand moved under not", moved),
+    ] {
+        let error = super::resolver_fixtures::report_secrets(&gateway, &bundle)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(own), "{label}: {error}");
+        assert!(error.contains("orphaned"), "{label}: {error}");
+        assert!(!error.contains("retired-trigger-token"), "{label}");
+        let mut resolved = gateway.clone();
+        assert!(
+            super::resolver_fixtures::resolve_secrets(&mut resolved, &bundle).is_err(),
+            "{label}"
+        );
+    }
+}
+
+/// A trigger slot seeded with placeholder text is not a secret: the
+/// committed placeholder is repository-known, so a client could send it. It
+/// is refused before the slot counts as resolved (so `export --materialize`,
+/// which resolves through the same walk, cannot write it), naming the slot
+/// only.
+#[test]
+fn trigger_slot_seeded_with_placeholder_text_is_refused() {
+    let gateway = trigger_gateway(serde_json::json!({"when": {"match": {"header": {
+        "name": "x-skip-waf", "value": {"exact": [PLACEHOLDER]}
+    }}}}));
+    let own = "ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[0]";
+    for seeded in [PLACEHOLDER, "${gh-env-secret:alloc=generate}"] {
+        let mut bundle = CredentialBundle::new();
+        bundle.insert(own.to_string(), seeded.to_string());
+        let error = super::resolver_fixtures::report_secrets(&gateway, &bundle)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(own), "{error}");
+        assert!(error.contains("placeholder"), "{error}");
+        let mut resolved = gateway.clone();
+        let error = super::resolver_fixtures::resolve_secrets(&mut resolved, &bundle)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(own), "{error}");
+        assert_eq!(trigger_text(&resolved), trigger_text(&gateway));
+    }
+}
+
+/// Import refuses a live trigger whose non-operand predicate holds broker
+/// syntax: the repository load boundary would reject the tree it wrote. The
+/// refusal names the path and writes nothing.
+#[test]
+fn import_refuses_broker_syntax_outside_trigger_operands() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let config = trigger_gateway(serde_json::json!({"when": {"match": {"query": {
+        "name": "x-${gh-env-secret:alloc=require}"
+    }}}}));
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("secret-migration.json");
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &gitforgeops::import::ImportPassthroughPolicy::strict(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("refusing to import"), "{error}");
+    assert!(error.contains("trigger.when.match.query.name"), "{error}");
+    assert!(!output.exists());
+    assert!(!bundle_path.exists());
 }
 
 /// End to end: a backup carrying a literal trigger token imports into a tree
@@ -476,4 +638,29 @@ fn import_brokers_trigger_operands_and_round_trips_exactly() {
     assert!(error.contains("--credential-bundle-output"), "{error}");
     assert!(!error.contains("synthetic-"), "{error}");
     assert!(!refused_output.exists());
+
+    // A short operand is captured as well and named for re-seeding.
+    let short_backup = source_dir.path().join("short.yaml");
+    let short = trigger_gateway(serde_json::json!({"when": {"match": {"header": {
+        "name": "x-skip-waf", "value": {"exact": ["on"]}
+    }}}}));
+    std::fs::write(&short_backup, gitforgeops::yaml::to_string(&short).unwrap()).unwrap();
+    let short_output = destination_parent.path().join("short-resources");
+    let short_bundle = destination_parent.path().join("short-migration.json");
+    let result = gitforgeops::import::from_file::import_from_file(
+        &short_backup,
+        &short_output,
+        Some(&short_bundle),
+        &gitforgeops::import::ImportPassthroughPolicy::strict(),
+        &[],
+    )
+    .unwrap();
+    let notice = result.short_plugin_trigger_notice().expect("short notice");
+    assert!(
+        notice.contains("ferrum/plugin/@plugin/waf/trigger/when/match/header/value/exact/[0]"),
+        "{notice}"
+    );
+    let plugin_yaml =
+        std::fs::read_to_string(short_output.join("ferrum/plugins/plugin.yaml")).unwrap();
+    assert!(plugin_yaml.contains(PLACEHOLDER), "{plugin_yaml}");
 }

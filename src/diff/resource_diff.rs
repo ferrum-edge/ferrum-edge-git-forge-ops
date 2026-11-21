@@ -256,19 +256,20 @@ fn redact_sensitive_leaves(kind: &str, changes: &mut [FieldChange]) {
     }
 }
 
-/// Redact the sensitive client-field operands of one serialized `trigger`
-/// value (placeholder-shaped ones included), or `None` when nothing needed
-/// replacing. A value that is not JSON is left to the caller, as above.
+/// Redact every non-empty client-field operand of one serialized `trigger`
+/// value, whatever its length and placeholder-shaped ones included, or `None`
+/// when nothing needed replacing. Redaction is by position, so a short
+/// operand the scrubber cannot match in free text is still withheld here. A
+/// value that is not JSON is left to the caller, as above.
 fn redact_trigger_json(serialized: &str) -> Option<String> {
     let mut value: serde_json::Value = serde_json::from_str(serialized).ok()?;
     if value.is_null() {
         return None;
     }
-    let sensitive: Vec<Vec<ConfigPathComponent>> =
-        plugin_trigger::sensitive_trigger_operands(&value)
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect();
+    let sensitive: Vec<Vec<ConfigPathComponent>> = plugin_trigger::secret_trigger_operands(&value)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
     if sensitive.is_empty() {
         return None;
     }

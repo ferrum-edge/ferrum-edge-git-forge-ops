@@ -1663,7 +1663,8 @@ generation agree:
   repository-known, low-entropy, and kept readable by the scrubber. Every
   Consumer lookup goes through it: validate, plan, diff, review, apply,
   `export --materialize`, and rotate's sibling resolve and publisher.
-  Plugin-config and service-discovery slots keep provenance semantics.
+  Plugin trigger operands get the same refusal; plugin-config and
+  service-discovery slots keep provenance semantics.
 - The allocator validates the whole candidate batch before GitHub key discovery,
   including direct callers and lenient reports. Structural types must match the
   slot. Non-generatable discovery secrets (`SD_SECRET_FIELDS`) and public
@@ -1775,9 +1776,13 @@ prefix keeps them out of the credential-type keyspace):
   `when`, every index kept; `resolver::plugin_trigger_slot`). One walk,
   `src/secrets/plugin_trigger.rs::visit_trigger_sites`, mirrors Edge's
   `project_plugin_trigger_with` for every boundary and for export site
-  prediction. Operands of ≥8 bytes are secrets like `RuleKind::Value`; other
-  predicates and field names stay literal, and broker syntax there is refused
-  (`validate_trigger_placeholders`).
+  prediction. Like Edge, every non-empty operand is a secret at any length
+  (import, literal gate, resolution, diff redaction by position); only
+  free-text scrubbing keeps the 8-byte floor, and a bundle value under 8 bytes
+  or one that is placeholder text is refused. A stored trigger slot no
+  brokered operand uses is a remap (`check_trigger_slot_retirement`). Other
+  predicates and field names stay literal; broker syntax there is refused at
+  load and import (`validate_trigger_placeholders`).
 - `Upstream.service_discovery` → `<ns>/<upstream-id>/@service-discovery/<path>`
   (e.g. `ferrum/orders/@service-discovery/consul/token`). Modeled secret leaves
   live in one table, `src/secrets/service_discovery.rs::SD_SECRET_FIELDS`, read

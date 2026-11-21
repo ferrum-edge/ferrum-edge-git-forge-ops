@@ -28,12 +28,14 @@
 //!   ([`crate::secrets::resolver::plugin_trigger_slot`]), with `<path>`
 //!   running from the trigger root (`when/...`) and every array index kept.
 //!
-//! An operand is a secret on the same terms as a plugin-config operator value
-//! (`RuleKind::Value` in [`super::plugin_config`]): a string of at least
-//! [`MIN_SCRUB_LENGTH`] bytes is brokered, masked, scrubbed and literal-gated.
-//! A shorter one (`exact: ["1"]`) could be neither stored by the bundle nor
-//! scrubbed, so it stays an ordinary literal, and none is declared required
-//! for display admission. A brokered placeholder is always long enough.
+//! Like Edge, the classification is by position, not by length: every
+//! non-empty operand ([`secret_trigger_operands`]) is brokered on import,
+//! literal-gated, resolved, masked and redacted structurally in diffs. The
+//! broker refuses to resolve a bundle value shorter than [`MIN_SCRUB_LENGTH`]
+//! bytes (it could not be removed from free text), so a short operand must be
+//! replaced by a longer one; free-text scrubbing
+//! ([`scrubbable_trigger_operands`]) keeps that floor, and no operand is
+//! declared required for display admission.
 
 use serde_json::Value;
 
@@ -235,18 +237,25 @@ pub(crate) fn trigger_operand_strings(trigger: &Value) -> Vec<(Vec<ConfigPathCom
     found
 }
 
-/// Whether an operand string is treated as a secret: long enough to broker
-/// and scrub (see the module docs).
-pub(crate) fn is_sensitive_trigger_operand(text: &str) -> bool {
-    text.len() >= MIN_SCRUB_LENGTH
-}
-
-/// The client-field operands treated as secrets
-/// ([`is_sensitive_trigger_operand`]).
-pub(crate) fn sensitive_trigger_operands(trigger: &Value) -> Vec<(Vec<ConfigPathComponent>, &str)> {
+/// The client-field operands treated as secrets: every non-empty one,
+/// whatever its length, as Edge withholds them. An empty operand holds
+/// nothing to protect (and Edge's admission refuses it).
+pub(crate) fn secret_trigger_operands(trigger: &Value) -> Vec<(Vec<ConfigPathComponent>, &str)> {
     trigger_operand_strings(trigger)
         .into_iter()
-        .filter(|(_, text)| is_sensitive_trigger_operand(text))
+        .filter(|(_, text)| !text.is_empty())
+        .collect()
+}
+
+/// The [`secret_trigger_operands`] long enough for free-text scrubbing
+/// (at least [`MIN_SCRUB_LENGTH`] bytes). Structural boundaries (import,
+/// the literal gate, diff redaction) never use this floor.
+pub(crate) fn scrubbable_trigger_operands(
+    trigger: &Value,
+) -> Vec<(Vec<ConfigPathComponent>, &str)> {
+    trigger_operand_strings(trigger)
+        .into_iter()
+        .filter(|(_, text)| text.len() >= MIN_SCRUB_LENGTH)
         .collect()
 }
 
@@ -296,30 +305,36 @@ pub(crate) fn trigger_from_json(
 /// broker syntax counts, like the identity check. Names the path, never a
 /// value.
 pub fn validate_trigger_placeholders(cfg: &GatewayConfig) -> crate::error::Result<()> {
-    for plugin in &cfg.plugin_configs {
-        let Some(trigger) = plugin.trigger.as_ref() else {
-            continue;
-        };
-        let json = trigger_json(trigger);
-        let operands: std::collections::BTreeSet<Vec<ConfigPathComponent>> =
-            trigger_operand_strings(&json)
-                .into_iter()
-                .map(|(path, _)| path)
-                .collect();
-        let mut path = Vec::new();
-        if let Some(found) = placeholder_outside(&json, &mut path, &operands) {
-            return Err(crate::error::Error::Config(format!(
-                "plugin `{}/{}` ({}): '{}' holds broker placeholder syntax, but only the \
-                 `value` operands of a trigger's header, query or cookie predicate are brokered; \
-                 author this predicate literally",
-                plugin.namespace,
-                plugin.id,
-                plugin.plugin_name,
-                render_trigger_path(&found)
-            )));
-        }
+    cfg.plugin_configs
+        .iter()
+        .try_for_each(check_trigger_placeholders)
+}
+
+/// [`validate_trigger_placeholders`] for one plugin, so import can check the
+/// rows it is about to write before staging anything.
+pub(crate) fn check_trigger_placeholders(plugin: &PluginConfig) -> crate::error::Result<()> {
+    let Some(trigger) = plugin.trigger.as_ref() else {
+        return Ok(());
+    };
+    let json = trigger_json(trigger);
+    let operands: std::collections::BTreeSet<Vec<ConfigPathComponent>> =
+        trigger_operand_strings(&json)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+    let mut path = Vec::new();
+    match placeholder_outside(&json, &mut path, &operands) {
+        Some(found) => Err(crate::error::Error::Config(format!(
+            "plugin `{}/{}` ({}): '{}' holds broker placeholder syntax, but only the \
+             `value` operands of a trigger's header, query or cookie predicate are brokered; \
+             author this predicate literally",
+            plugin.namespace,
+            plugin.id,
+            plugin.plugin_name,
+            render_trigger_path(&found)
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn placeholder_outside(

@@ -749,13 +749,14 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
     }
 }
 
-/// A `PluginConfig.trigger` `header` / `query` / `cookie` operand long enough
-/// to broker ([`crate::secrets::plugin_trigger`]) that is not a broker
+/// A `PluginConfig.trigger` `header` / `query` / `cookie` operand
+/// ([`crate::secrets::plugin_trigger`]), at any length, that is not a broker
 /// placeholder is a shared token committed to the repository: whoever knows it
 /// decides whether the plugin runs. Blocking, like a literal plugin-config
-/// secret, with the same remedy. Field names, shorter operands and every other
-/// predicate stay reviewable literals. Disabled plugins are included because
-/// their trigger is still published. Names the path, never the value.
+/// secret, with the same remedy; a brokered value must be at least 8 bytes.
+/// Field names and every other predicate stay reviewable literals. Disabled
+/// plugins are included because their trigger is still published. Names the
+/// path, never the value.
 fn check_literal_plugin_trigger_secrets(
     plugin: &PluginConfig,
     findings: &mut Vec<SecurityFinding>,
@@ -764,7 +765,7 @@ fn check_literal_plugin_trigger_secrets(
         return;
     };
     let json = plugin_trigger::trigger_json(trigger);
-    for (path, value) in plugin_trigger::sensitive_trigger_operands(&json) {
+    for (path, value) in plugin_trigger::secret_trigger_operands(&json) {
         if is_broker_placeholder(value) {
             continue;
         }
@@ -774,7 +775,7 @@ fn check_literal_plugin_trigger_secrets(
             &plugin.id,
             &plugin.namespace,
             format!(
-                "Literal plugin-trigger secret in '{path}' on plugin {} ({}) in namespace {} (a client that knows this operand decides whether the plugin runs; use ${{gh-env-secret:alloc=require}} and seed the derived broker slot)",
+                "Literal plugin-trigger secret in '{path}' on plugin {} ({}) in namespace {} (a client that knows this operand decides whether the plugin runs; use ${{gh-env-secret:alloc=require}} and seed the derived broker slot with an operand of at least 8 bytes)",
                 plugin.id, plugin.plugin_name, plugin.namespace
             ),
         ));
