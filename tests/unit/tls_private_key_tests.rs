@@ -409,7 +409,10 @@ fn brokered_keys_resolve_from_their_slots_and_fail_closed_without_them() {
     ]);
     let mut resolved = brokered_gateway("require");
     let report = super::resolver_fixtures::resolve_secrets(&mut resolved, &bundle).unwrap();
-    assert!(report.unresolved().is_empty(), "{:?}", report.results);
+    assert!(
+        report.unresolved().is_empty(),
+        "unexpected unresolved slots"
+    );
     assert_eq!(
         resolved.proxies[0].backend_tls_client_key_path.as_deref(),
         Some(bundle[PROXY_SLOT].as_str())
