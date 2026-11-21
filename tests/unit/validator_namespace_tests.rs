@@ -678,3 +678,289 @@ fn real_edge_multiple_namespaces_excluding_ferrum() {
         assert_command_contract(&["zeta", "alpha"], invalid, Some(&binary));
     }
 }
+
+/// A brokered leaf of each plugin whose stand-in shape #744 / #745 fixed. The
+/// non-brokered settings are taken from Ferrum Edge's own accepted test
+/// configurations, so a failure here is a verdict on the stand-in.
+fn brokered_standin_cases() -> Vec<(&'static str, serde_json::Value)> {
+    const BROKERED: &str = "${gh-env-secret:alloc=require}";
+    let introspection = |alg: &str| {
+        serde_json::json!({"providers": [{
+            "introspection_endpoint": "https://idp.example.com/introspect",
+            "client_auth": {
+                "method": "private_key_jwt",
+                "client_id": "ferrum-edge",
+                "private_key_jwt_alg": alg,
+                "private_key_pem": BROKERED
+            }
+        }]})
+    };
+    let relying_party = |alg: &str| {
+        serde_json::json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "authorization_endpoint": "https://issuer.example.com/authorize",
+                "token_endpoint": "https://issuer.example.com/token",
+                "jwks_uri": "https://issuer.example.com/jwks",
+                "client_id": "ferrum-gateway",
+                "client_auth": {
+                    "method": "private_key_jwt",
+                    "private_key_jwt_alg": alg,
+                    "private_key_pem": BROKERED
+                },
+                "scopes": ["openid", "profile"],
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "callback_path": "/oauth/callback",
+                "logout_path": "/oauth/logout"
+            }],
+            "session": {
+                "store": "cookie",
+                "cookie_name": "ferrum_session",
+                "encryption_secret": "9f3a7c1e5b2d8406a1c9e7f3b5d20486"
+            },
+            "behavior": {
+                "trusted_redirect_hosts": ["app.example.com"],
+                "post_login_redirect_param": "rd"
+            }
+        })
+    };
+    let mut cases = vec![
+        (
+            "rate_limiting",
+            serde_json::json!({
+                "limits": [{"scope": "default", "requests_per_minute": 10}],
+                "sync_mode": "redis",
+                "redis_url": BROKERED
+            }),
+        ),
+        (
+            "hmac_auth",
+            serde_json::json!({
+                "replay_scope": "shared",
+                "sync_mode": "redis",
+                "redis_url": BROKERED
+            }),
+        ),
+        (
+            "jwks_auth",
+            serde_json::json!({
+                "providers": [{
+                    "jwks_uri": "https://idp.example.com/jwks",
+                    "issuer": "https://idp.example.com",
+                    "require_dpop": true,
+                    "dpop_replay_scope": "shared"
+                }],
+                "sync_mode": "redis",
+                "redis_url": BROKERED
+            }),
+        ),
+        ("ws_logging", serde_json::json!({"endpoint_url": BROKERED})),
+        (
+            "serverless_function",
+            serde_json::json!({
+                "provider": "aws_lambda",
+                "aws_region": "us-east-1",
+                "aws_access_key_id": "AKIATEST",
+                "aws_secret_access_key": "synthetic-aws-secret-access-key",
+                "aws_function_name": "fn",
+                "aws_endpoint_url": BROKERED
+            }),
+        ),
+    ];
+    // Ambient AWS credentials: the unresolved override stands in as the
+    // row's default regional Lambda origin, which Edge's ambient scope admits.
+    for credentials in [
+        serde_json::json!({"aws_credentials": "default_chain"}),
+        serde_json::json!({"aws_credentials": "static"}),
+    ] {
+        let mut config = serde_json::json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": BROKERED
+        });
+        config["aws_credentials"] = credentials["aws_credentials"].clone();
+        cases.push(("serverless_function", config));
+    }
+    cases.push((
+        "ai_stream_router",
+        serde_json::json!({"providers": [{
+            "name": "gemini",
+            "provider_type": "google_gemini",
+            "endpoint": BROKERED,
+            "api_key": BROKERED,
+            "model_patterns": ["gemini-*"]
+        }]}),
+    ));
+    for alg in ["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"] {
+        cases.push(("oauth2_introspection", introspection(alg)));
+        cases.push(("oidc_relying_party", relying_party(alg)));
+    }
+    // Every brokered OIDC field at once: the session secret and the provider
+    // endpoints share the stand-in host, the key follows its algorithm.
+    let mut brokered = relying_party("ES256");
+    for field in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        brokered["providers"][0][field] = serde_json::json!(BROKERED);
+    }
+    brokered["session"]["encryption_secret"] = serde_json::json!(BROKERED);
+    cases.push(("oidc_relying_party", brokered));
+    cases
+}
+
+fn single_plugin(plugin_name: &str, config: serde_json::Value) -> GatewayConfig {
+    serde_json::from_value(serde_json::json!({
+        "plugin_configs": [{
+            "id": "standin-contract",
+            "namespace": "ferrum",
+            "plugin_name": plugin_name,
+            "scope": "global",
+            "config": config
+        }]
+    }))
+    .unwrap()
+}
+
+/// #744 / #745: the real gateway accepts every reshaped stand-in, so a
+/// secretless PR run grades the configuration rather than the brokering.
+#[test]
+fn real_edge_accepts_brokered_plugin_stand_ins() {
+    let Some(binary) = real_validator() else {
+        return;
+    };
+    let binary = binary.to_str().unwrap();
+
+    // Control: the validator really runs the plugin's admission checks.
+    let control = single_plugin(
+        "ws_logging",
+        serde_json::json!({"endpoint_url": "https://collector.example/logs"}),
+    );
+    let result = run_validation(&control, binary).unwrap();
+    assert!(!result.success, "a non-WebSocket URL must fail: {result:?}");
+
+    for (plugin_name, config) in brokered_standin_cases() {
+        let gateway = single_plugin(plugin_name, config.clone());
+        let result = run_validation(&gateway, binary).unwrap();
+        assert!(
+            result.success,
+            "{plugin_name} {config}: {}{}",
+            result.stdout, result.stderr
+        );
+    }
+}
+
+/// The real gateway accepts the stand-in for an ambient Lambda row that
+/// leaves its region to the environment. Run through the CLI with a cleared
+/// environment so the result does not depend on the caller's AWS variables:
+/// once with no region at all (the `us-east-1` stand-in passes Edge's
+/// any-region check) and once with a known `AWS_REGION`.
+#[test]
+fn real_edge_accepts_an_unconfigured_lambda_region_stand_in() {
+    let Some(binary) = real_validator() else {
+        return;
+    };
+    let repo = Repo::new(&[], None, Some(&binary));
+    for credentials in ["default_chain", "static"] {
+        repo.write(
+            "resources/ferrum/plugins/lambda.yaml",
+            &format!(
+                "kind: PluginConfig\nspec:\n  id: lambda\n  plugin_name: serverless_function\n  scope: global\n  config:\n    provider: aws_lambda\n    aws_credentials: {credentials}\n    aws_function_name: fn\n    aws_endpoint_url: '${{gh-env-secret:alloc=require}}'\n"
+            ),
+        );
+        for env in [&[][..], &[("AWS_REGION", "eu-west-1")][..]] {
+            let output = repo.run(&["validate"], env);
+            assert!(
+                output.status.success(),
+                "{credentials} {env:?}: {}",
+                output_text(&output)
+            );
+        }
+    }
+}
+
+/// The ambient-credential Lambda stand-in is scoped to its own row: the
+/// validator's environment is untouched, so another row that relies on the
+/// caller's `AWS_LAMBDA_ENDPOINT_URL` is still graded against it, while only
+/// the brokered row's override becomes its regional origin.
+#[test]
+fn an_ambient_lambda_stand_in_leaves_the_endpoint_environment_to_other_rows() {
+    let repo = Repo::new(&[], None, None);
+    repo.write(
+        "validator",
+        "#!/bin/sh
+[ \"$3\" = file ] || exit 0
+echo \"env:${AWS_LAMBDA_ENDPOINT_URL-unset}\"
+echo \"overrides:$(grep -c aws_endpoint_url \"$7\")\"
+grep -q 'aws_endpoint_url: https://lambda.us-east-1.amazonaws.com/' \"$7\" && echo brokered:regional
+exit 0
+",
+    );
+    let lambda = |id: &str, endpoint: Option<&str>| {
+        let mut yaml = format!(
+            "kind: PluginConfig\nspec:\n  id: {id}\n  plugin_name: serverless_function\n  scope: global\n  config:\n    provider: aws_lambda\n    aws_credentials: default_chain\n    aws_region: us-east-1\n    aws_function_name: fn\n"
+        );
+        if let Some(endpoint) = endpoint {
+            yaml.push_str(&format!("    aws_endpoint_url: '{endpoint}'\n"));
+        }
+        yaml
+    };
+    repo.write(
+        "resources/ferrum/plugins/inherited.yaml",
+        &lambda("inherited", None),
+    );
+    repo.write(
+        "resources/ferrum/plugins/brokered.yaml",
+        &lambda("brokered", Some("${gh-env-secret:alloc=require}")),
+    );
+
+    let output = repo.run(
+        &["validate"],
+        &[("AWS_LAMBDA_ENDPOINT_URL", "http://localhost:4566/lambda")],
+    );
+    let text = output_text(&output);
+    assert!(text.contains("env:http://localhost:4566/lambda"), "{text}");
+    assert!(text.contains("overrides:1"), "{text}");
+    assert!(text.contains("brokered:regional"), "{text}");
+}
+
+/// A Lambda row that leaves its region to the environment stands in with the
+/// region the validator will resolve from the same environment
+/// (`AWS_DEFAULT_REGION`, then `AWS_REGION`), or `us-east-1`, which Edge's
+/// any-region check accepts, when neither is set.
+#[test]
+fn an_unconfigured_lambda_region_stands_in_with_the_environment_region() {
+    let repo = Repo::new(&[], None, None);
+    repo.write(
+        "validator",
+        "#!/bin/sh\n[ \"$3\" = file ] || exit 0\nsed -n 's/.*aws_endpoint_url: /endpoint:/p' \"$7\"\nexit 0\n",
+    );
+    repo.write(
+        "resources/ferrum/plugins/lambda.yaml",
+        "kind: PluginConfig\nspec:\n  id: lambda\n  plugin_name: serverless_function\n  scope: global\n  config:\n    provider: aws_lambda\n    aws_credentials: default_chain\n    aws_function_name: fn\n    aws_endpoint_url: '${gh-env-secret:alloc=require}'\n",
+    );
+    for (env, expected) in [
+        (
+            &[("AWS_REGION", "eu-west-1")][..],
+            "endpoint:https://lambda.eu-west-1.amazonaws.com/",
+        ),
+        (
+            &[
+                ("AWS_DEFAULT_REGION", "ap-south-1"),
+                ("AWS_REGION", "eu-west-1"),
+            ][..],
+            "endpoint:https://lambda.ap-south-1.amazonaws.com/",
+        ),
+        // Edge selects the first non-empty variable before judging it, so a
+        // malformed `AWS_DEFAULT_REGION` wins (and Edge reports it).
+        (
+            &[
+                ("AWS_DEFAULT_REGION", "Not-A-Region"),
+                ("AWS_REGION", "eu-west-1"),
+            ][..],
+            "endpoint:https://lambda.us-east-1.amazonaws.com/",
+        ),
+        (&[][..], "endpoint:https://lambda.us-east-1.amazonaws.com/"),
+    ] {
+        let text = output_text(&repo.run(&["validate"], env));
+        assert!(text.contains(expected), "{env:?}: {text}");
+    }
+}

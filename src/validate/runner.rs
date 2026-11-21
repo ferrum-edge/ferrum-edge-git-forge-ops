@@ -608,8 +608,14 @@ fn run_validate_pass(
     // matched reliably in re-encoded output, a value that survived verbatim,
     // or a surviving fragment of one all withhold both streams and say which
     // it was. Everything else comes back scrubbed and readable.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Generated validation-only keys are not secrets and stay out of the
+    // scrubber (a multi-line value there would withhold every diagnostic),
+    // but they are still private keys: mask them before anything else reads
+    // the output, in case a wrapper around the validator echoes its input.
+    let stdout =
+        super::client_key_standin::mask_generated_keys(&String::from_utf8_lossy(&output.stdout));
+    let stderr =
+        super::client_key_standin::mask_generated_keys(&String::from_utf8_lossy(&output.stderr));
     // Label every diagnostic line in a multi-namespace run so text, JSON and
     // GitHub annotations retain its context. Label before scrubbing: even a
     // namespace can coincide with a credential. Single-pass output is unchanged.

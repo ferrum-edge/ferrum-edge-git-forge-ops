@@ -227,7 +227,7 @@ any valid admin JWT. Edge v0.9.16 and later serve the tenant tier to a token
 with an `ns` claim. The minimal tier carries only `status` and `ready`. A gateway serves it
 to an unauthenticated probe, to a token it does not accept for detail, and to
 a namespace-scoped token when the build has no tenant tier. On the minimal
-tier the write state is unknown:
+tier the write state is unknown. For a ready gateway (HTTP 200):
 
 - `rotate` refuses before any broker or gateway write with
   `GatewayWriteStateUnknown`. Rotation publishes the new secret before its
@@ -238,6 +238,47 @@ tier the write state is unknown:
 - `apply` keeps its advisory preflight. It prints a warning with the same
   remedy and proceeds, and the first refused write reports the truth.
 - `doctor --scope gateway` reports `gateway-writable` as `UNKNOWN`.
+
+While Edge is not ready it answers `/health` with HTTP 503 and the same
+tiered document, with `ready: false` and `status` set to `starting`,
+`unavailable`, `draining`, or `degraded` when a listener failure withdraws
+readiness. GitForgeOps treats that document as the gateway's answer and does
+not retry it. It is recognized only as Edge v0.9.20 and later send it:
+`application/json`, valid UTF-8, no duplicate keys, and exactly one tier's
+shape. The minimal tier is exactly `status` and `ready`. The tenant tier adds
+exactly `mode`, `admin_writes_enabled` and the `namespace` block. The detailed
+tier carries an RFC 3339 `timestamp`, `mode`, `admin_writes_enabled`, the
+`namespace` block, the `fips` metadata (its `mode`, `build_profile` and
+`provider` labels within their documented sets, `certified` always `false`)
+and the `cached_config` summary (exactly `{"available": false}`, or
+`available: true` with `loaded_at` and both counts), and no `error` or
+`message` key. An optional `database` block must be an object whose `status`
+is `connected` or `disconnected`; no other optional diagnostic is validated. `mode` is one of Edge's operating
+modes. The `namespace` block is exactly `active`, `serving_scope` and
+`data_plane_single_namespace`, and `serving_scope` is the one Edge derives
+from `mode`: `single-namespace-data-plane` for `database`, `file`, `dp` and
+`mesh`, `control-plane` for `cp`, and `no-data-plane` for `node_agent`.
+`data_plane_single_namespace` is true exactly for a single-namespace data
+plane. Of the fields checked here, only `namespace.active` may be `null`: it is
+`null` on a control plane or node agent, and in the tenant tier also when the
+token cannot address the namespace the data plane routes. No other checked
+field may be `null` or wrongly typed. Any other 503, including an
+HTML maintenance page, unrelated JSON or `status: ok`, is not Edge's answer,
+and is retried by HTTP status like any other 5xx read:
+
+- `doctor --scope gateway` reports `gateway-reachable` as `PASS` and adds
+  `gateway-ready` as `FAIL` (exit `3`), because the gateway itself says it is
+  not serving. The write state and the token are still checked as on a ready
+  gateway. A 503 without Edge's document fails `gateway-reachable` with a
+  message that says something other than the gateway answered, and leaves
+  `gateway-token` `UNKNOWN`.
+- `apply`'s preflight still refuses on an explicit `admin_writes_enabled:
+  false` or a read-only mode in the 503 document. Otherwise it warns that the
+  gateway is not ready and proceeds.
+- `rotate` refuses before any broker or gateway write: `GatewayReadOnly` when
+  the document refuses writes, and otherwise an error naming the not-ready
+  status. That includes a minimal-tier 503, which is not
+  `GatewayWriteStateUnknown`.
 
 `doctor --scope gateway` mints the token the environment's runs send: its
 `ns` claim is the namespace list `apply`, `plan`, `review` and `diff`
@@ -403,9 +444,55 @@ gets a fake value of the right shape:
 |---|---|
 | `basicauth` `password_hash` | `hmac_sha256:<64 hex>` |
 | other credentials, token/header/secret plugin config, and plugin trigger operands (also a valid literal `regex`) | `gitforgeops-validation-standin-<64 hex>` |
-| endpoint plugin config (`ldap_url`, `redis_url`, `jwks_uri`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
+| endpoint plugin config (`ldap_url`, `jwks_uri`, `endpoint_url`, ...) | `<scheme>://gitforgeops-validation-standin.invalid/<64 hex>` |
+| a Redis-backed plugin's `redis_url` | `redis://<32 hex>.gitforgeops-validation-standin.invalid/0` |
+| `serverless_function` `aws_endpoint_url` | `https://<32 hex>.gitforgeops-validation-standin.invalid/` |
+| `ai_stream_router` provider `endpoint` | `https://gitforgeops-validation-standin.invalid/<64 hex>/{model}` |
+| `oauth2_introspection` / `oidc_relying_party` `client_auth.private_key_pem` | a throwaway PKCS#8 key for the sibling `private_key_jwt_alg` |
 
-The scheme follows the field (`ldaps://`, `redis://`, otherwise `https://`).
+The scheme follows the field (`ldaps://`, `redis://`, `wss://` for
+`ws_logging`, otherwise `https://`). The shapes follow the gateway's own
+checks: a Redis URL path must be empty, `/` or a database number, an AWS
+Lambda endpoint override must be a bare origin, and a `google_gemini` endpoint
+must carry the `{model}` placeholder (or name its single exact model), so
+those carry the per-slot hash in a host label or before the placeholder
+instead. Edge parses a `private_key_jwt` key and signs
+a test assertion with it at admission, so its stand-in is a real key generated
+for the run (RSA 2048 for `RS256`/`RS384`/`RS512` and when the algorithm is
+unset or unsupported, P-256 for `ES256`, P-384 for `ES384`, Ed25519 for
+`EdDSA`), held only in memory and in the temporary validation file. It is the
+only stand-in that differs between runs. Stand-ins are not secrets and are not
+scrubbed from validator output, but a generated key's body is masked there as
+`[VALIDATION-STANDIN-KEY]` (across line breaks, at any wrap width) in case a
+wrapper around the validator echoes it.
+
+A Lambda row that signs with ambient AWS credentials (`aws_credentials:
+default_chain`, or either key left to the environment) may only use an
+official regional endpoint, which no `.invalid` stand-in can be. Unless
+`allow_custom_endpoint_with_ambient_credentials` is `true`, its unresolved
+`aws_endpoint_url` stands in as the row's default regional endpoint,
+`https://lambda.<region>.amazonaws.com/` (`amazonaws.com.cn` for a `cn-*`
+region), only in the temporary file; the real endpoint is checked when it is
+resolved. The validator's environment is not changed, so another row that
+relies on `AWS_LAMBDA_ENDPOINT_URL` is still checked against it. A row with
+no (or an empty) `aws_region` uses the region the gateway resolves from the
+same environment: the first non-empty of `AWS_DEFAULT_REGION` and
+`AWS_REGION`. When neither is set, or the selected one is not a valid region
+(a malformed `AWS_DEFAULT_REGION` wins over a valid `AWS_REGION`, as it does in
+the gateway), `us-east-1` stands in. The gateway reports a malformed environment
+region only when admission reaches its effective-region check; it can defer that
+check, for example for a `static` row whose access keys are not available on the
+validating node. A row whose
+configured `aws_region` is not a commercial, GovCloud or China region keeps
+the ordinary stand-in, so the gateway reports the region.
+
+`private_key_jwt_alg` and `aws_credentials` look like credentials by name, but
+when they hold a value the gateway accepts (`RS256`, `RS384`, `RS512`,
+`ES256`, `ES384`, `EdDSA`; `static`, `default_chain`) they are ordinary
+settings: import keeps them, the literal-secret check passes them, and they
+are not scrubbed from validator output. Any other value is still treated as a
+possible secret.
+
 Resolved values are always validated unchanged. Stand-ins are never exported,
 applied, delivered or stored.
 

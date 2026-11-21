@@ -929,6 +929,8 @@ async fn the_gateway_scope_issues_reads_only() {
         find(&checks, "gateway-conditional-writes").status,
         Status::Unknown
     );
+    // A ready gateway adds no readiness finding: the 200 report is unchanged.
+    assert!(!checks.iter().any(|check| check.id == "gateway-ready"));
 }
 
 #[tokio::test]
@@ -990,9 +992,14 @@ async fn an_accepted_token_with_an_unparseable_cluster_body_still_passes() {
 async fn an_unreachable_gateway_leaves_the_token_question_unknown() {
     let env = stub_env(format!("http://{}", super::promotion_tests::refused_port()));
     let checks = doctor::gateway::run("production", &env, &[]).await;
-    assert_eq!(find(&checks, "gateway-reachable").status, Status::Fail);
+    let reachable = find(&checks, "gateway-reachable");
+    assert_eq!(reachable.status, Status::Fail);
+    let remedy = reachable.remediation.as_deref().expect("remediation");
+    assert!(remedy.contains("was not reached"), "{remedy}");
     // Not attempted, and said so rather than silently missing from the report.
-    assert_eq!(find(&checks, "gateway-token").status, Status::Unknown);
+    let token = find(&checks, "gateway-token");
+    assert_eq!(token.status, Status::Unknown);
+    assert!(token.detail.contains("did not answer"), "{}", token.detail);
 }
 
 #[tokio::test]
@@ -1408,6 +1415,260 @@ async fn a_minimal_health_tier_leaves_the_write_state_unknown() {
     assert!(remediation.contains("`ns` claim"), "{remediation}");
     assert!(remediation.contains("tenant"), "{remediation}");
     assert!(checks.iter().all(|check| check.status != Status::Fail));
+}
+
+// -- Edge's not-ready /health (HTTP 503) -----------------------------------
+
+/// [`stub_env`] without retries, so an unrecognized 503 fails at once.
+fn no_retry_env(url: String) -> EnvConfig {
+    EnvConfig {
+        gateway_max_retries: 0,
+        ..stub_env(url)
+    }
+}
+
+/// A gateway whose `/health` answers `health` and that otherwise behaves as a
+/// healthy Edge: `/cluster` accepts the token and no namespace exists.
+fn not_ready_gateway(health: EdgeReply, requests: Arc<Mutex<Vec<String>>>) -> String {
+    spawn_edge_stub(
+        move |request| {
+            if request.starts_with("GET /health") {
+                health
+            } else if request.starts_with("GET /cluster") {
+                (
+                    200,
+                    r#"{"mode":"cp","control_plane":null,"data_planes":[]}"#,
+                )
+            } else {
+                (200, r#"{"data":[]}"#)
+            }
+        },
+        requests,
+    )
+}
+
+fn saw(requests: &Arc<Mutex<Vec<String>>>, prefix: &str) -> bool {
+    requests
+        .lock()
+        .expect("lock")
+        .iter()
+        .any(|request| request.starts_with(prefix))
+}
+
+#[tokio::test]
+async fn a_starting_gateway_on_the_minimal_tier_is_reachable_but_not_ready() {
+    // The minimal tier: what an unauthenticated probe, or a token the gateway
+    // did not accept for detail, receives while the gateway starts.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = not_ready_gateway(
+        (503, r#"{"status":"starting","ready":false}"#),
+        Arc::clone(&requests),
+    );
+    // Default retry budget: Edge's not-ready document is the answer, so it is
+    // requested once rather than retried.
+    let checks = doctor::gateway::run("production", &stub_env(url), &[]).await;
+    let health_requests = requests
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|request| request.starts_with("GET /health"))
+        .count();
+    assert_eq!(health_requests, 1);
+
+    let reachable = find(&checks, "gateway-reachable");
+    assert_eq!(reachable.status, Status::Pass, "{reachable:?}");
+    assert!(
+        reachable.detail.contains("HTTP 503"),
+        "{}",
+        reachable.detail
+    );
+    assert!(
+        reachable.detail.contains("status=starting"),
+        "{}",
+        reachable.detail
+    );
+    let ready = find(&checks, "gateway-ready");
+    assert_eq!(ready.status, Status::Fail);
+    assert!(ready.detail.contains("status=starting"), "{}", ready.detail);
+    let remedy = ready.remediation.as_deref().expect("remediation");
+    assert!(remedy.contains("startup"), "{remedy}");
+    assert_eq!(find(&checks, "gateway-writable").status, Status::Unknown);
+    // The token is still checked, independently of readiness.
+    assert_eq!(find(&checks, "gateway-token").status, Status::Pass);
+    assert!(saw(&requests, "GET /cluster"), "the token check never ran");
+    // Not ready blocks: doctor never reports it as healthy.
+    let report = Report { checks };
+    assert_eq!(report.exit_code(), doctor::DOCTOR_FAILED_EXIT_CODE);
+}
+
+#[tokio::test]
+async fn a_draining_gateway_on_the_detailed_tier_reports_its_write_state() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = not_ready_gateway(
+        (
+            503,
+            super::http_client_tests::edge_detailed_health("draining", "database", true),
+        ),
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &no_retry_env(url), &[]).await;
+
+    let reachable = find(&checks, "gateway-reachable");
+    assert_eq!(reachable.status, Status::Pass);
+    assert!(
+        reachable.detail.contains("admin_writes_enabled=true"),
+        "{}",
+        reachable.detail
+    );
+    let ready = find(&checks, "gateway-ready");
+    assert_eq!(ready.status, Status::Fail);
+    assert!(ready.detail.contains("status=draining"), "{}", ready.detail);
+    let remedy = ready.remediation.as_deref().expect("remediation");
+    assert!(remedy.contains("terminating"), "{remedy}");
+    // Writes are enabled, so there is no write finding, as on a 200.
+    assert!(!has(&checks, "gateway-writable"));
+    assert_eq!(find(&checks, "gateway-token").status, Status::Pass);
+    assert!(saw(&requests, "GET /cluster"));
+}
+
+#[tokio::test]
+async fn an_explicit_write_refusal_on_a_not_ready_tenant_tier_is_kept() {
+    // A namespace-scoped token on Edge v0.9.16+ gets the tenant tier, with the
+    // same 503 status as the other tiers.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_edge_stub(
+        |request| {
+            if request.starts_with("GET /health") {
+                (
+                    503,
+                    r#"{"status":"unavailable","ready":false,"mode":"database","admin_writes_enabled":false,"namespace":{"active":"team-alpha","serving_scope":"single-namespace-data-plane","data_plane_single_namespace":true}}"#,
+                )
+            } else if request.starts_with("GET /cluster") {
+                (403, FLEET_GLOBAL_REFUSAL)
+            } else {
+                (200, r#"{"data":[]}"#)
+            }
+        },
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &scoped_env(url), &team_alpha()).await;
+
+    assert_eq!(find(&checks, "gateway-reachable").status, Status::Pass);
+    let ready = find(&checks, "gateway-ready");
+    assert_eq!(ready.status, Status::Fail);
+    assert!(
+        ready.detail.contains("status=unavailable"),
+        "{}",
+        ready.detail
+    );
+    // Edge can report `unavailable` before it was ever ready, so the remedy
+    // claims no readiness history.
+    let remedy = ready.remediation.as_deref().expect("remediation");
+    assert!(remedy.contains("unavailable"), "{remedy}");
+    assert!(!remedy.contains("was ready"), "{remedy}");
+    let writable = find(&checks, "gateway-writable");
+    assert_eq!(writable.status, Status::Fail);
+    assert!(
+        writable.detail.contains("admin_writes_enabled=false"),
+        "{}",
+        writable.detail
+    );
+    // The token is proven on /namespaces, as on a ready gateway.
+    assert_eq!(find(&checks, "gateway-token").status, Status::Pass);
+    assert!(saw(&requests, "GET /namespaces"));
+}
+
+#[tokio::test]
+async fn an_intermediary_503_is_not_mistaken_for_the_gateway() {
+    for body in [
+        "<html><body>Down for maintenance</body></html>",
+        r#"{"error":"service unavailable"}"#,
+        r#"{"status":"ok","ready":false}"#,
+        r#"{"status":"starting"}"#,
+        r#"{"status":"starting","ready":false,"error":"maintenance"}"#,
+        // A mutation marker on a GET is not a committed change.
+        r#"{"error":"deployment pending","applied":false,"reason":"config_rejected"}"#,
+    ] {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let url = not_ready_gateway((503, body), Arc::clone(&requests));
+        let checks = doctor::gateway::run("production", &no_retry_env(url), &[]).await;
+
+        let reachable = find(&checks, "gateway-reachable");
+        assert_eq!(reachable.status, Status::Fail, "{body}");
+        assert!(
+            reachable
+                .detail
+                .contains("without Ferrum Edge's health document"),
+            "{body}: {}",
+            reachable.detail
+        );
+        assert!(reachable.detail.contains("503"), "{}", reachable.detail);
+        assert!(
+            !reachable.detail.contains("committed"),
+            "{}",
+            reachable.detail
+        );
+        let remedy = reachable.remediation.as_deref().expect("remediation");
+        assert!(remedy.contains("proxy"), "{remedy}");
+        assert!(!remedy.contains("FERRUM_GATEWAY_CA_CERT"), "{remedy}");
+        let token = find(&checks, "gateway-token");
+        assert_eq!(token.status, Status::Unknown);
+        assert!(
+            token
+                .detail
+                .contains("did not return Ferrum Edge's health document"),
+            "{}",
+            token.detail
+        );
+        assert!(!has(&checks, "gateway-ready"), "{body}");
+        assert!(!saw(&requests, "GET /cluster"), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn an_http_answer_followed_by_a_closed_listener_is_still_an_answer() {
+    // The intermediary answers once, then the retry cannot connect: doctor
+    // still reports that something answered, with its status, rather than a
+    // network or CA problem.
+    let (url, _) = super::http_client_tests::spawn_scripted_health(vec![(
+        503,
+        "text/html",
+        b"<html>maintenance</html>",
+    )]);
+    let env = EnvConfig {
+        gateway_max_retries: 1,
+        ..stub_env(url)
+    };
+    let checks = doctor::gateway::run("production", &env, &[]).await;
+    let reachable = find(&checks, "gateway-reachable");
+    assert_eq!(reachable.status, Status::Fail);
+    assert!(
+        reachable
+            .detail
+            .contains("without Ferrum Edge's health document"),
+        "{}",
+        reachable.detail
+    );
+    assert!(reachable.detail.contains("503"), "{}", reachable.detail);
+}
+
+#[tokio::test]
+async fn a_read_only_refusal_on_health_is_an_answer_not_a_network_failure() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let url = not_ready_gateway(
+        (403, r#"{"error":"Admin API is in read-only mode"}"#),
+        Arc::clone(&requests),
+    );
+    let checks = doctor::gateway::run("production", &no_retry_env(url), &[]).await;
+    let reachable = find(&checks, "gateway-reachable");
+    assert_eq!(reachable.status, Status::Fail);
+    assert!(
+        reachable.detail.contains("HTTP 403"),
+        "{}",
+        reachable.detail
+    );
+    let remedy = reachable.remediation.as_deref().expect("remediation");
+    assert!(!remedy.contains("FERRUM_GATEWAY_CA_CERT"), "{remedy}");
 }
 
 // -- doctor probes with the token the environment's runs mint --------------
