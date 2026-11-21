@@ -175,8 +175,24 @@ fn slot_digest(slot: &str) -> String {
 /// snapshots must use [`crate::validate::run_validation_with_report`] so actual
 /// values with placeholder syntax remain subject to validation.
 pub fn with_validation_standins(config: &GatewayConfig) -> Option<GatewayConfig> {
-    with_validation_standins_for_report(config, None)
+    with_validation_standins_for_report(config, None).map(|input| input.config)
 }
+
+/// The validator input a stand-in pass produced.
+pub(crate) struct StandinDocument {
+    /// The patched copy written to the temp spec.
+    pub(crate) config: GatewayConfig,
+    /// Environment variables the validator process must not inherit for this
+    /// document. Leaving an ambient-credential Lambda override out of the copy
+    /// would otherwise let Edge fall back to the caller's
+    /// `AWS_LAMBDA_ENDPOINT_URL` and grade an endpoint the repository never
+    /// named.
+    pub(crate) env_remove: Vec<&'static str>,
+}
+
+/// The variable Edge reads a Lambda endpoint from when a row sets no
+/// `aws_endpoint_url`.
+const AWS_LAMBDA_ENDPOINT_URL_ENV: &str = "AWS_LAMBDA_ENDPOINT_URL";
 
 /// A report must describe the supplied resolved snapshot. Only explicitly
 /// unresolved canonical slots are eligible; resolved or unreported values
@@ -186,7 +202,7 @@ pub fn with_validation_standins(config: &GatewayConfig) -> Option<GatewayConfig>
 pub(crate) fn with_validation_standins_for_report(
     config: &GatewayConfig,
     report: Option<&ResolveReport>,
-) -> Option<GatewayConfig> {
+) -> Option<StandinDocument> {
     let unresolved = report.map(|report| {
         let mut slots = std::collections::HashMap::new();
         for result in &report.results {
@@ -218,6 +234,7 @@ pub(crate) fn with_validation_standins_for_report(
 
     let mut patched = config.clone();
     let mut changed = false;
+    let mut omitted_lambda_endpoint = false;
     for consumer in &mut patched.consumers {
         let namespace = consumer.namespace.clone();
         let consumer_id = consumer.id.clone();
@@ -266,13 +283,22 @@ pub(crate) fn with_validation_standins_for_report(
         changed |= context.substitute(&mut config, &mut Vec::new(), &eligible);
         if omit_lambda_endpoint {
             if let Some(object) = config.as_object_mut() {
-                changed |= object.remove(AWS_ENDPOINT_URL).is_some();
+                let omitted = object.remove(AWS_ENDPOINT_URL).is_some();
+                omitted_lambda_endpoint |= omitted;
+                changed |= omitted;
             }
         }
         plugin.config = config;
     }
 
-    changed.then_some(patched)
+    changed.then(|| StandinDocument {
+        config: patched,
+        env_remove: if omitted_lambda_endpoint {
+            vec![AWS_LAMBDA_ENDPOINT_URL_ENV]
+        } else {
+            Vec::new()
+        },
+    })
 }
 
 /// `serverless_function`'s Lambda endpoint override.

@@ -340,6 +340,76 @@ fn redis_backed_plugins_treat_redis_url_like_rate_limiting() {
     }
 }
 
+/// The rows the new stand-ins validate must also pass the literal-secret
+/// gate: with only the key or the endpoint brokered, the literal
+/// `private_key_jwt_alg` / `aws_credentials` selectors beside them are
+/// ordinary settings, not demanded into the broker (they could never be
+/// seeded: every algorithm name is under the 8-byte minimum), and a validator
+/// diagnostic naming the algorithm is not withheld.
+#[test]
+fn stand_in_selectors_pass_the_literal_secret_gate() {
+    use gitforgeops::diff::security::{audit_security, security_blockers};
+    use gitforgeops::secrets::capture_and_redact_import_plugin_config_secrets;
+
+    const BROKERED: &str = "${gh-env-secret:alloc=require}";
+    for (plugin_name, config) in [
+        (
+            "oauth2_introspection",
+            serde_json::json!({"providers": [{
+                "introspection_endpoint": BROKERED,
+                "client_auth": {
+                    "method": "private_key_jwt",
+                    "client_id": "ferrum-edge",
+                    "private_key_jwt_alg": "ES256",
+                    "private_key_pem": BROKERED
+                }
+            }]}),
+        ),
+        (
+            "oidc_relying_party",
+            serde_json::json!({
+                "providers": [{
+                    "issuer": "https://issuer.example.com",
+                    "token_endpoint": BROKERED,
+                    "client_id": "ferrum-gateway",
+                    "client_auth": {
+                        "method": "private_key_jwt",
+                        "private_key_jwt_alg": "RS256",
+                        "private_key_pem": BROKERED
+                    }
+                }],
+                "session": {"encryption_secret": BROKERED}
+            }),
+        ),
+        (
+            "serverless_function",
+            serde_json::json!({
+                "provider": "aws_lambda",
+                "aws_credentials": "default_chain",
+                "aws_region": "us-east-1",
+                "aws_function_name": "fn",
+                "aws_endpoint_url": BROKERED
+            }),
+        ),
+    ] {
+        let gateway = single_plugin_gateway(plugin_name, config);
+        let findings = audit_security(&gateway);
+        assert!(
+            security_blockers(&findings).is_empty(),
+            "{plugin_name}: {findings:?}"
+        );
+
+        let mut imported = gateway.clone();
+        let capture = capture_and_redact_import_plugin_config_secrets(&mut imported).unwrap();
+        assert!(capture.captured.is_empty(), "{plugin_name}");
+        assert!(capture.unbrokered.is_empty(), "{plugin_name}");
+
+        let scrubber = gitforgeops::secrets::SecretScrubber::from_gateway_config(&gateway);
+        let output = scrubber.scrub_streams("", "error: cannot sign private_key_jwt_alg \"ES256\"");
+        assert!(output.suppressed.is_none(), "{plugin_name}");
+    }
+}
+
 fn single_plugin_gateway(plugin_name: &str, config: serde_json::Value) -> GatewayConfig {
     serde_json::from_value(serde_json::json!({
         "version": "1",

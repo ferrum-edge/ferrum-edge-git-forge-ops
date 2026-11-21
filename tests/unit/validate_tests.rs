@@ -2394,11 +2394,9 @@ fn private_key_jwt_stand_ins_are_keys_of_the_selected_algorithm_family() {
 /// The key stand-in reaches the validator through the 0600 temp spec intact,
 /// and, like every stand-in, it is not a scrubber value: a multi-line PEM
 /// registered there would withhold every diagnostic. A wrapper that echoes
-/// the key from its input still never puts it in the report: its body is
-/// masked on its own, and the ordinary diagnostic beside it stays readable.
-/// (The echo is limited to the key's line: the literal `private_key_jwt_alg`
-/// beside it is a short heuristic secret, which withholds any output that
-/// repeats it.)
+/// its input still never puts the key in the report: its body is
+/// masked on its own, and the ordinary diagnostic beside it stays readable,
+/// even though the echoed spec also repeats the literal `private_key_jwt_alg`.
 #[cfg(unix)]
 #[test]
 fn a_private_key_stand_in_is_masked_in_echoed_output_without_withholding_it() {
@@ -2421,7 +2419,7 @@ mode=$(stat -c %a "$7" 2>/dev/null || stat -f %Lp "$7")
 [ "$mode" = 600 ] || { echo "error: spec mode $mode" >&2; exit 1; }
 grep -q 'BEGIN PRIVATE KEY' "$7" || { echo 'error: private_key_pem is invalid EC PEM' >&2; exit 1; }
 if grep -q 'gh-env-secret' "$7"; then echo 'error: placeholder reached the validator' >&2; exit 1; fi
-grep 'private_key_pem' "$7"
+cat "$7"
 sed -n 's/.*private_key_pem: //p' "$7" | sed 's/\\n/\n/g' >&2
 echo 'error: proxy httpbin: unknown field `listen_path_typo`' >&2
 exit 1

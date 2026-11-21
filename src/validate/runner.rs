@@ -424,7 +424,11 @@ fn run_gateway_validation(
 ) -> crate::error::Result<ValidationResult> {
     // Stand-ins are fabricated here and go no further than `spec_file` below.
     let standins = crate::validate::standin::with_validation_standins_for_report(config, report);
-    let yaml = crate::yaml::to_string(standins.as_ref().unwrap_or(config))?;
+    let yaml = crate::yaml::to_string(
+        standins
+            .as_ref()
+            .map_or(config, |standins| &standins.config),
+    )?;
     let mut namespaces = collect_namespaces(config);
     if namespaces.is_empty() {
         // Empty documents still need schema/settings validation. This does
@@ -441,7 +445,10 @@ fn run_gateway_validation(
     // One binary lookup and one private spec/settings pair serve every pass;
     // only `FERRUM_NAMESPACE` differs between them. The files are removed
     // when `prepared` drops, on every path including an early error return.
-    let prepared = prepare_validation(&yaml, binary_path)?;
+    let mut prepared = prepare_validation(&yaml, binary_path)?;
+    if let Some(standins) = &standins {
+        prepared.env_remove.extend_from_slice(&standins.env_remove);
+    }
     for namespace in namespaces {
         // Keep the full document: Edge owns both pre-filter field validation
         // and post-filter graph validation. Never opt out of its empty filter gate.
@@ -507,6 +514,10 @@ struct PreparedValidation {
     binary_in_use: String,
     spec_file: tempfile::NamedTempFile<std::fs::File>,
     settings_file: tempfile::NamedTempFile<std::fs::File>,
+    /// Inherited variables removed from the validator's environment on top of
+    /// [`scrubbed_env_names`], because the stand-in document depends on their
+    /// absence (see `validate::standin::StandinDocument::env_remove`).
+    env_remove: Vec<&'static str>,
 }
 
 /// First half of [`run_validation`] and [`run_mesh_validation`]: locate the
@@ -562,6 +573,7 @@ fn prepare_validation(yaml: &str, binary_path: &str) -> crate::error::Result<Pre
         binary_in_use,
         spec_file,
         settings_file,
+        env_remove: Vec::new(),
     })
 }
 
@@ -589,6 +601,9 @@ fn run_validate_pass(
         prepared.spec_file.path(),
     ));
     for name in scrubbed_env_names(std::env::vars_os().map(|(name, _)| name)) {
+        command.env_remove(name);
+    }
+    for name in &prepared.env_remove {
         command.env_remove(name);
     }
     // Order is load-bearing: every inherited `FERRUM_*` name is removed

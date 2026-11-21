@@ -847,3 +847,42 @@ fn real_edge_accepts_brokered_plugin_stand_ins() {
         );
     }
 }
+
+/// Leaving an ambient-credential Lambda override out of the validator copy
+/// must not let Edge fall back to the caller's `AWS_LAMBDA_ENDPOINT_URL`
+/// (Edge reads it whenever `aws_endpoint_url` is absent), so the variable is
+/// removed from the validator's environment then, and only then: a resolved
+/// override reaches the validator as configured, beside whatever the caller
+/// exported.
+#[test]
+fn an_omitted_lambda_override_does_not_inherit_the_endpoint_environment() {
+    let repo = Repo::new(&[], None, None);
+    repo.write(
+        "validator",
+        "#!/bin/sh\n[ \"$3\" = file ] || exit 0\necho \"env:${AWS_LAMBDA_ENDPOINT_URL-unset}\"\nif grep -q aws_endpoint_url \"$7\"; then echo override:present; else echo override:absent; fi\nexit 0\n",
+    );
+    let lambda = |endpoint: &str| {
+        format!(
+            "kind: PluginConfig\nspec:\n  id: lambda\n  plugin_name: serverless_function\n  scope: global\n  config:\n    provider: aws_lambda\n    aws_credentials: default_chain\n    aws_region: us-east-1\n    aws_function_name: fn\n    aws_endpoint_url: '{endpoint}'\n"
+        )
+    };
+    let inherited = [("AWS_LAMBDA_ENDPOINT_URL", "http://localhost:4566/lambda")];
+
+    repo.write(
+        "resources/ferrum/plugins/lambda.yaml",
+        &lambda("${gh-env-secret:alloc=require}"),
+    );
+    let output = repo.run(&["validate"], &inherited);
+    let text = output_text(&output);
+    assert!(text.contains("env:unset"), "{text}");
+    assert!(text.contains("override:absent"), "{text}");
+
+    repo.write(
+        "resources/ferrum/plugins/lambda.yaml",
+        &lambda("https://lambda-fips.us-east-1.amazonaws.com"),
+    );
+    let output = repo.run(&["validate"], &inherited);
+    let text = output_text(&output);
+    assert!(text.contains("env:http://localhost:4566/lambda"), "{text}");
+    assert!(text.contains("override:present"), "{text}");
+}

@@ -54,9 +54,10 @@ impl ClientKeyFamily {
     ///
     /// Spelled exactly as Edge matches them (v0.9.20 and later accept
     /// `RS256`, `RS384`, `RS512`, `ES256`, `ES384` and `EdDSA`). Anything else
-    /// gets an RSA key: absent or `null` selects Edge's `RS256` default, and
-    /// Edge refuses an unsupported or non-string algorithm before it reads the
-    /// key, so the validator reports the algorithm itself, which is the
+    /// gets an RSA key: absent selects Edge's `RS256` default (so does `null`
+    /// or a non-string for `oidc_relying_party` v0.9.20, while
+    /// `oauth2_introspection` refuses those), and Edge refuses an unsupported
+    /// or non-string algorithm before it reads the key, so the validator reports the algorithm itself, which is the
     /// verdict the configuration deserves. Failing here instead would hide
     /// that diagnostic behind a GitForgeOps error.
     pub(crate) fn for_alg(alg: Option<&str>) -> Self {
@@ -101,37 +102,62 @@ static KEYS: [OnceLock<Option<String>>; 4] = [
 /// Text that replaces a generated key's body in captured validator output.
 pub(crate) const GENERATED_KEY_MASK: &str = "[VALIDATION-STANDIN-KEY]";
 
-/// Shortest PEM body line masked on its own. A key's last base64 line can be
-/// a few characters long (`AA==`), short enough to occur in ordinary text;
-/// every other line is the full 64 characters.
-const MIN_MASKED_LINE: usize = 16;
+/// Shortest base64 run masked. A key's last line, after any rewrapping, can
+/// be a few characters long (`AA==`); a run this short could occur in
+/// ordinary text, and leaving at most 15 characters of a synthetic key is
+/// harmless. Every longer run of the key is masked.
+const MIN_MASKED_RUN: usize = 16;
 
 /// `text` with the body of every key this process generated masked.
 ///
-/// The temp spec renders a key as one quoted YAML line with `\n` escapes; a
-/// wrapper echoing that line, the PEM itself, a block scalar or JSON keeps the
-/// same 64-character base64 lines. So the contiguous body (a re-encoding that
-/// dropped the line breaks) is masked first, then each body line. Families
+/// The output is split into maximal runs of base64 characters (`A-Z`, `a-z`,
+/// `0-9`, `+`, `/`; padding `=` ends a run, so `der=MII...` still splits),
+/// and every run of at least [`MIN_MASKED_RUN`] characters that occurs in a
+/// generated key's body is masked. That covers the raw PEM, the quoted YAML
+/// line with `\n` escapes in the temp spec (the escape's `n` is dropped
+/// from the run after a backslash), JSON, block scalars, a body rewrapped at
+/// any width or indentation, and one with its line breaks removed. Families
 /// never generated cost nothing.
 pub(crate) fn mask_generated_keys(text: &str) -> String {
-    let mut masked = text.to_string();
-    for pem in KEYS.iter().filter_map(|key| key.get()?.as_deref()) {
-        let lines: Vec<&str> = pem
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect();
-        let needles = std::iter::once(lines.concat()).chain(
-            lines
-                .iter()
-                .filter(|line| line.len() >= MIN_MASKED_LINE)
-                .map(|line| line.to_string()),
-        );
-        for needle in needles {
-            if masked.contains(&needle) {
-                masked = masked.replace(&needle, GENERATED_KEY_MASK);
-            }
+    let bodies: Vec<String> = KEYS
+        .iter()
+        .filter_map(|key| key.get()?.as_deref())
+        .map(|pem| {
+            pem.lines()
+                .filter(|line| !line.starts_with("-----"))
+                .collect::<String>()
+        })
+        .collect();
+    if bodies.is_empty() {
+        return text.to_string();
+    }
+    let is_base64 = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/';
+    let bytes = text.as_bytes();
+    let mut masked = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if !is_base64(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let mut start = index;
+        while index < bytes.len() && is_base64(bytes[index]) {
+            index += 1;
+        }
+        // `\n`, `\r`, `\t` escapes: the letter belongs to the escape.
+        if start > 0 && bytes[start - 1] == b'\\' && matches!(bytes[start], b'n' | b'r' | b't') {
+            start += 1;
+        }
+        // Every byte of a run is ASCII, so both ends are char boundaries.
+        let run = &text[start..index];
+        if run.len() >= MIN_MASKED_RUN && bodies.iter().any(|body| body.contains(run)) {
+            masked.push_str(&text[copied..start]);
+            masked.push_str(GENERATED_KEY_MASK);
+            copied = index;
         }
     }
+    masked.push_str(&text[copied..]);
     masked
 }
 
@@ -234,14 +260,22 @@ mod tests {
             serde_json::to_string(pem).expect("JSON"),
             format!("key: |\n  {}", pem.replace('\n', "\n  ")),
             format!("der={}", body.concat()),
+            // Rewrapped at 48 columns and indented.
+            body.concat()
+                .as_bytes()
+                .chunks(48)
+                .map(|chunk| format!("    {}\n", String::from_utf8_lossy(chunk)))
+                .collect::<String>(),
         ];
         for (index, rendering) in renderings.iter().enumerate() {
             let masked = mask_generated_keys(rendering);
             assert!(
-                body.iter()
-                    .filter(|line| line.len() >= MIN_MASKED_LINE)
-                    .all(|line| !masked.contains(line)),
-                "rendering {index} left a key line unmasked"
+                body.concat()
+                    .as_bytes()
+                    .chunks(MIN_MASKED_RUN)
+                    .filter(|chunk| chunk.len() == MIN_MASKED_RUN)
+                    .all(|chunk| !masked.contains(&*String::from_utf8_lossy(chunk))),
+                "rendering {index} left key material unmasked"
             );
             assert!(masked.contains(GENERATED_KEY_MASK), "rendering {index}");
         }

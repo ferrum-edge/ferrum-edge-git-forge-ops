@@ -729,9 +729,12 @@ pub(crate) fn classify_plugin_config(
     let mut heuristic = BTreeSet::new();
     collect_heuristic_paths(config, &root, &mut heuristic, true);
     collect_credential_named_parameters(plugin_name, config, &mut heuristic);
+    let selectors = enumerated_selector_paths(plugin_name, config);
     let unbrokered = heuristic
         .into_iter()
-        .filter(|path| !sensitive.contains(path) && !ordinary.contains(path))
+        .filter(|path| {
+            !sensitive.contains(path) && !ordinary.contains(path) && !selectors.contains(path)
+        })
         .collect();
     PluginConfigClassification {
         sensitive: sensitive.into_iter().collect(),
@@ -878,6 +881,69 @@ pub(crate) fn export_redacted_paths(
     }
     for path in export_only_rules_for(plugin_name) {
         walk_rule(config, path, &[], &mut site);
+    }
+    for (_, path, _) in ENUMERATED_SELECTORS
+        .iter()
+        .filter(|(plugin, _, _)| *plugin == plugin_name)
+    {
+        walk_rule(config, path, &[], &mut site);
+    }
+    found
+}
+
+/// The algorithms Edge v0.9.20 and later accept for a `private_key_jwt`
+/// client assertion (`private_key_jwt_alg`), matched exactly.
+const CLIENT_ASSERTION_ALGORITHMS: &[&str] =
+    &["RS256", "RS384", "RS512", "ES256", "ES384", "EdDSA"];
+
+/// Enumerated settings whose key names trip the credential heuristics
+/// (`private_key_jwt_alg` contains `privatekey`, `aws_credentials` contains
+/// `credential`), with the exact values Edge accepts there.
+///
+/// Holding one of those values, the leaf is an ordinary setting: import keeps
+/// it literal without a plaintext allowance, the literal-secret gate lets it
+/// through, and the validator-output scrubber does not hold `ES256` as a
+/// secret. Brokering one could never work: every algorithm name is shorter
+/// than the broker's 8-byte minimum, and an opaque validator stand-in is not
+/// a value Edge's exact match accepts, so the gate used to demand something
+/// impossible of exactly the rows a brokered `private_key_pem` or Lambda
+/// endpoint stand-in validates. Any other value (a pasted key, a typo) still
+/// falls to the heuristics, fail closed. Edge fingerprints these fields in
+/// `/config/export` by name whatever their value, so they stay export sites
+/// ([`export_redacted_paths`]).
+const ENUMERATED_SELECTORS: &[(&str, &[&str], &[&str])] = &[
+    (
+        "oauth2_introspection",
+        &["providers", "*", "client_auth", CLIENT_ASSERTION_ALG_FIELD],
+        CLIENT_ASSERTION_ALGORITHMS,
+    ),
+    (
+        "oidc_relying_party",
+        &["providers", "*", "client_auth", CLIENT_ASSERTION_ALG_FIELD],
+        CLIENT_ASSERTION_ALGORITHMS,
+    ),
+    (
+        "serverless_function",
+        &["aws_credentials"],
+        &["static", "default_chain"],
+    ),
+];
+
+/// [`ENUMERATED_SELECTORS`] leaves of this plugin that hold an accepted value.
+fn enumerated_selector_paths(
+    plugin_name: &str,
+    config: &Value,
+) -> BTreeSet<Vec<ConfigPathComponent>> {
+    let mut found = BTreeSet::new();
+    for (_, path, accepted) in ENUMERATED_SELECTORS
+        .iter()
+        .filter(|(plugin, _, _)| *plugin == plugin_name)
+    {
+        walk_rule(config, path, &[], &mut |node, at, complete| {
+            if complete && node.as_str().is_some_and(|value| accepted.contains(&value)) {
+                found.insert(at.to_vec());
+            }
+        });
     }
     found
 }
@@ -2457,6 +2523,69 @@ mod tests {
         assert!(client_assertion_key_paths("jwks_auth", &config).is_empty());
         assert!(
             client_assertion_key_paths("oidc_relying_party", &serde_json::json!(null)).is_empty()
+        );
+    }
+
+    /// `private_key_jwt_alg` and `aws_credentials` trip the key-name
+    /// heuristics, but holding a value Edge accepts they are ordinary
+    /// settings (never brokerable: every algorithm name is under the broker's
+    /// 8-byte minimum). They stay export sites, since Edge fingerprints them by
+    /// name; any other value still falls to the heuristics.
+    #[test]
+    fn enumerated_selectors_are_settings_but_remain_export_sites() {
+        for (plugin, config, path) in [
+            (
+                "oauth2_introspection",
+                serde_json::json!({"providers": [{"client_auth": {"private_key_jwt_alg": "ES256"}}]}),
+                "providers.[0].client_auth.private_key_jwt_alg",
+            ),
+            (
+                "oidc_relying_party",
+                serde_json::json!({"providers": [{"client_auth": {"private_key_jwt_alg": "EdDSA"}}]}),
+                "providers.[0].client_auth.private_key_jwt_alg",
+            ),
+            (
+                "serverless_function",
+                serde_json::json!({"aws_credentials": "default_chain"}),
+                "aws_credentials",
+            ),
+        ] {
+            let classification = classify_plugin_config(plugin, &config);
+            assert!(classification.unbrokered.is_empty(), "{plugin}");
+            assert!(
+                sensitive_string_paths(plugin, &config).is_empty(),
+                "{plugin}"
+            );
+            assert!(
+                dotted(export_redacted_paths(plugin, &config).into_iter().collect())
+                    .contains(&path.to_string()),
+                "{plugin}"
+            );
+        }
+        // A value Edge would refuse is not a known setting: fail closed.
+        for (plugin, config) in [
+            (
+                "oidc_relying_party",
+                serde_json::json!({"providers": [{"client_auth": {"private_key_jwt_alg": "synthetic-pasted-key-material"}}]}),
+            ),
+            (
+                "serverless_function",
+                serde_json::json!({"aws_credentials": "AKIASYNTHETICVALUE"}),
+            ),
+        ] {
+            assert_eq!(
+                classify_plugin_config(plugin, &config).unbrokered.len(),
+                1,
+                "{plugin}"
+            );
+        }
+        // Only the named plugins: another plugin's same-named key is unchanged.
+        let other = serde_json::json!({"aws_credentials": "static"});
+        assert_eq!(
+            classify_plugin_config("ai_federation", &other)
+                .unbrokered
+                .len(),
+            1
         );
     }
 

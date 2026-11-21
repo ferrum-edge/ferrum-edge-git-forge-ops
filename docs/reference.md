@@ -409,10 +409,11 @@ gets a fake value of the right shape:
 
 The scheme follows the field (`ldaps://`, `redis://`, `wss://` for
 `ws_logging`, otherwise `https://`). The shapes follow the gateway's own
-checks: a Redis URL path must be a database number, an AWS Lambda endpoint
-override must be a bare origin, and a `google_gemini` endpoint must carry the
-`{model}` placeholder, so those carry the per-slot hash in a host label or
-before the placeholder instead. Edge parses a `private_key_jwt` key and signs
+checks: a Redis URL path must be empty, `/` or a database number, an AWS
+Lambda endpoint override must be a bare origin, and a `google_gemini` endpoint
+must carry the `{model}` placeholder (or name its single exact model), so
+those carry the per-slot hash in a host label or before the placeholder
+instead. Edge parses a `private_key_jwt` key and signs
 a test assertion with it at admission, so its stand-in is a real key generated
 for the run (RSA 2048 for `RS256`/`RS384`/`RS512` and when the algorithm is
 unset or unsupported, P-256 for `ES256`, P-384 for `ES384`, Ed25519 for
@@ -425,9 +426,17 @@ A Lambda row that signs with ambient AWS credentials (`aws_credentials:
 default_chain`, or either key left to the environment) may only use an
 official regional endpoint, which no stand-in can be. Unless
 `allow_custom_endpoint_with_ambient_credentials` is `true`, its unresolved
-`aws_endpoint_url` is left out of the temporary file, so the gateway checks
-the row against its default endpoint; the real endpoint is checked when it is
-resolved.
+`aws_endpoint_url` is left out of the temporary file, and
+`AWS_LAMBDA_ENDPOINT_URL` is removed from the validator's environment for that
+run, so the gateway checks the row against its default endpoint; the real
+endpoint is checked when it is resolved.
+
+`private_key_jwt_alg` and `aws_credentials` look like credentials by name, but
+when they hold a value the gateway accepts (`RS256`, `RS384`, `RS512`,
+`ES256`, `ES384`, `EdDSA`; `static`, `default_chain`) they are ordinary
+settings: import keeps them, the literal-secret check passes them, and they
+are not scrubbed from validator output. Any other value is still treated as a
+possible secret.
 
 Resolved values are always validated unchanged. Stand-ins are never exported,
 applied, delivered or stored.
