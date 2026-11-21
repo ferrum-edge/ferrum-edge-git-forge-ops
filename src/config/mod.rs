@@ -1,5 +1,6 @@
 pub mod assembler;
 pub mod env;
+pub(crate) mod json_object;
 pub mod loader;
 pub mod namespace_guard;
 pub mod repo_config;

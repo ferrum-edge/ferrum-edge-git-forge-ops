@@ -539,7 +539,9 @@ with the admin credential.
   non-secret contents, so those are counted separately and keep the run
   non-authoritative (see exit codes above). The fingerprinted locations
   GitForgeOps predicts also cover what Ferrum Edge releases after v0.9.20
-  withhold: the `header`, `query` and `cookie` operands of a plugin `trigger`,
+  withhold: the `header`, `query` and `cookie` operands of a plugin `trigger`
+  (its other predicates, including `external_identity` and
+  `external_identity_authority`, stay visible and are compared),
   every string, number or boolean in a custom plugin's config, newer built-in
   plugin paths, and TLS private-key material in a Proxy, Upstream or plugin
   config; a gateway that still sends those values is compared as usual. Edge
