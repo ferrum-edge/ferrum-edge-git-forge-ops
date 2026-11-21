@@ -1258,7 +1258,6 @@ fn malformed_broker_declarations_at_tls_key_sources_are_refused() {
 #[cfg(unix)]
 #[test]
 fn materialize_refuses_a_malformed_tls_key_declaration_before_output() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let proxy_yaml = format!(
         "kind: Proxy\nspec:\n  id: edge\n  listen_path: /edge\n  backend_scheme: https\n  backend_host: backend.internal\n  backend_port: 443\n  backend_tls_client_cert_path: {CERT_PATH}\n  backend_tls_client_key_path: '${{gh-env-secret:alloc=require|len=40'\n"
@@ -1266,39 +1265,47 @@ fn materialize_refuses_a_malformed_tls_key_declaration_before_output() {
     let path = dir.path().join("resources/ferrum/proxies/edge.yaml");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, proxy_yaml).unwrap();
-    let validator = dir.path().join("ferrum-edge-stub");
-    std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
     let bundle = serde_json::json!({"FERRUM_CREDS_BUNDLE": {
         PROXY_SLOT: synthetic_key("zq7-materialize-seed")
     }})
     .to_string();
+    let output = run_materialize(dir.path(), &bundle);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(PROXY_SLOT), "{stderr}");
+    assert!(!stderr.contains(&body("zq7-materialize-seed")), "{stderr}");
+    assert!(!dir.path().join("export.yaml").exists());
+}
 
+/// `gitforgeops export --materialize --output export.yaml` in `repo`, file
+/// mode, hermetic, with `bundle` as `FERRUM_CREDS_JSON`.
+#[cfg(unix)]
+fn run_materialize(repo: &std::path::Path, bundle: &str) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    let validator = repo.join("ferrum-edge-stub");
+    std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = repo;
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
     command
         .args(["export", "--materialize", "--output", "export.yaml"])
-        .current_dir(dir.path())
+        .current_dir(dir)
         .env_clear();
     for name in ["PATH", "HOME", "TMPDIR"] {
         if let Ok(value) = std::env::var(name) {
             command.env(name, value);
         }
     }
-    let output = command
+    command
         .env("FERRUM_GATEWAY_MODE", "file")
         .env(
             "FERRUM_FILE_OUTPUT_PATH",
-            dir.path().join("published/resources.yaml"),
+            dir.join("published/resources.yaml"),
         )
         .env("FERRUM_EDGE_BINARY_PATH", &validator)
-        .env("FERRUM_CREDS_JSON", &bundle)
+        .env("FERRUM_CREDS_JSON", bundle)
         .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{stderr}");
-    assert!(stderr.contains(PROXY_SLOT), "{stderr}");
-    assert!(!stderr.contains(&body("zq7-materialize-seed")), "{stderr}");
-    assert!(!dir.path().join("export.yaml").exists());
+        .unwrap()
 }
 
 /// A schema-declared signing key (`client_auth.private_key_pem`) may carry
@@ -1381,4 +1388,120 @@ fn non_object_plugin_config_roots_refuse_certificate_bundles_on_import() {
     );
     assert!(!output.exists());
     assert!(!bundle_path.exists());
+}
+
+const CONSUL_SLOT: &str = "ferrum/edge/@service-discovery/consul/token";
+
+fn consul_upstream(token: &str) -> serde_json::Value {
+    upstream(serde_json::json!({
+        "targets": [],
+        "service_discovery": {"provider": "consul", "consul": {
+            "address": "https://consul.internal:8501",
+            "service_name": "edge",
+            "token": token,
+        }}
+    }))
+}
+
+/// Key material in a field another capture brokers (a Consul token) is
+/// refused on the original Upstream before any capture replaces it, and a
+/// discovery seed holding key material is refused before publication.
+#[test]
+fn key_material_in_a_discovery_token_is_refused_on_import() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let bundled = format!(
+        "{}{}",
+        synthetic_cert("public-consul-cert"),
+        synthetic_key("zq7-consul-bundled-key")
+    );
+    let original = gateway(serde_json::json!({"upstreams": [consul_upstream(&bundled)]}));
+    std::fs::write(
+        &backup_path,
+        gitforgeops::yaml::to_string(&original).unwrap(),
+    )
+    .unwrap();
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+    let message = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &gitforgeops::import::ImportPassthroughPolicy::strict(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        message.contains("service_discovery.consul.token"),
+        "{message}"
+    );
+    assert!(
+        !message.contains(&body("zq7-consul-bundled-key")),
+        "{message}"
+    );
+    assert!(!output.exists());
+    assert!(!bundle_path.exists());
+
+    let mut brokered = gateway(serde_json::json!({"upstreams": [consul_upstream(PLACEHOLDER)]}));
+    let seeds = BTreeMap::from([(CONSUL_SLOT.to_string(), bundled)]);
+    let message = super::resolver_fixtures::resolve_secrets(&mut brokered, &seeds)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains(CONSUL_SLOT), "{message}");
+    assert!(
+        !message.contains(&body("zq7-consul-bundled-key")),
+        "{message}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn materialize_refuses_key_material_seeded_for_a_discovery_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream_yaml = "kind: Upstream\nspec:\n  id: edge\n  targets: []\n  service_discovery:\n    provider: consul\n    consul:\n      address: https://consul.internal:8501\n      service_name: edge\n      token: '${gh-env-secret:alloc=require}'\n";
+    let path = dir.path().join("resources/ferrum/upstreams/edge.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, upstream_yaml).unwrap();
+    let bundle = serde_json::json!({"FERRUM_CREDS_BUNDLE": {
+        CONSUL_SLOT: format!("{}{}", synthetic_cert("public-consul-cert"), synthetic_key("zq7-consul-seed"))
+    }})
+    .to_string();
+    let output = run_materialize(dir.path(), &bundle);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(CONSUL_SLOT), "{stderr}");
+    assert!(!stderr.contains(&body("zq7-consul-seed")), "{stderr}");
+    assert!(!dir.path().join("export.yaml").exists());
+}
+
+/// A well-formed broker declaration at the backend key field that carries a
+/// line break the placeholder parser trims is a declaration, not key
+/// material: the audit passes it and the resolver resolves it.
+#[test]
+fn multiline_broker_declarations_at_the_backend_key_field_are_declarations() {
+    let declaration = "${gh-env-secret:\n  alloc=require}";
+    assert!(matches!(
+        gitforgeops::secrets::parse_placeholder(declaration),
+        Some(Ok(_))
+    ));
+    let cfg = gateway(serde_json::json!({"proxies": [proxy(serde_json::json!({
+        "backend_tls_client_cert_path": CERT_PATH,
+        "backend_tls_client_key_path": declaration,
+    }))]}));
+    let findings = audit_security(&cfg);
+    assert!(
+        !findings
+            .iter()
+            .any(|finding| finding.message.contains("TLS private key")),
+        "{findings:?}"
+    );
+    let mut resolved = cfg.clone();
+    let seeds = BTreeMap::from([(PROXY_SLOT.to_string(), synthetic_key("zq7-multiline-seed"))]);
+    super::resolver_fixtures::resolve_secrets(&mut resolved, &seeds).unwrap();
+    assert_eq!(
+        resolved.proxies[0].backend_tls_client_key_path.as_deref(),
+        Some(seeds[PROXY_SLOT].as_str())
+    );
 }

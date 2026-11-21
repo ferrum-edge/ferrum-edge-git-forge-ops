@@ -809,6 +809,16 @@ fn check_literal_backend_private_keys(config: &GatewayConfig, findings: &mut Vec
         let kind = row.owner.kind();
         let noun = kind.to_ascii_lowercase();
         for site in private_key_sites(&row.body) {
+            // A well-formed broker declaration at the brokered field (even one
+            // with a line break the placeholder parser trims) is not material.
+            if crate::secrets::backend_tls::is_brokered_site(&site.path)
+                && matches!(
+                    crate::secrets::plugin_config::value_at(&row.body, &site.path),
+                    Some(serde_json::Value::String(text)) if is_broker_placeholder(text)
+                )
+            {
+                continue;
+            }
             let path = render_config_path(&site.path);
             let remedy = if crate::secrets::backend_tls::is_brokered_site(&site.path) {
                 "use ${gh-env-secret:alloc=require} and seed the derived broker slot with the PEM key, or reference a key file"

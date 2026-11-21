@@ -528,6 +528,9 @@ pub(crate) fn split_config_with_inventory(
     reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
     reject_import_unknown_credential_types(&safe_config)?;
     let acknowledged_passthrough = acknowledged_passthrough_review(&safe_config);
+    // Before any capture replaces a leaf: a key in a field another capture
+    // would broker (a Consul token) must be refused, not captured.
+    crate::secrets::reject_unbrokerable_backend_private_keys(&safe_config)?;
     let captured_credentials = capture_and_redact_import_credentials(&mut safe_config)?;
     let plugin_capture = capture_and_redact_import_plugin_config_secrets(&mut safe_config)?;
     let captured_discovery = capture_and_redact_import_service_discovery_secrets(&mut safe_config)?;

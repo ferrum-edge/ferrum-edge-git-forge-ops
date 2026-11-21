@@ -187,8 +187,10 @@ be named `private_key` keeps its ordinary handling.
   top-level field (even an acknowledged one) is never brokered: the value also
   holds a certificate that must stay reviewable, or the field is unmodeled. `import` refuses it, naming the
   resource and field, and no plaintext allowance applies. Remove the key block
-  from that field on the gateway (Edge reads only the certificates there) and
-  re-run.
+  from that field on the gateway and re-run. Edge's backend and DTLS
+  certificate loaders read only the certificate records there, and some fields
+  (`mtls_auth` `ca_certificate_pem`) reject any extra record, so the key block
+  is not needed.
 - `import` also refuses `[REDACTED]` in a TLS material field: the backup was
   read through a redacting endpoint.
 - A committed inline key, in any of these places, is a blocking finding.
@@ -198,8 +200,10 @@ be named `private_key` keeps its ordinary handling.
   CLI displays are scrubbed of the key, including its LF and CRLF spellings
   and each encoded body line; because a PEM block is multi-line, validator
   diagnostics are withheld while one is resolved.
-- The broker never generates a TLS key (`alloc=generate` is refused): it must
-  match the configured certificate. Seed the slot with the PEM key. A seed is
+- The broker never generates a TLS key: `alloc=generate` or `alloc=rotate`
+  is refused when the slot has no value, because the key must match the
+  configured certificate (an existing seed is reused under either label).
+  Seed the slot with the PEM key. A seed is
   checked like a literal: placeholder text at a key slot, or a
   certificate-plus-key bundle seeded for a certificate field or an ordinary
   plugin string, is refused, naming the slot but never the value. A

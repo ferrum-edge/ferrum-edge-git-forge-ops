@@ -1297,8 +1297,10 @@ pub fn capture_and_redact_import_backend_tls_keys(
 }
 
 /// Refuse private-key material in a Proxy or Upstream field the broker does
-/// not hold (see [`capture_and_redact_import_backend_tls_keys`]).
-fn reject_unbrokerable_backend_private_keys(cfg: &GatewayConfig) -> crate::error::Result<()> {
+/// not hold (see [`capture_and_redact_import_backend_tls_keys`]). Import runs
+/// it on the original document before any capture replaces a leaf, so a key
+/// in a field another capture brokers (a Consul token) is refused too.
+pub fn reject_unbrokerable_backend_private_keys(cfg: &GatewayConfig) -> crate::error::Result<()> {
     let mut refused = Vec::new();
     for row in super::backend_tls::resource_bodies(cfg)? {
         if row.api_spec_owned {
@@ -1331,7 +1333,7 @@ fn reject_unbrokerable_backend_private_keys(cfg: &GatewayConfig) -> crate::error
         return Ok(());
     }
     Err(crate::error::Error::Config(format!(
-        "refusing to import TLS private-key material outside backend_tls_client_key_path; it would be committed to the repository as written. Edge reads only the certificates from a certificate or CA field, so remove the private-key block from these fields on the gateway (keep the key in backend_tls_client_key_path, which import brokers, or reference a key file), then re-run import. Nothing has been written.\n  {}",
+        "refusing to import TLS private-key material outside backend_tls_client_key_path; it would be committed to the repository as written. Edge's backend certificate loaders read only the certificate records from a certificate or CA field, so remove the private-key block from these fields on the gateway (keep the key in backend_tls_client_key_path, which import brokers, or reference a key file), then re-run import. Nothing has been written.\n  {}",
         refused.join("\n  ")
     )))
 }
@@ -2667,6 +2669,14 @@ fn resolve_service_discovery_leaf(
     let placeholder = parsed?;
     let slot = service_discovery::slot(namespace, upstream_id, field.path);
     let existing = lookup_exact_slot_value(&slot, bundle)?;
+    // A discovery credential is never TLS key material; the audit refuses the
+    // same value as a literal anywhere in an Upstream outside its key field.
+    if existing.is_some_and(|value| super::tls_material::is_private_key_material(value, None)) {
+        return Err(crate::error::Error::Config(format!(
+            "secret slot '{slot}' holds TLS private-key material, which a service-discovery \
+             credential never is; re-seed the slot with the provider's token"
+        )));
+    }
     let status = classify_status(&placeholder, existing);
 
     if matches!(constraints, ConstraintMode::Enforce)
