@@ -207,6 +207,8 @@ class RealDockerfileTests(unittest.TestCase):
                     "amd64": "1.3.dfsg+really1.3.1-1+deb13u1",
                     "arm64": "1.3.dfsg+really1.3.1-1+deb13u1",
                 },
+                "libc6": {"amd64": "2.41-12+deb13u5", "arm64": "2.41-12+deb13u5"},
+                "libc-bin": {"amd64": "2.41-12+deb13u5", "arm64": "2.41-12+deb13u5"},
             },
         )
         self.assertEqual(
@@ -218,18 +220,38 @@ class RealDockerfileTests(unittest.TestCase):
                 ("liblzma5", "arm64"): "88f3aa499dc30edf01b9209ab40f11e37edfbecef971f84f4721de1874ed4827",
                 ("zlib1g", "amd64"): "8c27c342230503b73dfde629642c3b352e87b554e06d60cf58772f236a305ceb",
                 ("zlib1g", "arm64"): "0e41b3d7ad8ad7fcd36dd4d61ca91a70018478fc4af652e044f4be770784ddff",
+                ("libc6", "amd64"): "b59b0625cd1a791375d40dab23a4d5d3d0641e3d0a773501becdc3725b7f99cf",
+                ("libc6", "arm64"): "0966fc3da1a26cc57647c68b5736f791b6e7eb498173a7993f63b6c89b4ed4f5",
+                ("libc-bin", "amd64"): "f30ee7381a9c6a3936165259bcd58e65f4b288e351606d200c8435724c5876dd",
+                ("libc-bin", "arm64"): "889850625c686a6d0b26a8baee5fb96f33e9f3305882f3a6751bb4c9433063e1",
             },
         )
         self.assertEqual(
             self.pin.pools,
             {
-                "libpcre2-8-0": "pool/updates/main/p/pcre2",
-                "liblzma5": "pool/updates/main/x/xz-utils",
-                "zlib1g": "pool/updates/main/z/zlib",
+                "libpcre2-8-0": "debian-security/pool/updates/main/p/pcre2",
+                "liblzma5": "debian-security/pool/updates/main/x/xz-utils",
+                "zlib1g": "debian-security/pool/updates/main/z/zlib",
+                # Debian 13.8 shipped the glibc fixes through the main archive.
+                "libc6": "debian/pool/main/g/glibc",
+                "libc-bin": "debian/pool/main/g/glibc",
             },
         )
         self.assertEqual(self.pin.epochs, {"zlib1g": 1})
-        self.assertEqual(self.pin.mirror, "https://deb.debian.org/debian-security/")
+        self.assertEqual(self.pin.mirror, "https://deb.debian.org/")
+        self.assertEqual(
+            self.pin.url_for(
+                next(package for package in self.pin.packages if package.name == "libc6")
+            ),
+            "https://deb.debian.org/debian/pool/main/g/glibc/libc6_2.41-12+deb13u5_amd64.deb",
+        )
+        self.assertEqual(
+            self.pin.url_for(
+                next(package for package in self.pin.packages if package.name == "zlib1g")
+            ),
+            "https://deb.debian.org/debian-security/pool/updates/main/z/zlib/"
+            "zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_amd64.deb",
+        )
         instructions = "\n".join(
             line
             for line in (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines()
