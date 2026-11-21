@@ -707,11 +707,14 @@ pub(crate) fn classify_plugin_config(
 
     if !config.is_null() && !config.is_object() {
         collect_string_paths(config, &root, &mut sensitive);
+        // Every string is brokered, except TLS material the broker must never
+        // hold, which import refuses here as it does under an object root.
+        let unbrokerable = classify_private_key_material(plugin_name, config, &mut sensitive);
         return PluginConfigClassification {
             sensitive: sensitive.into_iter().collect(),
             unbrokered: Vec::new(),
             short_credential_named: Vec::new(),
-            unbrokerable_private_keys: Vec::new(),
+            unbrokerable_private_keys: unbrokerable.into_iter().collect(),
         };
     }
 

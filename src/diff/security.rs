@@ -728,7 +728,7 @@ fn check_literal_plugin_config_secrets(plugin: &PluginConfig, findings: &mut Vec
         }
         let placement = match private_keys.get(&path).copied() {
             Some(KeyPlacement::Other)
-                if crate::secrets::tls_material::contains_public_pem_block(value) =>
+                if crate::secrets::tls_material::contains_certificate_block(value) =>
             {
                 Some(KeyPlacement::Certificate)
             }

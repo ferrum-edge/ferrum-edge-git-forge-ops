@@ -1213,3 +1213,172 @@ fn edge_certificate_sources_refuse_keys_and_sentinels() {
         assert_eq!(serde_json::to_value(&intact).unwrap(), before);
     }
 }
+
+/// A value at a TLS key source that carries the reserved broker prefix but
+/// does not parse (here a missing closing brace) is refused by both resolver
+/// walks and by import, naming the slot only: Edge would read it as a
+/// filesystem path.
+#[test]
+fn malformed_broker_declarations_at_tls_key_sources_are_refused() {
+    const MALFORMED: &str = "${gh-env-secret:alloc=require|len=40";
+    let proxy_cfg = gateway(serde_json::json!({"proxies": [proxy(serde_json::json!({
+        "backend_tls_client_cert_path": CERT_PATH,
+        "backend_tls_client_key_path": MALFORMED,
+    }))]}));
+    let dtls_cfg = gateway(
+        serde_json::json!({"plugin_configs": [plugin("udp_logging", serde_json::json!({
+            "host": "logs.internal", "port": 5514, "dtls": true,
+            "dtls_cert_path": CERT_PATH, "dtls_key_path": MALFORMED,
+        }))]}),
+    );
+    for (cfg, slot) in [(proxy_cfg, PROXY_SLOT), (dtls_cfg, DTLS_SLOT)] {
+        let bundle = BTreeMap::from([(slot.to_string(), synthetic_key("zq7-malformed-seed"))]);
+        for message in [
+            super::resolver_fixtures::resolve_secrets(&mut cfg.clone(), &bundle)
+                .unwrap_err()
+                .to_string(),
+            super::resolver_fixtures::report_secrets(&cfg, &bundle)
+                .unwrap_err()
+                .to_string(),
+            capture_all(&mut cfg.clone()).unwrap_err().to_string(),
+        ] {
+            assert!(message.contains(slot), "{message}");
+            assert!(message.contains("malformed"), "{message}");
+            assert!(!message.contains("len=40"), "{message}");
+        }
+    }
+
+    // An ordinary key path still resolves as a reference.
+    let mut cfg = reference_only_gateway();
+    super::resolver_fixtures::resolve_secrets(&mut cfg, &CredentialBundle::new()).unwrap();
+}
+
+/// `export --materialize` refuses a malformed declaration at a TLS key source
+/// before writing anything, even when the correctly named slot is seeded.
+#[cfg(unix)]
+#[test]
+fn materialize_refuses_a_malformed_tls_key_declaration_before_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let proxy_yaml = format!(
+        "kind: Proxy\nspec:\n  id: edge\n  listen_path: /edge\n  backend_scheme: https\n  backend_host: backend.internal\n  backend_port: 443\n  backend_tls_client_cert_path: {CERT_PATH}\n  backend_tls_client_key_path: '${{gh-env-secret:alloc=require|len=40'\n"
+    );
+    let path = dir.path().join("resources/ferrum/proxies/edge.yaml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, proxy_yaml).unwrap();
+    let validator = dir.path().join("ferrum-edge-stub");
+    std::fs::write(&validator, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bundle = serde_json::json!({"FERRUM_CREDS_BUNDLE": {
+        PROXY_SLOT: synthetic_key("zq7-materialize-seed")
+    }})
+    .to_string();
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_gitforgeops"));
+    command
+        .args(["export", "--materialize", "--output", "export.yaml"])
+        .current_dir(dir.path())
+        .env_clear();
+    for name in ["PATH", "HOME", "TMPDIR"] {
+        if let Ok(value) = std::env::var(name) {
+            command.env(name, value);
+        }
+    }
+    let output = command
+        .env("FERRUM_GATEWAY_MODE", "file")
+        .env(
+            "FERRUM_FILE_OUTPUT_PATH",
+            dir.path().join("published/resources.yaml"),
+        )
+        .env("FERRUM_EDGE_BINARY_PATH", &validator)
+        .env("FERRUM_CREDS_JSON", &bundle)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(PROXY_SLOT), "{stderr}");
+    assert!(!stderr.contains(&body("zq7-materialize-seed")), "{stderr}");
+    assert!(!dir.path().join("export.yaml").exists());
+}
+
+/// A schema-declared signing key (`client_auth.private_key_pem`) may carry
+/// its `PUBLIC KEY` record after the private key: that is a key, not a
+/// certificate-plus-key bundle, as a literal on import and as a seed.
+#[test]
+fn signing_keys_with_a_trailing_public_key_stay_brokerable() {
+    let signing_key = format!(
+        "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\n\
+         -----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        body("zq7-signing-key"),
+        body("public-signing-key")
+    );
+    for plugin_name in ["oidc_relying_party", "oauth2_introspection"] {
+        let literal = |value: &str| {
+            gateway(
+                serde_json::json!({"plugin_configs": [plugin(plugin_name, serde_json::json!({
+                    "providers": [{"client_auth": {"private_key_pem": value}}]
+                }))]}),
+            )
+        };
+        let slot = format!(
+            "ferrum/edge-plugin/@plugin/{plugin_name}/config/providers/[0]/client_auth/private_key_pem"
+        );
+        let mut cfg = literal(&signing_key);
+        let captured = capture_all(&mut cfg).unwrap();
+        assert_eq!(captured.get(&slot), Some(&signing_key), "{plugin_name}");
+
+        let mut brokered = literal(PLACEHOLDER);
+        let bundle = BTreeMap::from([(slot.clone(), signing_key.clone())]);
+        super::resolver_fixtures::resolve_secrets(&mut brokered, &bundle).unwrap();
+    }
+
+    // In an ordinary string a trailing public key is not a bundle either.
+    let mut cfg = gateway(
+        serde_json::json!({"plugin_configs": [plugin("acme_custom_tls", serde_json::json!({
+            "material": signing_key,
+        }))]}),
+    );
+    assert_eq!(capture_all(&mut cfg).unwrap().len(), 1);
+}
+
+/// A PluginConfig whose `config` is not an object still gets the TLS refusal:
+/// a certificate-plus-key bundle in a certificate field fails the import with
+/// no resource tree and no migration bundle written.
+#[test]
+fn non_object_plugin_config_roots_refuse_certificate_bundles_on_import() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let original = gateway(
+        serde_json::json!({"plugin_configs": [plugin("acme_custom_tls", serde_json::json!([
+            {"client_certificate": format!(
+                "{}{}",
+                synthetic_cert("public-array-cert"),
+                synthetic_key("zq7-array-bundled-key")
+            )}
+        ]))]}),
+    );
+    std::fs::write(
+        &backup_path,
+        gitforgeops::yaml::to_string(&original).unwrap(),
+    )
+    .unwrap();
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("migration.json");
+    let message = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &gitforgeops::import::ImportPassthroughPolicy::strict(),
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(message.contains("TLS private-key material"), "{message}");
+    assert!(
+        !message.contains(&body("zq7-array-bundled-key")),
+        "{message}"
+    );
+    assert!(!output.exists());
+    assert!(!bundle_path.exists());
+}

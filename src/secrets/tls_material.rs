@@ -113,6 +113,22 @@ const PLUGIN_KEY_SOURCES: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Plugin-config signing keys declared as broker secret rules
+/// (`providers[].client_auth.private_key_pem`, used for `private_key_jwt`).
+/// They get key placement, so a private key followed by its `PUBLIC KEY`
+/// record is a key, not a refused bundle. Their validator stand-in and
+/// generation rules stay those of an ordinary declared secret.
+const PLUGIN_SIGNING_KEY_SOURCES: &[(&str, &[&str])] = &[
+    (
+        "oidc_relying_party",
+        &["providers", "*", "client_auth", "private_key_pem"],
+    ),
+    (
+        "oauth2_introspection",
+        &["providers", "*", "client_auth", "private_key_pem"],
+    ),
+];
+
 /// Plugin-config certificate and CA sources Edge declares by schema
 /// (`certificate_source`) beyond the names [`tls_material_field`] knows.
 const PLUGIN_CERTIFICATE_SOURCES: &[(&str, &[&str])] = &[
@@ -167,7 +183,7 @@ pub(crate) enum KeyPlacement {
     /// secretless validator stand-in can reproduce.
     Certificate,
     /// Any other string. Brokered unless it also carries a certificate
-    /// ([`contains_public_pem_block`]).
+    /// ([`contains_certificate_block`]).
     Other,
 }
 
@@ -248,10 +264,69 @@ pub(crate) fn passthrough_private_key_sites(
         .collect()
 }
 
+/// Whether `value` starts with the reserved broker prefix
+/// (`${gh-env-secret:`, ignoring case and surrounding whitespace) but is not
+/// a well-formed placeholder, for example one missing its closing brace. At a
+/// TLS key source Edge would read such text as a filesystem path, so it is
+/// refused rather than kept as a reference.
+pub(crate) fn is_malformed_broker_declaration(value: &str) -> bool {
+    const PREFIX: &str = "${gh-env-secret:";
+    let trimmed = value.trim();
+    let prefixed = trimmed
+        .get(..PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX));
+    prefixed && !matches!(super::placeholder::parse_placeholder(value), Some(Ok(_)))
+}
+
+/// Every string at a plugin key source ([`KeyPlacement::KeySource`]) that is
+/// a malformed broker declaration ([`is_malformed_broker_declaration`]).
+pub(crate) fn malformed_key_source_declarations(
+    plugin_name: &str,
+    config: &Value,
+) -> Vec<Vec<ConfigPathComponent>> {
+    fn walk(
+        plugin_name: &str,
+        value: &Value,
+        path: &mut Vec<ConfigPathComponent>,
+        out: &mut Vec<Vec<ConfigPathComponent>>,
+    ) {
+        match value {
+            Value::String(text) => {
+                if is_malformed_broker_declaration(text)
+                    && plugin_placement(plugin_name, path) == KeyPlacement::KeySource
+                {
+                    out.push(path.clone());
+                }
+            }
+            Value::Object(map) => {
+                for (key, child) in map {
+                    path.push(ConfigPathComponent::Key(key.clone()));
+                    walk(plugin_name, child, path, out);
+                    path.pop();
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    path.push(ConfigPathComponent::Index(index));
+                    walk(plugin_name, child, path, out);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(plugin_name, config, &mut Vec::new(), &mut out);
+    out
+}
+
 /// Where `path` sits in a `plugin_name` config: a schema key source, a
 /// certificate source (by schema or by name), or anything else.
 pub(crate) fn plugin_placement(plugin_name: &str, path: &[ConfigPathComponent]) -> KeyPlacement {
-    if is_plugin_key_source(plugin_name, path) {
+    let signing_key = PLUGIN_SIGNING_KEY_SOURCES
+        .iter()
+        .any(|(name, pattern)| *name == plugin_name && schema_path_matches(pattern, path));
+    if is_plugin_key_source(plugin_name, path) || signing_key {
         KeyPlacement::KeySource
     } else if is_plugin_certificate_source(plugin_name, path)
         || placement_by_name(nearest_field(path)) == KeyPlacement::Certificate
@@ -283,7 +358,7 @@ pub(crate) fn is_unbrokerable_plugin_value(
     }
     match placement {
         KeyPlacement::Certificate => true,
-        KeyPlacement::Other => contains_public_pem_block(value),
+        KeyPlacement::Other => contains_certificate_block(value),
         KeyPlacement::KeySource => false,
     }
 }
@@ -424,13 +499,15 @@ fn banner_label(upper: &str, start: usize) -> (&str, usize) {
     }
 }
 
-/// Whether `value` also carries a PEM block that is not a private key (a
-/// certificate, a CA bundle): a certificate-plus-key bundle.
-pub(crate) fn contains_public_pem_block(value: &str) -> bool {
+/// Whether `value` also carries a certificate PEM record (`CERTIFICATE`,
+/// `TRUSTED CERTIFICATE`, ...): a certificate-plus-key bundle. Other records,
+/// such as a `PUBLIC KEY` after a signing key, do not make a bundle.
+pub(crate) fn contains_certificate_block(value: &str) -> bool {
     let upper = value.to_ascii_uppercase();
-    upper
-        .match_indices("-----BEGIN")
-        .any(|(start, _)| !banner_label(&upper, start).0.contains("PRIVATE KEY"))
+    upper.match_indices("-----BEGIN").any(|(start, _)| {
+        let label = banner_label(&upper, start).0;
+        label.contains("CERTIFICATE") && !label.contains("PRIVATE KEY")
+    })
 }
 
 /// Each private-key PEM block in `value`, armour included, in one forward
@@ -689,11 +766,15 @@ mod tests {
 
     #[test]
     fn bundles_are_told_apart_from_bare_keys() {
-        assert!(contains_public_pem_block(
+        assert!(contains_certificate_block(
             "-----BEGIN CERTIFICATE-----\nc\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----"
         ));
-        assert!(!contains_public_pem_block(
+        assert!(!contains_certificate_block(
             "-----BEGIN PRIVATE KEY-----\nk\n-----END PRIVATE KEY-----\n"
+        ));
+        assert!(!contains_certificate_block(
+            "-----BEGIN RSA PRIVATE KEY-----\nk\n-----END RSA PRIVATE KEY-----\n\
+             -----BEGIN PUBLIC KEY-----\np\n-----END PUBLIC KEY-----\n"
         ));
     }
 

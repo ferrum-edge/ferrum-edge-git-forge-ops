@@ -202,7 +202,11 @@ be named `private_key` keeps its ordinary handling.
   match the configured certificate. Seed the slot with the PEM key. A seed is
   checked like a literal: placeholder text at a key slot, or a
   certificate-plus-key bundle seeded for a certificate field or an ordinary
-  plugin string, is refused, naming the slot but never the value.
+  plugin string, is refused, naming the slot but never the value. A
+  declaration at a key field that starts with `${gh-env-secret:` but does not
+  parse (a missing `}`, say) is refused too, since Edge would read it as a
+  file path. A `PUBLIC KEY` record after a signing key (`client_auth`
+  `private_key_pem`) does not make a bundle; only certificate records do.
 - Where a key is unresolved (no bundle, or file-mode `apply`, which validates
   the publication document), the validator gets a PEM-shaped stand-in. Edge
   parses an inline Proxy, Upstream or `mesh_route_dispatch` key but does not

@@ -736,6 +736,18 @@ fn placeholder_text_reason(committed: &str, value: &str) -> Option<&'static str>
     }
 }
 
+/// Refuse a malformed broker declaration at a TLS key source: a value with
+/// the reserved `${gh-env-secret:` prefix that does not parse. Edge would read
+/// it as a filesystem path, so materialization would ship a broken key
+/// source. Names the slot, never the value.
+fn malformed_tls_key_declaration(slot: &str) -> crate::error::Error {
+    crate::error::Error::Config(format!(
+        "secret slot '{slot}' is declared with a malformed gh-env-secret placeholder at a TLS \
+         private-key field; fix the declaration (for example \
+         '${{gh-env-secret:alloc=require}}') or use a key file path"
+    ))
+}
+
 /// Refuse a bundle value seeded for a TLS private-key slot (Proxy/Upstream
 /// `backend_tls_client_key_path`, a schema plugin key source) that is
 /// placeholder text. Edge would read it as a filesystem path, so a
@@ -1118,6 +1130,19 @@ pub fn capture_and_redact_import_plugin_config_secrets(
                 safe_line(render_config_path(&path))
             ));
         }
+        if let Some(path) = super::tls_material::malformed_key_source_declarations(
+            &plugin.plugin_name,
+            &plugin.config,
+        )
+        .first()
+        {
+            return Err(malformed_tls_key_declaration(&plugin_config_slot(
+                &plugin.namespace,
+                &plugin.id,
+                &plugin.plugin_name,
+                path,
+            )));
+        }
         let classification = classify_plugin_config(&plugin.plugin_name, &plugin.config);
         for path in &classification.unbrokerable_private_keys {
             unbrokerable_private_keys.push(format!(
@@ -1259,10 +1284,13 @@ pub fn capture_and_redact_import_backend_tls_keys(
         let Some(text) = key.value.as_mut() else {
             continue;
         };
+        let slot = super::backend_tls::slot(key.owner, &key.namespace, &key.id);
+        if super::tls_material::is_malformed_broker_declaration(text) {
+            return Err(malformed_tls_key_declaration(&slot));
+        }
         if !super::backend_tls::is_client_key_material(text) {
             continue;
         }
-        let slot = super::backend_tls::slot(key.owner, &key.namespace, &key.id);
         capture_and_redact_string(text, &slot, &mut captured, "backend TLS client key")?;
     }
     Ok(captured)
@@ -2680,6 +2708,11 @@ fn resolve_backend_tls_leaf(
     constraints: ConstraintMode,
     report: &mut ResolveReport,
 ) -> crate::error::Result<Option<String>> {
+    if super::tls_material::is_malformed_broker_declaration(text) {
+        return Err(malformed_tls_key_declaration(&super::backend_tls::slot(
+            owner, namespace, id,
+        )));
+    }
     let Some(parsed) = parse_placeholder(text) else {
         return Ok(None);
     };
@@ -2826,6 +2859,17 @@ impl<'a> PluginWalk<'a> {
         path: &[ConfigPathComponent],
         report: &mut ResolveReport,
     ) -> crate::error::Result<Option<String>> {
+        if super::tls_material::is_malformed_broker_declaration(text)
+            && super::tls_material::plugin_placement(self.plugin_name, path)
+                == super::tls_material::KeyPlacement::KeySource
+        {
+            return Err(malformed_tls_key_declaration(&plugin_config_slot(
+                self.namespace,
+                self.plugin_id,
+                self.plugin_name,
+                path,
+            )));
+        }
         let Some(parsed) = parse_placeholder(text) else {
             return Ok(None);
         };
