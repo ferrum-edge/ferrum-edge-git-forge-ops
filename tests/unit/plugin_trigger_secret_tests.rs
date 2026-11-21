@@ -393,7 +393,7 @@ fn trigger_slots_follow_plugin_slot_identity() {
     let mut bundle = CredentialBundle::new();
     bundle.insert(own.to_string(), "seeded-trigger-token".to_string());
     let report = super::resolver_fixtures::report_secrets(&gateway, &bundle).unwrap();
-    assert!(report.slot_remaps.is_empty(), "{:?}", report.slot_remaps);
+    assert!(report.slot_remaps.is_empty(), "unexpected slot remaps");
 
     let mut retyped = bundle.clone();
     retyped.insert(
