@@ -780,10 +780,6 @@ fn brokered_standin_cases() -> Vec<(&'static str, serde_json::Value)> {
             "aws_endpoint_url": BROKERED
         });
         config["aws_credentials"] = credentials["aws_credentials"].clone();
-        cases.push(("serverless_function", config.clone()));
-        // The region left to the environment: the stand-in follows the
-        // validator's own region, or `us-east-1` when none is set.
-        config.as_object_mut().unwrap().remove("aws_region");
         cases.push(("serverless_function", config));
     }
     cases.push((
@@ -849,6 +845,35 @@ fn real_edge_accepts_brokered_plugin_stand_ins() {
             "{plugin_name} {config}: {}{}",
             result.stdout, result.stderr
         );
+    }
+}
+
+/// The real gateway accepts the stand-in for an ambient Lambda row that
+/// leaves its region to the environment. Run through the CLI with a cleared
+/// environment so the result does not depend on the caller's AWS variables:
+/// once with no region at all (the `us-east-1` stand-in passes Edge's
+/// any-region check) and once with a known `AWS_REGION`.
+#[test]
+fn real_edge_accepts_an_unconfigured_lambda_region_stand_in() {
+    let Some(binary) = real_validator() else {
+        return;
+    };
+    let repo = Repo::new(&[], None, Some(&binary));
+    for credentials in ["default_chain", "static"] {
+        repo.write(
+            "resources/ferrum/plugins/lambda.yaml",
+            &format!(
+                "kind: PluginConfig\nspec:\n  id: lambda\n  plugin_name: serverless_function\n  scope: global\n  config:\n    provider: aws_lambda\n    aws_credentials: {credentials}\n    aws_function_name: fn\n    aws_endpoint_url: '${{gh-env-secret:alloc=require}}'\n"
+            ),
+        );
+        for env in [&[][..], &[("AWS_REGION", "eu-west-1")][..]] {
+            let output = repo.run(&["validate"], env);
+            assert!(
+                output.status.success(),
+                "{credentials} {env:?}: {}",
+                output_text(&output)
+            );
+        }
     }
 }
 
@@ -923,6 +948,15 @@ fn an_unconfigured_lambda_region_stands_in_with_the_environment_region() {
                 ("AWS_REGION", "eu-west-1"),
             ][..],
             "endpoint:https://lambda.ap-south-1.amazonaws.com/",
+        ),
+        // Edge selects the first non-empty variable before judging it, so a
+        // malformed `AWS_DEFAULT_REGION` wins (and Edge reports it).
+        (
+            &[
+                ("AWS_DEFAULT_REGION", "Not-A-Region"),
+                ("AWS_REGION", "eu-west-1"),
+            ][..],
+            "endpoint:https://lambda.us-east-1.amazonaws.com/",
         ),
         (&[][..], "endpoint:https://lambda.us-east-1.amazonaws.com/"),
     ] {
