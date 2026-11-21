@@ -32,6 +32,7 @@ mod namespace_filter_guard_tests;
 mod override_tests;
 mod ownership_tests;
 mod passthrough_tests;
+mod plugin_trigger_secret_tests;
 mod policy_tests;
 mod promotion_tests;
 mod publication_preflight_tests;

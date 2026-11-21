@@ -520,9 +520,29 @@ struct DesiredRow {
     secret_pointers: BTreeSet<String>,
 }
 
+/// The part of a row Edge's projection sweeps for URL userinfo with its own
+/// parser: the whole Proxy and Upstream body, only `config` of a
+/// PluginConfig, nothing of a Consumer.
+#[derive(Clone, Copy)]
+enum UserinfoSweep {
+    WholeRow,
+    PluginConfig,
+    None,
+}
+
+impl UserinfoSweep {
+    fn covers(self, pointer: &str) -> bool {
+        match self {
+            Self::WholeRow => true,
+            Self::PluginConfig => pointer == "/config" || pointer.starts_with("/config/"),
+            Self::None => false,
+        }
+    }
+}
+
 impl DesiredRow {
-    fn new(value: Value, mut secret_pointers: BTreeSet<String>) -> Self {
-        collect_secret_values(&value, &mut String::new(), &mut secret_pointers);
+    fn new(value: Value, mut secret_pointers: BTreeSet<String>, sweep: UserinfoSweep) -> Self {
+        collect_secret_values(&value, &mut String::new(), sweep, &mut secret_pointers);
         Self {
             value,
             secret_pointers,
@@ -556,7 +576,10 @@ fn desired_comparison_rows(
         let value = serde_json::to_value(proxy)?;
         let mut secrets = BTreeSet::new();
         collect_tls_material_sites(&value, "", &mut secrets);
-        rows.insert(("Proxy", proxy.id.clone()), DesiredRow::new(value, secrets));
+        rows.insert(
+            ("Proxy", proxy.id.clone()),
+            DesiredRow::new(value, secrets, UserinfoSweep::WholeRow),
+        );
     }
     for consumer in &desired.consumers {
         let projected = project_consumer_for_export(consumer);
@@ -564,7 +587,7 @@ fn desired_comparison_rows(
         let secrets = consumer_secret_pointers(&projected);
         rows.insert(
             ("Consumer", consumer.id.clone()),
-            DesiredRow::new(value, secrets),
+            DesiredRow::new(value, secrets, UserinfoSweep::None),
         );
     }
     for plugin in &desired.plugin_configs {
@@ -584,13 +607,23 @@ fn desired_comparison_rows(
         if let Some(config) = value.get("config") {
             collect_tls_material_sites(config, "/config", &mut secrets);
         }
+        let mut visible = Vec::new();
         if let Some(trigger) = value.get("trigger") {
             collect_trigger_sites(trigger, &mut secrets);
+            collect_trigger_visible_subtrees(trigger, &mut visible);
         }
-        rows.insert(
-            ("PluginConfig", plugin.id.clone()),
-            DesiredRow::new(value, secrets),
-        );
+        let mut row = DesiredRow::new(value, secrets, UserinfoSweep::PluginConfig);
+        // Edge never withholds a visible predicate, so the generic
+        // placeholder/userinfo scan must not make one secret-bearing: a
+        // fingerprint-shaped literal there is a changed value, not a site.
+        row.secret_pointers.retain(|pointer| {
+            !visible.iter().any(|subtree| {
+                pointer
+                    .strip_prefix(subtree.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        });
+        rows.insert(("PluginConfig", plugin.id.clone()), row);
     }
     for upstream in &desired.upstreams {
         let value = serde_json::to_value(upstream)?;
@@ -605,7 +638,7 @@ fn desired_comparison_rows(
         collect_tls_material_sites(&value, "", &mut secrets);
         rows.insert(
             ("Upstream", upstream.id.clone()),
-            DesiredRow::new(value, secrets),
+            DesiredRow::new(value, secrets, UserinfoSweep::WholeRow),
         );
     }
     Ok(rows)
@@ -651,158 +684,86 @@ fn collect_tls_material_sites(value: &Value, root: &str, out: &mut BTreeSet<Stri
     }
 }
 
-/// Trigger `match` predicates whose operands a client presents, so Edge after
-/// v0.9.20 withholds them (`TRIGGER_CLIENT_FIELD_PREDICATES`).
-const TRIGGER_CLIENT_FIELD_PREDICATES: [&str; 3] = ["header", "query", "cookie"];
-
-/// Trigger `match` predicates Edge leaves visible.
-const TRIGGER_VISIBLE_PREDICATES: [&str; 12] = [
-    "method",
-    "path",
-    "host",
-    "sni",
-    "protocol",
-    "source_cidr",
-    "namespace",
-    "proxy_id",
-    "listen_port",
-    "consumer",
-    "auth_method",
-    "spiffe_id",
-];
-
 /// Add every site of a PluginConfig `trigger` that Edge after v0.9.20
 /// withholds from the export (`project_plugin_trigger_with`): each operand
 /// (`exact[]` and `prefix[]` entries, `regex`) of a `header` / `query` /
 /// `cookie` predicate, anywhere in the `all` / `any` / `not` tree. Like Edge,
-/// any shape a trigger cannot have is a site as a whole.
+/// any shape a trigger cannot have is a site as a whole. The walk is shared
+/// with the broker ([`crate::secrets::plugin_trigger::visit_trigger_sites`]).
 fn collect_trigger_sites(trigger: &Value, out: &mut BTreeSet<String>) {
-    let mut pointer = String::from("/trigger");
-    let Some(map) = trigger.as_object().filter(|map| map.contains_key("when")) else {
-        withheld_site(trigger, &pointer, out);
-        return;
-    };
-    for (key, child) in map {
-        let len = pointer.len();
-        push_pointer_segment(&mut pointer, key);
-        if key == "when" {
-            trigger_node_sites(child, &mut pointer, out);
-        } else {
-            withheld_site(child, &pointer, out);
+    crate::secrets::plugin_trigger::visit_trigger_sites(trigger, &mut |path, _, _| {
+        let mut pointer = String::from("/trigger");
+        for component in path {
+            let segment = match component {
+                ConfigPathComponent::Key(key) => key.clone(),
+                ConfigPathComponent::Index(index) => index.to_string(),
+            };
+            push_pointer_segment(&mut pointer, &segment);
         }
-        pointer.truncate(len);
-    }
+        out.insert(pointer);
+    });
 }
 
-/// A site Edge withholds as a whole (it leaves `null` alone).
-fn withheld_site(value: &Value, pointer: &str, out: &mut BTreeSet<String>) {
-    if !value.is_null() {
-        out.insert(pointer.to_string());
-    }
-}
-
-fn trigger_node_sites(node: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
-    let Some(map) = node.as_object() else {
-        withheld_site(node, pointer, out);
-        return;
-    };
-    for (key, child) in map {
-        let len = pointer.len();
-        push_pointer_segment(pointer, key);
-        match (key.as_str(), child) {
-            ("all" | "any", Value::Array(items)) => {
-                for (index, item) in items.iter().enumerate() {
-                    let item_len = pointer.len();
-                    push_pointer_segment(pointer, &index.to_string());
-                    trigger_node_sites(item, pointer, out);
-                    pointer.truncate(item_len);
+/// Pointers of every visible predicate value (`TRIGGER_VISIBLE_PREDICATES`)
+/// in a PluginConfig `trigger`'s `all` / `any` / `not` / `match` tree. Edge
+/// skips these subtrees entirely when it projects the export.
+fn collect_trigger_visible_subtrees(trigger: &Value, out: &mut Vec<String>) {
+    fn walk(node: &Value, pointer: &mut String, out: &mut Vec<String>) {
+        let Some(map) = node.as_object() else {
+            return;
+        };
+        for (key, child) in map {
+            let len = pointer.len();
+            push_pointer_segment(pointer, key);
+            match (key.as_str(), child) {
+                ("all" | "any", Value::Array(items)) => {
+                    for (index, item) in items.iter().enumerate() {
+                        let item_len = pointer.len();
+                        push_pointer_segment(pointer, &index.to_string());
+                        walk(item, pointer, out);
+                        pointer.truncate(item_len);
+                    }
                 }
+                ("not", child) => walk(child, pointer, out),
+                ("match", Value::Object(leaf)) => {
+                    for key in leaf.keys() {
+                        if crate::secrets::plugin_trigger::TRIGGER_VISIBLE_PREDICATES
+                            .contains(&key.as_str())
+                        {
+                            let leaf_len = pointer.len();
+                            push_pointer_segment(pointer, key);
+                            out.push(pointer.clone());
+                            pointer.truncate(leaf_len);
+                        }
+                    }
+                }
+                _ => {}
             }
-            ("not", child) => trigger_node_sites(child, pointer, out),
-            ("match", child) => trigger_leaf_sites(child, pointer, out),
-            (_, child) => withheld_site(child, pointer, out),
+            pointer.truncate(len);
         }
-        pointer.truncate(len);
     }
-}
-
-fn trigger_leaf_sites(leaf: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
-    let Some(map) = leaf.as_object() else {
-        withheld_site(leaf, pointer, out);
-        return;
-    };
-    for (key, predicate) in map {
-        if TRIGGER_VISIBLE_PREDICATES.contains(&key.as_str()) {
-            continue;
-        }
-        let len = pointer.len();
-        push_pointer_segment(pointer, key);
-        if TRIGGER_CLIENT_FIELD_PREDICATES.contains(&key.as_str()) {
-            trigger_field_predicate_sites(predicate, pointer, out);
-        } else {
-            withheld_site(predicate, pointer, out);
-        }
-        pointer.truncate(len);
-    }
-}
-
-fn trigger_field_predicate_sites(
-    predicate: &Value,
-    pointer: &mut String,
-    out: &mut BTreeSet<String>,
-) {
-    let Some(map) = predicate.as_object() else {
-        withheld_site(predicate, pointer, out);
-        return;
-    };
-    for (key, child) in map {
-        if matches!(key.as_str(), "name" | "presence" | "multi_value") {
-            continue;
-        }
-        let len = pointer.len();
-        push_pointer_segment(pointer, key);
-        if key == "value" {
-            trigger_operand_sites(child, pointer, out);
-        } else {
-            withheld_site(child, pointer, out);
-        }
-        pointer.truncate(len);
-    }
-}
-
-/// A trigger string match: every operand except a boolean `case_insensitive`
-/// flag, entry by entry for the `exact` / `prefix` lists.
-fn trigger_operand_sites(value: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
-    let Some(map) = value.as_object() else {
-        withheld_site(value, pointer, out);
-        return;
-    };
-    for (key, operand) in map {
-        if key == "case_insensitive" && operand.is_boolean() {
-            continue;
-        }
-        let len = pointer.len();
-        push_pointer_segment(pointer, key);
-        if let Value::Array(items) = operand {
-            for (index, item) in items.iter().enumerate() {
-                let item_len = pointer.len();
-                push_pointer_segment(pointer, &index.to_string());
-                withheld_site(item, pointer, out);
-                pointer.truncate(item_len);
-            }
-        } else {
-            withheld_site(operand, pointer, out);
-        }
-        pointer.truncate(len);
+    if let Some(when) = trigger.get("when") {
+        let mut pointer = String::from("/trigger/when");
+        walk(when, &mut pointer, out);
     }
 }
 
 /// Add the pointer of every string that is a brokered placeholder or a URL
-/// carrying userinfo.
-fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet<String>) {
+/// carrying userinfo: a literal `scheme://` authority anywhere, and, inside
+/// the region Edge sweeps, whatever Edge's own URL parser reads userinfo from.
+fn collect_secret_values(
+    value: &Value,
+    pointer: &mut String,
+    sweep: UserinfoSweep,
+    out: &mut BTreeSet<String>,
+) {
+    use crate::secrets::url_userinfo::{legacy_url_has_userinfo, parsed_url_has_userinfo};
     match value {
         Value::String(text) => {
-            if crate::secrets::parse_placeholder(text).is_some() || has_url_userinfo(text) {
+            if crate::secrets::parse_placeholder(text).is_some()
+                || legacy_url_has_userinfo(text)
+                || (sweep.covers(pointer) && parsed_url_has_userinfo(text))
+            {
                 out.insert(pointer.clone());
             }
         }
@@ -810,7 +771,7 @@ fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet
             for (key, child) in map {
                 let len = pointer.len();
                 push_pointer_segment(pointer, key);
-                collect_secret_values(child, pointer, out);
+                collect_secret_values(child, pointer, sweep, out);
                 pointer.truncate(len);
             }
         }
@@ -818,21 +779,12 @@ fn collect_secret_values(value: &Value, pointer: &mut String, out: &mut BTreeSet
             for (index, child) in items.iter().enumerate() {
                 let len = pointer.len();
                 push_pointer_segment(pointer, &index.to_string());
-                collect_secret_values(child, pointer, out);
+                collect_secret_values(child, pointer, sweep, out);
                 pointer.truncate(len);
             }
         }
         _ => {}
     }
-}
-
-/// True for `scheme://user[:password]@host…`.
-fn has_url_userinfo(value: &str) -> bool {
-    let Some((_, rest)) = value.split_once("://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    authority.contains('@')
 }
 
 /// Append one RFC 6901 reference token.

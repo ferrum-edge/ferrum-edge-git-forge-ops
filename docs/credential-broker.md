@@ -129,13 +129,49 @@ Secrets outside `Consumer.credentials` get a reserved `@` segment:
 ```text
 PluginConfig.config leaf     ->  <ns>/<plugin-id>/@plugin/<plugin_name>/config/<path>
                                  ferrum/ldap/@plugin/ldap_auth/config/ldap_url
+PluginConfig.trigger operand ->  <ns>/<plugin-id>/@plugin/<plugin_name>/trigger/<path>
+                                 ferrum/waf/@plugin/waf/trigger/when/not/match/header/value/exact/[0]
 Upstream.service_discovery   ->  <ns>/<upstream-id>/@service-discovery/<path>
                                  ferrum/orders/@service-discovery/consul/token
 Proxy backend TLS client key ->  <ns>/<proxy-id>/@proxy/backend_tls_client_key_path
 Upstream backend TLS client key -> <ns>/<upstream-id>/@upstream/backend_tls_client_key_path
 ```
 
-Plugin-config array paths keep every index, including `[0]`.
+Plugin-config and trigger array paths keep every index, including `[0]`.
+
+A plugin `trigger` is brokered operand by operand. The values a `header`,
+`query` or `cookie` predicate compares (`value.exact[]`, `value.prefix[]`,
+`value.regex`) are what a client sends to make the plugin run or skip, so
+Ferrum Edge withholds every one of them, whatever its length, and so does
+GitForgeOps: `import` captures it, `diff` and `plan` show it as `[REDACTED]`
+inside an otherwise readable trigger, and a committed literal is a blocking
+finding. Validator output and the review comment are scrubbed of every
+operand of at least 8 bytes; while the document holds a shorter literal
+operand, validator output is withheld outright. A trigger that does not decode is reported by field and
+expected shape only, never with the decoder's quote of the value. A brokered operand must be at least 8 bytes,
+because a shorter value cannot be removed from free text: `import` still
+captures a short one (and names its slot), but resolution refuses it until
+the slot is re-seeded with a longer operand and the clients sending it are
+updated. A slot seeded with placeholder text is refused the same way as a
+Consumer secret's. Field names, `presence`, `multi_value`, `case_insensitive`, the tree
+(`all`, `any`, `not`) and every other predicate (`path`, `method`, `host`,
+`sni`, `protocol`, `source_cidr`, `namespace`, `proxy_id`, `listen_port`,
+`consumer`, `external_identity`, `external_identity_authority`,
+`auth_method`, `spiffe_id`) stay literal and reviewable; a
+placeholder in one of them is refused, because it has no slot and would reach
+the gateway as text, and `import` refuses a live trigger that has one.
+`import --from-api`, and file import of an Edge `/backup` document (one with
+its `ferrum_version` / `exported_at` / `source` / `counts` envelope), also
+refuse a live operand that spells placeholder text (it is live data, not a
+declaration); a GitForgeOps export keeps such a string as the placeholder it
+is. Trigger
+slots belong to the plugin's type like its config slots, so the type-change
+check below covers them too. Retiring a trigger operand means removing its
+list, predicate or branch (Edge refuses an empty list), so a stored trigger
+slot whose operand path the trigger no longer has is refused as a slot remap:
+remove
+it from the bundle, or re-adding an operand at that path would resurrect the
+retired value.
 
 A plugin-config slot names the plugin type as well as its id, because what a
 config path means, and where the plugin sends it, depends on the type (the

@@ -2362,7 +2362,7 @@ async fn cmd_plan(
                  to the gateway at its current slot but does not remove the bundle key. Before \
                  shrinking or shifting a Consumer array, move surviving rotated values to their new \
                  canonical slots in the private bundle and remove vacated keys, preserving \
-                 unrelated entries. Reseed plugin-config slots and retire orphaned keys from the bundle, or re-run with \
+                 unrelated entries. Reseed plugin-config and trigger slots and retire orphaned keys from the bundle, or re-run with \
                  --allow-credential-slot-remap to accept the reassignment."
             );
         } else {
@@ -3975,6 +3975,9 @@ async fn cmd_import(
         eoutln!("{}", safe_block(notice));
     }
     if let Some(notice) = result.short_credential_plugin_config_notice() {
+        eoutln!("{}", safe_block(notice));
+    }
+    if let Some(notice) = result.short_plugin_trigger_notice() {
         eoutln!("{}", safe_block(notice));
     }
 

@@ -55,9 +55,10 @@ use super::placeholder::parse_placeholder;
 use super::plugin_config::{
     render_config_path, rule_declared_paths, sensitive_string_paths, value_at, ConfigPathComponent,
 };
+use super::plugin_trigger;
 use super::resolver::{
-    consumer_credential_slot, is_identity_credential_leaf, plugin_config_slot, ResolveReport,
-    SlotStatus,
+    consumer_credential_slot, is_identity_credential_leaf, plugin_config_slot, plugin_trigger_slot,
+    ResolveReport, SlotStatus,
 };
 use super::tls_material::private_key_sites;
 
@@ -130,6 +131,9 @@ pub struct SecretScrubber {
     /// [`is_reencoding_hazard`]. Every stream is withheld while this is set,
     /// because a partial substitution reads exactly like a complete one.
     unsafe_to_scrub: bool,
+    /// The document holds a literal trigger operand shorter than
+    /// [`MIN_SCRUB_LENGTH`] ([`SuppressionReason::ShortTriggerOperand`]).
+    short_trigger_operand: bool,
 }
 
 /// Why a validator's output was withheld instead of scrubbed.
@@ -145,6 +149,11 @@ pub enum SuppressionReason {
     /// A [`FRAGMENT_SCAN_LENGTH`]-byte run of a secret survived scrubbing, so
     /// the value reached the output in some encoding the needles do not cover.
     ResidualFragment,
+    /// The document carries a literal plugin trigger operand shorter than
+    /// [`MIN_SCRUB_LENGTH`] bytes. It has no encoding needles or fragment
+    /// windows, so an encoded echo (base64, percent) could not be recognized;
+    /// decided before the child runs.
+    ShortTriggerOperand,
 }
 
 impl SuppressionReason {
@@ -167,6 +176,12 @@ impl SuppressionReason {
                  the output could not be shown without leaking it. Credentials shorter than 8 \
                  bytes cannot be redacted from a diagnostic without mangling it — lengthen the \
                  credential, or move the literal value into the ${gh-env-secret:...} broker.\n"
+            }
+            Self::ShortTriggerOperand => {
+                "Validator diagnostics were withheld: a plugin trigger header, query or cookie \
+                 operand is shorter than 8 bytes, so it could not be redacted from the output in \
+                 every encoding. Trigger operands are secrets; use one of at least 8 bytes held in \
+                 ${gh-env-secret:alloc=require} to get diagnostics back.\n"
             }
             Self::ResidualFragment => {
                 "Validator diagnostics were withheld: a run of a resolved secret survived \
@@ -205,6 +220,11 @@ impl SecretScrubber {
     ///   set `import` moves into the private bundle. A plugin secret such as
     ///   an `otel_tracing` `headers.x-honeycomb-team` value is resolved into
     ///   the validator input exactly like a consumer credential.
+    /// * **Plugin triggers** — every non-empty `header` / `query` / `cookie`
+    ///   operand of a `trigger` ([`super::plugin_trigger`]): a shared token
+    ///   that decides whether the plugin runs. One shorter than
+    ///   [`MIN_SCRUB_LENGTH`] is not substring-replaced, but output that
+    ///   still contains it is withheld.
     /// * **Service discovery** — the modeled secret leaves of
     ///   `Upstream.service_discovery` ([`super::service_discovery`]), today the
     ///   Consul ACL token. The validator is handed the resolved upstream, so
@@ -227,6 +247,7 @@ impl SecretScrubber {
     /// No bundle values or unused slots are retained in the report.
     pub fn from_gateway_config_with_report(config: &GatewayConfig, report: &ResolveReport) -> Self {
         let mut scrubber = Self::from_values(gateway_secret_values(config, report));
+        scrubber.short_trigger_operand = has_short_trigger_operand(config);
         // The document with every secret removed. Serialization failure is not
         // worth failing validation over: an empty `public_text` only makes the
         // fragment scan stricter, never laxer.
@@ -284,6 +305,7 @@ impl SecretScrubber {
             fragments,
             public_text: String::new(),
             unsafe_to_scrub,
+            short_trigger_operand: false,
         }
     }
 
@@ -400,6 +422,9 @@ impl SecretScrubber {
         if self.unsafe_to_scrub {
             return withheld(SuppressionReason::NotSafelyScrubbable);
         }
+        if self.short_trigger_operand {
+            return withheld(SuppressionReason::ShortTriggerOperand);
+        }
 
         let stdout = self.scrub(stdout);
         let stderr = self.scrub(stderr);
@@ -429,6 +454,7 @@ pub(crate) fn gateway_secret_values(
     let mut values = ManifestValues::default();
     collect_consumer_secrets(config, &mut values);
     collect_plugin_config_secrets(config, &mut values);
+    collect_plugin_trigger_secrets(config, TriggerOperands::All, &mut values);
     collect_service_discovery_secrets(config, &mut values);
     collect_backend_private_keys(config, &mut values);
     let mut values = values.0;
@@ -444,7 +470,8 @@ pub(crate) struct LiveSecretLeaf {
     /// secret: it must be protectable, or the run is refused. `false` when
     /// only the key-name heuristics flag it (`*key`, a header map, a Kafka
     /// producer property not named like a credential, a custom plugin's
-    /// field): such a leaf may be an ordinary setting, such as a header name.
+    /// field) or it is a plugin trigger operand: such a leaf may be an
+    /// ordinary setting, such as a header name.
     pub required: bool,
     /// `<Kind> <namespace>/<id> <field path>`, sanitized for display; never
     /// the value. For a value found at several leaves, a required one.
@@ -459,6 +486,7 @@ pub(crate) fn live_secret_leaves(config: &GatewayConfig) -> Vec<LiveSecretLeaf> 
     let mut leaves = LiveLeaves::default();
     collect_consumer_secrets(config, &mut leaves);
     collect_plugin_config_secrets(config, &mut leaves);
+    collect_plugin_trigger_secrets(config, TriggerOperands::Scrubbable, &mut leaves);
     collect_service_discovery_secrets(config, &mut leaves);
     collect_backend_private_keys(config, &mut leaves);
     leaves
@@ -560,6 +588,16 @@ fn collect_resolved_secrets(
                 plugin_config_slot(&plugin.namespace, &plugin.id, &plugin.plugin_name, path);
             resolved.contains(plugin_slot.as_str())
         });
+        if let Some(trigger) = plugin.trigger.as_ref() {
+            let json = plugin_trigger::trigger_json(trigger);
+            for (path, text) in plugin_trigger::trigger_operand_strings(&json) {
+                let slot =
+                    plugin_trigger_slot(&plugin.namespace, &plugin.id, &plugin.plugin_name, &path);
+                if !text.is_empty() && resolved.contains(slot.as_str()) {
+                    out.insert(text.to_string());
+                }
+            }
+        }
     }
     for key in super::backend_tls::client_keys(config) {
         let slot = super::backend_tls::slot(key.owner, key.namespace, key.id);
@@ -840,6 +878,65 @@ fn collect_backend_private_keys(config: &GatewayConfig, out: &mut dyn LeafSink) 
             let path = render_config_path(&site.path);
             private_key_leaf(text, out, &|| {
                 leaf_location(row.owner.kind(), row.namespace, row.id, &path)
+            });
+        }
+    }
+}
+
+/// Whether any plugin trigger operand in `config` is a non-empty value
+/// shorter than [`MIN_SCRUB_LENGTH`] bytes (a placeholder never is).
+fn has_short_trigger_operand(config: &GatewayConfig) -> bool {
+    config.plugin_configs.iter().any(|plugin| {
+        plugin.trigger.as_ref().is_some_and(|trigger| {
+            let json = plugin_trigger::trigger_json(trigger);
+            plugin_trigger::secret_trigger_operands(&json)
+                .iter()
+                .any(|(_, text)| text.len() < MIN_SCRUB_LENGTH)
+        })
+    })
+}
+
+/// Which trigger operands a collector reports.
+#[derive(Clone, Copy)]
+enum TriggerOperands {
+    /// Every non-empty operand. For repository and resolved documents (the
+    /// validator scrubber): a short one cannot be substring-replaced, but it
+    /// is still checked verbatim, so validator output that echoes it is
+    /// withheld ([`SuppressionReason::ResidualValue`]) instead of printed.
+    All,
+    /// Operands of at least [`MIN_SCRUB_LENGTH`] bytes. For live documents
+    /// (display admission): a shorter value can be neither registered nor
+    /// scrubbed from free text, and treating it as required would refuse
+    /// every admin read, the import that migrates it included. It is kept out
+    /// of output structurally instead: diffs, plans and the review comment
+    /// redact every operand by position.
+    Scrubbable,
+}
+
+/// The `header` / `query` / `cookie` operands of every plugin `trigger`
+/// ([`super::plugin_trigger`]), never required for display admission.
+fn collect_plugin_trigger_secrets(
+    config: &GatewayConfig,
+    which: TriggerOperands,
+    out: &mut dyn LeafSink,
+) {
+    for plugin in &config.plugin_configs {
+        let Some(trigger) = plugin.trigger.as_ref() else {
+            continue;
+        };
+        let json = plugin_trigger::trigger_json(trigger);
+        let operands = match which {
+            TriggerOperands::All => plugin_trigger::secret_trigger_operands(&json),
+            TriggerOperands::Scrubbable => plugin_trigger::scrubbable_trigger_operands(&json),
+        };
+        for (path, text) in operands {
+            out.leaf(text, false, &|| {
+                leaf_location(
+                    "PluginConfig",
+                    &plugin.namespace,
+                    &plugin.id,
+                    &plugin_trigger::render_trigger_path(&path),
+                )
             });
         }
     }

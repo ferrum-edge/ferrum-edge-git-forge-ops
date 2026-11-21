@@ -103,6 +103,7 @@ pub async fn import_from_api(
             unsupported_sections: unsupported_sections.into_iter().collect(),
             sources,
             unmodeled_nested_fields,
+            live_source: true,
         },
         credential_bundle_output,
         true,

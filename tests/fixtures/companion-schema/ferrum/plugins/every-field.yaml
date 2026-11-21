@@ -56,6 +56,12 @@ spec:
               presence: present
               value:
                 exact: ["every-field-consumer"]
+            external_identity:
+              presence: present
+              value:
+                exact: ["every-field-subject"]
+            external_identity_authority:
+              - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             auth_method: [key_auth]
             spiffe_id:
               presence: present

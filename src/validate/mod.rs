@@ -1,3 +1,4 @@
+mod client_key_standin;
 mod compatibility;
 pub mod pem_standin;
 pub mod reporter;

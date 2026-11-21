@@ -11,6 +11,10 @@ use super::placeholder::{parse_placeholder, PlaceholderAlloc, SecretPlaceholder}
 use super::plugin_config::{
     classify_plugin_config, endpoint_paths, render_config_path, ConfigPathComponent,
 };
+use super::plugin_trigger::{
+    render_trigger_path, secret_trigger_operands, trigger_from_json, trigger_json,
+    trigger_operand_strings, trigger_value_mut,
+};
 use super::service_discovery::{
     self, SdSecretField, SD_SECRET_FIELDS, SERVICE_DISCOVERY_SLOT_KIND,
 };
@@ -361,8 +365,8 @@ impl ResolveReport {
             format!(
                 "{count} broker-controlled leaf/leaves remain unresolved. Authoritative live \
                  comparisons exclude only unresolved leaves in Consumer credentials, plugin \
-                 config, service-discovery secrets and backend TLS client keys; resolved \
-                 values, literal siblings, \
+                 config, plugin trigger operands, service-discovery secrets and backend TLS \
+                 client keys; resolved values, literal siblings, \
                  extra entries, shape changes and nonsecret fields are still compared."
             )
         })
@@ -694,6 +698,62 @@ fn lookup_slot_value<'a>(
     Ok(None)
 }
 
+/// Why a bundle value is placeholder text rather than a secret, if it is:
+/// it equals the placeholder committed at its slot, or matches (or starts
+/// like) the `${gh-env-secret:…}` grammar. Shared by the Consumer, plugin
+/// trigger and TLS private-key guards.
+fn placeholder_text_reason(committed: &str, value: &str) -> Option<&'static str> {
+    const PLACEHOLDER_PREFIX: &str = "${gh-env-secret:";
+    let trimmed = value.trim();
+    let has_placeholder_prefix = trimmed
+        .get(..PLACEHOLDER_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PLACEHOLDER_PREFIX));
+    if trimmed == committed {
+        Some("equals the placeholder text committed for this slot")
+    } else if parse_placeholder(trimmed).is_some() || has_placeholder_prefix {
+        Some("matches the gh-env-secret placeholder grammar")
+    } else {
+        None
+    }
+}
+
+/// Refuse a plugin trigger operand's bundle value that the gateway must not
+/// receive, before it is looked up as resolved.
+///
+/// * **Placeholder text** — the same rule as
+///   [`check_consumer_secret_not_placeholder_text`]: the committed
+///   placeholder is repository-known, so a client could send it and decide
+///   whether the plugin runs.
+/// * **Shorter than [`super::MIN_SCRUB_LENGTH`] bytes** — the generic
+///   refusal ([`check_min_secret_length`]) would suggest writing the value
+///   literally, which the literal-secret gate refuses for a trigger operand;
+///   this names the actual remedy.
+///
+/// Names the slot and the reason, never the value.
+fn check_trigger_operand_bundle_value(
+    slot: &str,
+    committed: &str,
+    value: &str,
+) -> crate::error::Result<()> {
+    if let Some(reason) = placeholder_text_reason(committed, value) {
+        return Err(crate::error::Error::Config(format!(
+            "plugin trigger slot '{slot}' holds a bundle value that {reason}, not a secret. \
+             Placeholder text is repository-known, so a client could send it to decide \
+             whether the plugin runs; re-seed the slot with the real operand."
+        )));
+    }
+    if value.len() < super::MIN_SCRUB_LENGTH && value != REDACTED_SENTINEL {
+        return Err(crate::error::Error::Config(format!(
+            "plugin trigger slot '{slot}' holds a bundle value shorter than {min} bytes. Every \
+             trigger header, query or cookie operand is a secret, and one this short cannot be \
+             removed from this tool's output; choose an operand of at least {min} bytes, update \
+             the clients that send it, and re-seed the slot.",
+            min = super::MIN_SCRUB_LENGTH
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse a Consumer secret whose bundle value is placeholder text.
 ///
 /// A supplied value normally counts as resolved whatever its bytes spell
@@ -717,23 +777,6 @@ fn check_consumer_secret_not_placeholder_text(
          Placeholder text is repository-known and cannot be a live Consumer credential; \
          re-seed the slot with the real secret or rotate it with 'gitforgeops rotate'."
     )))
-}
-
-/// Why a bundle value is placeholder text rather than a value, or `None`.
-/// Shared by the Consumer guard and the TLS private-key guard.
-fn placeholder_text_reason(committed: &str, value: &str) -> Option<&'static str> {
-    const PLACEHOLDER_PREFIX: &str = "${gh-env-secret:";
-    let trimmed = value.trim();
-    let has_placeholder_prefix = trimmed
-        .get(..PLACEHOLDER_PREFIX.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PLACEHOLDER_PREFIX));
-    if trimmed == committed {
-        Some("equals the placeholder text committed for this slot")
-    } else if parse_placeholder(trimmed).is_some() || has_placeholder_prefix {
-        Some("matches the gh-env-secret placeholder grammar")
-    } else {
-        None
-    }
 }
 
 /// Refuse a malformed broker declaration at a TLS key source: a value with
@@ -975,7 +1018,9 @@ pub fn validate_known_credential_types(cfg: &GatewayConfig) -> crate::error::Res
 /// Reject broker syntax in public credential identities before any bundle
 /// lookup, substitution or side effect. Also used at the CLI load boundary:
 /// plain export and inspect-only previews must enforce the same contract.
-/// Literal identities remain readable repository data.
+/// Literal identities remain readable repository data. Broker syntax in a
+/// `PluginConfig.trigger` predicate other than a client-field operand is
+/// refused here too ([`super::plugin_trigger::validate_trigger_placeholders`]).
 pub fn validate_identity_placeholders(cfg: &GatewayConfig) -> crate::error::Result<()> {
     for consumer in &cfg.consumers {
         for (credential_type, value) in &consumer.credentials {
@@ -987,7 +1032,9 @@ pub fn validate_identity_placeholders(cfg: &GatewayConfig) -> crate::error::Resu
             check_identity_placeholders(value, &mut components, credential_type, None)?;
         }
     }
-    Ok(())
+    // The same boundary refuses broker syntax in a trigger predicate that has
+    // no slot, so no walk can leave it to reach the gateway as literal text.
+    super::plugin_trigger::validate_trigger_placeholders(cfg)
 }
 
 fn check_identity_placeholders<'a>(
@@ -1203,6 +1250,78 @@ pub fn capture_and_redact_import_plugin_config_secrets(
     }
 
     Ok(capture)
+}
+
+/// Capture the sensitive client-field operands of every `PluginConfig.trigger`
+/// ([`super::plugin_trigger`]) and replace them with broker placeholders
+/// before import writes any resource file.
+///
+/// `GET /backup` returns a trigger raw, so a shared token a `header`, `query`
+/// or `cookie` predicate compares (a value that decides whether, say, a `waf`
+/// instance runs) would otherwise be committed. Every non-empty operand, at
+/// any length, moves to its
+/// `<ns>/<plugin-id>/@plugin/<plugin_name>/trigger/<path>` slot. Field names
+/// and every other predicate stay literal and reviewable. Spec-owned plugins
+/// are skipped, as import never writes them.
+///
+/// An operand shorter than [`super::MIN_SCRUB_LENGTH`] bytes is captured too
+/// (it is just as much a secret), but the broker will not resolve a value
+/// that short, so its slot is listed in [`PluginTriggerCapture::short`] for
+/// the operator to re-seed with a longer value.
+pub fn capture_and_redact_import_plugin_trigger_secrets(
+    cfg: &mut GatewayConfig,
+) -> crate::error::Result<PluginTriggerCapture> {
+    let mut capture = PluginTriggerCapture::default();
+    let captured = &mut capture.captured;
+
+    for plugin in &mut cfg.plugin_configs {
+        if plugin.api_spec_id.is_some() {
+            continue;
+        }
+        let Some(trigger) = plugin.trigger.as_ref() else {
+            continue;
+        };
+        let mut json = trigger_json(trigger);
+        let sensitive: Vec<Vec<ConfigPathComponent>> = secret_trigger_operands(&json)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        if sensitive.is_empty() {
+            continue;
+        }
+        for path in sensitive {
+            let slot =
+                plugin_trigger_slot(&plugin.namespace, &plugin.id, &plugin.plugin_name, &path);
+            let Some(serde_json::Value::String(text)) = trigger_value_mut(&mut json, &path) else {
+                return Err(crate::error::Error::Config(format!(
+                    "internal: sensitive plugin trigger operand for slot '{slot}' disappeared during import"
+                )));
+            };
+            let short = text.len() < super::MIN_SCRUB_LENGTH;
+            let before = captured.len();
+            capture_and_redact_string(text, &slot, captured, "plugin trigger")?;
+            if short && captured.len() > before {
+                capture.short.push(slot);
+            }
+        }
+        let redacted = trigger_from_json(plugin, json)?;
+        plugin.trigger = Some(redacted);
+    }
+
+    Ok(capture)
+}
+
+/// What [`capture_and_redact_import_plugin_trigger_secrets`] moved into the
+/// migration bundle.
+#[derive(Debug, Default)]
+pub struct PluginTriggerCapture {
+    /// Every captured operand, by canonical slot.
+    pub captured: CredentialBundle,
+    /// Slots whose captured value is shorter than
+    /// [`super::MIN_SCRUB_LENGTH`] bytes. The broker refuses to resolve them
+    /// until they are re-seeded with a longer value (and the clients sending
+    /// the old one are updated). Slot names only, never values.
+    pub short: Vec<String>,
 }
 
 /// Capture modeled `Upstream.service_discovery` secrets and replace them with
@@ -1447,17 +1566,90 @@ pub(crate) fn plugin_config_slot(
     plugin_name: &str,
     path: &[ConfigPathComponent],
 ) -> String {
+    plugin_slot(
+        namespace,
+        plugin_id,
+        plugin_name,
+        PluginSlotSection::Config,
+        path,
+    )
+}
+
+/// The canonical broker slot of one `PluginConfig.trigger` client-field
+/// operand ([`super::plugin_trigger`]):
+/// `<ns>/<plugin-id>/@plugin/<plugin_name>/trigger/<path>`, where `<path>`
+/// runs from the trigger root (`when/...`) and keeps every array index, e.g.
+/// `ferrum/waf/@plugin/waf/trigger/when/not/match/header/value/exact/[0]`.
+///
+/// It shares the plugin's typed keyspace with [`plugin_config_slot`], so a
+/// plugin type change orphans its trigger slots exactly like its config
+/// slots, and a `trigger` section can never spell a `config` path.
+pub(crate) fn plugin_trigger_slot(
+    namespace: &str,
+    plugin_id: &str,
+    plugin_name: &str,
+    path: &[ConfigPathComponent],
+) -> String {
+    plugin_slot(
+        namespace,
+        plugin_id,
+        plugin_name,
+        PluginSlotSection::Trigger,
+        path,
+    )
+}
+
+/// The part of a plugin that owns a brokered leaf: the fourth slot component
+/// after `@plugin/<plugin_name>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PluginSlotSection {
+    /// `PluginConfig.config`.
+    Config,
+    /// A `PluginConfig.trigger` client-field operand.
+    Trigger,
+}
+
+impl PluginSlotSection {
+    const ALL: [Self; 2] = [Self::Config, Self::Trigger];
+
+    fn segment(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Trigger => "trigger",
+        }
+    }
+
+    /// How a diagnostic names a leaf of this section.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Config => "plugin config",
+            Self::Trigger => "plugin trigger",
+        }
+    }
+}
+
+fn plugin_slot(
+    namespace: &str,
+    plugin_id: &str,
+    plugin_name: &str,
+    section: PluginSlotSection,
+    path: &[ConfigPathComponent],
+) -> String {
     let namespace = escape_slot_component(namespace);
     let plugin_id = escape_slot_component(plugin_id);
-    let cred_key = plugin_config_cred_key(plugin_name, path);
+    let cred_key = plugin_cred_key(plugin_name, section, path);
     format!("{namespace}/{plugin_id}/{cred_key}")
 }
 
-fn plugin_config_cred_key(plugin_name: &str, path: &[ConfigPathComponent]) -> String {
+fn plugin_cred_key(
+    plugin_name: &str,
+    section: PluginSlotSection,
+    path: &[ConfigPathComponent],
+) -> String {
     let mut pieces = vec![
         PLUGIN_CONFIG_SLOT_KIND.to_string(),
         escape_slot_component(plugin_name),
-        "config".to_string(),
+        section.segment().to_string(),
     ];
     pieces.extend(path.iter().map(|part| match part {
         ConfigPathComponent::Key(key) => escape_slot_component(key),
@@ -1586,6 +1778,11 @@ fn report_secrets_with_mode_inner(
         walk.check_type_slot_identity(&mut report);
         let mut path = Vec::new();
         walk_plugin_and_report(&plugin.config, &walk, &mut path, &mut report)?;
+        let trigger = plugin.trigger.as_ref().map(trigger_json);
+        walk.check_trigger_slot_retirement(trigger.as_ref(), &mut report);
+        if let Some(trigger) = trigger.as_ref() {
+            walk_plugin_trigger_and_report(trigger, &walk, &mut report)?;
+        }
     }
     for upstream in &cfg.upstreams {
         let Some(discovery) = upstream.service_discovery.as_ref() else {
@@ -1634,8 +1831,9 @@ fn report_secrets_with_mode_inner(
 /// here was never given a value, and writing its row would send the
 /// placeholder text as the credential. Walks the same leaves as
 /// [`report_secrets_with_mode_and_options`] (Consumer credentials,
-/// `PluginConfig.config`, modeled service-discovery secrets, Proxy and
-/// Upstream `backend_tls_client_key_path`) against an empty
+/// `PluginConfig.config`, `PluginConfig.trigger` operands, modeled
+/// service-discovery secrets, Proxy and Upstream `backend_tls_client_key_path`)
+/// against an empty
 /// bundle, so every placeholder reports regardless of what the bundle holds.
 pub fn unresolved_placeholder_slots(cfg: &GatewayConfig) -> crate::error::Result<Vec<String>> {
     let report = report_secrets_with_mode_inner(
@@ -1745,6 +1943,14 @@ fn resolve_secrets_in_place(
         walk.check_type_slot_identity(&mut report);
         let mut path = Vec::new();
         walk_plugin_report_and_replace(&mut plugin.config, &walk, &mut path, &mut report)?;
+        let trigger = plugin.trigger.as_ref().map(trigger_json);
+        walk.check_trigger_slot_retirement(trigger.as_ref(), &mut report);
+        if let Some(mut json) = trigger {
+            if walk_plugin_trigger_report_and_replace(&mut json, &walk, &mut report)? {
+                let resolved = trigger_from_json(plugin, json)?;
+                plugin.trigger = Some(resolved);
+            }
+        }
     }
 
     for upstream in cfg.upstreams.iter_mut() {
@@ -2344,19 +2550,30 @@ fn alloc_label(alloc: PlaceholderAlloc) -> &'static str {
 /// bundle instead: reseed the shifted entries and retire the orphaned slot.
 fn check_plugin_array_slot_identity(
     walk: &PluginWalk<'_>,
+    section: PluginSlotSection,
     path: &[ConfigPathComponent],
     items: &[serde_json::Value],
     report: &mut ResolveReport,
 ) {
+    // A trigger orphan, a shrink included, is reported once by
+    // `PluginWalk::check_trigger_slot_retirement`; only the advisory is here.
+    let scan_orphans = section == PluginSlotSection::Config;
     let bundle = walk.bundle;
-    let prefix = plugin_config_slot(walk.namespace, walk.plugin_id, walk.plugin_name, path);
+    let prefix = plugin_slot(
+        walk.namespace,
+        walk.plugin_id,
+        walk.plugin_name,
+        section,
+        path,
+    );
     let brokered = items.iter().any(contains_placeholder);
+    let label = section.label();
 
     if brokered && items.len() > 1 {
         push_warning(
             report,
             format!(
-                "plugin config array '{prefix}' has {} entries and entry ORDER is the slot \
+                "{label} array '{prefix}' has {} entries and entry ORDER is the slot \
                  identity (entry N uses '[N]'). Removing or reordering an entry reassigns the \
                  retired slot's value to whichever entry shifts into its index. Reseed the \
                  affected slots in the credential bundle instead of deleting or reordering \
@@ -2366,6 +2583,9 @@ fn check_plugin_array_slot_identity(
         );
     }
 
+    if !scan_orphans {
+        return;
+    }
     let scan_prefix = format!("{prefix}/");
     // Only keys under this array can match, and the bundle is sorted: scan
     // that key range instead of every slot in the bundle.
@@ -2384,7 +2604,7 @@ fn check_plugin_array_slot_identity(
             push_slot_remap(
                 report,
                 format!(
-                    "plugin config slot '{slot}' is orphaned: the credential bundle still holds a \
+                    "{label} slot '{slot}' is orphaned: the credential bundle still holds a \
                      value for it, but array '{prefix}' now has {} entr{} (entry index {index} no \
                      longer exists). Slot identity is positional, so the entry that shifted into \
                      a vacated index has inherited a retired secret, and re-growing the array \
@@ -2421,8 +2641,9 @@ fn enforce_slot_remap_policy(
     }
     Err(crate::error::Error::CredentialSlotRemap(format!(
         "Refusing to resolve credentials: {} credential slot(s) would be reassigned or \
-         revived by a credential shape change, a retired Consumer, or a PluginConfig that \
-         changed `plugin_name` (or still has retired type-less `@plugin-config` keys):\n  {}",
+         revived by a credential shape change, a retired Consumer or plugin trigger operand, \
+         or a PluginConfig that changed `plugin_name` (or still has retired type-less \
+         `@plugin-config` keys):\n  {}",
         report.slot_remaps.len(),
         report.slot_remaps.join("\n  ")
     )))
@@ -2813,7 +3034,17 @@ impl<'a> PluginWalk<'a> {
         let bundle = self.bundle;
         let namespace = escape_slot_component(self.namespace);
         let plugin_id = escape_slot_component(self.plugin_id);
-        let owned = plugin_config_slot(self.namespace, self.plugin_id, self.plugin_name, &[]);
+        // Its `config` and `trigger` sections; anything else under its own
+        // type is not a slot this build derives.
+        let sections = PluginSlotSection::ALL.map(|section| {
+            plugin_slot(
+                self.namespace,
+                self.plugin_id,
+                self.plugin_name,
+                section,
+                &[],
+            )
+        });
         for kind in [
             PLUGIN_CONFIG_SLOT_KIND,
             RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND,
@@ -2823,19 +3054,99 @@ impl<'a> PluginWalk<'a> {
                 .range(prefix.clone()..)
                 .map(|(slot, _)| slot)
                 .take_while(|slot| slot.starts_with(&prefix))
-                .filter(|slot| is_slot_under(slot, &prefix) && !is_slot_under(slot, &owned));
+                .filter(|slot| {
+                    is_slot_under(slot, &prefix)
+                        && !sections.iter().any(|owned| is_slot_under(slot, owned))
+                });
             for slot in foreign {
-                push_slot_remap(report, self.foreign_slot_message(slot, kind, &owned));
+                push_slot_remap(report, self.foreign_slot_message(slot, kind));
             }
+        }
+    }
+
+    /// Refuse stored `trigger` slots whose operand path this plugin's declared
+    /// trigger no longer has.
+    ///
+    /// A trigger operand cannot be emptied (Edge refuses an empty `exact` /
+    /// `prefix` list), so retiring the last one means removing its list, its
+    /// predicate, its branch or the whole trigger; an array-length check on
+    /// the arrays still present never sees that. Each stored slot under this
+    /// plugin type's `trigger` prefix that is not the slot of a current
+    /// operand position is therefore a proven remap under the same
+    /// [`SlotRemapPolicy`]: re-adding an operand at that path (with
+    /// `alloc=generate`, say) would otherwise resurrect a retired value.
+    /// Runs for every declared plugin, with or without a trigger.
+    fn check_trigger_slot_retirement(
+        &self,
+        trigger: Option<&serde_json::Value>,
+        report: &mut ResolveReport,
+    ) {
+        let root = plugin_trigger_slot(self.namespace, self.plugin_id, self.plugin_name, &[]);
+        let scan_prefix = format!("{root}/");
+        let mut stored = self
+            .bundle
+            .range(scan_prefix.clone()..)
+            .map(|(slot, _)| slot)
+            .take_while(|slot| slot.starts_with(&scan_prefix))
+            .peekable();
+        if stored.peek().is_none() {
+            return;
+        }
+        // Structural, so a second pass over an already-resolved document
+        // (`allocate_if_needed` re-resolves after allocation) sees the same
+        // owned slots: a resolved operand no longer spells a placeholder but
+        // still sits at its slot's path. A literal at that path is refused
+        // by the literal-secret gate instead.
+        let owned: std::collections::BTreeSet<String> = trigger
+            .map(|json| {
+                trigger_operand_strings(json)
+                    .into_iter()
+                    .map(|(path, _)| {
+                        plugin_trigger_slot(self.namespace, self.plugin_id, self.plugin_name, &path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let namespace = self.namespace;
+        let plugin_id = self.plugin_id;
+        let orphans: Vec<String> = stored
+            .filter(|slot| !owned.contains(slot.as_str()))
+            .map(|slot| {
+                format!(
+                    "plugin trigger slot '{slot}' is orphaned: the credential bundle still holds \
+                     a value for it, but plugin '{namespace}/{plugin_id}''s trigger has no \
+                     operand at that path any more (the operand, \
+                     its list, its predicate or the trigger was removed or moved). Re-adding an \
+                     operand at that path would resurrect the retired value. Retire this slot \
+                     from the credential bundle, keeping every other entry — or pass \
+                     --allow-credential-slot-remap to accept it."
+                )
+            })
+            .collect();
+        for message in orphans {
+            push_slot_remap(report, message);
         }
     }
 
     /// Why `slot`, found under this plugin's id, is not one of its slots.
     /// Names slots and the declared type only, never a value.
-    fn foreign_slot_message(&self, slot: &str, kind: &str, owned: &str) -> String {
+    ///
+    /// The remedy names the section the stored slot belongs to
+    /// (`<ns>/<id>/@plugin/<type>/<section>/…`), so a trigger value is
+    /// reseeded under the declared type's `trigger` prefix, not `config`.
+    fn foreign_slot_message(&self, slot: &str, kind: &str) -> String {
         let namespace = self.namespace;
         let plugin_id = self.plugin_id;
         let plugin_name = self.plugin_name;
+        let section = if kind == PLUGIN_CONFIG_SLOT_KIND
+            && slot.split('/').nth(4) == Some(PluginSlotSection::Trigger.segment())
+        {
+            PluginSlotSection::Trigger
+        } else {
+            PluginSlotSection::Config
+        };
+        let owned = plugin_slot(namespace, plugin_id, plugin_name, section, &[]);
+        let label = section.label();
         if kind == RETIRED_TYPELESS_PLUGIN_CONFIG_SLOT_KIND {
             return format!(
                 "plugin config slot '{slot}' uses the retired type-less encoding, which does not \
@@ -2847,7 +3158,7 @@ impl<'a> PluginWalk<'a> {
             );
         }
         format!(
-            "plugin config slot '{slot}' is orphaned: the credential bundle still holds a value \
+            "{label} slot '{slot}' is orphaned: the credential bundle still holds a value \
              for plugin '{namespace}/{plugin_id}' under a different plugin type than the declared \
              '{plugin_name}'. Slot identity includes the plugin type, so the value is never \
              resolved into the new plugin, and changing the type back would resurrect it. Seed \
@@ -2865,11 +3176,16 @@ impl<'a> PluginWalk<'a> {
     /// verdict cannot differ between `plan` and `apply`.
     fn report_leaf(
         &self,
+        section: PluginSlotSection,
         text: &str,
         path: &[ConfigPathComponent],
         report: &mut ResolveReport,
     ) -> crate::error::Result<Option<String>> {
-        if super::tls_material::is_malformed_broker_declaration(text)
+        // TLS key-source and seed checks classify config paths only; a
+        // trigger operand is never TLS material.
+        let config_section = section == PluginSlotSection::Config;
+        if config_section
+            && super::tls_material::is_malformed_broker_declaration(text)
             && super::tls_material::plugin_placement(self.plugin_name, path)
                 == super::tls_material::KeyPlacement::KeySource
         {
@@ -2884,16 +3200,29 @@ impl<'a> PluginWalk<'a> {
             return Ok(None);
         };
         let placeholder = parsed?;
-        let slot = plugin_config_slot(self.namespace, self.plugin_id, self.plugin_name, path);
+        let slot = plugin_slot(
+            self.namespace,
+            self.plugin_id,
+            self.plugin_name,
+            section,
+            path,
+        );
+        if section == PluginSlotSection::Trigger {
+            if let Some(value) = self.bundle.get(&slot) {
+                check_trigger_operand_bundle_value(&slot, text, value)?;
+            }
+        }
         let existing = lookup_exact_slot_value(&slot, self.bundle)?;
-        if let Some(value) = existing {
+        if let Some(value) = existing.filter(|_| config_section) {
             check_plugin_seed_brokerable(&slot, self.plugin_name, path, value)?;
             if super::tls_material::is_plugin_key_source(self.plugin_name, path) {
                 check_tls_key_not_placeholder_text(&slot, text, value)?;
             }
         }
         let status = classify_status(&placeholder, existing);
-        let endpoint = self.endpoints.contains(path);
+        // Endpoint rules classify config paths; a trigger operand is never a
+        // URL the gateway dials.
+        let endpoint = section == PluginSlotSection::Config && self.endpoints.contains(path);
         if matches!(self.constraints, ConstraintMode::Enforce)
             && matches!(status, SlotStatus::NeedsAllocation)
         {
@@ -2914,7 +3243,7 @@ impl<'a> PluginWalk<'a> {
         report.results.push(ResolveResult {
             consumer_id: self.plugin_id.to_string(),
             namespace: self.namespace.to_string(),
-            cred_key: plugin_config_cred_key(self.plugin_name, path),
+            cred_key: plugin_cred_key(self.plugin_name, section, path),
             slot,
             placeholder,
             status,
@@ -2931,7 +3260,7 @@ fn walk_plugin_and_report(
 ) -> crate::error::Result<()> {
     match value {
         serde_json::Value::String(text) => {
-            walk.report_leaf(text, path, report)?;
+            walk.report_leaf(PluginSlotSection::Config, text, path, report)?;
         }
         serde_json::Value::Object(map) => {
             for (key, child) in map {
@@ -2941,7 +3270,7 @@ fn walk_plugin_and_report(
             }
         }
         serde_json::Value::Array(items) => {
-            check_plugin_array_slot_identity(walk, path, items, report);
+            check_plugin_array_slot_identity(walk, PluginSlotSection::Config, path, items, report);
             for (index, child) in items.iter().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
                 walk_plugin_and_report(child, walk, path, report)?;
@@ -2951,6 +3280,87 @@ fn walk_plugin_and_report(
         _ => {}
     }
     Ok(())
+}
+
+/// Report the brokered client-field operands of one plugin's serialized
+/// `trigger` ([`super::plugin_trigger`]) under their `trigger` slots.
+///
+/// Only operand sites are walked: a placeholder anywhere else in a trigger is
+/// refused before either walk ([`validate_identity_placeholders`]). A
+/// multi-entry brokered array (`all` / `any`, `exact` / `prefix`) gets the
+/// order-is-identity advisory; stored slots no operand uses any more are
+/// refused by [`PluginWalk::check_trigger_slot_retirement`].
+fn walk_plugin_trigger_and_report(
+    trigger: &serde_json::Value,
+    walk: &PluginWalk<'_>,
+    report: &mut ResolveReport,
+) -> crate::error::Result<()> {
+    check_trigger_array_slot_identity(trigger, walk, &mut Vec::new(), report);
+    for (path, text) in trigger_operand_strings(trigger) {
+        walk.report_leaf(PluginSlotSection::Trigger, text, &path, report)?;
+    }
+    Ok(())
+}
+
+/// [`walk_plugin_trigger_and_report`] that also writes each stored value
+/// back. Returns whether anything was replaced. An operand left unresolved
+/// keeps its placeholder and is reported, so the write path's
+/// [`unresolved_placeholder_slots`] check refuses it like any other slot.
+fn walk_plugin_trigger_report_and_replace(
+    trigger: &mut serde_json::Value,
+    walk: &PluginWalk<'_>,
+    report: &mut ResolveReport,
+) -> crate::error::Result<bool> {
+    check_trigger_array_slot_identity(trigger, walk, &mut Vec::new(), report);
+    let operands: Vec<(Vec<ConfigPathComponent>, String)> = trigger_operand_strings(trigger)
+        .into_iter()
+        .map(|(path, text)| (path, text.to_string()))
+        .collect();
+    let mut changed = false;
+    for (path, text) in operands {
+        let Some(replacement) =
+            walk.report_leaf(PluginSlotSection::Trigger, &text, &path, report)?
+        else {
+            continue;
+        };
+        let slot = trigger_value_mut(trigger, &path).ok_or_else(|| {
+            crate::error::Error::Config(format!(
+                "internal: plugin `{}/{}` trigger operand '{}' disappeared during resolution",
+                walk.namespace,
+                walk.plugin_id,
+                render_trigger_path(&path)
+            ))
+        })?;
+        *slot = serde_json::Value::String(replacement);
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn check_trigger_array_slot_identity(
+    value: &serde_json::Value,
+    walk: &PluginWalk<'_>,
+    path: &mut Vec<ConfigPathComponent>,
+    report: &mut ResolveReport,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                path.push(ConfigPathComponent::Key(key.clone()));
+                check_trigger_array_slot_identity(child, walk, path, report);
+                path.pop();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            check_plugin_array_slot_identity(walk, PluginSlotSection::Trigger, path, items, report);
+            for (index, child) in items.iter().enumerate() {
+                path.push(ConfigPathComponent::Index(index));
+                check_trigger_array_slot_identity(child, walk, path, report);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Capture the credential type (third slot component) structurally, before it
@@ -3017,7 +3427,9 @@ fn walk_plugin_report_and_replace(
 ) -> crate::error::Result<()> {
     match value {
         serde_json::Value::String(text) => {
-            if let Some(replacement) = walk.report_leaf(text, path, report)? {
+            if let Some(replacement) =
+                walk.report_leaf(PluginSlotSection::Config, text, path, report)?
+            {
                 *text = replacement;
             }
         }
@@ -3029,7 +3441,7 @@ fn walk_plugin_report_and_replace(
             }
         }
         serde_json::Value::Array(items) => {
-            check_plugin_array_slot_identity(walk, path, items, report);
+            check_plugin_array_slot_identity(walk, PluginSlotSection::Config, path, items, report);
             for (index, child) in items.iter_mut().enumerate() {
                 path.push(ConfigPathComponent::Index(index));
                 walk_plugin_report_and_replace(child, walk, path, report)?;
