@@ -13,6 +13,7 @@ mod diff_exit_tests;
 mod diff_tests;
 mod doctor_cli_tests;
 mod doctor_tests;
+mod edge_version_tests;
 mod env_tests;
 mod exit_code_matrix_tests;
 mod file_target_tests;

@@ -283,12 +283,19 @@ fn load_and_assemble_all(
     resolved: &ResolvedEnv,
     env_config: &EnvConfig,
 ) -> Result<config::AssembledOutput, Box<dyn std::error::Error>> {
-    Ok(gitforgeops::pipeline::load_and_assemble(
+    let assembled = gitforgeops::pipeline::load_and_assemble(
         &PathBuf::from("./resources"),
         &PathBuf::from(config::OVERLAYS_ROOT),
         resolved,
         env_config,
-    )?)
+    )?;
+    if let Some(notice) = config::format_omitted_proxy_fields_notice(
+        resolved.effective_edge_version(),
+        &assembled.omitted_proxy_fields,
+    ) {
+        eoutln!("Notice: {}", safe_line(&notice));
+    }
+    Ok(assembled)
 }
 
 /// [`load_and_assemble_all`] for the commands that only reconcile gateway

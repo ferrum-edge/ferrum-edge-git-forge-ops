@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::edge_version::EdgeVersion;
 use super::env::ApplyStrategy;
 use super::repo_file::{read_bounded_repo_file, MAX_REPO_CONFIG_FILE_BYTES};
 
@@ -161,6 +162,11 @@ pub struct EnvironmentConfig {
     pub live_review: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace_filter: Option<String>,
+    /// Paired Ferrum Edge release version for this environment (for example
+    /// `v0.9.20` or `v0.9.21`). Unset falls back to `FERRUM_EDGE_VERSION`, then
+    /// the repository's default baseline (`v0.9.20`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_version: Option<EdgeVersion>,
     pub apply_strategy: ApplyStrategy,
     pub ownership: OwnershipConfig,
     pub monitoring: MonitoringConfig,
@@ -174,6 +180,7 @@ impl Default for EnvironmentConfig {
             overlay: None,
             live_review: true,
             namespace_filter: None,
+            edge_version: None,
             apply_strategy: ApplyStrategy::Incremental,
             ownership: OwnershipConfig::default(),
             monitoring: MonitoringConfig::default(),

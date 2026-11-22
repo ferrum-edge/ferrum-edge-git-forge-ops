@@ -85,6 +85,7 @@ fn env(mode: OwnershipMode, namespaces: Option<Vec<String>>) -> ResolvedEnv {
         overlay: None,
         namespace_filter: None,
         namespace_filter_is_environment_scope: false,
+        edge_version: None,
         apply_strategy: ApplyStrategy::Incremental,
         ownership: OwnershipConfig {
             mode,

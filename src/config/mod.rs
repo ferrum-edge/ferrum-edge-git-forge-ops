@@ -1,4 +1,5 @@
 pub mod assembler;
+pub mod edge_version;
 pub mod env;
 pub(crate) mod json_object;
 pub mod loader;
@@ -12,6 +13,10 @@ mod strict;
 pub use assembler::{
     apply_overlay, apply_overlay_with_options, assemble, assemble_with_namespace_filter,
     merge_mesh_fragments, AssembledOutput,
+};
+pub use edge_version::{
+    adapt_gateway_for_edge_version, format_omitted_proxy_fields_notice, EdgeVersion,
+    OmittedProxyField, DEFAULT_EDGE_VERSION, POOL_MAX_REQUESTS_FIELD, POOL_MAX_REQUESTS_REMOVED_IN,
 };
 pub use env::{load_env_config, ApplyStrategy, EnvConfig, GatewayMode};
 pub use loader::{load_resources, load_resources_with_options};

@@ -964,3 +964,52 @@ fn an_unconfigured_lambda_region_stands_in_with_the_environment_region() {
         assert!(text.contains(expected), "{env:?}: {text}");
     }
 }
+
+/// Paired `pool_max_requests_per_connection` fixtures (#739) against the real
+/// pinned Ferrum Edge validator when `GITFORGEOPS_TEST_EDGE_BINARY` is set.
+#[test]
+fn real_edge_validates_paired_pool_max_requests_fixtures() {
+    let Some(binary) = real_validator() else {
+        return;
+    };
+    let fixtures_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pool-max-requests");
+
+    for variant in ["with-field", "without-field"] {
+        let repo = Repo::new(&[], None, Some(&binary));
+        let fixture =
+            std::fs::read_to_string(fixtures_root.join(variant).join("ferrum/proxies/api.yaml"))
+                .unwrap();
+        repo.write("resources/ferrum/proxies/api.yaml", &fixture);
+
+        for env in [
+            &[][..],
+            &[("FERRUM_EDGE_VERSION", "v0.9.20")][..],
+            &[("FERRUM_EDGE_VERSION", "v0.9.21")][..],
+        ] {
+            let output = repo.run(&["validate", "--format", "json"], env);
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let emits_removed_field =
+                variant == "with-field" && env != [("FERRUM_EDGE_VERSION", "v0.9.21")];
+            if emits_removed_field && !output.status.success() {
+                // Against a real Edge v0.9.21+ binary under the v0.9.20 pairing,
+                // the validator rejects the field and GitForgeOps maps it to an
+                // actionable compatibility error before apply.
+                assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+                let stderr = report["stderr"].as_str().unwrap_or("");
+                assert!(
+                    stderr
+                        .contains("gitforgeops error [validator-pool-max-requests-per-connection]"),
+                    "{variant} {env:?}: {report}"
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{variant} {env:?}: {}",
+                    output_text(&output)
+                );
+                assert_eq!(report["success"], true, "{variant} {env:?}: {report}");
+            }
+        }
+    }
+}

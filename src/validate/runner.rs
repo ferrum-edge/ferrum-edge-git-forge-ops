@@ -641,7 +641,7 @@ fn run_validate_pass(
     }
 
     if mode == GATEWAY_VALIDATE_MODE && exit_code == 1 {
-        if let Some(diagnostic) = super::compatibility::resource_labels_diagnostic(
+        if let Some(diagnostic) = super::compatibility::compatibility_diagnostic(
             &stdout,
             &stderr,
             &prepared.binary_in_use,
