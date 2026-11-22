@@ -934,6 +934,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Update `url` to 2.5.9 (with `form_urlencoded` 1.2.3) for RUSTSEC-2026-0592,
+  fixing unbounded recursion in `Url::origin()` on nested `blob:` URLs that
+  could overflow the stack and abort the process.
 - Cover the Trivy image findings for glibc `2.41-12+deb13u4` (CVE-2026-5435,
   CVE-2026-6238, CVE-2026-6368, CVE-2026-6791, CVE-2026-8674, CVE-2026-18374,
   CVE-2026-19499, CVE-2026-19542, CVE-2026-77117, CVE-2026-80489,
