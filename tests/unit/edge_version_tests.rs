@@ -647,10 +647,10 @@ exit 0\n";
             }
 
             for (args, code) in [
-                (vec!["review"], 0),
-                (vec!["review", "--fail-on-blockers"], 1),
+                (&["review"][..], 0),
+                (&["review", "--fail-on-blockers"][..], 1),
             ] {
-                let output = repo.run(&args, &[]);
+                let output = repo.run(args, &[]);
                 assert_eq!(output.status.code(), Some(code), "{}", stderr(&output));
                 let rendered = stdout(&output);
                 repo.assert_remedy(&rendered);

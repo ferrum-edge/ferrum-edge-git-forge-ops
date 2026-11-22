@@ -1,10 +1,10 @@
 {
   "source": {
     "repository": "ferrum-edge/ferrum-edge",
-    "tag": "v0.9.20",
-    "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
+    "tag": "v0.9.21",
+    "commit": "f9915358c8032214f4034a17c28cdf72d14006c3",
     "path": "openapi.yaml",
-    "sha256": "8fa7232d96e1094578dee03cfa1966a4fdd9df77b8e027a9625f56ce6bfd355e"
+    "sha256": "fce981dc61d2ee8f929c91afcab9e3eb672dc028316c2a85bdcc5942671bcdf1"
   },
   "schemas": {
     "Proxy": {
@@ -50,7 +50,6 @@
         "pool_http2_max_frame_size",
         "pool_http3_connections_per_backend",
         "pool_idle_timeout_seconds",
-        "pool_max_requests_per_connection",
         "pool_tcp_keepalive_seconds",
         "preserve_host_header",
         "response_body_mode",

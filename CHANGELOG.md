@@ -21,7 +21,12 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with `>= v0.9.21`, proxy files carrying the field still load cleanly and the
   removed field is omitted from desired state across validate, export, diff,
   plan, review and apply with a stderr notice. Paired fixtures with and without
-  the field are added under `tests/fixtures/pool-max-requests/`.
+  the field are added under `tests/fixtures/pool-max-requests/`. The reviewed
+  Ferrum Edge v0.9.21 validator digest is appended to
+  `.github/ferrum-edge-checksums.txt` (retaining v0.9.20 and all prior lines)
+  and `tests/fixtures/edge-openapi/resource-fields.json` is refreshed to
+  v0.9.21 while keeping `Proxy.pool_max_requests_per_connection` mirrored for
+  the default v0.9.20 pairing.
 - Fork pull requests get `trusted-supply-chain-policy` and
   `validate-trusted-policy` verdicts again. `actions/checkout` v7.0.1 refuses a
   fork pull request's head in a `pull_request_target` run unless the step sets

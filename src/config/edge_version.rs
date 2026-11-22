@@ -82,14 +82,8 @@ impl EdgeVersion {
     /// True for v0.9.20 and earlier; false for v0.9.21 and later, where the
     /// no-op field was removed from Edge's `deny_unknown_fields` `Proxy` model
     /// (`ferrum-edge#7218`).
-    pub const fn supports_pool_max_requests_per_connection(self) -> bool {
-        if self.major != POOL_MAX_REQUESTS_REMOVED_IN.major {
-            return self.major < POOL_MAX_REQUESTS_REMOVED_IN.major;
-        }
-        if self.minor != POOL_MAX_REQUESTS_REMOVED_IN.minor {
-            return self.minor < POOL_MAX_REQUESTS_REMOVED_IN.minor;
-        }
-        self.patch < POOL_MAX_REQUESTS_REMOVED_IN.patch
+    pub fn supports_pool_max_requests_per_connection(self) -> bool {
+        self < POOL_MAX_REQUESTS_REMOVED_IN
     }
 }
 
