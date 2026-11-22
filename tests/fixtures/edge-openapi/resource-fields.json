@@ -4,7 +4,7 @@
     "tag": "v0.9.21",
     "commit": "f9915358c8032214f4034a17c28cdf72d14006c3",
     "path": "openapi.yaml",
-    "sha256": "fce981dc61d2ee8f929c91afcab9e3eb672dc028316c2a85bdcc5942671bcdf1"
+    "sha256": "13c21d12d3028c8044ad2f467cbca6425d9bd2f3fce787d6fe7ae78316c21bee"
   },
   "schemas": {
     "Proxy": {
