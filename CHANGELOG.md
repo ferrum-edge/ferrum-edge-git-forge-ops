@@ -7,6 +7,21 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Version-aware handling for `Proxy.pool_max_requests_per_connection` across
+  Ferrum Edge v0.9.20 and v0.9.21 pairings (#739). Ferrum Edge v0.9.21 removed
+  the no-op field while keeping `Proxy` `deny_unknown_fields`
+  (`ferrum-edge#7218`). Environments may now declare `edge_version` in
+  `.gitforgeops/config.yaml` (or fall back to `FERRUM_EDGE_VERSION`, optional
+  `v` prefix); the repository's default baseline stays `v0.9.20` (#266). When
+  paired with `< v0.9.21` (default), GitForgeOps accepts, emits and diffs
+  `pool_max_requests_per_connection` verbatim (preserving v0.9.20's semantics
+  where a save omitting the field clears it) and surfaces an actionable
+  `gitforgeops error [validator-pool-max-requests-per-connection]` diagnostic
+  before apply if an incompatible v0.9.21+ validator rejects it. When paired
+  with `>= v0.9.21`, proxy files carrying the field still load cleanly and the
+  removed field is omitted from desired state across validate, export, diff,
+  plan, review and apply with a stderr notice. Paired fixtures with and without
+  the field are added under `tests/fixtures/pool-max-requests/`.
 - Fork pull requests get `trusted-supply-chain-policy` and
   `validate-trusted-policy` verdicts again. `actions/checkout` v7.0.1 refuses a
   fork pull request's head in a `pull_request_target` run unless the step sets

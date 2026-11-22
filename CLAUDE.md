@@ -296,15 +296,21 @@ on Proxy, Consumer, Upstream and PluginConfig, keeping existing labels and an
 existing origin. No opt-out. This needs a gateway and validator that include
 ferrum-edge#5483; Edge 0.9.4 and earlier reject the labels.
 
-`validate::compatibility` recognizes only a failed validator's unknown-`labels`
-diagnostic (prefix `Validation error: Spec validation failed:`, with one of the
-four kinds' expected-field signature). It prepends `gitforgeops error
-[validator-resource-labels]` with the validator path (from the existing `which`
-lookup), the upgrade remedy, and the alternative of pinning an older Git Forge
-Ops. No version probe or version gate. Original output still goes through
-scrubbing. All formats carry the message; `plan` and `review` keep their
-validation-blocker verdicts; file apply refuses before publication. Mesh and
-other schema errors are unchanged.
+`validate::compatibility` recognizes failed gateway validator rejections for
+unknown `labels` (prefix `Validation error: Spec validation failed:`, with one
+of the four kinds' expected-field signature) and unknown
+`pool_max_requests_per_connection` on a `Proxy` (removed in Ferrum Edge v0.9.21,
+ferrum-edge#7218). It prepends `gitforgeops error [validator-resource-labels]`
+or `gitforgeops error [validator-pool-max-requests-per-connection]` with the
+validator path (from the existing `which` lookup) and actionable remedies. No
+version probe or version gate. Original output still goes through scrubbing. All
+formats carry the message; `plan` and `review` keep their validation-blocker
+verdicts; file apply refuses before publication. Mesh and other schema errors
+are unchanged. Environments paired with `>= v0.9.21` (`edge_version` in
+`.gitforgeops/config.yaml` or `FERRUM_EDGE_VERSION`; default stays `v0.9.20`)
+omit `pool_max_requests_per_connection` from assembled desired state at the
+shared `pipeline::load_and_assemble` boundary with a stderr notice while keeping
+v0.9.20 accept/emit/diff behaviour exact.
 
 `check-validator-resource-labels.sh` runs after the installer verifies the
 publisher and allowlisted SHA-256 digests. It validates

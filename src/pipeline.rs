@@ -43,7 +43,7 @@ pub fn load_and_assemble(
     let (on_disk_count, on_disk_namespaces) = config::NamespaceScope::on_disk_inventory(&resources);
     let assembled =
         config::assemble_with_namespace_filter(resources, resolved.namespace_filter.as_deref())?;
-    let gateway_config =
+    let mut gateway_config =
         config::select_config_namespace(&assembled.gateway, resolved.namespace_filter.as_deref());
     let namespace_scope = config::NamespaceScope::with_desired(
         resolved.namespace_filter.as_deref(),
@@ -68,11 +68,16 @@ pub fn load_and_assemble(
     // instead of waiting for post-merge API apply to discover it.
     crate::apply::validate_no_desired_spec_tags(&gateway_config)?;
     crate::secrets::resolver::validate_identity_placeholders(&gateway_config)?;
+    let omitted_proxy_fields = config::adapt_gateway_for_edge_version(
+        &mut gateway_config,
+        resolved.effective_edge_version(),
+    );
     Ok(AssembledOutput {
         gateway: gateway_config,
         mesh: assembled.mesh,
         mesh_sources: assembled.mesh_sources,
         namespace_scope,
+        omitted_proxy_fields,
     })
 }
 
