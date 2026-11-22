@@ -133,14 +133,12 @@ RUN set -eu; \
 # usable /bin/sh, and several of its code paths shell out — `validate` execs
 # `ferrum-edge`, overrides inspect Git. Trixie matches
 # the glibc of the upstream ferrum-edge image so the copied binary links cleanly.
-# The current Debian Trixie package index still lists libpcre2-8-0
-# 10.46-1~deb13u2 on amd64 and arm64; the reviewed security fix is u3. The
-# pinned base carries liblzma5 5.8.1-1+deb13u1 from the xz-utils source package;
-# the reviewed security fix is u2. It also carries zlib1g
-# 1:1.3.dfsg+really1.3.1-1+b1; the reviewed security fix is +deb13u1. It
-# carries libc6 and libc-bin 2.41-12+deb13u4; the reviewed point-release fix is
-# +deb13u5. Keep the exact-version, SHA-256-verified
-# package updates until the base's installed package metadata confirms it
+# The pinned base already ships libpcre2-8-0 10.46-1~deb13u3 and liblzma5
+# 5.8.1-1+deb13u2, so those two .deb pins currently reinstall the same reviewed
+# versions. It still carries zlib1g 1:1.3.dfsg+really1.3.1-1+b1; the reviewed
+# security fix is +deb13u1. It also carries libc6 and libc-bin 2.41-12+deb13u4;
+# the reviewed point-release fix is +deb13u5. Keep the exact-version,
+# SHA-256-verified package updates until the base's installed package metadata confirms it
 # already carries the fixes. Never `apt-get`.
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 # Install only bytes the builder already verified against the reviewed digests.

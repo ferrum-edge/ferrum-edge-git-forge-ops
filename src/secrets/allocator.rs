@@ -314,6 +314,102 @@ pub async fn allocate_and_deliver_at(
     Ok(outcome)
 }
 
+/// Complete the post-allocation handoff after [`allocate_and_deliver`] returns:
+/// journal every committed slot, re-resolve the configuration from the updated
+/// bundle, and surface any already-delivered ciphertexts before propagating an
+/// error from allocation, journaling or re-resolution.
+///
+/// Every GitHub Environment Secret write is an external commit of its own, so
+/// once any shard PUT succeeds a later failure must never drop its delivery
+/// ciphertexts: the next run will see those slots as already present in the
+/// bundle and will not re-allocate or re-deliver them.
+///
+/// On `Ok(outcome)`, `surface` is not called here; the caller prints its
+/// summary and surfaces `outcome` before mutating the gateway. On `Err`,
+/// `surface` has already been called for every committed slot (if any).
+pub async fn finalize_allocation<J, R, S, SFut>(
+    allocation: Result<AllocateOutcome, AllocationFailure>,
+    journal: J,
+    resolve: R,
+    surface: S,
+) -> crate::error::Result<AllocateOutcome>
+where
+    J: FnOnce(&AllocateOutcome) -> crate::error::Result<()>,
+    R: FnOnce() -> crate::error::Result<()>,
+    S: FnOnce(AllocateOutcome) -> SFut,
+    SFut: std::future::Future<Output = crate::error::Result<()>>,
+{
+    let outcome = match allocation {
+        Ok(outcome) => outcome,
+        Err(failure) => {
+            // Shard-atomic commit failed partway through: the shards in
+            // `failure.partial.allocated` were successfully PUT to GitHub
+            // before the failure, so their new values are live on the
+            // gateway side. Surface those ciphertexts NOW — if we let the
+            // error propagate without surfacing, recipients for already-
+            // committed shards have no decryption material and the next
+            // apply will see the slot as resolved (bundle has the value)
+            // so no re-delivery fires. Subsequent shards in the batch are
+            // not in `partial.allocated` (their PUT never succeeded), so
+            // they'll show up as NeedsAllocation on the next apply.
+            //
+            // Journal the committed slots before the error propagates. The
+            // Consumers that own them are not in the ledger yet, so without
+            // this record the retry would refuse its own slots as revived
+            // values (#352). Unwritten shards are not in `partial` and stay
+            // unrecorded.
+            let journaled = journal(&failure.partial);
+            if !failure.partial.allocated.is_empty() {
+                surface(failure.partial).await?;
+            }
+            if let Err(journal_error) = journaled {
+                return Err(crate::error::Error::Config(format!(
+                    "{}; recording the credential slots that were committed also failed: \
+                     {journal_error}",
+                    failure.source
+                )));
+            }
+            return Err(*failure.source);
+        }
+    };
+
+    // The shards are externally committed even if journaling them fails:
+    // surface the committed ciphertexts exactly as the partial-failure
+    // branch does, then report the persistence failure. Retry metadata is
+    // not durable in that case, and the error says so instead of letting
+    // the recipient lose material no later pass will redeliver.
+    if let Err(journal_error) = journal(&outcome) {
+        if !outcome.allocated.is_empty() {
+            surface(outcome).await?;
+        }
+        return Err(crate::error::Error::Config(format!(
+            "credentials were allocated and committed, but recording them in state failed: \
+             {journal_error}. The delivered ciphertexts above are the committed values; \
+             retry allocation journaling is not durable, so keep them — a retry may refuse \
+             these slots as revived values until state is repaired."
+        )));
+    }
+
+    // Re-resolve so `desired` picks up freshly allocated values. The shards
+    // are already externally committed and journaled, so a failure on this
+    // second resolve pass must surface the delivered ciphertexts before the
+    // error propagates — otherwise every recipient's ciphertext is dropped
+    // and no later run will re-deliver the already-committed slots.
+    if let Err(resolve_error) = resolve() {
+        if !outcome.allocated.is_empty() {
+            surface(outcome).await?;
+        }
+        return Err(crate::error::Error::Config(format!(
+            "credentials were allocated, committed, and recorded in state, but re-resolving \
+             the configuration failed: {resolve_error}. The delivered ciphertexts above are the \
+             committed values; keep them — a retry will reuse these bundle slots without \
+             re-delivering them."
+        )));
+    }
+
+    Ok(outcome)
+}
+
 /// Rotate a specific slot: generate a new value, write to GitHub, deliver to
 /// the invoking user.
 ///

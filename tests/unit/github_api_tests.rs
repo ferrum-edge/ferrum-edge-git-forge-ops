@@ -7,10 +7,10 @@ use std::time::Duration;
 use base64::Engine;
 use gitforgeops::error::Error;
 use gitforgeops::secrets::{
-    allocate_and_deliver_at, fetch_public_key_at, load_bundles_from_env, merge_bundles,
-    parse_placeholder, put_environment_secret_at, rotate_and_deliver_at, slot_path,
-    write_bundle_handoff, EnvSecretPublicKey, ResolveReport, ResolveResult, SlotStatus,
-    DEFAULT_GITHUB_API_BASE,
+    allocate_and_deliver_at, fetch_public_key_at, finalize_allocation, load_bundles_from_env,
+    merge_bundles, parse_placeholder, put_environment_secret_at, rotate_and_deliver_at, slot_path,
+    write_bundle_handoff, AllocateOutcome, AllocationFailure, EnvSecretPublicKey, ResolveReport,
+    ResolveResult, SlotStatus, DEFAULT_GITHUB_API_BASE,
 };
 use gitforgeops::verify::runner::run_check;
 use gitforgeops::verify::{
@@ -1291,6 +1291,331 @@ async fn a_failed_batch_discovery_writes_nothing() {
             "discovery is the only request of a refused batch"
         );
     }
+}
+
+/// When the post-allocation re-resolution pass fails after shards are already
+/// committed and journaled, `finalize_allocation` must still surface every
+/// already-delivered ciphertext (across consumer, plugin-config and
+/// plugin-trigger slots) instead of dropping them on a bare `?`.
+#[tokio::test]
+async fn finalize_allocation_surfaces_delivered_ciphertexts_when_second_resolve_fails() {
+    use gitforgeops::config::schema::GatewayConfig;
+    use gitforgeops::state::StateFile;
+
+    let (public_key, identity) = recipient_keypair();
+    let keys_body = serde_json::json!([{"key": public_key}]).to_string();
+    let mut routes = vec![(keys_path(), 200, keys_body)];
+    routes.extend(success_routes(204));
+    let (api_base, _) = spawn_github_stub(routes);
+
+    let cfg: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [{
+            "id": "app",
+            "username": "app",
+            "namespace": "ferrum",
+            "credentials": {
+                "keyauth": [{"key": GENERATE}]
+            }
+        }],
+        "plugin_configs": [
+            {
+                "id": "opaque",
+                "namespace": "ferrum",
+                "plugin_name": "custom_fixture",
+                "scope": "global",
+                "config": {"display_mode": GENERATE}
+            },
+            {
+                "id": "waf-trigger",
+                "namespace": "ferrum",
+                "plugin_name": "waf",
+                "scope": "global",
+                "config": {"mode": "enforce"},
+                "trigger": {
+                    "when": {
+                        "match": {
+                            "header": {
+                                "name": "x-skip-waf",
+                                "value": {"exact": [GENERATE]}
+                            }
+                        }
+                    }
+                }
+            }
+        ]
+    }))
+    .unwrap();
+
+    let consumer_slot = slot_path("ferrum", "app", "keyauth/key");
+    let plugin_config_slot = "ferrum/opaque/@plugin/custom_fixture/config/display_mode".to_string();
+    let plugin_trigger_slot =
+        "ferrum/waf-trigger/@plugin/waf/trigger/when/match/header/value/exact/[0]".to_string();
+
+    let mut state = StateFile {
+        environment: ENVIRONMENT.to_string(),
+        last_applied_at: Some(EARLIER_CLEAN_APPLY.to_string()),
+        ..StateFile::default()
+    };
+    let mut shards = BTreeMap::new();
+    let mut shard_count = 1;
+
+    let first = report_against_ledger(&cfg, &merge_bundles(&shards), &state)
+        .expect("first resolve classifies all three slot types as NeedsAllocation");
+    for slot in [&consumer_slot, &plugin_config_slot, &plugin_trigger_slot] {
+        assert_eq!(
+            status(&first, slot),
+            Some(SlotStatus::NeedsAllocation),
+            "{slot}"
+        );
+    }
+
+    let allocation = allocate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        Some(RECIPIENT),
+        &first,
+        &mut shards,
+        &mut shard_count,
+    )
+    .await;
+    assert!(
+        allocation.is_ok(),
+        "shards commit before the second resolve pass"
+    );
+
+    let surfaced: Arc<Mutex<Option<AllocateOutcome>>> = Arc::new(Mutex::new(None));
+    let surfaced_capture = Arc::clone(&surfaced);
+    let err = finalize_allocation(
+        allocation,
+        |committed| {
+            state.record_allocation(committed, Some("run-1"), &apply_binding());
+            Ok(())
+        },
+        || Err(Error::Config("injected second-pass resolve failure".into())),
+        |committed| async move {
+            *surfaced_capture.lock().expect("surfaced lock") = Some(committed);
+            Ok(())
+        },
+    )
+    .await
+    .expect_err("second-pass resolve failure must still fail the allocation step");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("injected second-pass resolve failure"),
+        "{message}"
+    );
+    assert!(
+        message.contains("delivered ciphertexts"),
+        "error should tell the operator to keep the surfaced ciphertexts: {message}"
+    );
+
+    let merged = merge_bundles(&shards);
+    let retained = surfaced
+        .lock()
+        .expect("surfaced lock")
+        .clone()
+        .expect("delivered ciphertexts must be surfaced on second-pass resolve error");
+    assert_eq!(retained.allocated.len(), 3);
+
+    let retained_slots: std::collections::BTreeSet<&str> = retained
+        .allocated
+        .iter()
+        .map(|slot| slot.slot.as_str())
+        .collect();
+    for slot in [&consumer_slot, &plugin_config_slot, &plugin_trigger_slot] {
+        assert!(
+            retained_slots.contains(slot.as_str()),
+            "missing surfaced slot {slot}: {retained_slots:?}"
+        );
+        assert!(
+            state.credentials.contains_key(slot),
+            "committed slot {slot} must remain journaled in state"
+        );
+    }
+
+    for slot in &retained.allocated {
+        let delivered = slot
+            .delivered
+            .as_ref()
+            .expect("every committed slot retains its delivery ciphertext");
+        assert_eq!(delivered.login, RECIPIENT);
+        assert!(!delivered.encrypted_b64.contains(&slot.value));
+        assert_eq!(
+            decrypt_delivery(&delivered.encrypted_b64, &identity),
+            merged[&slot.slot],
+            "surfaced ciphertext for {} must decrypt to the committed bundle value",
+            slot.slot
+        );
+    }
+}
+
+/// On the happy path `finalize_allocation` runs journaling and the second
+/// resolve pass without surfacing early (the caller surfaces `Ok(outcome)`
+/// once). On journal or partial-allocation failure it surfaces every committed
+/// ciphertext and skips the second resolve pass.
+#[tokio::test]
+async fn finalize_allocation_covers_success_journal_error_and_partial_failure() {
+    use gitforgeops::config::GatewayMode;
+    use gitforgeops::secrets::{resolve_secrets_with_mode_and_options, ResolveOptions};
+    use gitforgeops::state::StateFile;
+
+    let (public_key, identity) = recipient_keypair();
+    let keys_body = serde_json::json!([{"key": public_key}]).to_string();
+    let mut routes = vec![(keys_path(), 200, keys_body)];
+    routes.extend(success_routes(204));
+    let (api_base, _) = spawn_github_stub(routes);
+
+    let slot = slot_path("ferrum", "alpha", "keyauth/key");
+    let cfg = new_consumers_cfg(&["alpha"]);
+    let mut state = StateFile {
+        environment: ENVIRONMENT.to_string(),
+        last_applied_at: Some(EARLIER_CLEAN_APPLY.to_string()),
+        ..StateFile::default()
+    };
+    let mut shards = BTreeMap::new();
+    let mut shard_count = 1;
+    let first = report_against_ledger(&cfg, &BTreeMap::new(), &state).unwrap();
+    let allocated = allocate_and_deliver_at(
+        &test_client(),
+        &api_base,
+        REPO,
+        ENVIRONMENT,
+        TOKEN,
+        Some(RECIPIENT),
+        &first,
+        &mut shards,
+        &mut shard_count,
+    )
+    .await
+    .expect("allocate");
+    let merged = merge_bundles(&shards);
+
+    // 1. Happy path: journals, resolves desired in place, does not double-surface.
+    let mut desired = cfg.clone();
+    let surfaced: Arc<Mutex<Option<AllocateOutcome>>> = Arc::new(Mutex::new(None));
+    let surfaced_capture = Arc::clone(&surfaced);
+    let outcome = finalize_allocation(
+        Ok(allocated.clone()),
+        |committed| {
+            state.record_allocation(committed, Some("run-1"), &apply_binding());
+            Ok(())
+        },
+        || {
+            let _ = resolve_secrets_with_mode_and_options(
+                &mut desired,
+                &merged,
+                GatewayMode::Api,
+                ResolveOptions::allowing_slot_remap(false),
+            )?;
+            Ok(())
+        },
+        |committed| async move {
+            *surfaced_capture.lock().expect("surfaced lock") = Some(committed);
+            Ok(())
+        },
+    )
+    .await
+    .expect("happy path succeeds");
+    assert_eq!(outcome.allocated.len(), 1);
+    assert!(
+        surfaced.lock().expect("surfaced lock").is_none(),
+        "caller owns surfacing on Ok"
+    );
+    assert!(state.credentials.contains_key(&slot));
+    assert_eq!(
+        desired.consumers[0].credentials["keyauth"][0]["key"].as_str(),
+        Some(merged[&slot].as_str())
+    );
+
+    // 2. Journal failure: surfaces committed ciphertexts and skips re-resolve.
+    let surfaced: Arc<Mutex<Option<AllocateOutcome>>> = Arc::new(Mutex::new(None));
+    let surfaced_capture = Arc::clone(&surfaced);
+    let mut resolved_called = false;
+    let err = finalize_allocation(
+        Ok(allocated.clone()),
+        |_| Err(Error::Config("disk full".into())),
+        || {
+            resolved_called = true;
+            Ok(())
+        },
+        |committed| async move {
+            *surfaced_capture.lock().expect("surfaced lock") = Some(committed);
+            Ok(())
+        },
+    )
+    .await
+    .expect_err("journal failure propagates");
+    assert!(!resolved_called);
+    assert!(err.to_string().contains("disk full"), "{err}");
+    let retained = surfaced
+        .lock()
+        .expect("surfaced lock")
+        .clone()
+        .expect("journal failure must surface committed ciphertexts");
+    assert_eq!(
+        decrypt_delivery(
+            &retained.allocated[0]
+                .delivered
+                .as_ref()
+                .unwrap()
+                .encrypted_b64,
+            &identity
+        ),
+        merged[&slot]
+    );
+
+    // 3. Partial allocation failure: journals partial, surfaces partial, skips re-resolve.
+    let surfaced: Arc<Mutex<Option<AllocateOutcome>>> = Arc::new(Mutex::new(None));
+    let surfaced_capture = Arc::clone(&surfaced);
+    let mut partial_state = StateFile::default();
+    let mut resolved_called = false;
+    let err = finalize_allocation(
+        Err(AllocationFailure {
+            source: Box::new(Error::ApiError {
+                status: 502,
+                message: "Bad Gateway".into(),
+            }),
+            partial: allocated,
+        }),
+        |committed| {
+            partial_state.record_allocation(committed, Some("run-2"), &apply_binding());
+            Ok(())
+        },
+        || {
+            resolved_called = true;
+            Ok(())
+        },
+        |committed| async move {
+            *surfaced_capture.lock().expect("surfaced lock") = Some(committed);
+            Ok(())
+        },
+    )
+    .await
+    .expect_err("partial failure propagates");
+    assert!(!resolved_called);
+    assert_api_error(&err, 502, "Bad Gateway");
+    assert!(partial_state.credentials.contains_key(&slot));
+    let retained = surfaced
+        .lock()
+        .expect("surfaced lock")
+        .clone()
+        .expect("partial failure must surface already-committed ciphertexts");
+    assert_eq!(
+        decrypt_delivery(
+            &retained.allocated[0]
+                .delivered
+                .as_ref()
+                .unwrap()
+                .encrypted_b64,
+            &identity
+        ),
+        merged[&slot]
+    );
 }
 
 // --- Recipient hardening (#384) ----------------------------------------------

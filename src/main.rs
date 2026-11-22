@@ -565,7 +565,7 @@ fn write_review_to_step_summary(comment: &str) -> Result<(), Box<dyn std::error:
 async fn surface_delivered_credentials(
     env_config: &EnvConfig,
     outcome: &secrets::AllocateOutcome,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> gitforgeops::error::Result<()> {
     if outcome.allocated.is_empty() {
         return Ok(());
     }
@@ -682,7 +682,10 @@ fn journal_allocation(
 /// Returns the allocation outcome (or `None` if nothing needed allocation);
 /// `per_shard` and `shard_count` carry the post-allocation shard map. Every
 /// committed slot is journaled in `state` and saved before this returns,
-/// on success and on a partial failure alike.
+/// on success and on a partial failure alike, and any failure after a shard
+/// commit (partial allocation, state journaling or post-allocation
+/// re-resolution) surfaces the committed slots' delivered ciphertexts before
+/// propagating the error.
 #[allow(clippy::too_many_arguments)]
 async fn allocate_if_needed(
     desired: &mut GatewayConfig,
@@ -723,7 +726,7 @@ async fn allocate_if_needed(
     // the values.
     let client = secrets::github_api_client(env_config)?;
 
-    let outcome = match secrets::allocate_and_deliver(
+    let allocation = secrets::allocate_and_deliver(
         &client,
         repo,
         &resolved.name,
@@ -733,65 +736,24 @@ async fn allocate_if_needed(
         per_shard,
         shard_count,
     )
-    .await
-    {
-        Ok(o) => o,
-        Err(failure) => {
-            // Shard-atomic commit failed partway through: the shards in
-            // `failure.partial.allocated` were successfully PUT to GitHub
-            // before the failure, so their new values are live on the
-            // gateway side. Surface those ciphertexts NOW — if we let the
-            // error propagate without surfacing, recipients for already-
-            // committed shards have no decryption material and the next
-            // apply will see the slot as resolved (bundle has the value)
-            // so no re-delivery fires. Subsequent shards in the batch are
-            // not in `partial.allocated` (their PUT never succeeded), so
-            // they'll show up as NeedsAllocation on the next apply.
-            //
-            // Journal the committed slots before the error propagates. The
-            // Consumers that own them are not in the ledger yet, so without
-            // this record the retry would refuse its own slots as revived
-            // values (#352). Unwritten shards are not in `partial` and stay
-            // unrecorded.
-            let journaled = journal_allocation(state, &failure.partial, binding);
-            if !failure.partial.allocated.is_empty() {
-                surface_delivered_credentials(env_config, &failure.partial).await?;
-            }
-            if let Err(journal_error) = journaled {
-                return Err(format!(
-                    "{}; recording the credential slots that were committed also failed: \
-                     {journal_error}",
-                    failure.source
-                )
-                .into());
-            }
-            return Err(failure.source.into());
-        }
-    };
-    // The shards are externally committed even if journaling them fails:
-    // surface the committed ciphertexts exactly as the partial-failure
-    // branch does, then report the persistence failure. Retry metadata is
-    // not durable in that case, and the error says so instead of letting
-    // the recipient lose material no later pass will redeliver.
-    if let Err(journal_error) = journal_allocation(state, &outcome, binding) {
-        if !outcome.allocated.is_empty() {
-            surface_delivered_credentials(env_config, &outcome).await?;
-        }
-        return Err(format!(
-            "credentials were allocated and committed, but recording them in state failed: \
-             {journal_error}. The delivered ciphertexts above are the committed values; \
-             retry allocation journaling is not durable, so keep them — a retry may refuse \
-             these slots as revived values until state is repaired."
-        )
-        .into());
-    }
+    .await;
 
-    // Re-resolve so `desired` picks up freshly allocated values. The
-    // allocator only produces values for slots classified as NeedsAllocation
-    // (first-apply generate OR first-apply rotate). Already-allocated
-    // placeholders were resolved in the initial `resolve_secrets_with_options` pass.
-    let merged = secrets::merge_bundles(per_shard);
-    let _ = secrets::resolve_secrets_with_options(desired, &merged, resolve_options)?;
+    let outcome = secrets::finalize_allocation(
+        allocation,
+        |committed| journal_allocation(state, committed, binding),
+        || {
+            // Re-resolve so `desired` picks up freshly allocated values. The
+            // allocator only produces values for slots classified as
+            // NeedsAllocation (first-apply generate OR first-apply rotate).
+            // Already-allocated placeholders were resolved in the initial
+            // `resolve_secrets_with_options` pass.
+            let merged = secrets::merge_bundles(per_shard);
+            let _ = secrets::resolve_secrets_with_options(desired, &merged, resolve_options)?;
+            Ok(())
+        },
+        |committed| async move { surface_delivered_credentials(env_config, &committed).await },
+    )
+    .await?;
 
     Ok(Some(outcome))
 }
