@@ -654,6 +654,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `allocate_if_needed` now surfaces already-delivered credential ciphertexts
+  across every slot type when its post-allocation re-resolution pass fails,
+  matching how partial-allocation and state-journaling failures already retain
+  committed ciphertexts instead of dropping them on a bare `?` (`secrets::finalize_allocation`).
+- Update the `Dockerfile` runtime-stage comment to reflect that the pinned
+  `debian:trixie-slim` digest already ships `libpcre2-8-0` `10.46-1~deb13u3`
+  and `liblzma5` `5.8.1-1+deb13u2` (reinstalling the same reviewed versions),
+  while `zlib1g` (`+b1`) and `libc6`/`libc-bin` (`+deb13u4`) still need their
+  pinned updates.
 - Admin API examples use Ferrum Edge's default HTTPS admin port, `9443`
   (#754): `README.md`'s import example used `8081`, and `.env.example`, the
   `FERRUM_GATEWAY_URL` error text and its doc comment paired `https://` with

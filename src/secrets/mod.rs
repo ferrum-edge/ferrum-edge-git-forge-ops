@@ -13,7 +13,7 @@ pub(crate) mod tls_material;
 pub(crate) mod url_userinfo;
 
 pub use allocator::{
-    allocate_and_deliver, allocate_and_deliver_at, generate_credential_value,
+    allocate_and_deliver, allocate_and_deliver_at, finalize_allocation, generate_credential_value,
     generate_credential_value_typed, rotate_and_deliver, rotate_and_deliver_at, AllocateOutcome,
     AllocatedSlot, AllocationFailure,
 };
