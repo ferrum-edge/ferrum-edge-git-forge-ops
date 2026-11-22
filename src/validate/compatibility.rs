@@ -1,14 +1,41 @@
-//! Capability diagnostics for older Ferrum Edge validators. Labels remain
-//! mandatory; this only explains a schema rejection, never retries without them.
+//! Capability and version-pairing diagnostics for Ferrum Edge validators.
+//!
+//! These recognizers inspect already-scrubbed validator streams and prepend an
+//! actionable compatibility error while retaining Edge's original diagnostic.
+//! They never retry or rewrite the document behind the caller's back:
+//!
+//! * **`validator-resource-labels`** — an Edge build predating `ferrum-edge#5483`
+//!   rejected mandatory `labels` on a gateway resource.
+//! * **`validator-pool-max-requests-per-connection`** — an Edge `>= v0.9.21`
+//!   build rejected `Proxy.pool_max_requests_per_connection`, which Edge removed
+//!   after v0.9.20 (`ferrum-edge#7218`), when the run targeted the default
+//!   v0.9.20 pairing.
 
 use crate::diagnostics::safe;
 
-/// Recognize Edge's serde rejection, including the expected-field signature
-/// of a gateway resource. A mention of labels, an unrelated unknown field,
-/// or a nested plugin/mesh/settings schema must not become an upgrade error.
-fn resource_labels_rejection(stream: &str) -> Option<&str> {
-    const PREFIX: &str = "Validation error: Spec validation failed: unknown field `labels`, \
-                          expected one of ";
+const PROXY_SIGNATURE: &[&str] = &["listen_path", "backend_host", "backend_port"];
+const RESOURCE_SIGNATURES: &[&[&str]] = &[
+    PROXY_SIGNATURE,
+    &["username", "credentials", "acl_groups"],
+    &["name", "targets", "algorithm"],
+    &["plugin_name", "config", "scope", "proxy_id"],
+];
+
+const LABELS_PREFIX: &str =
+    "Validation error: Spec validation failed: unknown field `labels`, expected one of ";
+const POOL_MAX_PREFIX: &str = "Validation error: Spec validation failed: unknown field \
+                               `pool_max_requests_per_connection`, expected one of ";
+
+/// Recognize Edge's serde unknown-field rejection, including the expected-field
+/// signature of the matching gateway resource kind(s). A mention of the field,
+/// an unrelated unknown field, or a nested plugin/mesh/settings schema must not
+/// become a compatibility error.
+fn unknown_resource_field_rejection<'a>(
+    stream: &'a str,
+    prefix: &str,
+    field_name: &str,
+    signatures: &[&[&str]],
+) -> Option<&'a str> {
     stream.lines().find(|line| {
         // Edge prints the diagnostic bare on a TTY and wrapped in its JSON log
         // envelope (`{"timestamp":…,"level":"ERROR","fields":{"message":"…"}}`)
@@ -16,7 +43,7 @@ fn resource_labels_rejection(stream: &str) -> Option<&str> {
         // exactly those two shapes; a line that merely echoes the text elsewhere
         // (quoted YAML, a comment, a different key) is not a rejection.
         let trimmed = line.trim();
-        let Some(start) = trimmed.find(PREFIX) else {
+        let Some(start) = trimmed.find(prefix) else {
             return false;
         };
         let envelope = &trimmed[..start];
@@ -31,7 +58,7 @@ fn resource_labels_rejection(stream: &str) -> Option<&str> {
         {
             return false;
         }
-        let expected = &trimmed[start + PREFIX.len()..];
+        let expected = &trimmed[start + prefix.len()..];
         // Serde appends location text after the final field, and the JSON
         // envelope closes the string right after it. Only consume
         // comma-separated, backtick-quoted field names, never arbitrary text
@@ -60,33 +87,39 @@ fn resource_labels_rejection(stream: &str) -> Option<&str> {
         }
         fields.contains(&"id")
             && fields.contains(&"namespace")
-            && !fields.contains(&"labels")
-            && [
-                &["listen_path", "backend_host", "backend_port"][..],
-                &["username", "credentials", "acl_groups"][..],
-                &["name", "targets", "algorithm"][..],
-                &["plugin_name", "config", "scope", "proxy_id"][..],
-            ]
-            .iter()
-            .any(|signature| signature.iter().all(|field| fields.contains(field)))
+            && !fields.contains(&field_name)
+            && signatures
+                .iter()
+                .any(|signature| signature.iter().all(|field| fields.contains(field)))
     })
 }
 
-/// Prepend an actionable error to already-scrubbed stderr, retaining Edge's
-/// original streams for debugging. Copy a stdout rejection into stderr too:
-/// plan's failure detail is read from stderr. Never inspect unsanitized secret
-/// output here or bypass the scrubber's decision to withhold either stream.
-pub(super) fn resource_labels_diagnostic(
-    stdout: &str,
+fn prepend_diagnostic(
+    mut header: String,
+    stdout_rejection: Option<&str>,
+    stderr_rejection: Option<&str>,
     stderr: &str,
-    binary_path: &str,
-) -> Option<String> {
-    let stdout_rejection = resource_labels_rejection(stdout);
-    let stderr_rejection = resource_labels_rejection(stderr);
+) -> String {
+    if stderr_rejection.is_none() {
+        if let Some(line) = stdout_rejection {
+            header.push_str("Original Ferrum Edge diagnostic (stdout): ");
+            header.push_str(line);
+            header.push('\n');
+        }
+    }
+    header.push_str(stderr);
+    header
+}
+
+fn resource_labels_diagnostic(stdout: &str, stderr: &str, binary_path: &str) -> Option<String> {
+    let stdout_rejection =
+        unknown_resource_field_rejection(stdout, LABELS_PREFIX, "labels", RESOURCE_SIGNATURES);
+    let stderr_rejection =
+        unknown_resource_field_rejection(stderr, LABELS_PREFIX, "labels", RESOURCE_SIGNATURES);
     if stdout_rejection.is_none() && stderr_rejection.is_none() {
         return None;
     }
-    let mut diagnostic = format!(
+    let header = format!(
         "gitforgeops error [validator-resource-labels]: Ferrum Edge resource-labels support is \
          required for Proxy, Consumer, Upstream and PluginConfig. Validator binary: {}. \
          Upgrade the gateway and the `ferrum-edge validate` binary to a build including \
@@ -94,13 +127,59 @@ pub(super) fn resource_labels_diagnostic(
          emitted.\n",
         safe(binary_path)
     );
-    if stderr_rejection.is_none() {
-        if let Some(line) = stdout_rejection {
-            diagnostic.push_str("Original Ferrum Edge diagnostic (stdout): ");
-            diagnostic.push_str(line);
-            diagnostic.push('\n');
-        }
+    Some(prepend_diagnostic(
+        header,
+        stdout_rejection,
+        stderr_rejection,
+        stderr,
+    ))
+}
+
+fn pool_max_requests_diagnostic(stdout: &str, stderr: &str, binary_path: &str) -> Option<String> {
+    let stdout_rejection = unknown_resource_field_rejection(
+        stdout,
+        POOL_MAX_PREFIX,
+        "pool_max_requests_per_connection",
+        &[PROXY_SIGNATURE],
+    );
+    let stderr_rejection = unknown_resource_field_rejection(
+        stderr,
+        POOL_MAX_PREFIX,
+        "pool_max_requests_per_connection",
+        &[PROXY_SIGNATURE],
+    );
+    if stdout_rejection.is_none() && stderr_rejection.is_none() {
+        return None;
     }
-    diagnostic.push_str(stderr);
-    Some(diagnostic)
+    let header = format!(
+        "gitforgeops error [validator-pool-max-requests-per-connection]: Ferrum Edge v0.9.21 and \
+         later removed the no-op Proxy field `pool_max_requests_per_connection` \
+         (ferrum-edge#7218). Validator binary: {}. Set `edge_version: v0.9.21` on this \
+         environment in `.gitforgeops/config.yaml` (or `FERRUM_EDGE_VERSION=v0.9.21`) to omit \
+         the removed field automatically for v0.9.21+ targets while keeping v0.9.20 behaviour \
+         exact; remove `pool_max_requests_per_connection` from proxy YAML if no v0.9.20 gateway \
+         uses it (a save omitting it clears the stored field on v0.9.20); or validate with a \
+         v0.9.20 `ferrum-edge` binary.\n",
+        safe(binary_path)
+    );
+    Some(prepend_diagnostic(
+        header,
+        stdout_rejection,
+        stderr_rejection,
+        stderr,
+    ))
+}
+
+/// Prepend an actionable compatibility error to already-scrubbed stderr,
+/// retaining Edge's original streams for debugging. Copy a stdout rejection
+/// into stderr too: plan's failure detail is read from stderr. Never inspect
+/// unsanitized secret output here or bypass the scrubber's decision to withhold
+/// either stream.
+pub(super) fn compatibility_diagnostic(
+    stdout: &str,
+    stderr: &str,
+    binary_path: &str,
+) -> Option<String> {
+    resource_labels_diagnostic(stdout, stderr, binary_path)
+        .or_else(|| pool_max_requests_diagnostic(stdout, stderr, binary_path))
 }
