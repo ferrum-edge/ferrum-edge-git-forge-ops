@@ -161,12 +161,10 @@ pub fn mint_jwt_at(
         },
     };
 
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .map_err(|e| crate::error::Error::JwtError(e.to_string()))?;
+    let key = EncodingKey::from_secret(secret.as_bytes())
+        .map_err(|e| crate::error::Error::JwtError(e.to_string()))?;
+    let token = encode(&Header::default(), &claims, &key)
+        .map_err(|e| crate::error::Error::JwtError(e.to_string()))?;
     Ok(MintedJwt {
         token,
         issued_at: now,
