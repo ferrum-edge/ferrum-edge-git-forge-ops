@@ -934,6 +934,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Cover the Trivy image finding for `libzstd1` `1.5.7+dfsg-1`
+  (CVE-2026-124851, HIGH) with a checksum-pinned Debian Trixie security
+  update to `1.5.7+dfsg-1+deb13u1` for amd64 and arm64. The pinned
+  `debian:trixie-slim` base is unchanged.
 - Update `url` to 2.5.9 (with `form_urlencoded` 1.2.3) for RUSTSEC-2026-0592,
   fixing unbounded recursion in `Url::origin()` on nested `blob:` URLs that
   could overflow the stack and abort the process.

@@ -209,6 +209,7 @@ class RealDockerfileTests(unittest.TestCase):
                 },
                 "libc6": {"amd64": "2.41-12+deb13u5", "arm64": "2.41-12+deb13u5"},
                 "libc-bin": {"amd64": "2.41-12+deb13u5", "arm64": "2.41-12+deb13u5"},
+                "libzstd1": {"amd64": "1.5.7+dfsg-1+deb13u1", "arm64": "1.5.7+dfsg-1+deb13u1"},
             },
         )
         self.assertEqual(
@@ -224,6 +225,8 @@ class RealDockerfileTests(unittest.TestCase):
                 ("libc6", "arm64"): "0966fc3da1a26cc57647c68b5736f791b6e7eb498173a7993f63b6c89b4ed4f5",
                 ("libc-bin", "amd64"): "f30ee7381a9c6a3936165259bcd58e65f4b288e351606d200c8435724c5876dd",
                 ("libc-bin", "arm64"): "889850625c686a6d0b26a8baee5fb96f33e9f3305882f3a6751bb4c9433063e1",
+                ("libzstd1", "amd64"): "23a6f8a774d5dceda5f759b4ecdcdd652dfbefbf8271912e6a7ab0ee3250dc75",
+                ("libzstd1", "arm64"): "ab5ad90f986b315bfa12be50f438aa3453e32da3b29540844d2d847800d2ce08",
             },
         )
         self.assertEqual(
@@ -235,6 +238,7 @@ class RealDockerfileTests(unittest.TestCase):
                 # Debian 13.8 shipped the glibc fixes through the main archive.
                 "libc6": "debian/pool/main/g/glibc",
                 "libc-bin": "debian/pool/main/g/glibc",
+                "libzstd1": "debian-security/pool/updates/main/libz/libzstd",
             },
         )
         self.assertEqual(self.pin.epochs, {"zlib1g": 1})
