@@ -73,9 +73,11 @@ RUN cargo build --release --locked
 # CVE-2026-18374, CVE-2026-19499, CVE-2026-19542, CVE-2026-77117,
 # CVE-2026-80489, CVE-2026-86805, CVE-2026-89092, CVE-2026-95818 and
 # CVE-2026-97399 (MEDIUM/LOW), which Debian 13.8 shipped through the main
-# archive rather than the security archive. Pin each .deb by version and
-# SHA-256 from its content-immutable pool path (`debian-security/` or
-# `debian/`); never consult a mutable package index here. A pool drops a
+# archive rather than the security archive, and the libzstd1
+# 1.5.7+dfsg-1+deb13u1 security update for CVE-2026-124851 (HIGH). Pin each
+# .deb by version and SHA-256 from its content-immutable pool path
+# (`debian-security/` or `debian/`); never consult a mutable package index
+# here. A pool drops a
 # version once a newer update supersedes it; the build then fails closed (404)
 # and the base-image pin canary reports it.
 # Pool file names omit a Debian epoch, so a package that has one declares it
@@ -94,6 +96,7 @@ RUN set -eu; \
         8c27c342230503b73dfde629642c3b352e87b554e06d60cf58772f236a305ceb zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_amd64.deb \
         b59b0625cd1a791375d40dab23a4d5d3d0641e3d0a773501becdc3725b7f99cf libc6_2.41-12+deb13u5_amd64.deb \
         f30ee7381a9c6a3936165259bcd58e65f4b288e351606d200c8435724c5876dd libc-bin_2.41-12+deb13u5_amd64.deb \
+        23a6f8a774d5dceda5f759b4ecdcdd652dfbefbf8271912e6a7ab0ee3250dc75 libzstd1_1.5.7+dfsg-1+deb13u1_amd64.deb \
         > SHA256SUMS ;; \
       arm64) printf '%s  %s\n' \
         1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7 libpcre2-8-0_10.46-1~deb13u3_arm64.deb \
@@ -101,6 +104,7 @@ RUN set -eu; \
         0e41b3d7ad8ad7fcd36dd4d61ca91a70018478fc4af652e044f4be770784ddff zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_arm64.deb \
         0966fc3da1a26cc57647c68b5736f791b6e7eb498173a7993f63b6c89b4ed4f5 libc6_2.41-12+deb13u5_arm64.deb \
         889850625c686a6d0b26a8baee5fb96f33e9f3305882f3a6751bb4c9433063e1 libc-bin_2.41-12+deb13u5_arm64.deb \
+        ab5ad90f986b315bfa12be50f438aa3453e32da3b29540844d2d847800d2ce08 libzstd1_1.5.7+dfsg-1+deb13u1_arm64.deb \
         > SHA256SUMS ;; \
       *) echo "unsupported target architecture: $arch" >&2; exit 1 ;; \
     esac; \
@@ -111,6 +115,7 @@ RUN set -eu; \
         liblzma5_*) pool=debian-security/pool/updates/main/x/xz-utils ;; \
         zlib1g_*) pool=debian-security/pool/updates/main/z/zlib epoch=1 ;; \
         libc6_*|libc-bin_*) pool=debian/pool/main/g/glibc ;; \
+        libzstd1_*) pool=debian-security/pool/updates/main/libz/libzstd ;; \
         *) echo "unexpected package: $file" >&2; exit 1 ;; \
       esac; \
       version="${file#*_}"; version="${version%_*}"; \
@@ -137,7 +142,8 @@ RUN set -eu; \
 # 5.8.1-1+deb13u2, so those two .deb pins currently reinstall the same reviewed
 # versions. It still carries zlib1g 1:1.3.dfsg+really1.3.1-1+b1; the reviewed
 # security fix is +deb13u1. It also carries libc6 and libc-bin 2.41-12+deb13u4;
-# the reviewed point-release fix is +deb13u5. Keep the exact-version,
+# the reviewed point-release fix is +deb13u5. It carries libzstd1
+# 1.5.7+dfsg-1; the reviewed security fix is +deb13u1. Keep the exact-version,
 # SHA-256-verified package updates until the base's installed package metadata confirms it
 # already carries the fixes. Never `apt-get`.
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
