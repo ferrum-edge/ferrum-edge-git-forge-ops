@@ -934,6 +934,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- Cover the Trivy image findings for `login.defs` and `passwd`
+  `1:4.17.4-2` (CVE-2026-135901, shadow's `newgidmap`) with checksum-pinned
+  Debian Trixie security updates to `1:4.17.4-2+deb13u1` for amd64 and arm64
+  (`login.defs` is `Architecture: all`, so both pin the same file). The pinned
+  `debian:trixie-slim` base is unchanged.
 - Cover the Trivy image finding for `libzstd1` `1.5.7+dfsg-1`
   (CVE-2026-124851, HIGH) with a checksum-pinned Debian Trixie security
   update to `1.5.7+dfsg-1+deb13u1` for amd64 and arm64. The pinned

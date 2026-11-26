@@ -66,6 +66,10 @@ PACKAGE_ENTRY = re.compile(
     r"(?P<digest>[0-9a-f]{64})\s+(?P<name>[a-z0-9][a-z0-9+.-]*)"
     r"_(?P<version>[^_\s]+)_(?P<arch>[a-z0-9]+)\.deb"
 )
+# `<arch>) printf` opens the SHA256SUMS block one target architecture builds.
+# An `Architecture: all` file names no target, so each entry is attributed to
+# the block that lists it.
+ARCH_BLOCK = re.compile(r"(?P<target>[a-z0-9]+)\)\s*printf\b")
 # `<name>_*) pool=<path> ;;` from the pool-directory case statement, including
 # the alternation form `libc6_*|libc-bin_*)` where one source package ships
 # several binary packages.
@@ -194,6 +198,13 @@ class PinnedPackage:
     version: str
     arch: str
     digest: str
+    # The target architecture whose SHA256SUMS block lists this file. It equals
+    # `arch` except for an `Architecture: all` file, which every block lists.
+    target_arch: str = ""
+
+    @property
+    def target(self) -> str:
+        return self.target_arch or self.arch
 
     @property
     def filename(self) -> str:
@@ -220,11 +231,13 @@ class BasePin:
         return f"{self.image}@{self.digest}"
 
     def versions_by_name(self) -> dict[str, dict[str, str]]:
-        """name -> {arch: version}. Every architecture must be covered, or a
-        pin that only caught up on amd64 would read as covering both."""
+        """name -> {target architecture: version}. Every architecture must be
+        covered, or a pin that only caught up on amd64 would read as covering
+        both. Keyed by the block that lists the file, so an `Architecture: all`
+        package is checked once per target architecture."""
         by_name: dict[str, dict[str, str]] = {}
         for package in self.packages:
-            by_name.setdefault(package.name, {})[package.arch] = package.version
+            by_name.setdefault(package.name, {})[package.target] = package.version
         return by_name
 
     def debian_version(self, name: str, version: str) -> str:
@@ -286,12 +299,23 @@ def parse_dockerfile(text: str) -> BasePin:
     if "@sha256:" not in runtime_ref:
         raise ValueError(f"runtime base image is not digest-pinned: {runtime_ref}")
     image, _, digest = runtime_ref.partition("@")
+    blocks = [(match.start(), match.group("target")) for match in ARCH_BLOCK.finditer(text)]
+
+    def block_for(position: int) -> str:
+        target = ""
+        for start, name in blocks:
+            if start > position:
+                break
+            target = name
+        return target
+
     packages = [
         PinnedPackage(
             name=match.group("name"),
             version=match.group("version"),
             arch=match.group("arch"),
             digest=match.group("digest"),
+            target_arch=block_for(match.start()),
         )
         for match in PACKAGE_ENTRY.finditer(text)
     ]
@@ -437,6 +461,7 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
         has_pins=bool(pin.packages),
     )
     pinned = pin.versions_by_name()
+    targets = {package.target for package in pin.packages}
     purged = set(pin.purged)
     reported = {finding.package for finding in findings}
 
@@ -461,6 +486,9 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
             for arch, installed in installs.items()
             if compare_debian_versions(installed, finding.fixed) < 0
         )
+        # A target architecture whose block lists no file for the package
+        # still installs the base's version.
+        behind += sorted(f"{arch}: not pinned" for arch in targets - set(versions))
         if behind:
             report.stale_pins.append(f"{label} ({'; '.join(behind)})")
         else:
@@ -529,7 +557,7 @@ def head_status(url: str, *, timeout: float = 20.0, attempts: int = 2) -> int | 
 def check_pool(pin: BasePin, report: Report, *, fetch=head_status) -> None:
     """A superseded point release is dropped from the archive pool, and the
     image build then fails on a 404. Notice it here instead."""
-    for package in sorted(pin.packages, key=lambda item: (item.name, item.arch)):
+    for package in sorted(pin.packages, key=lambda item: (item.name, item.target)):
         url = pin.url_for(package)
         if url is None:
             report.unverified_pool.append(f"{package.filename} (no pool directory in the Dockerfile)")
