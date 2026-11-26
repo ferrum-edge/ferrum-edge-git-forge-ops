@@ -217,6 +217,14 @@ class ArchitectureAllTests(unittest.TestCase):
             "4444444444444444444444444444444444444444444444444444444444444444 perl-base_5.40.1-6+deb13u1_arm64.deb",
         )
         self.assertEqual(sorted(pin.versions_by_name()["gzip"]), ["amd64"])
+        report = check_base_image_pin.classify(
+            check_base_image_pin.parse_trivy_report(
+                report_document([vulnerability("gzip", "1.13-1+deb13u1", installed="1.13-1")])
+            )[0],
+            pin,
+        )
+        self.assertEqual(report.state, check_base_image_pin.State.STALE)
+        self.assertIn("arm64: not pinned", report.stale_pins[0])
 
 
 class RealDockerfileTests(unittest.TestCase):

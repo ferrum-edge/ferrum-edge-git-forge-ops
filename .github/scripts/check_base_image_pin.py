@@ -461,6 +461,7 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
         has_pins=bool(pin.packages),
     )
     pinned = pin.versions_by_name()
+    targets = {package.target for package in pin.packages}
     purged = set(pin.purged)
     reported = {finding.package for finding in findings}
 
@@ -485,6 +486,9 @@ def classify(findings: list[Finding], pin: BasePin, current_digest: str = "") ->
             for arch, installed in installs.items()
             if compare_debian_versions(installed, finding.fixed) < 0
         )
+        # A target architecture whose block lists no file for the package
+        # still installs the base's version.
+        behind += sorted(f"{arch}: not pinned" for arch in targets - set(versions))
         if behind:
             report.stale_pins.append(f"{label} ({'; '.join(behind)})")
         else:
