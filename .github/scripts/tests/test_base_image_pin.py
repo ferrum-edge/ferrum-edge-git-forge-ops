@@ -210,6 +210,9 @@ class RealDockerfileTests(unittest.TestCase):
                 "libc6": {"amd64": "2.41-12+deb13u5", "arm64": "2.41-12+deb13u5"},
                 "libc-bin": {"amd64": "2.41-12+deb13u5", "arm64": "2.41-12+deb13u5"},
                 "libzstd1": {"amd64": "1.5.7+dfsg-1+deb13u1", "arm64": "1.5.7+dfsg-1+deb13u1"},
+                # Architecture: all; the same file is pinned for amd64 and arm64.
+                "login.defs": {"all": "4.17.4-2+deb13u1"},
+                "passwd": {"amd64": "4.17.4-2+deb13u1", "arm64": "4.17.4-2+deb13u1"},
             },
         )
         self.assertEqual(
@@ -227,6 +230,9 @@ class RealDockerfileTests(unittest.TestCase):
                 ("libc-bin", "arm64"): "889850625c686a6d0b26a8baee5fb96f33e9f3305882f3a6751bb4c9433063e1",
                 ("libzstd1", "amd64"): "23a6f8a774d5dceda5f759b4ecdcdd652dfbefbf8271912e6a7ab0ee3250dc75",
                 ("libzstd1", "arm64"): "ab5ad90f986b315bfa12be50f438aa3453e32da3b29540844d2d847800d2ce08",
+                ("login.defs", "all"): "5573474d7bdfab60b27abdb6cbd5c5d4bf898e86d17fd8956eed6a4ebf1a4246",
+                ("passwd", "amd64"): "e7f364ab275542ba9cfdf0c6bec9276fbac3ef6fe27d3a65674bd29ba3d32096",
+                ("passwd", "arm64"): "49acfe766c3dea4f760e330ff9f1142c052ba2198442a35ad7d22ecf65508f6f",
             },
         )
         self.assertEqual(
@@ -239,9 +245,11 @@ class RealDockerfileTests(unittest.TestCase):
                 "libc6": "debian/pool/main/g/glibc",
                 "libc-bin": "debian/pool/main/g/glibc",
                 "libzstd1": "debian-security/pool/updates/main/libz/libzstd",
+                "login.defs": "debian-security/pool/updates/main/s/shadow",
+                "passwd": "debian-security/pool/updates/main/s/shadow",
             },
         )
-        self.assertEqual(self.pin.epochs, {"zlib1g": 1})
+        self.assertEqual(self.pin.epochs, {"zlib1g": 1, "login.defs": 1, "passwd": 1})
         self.assertEqual(self.pin.mirror, "https://deb.debian.org/")
         self.assertEqual(
             self.pin.url_for(
@@ -274,11 +282,21 @@ class RealDockerfileTests(unittest.TestCase):
 
     def test_every_pinned_package_carries_both_architectures_and_a_pool(self):
         # Both architectures and their pool directory must stay in step.
+        # An `Architecture: all` package is one file that must be listed in
+        # both the amd64 and the arm64 SHA256SUMS blocks.
         versions = self.pin.versions_by_name()
         for name, by_arch in versions.items():
-            self.assertEqual(
-                sorted(by_arch), ["amd64", "arm64"], f"{name} is not pinned for both architectures"
-            )
+            if sorted(by_arch) == ["all"]:
+                listed = [package for package in self.pin.packages if package.name == name]
+                self.assertEqual(
+                    len(listed), 2, f"{name} (all) is not listed for both architectures"
+                )
+            else:
+                self.assertEqual(
+                    sorted(by_arch),
+                    ["amd64", "arm64"],
+                    f"{name} is not pinned for both architectures",
+                )
             self.assertIn(name, self.pin.pools, f"{name} has no pool directory")
         for package in self.pin.packages:
             self.assertIsNotNone(self.pin.url_for(package))
