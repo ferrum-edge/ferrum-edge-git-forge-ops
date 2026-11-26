@@ -1077,7 +1077,7 @@ fn bearer_token(request: &str) -> String {
 
 fn verifies_under(token: &str, secret: &str) -> Option<Value> {
     let validation = Validation::new(Algorithm::HS256);
-    let key = DecodingKey::from_secret(secret.as_bytes());
+    let key = DecodingKey::from_secret(secret.as_bytes()).ok()?;
     decode::<Value>(token, &key, &validation)
         .ok()
         .map(|data| data.claims)

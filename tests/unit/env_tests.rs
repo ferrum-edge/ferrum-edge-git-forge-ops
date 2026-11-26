@@ -177,7 +177,7 @@ fn gateway_verifies(
     if let Some(audience) = audience {
         validation.set_audience(&[audience]);
     }
-    let key = DecodingKey::from_secret(secret.as_bytes());
+    let key = DecodingKey::from_secret(secret.as_bytes())?;
     decode::<serde_json::Value>(token, &key, &validation)?;
     Ok(())
 }

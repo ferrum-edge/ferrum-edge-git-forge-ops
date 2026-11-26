@@ -30,7 +30,7 @@ walkdir = "2"
 # Only HS256 signing is used. The aws-lc provider avoids pulling the RustCrypto
 # RSA implementation into the admin-token path; RSA remains solely behind
 # `age`'s SSH-recipient support (see docs/dependency-security.md).
-jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs"] }
 # Already in the tree as `jsonwebtoken`'s `aws_lc_rs` provider (same version and
 # default features, so the lockfile gains no package). Taken directly to
 # generate the throwaway `private_key_jwt` key a secretless validation run
