@@ -173,6 +173,52 @@ class DockerfileParsingTests(unittest.TestCase):
         )
 
 
+class ArchitectureAllTests(unittest.TestCase):
+    """An `Architecture: all` file is attributed to the block that lists it."""
+
+    def pin(self, amd64_line, arm64_line):
+        text = (
+            DOCKERFILE.replace(
+                "2222222222222222222222222222222222222222222222222222222222222222 gzip_1.13-1+deb13u1_amd64.deb",
+                amd64_line,
+            ).replace(
+                "4444444444444444444444444444444444444444444444444444444444444444 gzip_1.13-1+deb13u1_arm64.deb",
+                arm64_line,
+            )
+        )
+        return check_base_image_pin.parse_dockerfile(text)
+
+    def test_an_all_file_in_both_blocks_covers_both_architectures(self):
+        pin = self.pin(
+            "5555555555555555555555555555555555555555555555555555555555555555 gzip_1.13-1+deb13u1_all.deb",
+            "5555555555555555555555555555555555555555555555555555555555555555 gzip_1.13-1+deb13u1_all.deb",
+        )
+        self.assertEqual(
+            pin.versions_by_name()["gzip"],
+            {"amd64": "1.13-1+deb13u1", "arm64": "1.13-1+deb13u1"},
+        )
+
+    def test_an_all_file_lagging_in_one_block_is_stale(self):
+        pin = self.pin(
+            "5555555555555555555555555555555555555555555555555555555555555555 gzip_1.13-1+deb13u1_all.deb",
+            "6666666666666666666666666666666666666666666666666666666666666666 gzip_1.13-1_all.deb",
+        )
+        report = check_base_image_pin.classify(
+            check_base_image_pin.parse_trivy_report(
+                report_document([vulnerability("gzip", "1.13-1+deb13u1", installed="1.13-1")])
+            )[0],
+            pin,
+        )
+        self.assertTrue(report.stale_pins, report)
+
+    def test_an_all_file_in_one_block_only_leaves_the_other_uncovered(self):
+        pin = self.pin(
+            "5555555555555555555555555555555555555555555555555555555555555555 gzip_1.13-1+deb13u1_all.deb",
+            "4444444444444444444444444444444444444444444444444444444444444444 perl-base_5.40.1-6+deb13u1_arm64.deb",
+        )
+        self.assertEqual(sorted(pin.versions_by_name()["gzip"]), ["amd64"])
+
+
 class RealDockerfileTests(unittest.TestCase):
     """The parser is only useful if it keeps matching the file it reads."""
 
@@ -210,13 +256,13 @@ class RealDockerfileTests(unittest.TestCase):
                 "libc6": {"amd64": "2.41-12+deb13u5", "arm64": "2.41-12+deb13u5"},
                 "libc-bin": {"amd64": "2.41-12+deb13u5", "arm64": "2.41-12+deb13u5"},
                 "libzstd1": {"amd64": "1.5.7+dfsg-1+deb13u1", "arm64": "1.5.7+dfsg-1+deb13u1"},
-                # Architecture: all; the same file is pinned for amd64 and arm64.
-                "login.defs": {"all": "4.17.4-2+deb13u1"},
+                # Architecture: all; the same file is listed in both blocks.
+                "login.defs": {"amd64": "4.17.4-2+deb13u1", "arm64": "4.17.4-2+deb13u1"},
                 "passwd": {"amd64": "4.17.4-2+deb13u1", "arm64": "4.17.4-2+deb13u1"},
             },
         )
         self.assertEqual(
-            {(package.name, package.arch): package.digest for package in self.pin.packages},
+            {(package.name, package.target): package.digest for package in self.pin.packages},
             {
                 ("libpcre2-8-0", "amd64"): "e226f661d918f04daf38cdbc4806b7ed7d6ef95c7eb0ade692fc350e31970040",
                 ("libpcre2-8-0", "arm64"): "1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7",
@@ -230,7 +276,8 @@ class RealDockerfileTests(unittest.TestCase):
                 ("libc-bin", "arm64"): "889850625c686a6d0b26a8baee5fb96f33e9f3305882f3a6751bb4c9433063e1",
                 ("libzstd1", "amd64"): "23a6f8a774d5dceda5f759b4ecdcdd652dfbefbf8271912e6a7ab0ee3250dc75",
                 ("libzstd1", "arm64"): "ab5ad90f986b315bfa12be50f438aa3453e32da3b29540844d2d847800d2ce08",
-                ("login.defs", "all"): "5573474d7bdfab60b27abdb6cbd5c5d4bf898e86d17fd8956eed6a4ebf1a4246",
+                ("login.defs", "amd64"): "5573474d7bdfab60b27abdb6cbd5c5d4bf898e86d17fd8956eed6a4ebf1a4246",
+                ("login.defs", "arm64"): "5573474d7bdfab60b27abdb6cbd5c5d4bf898e86d17fd8956eed6a4ebf1a4246",
                 ("passwd", "amd64"): "e7f364ab275542ba9cfdf0c6bec9276fbac3ef6fe27d3a65674bd29ba3d32096",
                 ("passwd", "arm64"): "49acfe766c3dea4f760e330ff9f1142c052ba2198442a35ad7d22ecf65508f6f",
             },
@@ -282,22 +329,27 @@ class RealDockerfileTests(unittest.TestCase):
 
     def test_every_pinned_package_carries_both_architectures_and_a_pool(self):
         # Both architectures and their pool directory must stay in step.
-        # An `Architecture: all` package is one file that must be listed in
-        # both the amd64 and the arm64 SHA256SUMS blocks.
         versions = self.pin.versions_by_name()
         for name, by_arch in versions.items():
-            if sorted(by_arch) == ["all"]:
-                listed = [package for package in self.pin.packages if package.name == name]
-                self.assertEqual(
-                    len(listed), 2, f"{name} (all) is not listed for both architectures"
-                )
-            else:
-                self.assertEqual(
-                    sorted(by_arch),
-                    ["amd64", "arm64"],
-                    f"{name} is not pinned for both architectures",
-                )
+            self.assertEqual(
+                sorted(by_arch), ["amd64", "arm64"], f"{name} is not pinned for both architectures"
+            )
             self.assertIn(name, self.pin.pools, f"{name} has no pool directory")
+        # Each block lists one file per package: its own architecture's, or the
+        # shared `Architecture: all` file.
+        seen = set()
+        for package in self.pin.packages:
+            self.assertIn(
+                package.arch,
+                (package.target, "all"),
+                f"{package.filename} is in the {package.target} block",
+            )
+            self.assertNotIn(
+                (package.name, package.target),
+                seen,
+                f"{package.name} is listed twice for {package.target}",
+            )
+            seen.add((package.name, package.target))
         for package in self.pin.packages:
             self.assertIsNotNone(self.pin.url_for(package))
 
