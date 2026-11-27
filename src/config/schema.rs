@@ -655,12 +655,12 @@ pub struct PluginTriggerMatch {
     #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub consumer: Option<PluginTriggerIdentityMatch>,
     /// Unmapped external identity (present only when no gateway Consumer is
-    /// mapped). Edge after v0.9.20; the pinned validator rejects it.
+    /// mapped). Edge v0.9.21 and later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "crate::config::json_object::deserialize_optional_object")]
     pub external_identity: Option<PluginTriggerIdentityMatch>,
     /// Verifying authorities (64-hex realm digests) of the unmapped external
-    /// identity; the list is an OR. Edge after v0.9.20.
+    /// identity; the list is an OR. Edge v0.9.21 and later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_identity_authority: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1233,7 +1233,7 @@ pub struct MeshConfigSpec {
     pub destination_rules: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_service_cors_policies: Vec<serde_json::Value>,
-    /// Mesh bindings of VirtualService HTTP routes (Edge after v0.9.20).
+    /// Mesh bindings of VirtualService HTTP routes (Edge v0.9.21 and later).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_service_http_routes: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

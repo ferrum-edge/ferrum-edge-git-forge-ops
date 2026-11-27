@@ -1160,7 +1160,7 @@ fn resource_timestamps_round_trip_at_the_year_range_edges() {
 const EXTERNAL_IDENTITY_AUTHORITY: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Ferrum Edge after v0.9.20 splits unmapped external identities out of
+/// Ferrum Edge v0.9.21 and later splits unmapped external identities out of
 /// `consumer` into `external_identity`, scoped by
 /// `external_identity_authority`. Both are nested `PluginTriggerMatch` keys,
 /// which the escape hatch never covers, so the strict loader must model them.

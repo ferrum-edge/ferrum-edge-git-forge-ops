@@ -1,11 +1,12 @@
 //! Paired Ferrum Edge release version and version-aware resource adaptation.
 //!
-//! GitForgeOps keeps the repository's default baseline at [`DEFAULT_EDGE_VERSION`]
-//! (`v0.9.20`) so existing deployments and tests see byte-identical behaviour.
-//! Environments paired with a newer Ferrum Edge release can declare their target
-//! version (`edge_version` in `.gitforgeops/config.yaml`, or
-//! `FERRUM_EDGE_VERSION`), which enables version-aware handling for gateway
-//! schema changes without forcing a destructive repository-wide migration:
+//! [`DEFAULT_EDGE_VERSION`] is the Ferrum Edge release the repository pins
+//! (`validator.version` in `release/baseline.json`, `v0.9.21`;
+//! `check_release_baseline.py` keeps the two equal). An environment paired with
+//! a different Ferrum Edge release can declare it (`edge_version` in
+//! `.gitforgeops/config.yaml`, or `FERRUM_EDGE_VERSION`), which selects
+//! version-aware handling for gateway schema changes without forcing a
+//! destructive repository-wide migration:
 //!
 //! * **`Proxy.pool_max_requests_per_connection`** — Ferrum Edge v0.9.20 and
 //!   earlier accept and persist this field (a no-op carrier whose omission on
@@ -35,8 +36,10 @@ pub struct EdgeVersion {
 }
 
 /// Default paired Ferrum Edge version when neither the environment config nor
-/// `FERRUM_EDGE_VERSION` selects one. Matches the repository's current baseline.
-pub const DEFAULT_EDGE_VERSION: EdgeVersion = EdgeVersion::new(0, 9, 20);
+/// `FERRUM_EDGE_VERSION` selects one. Matches the release baseline's pinned
+/// validator (`release/baseline.json`), which `check_release_baseline.py`
+/// enforces.
+pub const DEFAULT_EDGE_VERSION: EdgeVersion = EdgeVersion::new(0, 9, 21);
 
 /// First Ferrum Edge release that removed `Proxy.pool_max_requests_per_connection`
 /// (`ferrum-edge#7218`).
@@ -141,11 +144,12 @@ pub struct OmittedProxyField {
 /// Adapt an assembled desired [`GatewayConfig`] for `edge_version`.
 ///
 /// * When `edge_version.supports_pool_max_requests_per_connection()` is `true`
-///   (`<= v0.9.20`, including [`DEFAULT_EDGE_VERSION`]), `config` is untouched
+///   (`<= v0.9.20`, selected explicitly), `config` is untouched
 ///   and an empty list is returned: `pool_max_requests_per_connection` is
 ///   emitted and diffed verbatim, preserving v0.9.20's omission-clears
 ///   semantics.
-/// * When `false` (`>= v0.9.21`), `pool_max_requests_per_connection` is cleared
+/// * When `false` (`>= v0.9.21`, including [`DEFAULT_EDGE_VERSION`]),
+///   `pool_max_requests_per_connection` is cleared
 ///   from every desired proxy that declared it, and each affected proxy is
 ///   returned so callers can emit an explicit operator notice. Live snapshots
 ///   from the gateway are never stripped here: if a v0.9.20 gateway still holds
@@ -190,8 +194,8 @@ pub fn format_omitted_proxy_fields_notice(
     Some(format!(
         "omitted removed no-op Proxy field `{POOL_MAX_REQUESTS_FIELD}` for paired Ferrum Edge \
          {edge_version} (removed in {POOL_MAX_REQUESTS_REMOVED_IN}, ferrum-edge#7218) on {} \
-         proxy/proxies: {proxies}. Environments paired with v0.9.20 continue to emit and diff \
-         this field verbatim.",
+         proxy/proxies: {proxies}. Only an environment explicitly paired with v0.9.20 or \
+         earlier emits and diffs this field verbatim.",
         omitted.len()
     ))
 }

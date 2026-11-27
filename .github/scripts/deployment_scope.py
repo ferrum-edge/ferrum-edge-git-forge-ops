@@ -67,6 +67,8 @@ from pathlib import Path
 #                                         (credential loading, installer,
 #                                         merge attribution, this file)
 #   .github/ferrum-edge-checksums.txt     which validator binary is trusted
+#   release/baseline.json                 which validator release is installed
+#                                         (`validator.version` / `sha256`)
 #   .github/workflows/apply-on-merge.yml  the deployment procedure itself
 #
 # Sorted, and written with the same `**` spelling the workflow trigger uses so
@@ -82,6 +84,7 @@ DEPLOYMENT_INPUT_PATHS: tuple[str, ...] = (
     "Cargo.toml",
     "build.rs",
     "overlays/**",
+    "release/baseline.json",
     "resources/**",
     "rust-toolchain",
     "rust-toolchain.toml",

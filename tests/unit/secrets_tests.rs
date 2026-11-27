@@ -645,7 +645,7 @@ fn edge_post_0_9_20_redacted_plugins() -> Vec<(&'static str, serde_json::Value, 
     ]
 }
 
-/// Edge after v0.9.20 redacts these paths, so import must broker them rather
+/// Edge v0.9.21 and later redacts these paths, so import must broker them rather
 /// than write them into resource YAML. The header maps used to be caught only
 /// by the header-map heuristic (a plaintext allowance), and the selector
 /// tokens and the bare `without_headers` / `query_params` operands by nothing

@@ -13,4 +13,5 @@ v0.9.21 removed the field while keeping `Proxy` `deny_unknown_fields`
 in `#737`).
 
 `tests/unit/edge_version_tests.rs` and `tests/unit/validator_namespace_tests.rs`
-exercise both fixtures across the v0.9.20 and v0.9.21 pairings.
+exercise both fixtures across an explicit v0.9.20 pairing and the v0.9.21
+pairing (the default, the release the repository pins).

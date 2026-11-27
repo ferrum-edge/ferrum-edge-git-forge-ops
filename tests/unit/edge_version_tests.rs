@@ -31,7 +31,8 @@ fn load_fixture_gateway(variant: &str) -> GatewayConfig {
 
 #[test]
 fn edge_version_parsing_ordering_and_pool_max_capability() {
-    assert_eq!(DEFAULT_EDGE_VERSION, EdgeVersion::new(0, 9, 20));
+    // The default is the release the repository pins (`release/baseline.json`).
+    assert_eq!(DEFAULT_EDGE_VERSION, EdgeVersion::new(0, 9, 21));
     assert_eq!(POOL_MAX_REQUESTS_REMOVED_IN, EdgeVersion::new(0, 9, 21));
 
     for (raw, expected) in [
@@ -78,7 +79,7 @@ fn edge_version_parsing_ordering_and_pool_max_capability() {
 
     assert!(EdgeVersion::new(0, 9, 19).supports_pool_max_requests_per_connection());
     assert!(EdgeVersion::new(0, 9, 20).supports_pool_max_requests_per_connection());
-    assert!(DEFAULT_EDGE_VERSION.supports_pool_max_requests_per_connection());
+    assert!(!DEFAULT_EDGE_VERSION.supports_pool_max_requests_per_connection());
     assert!(!EdgeVersion::new(0, 9, 21).supports_pool_max_requests_per_connection());
     assert!(!EdgeVersion::new(0, 9, 22).supports_pool_max_requests_per_connection());
     assert!(!EdgeVersion::new(0, 10, 0).supports_pool_max_requests_per_connection());
@@ -112,7 +113,7 @@ environments:
     assert_eq!(repo.environment("inherited").unwrap().edge_version, None);
 
     // Repo config wins over FERRUM_EDGE_VERSION; unset falls back to env var,
-    // then to DEFAULT_EDGE_VERSION (v0.9.20).
+    // then to DEFAULT_EDGE_VERSION (the pinned v0.9.21).
     let env_v21 = EnvConfig {
         edge_version: Some(EdgeVersion::new(0, 9, 21)),
         ..EnvConfig::default()
@@ -469,7 +470,12 @@ exit 0\n";
             "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    jwt:\n      - key: app-issuer\n        secret: '${gh-env-secret:alloc=generate}'\n",
         );
 
-        for env in [&[][..], &[("FERRUM_EDGE_VERSION", "v0.9.20")][..]] {
+        // v0.9.20 behaviour is selected explicitly; the default is the pinned
+        // v0.9.21 (`default_pairing_is_the_pinned_v0921_and_omits_the_removed_field`).
+        for env in [
+            &[("FERRUM_EDGE_VERSION", "v0.9.20")][..],
+            &[("FERRUM_EDGE_VERSION", "v0.9.19")][..],
+        ] {
             let output = repo.run(&["validate", "--format", "json"], env);
             assert!(output.status.success(), "{env:?}: {}", stderr(&output));
             let captured = std::fs::read_to_string(repo.dir.path().join("captured.yaml")).unwrap();
@@ -555,6 +561,37 @@ exit 0\n";
     }
 
     #[test]
+    fn default_pairing_is_the_pinned_v0921_and_omits_the_removed_field() {
+        let repo = PairingRepo::new("with-field", &v21_stub_script(false));
+
+        let val = repo.run(&["validate", "--format", "json"], &[]);
+        assert!(val.status.success(), "{}", stderr(&val));
+        let captured = std::fs::read_to_string(repo.dir.path().join("captured.yaml")).unwrap();
+        assert!(
+            !captured.contains("pool_max_requests_per_connection"),
+            "{captured}"
+        );
+
+        let exported = repo.run(&["export"], &[]);
+        assert!(exported.status.success(), "{}", stderr(&exported));
+        assert!(
+            !stdout(&exported).contains("pool_max_requests_per_connection"),
+            "{}",
+            stdout(&exported)
+        );
+        assert!(
+            stderr(&exported).contains("omitted removed no-op Proxy field"),
+            "{}",
+            stderr(&exported)
+        );
+        assert!(
+            stderr(&exported).contains("v0.9.21"),
+            "{}",
+            stderr(&exported)
+        );
+    }
+
+    #[test]
     fn v0921_pairing_preserves_validation_standins() {
         let repo = PairingRepo::new("with-field", &v21_stub_script(false));
         repo.write(
@@ -609,12 +646,15 @@ exit 0\n";
 
     #[test]
     fn incompatible_document_on_v0921_validator_reports_actionable_remedy_before_apply() {
+        // Only an environment explicitly paired with v0.9.20 still emits the
+        // field; the default pairing omits it (see the next test).
+        const V20: &[(&str, &str)] = &[("FERRUM_EDGE_VERSION", "v0.9.20")];
         for use_stdout in [false, true] {
             let repo = PairingRepo::new("with-field", &v21_stub_script(use_stdout));
             let diagnostic = edge_v21_rejection();
 
             for format in ["text", "json", "github", "github-annotations"] {
-                let output = repo.run(&["validate", "--format", format], &[]);
+                let output = repo.run(&["validate", "--format", format], V20);
                 assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
                 let rendered = stdout(&output);
                 repo.assert_remedy(&rendered);
@@ -632,7 +672,7 @@ exit 0\n";
             }
 
             for format in ["text", "json"] {
-                let output = repo.run(&["plan", "--format", format], &[]);
+                let output = repo.run(&["plan", "--format", format], V20);
                 assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
                 let detail = if format == "json" {
                     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -650,7 +690,7 @@ exit 0\n";
                 (&["review"][..], 0),
                 (&["review", "--fail-on-blockers"][..], 1),
             ] {
-                let output = repo.run(args, &[]);
+                let output = repo.run(args, V20);
                 assert_eq!(output.status.code(), Some(code), "{}", stderr(&output));
                 let rendered = stdout(&output);
                 repo.assert_remedy(&rendered);
@@ -659,7 +699,7 @@ exit 0\n";
             }
 
             std::fs::write(repo.published(), "existing gateway document\n").unwrap();
-            let output = repo.run(&["apply", "--auto-approve"], &[]);
+            let output = repo.run(&["apply", "--auto-approve"], V20);
             assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
             repo.assert_remedy(&stderr(&output));
             assert!(stderr(&output).contains(&diagnostic));

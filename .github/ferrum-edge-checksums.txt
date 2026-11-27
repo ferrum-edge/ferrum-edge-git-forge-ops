@@ -3,19 +3,19 @@
 # Format: <64 lowercase hex sha256>  ferrum-edge-linux-x86_64  # <date/note>
 #
 # Upstream publishes production artifacts only for version tags. Assets on a
-# given tag are immutable; a new version tag is a new candidate. GitHub's
-# `/releases/latest` endpoint returns the newest non-draft, non-prerelease
-# release and skips prereleases, so a retired rolling `latest` tag cannot
-# starve versioned builds. Content is the only stable pin.
-# `install-ferrum-edge.sh` resolves that candidate, verifies the publisher's
-# own checksum, and then refuses to make the bytes executable unless the
-# digest appears below.
+# given tag are immutable; a new version tag is a new candidate. Content is the
+# only stable pin. `install-ferrum-edge.sh` installs exactly the release
+# release/baseline.json pins (`validator.version`, resolved by tag), verifies
+# the publisher's own checksum, and then refuses to make the bytes executable
+# unless the digest equals the baseline's `validator.sha256` and appears below.
+# Each line notes the release it was approved for; check_release_baseline.py
+# requires the pinned digest's line to name the pinned release.
 #
-# Keep one line per approved build. Retaining the previous line means a refresh
-# does not break in-flight pull requests that still run against the older
-# binary. Regenerate a line with:
+# Keep one line per approved build. Retaining the previous line means moving
+# the pin does not break in-flight pull requests that still carry the older
+# baseline. Generate the line for a release with:
 #
-#   bash .github/scripts/refresh-ferrum-edge-pin.sh --append
+#   bash .github/scripts/refresh-ferrum-edge-pin.sh --release vX.Y.Z --append
 db496ec730d4ec6bf7c03eff21649ba859e236356d843c37da9700c28215dfdb  ferrum-edge-linux-x86_64  # 2026-09-02T03:02:29Z release latest
 fcc61174ddbc9a8b7669f3496c3c84e1cdfa7c7d0a9d1c3c3cc481f9b421c127  ferrum-edge-linux-x86_64  # 2026-09-02T21:24:55Z release latest
 cb797e2210d1f75b4c67f40ab41fe53b6ad98e0fbc830de09c7f2264abe9f59d  ferrum-edge-linux-x86_64  # 2026-09-05T03:37:48Z release latest

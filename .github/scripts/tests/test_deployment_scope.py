@@ -137,6 +137,9 @@ class DeploymentScopeTests(unittest.TestCase):
             ("rust-toolchain", "1.98.0\n"),
             (".github/scripts/credential_bundles.py", "# loader\n"),
             (".github/ferrum-edge-checksums.txt", "# pins\n"),
+            # The installer selects the validator release from the baseline,
+            # so a baseline-only change swaps the executable bytes.
+            ("release/baseline.json", '{"validator": {"version": "v0.9.20"}}\n'),
             (".github/workflows/apply-on-merge.yml", "name: GitForgeOps Apply\n"),
         ):
             with self.subTest(path=path):

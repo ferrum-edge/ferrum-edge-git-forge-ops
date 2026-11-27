@@ -13,8 +13,8 @@
 //! literal-secret gate, the validator scrubber and display sink, diff and
 //! review redaction, plugin-config classification and the `/config/export`
 //! site prediction all ask it, so a string cannot be a private key on one
-//! path and an ordinary setting on another. It mirrors Edge (`main`, after
-//! v0.9.20):
+//! path and an ordinary setting on another. It mirrors Edge v0.9.21
+//! (`plugin_config_projection::tls_material_field` / `tls_material_withheld`):
 //!
 //! * [`contains_inline_private_key`] is Edge's
 //!   `kafka_logging::contains_inline_private_key`: a PEM opening line whose
@@ -93,7 +93,7 @@ pub(crate) fn is_private_key_material(value: &str, field: Option<TlsMaterialFiel
 /// bundle-less validation gets a PEM-shaped stand-in. Paths use `*` for one
 /// map key or array entry; array indices are otherwise transparent.
 ///
-/// * `udp_logging` `dtls_key_path`: Edge after v0.9.20 declares it a
+/// * `udp_logging` `dtls_key_path`: Edge v0.9.21 and later declares it a
 ///   private-key source (`plugin_config_projection`), so it gets the
 ///   private-key field rule even though [`tls_material_field`] does not name
 ///   it.

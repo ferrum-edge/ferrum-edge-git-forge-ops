@@ -339,10 +339,13 @@ using GET only. No consumer to probe means unknown, never pass. A missing
 capability refuses the operation that needs it. Ordinary diff, plan, review and
 viewer drift reads retain their current endpoints and explain these runtime
 requirements. The conditional API owner contract was published at Edge
-`c764084b3b51c3f7ffde268c039688d35e49c553`. The current candidate gateway is
-published v0.9.20, with exact binary and image pins in the
-[pending release record](../release/baseline.json); GitForgeOps enforcement
-qualification against those bytes remains required before release acceptance.
+`c764084b3b51c3f7ffde268c039688d35e49c553`. The paired gateway is published
+v0.9.21, with exact binary and image pins in the
+[release baseline](../release/baseline.json). The release gate requires
+GitForgeOps enforcement qualification against those bytes; each published
+release's record in
+[`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+on upstream `main` links that evidence.
 Edge operator changes to review:
 [v0.9.15](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915)
 (external identity headers; plugin-config environment references only under
@@ -355,7 +358,11 @@ than deleted),
 `expected_proxy_ids` on PluginConfig writes) and
 [v0.9.20](https://github.com/ferrum-edge/ferrum-edge/blob/e4a606a00352674daaef08636e3e359e6c48ba18/docs/upgrade_guide.md#upgrading-to-0920)
 (plugin configs reject unknown keys in nested objects; stalled proxy clients
-are cut after `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS`).
+are cut after `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS`) and
+[v0.9.21](https://github.com/ferrum-edge/ferrum-edge/blob/f9915358c8032214f4034a17c28cdf72d14006c3/docs/upgrade_guide.md#upgrading-to-0921)
+(removes `Proxy.pool_max_requests_per_connection` and deprecated plugin
+options; `/restore` accepts only `api_specs.section_version: "2"`; viewer-key
+reads get no `ETag`).
 
 **Proxies and their plugins.** Ferrum Edge rewrites a proxy's association list
 itself when a scoped plugin is created, retargeted or removed. A proxy this
@@ -418,12 +425,12 @@ detaches it.
 The re-read alone only narrows the race: a proxy that attaches the plugin
 between that read and the write is detached unless the gateway enforces
 `expected_proxy_ids`, which closes the interval (issue #569). The pinned
-Ferrum Edge v0.9.20 includes ferrum-edge#6744 (first published in v0.9.19)
+Ferrum Edge v0.9.21 includes ferrum-edge#6744 (first published in v0.9.19)
 and refuses a PluginConfig update or delete that omits the parameter. Released builds up to and including
 v0.9.17 do not include that precondition and ignore the parameter. The client
 cannot tell whether the target gateway enforces it, so the re-read runs on
 every such write (issue #603). It stays until hosted lifecycle qualification
-of the exact v0.9.20 build is recorded.
+of the exact v0.9.21 build is recorded.
 
 ## Ordering between runs
 

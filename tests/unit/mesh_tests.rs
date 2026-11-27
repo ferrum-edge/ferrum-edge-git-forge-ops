@@ -808,7 +808,7 @@ fn summary_reports_only_non_empty_collections() {
     assert!(!summary.contains("sidecar"), "{summary}");
 }
 
-/// `virtual_service_http_routes` (Edge after v0.9.20) loads strictly,
+/// `virtual_service_http_routes` (Edge v0.9.21 and later) loads strictly,
 /// concatenates across fragments like the sibling namespaced lists (Edge's
 /// validator owns the `(namespace, name)` duplicate check), is counted by the
 /// plan summary, and reaches the published mesh document verbatim.

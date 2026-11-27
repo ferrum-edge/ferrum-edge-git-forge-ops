@@ -17,9 +17,9 @@ repository pins, split into writable `properties` and `read_only` ones.
   pairings, such as `Proxy.pool_max_requests_per_connection`) is a property of
   the schema, so a misspelled mirror field fails too.
 
-It also requires `source.tag` to be the newest release in
-`.github/ferrum-edge-checksums.txt`, so moving the validator pin fails until
-this file is regenerated from the new release.
+It also requires `source.tag` to be the pinned release
+(`validator.version` in `release/baseline.json`), so moving the validator pin
+fails until this file is regenerated from the new release.
 
 ## Regenerating
 

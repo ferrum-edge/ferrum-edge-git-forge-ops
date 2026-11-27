@@ -136,10 +136,10 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         // DPoP replay protection (`jwks_auth`) and `replay_scope: "shared"`
         // nonce tracking (`hmac_auth`) read the root Redis fields through
         // Edge's shared `RedisConfig::from_plugin_config`, exactly like the
-        // rate limiters. Edge v0.9.20 projects `redis_url` on any plugin by
-        // name (later Edge also declares it for both plugins), fingerprinting
-        // it in `/config/export` whenever projection changes it (userinfo,
-        // query or fragment), so it is an export site here as it is for
+        // rate limiters. Edge v0.9.21 declares `redis_url` for both plugins
+        // (v0.9.20 projected it by name), fingerprinting it in
+        // `/config/export` whenever projection changes it (userinfo, query or
+        // fragment), so it is an export site here as it is for
         // `rate_limiting`.
         "jwks_auth" => {
             let mut rules = vec![
@@ -198,13 +198,12 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         ],
         // `privacy.snippet_hash_salt` keys the hashes of logged snippets; a
         // reader holding it can confirm guessed snippets against them.
-        // Ferrum Edge v0.9.20 accepts it unredacted; later Edge redacts it
-        // (ferrum-edge#7054).
+        // Ferrum Edge v0.9.21 redacts it (ferrum-edge#7054); v0.9.20 did not.
         "ai_semantic_firewall" => vec![
             endpoint(&["provider", "endpoint"]),
             secret(&["privacy", "snippet_hash_salt"]),
         ],
-        // Edge after v0.9.20 redacts the approval webhook's static headers
+        // Edge v0.9.21 and later redacts the approval webhook's static headers
         // and each MCP server's upstream request headers: the approval
         // service's or hosted MCP server's credential usually rides there
         // under a vendor name. The same maps carry ordinary short settings
@@ -260,7 +259,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             operator_value(&["custom_headers", "*"]),
         ],
         // `conditions.headers` values scope a custom rule or override to
-        // requests carrying a header value. Edge after v0.9.20 redacts them
+        // requests carrying a header value. Edge v0.9.21 and later redacts them
         // because an operator may target with a shared secret, as for
         // `fault_injection`; a `null` (presence-only) condition stays `null`.
         "waf" => vec![
@@ -271,11 +270,11 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
         // Since Edge v0.9.19 every `bypass.header_present` value is a shared
         // secret (16 to 4096 visible ASCII characters) whose exact presence
         // skips OpenAPI request validation, the same kind of value as the
-        // `waf` exemption above (GHSA-5p93-qfr5-m7m9). Edge v0.9.20 does not
-        // yet redact it; later Edge does (ferrum-edge#7054).
+        // `waf` exemption above (GHSA-5p93-qfr5-m7m9). Edge v0.9.21 redacts
+        // it (ferrum-edge#7054); v0.9.20 did not.
         "openapi_validator" => vec![secret(&["bypass", "header_present", "*"])],
         "request_transformer" => vec![operator_value(&["rules", "*", "value"])],
-        // Match operands (Edge after v0.9.20) select a route by a value the
+        // Match operands (Edge v0.9.21 and later) select a route by a value the
         // client presents, which may be a shared secret. Each is a bare
         // string or a one-key `{exact|prefix|regex: ...}` object: the
         // trailing `*` matches the bare string (a scalar where a container is
@@ -286,7 +285,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
             operator_value(&["rules", "*", "match", "without_headers", "*", "*"]),
             operator_value(&["rules", "*", "match", "query_params", "*", "*"]),
         ],
-        // Operator-chosen selector tokens Edge after v0.9.20 redacts: the
+        // Operator-chosen selector tokens Edge v0.9.21 and later redacts: the
         // header value a request must carry to be terminated or captured.
         // Neither has a gateway minimum, so short ones stay literal.
         "request_termination" => vec![operator_value(&["trigger", "header_value"])],
@@ -319,12 +318,12 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
     }
 }
 
-/// Sites the Ferrum Edge `plugin_config_projection` on `main` (after the pinned
-/// v0.9.20) withholds from `/config/export` that [`rules_for`] does not
-/// declare. They only extend [`export_redacted_paths`], so a fingerprint at one
-/// of them is substituted and counted as uncompared instead of reading as
-/// permanent drift once the pin moves; a gateway that does not fingerprint
-/// them (v0.9.20) still compares them as ordinary values. Import brokering,
+/// Sites the pinned Ferrum Edge v0.9.21 `plugin_config_projection` withholds
+/// from `/config/export` that [`rules_for`] does not declare. They only extend
+/// [`export_redacted_paths`], so a fingerprint at one of them is substituted
+/// and counted as uncompared instead of reading as permanent drift; a gateway
+/// that does not fingerprint them (v0.9.20) still compares them as ordinary
+/// values. Import brokering,
 /// redaction, scrubbing and display admission are unchanged for them, with
 /// one exception: a credential-named key of a
 /// [`credential_named_parameter_maps`] map (`api_chargeback_sink`
@@ -366,7 +365,7 @@ fn rules_for(plugin_name: &str) -> Vec<Rule> {
 ///
 /// Every other credential or operator-chosen token Edge redacts is a
 /// [`rules_for`] rule instead (brokered, literal-gated and masked), whether
-/// or not the pinned gateway redacts it yet.
+/// or not every supported gateway redacts it.
 fn export_only_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]] {
     match plugin_name {
         "mtls_auth" => &[&["allowed_issuers", "*", "ca_certificate_pem"]],
@@ -916,7 +915,7 @@ pub(crate) fn sensitive_string_paths(
 /// such a value comparable against a baseline instead of reading as drift or
 /// as a masked ancestor.
 ///
-/// A custom (non-built-in) plugin has no schema, so Edge after v0.9.20
+/// A custom (non-built-in) plugin has no schema, so Edge v0.9.21 and later
 /// fingerprints every scalar leaf (string, number, boolean) of its object
 /// config; each one is a site.
 pub(crate) fn export_redacted_paths(
@@ -1368,7 +1367,7 @@ fn collect_kafka_properties(
 /// not. Everywhere else, and in every custom plugin, Edge's full parser match
 /// applies.
 ///
-/// Checked against the Edge v0.9.20 and `main` plugin constructors.
+/// Checked against the Edge v0.9.20 and v0.9.21 plugin constructors.
 fn literal_payload_rules_for(plugin_name: &str) -> &'static [&'static [&'static str]] {
     match plugin_name {
         "response_mock" => &[&["rules", "*", "body"]],
@@ -1790,7 +1789,7 @@ mod tests {
         );
     }
 
-    /// Edge after v0.9.20 fingerprints every scalar leaf of a custom plugin's
+    /// Edge v0.9.21 and later fingerprints every scalar leaf of a custom plugin's
     /// config. Each is an export site, while import still brokers only the
     /// heuristic matches and reports the rest for review.
     #[test]
@@ -1860,7 +1859,7 @@ mod tests {
         }
     }
 
-    /// The credential header maps Edge after v0.9.20 redacts are operator
+    /// The credential header maps Edge v0.9.21 and later redacts are operator
     /// values: a credential long enough to protect is brokered, a short
     /// ordinary header (`x-api-version: "2"`) stays literal and is not
     /// rule-declared, so it never refuses live display admission, and every
@@ -2296,7 +2295,7 @@ mod tests {
         );
     }
 
-    /// Operator-chosen tokens and match operands Edge after v0.9.20 redacts
+    /// Operator-chosen tokens and match operands Edge v0.9.21 and later redacts
     /// are [`RuleKind::Value`] rules: brokered when long enough to protect,
     /// ordinary settings when shorter, never rule-declared, and an export
     /// site whatever their length.
@@ -2383,6 +2382,456 @@ mod tests {
                 dotted(export_redacted_paths(plugin, &config).into_iter().collect()),
                 sites,
                 "{plugin}"
+            );
+        }
+    }
+
+    /// Every path in Ferrum Edge v0.9.21's `PLUGIN_SENSITIVITY_SCHEMAS`
+    /// (`src/admin/plugin_config_projection.rs` at
+    /// `f9915358c8032214f4034a17c28cdf72d14006c3`), transcribed rule by rule.
+    /// `kafka_logging` `producer_config` is a property map judged key by key
+    /// (`kafka_properties_are_fail_closed_except_for_reviewed_tuning_keys`),
+    /// and the name heuristic, URL sweep, TLS-material sweep and custom-plugin
+    /// rule are covered by their own tests.
+    const EDGE_V0_9_21_PROJECTION_PATHS: &[(&str, &[&str])] = &[
+        ("otel_tracing", &["endpoint"]),
+        ("otel_tracing", &["authorization"]),
+        ("otel_tracing", &["headers", "*"]),
+        ("request_termination", &["trigger", "header_value"]),
+        ("spec_expose", &["spec_url"]),
+        ("grpc_method_router", &["redis_url"]),
+        ("mtls_auth", &["allowed_issuers", "*", "ca_certificate_pem"]),
+        ("jwks_auth", &["providers", "*", "discovery_url"]),
+        ("jwks_auth", &["providers", "*", "jwks_uri"]),
+        ("jwks_auth", &["discovery_url"]),
+        ("jwks_auth", &["jwks_uri"]),
+        ("jwks_auth", &["redis_url"]),
+        ("oauth2_introspection", &["providers", "*", "discovery_url"]),
+        (
+            "oauth2_introspection",
+            &["providers", "*", "introspection_endpoint"],
+        ),
+        ("oauth2_introspection", &["discovery_url"]),
+        ("oauth2_introspection", &["introspection_endpoint"]),
+        ("oidc_relying_party", &["providers", "*", "discovery_url"]),
+        ("oidc_relying_party", &["providers", "*", "jwks_uri"]),
+        ("oidc_relying_party", &["providers", "*", "token_endpoint"]),
+        (
+            "oidc_relying_party",
+            &["providers", "*", "authorization_endpoint"],
+        ),
+        (
+            "oidc_relying_party",
+            &["providers", "*", "userinfo_endpoint"],
+        ),
+        (
+            "oidc_relying_party",
+            &["providers", "*", "end_session_endpoint"],
+        ),
+        ("oidc_relying_party", &["discovery_url"]),
+        ("oidc_relying_party", &["jwks_uri"]),
+        ("oidc_relying_party", &["token_endpoint"]),
+        ("oidc_relying_party", &["authorization_endpoint"]),
+        ("oidc_relying_party", &["userinfo_endpoint"]),
+        ("oidc_relying_party", &["end_session_endpoint"]),
+        ("ldap_auth", &["ldap_url"]),
+        ("ldap_auth", &["failover_ldap_urls"]),
+        ("hmac_auth", &["redis_url"]),
+        (
+            "soap_ws_security",
+            &["x509_signature", "trusted_certs", "*"],
+        ),
+        ("soap_ws_security", &["saml", "trusted_signing_certs", "*"]),
+        ("soap_ws_security", &["redis_url"]),
+        (
+            "mesh_authz",
+            &[
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "to",
+                "*",
+                "headers",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "values",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "not_values",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "to",
+                "*",
+                "headers",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "values",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "not_values",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "node_waypoint_capture_mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "to",
+                "*",
+                "headers",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "node_waypoint_capture_mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "values",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "node_waypoint_capture_mesh_policies",
+                "*",
+                "rules",
+                "*",
+                "when",
+                "*",
+                "not_values",
+                "*",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "ext_authz_providers",
+                "*",
+                "include_additional_headers_in_check",
+                "*",
+                "value",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &["mesh_slice", "ext_authz_providers", "*", "path_prefix"],
+        ),
+        (
+            "mesh_authz",
+            &["mesh_slice", "proxy_configs", "*", "environment", "*"],
+        ),
+        (
+            "mesh_authz",
+            &["mesh_slice", "extension_configs", "*", "value"],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "telemetry_resources",
+                "*",
+                "config",
+                "tracing",
+                "providers",
+                "*",
+                "config",
+                "url",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "telemetry_resources",
+                "*",
+                "config",
+                "tracing",
+                "providers",
+                "*",
+                "config",
+                "agent_url",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "telemetry_resources",
+                "*",
+                "config",
+                "tracing",
+                "providers",
+                "*",
+                "config",
+                "collector_url",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "telemetry_resources",
+                "*",
+                "config",
+                "tracing",
+                "providers",
+                "*",
+                "config",
+                "endpoint",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "request_authentications",
+                "*",
+                "jwt_rules",
+                "*",
+                "jwks_uri",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &["mesh_slice", "multi_cluster", "federation_endpoint"],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "multi_cluster",
+                "remote_clusters",
+                "*",
+                "control_plane_url",
+            ],
+        ),
+        (
+            "mesh_authz",
+            &[
+                "mesh_slice",
+                "multi_cluster",
+                "remote_clusters",
+                "*",
+                "federation_endpoint",
+            ],
+        ),
+        ("opa", &["opa_host"]),
+        ("opa", &["headers", "*"]),
+        ("request_deduplication", &["redis_url"]),
+        ("graphql", &["redis_url"]),
+        ("rate_limiting", &["redis_url"]),
+        ("ws_rate_limiting", &["redis_url"]),
+        ("udp_rate_limiting", &["redis_url"]),
+        ("ai_rate_limiter", &["redis_url"]),
+        ("ai_transcript_audit", &["sink", "endpoint_url"]),
+        ("ai_transcript_audit", &["sink", "custom_headers", "*"]),
+        ("ai_transcript_audit", &["endpoint_url"]),
+        ("ai_transcript_audit", &["headers", "*"]),
+        ("ai_transcript_audit", &["custom_headers", "*"]),
+        ("waf", &["global_exemptions", "header_present", "*"]),
+        ("waf", &["custom_rules", "*", "conditions", "headers", "*"]),
+        (
+            "waf",
+            &["rule_overrides", "*", "conditions", "headers", "*"],
+        ),
+        ("fault_injection", &["match", "headers", "*"]),
+        ("openapi_validator", &["bypass", "header_present", "*"]),
+        ("ai_semantic_firewall", &["provider", "endpoint"]),
+        ("ai_semantic_firewall", &["privacy", "snippet_hash_salt"]),
+        ("ai_tool_governor", &["endpoint_url"]),
+        ("ai_tool_governor", &["approval", "endpoint_url"]),
+        ("ai_tool_governor", &["approval", "headers", "*"]),
+        ("ai_stream_router", &["providers", "*", "endpoint"]),
+        ("mcp_gateway", &["servers", "*", "upstream_url"]),
+        ("mcp_gateway", &["upstream_url"]),
+        ("mcp_gateway", &["servers", "*", "headers", "*"]),
+        (
+            "mesh_route_dispatch",
+            &["rules", "*", "request_transform", "*", "value"],
+        ),
+        (
+            "mesh_route_dispatch",
+            &["rules", "*", "match", "headers", "*", "*"],
+        ),
+        (
+            "mesh_route_dispatch",
+            &["rules", "*", "match", "without_headers", "*", "*"],
+        ),
+        (
+            "mesh_route_dispatch",
+            &["rules", "*", "match", "query_params", "*", "*"],
+        ),
+        ("mesh_route_dispatch", &["rules", "*", "rewrite", "uri"]),
+        ("ai_semantic_cache", &["redis_url"]),
+        ("ai_semantic_cache", &["semantic_embedding_endpoint"]),
+        ("ai_semantic_cache", &["semantic_embedding_auth_header"]),
+        ("request_transformer", &["rules", "*", "value"]),
+        ("serverless_function", &["function_url"]),
+        ("serverless_function", &["aws_endpoint_url"]),
+        ("serverless_function", &["azure_function_key"]),
+        ("response_mock", &["rules", "*", "match", "headers", "*"]),
+        (
+            "response_mock",
+            &["rules", "*", "match", "query_params", "*"],
+        ),
+        ("request_mirror", &["mirror_path"]),
+        ("ai_federation", &["base_url"]),
+        ("ai_federation", &["providers", "*", "base_url"]),
+        ("http_logging", &["endpoint_url"]),
+        ("http_logging", &["custom_headers", "*"]),
+        ("loki_logging", &["endpoint_url"]),
+        ("loki_logging", &["authorization_header"]),
+        ("loki_logging", &["custom_headers", "*"]),
+        ("udp_logging", &["dtls_key_path"]),
+        ("udp_logging", &["dtls_cert_path"]),
+        ("udp_logging", &["dtls_ca_cert_path"]),
+        ("ws_logging", &["endpoint_url"]),
+        ("ws_logging", &["custom_headers", "*"]),
+        ("transaction_debugger", &["capture_request_header_value"]),
+        ("proxy_alerts", &["channels", "*", "webhook_url"]),
+        ("proxy_alerts", &["channels", "*", "url"]),
+        ("proxy_alerts", &["channels", "*", "headers", "*"]),
+        ("proxy_alerts", &["channels", "*", "body_template"]),
+        ("api_chargeback_sink", &["clickhouse", "url"]),
+        (
+            "api_chargeback_sink",
+            &["clickhouse", "insert_query_params", "*"],
+        ),
+        ("workload_metrics", &["tracing_provider", "config", "url"]),
+        (
+            "workload_metrics",
+            &["tracing_provider", "config", "agent_url"],
+        ),
+        (
+            "workload_metrics",
+            &["tracing_provider", "config", "collector_url"],
+        ),
+        (
+            "workload_metrics",
+            &["tracing_provider", "config", "endpoint"],
+        ),
+        (
+            "workload_metrics",
+            &["tracing_providers", "*", "config", "url"],
+        ),
+        (
+            "workload_metrics",
+            &["tracing_providers", "*", "config", "agent_url"],
+        ),
+        (
+            "workload_metrics",
+            &["tracing_providers", "*", "config", "collector_url"],
+        ),
+        (
+            "workload_metrics",
+            &["tracing_providers", "*", "config", "endpoint"],
+        ),
+    ];
+
+    /// Build a config holding one string at `path`, choosing `sample` for
+    /// every `*` (an object key, which a `*` rule matches like an index).
+    fn config_at(path: &[&str], leaf: Value) -> (Value, Vec<ConfigPathComponent>) {
+        let components: Vec<ConfigPathComponent> = path
+            .iter()
+            .map(|key| {
+                let name: &str = if *key == "*" { "sample" } else { key };
+                ConfigPathComponent::Key(name.to_string())
+            })
+            .collect();
+        let config = components.iter().rev().fold(leaf, |inner, component| {
+            let ConfigPathComponent::Key(name) = component else {
+                unreachable!("config_at builds keys only");
+            };
+            let mut map = serde_json::Map::new();
+            map.insert(name.clone(), inner);
+            Value::Object(map)
+        });
+        (config, components)
+    }
+
+    /// Every site Ferrum Edge v0.9.21 withholds from `/config/export` by
+    /// schema is a site this classifier predicts (brokered, operator value or
+    /// export-only), so no fingerprint from the pinned gateway reads as
+    /// drift. Edge's schema names only built-in plugins, and so does this
+    /// table.
+    #[test]
+    fn every_edge_v0_9_21_projection_path_is_an_export_site() {
+        for (plugin, path) in EDGE_V0_9_21_PROJECTION_PATHS {
+            assert!(is_builtin(plugin), "{plugin} is not a built-in plugin");
+            let (config, expected) = config_at(
+                path,
+                Value::String("sample-operator-value-0123456789".to_string()),
+            );
+            let sites = export_redacted_paths(plugin, &config);
+            assert!(
+                sites.contains(&expected),
+                "{plugin} {path:?} is not an export site: {:?}",
+                dotted(sites.into_iter().collect())
             );
         }
     }

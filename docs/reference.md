@@ -361,7 +361,7 @@ case-insensitive), malformed numbers, zero for the timeout and TTL settings
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode gateway document. |
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Mesh document. Must not resolve to the same file as the gateway document. |
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validator binary. |
-| `FERRUM_EDGE_VERSION` | unset (`v0.9.20` baseline) | Paired Ferrum Edge release (`MAJOR.MINOR.PATCH`, optional `v` prefix) when the selected environment leaves `edge_version` unset in `.gitforgeops/config.yaml`. Controls version-aware handling of removed fields such as `Proxy.pool_max_requests_per_connection` (emitted and diffed verbatim on `< v0.9.21`; omitted from desired state with a stderr notice on `>= v0.9.21`). |
+| `FERRUM_EDGE_VERSION` | unset (the pinned `v0.9.21`, `validator.version` in `release/baseline.json`) | Paired Ferrum Edge release (`MAJOR.MINOR.PATCH`, optional `v` prefix) when the selected environment leaves `edge_version` unset in `.gitforgeops/config.yaml`. Controls version-aware handling of removed fields such as `Proxy.pool_max_requests_per_connection` (emitted and diffed verbatim on `< v0.9.21`; omitted from desired state with a stderr notice on `>= v0.9.21`). |
 | `FERRUM_VERIFY_BASE_URL` | — | Data-plane URL for `verify`. |
 | `FERRUM_VERIFY_PROBE_CONSUMERS` | — | Operator allowlist of probe Consumers (`<namespace>/<consumer-id>`, comma-separated). `verify` refuses every check that sends a slot while it is unset; `validate`, `plan`, `apply` and `review` check it when set. |
 | `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set (`true`) only by workflow steps bound to the environment. Then an unset or blank allowlist refuses a slot-sending check in `validate`, `plan`, `apply` and `review`, as `verify` refuses it, instead of reading as "not visible". A malformed allowlist refuses any run that sends a slot, with or without this marker. |
@@ -576,7 +576,7 @@ with the admin credential.
   credential-bearing URLs, URL userinfo in a Proxy or Upstream, the Consul
   token) arrive as `hmac-sha256:<64 hex>`. The MAC key derives from a
   gateway-side secret: `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on
-  Ferrum Edge after v0.9.20 (a random key per gateway process when it is
+  Ferrum Edge v0.9.21 and later (a random key per gateway process when it is
   unset), the admin `FERRUM_ADMIN_JWT_SECRET` on v0.9.20. Edge deliberately
   does not let a viewer compute it, so `diff` cannot fingerprint the
   repository's value. Where the
@@ -589,12 +589,12 @@ with the admin credential.
   fields are secret-bearing. Replacing an ancestor also hides that value's
   non-secret contents, so those are counted separately and keep the run
   non-authoritative (see exit codes above). The fingerprinted locations
-  GitForgeOps predicts also cover what Ferrum Edge releases after v0.9.20
-  withhold: the `header`, `query` and `cookie` operands of a plugin `trigger`
+  GitForgeOps predicts also cover what the pinned Ferrum Edge v0.9.21
+  withholds and v0.9.20 did not: the `header`, `query` and `cookie` operands of a plugin `trigger`
   (its other predicates, including `external_identity` and
   `external_identity_authority`, stay visible and are compared),
-  every string, number or boolean in a custom plugin's config, newer built-in
-  plugin paths, and TLS private-key material in a Proxy, Upstream or plugin
+  every string, number or boolean in a custom plugin's config, the built-in
+  plugin paths v0.9.21 added, and TLS private-key material in a Proxy, Upstream or plugin
   config; a gateway that still sends those values is compared as usual. Edge
   v0.9.9 does not publish which pointers it redacted, so a
   fingerprint-shaped string anywhere else is compared like any value and shows
@@ -621,7 +621,7 @@ with the admin credential.
   restart of a gateway that does not set one, and between replicas that do
   not share one. **For a baseline that survives restarts and load-balanced
   replicas, set the same `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on
-  every gateway replica** (Ferrum Edge after v0.9.20; at least 32 characters
+  every gateway replica** (Ferrum Edge v0.9.21 and later; at least 32 characters
   and distinct from every JWT secret; on v0.9.20 the key follows
   `FERRUM_ADMIN_JWT_SECRET`). It is a gateway setting: GitForgeOps never
   needs or reads it. After a key change the baseline is not comparable: the
@@ -685,7 +685,7 @@ No tooling reads, prints or copies secret values; an operator enters the value
 through the protected secret-entry UI.
 
 Gateways that serve the drift check should also share one
-`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (Ferrum Edge after v0.9.20).
+`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (Ferrum Edge v0.9.21 and later).
 Without it every gateway process keys fingerprints randomly, so they change on
 each restart and differ between replicas, and any fingerprint baseline an
 operator keeps stops matching (see

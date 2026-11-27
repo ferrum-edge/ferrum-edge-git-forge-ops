@@ -163,8 +163,8 @@ pub struct EnvironmentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace_filter: Option<String>,
     /// Paired Ferrum Edge release version for this environment (for example
-    /// `v0.9.20` or `v0.9.21`). Unset falls back to `FERRUM_EDGE_VERSION`, then
-    /// the repository's default baseline (`v0.9.20`).
+    /// `v0.9.21` or `v0.9.20`). Unset falls back to `FERRUM_EDGE_VERSION`, then
+    /// the release the repository pins (`v0.9.21`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edge_version: Option<EdgeVersion>,
     pub apply_strategy: ApplyStrategy,

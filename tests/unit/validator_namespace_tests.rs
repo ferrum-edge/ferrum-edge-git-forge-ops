@@ -989,8 +989,10 @@ fn real_edge_validates_paired_pool_max_requests_fixtures() {
         ] {
             let output = repo.run(&["validate", "--format", "json"], env);
             let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            // Only an explicit v0.9.20 pairing emits the removed field; the
+            // default is the pinned v0.9.21.
             let emits_removed_field =
-                variant == "with-field" && env != [("FERRUM_EDGE_VERSION", "v0.9.21")];
+                variant == "with-field" && env == [("FERRUM_EDGE_VERSION", "v0.9.20")];
             if emits_removed_field && !output.status.success() {
                 // Against a real Edge v0.9.21+ binary under the v0.9.20 pairing,
                 // the validator rejects the field and GitForgeOps maps it to an

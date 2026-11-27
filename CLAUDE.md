@@ -17,10 +17,10 @@ live operations.
 Shared contracts live in [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts); see
 [README.md's Contracts section](README.md#contracts) for the vendored pin and update rule.
 
-The 13 adopted files are pinned to published `contracts-edge-0.9.20` at
-`39da322083044c2e92617209e62983c92387f0ad`, with Edge v0.9.20 provenance at
-`e4a606a00352674daaef08636e3e359e6c48ba18`. Adoption covers only the GitForgeOps
-resource-envelope schema, its ten fixtures, and the plugin-catalog and
+The 16 adopted files are pinned to published `contracts-edge-0.9.21` at
+`92d8da5be93ea1ece9f47729b1f7aa10ae8a7c3f`, with Edge v0.9.21 provenance at
+`f9915358c8032214f4034a17c28cdf72d14006c3`. Adoption covers only the GitForgeOps
+resource-envelope schema (closed since 0.9.21), its 13 fixtures, and the plugin-catalog and
 `provisioned-by` vocabularies. Retain upstream preparation prose verbatim; the
 [contracts guide](docs/contracts.md) distinguishes actual publication from metadata
 and the separate hosted qualification and first-release acceptance gates. The
@@ -97,7 +97,8 @@ cargo fmt --all && cargo fmt --all -- --check
   toolchain/lint config, `Dockerfile`) or a non-Rust file the unit suite reads
   or the binary embeds (`docs/quickstart.md`, `.gitforgeops/*.example.yaml`,
   `.github/scripts/audit_settings.py`, `contracts/`,
-  `.github/ferrum-edge-checksums.txt`, `apply-on-merge.yml`, `rotate.yml`,
+  `.github/ferrum-edge-checksums.txt`, `release/baseline.json`,
+  `apply-on-merge.yml`, `rotate.yml`,
   `trusted-pr-review.yml`).
 - Unit tests never read the customer-owned `resources/` tree. Shipped-example
   checks use `tests/fixtures/shipped-examples/`; upstream,
@@ -306,18 +307,30 @@ version probe or version gate. Original output still goes through scrubbing. All
 formats carry the message; `plan` and `review` keep their validation-blocker
 verdicts; file apply refuses before publication. Mesh and other schema errors
 are unchanged. Environments paired with `>= v0.9.21` (`edge_version` in
-`.gitforgeops/config.yaml` or `FERRUM_EDGE_VERSION`; default stays `v0.9.20`)
-omit `pool_max_requests_per_connection` from assembled desired state at the
-shared `pipeline::load_and_assemble` boundary with a stderr notice while keeping
-v0.9.20 accept/emit/diff behaviour exact.
+`.gitforgeops/config.yaml` or `FERRUM_EDGE_VERSION`; the default is
+`DEFAULT_EDGE_VERSION`, the pinned v0.9.21, which `check_release_baseline.py`
+keeps equal to `validator.version` in `release/baseline.json`) omit
+`pool_max_requests_per_connection` from assembled desired state at the shared
+`pipeline::load_and_assemble` boundary with a stderr notice; an explicit
+`v0.9.20` pairing keeps v0.9.20 accept/emit/diff behaviour exact.
 
+The installer (`install-ferrum-edge.sh`) installs exactly the release
+`release/baseline.json` pins (`validator.version` resolved through
+`/releases/tags/<tag>`, never `/releases/latest`); the baseline is read from
+the same tree as the allowlist it is given. The bytes become executable only
+when the publisher's `.sha256`, the baseline's `validator.sha256` and the
+allowlist agree. A newer upstream release is only reported.
 `check-validator-resource-labels.sh` runs after the installer verifies the
 publisher and allowlisted SHA-256 digests. It validates
 `tests/fixtures/validator-resource-labels.yaml` (all four kinds) with empty
 settings and a clean environment.
 
-- The daily validator-pin canary fails, and keeps its tracking issue open, on a
-  stale digest or failed label acceptance.
+- The daily validator-pin canary fails, and keeps its tracking issue open, when
+  the pinned build no longer installs or fails label acceptance. It also keeps
+  the issue open (without failing) while a newer Edge release than the pin is
+  published (`refresh-ferrum-edge-pin.sh --newer`, a numeric version comparison,
+  not GitHub's latest designation), with that release's
+  candidate allowlist line.
 - `validate-pr.yml` runs the same probe, including the unconditional
   `validator-pairing` job required by `gitforgeops-required-static-validation`
   (even on pin-only or code-only PRs and empty repositories).
@@ -486,7 +499,7 @@ namespace payload is built before the first mutation.
   proxies the plan accounts for referencing the plugin — and an Edge build
   with ferrum-edge#6744 checks it atomically with the write under the same
   lease (issue #569), answering `412` for a referencing proxy outside that set
-  (kept target aside). The pinned Edge v0.9.20 includes #6744 and refuses a
+  (kept target aside). The pinned Edge v0.9.21 includes #6744 and refuses a
   write without the parameter (`400`); released Edge up to v0.9.17 ignores it,
   so `refuse_unplanned_references` also stays (issue #603): before a plugin
   delete, and before an update changing the planned `scope`/`proxy_id` to
@@ -494,7 +507,7 @@ namespace payload is built before the first mutation.
   refuses when a referencing proxy is not in the plan's live view, not
   declared, and not the kept target. Both surface as
   `Error::UnplannedPluginReference` (withholds like `StalePlan`). Keep the
-  re-read until hosted lifecycle qualification of the exact v0.9.20 build
+  re-read until hosted lifecycle qualification of the exact v0.9.21 build
   (the intended minimum supported release) is recorded; the client cannot
   detect a gateway that ignores the parameter.
 
@@ -665,7 +678,7 @@ pending-create matching and spec ownership need raw values and `api_spec_id`,
 which the export lacks.
 
 - Fingerprints (`hmac-sha256:<64 hex>`) are keyed from a gateway-side secret:
-  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on Edge after v0.9.20
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on Edge v0.9.21 and later
   (random per gateway process when unset), the primary admin secret on
   v0.9.20. A viewer cannot compute the repository value's fingerprint, and
   this build does not try. `ConfigExport::live_view_with` substitutes the declared
@@ -681,8 +694,8 @@ which the export lacks.
   covered by a baseline or `--accept-unverified-secrets`.
   Desired Consumers go through `project_consumer_for_export` (keyauth key,
   jwt/hmac secret, mtls identity only; `basicauth` dropped).
-- The predicted sites also mirror what Edge `main` (after the pinned v0.9.20)
-  withholds: `header`/`query`/`cookie` trigger operands
+- The predicted sites also mirror what the pinned Edge v0.9.21 withholds
+  (and v0.9.20 did not): `header`/`query`/`cookie` trigger operands
   (`collect_trigger_sites`), every scalar leaf of a custom plugin's config,
   the built-in paths of `plugin_config::export_only_rules_for`, and TLS
   private-key material in Proxy, Upstream and plugin-config bodies
@@ -2111,8 +2124,8 @@ namespace-checking stub, and with the real validator when
 `rust-ci.yml` does not set it yet. Wiring it in must use the trusted installer,
 the candidate checksum allowlist and the same pin as `validate-pr.yml`, and
 requires a pinned validator that accepts resource labels. The installer
-candidate is GitHub's newest published release (`GET /releases/latest`); the
-trust anchor is the content allowlist, not the tag.
+resolves exactly `release/baseline.json`'s `validator.version`; the trust
+anchor is content (baseline digest and allowlist), not the tag.
 
 ## Lifecycle acceptance (`tests/lifecycle/`)
 
@@ -2130,6 +2143,13 @@ traffic. Details: `tests/lifecycle/README.md`. Invariants:
   unsealed (cancelled) record, a `skipped` scenario or a stale record is a
   refusal. `--gateway-allowlist` binds the gateway build to the revision's own
   checksum allowlist.
+- `release/baseline.json` is the release under preparation;
+  `release/records/<tag>.json` is each published release's finalized support
+  record (identical to the finalized baseline, `status` `supported`).
+  `check_release_baseline.py` validates both and ties the README's "First
+  supported baseline" to the lowest record; `check_supply_chain.py`
+  (`release_record_violations`) refuses a change that rewrites or deletes a
+  record already on the protected branch.
 - Not a per-PR required check: it needs a gateway build, and an often-red check
   trains people to override it.
 - `partial-failure-recovery` runs in CI through `tests/lifecycle/fault_proxy.py`,
