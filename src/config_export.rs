@@ -109,7 +109,7 @@ pub const VIEWER_ROLE: &str = "viewer";
 pub const BASELINE_FORMAT: &str = "gitforgeops/config-export-fingerprints/v1";
 
 /// Export section name and the repository kind it holds.
-const SECTIONS: [(&str, &str); 4] = [
+pub const SECTIONS: [(&str, &str); 4] = [
     ("proxies", "Proxy"),
     ("consumers", "Consumer"),
     ("plugin_configs", "PluginConfig"),
@@ -118,7 +118,7 @@ const SECTIONS: [(&str, &str); 4] = [
 
 /// Credential types whose secret field the export fingerprints, one entry per
 /// stored credential, mirroring Edge's closed Consumer projection.
-const FINGERPRINTED_CREDENTIAL_FIELDS: [(&str, &str); 3] = [
+pub const FINGERPRINTED_CREDENTIAL_FIELDS: [(&str, &str); 3] = [
     ("keyauth", "key"),
     ("jwt", "secret"),
     ("hmac_auth", "secret"),

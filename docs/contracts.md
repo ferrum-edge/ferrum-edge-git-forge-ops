@@ -85,4 +85,11 @@ fields GitForgeOps does carry: built-in names, priorities, retired names, and re
    `-text`, so checkouts never rewrite the bytes `PIN` hashes.
 5. Resolve drift through the owning implementation or the upstream contract, then re-vendor; do
    not patch a shared vendored file locally.
-6. Open a PR and let the existing Rust CI run the contract test.
+6. When the new tag carries `vocabularies/plugin-config-sensitivity.json`
+   (ferrum-contracts#96, on contracts `main` and in no tag yet), vendor it and add a parity test
+   in `tests/unit/contracts_tests.rs`: every built-in plugin's sensitive config paths in the
+   vocabulary must equal the broker rules in `src/secrets/plugin_config.rs`
+   (`export_redacted_paths` and the per-plugin secret rules), in both directions, and a plugin
+   the vocabulary lists must not be missing from those rules. Until then those rules are a
+   transcription of Edge's sensitivity schema that no test compares with Edge.
+7. Open a PR and let the existing Rust CI run the contract test.

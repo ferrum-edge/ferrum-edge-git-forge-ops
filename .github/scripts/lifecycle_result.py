@@ -138,6 +138,14 @@ REQUIRED_SCENARIOS: tuple[tuple[str, str], ...] = (
         "touches the committed artifact — and that assembly is not reported as "
         "live fleet deployment.",
     ),
+    (
+        "edge-contract-copies",
+        "GitForgeOps' copies of Edge rules hold against the gateway: the "
+        "JSON-object trigger rules, the derived backend scheme of a proxy that "
+        "omits it, restore refusals that change nothing, a "
+        "backup import and full replacement of a registered namespace, and the "
+        "closed Consumer projection of GET /config/export.",
+    ),
 )
 
 REQUIRED_SCENARIO_IDS = tuple(identifier for identifier, _ in REQUIRED_SCENARIOS)

@@ -1174,6 +1174,477 @@ def _file_and_mesh_boundary(harness: Harness) -> str:
     )
 
 
+# -- edge-contract-copies ------------------------------------------------------
+#
+# GitForgeOps carries its own copies of several Edge rules, and each is used
+# against a live gateway. This scenario runs every copy against the gateway
+# under test: the pinned release in lifecycle.yml, Edge `main` in the Edge Main
+# Drift workflow, so a change on Edge `main` fails the drift check before it is
+# released. The static half (the same copies against Edge's openapi.yaml) is
+# tests/unit/edge_main_openapi_tests.rs.
+
+CONTRACT_PROXY = "contract-trigger-proxy"
+CONTRACT_PLUGIN = "contract-trigger-plugin"
+CONTRACT_CONSUMER = "contract-consumer"
+CONTRACT_SPEC_PROXY = "contract-spec-proxy"
+CONTRACT_MTLS_IDENTITY = "CN=contract-client"
+_GET = {"match": {"method": ["GET"]}}
+
+
+def _contract_trigger_cases() -> list[tuple[str, dict, object]]:
+    """`(position, valid trigger, the same trigger with that position an array)`.
+
+    One case per position where `src/config/json_object.rs` requires a JSON
+    object (`config::schema::PluginTrigger*`). `None` as the mutated trigger
+    means the `trigger` value itself is an array.
+    """
+    cases: list[tuple[str, dict, object]] = [
+        ("trigger", {"when": _GET}, None),
+        ("trigger.when", {"when": _GET}, {"when": []}),
+        ("all[]", {"when": {"all": [_GET]}}, {"when": {"all": [[]]}}),
+        ("any[]", {"when": {"any": [_GET]}}, {"when": {"any": [[]]}}),
+        ("not", {"when": {"not": _GET}}, {"when": {"not": []}}),
+        ("match", {"when": _GET}, {"when": {"match": []}}),
+    ]
+    leaves = {
+        "path": {"prefix": ["/contract"]},
+        "host": {"exact": ["api.example.test"]},
+        "sni": {"exact": ["api.example.test"]},
+        "header": {"name": "x-contract"},
+        "query": {"name": "contract"},
+        "cookie": {"name": "contract"},
+        "consumer": {"presence": "present"},
+        "external_identity": {"presence": "present"},
+        "spiffe_id": {"presence": "present"},
+    }
+    for name, value in leaves.items():
+        cases.append(
+            (f"match.{name}", {"when": {"match": {name: value}}}, {"when": {"match": {name: []}}})
+        )
+    for name, base in (("header", {"name": "x-contract"}), ("consumer", {})):
+        valid = dict(base, value={"exact": ["contract"]})
+        cases.append(
+            (
+                f"match.{name}.value",
+                {"when": {"match": {name: valid}}},
+                {"when": {"match": {name: dict(base, value=[])}}},
+            )
+        )
+    return cases
+
+
+def _contract_plugin(trigger: object) -> dict:
+    return {
+        "id": CONTRACT_PLUGIN,
+        "plugin_name": "key_auth",
+        "scope": "proxy",
+        "proxy_id": CONTRACT_PROXY,
+        "enabled": True,
+        "config": {},
+        "trigger": trigger,
+    }
+
+
+def _contract_proxy() -> dict:
+    return {
+        "id": CONTRACT_PROXY,
+        "name": "Edge contract copies",
+        "listen_path": "/contract-trigger",
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 1,
+    }
+
+
+def _write_contract_trigger_files(harness: Harness, trigger: object) -> None:
+    # JSON is YAML, and json.dumps cannot mis-indent a nested trigger.
+    harness.write(
+        f"resources/{NAMESPACE}/proxies/{CONTRACT_PROXY}.yaml",
+        json.dumps({"kind": "Proxy", "spec": _contract_proxy()}),
+    )
+    harness.write(
+        f"resources/{NAMESPACE}/plugins/{CONTRACT_PLUGIN}.yaml",
+        json.dumps({"kind": "PluginConfig", "spec": _contract_plugin(trigger)}),
+    )
+
+
+def _json_object_rules(harness: Harness) -> str:
+    """`json_object.rs`: Edge and gitforgeops refuse an array at each position.
+
+    Each case's valid trigger must be accepted by both, so a refusal is about
+    the array and nothing else; an Edge that accepts the array (the positional
+    struct construction the copy exists to refuse) or refuses the valid shape
+    no longer matches the copy.
+    """
+    _admin(harness, "POST", "/proxies", dict(_contract_proxy(), namespace=NAMESPACE))
+    findings = []
+    try:
+        for position, valid, mutated in _contract_trigger_cases():
+            invalid = [] if mutated is None else mutated
+            status, _, _ = _admin_exchange(harness, "POST", "/plugins/config", _contract_plugin(valid))
+            if status != 201:
+                findings.append(f"{position}: Edge answered {status} to the valid trigger")
+            else:
+                _admin(harness, "DELETE", f"/plugins/config/{CONTRACT_PLUGIN}")
+            status, _, _ = _admin_exchange(harness, "POST", "/plugins/config", _contract_plugin(invalid))
+            if status != 400:
+                findings.append(f"{position}: Edge answered {status} to an array, expected 400")
+                if status in (200, 201):
+                    _admin(harness, "DELETE", f"/plugins/config/{CONTRACT_PLUGIN}")
+            _write_contract_trigger_files(harness, valid)
+            accepted = harness.run("validate", expect=None)
+            if accepted.returncode != 0:
+                findings.append(
+                    f"{position}: gitforgeops validate refused the valid trigger "
+                    f"(exit {accepted.returncode})\n{accepted.stdout}\n{accepted.stderr}"
+                )
+            _write_contract_trigger_files(harness, invalid)
+            refused = harness.run("validate", expect=None)
+            if refused.returncode == 0:
+                findings.append(f"{position}: gitforgeops validate accepted an array")
+    finally:
+        harness.remove(f"resources/{NAMESPACE}/proxies/{CONTRACT_PROXY}.yaml")
+        harness.remove(f"resources/{NAMESPACE}/plugins/{CONTRACT_PLUGIN}.yaml")
+        __admin(harness, "DELETE", f"/plugins/config/{CONTRACT_PLUGIN}")
+        _admin(harness, "DELETE", f"/proxies/{CONTRACT_PROXY}")
+    if findings:
+        raise ScenarioFailure(
+            "the JSON-object rules (src/config/json_object.rs) no longer match the gateway:\n"
+            + "\n".join(findings)
+        )
+    return f"{len(_contract_trigger_cases())} JSON-object positions"
+
+
+def _namespace_snapshot(harness: Harness) -> tuple[str, dict]:
+    status, token, body = _admin_exchange(harness, "GET", "/backup?conditional=true")
+    if status != 200 or not token:
+        raise ScenarioFailure(f"coherent namespace snapshot is unavailable (HTTP {status})")
+    return token, json.loads(body)
+
+
+def _restore_body(snapshot: dict) -> dict:
+    return {
+        key: snapshot[key]
+        for key in ("version", "proxies", "consumers", "upstreams", "plugin_configs", "api_specs")
+        if key in snapshot
+    }
+
+
+def _expect_unchanged(harness: Harness, token: str, what: str) -> None:
+    after, _ = _namespace_snapshot(harness)
+    if after != token:
+        raise ScenarioFailure(f"{what} changed the namespace; GitForgeOps reads it as a refusal")
+
+
+def _restore_semantics(harness: Harness) -> str:
+    """`api_target.rs` / `http_client.rs` restore handling against the gateway.
+
+    GitForgeOps always sends `?confirm=true`, reads a `4xx` as a refusal that
+    changed nothing, and reads a `409` carrying `api_specs_at_risk` /
+    `confirmation_required` as the API-spec guard. Each holds here, and the
+    namespace revision proves nothing was written.
+    """
+    token, snapshot = _namespace_snapshot(harness)
+    body = _restore_body(snapshot)
+
+    status, _, _ = _admin_exchange(harness, "POST", "/restore", body)
+    if status != 400:
+        raise ScenarioFailure(f"POST /restore without ?confirm=true answered {status}, expected 400")
+    _expect_unchanged(harness, token, "an unconfirmed restore")
+
+    # A batch-shaped row (no `id`) and a mistyped field: refused before the
+    # namespace is cleared, conditionally and unconditionally.
+    batch_shaped = dict(body, proxies=[*body["proxies"], {
+        "name": "no id", "listen_path": "/contract-no-id", "backend_scheme": "http",
+        "backend_host": "127.0.0.1", "backend_port": 1,
+    }])
+    mistyped = dict(body, proxies=[*body["proxies"], dict(
+        _contract_proxy(), id="contract-mistyped", listen_path="/contract-mistyped",
+        backend_port="not-a-port", namespace=NAMESPACE,
+    )])
+    for what, invalid, if_match in (
+        ("a batch-shaped restore", batch_shaped, None),
+        ("a conditional batch-shaped restore", batch_shaped, token),
+        ("a mistyped restore", mistyped, None),
+    ):
+        status, _, _ = _admin_exchange(
+            harness, "POST", "/restore?confirm=true", invalid, if_match=if_match
+        )
+        if status != 400:
+            raise ScenarioFailure(f"{what} answered {status}, expected a 400 refusal")
+        _expect_unchanged(harness, token, what)
+
+    # The API-spec guard: a body without `api_specs` while the namespace holds
+    # a spec.
+    backend = urllib.parse.urlsplit(harness.upstream_url)
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Contract copies spec", "version": "1"},
+        "paths": {"/status/200": {"get": {"responses": {"200": {"description": "OK"}}}}},
+        "x-ferrum-proxy": {
+            "id": CONTRACT_SPEC_PROXY, "listen_path": "/contract-spec",
+            "backend_host": backend.hostname, "backend_port": backend.port,
+            "backend_scheme": "http",
+        },
+    }
+    status, _, created = _admin_exchange(harness, "POST", "/api-specs", spec)
+    if status != 201:
+        raise ScenarioFailure(f"the harness's API-spec fixture was refused (HTTP {status})")
+    spec_id = json.loads(created).get("id")
+    try:
+        guarded_token, guarded = _namespace_snapshot(harness)
+        legacy = _restore_body(guarded)
+        legacy.pop("api_specs", None)
+        for section in ("proxies", "upstreams", "plugin_configs"):
+            legacy[section] = [row for row in legacy[section] if not row.get("api_spec_id")]
+        status, _, refusal = _admin_exchange(harness, "POST", "/restore?confirm=true", legacy)
+        fields = json.loads(refusal) if status == 409 else {}
+        if status != 409 or not {"api_specs_at_risk", "confirmation_required"} <= set(fields):
+            raise ScenarioFailure(
+                f"a restore that would delete an API spec answered {status} with fields "
+                f"{sorted(fields)}; GitForgeOps expects 409 with api_specs_at_risk and "
+                "confirmation_required"
+            )
+        _expect_unchanged(harness, guarded_token, "the API-spec guard")
+    finally:
+        if spec_id:
+            _admin(harness, "DELETE", f"/api-specs/{spec_id}", expect=(200, 204))
+    return "restore refusals (unconfirmed, batch-shaped, mistyped, API-spec guard) changed nothing"
+
+
+def _backup_round_trip(harness: Harness) -> str:
+    """`BackupSnapshot` (http_client.rs) and the conditional decode, end to end.
+
+    The namespace gets a registry row first, so a gateway that adds it to
+    `GET /backup` (ferrum-edge#7539's `namespace_registry`) shows it here:
+    import must report no unsupported section, and a full replacement must
+    carry the whole backup through `POST /restore` and converge.
+    """
+    description = "GitForgeOps lifecycle: Edge contract copies"
+    status, _, _ = _admin_exchange(
+        harness, "POST", "/namespaces", {"name": NAMESPACE, "description": description}
+    )
+    if status == 409:
+        _admin(harness, "PUT", f"/namespaces/{NAMESPACE}", {"description": description})
+    elif status != 201:
+        raise ScenarioFailure(f"registering the namespace answered {status}")
+
+    scratch = harness.workdir.parent
+    tree = scratch / "contract-import"
+    bundle = scratch / "contract-import-bundle.json"
+    shutil.rmtree(tree, ignore_errors=True)
+    bundle.unlink(missing_ok=True)
+    try:
+        imported = harness.run(
+            "import", "--from-api", "--output-dir", str(tree),
+            "--credential-bundle-output", str(bundle),
+            "--allow-plaintext-plugin-config", "key_auth",
+            FERRUM_NAMESPACE=NAMESPACE,
+        )
+    finally:
+        shutil.rmtree(tree, ignore_errors=True)
+        bundle.unlink(missing_ok=True)
+    if "Unsupported backup section" in imported.stdout + imported.stderr:
+        raise ScenarioFailure(
+            "import found a GET /backup section this build does not model "
+            "(http_client::BACKUP_TOP_LEVEL_FIELDS):\n" + imported.stdout + imported.stderr
+        )
+
+    harness.write(".gitforgeops/config.yaml", f"""
+        version: 1
+        default_environment: acceptance
+        environments:
+          acceptance:
+            apply_strategy: full_replace
+            ownership:
+              mode: exclusive
+              namespaces: [{NAMESPACE}]
+    """)
+    try:
+        harness.run("apply", "--auto-approve", "--allow-large-prune")
+        harness.run("diff", "--exit-on-drift")
+    finally:
+        seed_repository(harness)
+    return "import and full replacement carried a registered namespace's backup"
+
+
+def _contract_credentials(harness: Harness) -> dict[str, str]:
+    """Seed the contract consumer's slots in the run's broker bundle."""
+    import secrets  # noqa: PLC0415 - only this scenario generates values
+
+    values = {
+        f"{NAMESPACE}/{CONTRACT_CONSUMER}/{slot}": secrets.token_urlsafe(36)
+        for slot in ("keyauth/key", "jwt/secret", "hmac_auth/secret", "basicauth/password")
+    }
+    for value in values.values():
+        harness.remember_secret(value)
+    return values
+
+
+def _export_projection(harness: Harness) -> str:
+    """`config_export.rs`'s closed Consumer projection against `GET /config/export`.
+
+    A consumer with every credential type (basicauth is omitted by the export,
+    mtls identities stay visible, the rest are fingerprinted) must compare in
+    sync through the viewer-credential export, its fingerprints must verify
+    against a baseline, and an out-of-band change must still be drift.
+    """
+    viewer = os.environ.get("GITFORGEOPS_LIFECYCLE_VIEWER_SECRET", "")
+    if not viewer:
+        raise ScenarioFailure(
+            "run.sh did not start the gateway with a viewer secret "
+            "(GITFORGEOPS_LIFECYCLE_VIEWER_SECRET); this is a harness failure"
+        )
+    harness.remember_secret(viewer)
+    creds_path = Path(harness.creds_file)
+    original = creds_path.read_text(encoding="utf-8")
+    creds = json.loads(original)
+    creds["FERRUM_CREDS_BUNDLE"].update(_contract_credentials(harness))
+    creds_path.write_text(json.dumps(creds), encoding="utf-8")
+    consumer = f"resources/{NAMESPACE}/consumers/{CONTRACT_CONSUMER}.yaml"
+    harness.write(consumer, f"""
+        kind: Consumer
+        spec:
+          id: "{CONTRACT_CONSUMER}"
+          username: "{CONTRACT_CONSUMER}"
+          credentials:
+            keyauth:
+              - key: "${{gh-env-secret:alloc=require}}"
+            jwt:
+              - secret: "${{gh-env-secret:alloc=require}}"
+            hmac_auth:
+              - secret: "${{gh-env-secret:alloc=require}}"
+            basicauth:
+              - password: "${{gh-env-secret:alloc=require}}"
+            mtls_auth:
+              - identity: "{CONTRACT_MTLS_IDENTITY}"
+    """)
+    baseline = harness.workdir.parent / "contract-fingerprints.json"
+    baseline.unlink(missing_ok=True)
+    through_export = {"FERRUM_ADMIN_JWT_VIEWER_SECRET": viewer}
+    try:
+        harness.run("apply", "--auto-approve")
+        first = harness.run("diff", "--exit-on-drift", expect=None, **through_export)
+        if "GET /config/export" not in first.stdout + first.stderr:
+            raise ScenarioFailure("diff with the viewer secret did not read GET /config/export")
+        if first.returncode != 6:
+            raise ScenarioFailure(
+                f"the export comparison exited {first.returncode}, expected in sync with "
+                f"unverified secrets (6)\n{first.stdout}\n{first.stderr}"
+            )
+        recorded = harness.run(
+            "diff", "--exit-on-drift", "--write-fingerprint-baseline", str(baseline),
+            expect=None, **through_export,
+        )
+        if recorded.returncode not in (0, 6) or not baseline.is_file():
+            raise ScenarioFailure(
+                f"recording the fingerprint baseline exited {recorded.returncode}\n"
+                f"{recorded.stdout}\n{recorded.stderr}"
+            )
+        harness.run(
+            "diff", "--exit-on-drift", "--fingerprint-baseline", str(baseline),
+            expect=0, **through_export,
+        )
+        mutate_proxy_out_of_band(harness)
+        harness.run(
+            "diff", "--exit-on-drift", "--fingerprint-baseline", str(baseline),
+            expect=2, **through_export,
+        )
+    finally:
+        baseline.unlink(missing_ok=True)
+        harness.remove(consumer)
+        creds_path.write_text(original, encoding="utf-8")
+        ensure_deployed(harness)
+    return "the export projection compared in sync and verified every fingerprint"
+
+
+def _schemeless_http_proxies() -> list[dict]:
+    """HTTP-family proxies with no `backend_scheme`, one per dial shape."""
+    return [
+        {"id": "contract-scheme-443", "listen_path": "/contract-scheme-443",
+         "backend_host": "127.0.0.1", "backend_port": 443},
+        {"id": "contract-scheme-80", "listen_path": "/contract-scheme-80",
+         "backend_host": "127.0.0.1", "backend_port": 80},
+        {"id": "contract-scheme-upstream", "listen_path": "/contract-scheme-upstream",
+         "upstream_id": "orders-upstream"},
+    ]
+
+
+CONTRACT_STREAM_PROXY = "contract-scheme-stream"
+
+
+def _stream_proxy(scheme: str | None) -> dict:
+    proxy = {"id": CONTRACT_STREAM_PROXY, "listen_port": 18923,
+             "backend_host": "127.0.0.1", "backend_port": 1}
+    if scheme:
+        proxy["backend_scheme"] = scheme
+    return proxy
+
+
+def _backend_scheme_derivation(harness: Harness) -> str:
+    """`normalize_proxy_backend_schemes` (assembler.rs) against Edge's own derivation.
+
+    GitForgeOps fills an omitted HTTP-family scheme before sending, so no
+    other scenario sees what Edge derives (`Proxy::effective_scheme`). Here
+    Edge stores each proxy written WITHOUT a scheme, and `diff` must find it
+    equal to the same proxy declared without one. A stream proxy without a
+    scheme is left alone by GitForgeOps; Edge and `gitforgeops validate` must
+    both refuse it, and both accept it with one.
+    """
+    files = []
+    try:
+        for proxy in _schemeless_http_proxies():
+            relative = f"resources/{NAMESPACE}/proxies/{proxy['id']}.yaml"
+            harness.write(relative, json.dumps({"kind": "Proxy", "spec": proxy}))
+            files.append(relative)
+        harness.run("apply", "--auto-approve")
+        derived = {}
+        for proxy in _schemeless_http_proxies():
+            _admin(harness, "PUT", f"/proxies/{proxy['id']}", dict(proxy, namespace=NAMESPACE))
+            status, _, body = _admin_exchange(harness, "GET", f"/proxies/{proxy['id']}")
+            derived[proxy["id"]] = json.loads(body).get("backend_scheme") if status == 200 else status
+        compared = harness.run("diff", "--exit-on-drift", expect=None)
+        if compared.returncode != 0:
+            raise ScenarioFailure(
+                f"Edge derived {derived} for proxies written without backend_scheme, and diff "
+                f"exited {compared.returncode} against the same proxies normalized by "
+                f"GitForgeOps\n{compared.stdout}\n{compared.stderr}"
+            )
+
+        stream = f"resources/{NAMESPACE}/proxies/{CONTRACT_STREAM_PROXY}.yaml"
+        files.append(stream)
+        status, _, _ = _admin_exchange(harness, "POST", "/proxies", _stream_proxy(None))
+        if status != 400:
+            if status in (200, 201):
+                _admin(harness, "DELETE", f"/proxies/{CONTRACT_STREAM_PROXY}")
+            raise ScenarioFailure(f"a stream proxy without backend_scheme answered {status}, expected 400")
+        _admin(harness, "POST", "/proxies", _stream_proxy("tcp"))
+        _admin(harness, "DELETE", f"/proxies/{CONTRACT_STREAM_PROXY}")
+        harness.write(stream, json.dumps({"kind": "Proxy", "spec": _stream_proxy("tcp")}))
+        harness.run("validate")
+        harness.write(stream, json.dumps({"kind": "Proxy", "spec": _stream_proxy(None)}))
+        if harness.run("validate", expect=None).returncode == 0:
+            raise ScenarioFailure("gitforgeops validate accepted a stream proxy without backend_scheme")
+    finally:
+        for relative in files:
+            harness.remove(relative)
+        ensure_deployed(harness)
+    return f"Edge's derived backend schemes {sorted(set(map(str, derived.values())))} match GitForgeOps' normalization"
+
+
+def scenario_edge_contract_copies(harness: Harness) -> str:
+    ensure_deployed(harness)
+    return "; ".join(
+        (
+            _json_object_rules(harness),
+            _backend_scheme_derivation(harness),
+            _restore_semantics(harness),
+            _backup_round_trip(harness),
+            _export_projection(harness),
+        )
+    )
+
+
 SCENARIOS = {
     "create-and-route": scenario_create_and_route,
     "reapply-is-a-no-op": scenario_reapply_is_a_no_op,
@@ -1188,6 +1659,7 @@ SCENARIOS = {
     "staged-promotion": scenario_staged_promotion,
     "drift-monitoring": scenario_drift_monitoring,
     "file-and-mesh-boundary": scenario_file_and_mesh_boundary,
+    "edge-contract-copies": scenario_edge_contract_copies,
 }
 
 

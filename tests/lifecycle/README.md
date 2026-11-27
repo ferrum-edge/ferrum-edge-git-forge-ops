@@ -17,10 +17,10 @@ revision can be published. The ids are declared once, in
 [`.github/scripts/lifecycle_result.py`](../../.github/scripts/lifecycle_result.py),
 and a test checks that this file lists each of them.
 
-The harness (`run.sh`) runs eight scenarios itself: `create-and-route`,
+The harness (`run.sh`) runs nine scenarios itself: `create-and-route`,
 `reapply-is-a-no-op`, `modify-and-delete-in-order`, `conditional-overwrite`,
-`conditional-full-replace`, `partial-failure-recovery`, `drift-monitoring` and
-`file-and-mesh-boundary`. The other five always record `skipped` and are
+`conditional-full-replace`, `partial-failure-recovery`, `drift-monitoring`,
+`file-and-mesh-boundary` and `edge-contract-copies`. The other five always record `skipped` and are
 exercised by hand (see below).
 
 | Scenario | Question it answers |
@@ -38,6 +38,7 @@ exercised by hand (see below).
 | `staged-promotion` | Does an opted-in production environment stay blocked until staging applied *and* served traffic for the same revision — and does breaking staging's routing block it even though the gateway accepted the write? |
 | `drift-monitoring` | Is drift distinguishable from a failed check and from a skipped one? |
 | `file-and-mesh-boundary` | For the advertised file/mesh profile: assembly that preserves placeholders, a separate mesh document, and 0600 materialization that never touches the committed artifact — and that assembly is *not* reported as live fleet deployment. Encrypted delivery to a GitHub key is `credentials-generate-and-rotate`'s. |
+| `edge-contract-copies` | Do GitForgeOps' copies of Edge rules still match the gateway? See [Edge contract copies](#edge-contract-copies). |
 
 ### `skipped` is not `passed`
 
@@ -199,6 +200,41 @@ case added are removed even when it fails, so the next scenario's apply prunes
 the rows the ledger owns; shared mode leaves an unowned one in place. Process interruption (SIGKILL, runner loss) and
 its ledger recovery stay with `runner-interruption`, which needs the GitHub
 half.
+
+---
+
+## Edge contract copies
+
+GitForgeOps carries its own copies of several Edge rules and uses each against
+a live gateway. `edge-contract-copies` runs every copy against the gateway
+under test. In `lifecycle.yml` that is the pinned release; the
+[Edge Main Drift](../../.github/workflows/edge-main-drift.yml) workflow runs
+the same suite against Edge `main`, so a change there fails the drift check
+before Edge releases it.
+
+| Copy | What the scenario does |
+| --- | --- |
+| JSON-object rules (`src/config/json_object.rs`) | For every trigger position that must be an object, Edge accepts a valid trigger and refuses an array with `400` (`POST /plugins/config`), and `gitforgeops validate` does the same. |
+| Backend scheme normalization (`normalize_proxy_backend_schemes` in `src/config/assembler.rs`) | HTTP-family proxies written to Edge without `backend_scheme` (direct on port 443, direct on port 80, through an upstream) diff in sync with the same proxies declared without one, so Edge's derived scheme is GitForgeOps' `https`. A stream proxy without a scheme is refused by Edge (`400`) and by `gitforgeops validate`, and accepted by both with one. |
+| Restore handling (`src/apply/api_target.rs`, `src/http_client.rs`) | `POST /restore` without `?confirm=true`, with a batch-shaped row (conditionally and not) and with a mistyped field answers `400`; a body without `api_specs` while the namespace holds a spec answers `409` with `api_specs_at_risk` and `confirmation_required`. The namespace ETag proves none of them wrote anything. |
+| `GET /backup` decode (`BackupSnapshot`, the conditional decode) | After the namespace gets a registry row, `gitforgeops import --from-api` reports no unsupported section, and a `full_replace` apply carries the backup through `POST /restore` and converges. |
+| Closed Consumer projection (`src/config_export.rs`) | A consumer with every credential type compares in sync through `GET /config/export` with the viewer secret (exit 6), its fingerprints verify against a recorded baseline (exit 0), and an out-of-band change is drift (exit 2). |
+
+`run.sh` starts the gateway with a generated `FERRUM_ADMIN_JWT_VIEWER_SECRET`
+and exports it as `GITFORGEOPS_LIFECYCLE_VIEWER_SECRET`, the same way it
+handles the admin secret. A gateway started with `LIFECYCLE_GATEWAY_EXTERNAL=1`
+must have that viewer secret too, or this scenario fails.
+
+The scenario runs last: the namespace registry row it creates stays for the
+rest of the run.
+
+The static half of the same check compares each copy with Edge's
+`openapi.yaml` (`tests/unit/edge_main_openapi_tests.rs`): the
+`BackupResponse`, `RestoreRequest` and `RestoreResponse` fields, every
+`POST /restore` response field and `rollback` / `failure_class` value, the
+`GET /config/export` envelope and its credential projection. Edge Main Drift
+runs it against Edge `main`'s spec, and `lifecycle.yml` against the pinned
+release's.
 
 ---
 

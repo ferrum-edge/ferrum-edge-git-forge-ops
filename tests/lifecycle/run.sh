@@ -28,6 +28,7 @@ cleanup() {
     # environment; strip it before any of this reaches a CI log.
     sed -e "s/${FERRUM_ADMIN_JWT_SECRET:-__none__}/[REDACTED]/g" \
         -e "s/${GITFORGEOPS_LIFECYCLE_CONSUMER_KEY:-__none__}/[REDACTED]/g" \
+        -e "s/${GITFORGEOPS_LIFECYCLE_VIEWER_SECRET:-__none__}/[REDACTED]/g" \
         "$GATEWAY_LOG" | tail -50 >&2
   fi
   rm -rf "$WORKDIR"
@@ -45,7 +46,10 @@ command -v "${FERRUM_EDGE_BINARY_PATH:-ferrum-edge}" >/dev/null || {
 # Disposable credentials. Generated per run, never persisted, never reused.
 FERRUM_ADMIN_JWT_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n=/+' | head -c 48)"
 GITFORGEOPS_LIFECYCLE_CONSUMER_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n=/+' | head -c 32)"
-export FERRUM_ADMIN_JWT_SECRET GITFORGEOPS_LIFECYCLE_CONSUMER_KEY
+# The gateway's viewer-token secret, so `edge-contract-copies` can read
+# `GET /config/export` the way `diff` does with FERRUM_ADMIN_JWT_VIEWER_SECRET.
+GITFORGEOPS_LIFECYCLE_VIEWER_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n=/+' | head -c 48)"
+export FERRUM_ADMIN_JWT_SECRET GITFORGEOPS_LIFECYCLE_CONSUMER_KEY GITFORGEOPS_LIFECYCLE_VIEWER_SECRET
 
 # The broker bundle the seeded `alloc=require` slot resolves from. 0600, inside
 # the throwaway workdir, removed with it.
@@ -115,6 +119,7 @@ if [ -z "${LIFECYCLE_GATEWAY_EXTERNAL:-}" ]; then
   echo "Starting the gateway with: $GATEWAY_CMD"
   # shellcheck disable=SC2086  # the command is a deliberate word-split hook
   env FERRUM_ADMIN_JWT_SECRET="$FERRUM_ADMIN_JWT_SECRET" \
+      FERRUM_ADMIN_JWT_VIEWER_SECRET="$GITFORGEOPS_LIFECYCLE_VIEWER_SECRET" \
       FERRUM_MODE="${LIFECYCLE_GATEWAY_MODE:-database}" \
       FERRUM_DB_TYPE="$FERRUM_DB_TYPE" \
       FERRUM_DB_URL="$FERRUM_DB_URL" \

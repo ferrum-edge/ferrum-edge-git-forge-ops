@@ -627,6 +627,43 @@ fn restore_failure_without_commit_proof_is_ambiguous_and_run_stopping() {
 }
 
 #[test]
+fn edge_1_0_restore_503_rollback_values_are_classified() {
+    // Edge 1.0 documents three more `rollback` values on a `503`. Two leave
+    // the namespace possibly cleared and keep Edge's admission guard held:
+    // manual recovery, never a retry. The third proves nothing was deleted.
+    for rollback in ["skipped_after_intervening_write", "unknown_clear_outcome"] {
+        let raw = format!(r#"{{"error":"restore failed","rollback":"{rollback}"}}"#);
+        assert_eq!(
+            classify_retry(503, &body(&raw), RequestKind::Restore),
+            RetryDecision::NoRetry,
+            "rollback={rollback}"
+        );
+        let error = gitforgeops::http_client::map_api_error(503, &raw, RequestKind::Restore);
+        assert!(
+            matches!(
+                error,
+                gitforgeops::error::Error::RestoreNeedsManualRecovery(_)
+            ),
+            "rollback={rollback}: {error:?}"
+        );
+    }
+    let untouched =
+        r#"{"error":"restore aborted","rollback":"not_needed_after_intervening_write"}"#;
+    assert_eq!(
+        classify_retry(503, &body(untouched), RequestKind::Restore),
+        RetryDecision::NoRetry
+    );
+    let error = gitforgeops::http_client::map_api_error(503, untouched, RequestKind::Restore);
+    assert!(
+        matches!(
+            error,
+            gitforgeops::error::Error::ApiError { status: 503, .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn restore_503_connectivity_is_retryable() {
     let b = body(r#"{"error":"datastore unavailable","failure_class":"connectivity"}"#);
     assert_eq!(
