@@ -116,12 +116,10 @@ UPSTREAM_MANAGED = (
     ".github/ferrum-edge-checksums.txt",
     ".github/cargo-audit-policy.json",
     ".github/dependabot.yml",
-    # The agent skills, launchers and rules that `.github/scripts/
-    # check_agent_setup.py` judges. Upstream changes that validator and these
-    # trees in the same commits, and a copy adopts the validator above, so it
-    # adopts the trees with it; otherwise the required Agent Setup Policy check
-    # fails on every pull request after such an update. `AGENTS.md` is a link
-    # to `CLAUDE.md`, which the updater refuses, so `CLAUDE.md` carries it.
+    # The agent skills, launchers and rules. Upstream changes the launchers and
+    # the `.github/scripts/tests` that exercise them together, so a copy adopts
+    # both. `AGENTS.md` is a link to `CLAUDE.md`, which the updater refuses, so
+    # `CLAUDE.md` carries it.
     ".agents",
     ".claude",
     ".gitignore",

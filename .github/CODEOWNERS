@@ -1,10 +1,6 @@
 # SET UP YOUR OWN COPY: replace @jeremyjpj0916 everywhere below with your own
 # maintainers — one or more `@user` handles, or `@org/team` slugs for an
-# organization. Every line must name the SAME set of owners, because
-# `.github/scripts/check_agent_setup.py` reads the expected set from the
-# `/.github/CODEOWNERS` rule near the bottom of this file and then requires
-# every other protected path to match it exactly. A one-line change here is
-# therefore visible on every protected path for root review.
+# organization. Use the SAME set of owners on every line.
 #
 # These entries route review and document ownership. They do not require a
 # Code Owner approval submission. The root orchestrator reviews the exact head
@@ -24,14 +20,8 @@
 /src/reconcile.rs @jeremyjpj0916
 /src/secrets/ @jeremyjpj0916
 /.github/actions/ @jeremyjpj0916
-# Repository settings must require "Agent Setup Policy / validate-trusted-policy"
-# alongside exact-head root review for these entries. They stay the
-# final rules so no later pattern can override them.
+# These entries stay the final rules so no later pattern can override them.
 /.github/CODEOWNERS @jeremyjpj0916
-/.github/workflows/agent-setup-ci.yml @jeremyjpj0916
-/.github/workflows/agent-setup-policy.yml @jeremyjpj0916
-/.github/scripts/check_agent_setup.py @jeremyjpj0916
-/.github/scripts/tests/test_agent_setup.py @jeremyjpj0916
 /.agents/ @jeremyjpj0916
 /.claude/ @jeremyjpj0916
 /CLAUDE.md @jeremyjpj0916

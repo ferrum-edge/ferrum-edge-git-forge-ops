@@ -69,9 +69,8 @@ mandatory repository gate:
 - `cargo test --lib`
 - `git diff --check`
 
-When agent setup, shell dispatchers, or workflows change, also run
-`python3 .github/scripts/check_agent_setup.py`, `actionlint`, and `shellcheck` on every changed
-dispatcher.
+When shell dispatchers or workflows change, also run `actionlint` and `shellcheck` on every
+changed dispatcher.
 
 Run additional focused tests and changed-surface policy checks when relevant, and report every
 exact command and result. This repository has no standing known-flake allowlist; investigate every

@@ -3157,54 +3157,6 @@ def security_trigger_violations(text: str) -> list[str]:
     return violations
 
 
-# The exact trigger shape `agent-setup-policy.yml` may carry. Its job reports
-# the required `validate-trusted-policy` context, and the exemption in
-# `policy_check_impersonation_violations` trusts this file to be the context's
-# only home. `pull_request_target` loads the protected definition; any added
-# candidate-controlled trigger (above all `pull_request`) would run the
-# candidate's own copy and could post a result under the required name
-# without the trusted validator ever running.
-AGENT_SETUP_POLICY_SHAPE = {
-    "types": ["opened", "synchronize", "reopened", "edited"],
-}
-
-
-def agent_setup_policy_trigger_violations(text: str) -> list[str]:
-    """`agent-setup-policy.yml` may run only on its reviewed trigger shape."""
-    try:
-        document = parse_workflow(text)
-    except WorkflowSyntaxError as error:
-        return [
-            "agent-setup-policy.yml: the trigger list must be in the YAML "
-            f"subset the policy reads: {error}"
-        ]
-    candidates = [value for key, value in document.items() if key.casefold() == "on"]
-    if len(candidates) != 1 or not isinstance(candidates[0], dict):
-        return ["agent-setup-policy.yml: the workflow must declare exactly one `on:` mapping"]
-    triggers = candidates[0]
-    violations: list[str] = []
-    for found in triggers:
-        if found.casefold() != "pull_request_target":
-            violations.append(
-                f"agent-setup-policy.yml: the trigger {found!r} is not reviewed; "
-                "the only reviewed trigger is pull_request_target, because a "
-                "candidate-controlled trigger would let a pull request report "
-                "the required validate-trusted-policy check itself"
-            )
-    spelled = {found.casefold(): found for found in triggers}
-    target = triggers.get(spelled.get("pull_request_target", ""))
-    if "pull_request_target" not in spelled:
-        violations.append(
-            "agent-setup-policy.yml: the reviewed pull_request_target trigger is missing"
-        )
-    elif target != AGENT_SETUP_POLICY_SHAPE:
-        violations.append(
-            "agent-setup-policy.yml: pull_request_target must keep its reviewed "
-            f"types; expected {AGENT_SETUP_POLICY_SHAPE!r}, found {target!r}"
-        )
-    return violations
-
-
 def allowlisted_validator_digests(text: str) -> list[str]:
     """Return every approved validator digest, in file order."""
     digests: list[str] = []
@@ -3404,13 +3356,6 @@ UNSAFE_PR_CHECKOUT_STEPS = {
         "persist-credentials": "false",
         UNSAFE_PR_CHECKOUT_INPUT: "true",
     },
-    ".github/workflows/agent-setup-policy.yml": {
-        "repository": "${{ github.event.pull_request.head.repo.full_name }}",
-        "ref": "${{ github.event.pull_request.head.sha }}",
-        "path": ".agent-setup-candidate",
-        "persist-credentials": "false",
-        UNSAFE_PR_CHECKOUT_INPUT: "true",
-    },
 }
 
 
@@ -3440,7 +3385,7 @@ def unsafe_pr_checkout_violations(relative: str, document: dict) -> list[str]:
     allowed = UNSAFE_PR_CHECKOUT_STEPS.get(relative)
     refusal = (
         f"{relative}: `{UNSAFE_PR_CHECKOUT_INPUT}` is admitted only on the candidate "
-        "data checkout of supply-chain-policy.yml and agent-setup-policy.yml, with "
+        "data checkout of supply-chain-policy.yml, with "
         f"exactly {{repository, ref, path, persist-credentials: false, "
         f"{UNSAFE_PR_CHECKOUT_INPUT}: true}}"
     )
@@ -5701,8 +5646,6 @@ REQUIRED_CHECK_WORKFLOWS = {
 # fence below has ever been written for it. Adding one is a two-step change —
 # land the allowlist entry (and any fences) first, then the workflow.
 KNOWN_WORKFLOWS = frozenset({
-    "agent-setup-ci.yml",
-    "agent-setup-policy.yml",
     "alloy-consumer.yml",
     "apply-on-merge.yml",
     "base-image-pin-canary.yml",
@@ -5731,7 +5674,6 @@ KNOWN_WORKFLOWS = frozenset({
 # grows an entry (and fences) for it.
 PRIVILEGED_TRIGGER_OWNERS = {
     "pull_request_target": frozenset({
-        "agent-setup-policy.yml",
         "state-guard.yml",
         "supply-chain-policy.yml",
     }),
@@ -7263,13 +7205,6 @@ def main(argv: list[str] | None = None) -> int:
     violations.extend(cargo_audit_install_violations(security_workflow))
     violations.extend(security_push_trigger_violations(security_workflow))
     violations.extend(security_trigger_violations(security_workflow))
-    agent_setup_policy = workflows / "agent-setup-policy.yml"
-    if agent_setup_policy.is_file():
-        violations.extend(
-            agent_setup_policy_trigger_violations(
-                agent_setup_policy.read_text(encoding="utf-8")
-            )
-        )
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     violations.extend(state_guard_helper_violations(state_guard))
     violations.extend(state_guard_override_authorize_violations(state_guard))

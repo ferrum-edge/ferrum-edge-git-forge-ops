@@ -120,7 +120,6 @@ keep its schema in one initial baseline; see the
 | `alloy-consumer.yml` | consumer-surface pull requests, weekly, manual | Non-required Alloy consumer qualification. |
 | `lifecycle.yml` | push, daily, manual | End-to-end acceptance against a real gateway. |
 | `release.yml` | `v*` tag | Publish the container image. |
-| `agent-setup-ci.yml`, `agent-setup-policy.yml` | pull request | Contributor tooling checks. |
 
 ## GitHub plan requirements
 
@@ -188,12 +187,10 @@ environment through to a first apply and authenticated traffic.
    re-enable them when that happens.
 
 3. **Name your maintainers in `.github/CODEOWNERS`.** Replace every
-   `@jeremyjpj0916` with your own handles, using the same set on every line;
-   `check_agent_setup.py` requires it.
+   `@jeremyjpj0916` with your own handles, using the same set on every line.
 
    ```bash
    sed -i '' 's/@jeremyjpj0916/@acme-platform-lead/g' .github/CODEOWNERS   # macOS; drop '' on Linux
-   python3 .github/scripts/check_agent_setup.py
    ```
 
 4. **Apply the launch controls.** The bootstrap script writes the Actions
