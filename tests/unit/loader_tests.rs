@@ -609,6 +609,37 @@ fn loader_rejects_yaml_merge_keys_as_an_unknown_field() {
     assert!(error.contains(".spec.<<"), "{error}");
 }
 
+/// Ferrum Edge 1.0.0 removes the passive-health `gateway_error_codes` and
+/// `split_external_local_origin_errors` fields (accepted through v0.9.21 and
+/// never applied) and refuses either key. GitForgeOps no longer models them,
+/// so the strict loader refuses a document that still sets one, naming it,
+/// instead of rendering a configuration Edge 1.0.0 would refuse.
+#[test]
+fn loader_refuses_the_removed_passive_health_fields() {
+    for field in [
+        "gateway_error_codes: [502, 504]",
+        "split_external_local_origin_errors: true",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_resource(
+            tmp.path(),
+            "upstreams",
+            "pool.yaml",
+            &format!(
+                "kind: Upstream\nspec:\n  id: pool\n  targets:\n    - host: h\n      port: 80\n  \
+                 health_checks:\n    passive:\n      unhealthy_threshold: 3\n      {field}\n"
+            ),
+        );
+        let error = load_resources(tmp.path()).unwrap_err().to_string();
+        let name = field.split(':').next().unwrap();
+        assert!(error.contains("unknown configuration field"), "{error}");
+        assert!(
+            error.contains(&format!(".spec.health_checks.passive.{name}")),
+            "{field}: {error}"
+        );
+    }
+}
+
 /// Pads `body` with a trailing YAML comment so the file is exactly `len` bytes.
 fn padded_yaml(body: &str, len: usize) -> String {
     let padding = len - body.len() - 2;

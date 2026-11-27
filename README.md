@@ -1106,6 +1106,21 @@ Moving the pin is one reviewed change: append the new line, then set
 gateway stage, `DEFAULT_EDGE_VERSION` and the contracts pin to the new release
 (`check_release_baseline.py` refuses a partial move).
 
+**Edge 1.0.0 readiness (for the 1.0 pin change).** Already done ahead of the
+pin: GitForgeOps no longer models the passive-health `gateway_error_codes` and
+`split_external_local_origin_errors` fields Edge 1.0.0 removes, and every
+nested Proxy/Upstream key it emits is declared by Edge 1.0.0's `openapi.yaml`.
+Still for the pin change itself:
+
+- Run lifecycle jobs against a fresh 1.0.0 database. The bundled suite creates
+  a throwaway SQLite file per run, but a gateway kept for acceptance (and any
+  `LIFECYCLE_DB_URL`) must be rebuilt: 1.0.0 refuses a database created by a
+  0.9.x release and stored documents carrying removed or unknown keys.
+- Edge 1.0.0 speaks ConfigSync revision 8 and refuses 0.9.21 peers, so CP and
+  DP gateways in any test or acceptance setup must run the same 1.0.0 build.
+- Move the Edge pin, contracts pin, `DEFAULT_EDGE_VERSION`, release baseline
+  and product version together, as above.
+
 `validator-pin-canary.yml` runs daily. When the pinned build no longer
 installs, the pinned binary rejects
 `tests/fixtures/validator-resource-labels.yaml`, or Ferrum Edge has published a
