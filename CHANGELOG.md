@@ -7,6 +7,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `check_agent_setup.py` treats the `opus-agents` Claude mirror as optional
+  instead of rejecting it, and reports a Claude mirror as unexpected only when
+  no canonical `.agents/skills/` skill backs it. This lets a follow-up add the
+  `.claude/skills/opus-agents` entrypoint under the trusted default-branch
+  validator.
 - Version-aware handling for `Proxy.pool_max_requests_per_connection` across
   Ferrum Edge v0.9.20 and v0.9.21 pairings (#739). Ferrum Edge v0.9.21 removed
   the no-op field while keeping `Proxy` `deny_unknown_fields`
