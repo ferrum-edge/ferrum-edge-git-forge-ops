@@ -7997,12 +7997,6 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                     )
                 )
 
-    def test_the_helper_may_drop_the_retiring_agent_setup_check(self):
-        source = (ROOT / check_supply_chain.RELEASE_GATE_HELPER).read_text(encoding="utf-8")
-        retiring = f'    "{check_supply_chain.RETIRING_RELEASE_GATE_CHECK}",\n'
-        self.assertEqual(source.count(retiring), 1)
-        self.assertEqual(self._helper_violations(source.replace(retiring, "", 1)), [])
-
     def test_helper_invocation_is_pinned(self):
         step = self.RELEASE_HELPER_STEP
         for name, changed in (

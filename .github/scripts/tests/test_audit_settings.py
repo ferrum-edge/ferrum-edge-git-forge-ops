@@ -20,7 +20,6 @@ REQUIRED_CHECKS = {
     "trusted-supply-chain-policy",
     "state-guard-reject-state-edits",
     "gitforgeops-required-static-validation",
-    "validate-trusted-policy",
 }
 
 
@@ -1508,10 +1507,10 @@ class TemplateRepositoryAuditTests(unittest.TestCase):
 class TrustedPolicyCheckTests(unittest.TestCase):
     """GHSA-x5m2-4555-q4cr: the protected-definition policy checks are required.
 
-    `trusted-supply-chain-policy` and `validate-trusted-policy` come from
-    `pull_request_target` workflows the pull request cannot edit. The retired
-    in-tree `security-supply-chain-policy` context is no longer required, and a
-    ruleset that still lists it passes, so the operator can drop it at any time.
+    `trusted-supply-chain-policy` comes from a `pull_request_target` workflow
+    the pull request cannot edit. The retired in-tree
+    `security-supply-chain-policy` context and the retired Agent Setup Policy
+    `validate-trusted-policy` context are no longer required.
     """
 
     TRUSTED = "trusted-supply-chain-policy"
@@ -1567,11 +1566,12 @@ class TrustedPolicyCheckTests(unittest.TestCase):
         self.assertEqual(set(audit_settings.REQUIRED_STATUS_CHECKS), REQUIRED_CHECKS)
         self.assertNotIn(self.RETIRED, audit_settings.REQUIRED_STATUS_CHECKS)
         self.assertFalse(hasattr(audit_settings, "TRANSITIONAL_STATUS_CHECKS"))
-        self.assertIn(self.AGENT_POLICY, audit_settings.SOURCE_BOUND_STATUS_CHECKS)
+        self.assertNotIn(self.AGENT_POLICY, audit_settings.REQUIRED_STATUS_CHECKS)
+        self.assertNotIn(self.AGENT_POLICY, audit_settings.SOURCE_BOUND_STATUS_CHECKS)
 
     def test_a_ruleset_without_the_trusted_checks_fails(self):
         # No longer a warning: the ruleset switch is done.
-        for absent in (self.TRUSTED, self.AGENT_POLICY):
+        for absent in (self.TRUSTED,):
             with self.subTest(absent=absent):
                 audit = self.audit_ruleset(REQUIRED_CHECKS - {absent})
                 rendered = "\n".join(audit.violations)
@@ -1620,7 +1620,7 @@ class TrustedPolicyCheckTests(unittest.TestCase):
         # Its definition is protected too (pull_request_target), so an
         # own-token commit status is the only way to forge it.
         audit = self.audit_ruleset(
-            REQUIRED_CHECKS | {self.TRUSTED, self.AGENT_POLICY},
+            REQUIRED_CHECKS | {self.TRUSTED},
             unbound=frozenset({"state-guard-reject-state-edits"}),
         )
         rendered = "\n".join(audit.violations)
@@ -1630,13 +1630,12 @@ class TrustedPolicyCheckTests(unittest.TestCase):
             (
                 "trusted-supply-chain-policy",
                 "state-guard-reject-state-edits",
-                "validate-trusted-policy",
             ),
         )
 
     def test_older_unbound_contexts_are_a_warning(self):
         audit = self.audit_ruleset(
-            REQUIRED_CHECKS | {self.TRUSTED, self.AGENT_POLICY},
+            REQUIRED_CHECKS | {self.TRUSTED},
             unbound=frozenset({"rust-ci-check"}),
         )
         self.assertEqual(audit.violations, [])
@@ -1698,7 +1697,7 @@ class RequiredWorkflowRuleTests(unittest.TestCase):
         audit = self.run_audit(responses)
         self.assertEqual(len(audit.violations), 1)
         self.assertIn("state-guard.yml", audit.violations[0])
-        self.assertIn("agent-setup-policy.yml", audit.violations[0])
+        self.assertIn("rust-ci.yml", audit.violations[0])
         self.assertNotIn("supply-chain-policy.yml", audit.violations[0])
         self.assertIn(
             "required workflow: .github/workflows/supply-chain-policy.yml "

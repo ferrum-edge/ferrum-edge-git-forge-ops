@@ -69,7 +69,6 @@ REQUIRED_CHECKS = (
     "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "GitForgeOps State Guard / state-guard-reject-state-edits",
     "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-    "Agent Setup Policy / validate-trusted-policy",
 )
 ACTIONS_APP_ID = 15368
 BUDGET_SECONDS = 900

@@ -5692,7 +5692,6 @@ REQUIRED_CHECK_WORKFLOWS = {
     SUPPLY_CHAIN_POLICY_JOB: SUPPLY_CHAIN_POLICY_PATH,
     "state-guard-reject-state-edits": ".github/workflows/state-guard.yml",
     "gitforgeops-required-static-validation": ".github/workflows/validate-pr.yml",
-    "validate-trusted-policy": ".github/workflows/agent-setup-policy.yml",
 }
 
 
@@ -6337,7 +6336,6 @@ RELEASE_GATE_REQUIRED_CHECKS = (
     "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "GitForgeOps State Guard / state-guard-reject-state-edits",
     "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-    "Agent Setup Policy / validate-trusted-policy",
 )
 RELEASE_GATE_APP_ID = 15368
 RELEASE_GATE_BUDGET_SECONDS = 900
@@ -6360,19 +6358,6 @@ RELEASE_GATE_PINS = {
     "REQUIRED_CHECKS": RELEASE_GATE_REQUIRED_CHECKS,
     "ACTIONS_APP_ID": RELEASE_GATE_APP_ID,
     "BUDGET_SECONDS": RELEASE_GATE_BUDGET_SECONDS,
-}
-# The Agent Setup Policy check is being retired. Until the follow-up drops it
-# from every list, the helper may require the launch contexts with or without
-# it; any other change to the list is still refused.
-RETIRING_RELEASE_GATE_CHECK = "Agent Setup Policy / validate-trusted-policy"
-RELEASE_GATE_PIN_ALTERNATIVES = {
-    "REQUIRED_CHECKS": (
-        tuple(
-            context
-            for context in RELEASE_GATE_REQUIRED_CHECKS
-            if context != RETIRING_RELEASE_GATE_CHECK
-        ),
-    ),
 }
 RELEASE_GATE_IMPORTS = frozenset(
     {"json", "os", "re", "subprocess", "sys", "time", "urllib.parse"}
@@ -6579,10 +6564,7 @@ def release_gate_helper_violations(root: Path) -> list[str]:
     violations: list[str] = []
     for name, expected in RELEASE_GATE_PINS.items():
         value = _module_constant(tree, name)
-        accepted = (expected, *RELEASE_GATE_PIN_ALTERNATIVES.get(name, ()))
-        if not any(
-            type(value) is type(candidate) and value == candidate for candidate in accepted
-        ):
+        if type(value) is not type(expected) or value != expected:
             violations.append(f"{label}: {name} must be assigned exactly {expected!r}")
         if _python_bindings(tree, name) != 1:
             violations.append(f"{label}: {name} must be bound once, at module level")
@@ -7281,11 +7263,13 @@ def main(argv: list[str] | None = None) -> int:
     violations.extend(cargo_audit_install_violations(security_workflow))
     violations.extend(security_push_trigger_violations(security_workflow))
     violations.extend(security_trigger_violations(security_workflow))
-    violations.extend(
-        agent_setup_policy_trigger_violations(
-            (workflows / "agent-setup-policy.yml").read_text(encoding="utf-8")
+    agent_setup_policy = workflows / "agent-setup-policy.yml"
+    if agent_setup_policy.is_file():
+        violations.extend(
+            agent_setup_policy_trigger_violations(
+                agent_setup_policy.read_text(encoding="utf-8")
+            )
         )
-    )
     state_guard = (workflows / "state-guard.yml").read_text(encoding="utf-8")
     violations.extend(state_guard_helper_violations(state_guard))
     violations.extend(state_guard_override_authorize_violations(state_guard))
