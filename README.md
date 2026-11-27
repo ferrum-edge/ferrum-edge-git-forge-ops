@@ -14,9 +14,11 @@
   <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge-git-forge-ops"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge-git-forge-ops" alt="Docker Pulls" /></a>
 </p>
 
-> **Active build-out:** breaking changes to the CLI, configuration, and state
-> formats are expected until the first supported baseline. See
-> [Development status](#development-status).
+> **Release status:** there is no supported GitForgeOps release until the
+> [release record](release/baseline.json) says `supported`. From 1.0.0 onward,
+> the CLI, configuration, state and workflow formats change only as the
+> [compatibility policy](release/README.md#publishing-and-later-changes) allows.
+> See [Development status](#development-status).
 
 GitOps for [Ferrum Edge](https://github.com/ferrum-edge/ferrum-edge) gateway
 configuration. Gateway resources live in this repository as YAML; pull requests
@@ -48,23 +50,30 @@ First supported baseline: [v0.1.0](release/README.md). The committed
 [upstream release record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json)
 is the source of truth for status and for the exact component pairing:
 
-- While its `status` is `pending`, GitForgeOps is in active buildout with no
-  supported release or users. Expect breaking changes to the CLI,
-  configuration and state formats.
+- While its `status` is `pending`, there is no supported GitForgeOps release.
+  `main` is being prepared as the release candidate and may still change the
+  CLI, configuration and state formats without migration steps.
 - Once `status` becomes `supported`, use only the source SHA, image digest,
-  validator pin and gateway pairing in that record. Earlier buildout revisions
-  have no compatibility or upgrade commitment.
+  validator pin and gateway pairing in that record.
 
-The [release policy and adoption steps](release/README.md#publishing-and-later-changes)
-apply from that baseline onward.
+From 1.0.0 onward, GitForgeOps versions follow semantic versioning. Within a
+major version, the CLI (commands, flags, exit codes), repository configuration
+(`.gitforgeops/*.yaml`), resource and overlay files, the state ledger and the
+bundled workflows change only compatibly. A removal or incompatible change is
+announced as a deprecation in a release note first and lands only in a new
+major version with migration steps; state ledger changes are forward-only
+migrations. Revisions from before the first supported release carry no
+compatibility or upgrade commitment. The
+[release policy and adoption steps](release/README.md#publishing-and-later-changes)
+give the details.
 
 GitForgeOps has **no database**. Gateway resource types are defined in
 [`src/config/schema.rs`](src/config/schema.rs), environment and policy
 configuration in [`src/config/repo_config.rs`](src/config/repo_config.rs) and
 [`src/policy/config.rs`](src/policy/config.rs), and the JSON ownership ledger in
-[`src/state.rs`](src/state.rs). If a database is ever added during buildout,
-keep its schema in one initial baseline; see the
-[contributor policy](CLAUDE.md#buildout-and-schema-policy).
+[`src/state.rs`](src/state.rs). If a database is ever added, its schema
+changes follow the same forward-only migration rule; see the
+[contributor policy](CLAUDE.md#compatibility-and-schema-policy).
 
 ## Features
 

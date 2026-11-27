@@ -153,10 +153,14 @@ the GitHub release with the committed notes and link to this record.
 
 After the first supported baseline, announce each fix in a versioned release
 note with the affected versions, replacement source SHA, image digest, gateway
-pairing and any operator action. Patch releases carry compatible fixes.
-During 0.x, breaking CLI, configuration, state or workflow changes need a new
-minor version, explicit migration steps and a new tested pairing. Security
-fixes use [security advisories](../SECURITY.md) as needed.
+pairing and any operator action. From 1.0.0 onward, versions follow semantic
+versioning: patch releases carry compatible fixes, minor releases add
+compatible features or a new tested gateway pairing, and a breaking CLI,
+configuration, state or workflow change is first announced as a deprecation in
+a release note and then lands only in a new major version, with explicit
+migration steps and a new tested pairing. State ledger changes are forward-only
+migrations. Security fixes use [security advisories](../SECURITY.md) and the
+supported versions stated there.
 
 Existing template copies get none of these changes automatically; use
 [the downstream update procedure](../docs/template-updates.md) to review and

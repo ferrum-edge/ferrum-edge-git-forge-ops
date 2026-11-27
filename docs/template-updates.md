@@ -358,7 +358,10 @@ skips the job, and its settings audit requires nothing new.
 ## What a supported baseline means
 
 This adoption process starts at the first supported release. Upstream does not
-promise updates for a copy taken from an arbitrary pre-release revision. The
+promise updates for a copy taken from an arbitrary pre-release revision. From
+1.0.0 onward, updates within a major version are compatible by the
+[release policy](../release/README.md#publishing-and-later-changes); a new
+major version carries migration steps in its release notes. The
 baseline you record has to be a revision upstream still has, and the further
 behind you are, the more of the comparison lands in the conflict column. Adopt
 regularly and each update stays small.

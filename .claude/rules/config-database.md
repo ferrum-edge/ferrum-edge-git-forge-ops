@@ -16,10 +16,12 @@ paths:
 This repository has no configuration database. It assembles repository YAML, applies overlays,
 and reconciles the result with the companion `ferrum-edge` gateway.
 
-- Follow the [buildout and schema policy](../../CLAUDE.md#buildout-and-schema-policy): there are
-  no users or backward-compatibility requirements for earlier buildout revisions. Update the
-  current schema and fixtures together. If a database is introduced, maintain one complete initial
-  schema during buildout and fold subsequent changes into it.
+- Follow the [compatibility and schema policy](../../CLAUDE.md#compatibility-and-schema-policy):
+  unreleased revisions before the first supported release carry no backward-compatibility
+  requirement; from 1.0.0 onward, configuration and state formats change only compatibly
+  within a major version, and state changes are forward-only migrations. Update the
+  current schema and fixtures together. If a database is introduced, start from one complete
+  initial schema; from 1.0.0 onward its changes are forward-only migrations.
 - Keep the Serde mirror fail-closed for unknown typed fields. Free-form plugin config, credential
   entry values, and mesh-item values round-trip unchanged; credential map keys are the closed
   `KNOWN_CREDENTIAL_TYPES` set. `FERRUM_ALLOW_UNKNOWN_FIELDS=true` permits

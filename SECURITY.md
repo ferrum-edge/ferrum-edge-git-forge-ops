@@ -21,8 +21,21 @@ informed until a fix or a documented decision is published.
 
 ## Supported versions
 
-Only the `main` branch and the most recent published release/container image
-receive security fixes.
+There is no supported GitForgeOps release until the
+[release record](release/baseline.json) says `supported`; until then only the
+`main` branch receives security fixes.
+
+From 1.0.0 onward:
+
+| Version | Security fixes |
+| --- | --- |
+| Latest minor release of the current major line (1.x) | Yes, as a new patch release and container image |
+| Earlier minor releases of the same major line | No; upgrade to the latest minor, which is compatible within the major line by the [release policy](release/README.md#publishing-and-later-changes) |
+| `main` | Yes; fixes land here first, but `main` is not a release |
+| Revisions from before the first supported release | No |
+
+A security fix that cannot be made without an incompatible change is called
+out in its advisory and release note, with the operator action it needs.
 
 ## Scope
 
