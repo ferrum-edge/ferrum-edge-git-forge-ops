@@ -441,17 +441,28 @@ class AgentSetupTests(unittest.TestCase):
             write_valid_setup(root, "opus-agents", claude_mirror=False)
             self.assertEqual(check_agent_setup.collect_violations(root), [])
 
+    def test_accepts_optional_claude_mirror_for_claude_native_launchers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_valid_setup(root, "opus-agents", claude_mirror=True)
+            self.assertEqual(check_agent_setup.collect_violations(root), [])
+
     def test_rejects_unexpected_claude_mirror(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_valid_setup(root, "opus-agents", claude_mirror=False)
-            mirror = root / ".claude" / "skills" / "opus-agents"
+            write_valid_setup(root)
+            mirror = root / ".claude" / "skills" / "orphan-agents"
             mirror.mkdir()
             (mirror / "SKILL.md").write_text(
-                skill_text("opus-agents", claude=True), encoding="utf-8"
+                skill_text("orphan-agents", claude=True), encoding="utf-8"
             )
             violations = check_agent_setup.collect_violations(root)
-        self.assertTrue(any("unexpected Claude mirror" in item for item in violations))
+        self.assertTrue(
+            any(
+                ".claude/skills/orphan-agents: unexpected Claude mirror" in item
+                for item in violations
+            )
+        )
 
     def test_claude_launchers_must_isolate_every_override_and_settings_source(self):
         with tempfile.TemporaryDirectory() as directory:
