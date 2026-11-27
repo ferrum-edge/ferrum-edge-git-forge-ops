@@ -78,7 +78,7 @@ orchestrators share one source of truth.
 Every prompt must also PIN THE WORKER'S ROLE: "YOU are the implementer: complete every assigned task
 and validation in this session. Perform commit, push, PR, review, and CI actions only when this
 prompt assigns them; after the final requested push and report, exit — the controller owns post-push
-CI and review monitoring. Do NOT invoke agent-dispatch skills (muse-agents, sol-agents, opus-agents,
+CI and review monitoring. Do NOT invoke agent-dispatch skills (muse-agents, astra-agents, sol-agents, opus-agents,
 antigravity-neon-agents, .agents/skills/*/scripts/dispatch-agent.sh), do NOT use Antigravity
 subagents, swarms, or browser subagents, and do NOT spawn nested workers."
 

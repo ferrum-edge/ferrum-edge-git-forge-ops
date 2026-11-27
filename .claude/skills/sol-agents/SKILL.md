@@ -95,7 +95,7 @@ Every prompt must also PIN THE WORKER'S ROLE explicitly (the briefs repeat it, b
 what survives a partial brief read): "YOU are the implementer: complete every assigned task and
 validation in this session. Perform commit, push, PR, review, and CI actions only when this prompt
 assigns them; after the final requested push and report, exit — the controller owns post-push CI and
-review monitoring. Do NOT invoke agent-dispatch skills from your environment (opus-agents,
+review monitoring. Do NOT invoke agent-dispatch skills from your environment (astra-agents, opus-agents,
 muse-agents, antigravity-neon-agents, .agents/skills/*/scripts/dispatch-agent.sh, claude CLI
 workers) and do NOT spawn nested workers." The repo intentionally ships mirror skills under
 `.agents/skills/` (codex→Claude/Muse/Gemini dispatch, for when the USER asks codex to

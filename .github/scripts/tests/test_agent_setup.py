@@ -429,19 +429,25 @@ class AgentSetupTests(unittest.TestCase):
             violations, [f"{link}: the tree under review must be a real directory"]
         )
 
-    def test_requires_claude_mirror_except_for_claude_native_launchers(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_valid_setup(root, claude_mirror=False)
-            violations = check_agent_setup.collect_violations(root)
-        self.assertTrue(any("missing required Claude mirror" in item for item in violations))
+    def test_requires_claude_mirror_for_every_skill(self):
+        for name in ("sample", "opus-agents"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_valid_setup(root, name, claude_mirror=False)
+                violations = check_agent_setup.collect_violations(root)
+                self.assertTrue(
+                    any(
+                        f".claude/skills/{name}: missing required Claude mirror" in item
+                        for item in violations
+                    )
+                )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_valid_setup(root, "opus-agents", claude_mirror=False)
+            write_valid_setup(root, "opus-agents")
             self.assertEqual(check_agent_setup.collect_violations(root), [])
 
-    def test_accepts_optional_claude_mirror_for_claude_native_launchers(self):
+    def test_accepts_claude_mirror_for_claude_native_launchers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_valid_setup(root, "opus-agents", claude_mirror=True)
@@ -467,7 +473,7 @@ class AgentSetupTests(unittest.TestCase):
     def test_claude_launchers_must_isolate_every_override_and_settings_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            agent = write_valid_setup(root, "opus-agents", claude_mirror=False)
+            agent = write_valid_setup(root, "opus-agents")
             launcher = agent / "scripts" / "dispatch-agent.sh"
             launcher.write_text(
                 valid_launcher("opus-agents")
