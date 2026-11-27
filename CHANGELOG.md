@@ -267,6 +267,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The `astra-agents` skill (canonical and Claude entrypoints, briefs, Codex
+  `openai.yaml`, `scripts/dispatch-agent.sh` pinned to `gpt-6.2-astra` with
+  `medium`/`high`/`xhigh` effort and opt-in fast mode, and a fake-Codex
+  `test_dispatch.py`), derived from this repository's hardened `sol-agents`
+  launcher. Every dispatch-prohibition list in the agent skills and briefs now
+  names `astra-agents`.
+- A `.claude/skills/opus-agents` Claude entrypoint, so Claude orchestrators can
+  dispatch standalone Claude Code Opus 5.5 1M workers through the shared
+  launcher. `check_agent_setup.py` now requires a Claude mirror for every
+  canonical skill (`CLAUDE_MIRROR_EXCEPTIONS` is empty), with updated tests.
 - The `antigravity-neon-agents` skill (canonical and Claude entrypoints,
   briefs, agent metadata and launcher) dispatches Gemini 4 Neon
   (`gemini-4-neon`) workers through the standalone Google Antigravity `agy`

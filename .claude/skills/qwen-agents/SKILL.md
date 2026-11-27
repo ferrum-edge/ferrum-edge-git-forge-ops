@@ -77,7 +77,7 @@ Every prompt must also PIN THE WORKER'S ROLE: "YOU are the implementer: complete
 and validation in this session. Perform commit, push, PR, review, and CI actions only when this
 prompt assigns them; after the final requested push and report, exit — the controller owns post-push
 CI and review monitoring. Do NOT invoke agent-dispatch skills (qwen-agents, deepseek-flash-agents,
-muse-agents, sol-agents, opus-agents, antigravity-neon-agents,
+muse-agents, astra-agents, sol-agents, opus-agents, antigravity-neon-agents,
 .agents/skills/*/scripts/dispatch-agent.sh) and do NOT spawn nested workers."
 
 Then append the mode block:

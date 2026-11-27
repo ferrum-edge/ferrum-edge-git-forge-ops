@@ -114,8 +114,9 @@ output, ignores user/project/local settings, and closes stdin at the prompt file
 Pass `--model 'opus[1m]'` only for an explicit rolling-latest request. Delete the temporary prompt
 after the worker finishes.
 
-This skill is intentionally Codex-orchestrator-only. Claude-side sessions already have native
-Claude workers, so `.claude/skills/` does not mirror this wrapper.
+Claude orchestrators use the same launcher through the `.claude/skills/opus-agents` mirror when
+the user wants separate Opus CLI workers with a pinned model, effort, and worktree rather than
+Claude Code's built-in subagents.
 
 Start every worker in its own long-lived execution session and retain the exact session handle
 or PID. Prefer one tool call per worker so completions and failures remain attributable. Never
@@ -133,7 +134,7 @@ not stop at analysis, partial implementation, or a handoff for someone else to f
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including sol-agents, opus-agents, muse-agents, antigravity-neon-agents, or any
+skills or scripts (including astra-agents, sol-agents, opus-agents, muse-agents, antigravity-neon-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 

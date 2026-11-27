@@ -124,7 +124,7 @@ not stop at analysis, partial implementation, or a handoff for someone else to f
 commit, push, PR, review, and CI actions only when the prompt assigns them. Do not request or wait
 for a separate review-bot pass unless explicitly assigned. After the final requested push and
 report, exit; the controller owns post-push CI and review monitoring. Do not invoke agent-dispatch
-skills or scripts (including sol-agents, opus-agents, muse-agents, antigravity-neon-agents, or any
+skills or scripts (including astra-agents, sol-agents, opus-agents, muse-agents, antigravity-neon-agents, or any
 .agents/skills/*/scripts/dispatch-agent.sh), and do not spawn nested workers.
 ```
 
