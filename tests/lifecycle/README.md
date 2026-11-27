@@ -74,11 +74,11 @@ qualify it, including the CLI's namespace and credential checks. This
 qualification also covers the gateway's backup and consumer representations.
 The consumer-verification and coherent replacement scenarios target published
 Edge v0.9.21 at `f9915358c8032214f4034a17c28cdf72d14006c3`, with the exact approved
-x86_64 binary recorded in `release/baseline.json`. Hosted qualification of this
-client revision against those bytes remains required. No scenario is skipped to
-make an older pin pass.
-The first-release record stays pending until its lifecycle and external acceptance
-gates are complete.
+x86_64 binary recorded in `release/baseline.json`. The release gate requires
+hosted qualification of the exact client revision against those bytes. No
+scenario is skipped to make an older pin pass. A release's record in
+`release/records/` is written only after its lifecycle and external acceptance
+gates pass, and links that evidence.
 
 The Python harness checks its admin and data-plane URLs before use and sends
 credentials only over HTTPS or HTTP to literal loopback IPs (`127.0.0.0/8`,

@@ -19,9 +19,20 @@ check_release_baseline = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = check_release_baseline
 SPEC.loader.exec_module(check_release_baseline)
 
-RECORD = json.loads((ROOT / "release/baseline.json").read_text(encoding="utf-8"))
+# The live record may be in any valid state: a pending candidate with no
+# records, a finalized first release, a pending patch on top of finalized
+# releases, or a finalized patch. Every test except the live-tree one starts
+# from the same normalized state, the live candidate as a pending release with
+# no records, so the suite passes in each of them.
+LIVE = json.loads((ROOT / "release/baseline.json").read_text(encoding="utf-8"))
+RECORD = json.loads(json.dumps(LIVE))
+RECORD["status"] = "pending"
+RECORD["gitforgeops"]["source_sha"] = None
+RECORD["gitforgeops"]["image_digest"] = None
+RECORD["lifecycle"]["run_url"] = None
 NOTES = check_release_baseline.notes_path(RECORD)
 EDGE_VERSION = RECORD["validator"]["version"]
+UPSTREAM_RECORDS = check_release_baseline.UPSTREAM_RECORDS
 
 INPUTS = (
     "Cargo.toml",
@@ -36,6 +47,8 @@ INPUTS = (
     "contracts/ferrum-contracts/PIN",
     "src/config/edge_version.rs",
     "release/records/README.md",
+    # Every committed release's notes; finalized records need theirs.
+    *sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "release").glob("notes-*.md")),
 )
 TAG = RECORD["gitforgeops"]["tag"]
 RUN_URL = "https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/actions/runs/123"
@@ -51,10 +64,29 @@ class ReleaseBaselineTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for relative in INPUTS:
+        for relative in dict.fromkeys(INPUTS):
             target = self.root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / relative, target)
+        # Normalize to "pending candidate, no records": the README milestone
+        # is then the candidate itself.
+        self.write_record(RECORD)
+        readme = self.root / "README.md"
+        readme.write_text(
+            re.sub(
+                r"First supported baseline: \[v[0-9.]+\]\(release/README\.md\)",
+                f"First supported baseline: [{TAG}](release/README.md)",
+                readme.read_text(encoding="utf-8"),
+            ),
+            encoding="utf-8",
+        )
+
+    def test_the_live_tree_is_consistent(self):
+        # Whatever state upstream is in (see the module comment), it is valid.
+        self.assertEqual(check_release_baseline.check(ROOT), [])
+        for record in sorted((ROOT / "release/records").glob("*.json")):
+            with self.subTest(record=record.name):
+                self.assertTrue((ROOT / f"release/notes-{record.stem}.md").is_file())
 
     def record(self):
         return json.loads((self.root / "release/baseline.json").read_text())
@@ -101,8 +133,8 @@ class ReleaseBaselineTests(unittest.TestCase):
         quickstart = self.root / "docs/quickstart.md"
         text = quickstart.read_text(encoding="utf-8")
         changed = text.replace(
-            f"Release baseline: [{TAG}](../release/README.md)",
-            f"Release baseline: [v{version}](../release/README.md)",
+            f"Release baseline: [{TAG}]({UPSTREAM_RECORDS}/{TAG}.json)",
+            f"Release baseline: [v{version}]({UPSTREAM_RECORDS}/v{version}.json)",
         )
         self.assertNotEqual(changed, text)
         quickstart.write_text(changed, encoding="utf-8")
@@ -149,6 +181,76 @@ class ReleaseBaselineTests(unittest.TestCase):
             check_release_baseline.check(self.root),
             [f"README Development status must link to the first supported baseline {TAG}"],
         )
+
+    def test_every_release_state_is_consistent(self):
+        # Pending candidate, no records (the normalized state).
+        self.assertEqual(check_release_baseline.check(self.root), [])
+        # Finalized first release: supported baseline plus its record.
+        first = self.finalized()
+        self.write_record(first)
+        self.write_finalized(first)
+        self.assertEqual(check_release_baseline.check(self.root), [])
+        # Pending patch on top of the finalized release.
+        candidate = self.prepare_next_patch()
+        self.assertEqual(check_release_baseline.check(self.root), [])
+        # Finalized patch: the milestone stays the first release.
+        patch = self.record()
+        patch["status"] = "supported"
+        patch["gitforgeops"]["source_sha"] = "c" * 40
+        patch["gitforgeops"]["image_digest"] = "sha256:" + "d" * 64
+        patch["lifecycle"]["run_url"] = RUN_URL + "9"
+        self.write_record(patch)
+        self.write_finalized(patch)
+        self.assertEqual(check_release_baseline.check(self.root), [])
+        self.assertTrue((self.root / f"release/records/{candidate}.json").is_file())
+        self.assertTrue((self.root / f"release/records/{TAG}.json").is_file())
+
+    def test_the_quickstart_describes_the_candidate_not_the_milestone(self):
+        candidate = self.prepare_next_patch()
+        quickstart = self.root / "docs/quickstart.md"
+        text = quickstart.read_text(encoding="utf-8")
+        quickstart.write_text(
+            text.replace(
+                f"Release baseline: [{candidate}]({UPSTREAM_RECORDS}/{candidate}.json)",
+                f"Release baseline: [{TAG}]({UPSTREAM_RECORDS}/{TAG}.json)",
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            check_release_baseline.check(self.root),
+            ["quickstart must name and link the record of the release it describes"],
+        )
+
+    def test_the_published_tag_must_be_the_candidate(self):
+        self.assertEqual(check_release_baseline.check(self.root, release_ref=TAG), [])
+        major, minor, patch = (int(part) for part in TAG[1:].split("."))
+        for ref in (f"v{major}.{minor}.{patch + 1}", TAG[1:], f"{TAG}-rc.1"):
+            with self.subTest(ref=ref):
+                self.assertEqual(
+                    check_release_baseline.check(self.root, release_ref=ref),
+                    [
+                        f"the pushed tag {ref} must equal release/baseline.json's "
+                        f"gitforgeops.tag {TAG} and v + the Cargo version {TAG}"
+                    ],
+                )
+
+    def test_main_reads_the_published_tag_from_the_actions_ref(self):
+        for ref, expected in (
+            (f"refs/tags/{TAG}", TAG),
+            ("refs/heads/main", None),
+            ("refs/pull/7/merge", None),
+            ("", None),
+        ):
+            with self.subTest(ref=ref):
+                previous = os.environ.get("GITHUB_REF")
+                os.environ["GITHUB_REF"] = ref
+                try:
+                    self.assertEqual(check_release_baseline.published_tag(), expected)
+                finally:
+                    if previous is None:
+                        os.environ.pop("GITHUB_REF", None)
+                    else:
+                        os.environ["GITHUB_REF"] = previous
 
     def test_a_published_release_cannot_be_reopened_as_pending(self):
         self.write_finalized(self.finalized())

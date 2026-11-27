@@ -339,10 +339,13 @@ using GET only. No consumer to probe means unknown, never pass. A missing
 capability refuses the operation that needs it. Ordinary diff, plan, review and
 viewer drift reads retain their current endpoints and explain these runtime
 requirements. The conditional API owner contract was published at Edge
-`c764084b3b51c3f7ffde268c039688d35e49c553`. The current candidate gateway is
-published v0.9.21, with exact binary and image pins in the
-[pending release record](../release/baseline.json); GitForgeOps enforcement
-qualification against those bytes remains required before release acceptance.
+`c764084b3b51c3f7ffde268c039688d35e49c553`. The paired gateway is published
+v0.9.21, with exact binary and image pins in the
+[release baseline](../release/baseline.json). The release gate requires
+GitForgeOps enforcement qualification against those bytes; each published
+release's record in
+[`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+on upstream `main` links that evidence.
 Edge operator changes to review:
 [v0.9.15](https://github.com/ferrum-edge/ferrum-edge/blob/v0.9.15/docs/upgrade_guide.md#upgrading-to-0915)
 (external identity headers; plugin-config environment references only under
