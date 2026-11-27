@@ -1263,8 +1263,8 @@ A new upstream release therefore changes nothing by itself.
 - It holds `contents: read` and `issues: write`, and never touches a deployment
   environment or gateway credential.
 
-The same workflow's weekly `edge-main-drift` job (cron `17 6 * * 1`, or
-`workflow_dispatch` with `check: edge-main`) checks this repository against
+The weekly `edge-main-drift.yml` workflow (cron `17 6 * * 1`, `workflow_dispatch`,
+and pull requests that change it or its comparison test) checks this repository against
 unreleased Ferrum Edge `main` (ferrum-contracts#76). It runs a binary copied
 from Edge's signed `main` image, never an allowlisted one, so it holds only
 `contents: read` and binds no environment or secret. Its findings, and a
