@@ -140,10 +140,10 @@ pub struct EnvConfig {
     pub mesh_file_output_path: String,
     /// Path to the `ferrum-edge` binary for validation.
     pub edge_binary_path: String,
-    /// Paired Ferrum Edge release version (`FERRUM_EDGE_VERSION`, e.g. `v0.9.20`
-    /// or `v0.9.21`), used as fallback when `.gitforgeops/config.yaml` leaves
+    /// Paired Ferrum Edge release version (`FERRUM_EDGE_VERSION`, e.g. `v0.9.21`
+    /// or `v0.9.20`), used as fallback when `.gitforgeops/config.yaml` leaves
     /// `edge_version` unset. `None` defaults to [`super::edge_version::DEFAULT_EDGE_VERSION`]
-    /// (`v0.9.20`).
+    /// (the pinned `v0.9.21`).
     pub edge_version: Option<EdgeVersion>,
     /// Skip TLS certificate verification when talking to the gateway.
     ///
@@ -388,7 +388,7 @@ impl Default for EnvConfig {
 /// | `FERRUM_FILE_OUTPUT_PATH`    | `file_output_path` | `./assembled/resources.yaml`     |
 /// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
-/// | `FERRUM_EDGE_VERSION`        | `edge_version`     | `None` (defaults to `v0.9.20` baseline) |
+/// | `FERRUM_EDGE_VERSION`        | `edge_version`     | `None` (defaults to the pinned `v0.9.21`) |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
 /// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (`verify` refuses to run declared checks); `http://` only to a literal loopback IP |
 /// | `FERRUM_VERIFY_PROBE_CONSUMERS` | `verify_probe_consumers` | unset (`verify` refuses every check that sends a slot) |

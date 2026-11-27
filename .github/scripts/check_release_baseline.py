@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Check the committed release pairing against source, docs, and pins."""
+"""Check the committed release pairing against source, docs, and pins.
+
+Everything version-specific is derived from `release/baseline.json`: the
+release notes file is `release/notes-<gitforgeops.tag>.md`, and the paired
+Ferrum Edge version is `validator.version`. That version must be a plain
+`vMAJOR.MINOR.PATCH` tag and must agree with every other place the pairing is
+recorded (the allowlist line approving the pinned digest, the Dockerfile
+gateway stage, the vendored contracts PIN, the CLI's `DEFAULT_EDGE_VERSION`,
+the release notes and the release README), so moving the pin is one reviewed
+change that cannot leave a stale copy behind.
+"""
 
 from __future__ import annotations
 
@@ -19,19 +29,66 @@ RUN_URL = re.compile(
 
 
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+RELEASE_TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
+DEFAULT_EDGE_VERSION = re.compile(
+    r"pub const DEFAULT_EDGE_VERSION: EdgeVersion = EdgeVersion::new\("
+    r"(?P<major>[0-9]+), (?P<minor>[0-9]+), (?P<patch>[0-9]+)\);"
+)
+
+
+def notes_path(record: object) -> str | None:
+    """The release notes file the record's GitForgeOps tag names."""
+    if not isinstance(record, dict):
+        return None
+    engine = record.get("gitforgeops")
+    tag = engine.get("tag") if isinstance(engine, dict) else None
+    if not isinstance(tag, str) or not RELEASE_TAG.fullmatch(tag):
+        return None
+    return f"release/notes-{tag}.md"
+
+
+def allowlist_releases(policy: str, digest: str, asset: str) -> list[str]:
+    """The `release <tag>` notes on every allowlist line approving `digest`."""
+    releases = []
+    for line in policy.splitlines():
+        record, _, note = line.partition("#")
+        if record.strip() != f"{digest}  {asset}":
+            continue
+        words = note.split()
+        releases.extend(
+            words[index + 1]
+            for index, word in enumerate(words[:-1])
+            if word == "release"
+        )
+    return releases
+
+
+def pin_edge_version(pin: str) -> str | None:
+    for line in pin.splitlines():
+        if line.startswith("edge_version="):
+            return line.removeprefix("edge_version=")
+    return None
 
 
 def check(root: Path) -> list[str]:
     issues: list[str] = []
     try:
         record = json.loads((root / "release/baseline.json").read_text(encoding="utf-8"))
+        notes_file = notes_path(record)
+        if notes_file is None:
+            return ["release/baseline.json must name a vMAJOR.MINOR.PATCH gitforgeops.tag"]
         cargo = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
         readme = (root / "README.md").read_text(encoding="utf-8")
         quickstart = (root / "docs/quickstart.md").read_text(encoding="utf-8")
-        notes = (root / "release/notes-v0.1.0.md").read_text(encoding="utf-8")
+        notes = (root / notes_file).read_text(encoding="utf-8")
+        release_readme = (root / "release/README.md").read_text(encoding="utf-8")
         policy = (root / ".github/ferrum-edge-checksums.txt").read_text(encoding="utf-8")
         dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
         workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        contracts_pin = (root / "contracts/ferrum-contracts/PIN").read_text(encoding="utf-8")
+        edge_version_source = (root / "src/config/edge_version.rs").read_text(
+            encoding="utf-8"
+        )
     except (OSError, ValueError) as error:
         return [f"release baseline input cannot be read: {error}"]
 
@@ -77,8 +134,39 @@ def check(root: Path) -> list[str]:
         for line in policy.splitlines()
     ):
         issues.append("validator SHA-256 must appear in the checked-in allowlist")
-    if validator.get("version") != "v0.9.20":
-        issues.append("the first baseline must name the verified v0.9.20 validator")
+    edge_version = validator.get("version")
+    if not isinstance(edge_version, str) or not RELEASE_TAG.fullmatch(edge_version):
+        issues.append("validator version must be a vMAJOR.MINOR.PATCH Ferrum Edge release tag")
+    else:
+        # The digest must be the one the allowlist approved for this release,
+        # so a former pairing's digest cannot certify a new version (or the
+        # reverse).
+        if isinstance(pin, str) and isinstance(asset, str):
+            releases = allowlist_releases(policy, pin, asset)
+            if releases and edge_version not in releases:
+                issues.append(
+                    f"the allowlist approves the validator SHA-256 for release "
+                    f"{', '.join(releases)}, not {edge_version}"
+                )
+            elif not releases and any(
+                line.split("#", 1)[0].strip() == f"{pin}  {asset}"
+                for line in policy.splitlines()
+            ):
+                issues.append(
+                    f"the allowlist line approving the validator SHA-256 must note "
+                    f"`release {edge_version}`"
+                )
+        if pin_edge_version(contracts_pin) != edge_version:
+            issues.append("contracts PIN edge_version must match the validator version")
+        default = DEFAULT_EDGE_VERSION.search(edge_version_source)
+        if default is None or (
+            f"v{default['major']}.{default['minor']}.{default['patch']}" != edge_version
+        ):
+            issues.append("DEFAULT_EDGE_VERSION must match the validator version")
+        if f"Ferrum Edge {edge_version}" not in " ".join(notes.split()):
+            issues.append("release notes must name the paired Ferrum Edge version")
+        if f"Ferrum Edge {edge_version}" not in " ".join(release_readme.split()):
+            issues.append("release/README.md must name the paired Ferrum Edge version")
 
     image = gateway.get("image")
     image_digest = gateway.get("image_digest")

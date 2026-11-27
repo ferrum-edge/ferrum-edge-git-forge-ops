@@ -8217,6 +8217,27 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 return workflow.replace(f"uses: {current_pin}", f"uses: {pin}", 1)
         self.fail("security.yml must use the reviewed cargo-audit installer pin")
 
+    def test_installer_must_install_exactly_the_pinned_release(self):
+        # Dropping any pinned-release control reverts the installer towards
+        # "whatever upstream published last", which the checker refuses.
+        for control in (
+            '"$releases_api/tags/$pinned_tag"',
+            ".draft == false and .prerelease == false",
+            '"$actual_sha256" != "$pinned_sha256"',
+        ):
+            with self.subTest(control=control), tempfile.TemporaryDirectory() as directory:
+                root = self._mirror_repo(Path(directory))
+                installer = root / ".github/scripts/install-ferrum-edge.sh"
+                original = installer.read_text(encoding="utf-8")
+                self.assertIn(control, original)
+                installer.write_text(original.replace(control, "removed"), encoding="utf-8")
+                violations = self._violations(root)
+                self.assertIn(
+                    "install-ferrum-edge.sh: missing required validator installer control "
+                    f"{control!r}",
+                    violations,
+                )
+
     def _mirror_repo(self, root: Path) -> Path:
         """Copy the policy-relevant tree so a test can mutate one file.
 

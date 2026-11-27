@@ -7368,6 +7368,14 @@ def main(argv: list[str] | None = None) -> int:
         '"$releases_api?per_page=5"',
         "select(.name == $name)",
         "install -m 0755",
+        # Exactly the release the baseline pins, never "latest": the tag and
+        # digest come from release/baseline.json, the tag must be a published
+        # non-prerelease release, and the bytes must match the pinned digest.
+        "release/baseline.json",
+        '"$releases_api/tags/$pinned_tag"',
+        ".draft == false and .prerelease == false",
+        "pinned_sha256",
+        '"$actual_sha256" != "$pinned_sha256"',
     ):
         if required not in installer:
             violations.append(

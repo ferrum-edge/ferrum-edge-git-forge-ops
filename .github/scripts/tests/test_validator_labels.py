@@ -173,19 +173,43 @@ class ValidatorLabelsTests(unittest.TestCase):
         # `success() && ...`, so a failed install followed by a failed refresh
         # would skip both the tracking issue and the final failure.
         workflow = (ROOT / ".github/workflows/validator-pin-canary.yml").read_text()
-        condition = (
-            "if: ${{ !cancelled() && (steps.install.outputs.status != '0' || "
-            "steps.verify.outputs.status != '0') }}"
+        broken = (
+            "!cancelled() && (steps.install.outputs.status != '0' || "
+            "steps.verify.outputs.status != '0'"
         )
-        for name in (
-            "Open or update the tracking issue",
-            "Fail when the validator pairing is invalid",
+        for name, condition in (
+            (
+                "Open or update the tracking issue",
+                f"if: ${{{{ {broken} || steps.newer.outputs.tag != '') }}}}",
+            ),
+            (
+                "Fail when the validator pairing is invalid",
+                f"if: ${{{{ {broken}) }}}}",
+            ),
         ):
             with self.subTest(step=name):
                 step = workflow.split(f"      - name: {name}\n", 1)[1].split(
                     "\n      - name:", 1
                 )[0]
                 self.assertIn(condition, step)
+
+    def test_canary_reports_a_newer_release_without_failing_or_installing_it(self):
+        workflow = (ROOT / ".github/workflows/validator-pin-canary.yml").read_text()
+        newer = workflow.split("      - name: Check for a newer upstream release\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        self.assertIn("if: ${{ !cancelled() }}", newer)
+        self.assertIn("refresh-ferrum-edge-pin.sh --newest", newer)
+        self.assertIn('refresh-ferrum-edge-pin.sh --release "$newest"', newer)
+        self.assertIn(".validator.version", newer)
+        self.assertNotIn("install-ferrum-edge.sh", newer)
+        fail = workflow.split("      - name: Fail when the validator pairing is invalid\n", 1)[1]
+        self.assertNotIn("steps.newer", fail.split("\n      - name:", 1)[0])
+        close = workflow.split("      - name: Close a resolved tracking issue\n", 1)[1].split(
+            "\n      - name:", 1
+        )[0]
+        self.assertIn("steps.newer.outputs.lookup == 'ok'", close)
+        self.assertIn("steps.newer.outputs.tag == ''", close)
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ pub struct AssembledOutput {
     /// overlays and namespace selection.
     pub namespace_scope: super::namespace_guard::NamespaceScope,
     /// Proxy fields omitted for the paired Ferrum Edge version (for example
-    /// `pool_max_requests_per_connection` on `>= v0.9.21`). Empty on v0.9.20
+    /// `pool_max_requests_per_connection` on `>= v0.9.21`, the default). Empty on v0.9.20
     /// and when assembly runs without a target pairing.
     pub omitted_proxy_fields: Vec<super::edge_version::OmittedProxyField>,
 }

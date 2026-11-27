@@ -75,9 +75,9 @@ fn string_set<'a>(values: impl Iterator<Item = &'a str>) -> BTreeSet<String> {
 #[test]
 fn vendored_contract_files_match_the_pin_hashes() {
     let (tag, commit, edge_version, hashes) = parse_pin();
-    assert_eq!(tag, "contracts-edge-0.9.20");
-    assert_eq!(commit, "39da322083044c2e92617209e62983c92387f0ad");
-    assert_eq!(edge_version, "v0.9.20");
+    assert_eq!(tag, "contracts-edge-0.9.21");
+    assert_eq!(commit, "92d8da5be93ea1ece9f47729b1f7aa10ae8a7c3f");
+    assert_eq!(edge_version, "v0.9.21");
 
     let mut vendored = BTreeSet::new();
     contract_files(&contract_dir(), &contract_dir(), &mut vendored);
@@ -322,21 +322,44 @@ fn the_strict_loader_refuses_envelope_keys_outside_the_contract() {
     }
 }
 
-/// `contracts-edge-0.9.20` publishes an open envelope (no top-level
-/// `additionalProperties: false`), which admits the keys the loader refuses
-/// above (ferrum-contracts#73). Any later pin must close it: re-pinning to a
-/// release whose envelope is still open fails here, so the schema and the
-/// loader can only diverge on the release already vendored.
+/// `contracts-edge-0.9.20` published an open envelope (no top-level
+/// `additionalProperties: false`) that admitted the keys the loader refuses
+/// above (ferrum-contracts#73). `contracts-edge-0.9.21` closes it: no wrapper
+/// key beyond `kind`, `spec` and `id`, and `id` only on a MeshConfig. Re-pinning
+/// to a release whose envelope is open again fails here, so the schema a
+/// producer validates against can never admit what the loader refuses.
 #[test]
-fn a_repinned_contract_must_close_the_resource_envelope() {
-    let (tag, _, _, _) = parse_pin();
+fn the_pinned_contract_closes_the_resource_envelope() {
     let schema = json("schemas/gitforgeops-resource/v1.schema.json");
-    if schema.get("additionalProperties") != Some(&Value::Bool(false)) {
-        assert_eq!(
-            tag, "contracts-edge-0.9.20",
-            "the pinned gitforgeops-resource envelope admits wrapper keys the strict loader \
-             refuses; pin a contracts release that closes it"
-        );
+    assert_eq!(
+        schema.get("additionalProperties"),
+        Some(&Value::Bool(false)),
+        "the pinned gitforgeops-resource envelope admits wrapper keys the strict loader refuses"
+    );
+    let id_only_on_mesh = schema["allOf"]
+        .as_array()
+        .expect("schema allOf array")
+        .iter()
+        .any(|rule| {
+            rule["if"]["required"] == serde_json::json!(["id"])
+                && rule["then"]["properties"]["kind"]["const"] == "MeshConfig"
+        });
+    assert!(
+        id_only_on_mesh,
+        "the pinned envelope must admit `id` only on a MeshConfig"
+    );
+    // The fixtures that pin the closure ship with the release and are
+    // vendored: the strict loader refuses each of them above.
+    let invalid: BTreeSet<String> = resource_fixtures("invalid")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    for name in [
+        "proxy-unknown-wrapper-key.json",
+        "proxy-with-id.json",
+        "upstream-null-id.json",
+    ] {
+        assert!(invalid.contains(name), "missing envelope fixture {name}");
     }
 }
 

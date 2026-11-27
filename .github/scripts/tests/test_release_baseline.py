@@ -17,15 +17,22 @@ check_release_baseline = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = check_release_baseline
 SPEC.loader.exec_module(check_release_baseline)
 
+RECORD = json.loads((ROOT / "release/baseline.json").read_text(encoding="utf-8"))
+NOTES = check_release_baseline.notes_path(RECORD)
+EDGE_VERSION = RECORD["validator"]["version"]
+
 INPUTS = (
     "Cargo.toml",
     "README.md",
     "docs/quickstart.md",
     "release/baseline.json",
-    "release/notes-v0.1.0.md",
+    "release/README.md",
+    NOTES,
     ".github/ferrum-edge-checksums.txt",
     ".github/workflows/release.yml",
     "Dockerfile",
+    "contracts/ferrum-contracts/PIN",
+    "src/config/edge_version.rs",
 )
 
 
@@ -97,10 +104,13 @@ class ReleaseBaselineTests(unittest.TestCase):
         record["validator"]["version"] = "v0.9.14"
         self.write_record(record)
         issues = check_release_baseline.check(self.root)
+        self.assertIn("validator and tested gateway versions must agree", issues)
         self.assertIn(
-            "the first baseline must name the verified v0.9.20 validator",
+            f"the allowlist approves the validator SHA-256 for release {EDGE_VERSION}, "
+            "not v0.9.14",
             issues,
         )
+        self.assertIn("contracts PIN edge_version must match the validator version", issues)
 
     def test_docs_and_cargo_version_drift_are_rejected(self):
         cargo = self.root / "Cargo.toml"
@@ -123,9 +133,81 @@ class ReleaseBaselineTests(unittest.TestCase):
         (self.root / "Dockerfile").write_text(
             f"FROM ferrumedge/ferrum-edge:v0.9.19@{previous_image} AS ferrum-edge\n"
         )
+        # The former pairing is internally consistent (allowlist note,
+        # Dockerfile), but the contracts pin, the CLI default and the docs all
+        # name the current pairing, so it cannot certify a release.
         self.assertEqual(
             check_release_baseline.check(self.root),
-            ["the first baseline must name the verified v0.9.20 validator"],
+            [
+                "contracts PIN edge_version must match the validator version",
+                "DEFAULT_EDGE_VERSION must match the validator version",
+                "release notes must name the paired Ferrum Edge version",
+                "release/README.md must name the paired Ferrum Edge version",
+            ],
+        )
+
+    def test_release_notes_file_follows_the_recorded_tag(self):
+        self.assertEqual(NOTES, f"release/notes-{RECORD['gitforgeops']['tag']}.md")
+        (self.root / NOTES).unlink()
+        issues = check_release_baseline.check(self.root)
+        self.assertEqual(len(issues), 1, issues)
+        self.assertIn("release baseline input cannot be read", issues[0])
+
+        record = self.record()
+        record["gitforgeops"]["tag"] = "v1.0.0-rc.1"
+        self.write_record(record)
+        self.assertEqual(
+            check_release_baseline.check(self.root),
+            ["release/baseline.json must name a vMAJOR.MINOR.PATCH gitforgeops.tag"],
+        )
+
+    def test_edge_version_must_be_a_plain_release_tag(self):
+        for version in ("latest", f"{EDGE_VERSION}-rc.1", EDGE_VERSION.removeprefix("v")):
+            with self.subTest(version=version):
+                record = self.record()
+                record["validator"]["version"] = version
+                record["tested_gateway"]["version"] = version
+                self.write_record(record)
+                issues = check_release_baseline.check(self.root)
+                self.assertIn(
+                    "validator version must be a vMAJOR.MINOR.PATCH Ferrum Edge release tag",
+                    issues,
+                )
+
+    def test_every_pairing_copy_must_follow_the_baseline(self):
+        for relative, needle in (
+            ("contracts/ferrum-contracts/PIN", f"edge_version={EDGE_VERSION}"),
+            ("src/config/edge_version.rs", "pub const DEFAULT_EDGE_VERSION"),
+            (NOTES, f"Ferrum Edge {EDGE_VERSION}"),
+            ("release/README.md", f"Ferrum Edge {EDGE_VERSION}"),
+        ):
+            with self.subTest(relative=relative):
+                path = self.root / relative
+                original = path.read_text(encoding="utf-8")
+                self.assertIn(needle, original)
+                path.write_text(original.replace(needle, "stale"), encoding="utf-8")
+                self.assertEqual(len(check_release_baseline.check(self.root)), 1)
+                path.write_text(original, encoding="utf-8")
+        self.assertEqual(check_release_baseline.check(self.root), [])
+
+    def test_allowlist_line_must_name_the_pinned_release(self):
+        policy = self.root / ".github/ferrum-edge-checksums.txt"
+        pin = self.record()["validator"]["sha256"]
+        lines = policy.read_text(encoding="utf-8").splitlines(keepends=True)
+        changed = [
+            f"{pin}  ferrum-edge-linux-x86_64  # reviewed\n"
+            if line.startswith(f"{pin} ")
+            else line
+            for line in lines
+        ]
+        self.assertNotEqual(changed, lines)
+        policy.write_text("".join(changed), encoding="utf-8")
+        self.assertEqual(
+            check_release_baseline.check(self.root),
+            [
+                "the allowlist line approving the validator SHA-256 must note "
+                f"`release {EDGE_VERSION}`"
+            ],
         )
 
     def test_quickstart_must_require_a_supported_record(self):

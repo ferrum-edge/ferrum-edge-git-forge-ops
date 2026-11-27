@@ -3374,7 +3374,7 @@ fn import_refuses_a_rendered_resource_over_the_loader_size_cap() {
     );
 }
 
-/// `external_identity` / `external_identity_authority` (Edge after v0.9.20)
+/// `external_identity` / `external_identity_authority` (Edge v0.9.21 and later)
 /// are modeled `PluginTriggerMatch` predicates: a backup carrying them is not
 /// an unmodeled nested field, imports with no acknowledgement flag, and the
 /// written tree loads under the strict loader.

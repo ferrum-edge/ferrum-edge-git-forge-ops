@@ -230,7 +230,7 @@ fn newest_allowlisted_edge_release() -> String {
 fn version_aware_retained_fields(struct_name: &str) -> BTreeSet<String> {
     let mut retained = BTreeSet::new();
     if struct_name == "Proxy" {
-        // Retained for `< v0.9.21` pairings (default v0.9.20 baseline);
+        // Retained for explicit `< v0.9.21` pairings (the default is v0.9.21);
         // removed in Edge v0.9.21 (`ferrum-edge#7218`) and omitted from desired
         // state on `>= v0.9.21` (#739).
         retained.insert(gitforgeops::config::POOL_MAX_REQUESTS_FIELD.to_string());

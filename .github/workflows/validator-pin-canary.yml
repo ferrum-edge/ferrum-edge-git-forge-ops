@@ -1,11 +1,14 @@
 name: GitForgeOps Validator Pin Canary
 
 # Upstream ferrum-edge publishes production artifacts only for version tags.
-# Assets on a given tag are immutable; a new version tag is a new candidate, so
-# the reviewed digest allowlist goes stale when a new version is published
-# rather than on a rolling rebuild. This canary notices that the same day
-# instead of when the next pull request fails, and it hands a maintainer the
-# exact reviewed line to commit.
+# Assets on a given tag are immutable; a new version tag is a new candidate.
+# Every workflow installs exactly the release release/baseline.json pins, so a
+# new upstream release never breaks validation by itself. This canary checks
+# daily that the pinned build still installs (publisher checksum, baseline
+# digest and reviewed allowlist agree) and accepts resource labels, and it
+# reports when Ferrum Edge has published a newer release than the pin, handing
+# a maintainer the exact reviewed allowlist line for it. Moving the pin is a
+# reviewed change to the allowlist and release/baseline.json together.
 #
 # The weekly `edge-main-drift` job is the forward-looking half of the same
 # pairing check (ferrum-edge/ferrum-contracts#76): it runs the validator and
@@ -86,7 +89,7 @@ jobs:
             "$RUNNER_TEMP/validator-canary/ferrum-edge" || status=$?
           echo "status=$status" >>"$GITHUB_OUTPUT"
 
-      - name: Compute the current upstream allowlist line
+      - name: Compute the pinned allowlist line
         id: refresh
         if: steps.install.outputs.status != '0'
         env:
@@ -100,54 +103,118 @@ jobs:
             echo 'CANARY_EOF'
           } >>"$GITHUB_OUTPUT"
 
+      # Informational: a newer upstream release is reported, never installed.
+      # A failed lookup leaves the tracking issue as it is.
+      - name: Check for a newer upstream release
+        id: newer
+        if: ${{ !cancelled() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          pinned=$(jq -er '.validator.version' release/baseline.json) || pinned=
+          if ! newest=$(bash .github/scripts/refresh-ferrum-edge-pin.sh --newest) || [ -z "$pinned" ]; then
+            echo "lookup=failed" >>"$GITHUB_OUTPUT"
+            echo "tag=" >>"$GITHUB_OUTPUT"
+            echo "::warning::The newest published Ferrum Edge release could not be compared with the pin."
+            exit 0
+          fi
+          echo "lookup=ok" >>"$GITHUB_OUTPUT"
+          echo "pinned=$pinned" >>"$GITHUB_OUTPUT"
+          if [ "$newest" = "$pinned" ]; then
+            echo "tag=" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$newest" >>"$GITHUB_OUTPUT"
+          echo "::warning::Ferrum Edge $newest is published; release/baseline.json pins $pinned."
+          line=$(bash .github/scripts/refresh-ferrum-edge-pin.sh --release "$newest") || line=
+          {
+            echo 'line<<CANARY_EOF'
+            printf '%s\n' "$line"
+            echo 'CANARY_EOF'
+          } >>"$GITHUB_OUTPUT"
+
       # `!cancelled()`: without a status function the condition is implicitly
       # `success() && ...`, so a failed refresh after a failed install would
       # skip this step exactly when the pairing is broken.
       - name: Open or update the tracking issue
-        if: ${{ !cancelled() && (steps.install.outputs.status != '0' || steps.verify.outputs.status != '0') }}
+        if: ${{ !cancelled() && (steps.install.outputs.status != '0' || steps.verify.outputs.status != '0' || steps.newer.outputs.tag != '') }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          INSTALL_STATUS: ${{ steps.install.outputs.status }}
+          VERIFY_STATUS: ${{ steps.verify.outputs.status }}
           ALLOWLIST_LINE: ${{ steps.refresh.outputs.line }}
+          PINNED_TAG: ${{ steps.newer.outputs.pinned }}
+          NEWER_TAG: ${{ steps.newer.outputs.tag }}
+          NEWER_LINE: ${{ steps.newer.outputs.line }}
         run: |
           set -euo pipefail
-          cat >issue-body.md <<EOF
-          $ISSUE_MARKER
+          {
+            printf '%s\n\n' "$ISSUE_MARKER"
+            if [ "$INSTALL_STATUS" != '0' ] || [ "$VERIFY_STATUS" != '0' ]; then
+              cat <<EOF
+          ## The pinned validator pairing failed
 
-          The validator pairing check failed: either the reviewed digest
-          allowlist no longer covers the newest published version release, or
+          Either the build release/baseline.json pins no longer installs (the
+          publisher checksum, the baseline digest and the reviewed
+          \`.github/ferrum-edge-checksums.txt\` allowlist must all agree), or
           the verified binary rejected the minimal fixture with labels on all
-          four gateway resource kinds. Assets on a given version tag are
-          immutable; a new version tag is a new candidate, and the allowlist
-          still lists one line per approved build. Every workflow that runs
-          \`ferrum-edge validate\` fails until the allowlist is refreshed. See
-          the canary log for the original diagnostic. Git Forge Ops always
-          emits resource labels and requires a build including ferrum-edge#5483.
+          four gateway resource kinds. Every workflow that runs
+          \`ferrum-edge validate\` fails until this is fixed. See the canary
+          log for the original diagnostic. Git Forge Ops always emits resource
+          labels and requires a build including ferrum-edge#5483.
 
-          When the digest is stale, the candidate line below is computed from
-          the publisher checksum. Review the upstream build before appending
-          it to \`.github/ferrum-edge-checksums.txt\`:
+          When the pinned digest is missing from the allowlist, the line below
+          is computed from the publisher checksum and checked against the
+          baseline digest. Review the upstream build before appending it:
 
           \`\`\`
           $ALLOWLIST_LINE
           \`\`\`
 
           If no line is shown, either installation succeeded but label
-          validation failed, or computing the candidate line failed too (see
-          the canary log). Do not re-approve the same incompatible build; select an
-          upstream build with resource-label support. Regenerate a candidate:
+          validation failed, or computing the line failed too (see the canary
+          log). Do not re-approve the same incompatible build. Regenerate the
+          line with:
 
           \`\`\`bash
           bash .github/scripts/refresh-ferrum-edge-pin.sh --append
           \`\`\`
 
-          Keep previous approved digests. The PR's required static-validation
-          check must also accept the labeled fixture before the new pairing
-          can merge; an allowlist entry alone does not prove compatibility.
-
-          Canary run: $RUN_URL
           EOF
+            fi
+            if [ -n "$NEWER_TAG" ]; then
+              cat <<EOF
+          ## A newer Ferrum Edge release is published
+
+          Ferrum Edge $NEWER_TAG is published; release/baseline.json pins
+          $PINNED_TAG, and every workflow keeps installing exactly the pinned
+          build. Adopting the new release is a reviewed change: append its
+          allowlist line, move \`validator\` and \`tested_gateway\` in
+          release/baseline.json, the Dockerfile gateway stage and the paired
+          contracts together, and qualify the new pairing. Candidate allowlist
+          line, computed from the publisher checksum (empty when that failed):
+
+          \`\`\`
+          $NEWER_LINE
+          \`\`\`
+
+          Regenerate it with:
+
+          \`\`\`bash
+          bash .github/scripts/refresh-ferrum-edge-pin.sh --release $NEWER_TAG --append
+          \`\`\`
+
+          EOF
+            fi
+            echo "Keep previous approved digests. The PR's required static-validation"
+            echo 'check must also accept the labeled fixture before a new pairing'
+            echo 'can merge; an allowlist entry alone does not prove compatibility.'
+            echo
+            echo "Canary run: $RUN_URL"
+          } >issue-body.md
 
           number=$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
             --jq '.[] | select(.pull_request == null) | [.number, .title] | @tsv' \
@@ -158,11 +225,11 @@ jobs:
             echo "::notice::Updated tracking issue #$number."
           else
             gh issue create --repo "$REPO" --title "$ISSUE_TITLE" --body-file issue-body.md
-            echo "::notice::Opened a tracking issue for the stale validator pin."
+            echo "::notice::Opened a tracking issue for the validator pin."
           fi
 
       - name: Close a resolved tracking issue
-        if: steps.install.outputs.status == '0' && steps.verify.outputs.status == '0'
+        if: steps.install.outputs.status == '0' && steps.verify.outputs.status == '0' && steps.newer.outputs.lookup == 'ok' && steps.newer.outputs.tag == ''
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -173,14 +240,14 @@ jobs:
             | awk -F'\t' -v title="$ISSUE_TITLE" '$2 == title { print $1; exit }')
           if [ -n "$number" ]; then
             gh issue close "$number" --repo "$REPO" \
-              --comment 'The reviewed digest resolves and the verified validator accepts resource labels on all four gateway resource kinds.'
+              --comment 'The pinned validator installs, accepts resource labels on all four gateway resource kinds, and is the newest published Ferrum Edge release.'
             echo "::notice::Closed resolved tracking issue #$number."
           fi
 
       - name: Fail when the validator pairing is invalid
         if: ${{ !cancelled() && (steps.install.outputs.status != '0' || steps.verify.outputs.status != '0') }}
         run: |
-          echo "::error::The reviewed validator digest or resource-label compatibility check failed; see the tracking issue."
+          echo "::error::The pinned validator digest or resource-label compatibility check failed; see the tracking issue."
           exit 1
 
   # Every other workflow runs the reviewed release validator from the digest

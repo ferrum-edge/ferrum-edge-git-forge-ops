@@ -864,7 +864,7 @@ fn a_baseline_round_trips_through_a_file_and_rejects_malformed_input() {
     assert!(FingerprintBaseline::from_json(&unknown_field.to_string()).is_err());
 }
 
-/// Ferrum Edge after v0.9.20 keys fingerprints from
+/// Ferrum Edge v0.9.21 and later keys fingerprints from
 /// `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` and uses a random key per
 /// process without it, so a restart (or a replica with another key) changes
 /// the key id and every fingerprint at once. That is unverified, never drift:
@@ -1168,7 +1168,7 @@ fn export_endpoint_debug_redacts_the_gateway_url() {
     assert!(rendered.contains("<redacted>"), "{rendered}");
 }
 
-// --- Edge's widened export projection (after v0.9.20) ----------------------
+// --- Edge v0.9.21's widened export projection --------------------------------
 
 /// Not key material: a label-only PEM frame the TLS-material sweep matches.
 const INLINE_KEY: &str = concat!(
@@ -1177,8 +1177,8 @@ const INLINE_KEY: &str = concat!(
     "PRIVATE KEY-----"
 );
 
-/// A repository with every kind of site Edge's projection on `main` withholds
-/// and v0.9.20 does not: client-presented trigger operands, a custom plugin's
+/// A repository with every kind of site Edge v0.9.21's projection withholds
+/// and v0.9.20's does not: client-presented trigger operands, a custom plugin's
 /// scalar leaves, a new built-in path (`request_termination`
 /// `trigger.header_value`) and inline TLS key material on an Upstream.
 fn widened_desired() -> GatewayConfig {
@@ -1352,7 +1352,7 @@ fn widened_edge_fingerprints_are_uncompared_not_drift() {
 
 #[test]
 fn a_gateway_that_sends_widened_sites_literally_is_compared_as_usual() {
-    // The pinned v0.9.20 does not fingerprint these sites. Predicting them
+    // A v0.9.20 gateway does not fingerprint these sites. Predicting them
     // must neither hide a changed value nor count anything as uncompared.
     let desired = widened_desired();
     let view = widened_export(|_| {})

@@ -37,7 +37,7 @@ impl ResolvedEnv {
     }
 
     /// Effective paired Ferrum Edge release version for this run, defaulting to
-    /// [`DEFAULT_EDGE_VERSION`] (`v0.9.20`) when unset.
+    /// [`DEFAULT_EDGE_VERSION`] (the pinned `v0.9.21`) when unset.
     pub fn effective_edge_version(&self) -> EdgeVersion {
         self.edge_version.unwrap_or(DEFAULT_EDGE_VERSION)
     }
