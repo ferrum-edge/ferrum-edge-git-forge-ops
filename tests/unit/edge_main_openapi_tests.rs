@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use gitforgeops::config::load_resources;
-use gitforgeops::config::schema::Resource;
+use gitforgeops::config::schema::{Proxy, Resource};
 use serde_json::{Map, Value};
 
 /// Printed once the comparison ran, so the workflow can tell a real pass from
@@ -147,6 +147,32 @@ fn undeclared(
     }
 }
 
+/// Wire shapes the companion Proxy does not take on its own: an enum the
+/// mirror serializes as one of several variants is compared in every variant.
+/// The fixture sets the exponential retry backoff; a `retry` block that omits
+/// `backoff` takes the default fixed backoff, which serializes as
+/// `fixed.delay_ms`.
+fn proxy_variant_shapes(emitted: &Value) -> Vec<(String, Value)> {
+    let mut default_backoff = emitted.clone();
+    let retry = default_backoff
+        .get_mut("retry")
+        .and_then(Value::as_object_mut)
+        .expect("the companion Proxy sets a retry block");
+    assert!(
+        retry.remove("backoff").is_some(),
+        "the companion Proxy sets a non-default retry backoff"
+    );
+    let proxy: Proxy =
+        serde_json::from_value(default_backoff).expect("the variant is a valid Proxy");
+    let reemitted = serde_json::to_value(proxy).expect("serialize the variant");
+    assert!(
+        reemitted["retry"]["backoff"].get("fixed").is_some(),
+        "the default retry backoff is the fixed variant: {}",
+        reemitted["retry"]["backoff"]
+    );
+    vec![("Proxy(default retry backoff)".to_string(), reemitted)]
+}
+
 fn names(value: &Value) -> BTreeSet<String> {
     value
         .as_array()
@@ -220,12 +246,18 @@ fn edge_main_openapi_declares_every_field_gitforgeops_emits() {
         let schema = schemas
             .get(kind)
             .unwrap_or_else(|| panic!("openapi.yaml has no {kind} schema"));
-        let mut found = Vec::new();
-        undeclared(schemas, &emitted, schema, kind, &mut found);
-        for path in found {
-            problems.push(format!(
-                "{path}: emitted by GitForgeOps, not declared by Edge main"
-            ));
+        let mut shapes = vec![(kind.to_string(), emitted.clone())];
+        if kind == "Proxy" {
+            shapes.extend(proxy_variant_shapes(&emitted));
+        }
+        for (label, shape) in shapes {
+            let mut found = Vec::new();
+            undeclared(schemas, &shape, schema, &label, &mut found);
+            for path in found {
+                problems.push(format!(
+                    "{path}: emitted by GitForgeOps, not declared by Edge main"
+                ));
+            }
         }
         checked.insert(kind);
     }

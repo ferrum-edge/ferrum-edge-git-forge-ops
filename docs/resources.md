@@ -440,5 +440,17 @@ is refused with an `unknown configuration field(s)` error naming it:
   applied; Ferrum Edge 1.0.0 removes them.
 
 Delete such a field from resources and overlays. A live gateway row that still
-stores one is an unmodeled field: import refuses the source and apply refuses
-to rewrite that row until the value is cleared on the gateway.
+stores one is treated by the existing rules for fields this build does not
+model:
+
+- The two passive-health keys are nested, so the refusal is unconditional:
+  import refuses a source carrying either, and apply refuses to rewrite an
+  upstream that stores one, until the value is cleared on the gateway.
+- `pool_max_requests_per_connection` is a top-level Proxy field, so the
+  version-skew rules in [Supported fields and unknown fields](#supported-fields-and-unknown-fields) apply. By default
+  import refuses it and apply refuses to rewrite a proxy that stores it. Import
+  accepts it with `--accept-unknown-field pool_max_requests_per_connection`
+  and `FERRUM_ALLOW_UNKNOWN_FIELDS=true`, and apply rewrites such a proxy only
+  if the repository declares the field under that flag, which sends it to a
+  gateway that refuses it since v0.9.21. Clearing it on the gateway is the
+  remedy.

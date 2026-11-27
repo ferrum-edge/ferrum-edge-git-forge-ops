@@ -146,20 +146,40 @@ fn parse_pin() -> Pin {
     parse_pin_text(&text).unwrap_or_else(|error| panic!("contracts PIN: {error}"))
 }
 
+/// Every vendored file, root-relative with `/` separators. Only the `PIN` at
+/// the top of the vendored directory is excluded; a nested file named `PIN`
+/// is an ordinary vendored file that needs its own row.
 fn contract_files(root: &Path, directory: &Path, found: &mut BTreeSet<String>) {
     for entry in fs::read_dir(directory).expect("read contract directory") {
         let path = entry.expect("read contract directory entry").path();
         if path.is_dir() {
             contract_files(root, &path, found);
-        } else if path.file_name().and_then(|name| name.to_str()) != Some("PIN") {
-            found.insert(
-                path.strip_prefix(root)
-                    .expect("contract path is under contract root")
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .expect("contract path is under contract root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative != "PIN" {
+            found.insert(relative);
         }
     }
+}
+
+#[test]
+fn only_the_top_level_pin_is_left_out_of_the_tree() {
+    let tree = tempfile::tempdir().expect("temporary contract tree");
+    fs::create_dir_all(tree.path().join("fixtures")).unwrap();
+    fs::write(tree.path().join("PIN"), "tag contracts-edge-7.8.9\n").unwrap();
+    fs::write(tree.path().join("fixtures/PIN"), "{}\n").unwrap();
+    fs::write(tree.path().join("fixtures/a.json"), "{}\n").unwrap();
+    let mut found = BTreeSet::new();
+    contract_files(tree.path(), tree.path(), &mut found);
+    assert_eq!(
+        found,
+        BTreeSet::from(["fixtures/PIN".to_string(), "fixtures/a.json".to_string()])
+    );
 }
 
 fn json(path: &str) -> Value {
@@ -180,6 +200,8 @@ fn vendored_contract_files_match_the_pin_hashes() {
         edge_version,
         rows: hashes,
     } = parse_pin();
+    // The adopted pin. A pin bump changes exactly these three literals (docs/contracts.md,
+    // "Bumping the pin", step 4); every other test reads the live PIN or a fixed sample.
     assert_eq!(tag, "contracts-edge-0.9.21");
     assert_eq!(commit, "92d8da5be93ea1ece9f47729b1f7aa10ae8a7c3f");
     assert_eq!(edge_version.as_deref(), Some("v0.9.21"));
@@ -213,13 +235,24 @@ fn vendored_contract_files_match_the_pin_hashes() {
 /// (ferrum-contracts `docs/consumer-pins.md`, "Required checks" 1-3).
 #[test]
 fn the_pin_parse_is_strict() {
-    let good = fs::read_to_string(contract_dir().join("PIN")).expect("read contracts PIN");
-    assert!(parse_pin_text(&good).is_ok());
-    let row = good
-        .lines()
-        .find(|line| line.len() > 66 && is_lower_hex(&line[..64], 64))
-        .expect("a checksum row")
-        .to_string();
+    // A fixed sample, independent of the adopted release, so re-pinning the
+    // vendored copy never changes what this test mutates.
+    let good = concat!(
+        "tag contracts-edge-7.8.9\n",
+        "commit 0123456789abcdef0123456789abcdef01234567\n",
+        "edge_version v7.8.9\n",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  fixtures/a-b/x.json\n",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  fixtures/a/x.json\n",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  vocabularies/v.json\n",
+    )
+    .to_string();
+    let pin = parse_pin_text(&good).expect("the sample parses");
+    assert_eq!(pin.tag, "contracts-edge-7.8.9");
+    assert_eq!(pin.edge_version.as_deref(), Some("v7.8.9"));
+    assert_eq!(pin.rows.len(), 3);
+    // The live PIN parses too (its literal values are asserted above).
+    parse_pin();
+    let row = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  fixtures/a/x.json";
     let (hash, path) = row.split_once("  ").unwrap();
     let cases: Vec<(&str, String)> = vec![
         ("CRLF", good.replace('\n', "\r\n")),
@@ -229,25 +262,13 @@ fn the_pin_parse_is_strict() {
         ("old key=value header", good.replacen("tag ", "tag=", 1)),
         (
             "uppercase hash",
-            good.replace(&row, &format!("{}  {path}", hash.to_uppercase())),
+            good.replace(row, &format!("{}  {path}", hash.to_uppercase())),
         ),
-        ("one space", good.replace(&row, &format!("{hash} {path}"))),
-        (
-            "three spaces",
-            good.replace(&row, &format!("{hash}   {path}")),
-        ),
-        (
-            "leading slash",
-            good.replace(&row, &format!("{hash}  /{path}")),
-        ),
-        (
-            "dot-dot segment",
-            good.replace(&row, &format!("{hash}  ../{path}")),
-        ),
-        (
-            "duplicate row",
-            good.replace(&row, &format!("{row}\n{row}")),
-        ),
+        ("one space", good.replace(row, &format!("{hash} {path}"))),
+        ("three spaces", good.replace(row, &format!("{hash}   {path}"))),
+        ("leading slash", good.replace(row, &format!("{hash}  /{path}"))),
+        ("dot-dot segment", good.replace(row, &format!("{hash}  ../{path}"))),
+        ("duplicate row", good.replace(row, &format!("{row}\n{row}"))),
         ("PIN lists itself", format!("{good}{hash}  PIN\n")),
         ("unknown key", good.replacen("commit ", "revision ", 1)),
         (
@@ -257,17 +278,19 @@ fn the_pin_parse_is_strict() {
         ("trailing space", good.replacen('\n', " \n", 1)),
         (
             "revision -r1",
-            good.replacen(
-                "tag contracts-edge-0.9.21",
-                "tag contracts-edge-0.9.21-r1",
-                1,
-            ),
+            good.replacen("tag contracts-edge-7.8.9", "tag contracts-edge-7.8.9-r1", 1),
         ),
         (
             "prerelease tag",
+            good.replacen("tag contracts-edge-7.8.9", "tag contracts-edge-7.8.9-rc.1", 1),
+        ),
+        (
+            "rows out of byte order",
             good.replacen(
-                "tag contracts-edge-0.9.21",
-                "tag contracts-edge-0.9.21-rc.1",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  fixtures/a-b/x.json\n\
+                 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  fixtures/a/x.json\n",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  fixtures/a/x.json\n\
+                 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  fixtures/a-b/x.json\n",
                 1,
             ),
         ),
@@ -276,21 +299,20 @@ fn the_pin_parse_is_strict() {
         assert_ne!(text, good, "{name}: the mutation did not apply");
         assert!(parse_pin_text(&text).is_err(), "{name} must be refused");
     }
-    // Rows out of byte order are refused even when each row is valid.
-    let mut lines: Vec<&str> = good.lines().collect();
-    let first_row = lines
-        .iter()
-        .position(|line| is_lower_hex(&line[..line.len().min(64)], 64))
-        .unwrap();
-    lines.swap(first_row, first_row + 1);
-    assert!(parse_pin_text(&(lines.join("\n") + "\n")).is_err());
     // A later revision tag is a valid form.
-    assert!(parse_pin_text(&good.replacen(
-        "tag contracts-edge-0.9.21",
-        "tag contracts-edge-0.9.21-r2",
-        1
-    ))
-    .is_ok());
+    let revision = good.replacen("tag contracts-edge-7.8.9", "tag contracts-edge-7.8.9-r2", 1);
+    assert_ne!(revision, good);
+    assert_eq!(
+        parse_pin_text(&revision).expect("a -r2 tag parses").tag,
+        "contracts-edge-7.8.9-r2"
+    );
+    // A nested file named PIN is an ordinary row; only the top-level PIN may
+    // not list itself.
+    let nested = good.replace(
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  vocabularies/v.json",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  vocabularies/PIN",
+    );
+    assert!(parse_pin_text(&nested).is_ok());
 }
 
 /// Check 4: nothing in the vendored directory may be anything but a regular
