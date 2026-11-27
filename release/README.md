@@ -83,8 +83,10 @@ publishing.
 
 ## Adopt the immutable source/template revision
 
-Once the upstream record is `supported`, copy its `gitforgeops.source_sha` into
-`GFO_SHA` and check that the protected tag resolves to that commit. GitHub's
+Pick the release to adopt from its finalized record,
+`release/records/<tag>.json` on upstream `main` (`status` `supported`). Copy its
+`gitforgeops.tag` into `GFO_TAG` and its `gitforgeops.source_sha` into
+`GFO_SHA`, and check that the protected tag resolves to that commit. GitHub's
 **Use this template** button always copies the current default branch, so
 start a clean repository from the verified source archive instead. Choose
 repository visibility and GitHub plan with the
@@ -93,15 +95,16 @@ environments on a private repository need Pro, Team or Enterprise, and required
 reviewers on one need Enterprise.
 
 ```bash
+GFO_TAG='PASTE_TAG_FROM_RELEASE_RECORD'   # gitforgeops.tag, for example v1.0.0
 GFO_SHA='PASTE_40_HEX_SOURCE_SHA_FROM_RELEASE_RECORD'
 git clone --no-checkout https://github.com/ferrum-edge/ferrum-edge-git-forge-ops.git gitforgeops-upstream
-test "$(git -C gitforgeops-upstream rev-parse 'v0.1.0^{commit}')" = "$GFO_SHA"
+test "$(git -C gitforgeops-upstream rev-parse "${GFO_TAG}^{commit}")" = "$GFO_SHA"
 mkdir gateway-config
 git -C gitforgeops-upstream archive "$GFO_SHA" | tar -x -C gateway-config
 cd gateway-config
 git init -b main
 git add -A
-git commit -m 'Adopt GitForgeOps v0.1.0 baseline'
+git commit -m "Adopt GitForgeOps ${GFO_TAG} baseline"
 gh repo create OWNER/REPO --private --source . --push  # or --public; see the quickstart prerequisites
 python3 .github/scripts/template_update.py detect-baseline --write
 git add .gitforgeops/baseline.json
@@ -122,7 +125,7 @@ to this pairing.
 
 ## Verify the distributed image and provenance
 
-After publication, take `GFO_SHA` and `IMAGE_DIGEST` from the supported record,
+After publication, take `GFO_TAG`, `GFO_SHA` and `IMAGE_DIGEST` from the same record,
 and authenticate `gh` and the OCI registry. The release workflow attests the
 same image digest under both registry names. For GHCR, verify the GitHub-signed
 SLSA provenance, restricted to this repository, signer workflow, source commit
@@ -134,7 +137,7 @@ gh attestation verify \
   "oci://ghcr.io/ferrum-edge/ferrum-edge-git-forge-ops@${IMAGE_DIGEST}" \
   --repo ferrum-edge/ferrum-edge-git-forge-ops \
   --signer-workflow ferrum-edge/ferrum-edge-git-forge-ops/.github/workflows/release.yml \
-  --source-digest "$GFO_SHA" --source-ref refs/tags/v0.1.0
+  --source-digest "$GFO_SHA" --source-ref "refs/tags/${GFO_TAG}"
 ```
 
 For Docker Hub, run the same flags against
@@ -149,7 +152,8 @@ record; the committed record and release notes are.
 
 The protected `release.yml` is the only packaging path. Before building, it
 checks the merged PR's required checks and a sealed lifecycle result for the
-exact commit. Its `docker` job binds the `release` GitHub Environment, which
+exact commit, and `check_release_baseline.py` refuses a pushed tag that is not
+exactly `baseline.json`'s `gitforgeops.tag` (`v` + the Cargo version). Its `docker` job binds the `release` GitHub Environment, which
 holds `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as environment secrets and
 admits only the default branch and `v*` tags, so a workflow on any other
 branch cannot read the push token. They must never be repository or

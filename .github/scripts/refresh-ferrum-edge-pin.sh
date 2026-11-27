@@ -21,8 +21,9 @@ set -euo pipefail
 # version and digest in the same reviewed change.
 #
 # `--newest` prints the highest published version release: the numerically
-# greatest plain `vMAJOR.MINOR.PATCH` tag among the newest 100 releases that
-# are neither drafts nor prereleases and publish the asset. GitHub's
+# greatest plain `vMAJOR.MINOR.PATCH` tag among all published releases (every
+# page of the list) that are neither drafts nor prereleases and publish the
+# asset. GitHub's
 # "latest" designation is not used: a release can be published without it,
 # and a backport can carry it. `--newer` prints that tag only when it is
 # numerically greater than the baseline's `validator.version`, and nothing
@@ -113,7 +114,7 @@ release_json="$tmp_dir/release.json"
 
 curl_common=(
   --proto '=https' --tlsv1.2 --fail --silent --show-error --location
-  --retry 3 --retry-connrefused
+  --connect-timeout 20 --retry 3 --retry-connrefused
   -H 'X-GitHub-Api-Version: 2022-11-28'
   -H 'User-Agent: gitforgeops-validator-pin-refresh'
 )
@@ -121,25 +122,52 @@ curl_auth=()
 if [ -n "${GITHUB_TOKEN:-}" ]; then
   curl_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
 fi
+# Release-list pages are small: bound each request so a stalled endpoint fails
+# the lookup quickly instead of consuming the caller's time budget.
+curl_list=(
+  --proto '=https' --tlsv1.2 --fail --silent --show-error --location
+  --connect-timeout 10 --max-time 30 --retry 2
+  -H 'X-GitHub-Api-Version: 2022-11-28'
+  -H 'User-Agent: gitforgeops-validator-pin-refresh'
+)
 
-# The highest published plain version release, compared numerically.
+# The highest published plain version release, compared numerically across
+# every page of the release list. GitHub orders the list by creation, not by
+# version, so a higher version may sit on any page: enumeration must reach a
+# short page, and a page that fails or the page cap fails the whole lookup.
+max_release_pages=20
 highest_published_release() {
-  local releases_json="$tmp_dir/releases.json"
-  curl "${curl_common[@]}" "${curl_auth[@]}" \
-    -H 'Accept: application/vnd.github+json' \
-    "$releases_api?per_page=100" --output "$releases_json" || return 1
-  jq -r --arg name "$asset" '
-    [ .[]
+  local page=1 page_json count candidates="$tmp_dir/candidates.txt"
+  : >"$candidates"
+  while :; do
+    if [ "$page" -gt "$max_release_pages" ]; then
+      echo "The release list has more than $max_release_pages pages; refusing to guess." >&2
+      return 1
+    fi
+    page_json="$tmp_dir/releases-$page.json"
+    curl "${curl_list[@]}" "${curl_auth[@]}" \
+      -H 'Accept: application/vnd.github+json' \
+      "$releases_api?per_page=100&page=$page" --output "$page_json" || return 1
+    count=$(jq -er 'if type == "array" then length else error("not a release list") end' \
+      "$page_json") || return 1
+    jq -r --arg name "$asset" '
+      .[]
       | select(.draft | not)
       | select(.prerelease | not)
       | select([.assets[]?.name] | index($name) != null)
       | .tag_name
       | strings
       | select(test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-    ]
+    ' "$page_json" >>"$candidates" || return 1
+    [ "$count" -lt 100 ] && break
+    page=$((page + 1))
+  done
+  jq -Rr -s '
+    split("\n")
+    | map(select(length > 0))
     | max_by(ltrimstr("v") | split(".") | map(tonumber))
     // empty
-  ' "$releases_json"
+  ' "$candidates"
 }
 
 if [ "$newest" = true ] || [ "$newer" = true ]; then

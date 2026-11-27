@@ -56,11 +56,27 @@ if url.endswith('/releases/latest'):
     if os.environ.get('FAKE_LATEST_MISSING'):
         raise SystemExit(22)
     output.write_text(os.environ['FAKE_LATEST_JSON'])
-elif url.endswith('/releases?per_page=5') or url.endswith('/releases?per_page=100'):
+elif url.endswith('/releases?per_page=5'):
     payload = os.environ.get('FAKE_RELEASE_LIST_JSON')
     if payload is None:
         raise SystemExit(22)
     output.write_text(payload)
+elif '/releases?per_page=100&page=' in url:
+    page = int(url.rsplit('=', 1)[1])
+    pages = os.environ.get('FAKE_RELEASE_PAGES_JSON')
+    if pages is not None:
+        pages = json.loads(pages)
+    elif os.environ.get('FAKE_RELEASE_LIST_JSON') is not None:
+        pages = [json.loads(os.environ['FAKE_RELEASE_LIST_JSON'])]
+    else:
+        raise SystemExit(22)
+    if page > len(pages):
+        payload = []
+    elif pages[page - 1] is None:
+        raise SystemExit(22)
+    else:
+        payload = pages[page - 1]
+    output.write_text(json.dumps(payload))
 elif url.startswith(tags_prefix):
     payload = os.environ.get('FAKE_TAG_JSON')
     if payload is None or url[len(tags_prefix):] != os.environ['FAKE_TAG']:
@@ -131,6 +147,7 @@ class Harness:
         release_list_json=None,
         latest_missing: bool = False,
         latest_stall: bool = False,
+        release_pages_json=None,
         symlink_allowlist: bool = False,
         symlink_baseline: bool = False,
     ):
@@ -180,6 +197,8 @@ class Harness:
             environment["FAKE_LATEST_MISSING"] = "1"
         if latest_stall:
             environment["FAKE_LATEST_STALL"] = "1"
+        if release_pages_json is not None:
+            environment["FAKE_RELEASE_PAGES_JSON"] = json.dumps(release_pages_json)
         if github_token is not None:
             environment["GITHUB_TOKEN"] = github_token
             environment["FAKE_EXPECT_AUTH"] = f"Authorization: Bearer {github_token}"
@@ -658,6 +677,58 @@ class RefreshPinTests(unittest.TestCase):
                 self.assertIn("Could not determine", result.stderr)
         result = self.newest([release(tag="v1.0.0-rc.1")], "--newest")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_newest_reads_every_page_of_the_release_list(self):
+        # A full first page of older releases does not end the search: the
+        # higher version on page two is found.
+        full_page = [release(tag=f"v0.8.{index}") for index in range(100)]
+        harness = self.harness(
+            b"x",
+            "0" * 64,
+            "# empty\n",
+            baseline(),
+            release_pages_json=[full_page, [release(tag="v0.10.0")]],
+        )
+        result = harness.refresh("--newest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "v0.10.0\n")
+        self.assertIn(
+            "https://api.github.com/repos/ferrum-edge/ferrum-edge/releases?per_page=100&page=2",
+            harness.urls(),
+        )
+        result = harness.refresh("--newer", "--baseline", str(harness.baseline))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "v0.10.0\n")
+
+    def test_an_unfinished_enumeration_is_a_lookup_failure(self):
+        # Page two fails: nothing may be concluded, so the canary keeps its
+        # issue open instead of reporting "nothing newer".
+        full_page = [release(tag=f"v0.8.{index}") for index in range(99)] + [release(tag=PINNED_TAG)]
+        harness = self.harness(
+            b"x",
+            "0" * 64,
+            "# empty\n",
+            baseline(),
+            release_pages_json=[full_page, None],
+        )
+        for args in (("--newest",), ("--newer", "--baseline", str(harness.baseline))):
+            with self.subTest(args=args):
+                result = harness.refresh(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("Could not determine", result.stderr)
+
+    def test_release_list_requests_are_bounded(self):
+        harness = self.harness(
+            b"x", "0" * 64, "# empty\n", baseline(), release_list_json=[release(tag=PINNED_TAG)]
+        )
+        result = harness.refresh("--newest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        listing = [argv for argv in harness.calls() if any("per_page=100" in arg for arg in argv)]
+        self.assertTrue(listing)
+        for argv in listing:
+            self.assertIn("--max-time", argv)
+            self.assertIn("--connect-timeout", argv)
 
     def test_newest_cannot_append(self):
         harness = self.harness(b"x", "0" * 64, "# empty\n", baseline())

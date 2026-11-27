@@ -200,6 +200,13 @@ class ValidatorLabelsTests(unittest.TestCase):
         )[0]
         self.assertIn("if: ${{ !cancelled() }}", newer)
         self.assertIn("refresh-ferrum-edge-pin.sh --newer", newer)
+        # Every informational call is bounded, and a failed or timed-out
+        # lookup is reported as unknown without failing the job.
+        self.assertIn("timeout 120 bash .github/scripts/refresh-ferrum-edge-pin.sh --newer", newer)
+        self.assertIn('timeout 360 bash .github/scripts/refresh-ferrum-edge-pin.sh --release "$newest"', newer)
+        self.assertIn("timeout-minutes: ", newer)
+        self.assertIn('echo "lookup=unknown"', newer)
+        self.assertIn("exit 0", newer)
         self.assertIn('refresh-ferrum-edge-pin.sh --release "$newest"', newer)
         self.assertIn(".validator.version", newer)
         self.assertNotIn("install-ferrum-edge.sh", newer)

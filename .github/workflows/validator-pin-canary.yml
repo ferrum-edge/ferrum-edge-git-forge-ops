@@ -44,7 +44,9 @@ jobs:
       (github.event_name == 'schedule' && github.event.schedule == '17 7 * * *') ||
       (github.event_name == 'workflow_dispatch' && inputs.check == 'validator-pin')
     runs-on: ubuntu-26.04
-    timeout-minutes: 15
+    # Install and label probe, plus at most two bounded candidate-line
+    # computations (each capped below) and the issue update.
+    timeout-minutes: 30
     permissions:
       contents: read
       issues: write
@@ -92,11 +94,12 @@ jobs:
       - name: Compute the pinned allowlist line
         id: refresh
         if: steps.install.outputs.status != '0'
+        timeout-minutes: 7
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          line=$(bash .github/scripts/refresh-ferrum-edge-pin.sh)
+          line=$(timeout 360 bash .github/scripts/refresh-ferrum-edge-pin.sh)
           {
             echo 'line<<CANARY_EOF'
             printf '%s\n' "$line"
@@ -104,21 +107,26 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       # Informational: a newer upstream release is reported, never installed.
-      # A failed lookup leaves the tracking issue as it is.
+      # Every network call here is bounded. A lookup that fails or times out is
+      # "unknown": reported, never failing, and it leaves the tracking issue as
+      # it is. The pinned-build verification above stays strict.
       - name: Check for a newer upstream release
         id: newer
         if: ${{ !cancelled() }}
+        timeout-minutes: 9
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
-          # `--newer` compares versions numerically against the baseline and
-          # prints the highest published release only when it is greater.
+          # `--newer` compares versions numerically against the baseline,
+          # across every page of the release list, and prints the highest
+          # published release only when it is greater.
           pinned=$(jq -er '.validator.version' release/baseline.json) || pinned=
-          if ! newest=$(bash .github/scripts/refresh-ferrum-edge-pin.sh --newer) || [ -z "$pinned" ]; then
-            echo "lookup=failed" >>"$GITHUB_OUTPUT"
+          if ! newest=$(timeout 120 bash .github/scripts/refresh-ferrum-edge-pin.sh --newer) || [ -z "$pinned" ]; then
+            echo "lookup=unknown" >>"$GITHUB_OUTPUT"
             echo "tag=" >>"$GITHUB_OUTPUT"
-            echo "::warning::The newest published Ferrum Edge release could not be compared with the pin."
+            echo "::warning::Unknown: the newest published Ferrum Edge release could not be compared with the pin."
+            echo "Newer Ferrum Edge release: unknown (lookup failed or timed out)." >>"$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           echo "lookup=ok" >>"$GITHUB_OUTPUT"
@@ -129,7 +137,9 @@ jobs:
           fi
           echo "tag=$newest" >>"$GITHUB_OUTPUT"
           echo "::warning::Ferrum Edge $newest is published; release/baseline.json pins $pinned."
-          line=$(bash .github/scripts/refresh-ferrum-edge-pin.sh --release "$newest") || line=
+          # The tag is already recorded above; a slow or failed digest fetch
+          # only leaves the candidate line empty.
+          line=$(timeout 360 bash .github/scripts/refresh-ferrum-edge-pin.sh --release "$newest") || line=
           {
             echo 'line<<CANARY_EOF'
             printf '%s\n' "$line"

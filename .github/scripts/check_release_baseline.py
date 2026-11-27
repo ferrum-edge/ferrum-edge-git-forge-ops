@@ -24,6 +24,7 @@ before any release is recorded).
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import tomllib
@@ -176,7 +177,17 @@ def pin_edge_version(pin: str) -> str | None:
     return None
 
 
-def check(root: Path) -> list[str]:
+UPSTREAM_RECORDS = (
+    "https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/records"
+)
+
+
+def check(root: Path, release_ref: str | None = None) -> list[str]:
+    """Issues with the committed release pairing.
+
+    `release_ref` is the tag being published (`release.yml` passes the pushed
+    tag); it must be exactly the candidate's tag and `v` + the Cargo version.
+    """
     issues: list[str] = []
     try:
         record = json.loads((root / "release/baseline.json").read_text(encoding="utf-8"))
@@ -221,8 +232,17 @@ def check(root: Path) -> list[str]:
         )
     if RECORDS_DIR + "/" not in readme:
         issues.append("README Development status must point to the finalized release records")
-    if f"Release baseline: [v{version}](../release/README.md)" not in quickstart:
-        issues.append("quickstart must link to the recorded version")
+    # The quickstart describes the release being prepared, so it names and
+    # links that release's own record (which exists once it is published).
+    if f"Release baseline: [v{version}]({UPSTREAM_RECORDS}/v{version}.json)" not in quickstart:
+        issues.append("quickstart must name and link the record of the release it describes")
+    if release_ref is not None and (
+        release_ref != engine.get("tag") or release_ref != f"v{version}"
+    ):
+        issues.append(
+            f"the pushed tag {release_ref} must equal release/baseline.json's "
+            f"gitforgeops.tag {engine.get('tag')} and v + the Cargo version v{version}"
+        )
     if f"# GitForgeOps v{version} release notes" not in notes:
         issues.append("release notes must name the recorded version")
     if "`status` is `supported`" not in " ".join(quickstart.split()):
@@ -338,8 +358,16 @@ def check(root: Path) -> list[str]:
     return issues
 
 
+def published_tag() -> str | None:
+    """The tag `release.yml` is publishing, from the Actions environment."""
+    ref = os.environ.get("GITHUB_REF", "")
+    if ref.startswith("refs/tags/"):
+        return ref.removeprefix("refs/tags/")
+    return None
+
+
 def main() -> int:
-    issues = check(ROOT)
+    issues = check(ROOT, release_ref=published_tag())
     for issue in issues:
         print(f"release baseline: {issue}", file=sys.stderr)
     if issues:
