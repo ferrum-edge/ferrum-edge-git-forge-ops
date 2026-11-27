@@ -461,6 +461,14 @@ password) in place of each `basicauth` `password`, resolved or not, so the
 resolved password is never written to it. File mode keeps the password, which
 a file-mode gateway refuses.
 
+**A `basic_auth` plugin is validated with a stand-in key.** Edge checks a
+plugin config by building the plugin, and `basic_auth` will not build without
+`FERRUM_BASIC_AUTH_HMAC_SECRET`. The validator never inherits a `FERRUM_*`
+variable, so it gets the public constant
+`gitforgeops-validation-standin-basic-auth-hmac-key-not-a-secret` instead,
+on the validator process only. The gateway keeps its own key; GitForgeOps
+never reads it.
+
 The scheme follows the field (`ldaps://`, `redis://`, `wss://` for
 `ws_logging`, otherwise `https://`). The shapes follow the gateway's own
 checks: a Redis URL path must be empty, `/` or a database number, an AWS

@@ -1612,18 +1612,20 @@ def _export_projection(harness: Harness) -> str:
             hmac_auth:
               - secret: "${{gh-env-secret:alloc=require}}"
             basicauth:
-              - username: "{CONTRACT_BASIC_USERNAME}"
-                password: "${{gh-env-secret:alloc=require}}"
+              - password: "${{gh-env-secret:alloc=require}}"
             mtls_auth:
               - identity: "{CONTRACT_MTLS_IDENTITY}"
     """)
+    route = _basic_route_files(harness)
     baseline = harness.workdir.parent / "contract-fingerprints.json"
     baseline.unlink(missing_ok=True)
     through_export = {"FERRUM_ADMIN_JWT_VIEWER_SECRET": viewer}
     password = seeded[f"{NAMESPACE}/{CONTRACT_CONSUMER}/basicauth/password"]
     try:
         # Every credential type the broker advertises for api mode, resolved,
-        # through the pre-apply validator and the admin API.
+        # and a declared `basic_auth` plugin, through the pre-apply validator
+        # and the admin API.
+        harness.run("validate")
         harness.run("apply", "--auto-approve")
         _viewer_export(harness, viewer, [*seeded.values(), harness_key(harness)])
         first = harness.run("diff", "--exit-on-drift", expect=None, **through_export)
@@ -1682,6 +1684,8 @@ def _export_projection(harness: Harness) -> str:
     finally:
         baseline.unlink(missing_ok=True)
         harness.remove(consumer)
+        for relative in route:
+            harness.remove(relative)
         creds_path.write_text(original, encoding="utf-8")
         ensure_deployed(harness)
     return (
@@ -1690,48 +1694,49 @@ def _export_projection(harness: Harness) -> str:
     )
 
 
-CONTRACT_BASIC_USERNAME = "contract-basic"
 CONTRACT_BASIC_PROXY = "contract-basic-proxy"
 CONTRACT_BASIC_PLUGIN = "contract-basic-auth"
+
+
+def _basic_route_files(harness: Harness) -> list[str]:
+    """A route guarded by a declared `basic_auth` plugin, written to the tree.
+
+    Declared rather than created on the gateway, so `validate` and `apply`
+    build a `basic_auth` plugin (which needs the validator's key stand-in).
+    """
+    backend = urllib.parse.urlsplit(harness.upstream_url)
+    proxy = f"resources/{NAMESPACE}/proxies/{CONTRACT_BASIC_PROXY}.yaml"
+    plugin = f"resources/{NAMESPACE}/plugins/{CONTRACT_BASIC_PLUGIN}.yaml"
+    harness.write(proxy, json.dumps({"kind": "Proxy", "spec": {
+        "id": CONTRACT_BASIC_PROXY, "listen_path": "/contract-basic",
+        "backend_scheme": "http", "backend_host": backend.hostname,
+        "backend_port": backend.port, "strip_listen_path": True,
+    }}))
+    harness.write(plugin, json.dumps({"kind": "PluginConfig", "spec": {
+        "id": CONTRACT_BASIC_PLUGIN, "plugin_name": "basic_auth", "scope": "proxy",
+        "proxy_id": CONTRACT_BASIC_PROXY, "enabled": True, "config": {},
+    }}))
+    return [proxy, plugin]
 
 
 def _brokered_basicauth_authenticates(harness: Harness, password: str) -> None:
     """The password GitForgeOps applied through the admin API authenticates.
 
-    The gateway hashed the brokered plaintext on write; a `basic_auth`
-    instance on a throwaway route must accept it and refuse a wrong one. The
-    route is the harness's, not the subject: the credential is.
+    The gateway hashed the brokered plaintext on write; the declared
+    `basic_auth` route must accept it and refuse a wrong one or none.
     """
     import base64  # noqa: PLC0415
 
-    backend = urllib.parse.urlsplit(harness.upstream_url)
-    _admin(harness, "POST", "/proxies", {
-        "id": CONTRACT_BASIC_PROXY, "listen_path": "/contract-basic",
-        "backend_scheme": "http", "backend_host": backend.hostname,
-        "backend_port": backend.port, "strip_listen_path": True, "namespace": NAMESPACE,
-    })
-    try:
-        _admin(harness, "POST", "/plugins/config", {
-            "id": CONTRACT_BASIC_PLUGIN, "plugin_name": "basic_auth", "scope": "proxy",
-            "proxy_id": CONTRACT_BASIC_PROXY, "enabled": True, "config": {},
-        })
+    def basic(secret: str) -> dict[str, str]:
+        # Edge keys basicauth on the consumer's username; an entry carries
+        # exactly one of `password` / `password_hash`.
+        token = base64.b64encode(f"{CONTRACT_CONSUMER}:{secret}".encode()).decode()
+        harness.remember_secret(token)
+        return {"Authorization": f"Basic {token}"}
 
-        def basic(secret: str) -> dict[str, str]:
-            token = base64.b64encode(f"{CONTRACT_BASIC_USERNAME}:{secret}".encode()).decode()
-            harness.remember_secret(token)
-            return {"Authorization": f"Basic {token}"}
-
-        harness.expect_status("/contract-basic/status/200", 200, basic(password))
-        harness.expect_status("/contract-basic/status/200", 401, basic(password + "-wrong"))
-        harness.expect_status("/contract-basic/status/200", 401)
-    finally:
-        status = __admin(
-            harness, "DELETE",
-            f"/plugins/config/{CONTRACT_BASIC_PLUGIN}?expected_proxy_ids={CONTRACT_BASIC_PROXY}",
-        )
-        if status not in (200, 202, 204, 404):
-            raise ScenarioFailure(f"cleanup: DELETE of the basic_auth plugin answered {status}")
-        _admin(harness, "DELETE", f"/proxies/{CONTRACT_BASIC_PROXY}")
+    harness.expect_status("/contract-basic/status/200", 200, basic(password))
+    harness.expect_status("/contract-basic/status/200", 401, basic(password + "-wrong"))
+    harness.expect_status("/contract-basic/status/200", 401)
 
 
 def _schemeless_http_proxies() -> list[dict]:

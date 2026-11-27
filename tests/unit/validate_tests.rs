@@ -908,14 +908,21 @@ fn mesh_validation_context_is_the_documented_no_ca_opt_out() {
 }
 
 /// The gateway pass has no identity gate to relax, and a gateway document must
-/// never be graded under a relaxed mesh context. `-m file` gets no constant
-/// identity overrides; its namespace is derived separately from the document.
+/// never be graded under a relaxed mesh context. `-m file` gets only the
+/// public `basic_auth` key stand-in, which lets that plugin build; its
+/// namespace is derived separately from the document.
 #[test]
-fn gateway_validation_context_injects_nothing() {
-    assert!(
-        validation_context_env(GATEWAY_VALIDATE_MODE).is_empty(),
-        "{:?}",
-        validation_context_env(GATEWAY_VALIDATE_MODE)
+fn gateway_validation_context_is_only_the_basic_auth_key_standin() {
+    use gitforgeops::validate::{BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN};
+
+    assert_eq!(BASIC_AUTH_HMAC_SECRET_ENV, "FERRUM_BASIC_AUTH_HMAC_SECRET");
+    // Edge refuses a key under 32 bytes.
+    assert!(BASIC_AUTH_HMAC_SECRET_STANDIN.len() >= 32);
+    assert!(BASIC_AUTH_HMAC_SECRET_STANDIN
+        .starts_with(gitforgeops::validate::VALIDATION_STANDIN_PREFIX));
+    assert_eq!(
+        validation_context_env(GATEWAY_VALIDATE_MODE),
+        vec![(BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN)]
     );
     // Any mode that is not the mesh pass is treated the same way: the context
     // is an allow-list keyed on one exact mode, not a default.
@@ -2519,7 +2526,7 @@ esac
 "#;
     for seed in [Some(PASSWORD), None] {
         let mut config = consumer_config(serde_json::json!({
-            "basicauth": [{"username": "app-login", "password": "${gh-env-secret:alloc=require}"}],
+            "basicauth": [{"password": "${gh-env-secret:alloc=require}"}],
         }));
         let bundle: BTreeMap<String, String> = seed
             .map(|value| {
@@ -2552,8 +2559,8 @@ esac
             .as_object()
             .unwrap()
             .clone();
-        assert!(!entry.contains_key("password"), "{entry:?}");
-        assert_eq!(entry["username"], "app-login");
+        // Edge requires exactly one of `password` / `password_hash`.
+        assert_eq!(entry.len(), 1, "{entry:?}");
         assert!(entry["password_hash"]
             .as_str()
             .unwrap()
@@ -2586,15 +2593,15 @@ fn admin_api_basicauth_standins_leave_an_explicit_hash_alone() {
     use gitforgeops::validate::with_admin_api_basicauth_standins;
 
     let both = consumer_config(serde_json::json!({
-        "basicauth": [{"username": "app", "password": "p", "password_hash": "hmac_sha256:00"}],
+        "basicauth": [{"password": "p", "password_hash": "hmac_sha256:00"}],
     }));
     assert!(with_admin_api_basicauth_standins(&both).is_none());
     let hash_only = consumer_config(serde_json::json!({
-        "basicauth": [{"username": "app", "password_hash": "hmac_sha256:00"}],
+        "basicauth": [{"password_hash": "hmac_sha256:00"}],
     }));
     assert!(with_admin_api_basicauth_standins(&hash_only).is_none());
     let legacy = consumer_config(serde_json::json!({
-        "basicauth": {"username": "app", "password": "p"},
+        "basicauth": {"password": "p"},
     }));
     let patched = with_admin_api_basicauth_standins(&legacy).expect("a legacy single entry");
     let entry = &patched.consumers[0].credentials["basicauth"];
@@ -2603,4 +2610,28 @@ fn admin_api_basicauth_standins_leave_an_explicit_hash_alone() {
         .as_str()
         .unwrap()
         .starts_with("hmac_sha256:"));
+}
+
+/// A repository declaring a `basic_auth` plugin validates: Edge builds the
+/// plugin to check its config and refuses without
+/// `FERRUM_BASIC_AUTH_HMAC_SECRET`. The validator child gets the public
+/// stand-in, and the parent's own value never reaches it.
+#[cfg(unix)]
+#[test]
+fn a_basic_auth_plugin_validates_with_the_key_standin_only() {
+    use gitforgeops::validate::BASIC_AUTH_HMAC_SECRET_STANDIN;
+
+    let config = plugin_config_for("basic", "basic_auth", serde_json::json!({}));
+    let dir = tempfile::tempdir().unwrap();
+    // Edge's construction rule, applied to the child's environment.
+    let validator = echo_validator(
+        dir.path(),
+        "basic-auth-validator",
+        &format!(
+            "#!/bin/sh\nif [ \"$FERRUM_BASIC_AUTH_HMAC_SECRET\" != \"{BASIC_AUTH_HMAC_SECRET_STANDIN}\" ]; then\n  \
+             echo 'basic_auth: FERRUM_BASIC_AUTH_HMAC_SECRET must be set' >&2\n  exit 1\nfi\nexit 0\n"
+        ),
+    );
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+    assert!(result.success, "{}{}", result.stdout, result.stderr);
 }

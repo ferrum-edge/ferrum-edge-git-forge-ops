@@ -134,15 +134,33 @@ where
 /// malformed policy or schema is still rejected.
 pub const MESH_ALLOW_NO_CA_ENV: &str = "FERRUM_MESH_ALLOW_NO_CA";
 
+/// The key ferrum-edge's `basic_auth` plugin needs before it can be built.
+pub const BASIC_AUTH_HMAC_SECRET_ENV: &str = "FERRUM_BASIC_AUTH_HMAC_SECRET";
+
+/// The validation-only stand-in for [`BASIC_AUTH_HMAC_SECRET_ENV`].
+///
+/// `ferrum-edge validate` checks a plugin config by constructing the plugin,
+/// and `basic_auth` refuses to construct without
+/// `FERRUM_BASIC_AUTH_HMAC_SECRET` (at least 32 bytes). GitForgeOps scrubs
+/// every inherited `FERRUM_*` variable from the validator, and never holds the
+/// gateway's key anyway, so without this every repository declaring a
+/// `basic_auth` plugin failed `validate`, `plan`, review and `apply`. The
+/// stand-in only lets the plugin build: it is a public constant, never a
+/// gateway's key, and is set on the validator child alone. The validator's
+/// `password_hash` check is a format check that does not use the key.
+pub const BASIC_AUTH_HMAC_SECRET_STANDIN: &str =
+    "gitforgeops-validation-standin-basic-auth-hmac-key-not-a-secret";
+
 /// The explicit, trusted validation-only context for a validator child in
 /// `mode`, applied **after** [`scrubbed_env_names`] has removed every
 /// inherited `FERRUM_*` variable.
 ///
 /// This is an allow-list of constants, not a pass-through: the parent's own
-/// `FERRUM_MESH_ALLOW_NO_CA` is scrubbed like everything else and cannot
-/// influence the child either way. Gateway validation gets no constant
-/// identity overrides — `-m file` has no identity gate. Its `FERRUM_NAMESPACE`
-/// is set separately from the assembled document, never the parent's filter.
+/// `FERRUM_MESH_ALLOW_NO_CA` and `FERRUM_BASIC_AUTH_HMAC_SECRET` are scrubbed
+/// like everything else and cannot influence the child either way. Gateway
+/// validation gets no identity overrides — `-m file` has no identity gate —
+/// only [`BASIC_AUTH_HMAC_SECRET_STANDIN`]. Its `FERRUM_NAMESPACE` is set
+/// separately from the assembled document, never the parent's filter.
 ///
 /// Nothing here reaches `apply`'s runtime settings: it is set on the
 /// `ferrum-edge validate` child process only, and the published mesh document
@@ -151,6 +169,8 @@ pub const MESH_ALLOW_NO_CA_ENV: &str = "FERRUM_MESH_ALLOW_NO_CA";
 pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
     if mode == MESH_VALIDATE_MODE {
         vec![(MESH_ALLOW_NO_CA_ENV, "true")]
+    } else if mode == GATEWAY_VALIDATE_MODE {
+        vec![(BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN)]
     } else {
         Vec::new()
     }
