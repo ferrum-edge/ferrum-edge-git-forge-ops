@@ -12,20 +12,18 @@ spec:
   namespace: ferrum
   custom_id: crm-00042
   credentials:
+    # Each entry holds exactly the fields Ferrum Edge admits
+    # (`config::schema::CREDENTIAL_ENTRY_SHAPES`).
     basicauth:
-      - username: every-field
-        password_hash: "${gh-env-secret:alloc=require}"
+      - password_hash: "${gh-env-secret:alloc=require}"
     keyauth:
       - key: "${gh-env-secret:alloc=require}"
     jwt:
-      - key: every-field-issuer
-        secret: "${gh-env-secret:alloc=require}"
-        algorithm: HS256
+      - secret: "${gh-env-secret:alloc=require}"
     hmac_auth:
-      - username: every-field
-        secret: "${gh-env-secret:alloc=require}"
+      - secret: "${gh-env-secret:alloc=require}"
     mtls_auth:
-      - subject_dn: "CN=every-field,O=Example,C=US"
+      - identity: "CN=every-field,O=Example,C=US"
   acl_groups:
     - partners
     - beta

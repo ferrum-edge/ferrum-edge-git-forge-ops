@@ -1321,3 +1321,108 @@ fn plugin_trigger_struct_slots_must_be_objects_and_keep_unknown_key_detection() 
         assert!(error.contains(field), "{trigger}: {error}");
     }
 }
+
+/// `CREDENTIAL_ENTRY_SHAPES` admits exactly what Ferrum Edge admits
+/// (`Consumer::validate_fields`): jwt / hmac_auth / mtls_auth entries hold one
+/// field, a basicauth entry one of password / password_hash and no username,
+/// and a keyauth entry needs `key` and may carry other fields.
+#[test]
+fn credential_entry_shapes_follow_edge() {
+    use gitforgeops::config::schema::credential_entry_shape_error;
+
+    let check = |credential_type: &str, entry: serde_json::Value| {
+        credential_entry_shape_error(credential_type, entry.as_object().unwrap(), "app-login")
+    };
+    for (credential_type, entry) in [
+        ("keyauth", serde_json::json!({"key": "k"})),
+        (
+            "keyauth",
+            serde_json::json!({"key": "k", "legacy": "kept by Edge"}),
+        ),
+        ("jwt", serde_json::json!({"secret": "s"})),
+        ("hmac_auth", serde_json::json!({"secret": "s"})),
+        ("mtls_auth", serde_json::json!({"identity": "CN=client"})),
+        ("basicauth", serde_json::json!({"password": "p"})),
+        (
+            "basicauth",
+            serde_json::json!({"password_hash": "hmac_sha256:00"}),
+        ),
+    ] {
+        assert_eq!(
+            check(credential_type, entry.clone()),
+            None,
+            "{credential_type} {entry}"
+        );
+    }
+    for (credential_type, entry, expected) in [
+        ("keyauth", serde_json::json!({"id": "x"}), "requires `key`"),
+        (
+            "jwt",
+            serde_json::json!({"key": "issuer", "secret": "s"}),
+            "remove `key`",
+        ),
+        ("jwt", serde_json::json!({}), "exactly one field, `secret`"),
+        (
+            "hmac_auth",
+            serde_json::json!({"username": "u", "secret": "s"}),
+            "remove `username`",
+        ),
+        (
+            "mtls_auth",
+            serde_json::json!({"subject_dn": "CN=x"}),
+            "`identity`",
+        ),
+        (
+            "basicauth",
+            serde_json::json!({"password": "p", "password_hash": "h"}),
+            "exactly one of",
+        ),
+        ("basicauth", serde_json::json!({}), "exactly one of"),
+        (
+            "basicauth",
+            serde_json::json!({"password": "p", "salt": "x"}),
+            "remove `salt`",
+        ),
+    ] {
+        let error = check(credential_type, entry.clone()).expect("refused");
+        assert!(
+            error.contains(expected),
+            "{credential_type} {entry}: {error}"
+        );
+    }
+    let error = check(
+        "basicauth",
+        serde_json::json!({"username": "alice", "password": "p"}),
+    )
+    .expect("a basicauth username is refused");
+    assert!(error.contains("consumer's own `username`"), "{error}");
+    assert!(error.contains("\"app-login\""), "{error}");
+    // Unknown types are refused elsewhere, with their own message.
+    assert_eq!(check("custom", serde_json::json!({"anything": 1})), None);
+}
+
+/// The shared load boundary refuses an Edge-refused entry field.
+#[test]
+fn the_load_boundary_refuses_an_edge_refused_credential_field() {
+    use gitforgeops::config::schema::validate_credential_entry_shapes;
+
+    let tree = tempfile::tempdir().unwrap();
+    let file = tree.path().join("ferrum/consumers/app.yaml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    jwt:\n      \
+         - key: issuer\n        secret: \"${gh-env-secret:alloc=require}\"\n",
+    )
+    .unwrap();
+    let resources = gitforgeops::config::load_resources(tree.path()).unwrap();
+    let gateway = gitforgeops::config::assemble(resources).unwrap().gateway;
+    let error = validate_credential_entry_shapes(&gateway)
+        .expect_err("a jwt key is refused")
+        .to_string();
+    assert!(
+        error.contains("consumer app in namespace ferrum"),
+        "{error}"
+    );
+    assert!(error.contains("credentials.jwt[0]"), "{error}");
+}

@@ -2600,8 +2600,8 @@ async fn cmd_plan(
                 json_mode,
                 "\n{} error-severity finding(s) block apply. Consumer credentials belong in the \
                  broker as ${{gh-env-secret:...}} placeholders; a literal value in repository YAML \
-                 is a committed secret. Identity halves (basicauth username, mtls_auth identity) \
-                 are not secrets and are not reported here.",
+                 is a committed secret. Identities (an mtls_auth identity) are not secrets and \
+                 are not reported here.",
                 gate.count
             );
         }

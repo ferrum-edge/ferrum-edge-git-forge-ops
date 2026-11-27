@@ -425,7 +425,7 @@ Every resolved or literal credential, sensitive plugin-config value, plugin
 trigger `header`/`query`/`cookie` operand (of at least 8 bytes; `diff` and
 `plan` redact shorter ones by position), modeled service-discovery secret and
 inline TLS private key, plus its base64 and percent-encoded forms, is
-replaced with `[REDACTED]`. Identities (`basicauth` usernames, `mtls_auth`
+replaced with `[REDACTED]`. Identities (consumer usernames, `mtls_auth`
 identities) stay readable. The whole stream is withheld instead when:
 
 - a secret is shorter than 8 bytes;

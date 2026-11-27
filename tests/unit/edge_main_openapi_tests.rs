@@ -543,6 +543,82 @@ fn gitforgeops_export_projection() -> BTreeMap<String, BTreeSet<String>> {
         .collect()
 }
 
+/// `config::schema::CREDENTIAL_ENTRY_SHAPES` against each credential type's
+/// entry schema under `ConsumerCredentialsInput`: the fields it declares,
+/// which are required, whether it is closed, and its one-of alternatives.
+fn credential_entry_shape_problems(schemas: &Map<String, Value>, problems: &mut Vec<String>) {
+    use gitforgeops::config::schema::{CredentialEntryShape, CREDENTIAL_ENTRY_SHAPES};
+
+    let input = shape(schemas, named(schemas, "ConsumerCredentialsInput"), 0);
+    for (credential_type, modeled) in CREDENTIAL_ENTRY_SHAPES {
+        let Some(items) = input
+            .properties
+            .get(credential_type)
+            .and_then(|property| shape(schemas, property, 0).items)
+        else {
+            problems.push(format!(
+                "ConsumerCredentialsInput.{credential_type}: not an array of entries"
+            ));
+            continue;
+        };
+        let entry = resolve(schemas, items);
+        let declared = shape(schemas, entry, 0);
+        let fields: BTreeSet<String> = declared.properties.keys().cloned().collect();
+        let required: BTreeSet<String> = entry
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let closed = declared.additional == Some(&Value::Bool(false));
+        let alternatives: BTreeSet<BTreeSet<String>> = entry
+            .get("oneOf")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|member| {
+                member
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect();
+        let edge = format!(
+            "fields {fields:?}, required {required:?}, closed {closed}, one of {alternatives:?}"
+        );
+        let matches = match modeled {
+            CredentialEntryShape::Exactly(field) => {
+                fields == strings(&[field]) && required == strings(&[field]) && closed
+            }
+            CredentialEntryShape::OneOf(choices) => {
+                fields == strings(choices)
+                    && closed
+                    && required.is_empty()
+                    && alternatives
+                        == choices
+                            .iter()
+                            .map(|choice| strings(&[*choice]))
+                            .collect::<BTreeSet<_>>()
+            }
+            CredentialEntryShape::Requires(field) => {
+                fields.contains(field) && required == strings(&[field]) && !closed
+            }
+        };
+        if !matches {
+            problems.push(format!(
+                "ConsumerCredentialsInput.{credential_type} entry: Edge documents {edge}; \
+                 GitForgeOps models {modeled:?}"
+            ));
+        }
+    }
+}
+
 #[test]
 fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
     use gitforgeops::config::schema::{GatewayConfig, KNOWN_CREDENTIAL_TYPES};
@@ -819,6 +895,7 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
         &declared_names(schemas, named(schemas, "ConsumerCredentialsInput")),
         &strings(&KNOWN_CREDENTIAL_TYPES),
     );
+    credential_entry_shape_problems(schemas, &mut problems);
 
     println!(
         "{COMPARED_MARKER} envelopes ({} difference(s))",

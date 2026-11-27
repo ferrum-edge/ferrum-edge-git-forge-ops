@@ -1035,6 +1035,136 @@ pub fn unknown_credential_type_message(
     message
 }
 
+/// How Ferrum Edge admits the fields of one credential entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialEntryShape {
+    /// The entry holds this one field and nothing else.
+    Exactly(&'static str),
+    /// The entry holds exactly one of these fields and nothing else.
+    OneOf(&'static [&'static str]),
+    /// The entry must hold this field; Edge leaves its other fields alone.
+    Requires(&'static str),
+}
+
+/// The entry shape Ferrum Edge admits for each credential type
+/// (`Consumer::validate_fields` in Edge's `src/config/types.rs`, and the
+/// `*Credential` schemas of its `openapi.yaml`; the Edge Main Drift and
+/// lifecycle workflows compare this with the spec). A `basicauth` entry carries
+/// no `username`: Edge keys basicauth on the consumer's own `username`.
+pub const CREDENTIAL_ENTRY_SHAPES: [(&str, CredentialEntryShape); 5] = [
+    (
+        "basicauth",
+        CredentialEntryShape::OneOf(&["password", "password_hash"]),
+    ),
+    ("keyauth", CredentialEntryShape::Requires("key")),
+    ("jwt", CredentialEntryShape::Exactly("secret")),
+    ("hmac_auth", CredentialEntryShape::Exactly("secret")),
+    ("mtls_auth", CredentialEntryShape::Exactly("identity")),
+];
+
+/// Why Ferrum Edge would refuse this credential entry's fields, if it would.
+pub fn credential_entry_shape_error(
+    credential_type: &str,
+    entry: &serde_json::Map<String, serde_json::Value>,
+    consumer_username: &str,
+) -> Option<String> {
+    let (_, shape) = CREDENTIAL_ENTRY_SHAPES
+        .iter()
+        .find(|(known, _)| *known == credential_type)?;
+    let quoted = |fields: &[&str]| {
+        fields
+            .iter()
+            .map(|field| format!("`{field}`"))
+            .collect::<Vec<_>>()
+            .join(" or ")
+    };
+    if credential_type == "basicauth" && entry.contains_key("username") {
+        return Some(format!(
+            "`username` is not a basicauth entry field: Ferrum Edge keys basicauth on the \
+             consumer's own `username` ({consumer_username:?}). Delete `username` from the entry, \
+             which holds exactly one of `password` or `password_hash`"
+        ));
+    }
+    match shape {
+        CredentialEntryShape::Exactly(field) => {
+            let extra: Vec<&str> = entry
+                .keys()
+                .map(String::as_str)
+                .filter(|key| key != field)
+                .collect();
+            if !entry.contains_key(*field) || !extra.is_empty() {
+                return Some(format!(
+                    "a {credential_type} entry holds exactly one field, `{field}`{}",
+                    if extra.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; remove {}", quoted(&extra))
+                    }
+                ));
+            }
+        }
+        CredentialEntryShape::OneOf(fields) => {
+            let present = fields
+                .iter()
+                .filter(|field| entry.contains_key(**field))
+                .count();
+            let extra: Vec<&str> = entry
+                .keys()
+                .map(String::as_str)
+                .filter(|key| !fields.contains(key))
+                .collect();
+            if present != 1 || !extra.is_empty() {
+                return Some(format!(
+                    "a {credential_type} entry holds exactly one of {}{}",
+                    quoted(fields),
+                    if extra.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; remove {}", quoted(&extra))
+                    }
+                ));
+            }
+        }
+        CredentialEntryShape::Requires(field) => {
+            if !entry.contains_key(*field) {
+                return Some(format!("a {credential_type} entry requires `{field}`"));
+            }
+        }
+    }
+    None
+}
+
+/// Refuse every Consumer credential entry whose fields Ferrum Edge would
+/// refuse ([`CREDENTIAL_ENTRY_SHAPES`]), at the shared load boundary so
+/// `validate`, `plan`, `diff`, review, `export` and `apply` all fail on it
+/// before any bundle, validator or gateway is touched.
+pub fn validate_credential_entry_shapes(config: &GatewayConfig) -> crate::error::Result<()> {
+    for consumer in &config.consumers {
+        for (credential_type, value) in &consumer.credentials {
+            let entries: Vec<&serde_json::Map<String, serde_json::Value>> = match value {
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .filter_map(serde_json::Value::as_object)
+                    .collect(),
+                serde_json::Value::Object(entry) => vec![entry],
+                _ => Vec::new(),
+            };
+            for (index, entry) in entries.into_iter().enumerate() {
+                if let Some(problem) =
+                    credential_entry_shape_error(credential_type, entry, &consumer.username)
+                {
+                    return Err(crate::error::Error::Config(format!(
+                        "consumer {} in namespace {}: credentials.{credential_type}[{index}]: \
+                         {problem}",
+                        consumer.id, consumer.namespace
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Upstream {
     /// Operator metadata, independent of routing, credentials and API-spec ownership.

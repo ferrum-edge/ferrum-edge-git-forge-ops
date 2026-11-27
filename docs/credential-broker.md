@@ -42,15 +42,20 @@ hatch is the policy override label, for emergencies only.
 ## Credential shapes
 
 Ferrum Edge authenticates exactly five credential types. Each is an **array**
-of entries:
+of entries, and each entry holds exactly the fields Edge admits (Edge v0.9.21
+`Consumer::validate_fields`; `validate`, `plan` and `apply` refuse any other
+field with the reason):
 
-| Type | Entry field | Notes |
+| Type | Entry fields | Notes |
 |---|---|---|
-| `keyauth` | `key` | non-empty, at most 4096 characters |
-| `jwt` | `secret` | at least 32 characters |
-| `hmac_auth` | `secret` | at least 32 characters, unique per namespace |
-| `mtls_auth` | `identity` | certificate CN / SAN / fingerprint; a public identity, written literally |
-| `basicauth` | `username` plus `password` **or** `password_hash` | `username` is a public identity; the hash form is `hmac_sha256:<64 hex>` |
+| `keyauth` | `key` (required) | at least 16 non-whitespace characters, at most 4096 |
+| `jwt` | `secret`, and nothing else | at least 32 non-whitespace characters |
+| `hmac_auth` | `secret`, and nothing else | at least 32 non-whitespace characters, unique per namespace |
+| `mtls_auth` | `identity`, and nothing else | certificate CN / SAN / fingerprint; a public identity, written literally |
+| `basicauth` | exactly one of `password` **or** `password_hash` | the login is the consumer's own `username`; the hash form is `hmac_sha256:<64 hex>` |
+
+A `basicauth` entry has no `username`: Edge keys basicauth on the consumer's
+`username`. Write the login there.
 
 - **Write the array form.** `GET /backup` returns arrays, so an object form
   (`keyauth: {key: ...}`) would read as drift. Assembly normalizes the object
@@ -82,8 +87,8 @@ Plan and apply check these before any GitHub call or secret write:
   `discovery_url`, ...). Use `alloc=require` and seed the real endpoint.
 - Consul ACL tokens. They are minted by the Consul cluster; use
   `alloc=require` and seed the slot.
-- `mtls_auth.identity` and `basicauth.username`. These are refused as
-  placeholders in every mode, even seeded; see
+- `mtls_auth.identity`. It is refused as a placeholder in every mode, even
+  seeded; see
   [Credential identities](credential-identities.md).
 
 A bundle value of `[REDACTED]` is refused: that is what `GET /consumers/...`
@@ -323,8 +328,8 @@ review formatter spelling falls below 8 bytes after CRLF collapse or trimming,
 rather than admitting a short spelling that would suppress ordinary prose. A
 live leaf that equals `${gh-env-secret:...}` is a real credential and is
 registered without the repository-placeholder exemption.
-Credential identities (`basicauth.username`, `mtls_auth.identity`) remain
-non-secret. Unresolved placeholders and short non-secret settings declared in
+Credential identities (`mtls_auth.identity`, and the consumer's own
+`username`) remain non-secret. Unresolved placeholders and short non-secret settings declared in
 resource YAML retain their existing policy; reserved broker sentinels remain
 refused.
 

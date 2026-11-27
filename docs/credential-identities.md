@@ -1,8 +1,12 @@
 # Credential identities and broker boundaries
 
-`basicauth[].username` and `mtls_auth[].identity` are public identity fields.
-Write their values literally. The broker refuses its `${gh-env-secret:` marker
-in either field, including incomplete or embedded placeholders. The refusal
+`mtls_auth[].identity` is a public identity field, and so is the consumer's
+own `username`, which is also its basicauth login. Write them literally. A
+`basicauth` entry has no `username` field: Ferrum Edge keys basicauth on the
+consumer's `username`, and `validate`, `plan` and `apply` refuse a
+`basicauth[].username` (see [Credential shapes](credential-broker.md#credential-shapes)).
+The broker refuses its `${gh-env-secret:` marker in an identity field,
+including incomplete or embedded placeholders. The refusal
 does not depend on allocation mode, gateway mode, bundle contents or
 `--allow-credential-slot-remap`. The error names the canonical slot and tells
 you to author the identity literally, without printing the supplied value.

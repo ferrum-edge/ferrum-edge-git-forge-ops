@@ -1179,16 +1179,15 @@ spec:
       - identity: client.example
 "#;
 
-/// The issue-128 Basic-auth consumer as `import` writes it: a legible
-/// username beside a brokered secret half.
+/// The issue-128 Basic-auth consumer: the login is the consumer's own
+/// `username`, beside a brokered hash.
 const BASICAUTH_IDENTITY_CONSUMER: &str = r#"kind: Consumer
 spec:
   id: "app"
   username: "app"
   credentials:
     basicauth:
-      - username: alice
-        password_hash: "${gh-env-secret:alloc=require}"
+      - password_hash: "${gh-env-secret:alloc=require}"
 "#;
 
 /// Bundle seeding the Basic-auth consumer's one brokered slot.
@@ -1203,8 +1202,7 @@ spec:
   username: "app"
   credentials:
     basicauth:
-      - username: alice
-        password_hash: "hmac_sha256:0123456789abcdef"
+      - password_hash: "hmac_sha256:0123456789abcdef"
 "#;
 
 #[test]
@@ -1216,7 +1214,7 @@ fn apply_accepts_credential_identity_fields_without_an_override() {
     for (name, consumer, bundle) in [
         ("mtls_auth identity", MTLS_IDENTITY_CONSUMER, None),
         (
-            "basicauth username",
+            "basicauth hash",
             BASICAUTH_IDENTITY_CONSUMER,
             Some(BASICAUTH_BUNDLE),
         ),
@@ -1255,8 +1253,7 @@ fn apply_accepts_credential_identity_fields_without_an_override() {
 
 #[test]
 fn apply_still_refuses_a_committed_secret_beside_an_identity() {
-    // The exemption is per-leaf. A Basic-auth consumer whose username is
-    // legible and whose hash is committed is still a committed secret.
+    // A Basic-auth consumer whose hash is committed is a committed secret.
     let repo = Repo::with_consumer(BASICAUTH_LITERAL_HASH_CONSUMER);
 
     let output = repo.run(&["apply", "--auto-approve"], &[]);
@@ -1271,10 +1268,6 @@ fn apply_still_refuses_a_committed_secret_beside_an_identity() {
     assert!(
         stderr.contains("basicauth[0].password_hash"),
         "the refusal must name the secret leaf: {stderr}"
-    );
-    assert!(
-        !stderr.contains("basicauth[0].username"),
-        "the identity half must not be reported: {stderr}"
     );
     assert!(
         !repo.published().exists(),
@@ -2876,4 +2869,30 @@ fn rotate_and_export_refuse_a_malformed_recipient_first() {
         }
         assert!(!output_path.exists(), "{login:?}");
     }
+}
+
+#[test]
+fn a_basicauth_username_is_refused_with_where_the_login_comes_from() {
+    // Ferrum Edge keys basicauth on the consumer's own `username`, and an
+    // entry holds exactly one of `password` / `password_hash`.
+    let repo = Repo::with_consumer(
+        r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app-login"
+  credentials:
+    basicauth:
+      - username: alice
+        password_hash: "${gh-env-secret:alloc=require}"
+"#,
+    );
+    for command in [&["validate"][..], &["plan"], &["apply", "--auto-approve"]] {
+        let output = repo.run(command, &[("FERRUM_CREDS_JSON", BASICAUTH_BUNDLE)]);
+        assert!(!output.status.success(), "{command:?} must refuse");
+        let stderr = stderr(&output);
+        assert!(stderr.contains("credentials.basicauth[0]"), "{stderr}");
+        assert!(stderr.contains("consumer's own `username`"), "{stderr}");
+        assert!(stderr.contains("\"app-login\""), "{stderr}");
+    }
+    assert!(!repo.published().exists());
 }
