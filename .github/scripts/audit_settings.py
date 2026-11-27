@@ -41,7 +41,6 @@ REQUIRED_STATUS_CHECKS = (
     "trusted-supply-chain-policy",
     "state-guard-reject-state-edits",
     "gitforgeops-required-static-validation",
-    "validate-trusted-policy",
 )
 
 # Every required context is a GitHub Actions job, so the ruleset binds each to
@@ -57,7 +56,6 @@ GITHUB_ACTIONS_APP_ID = 15368
 SOURCE_BOUND_STATUS_CHECKS = (
     "trusted-supply-chain-policy",
     "state-guard-reject-state-edits",
-    "validate-trusted-policy",
 )
 
 # The required-check binding above names a check, not the workflow that ran it,
@@ -75,7 +73,6 @@ SOURCE_BOUND_STATUS_CHECKS = (
 REQUIRED_RULESET_WORKFLOWS = (
     ".github/workflows/supply-chain-policy.yml",
     ".github/workflows/state-guard.yml",
-    ".github/workflows/agent-setup-policy.yml",
     ".github/workflows/rust-ci.yml",
     ".github/workflows/security.yml",
     ".github/workflows/validate-pr.yml",

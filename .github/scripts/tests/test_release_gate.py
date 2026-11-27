@@ -34,20 +34,13 @@ REQUIRED = [
     "GitForgeOps Supply-Chain Policy / trusted-supply-chain-policy",
     "GitForgeOps State Guard / state-guard-reject-state-edits",
     "GitForgeOps PR Static Validation / gitforgeops-required-static-validation",
-    "Agent Setup Policy / validate-trusted-policy",
 ]
-# The two launch contexts whose workflows `pull_request_target` loads from the
+# The launch context whose workflow `pull_request_target` loads from the
 # protected branch.
 TRUSTED_POLICY_CHECK = {
     "bucket": "pass",
     "name": "trusted-supply-chain-policy",
     "workflow": "GitForgeOps Supply-Chain Policy",
-    "required": True,
-}
-AGENT_POLICY_CHECK = {
-    "bucket": "pass",
-    "name": "validate-trusted-policy",
-    "workflow": "Agent Setup Policy",
     "required": True,
 }
 
@@ -72,7 +65,6 @@ PASSING_CHECKS = [
         "workflow": "GitForgeOps State Guard",
         "required": True,
     },
-    AGENT_POLICY_CHECK,
 ]
 
 
@@ -519,7 +511,7 @@ class ReleaseGateBehavior:
                 self.assert_gate(without(check), False)
 
     def test_a_reported_policy_check_must_pass(self) -> None:
-        for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
+        for policy in (TRUSTED_POLICY_CHECK,):
             for bucket in ("fail", "pending", "skipping", "cancel"):
                 with self.subTest(check=policy["name"], bucket=bucket):
                     self.assert_gate(without(policy) + [dict(policy, bucket=bucket)], False)
@@ -533,7 +525,7 @@ class ReleaseGateBehavior:
         self.assert_gate(PASSING_CHECKS, True, settings=rules(*REQUIRED))
 
     def test_a_ruleset_missing_a_policy_context_fails_immediately(self) -> None:
-        for context in (REQUIRED[2], REQUIRED[5]):
+        for context in (REQUIRED[2], REQUIRED[3]):
             with self.subTest(context=context):
                 settings = rules(*[item for item in REQUIRED if item != context])
                 self.assert_gate(PASSING_CHECKS, False, settings=settings)
@@ -759,7 +751,7 @@ class ReleaseGateBehavior:
         self.assertEqual(self.sleeps, [["sleep", "15"]])
 
     def test_pending_policy_checks_wait_then_pass(self) -> None:
-        for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
+        for policy in (TRUSTED_POLICY_CHECK,):
             with self.subTest(check=policy["name"]):
                 pending = without(policy) + [dict(policy, bucket="pending")]
                 result = self.run_gate(PASSING_CHECKS, samples=[pending, PASSING_CHECKS])
@@ -767,7 +759,7 @@ class ReleaseGateBehavior:
                 self.assertEqual(self.sleeps, [["sleep", "15"]])
 
     def test_pending_policy_checks_wait_then_fail(self) -> None:
-        for policy in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK):
+        for policy in (TRUSTED_POLICY_CHECK,):
             with self.subTest(check=policy["name"]):
                 pending = without(policy) + [dict(policy, bucket="pending")]
                 failed = without(policy) + [dict(policy, bucket="cancel")]
@@ -802,7 +794,7 @@ class ReleaseGateBehavior:
 
     def test_absent_policy_checks_cannot_pass(self) -> None:
         result = self.run_gate(
-            without(TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK),
+            without(TRUSTED_POLICY_CHECK),
             settings=rules(*REQUIRED),
             sleep_advance=900,
         )
@@ -814,14 +806,14 @@ class ReleaseGateBehavior:
         result = self.run_gate(
             PASSING_CHECKS,
             settings=rules(*REQUIRED),
-            samples=[without(TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK), PASSING_CHECKS],
+            samples=[without(TRUSTED_POLICY_CHECK), PASSING_CHECKS],
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.sleeps, [["sleep", "15"]])
 
     def test_missing_required_contexts_on_page_two_cannot_pass_by_absence(self) -> None:
         coverage = {"bucket": "pass", "name": "coverage", "workflow": "Rust CI"}
-        for check in (TRUSTED_POLICY_CHECK, AGENT_POLICY_CHECK, coverage):
+        for check in (TRUSTED_POLICY_CHECK, coverage):
             with self.subTest(check=check["name"]):
                 context = f"{check['workflow']} / {check['name']}"
                 first_page = rules(*[item for item in REQUIRED if item != context])

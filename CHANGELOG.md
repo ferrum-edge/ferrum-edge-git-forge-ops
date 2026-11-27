@@ -7,6 +7,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Retiring the Agent Setup CI / Agent Setup Policy checks, step 2 of 3:
+  `Agent Setup Policy / validate-trusted-policy` is no longer a launch-required
+  context. It is dropped from `audit_settings.REQUIRED_STATUS_CHECKS` (and so
+  from the ruleset `bootstrap_repo_settings.py` writes),
+  `SOURCE_BOUND_STATUS_CHECKS`, `REQUIRED_RULESET_WORKFLOWS`, the release
+  gate's `REQUIRED_CHECKS`, `settings-audit.yml` and `check_supply_chain.py`,
+  whose transitional release-gate allowance is removed again.
 - Retiring the Agent Setup CI / Agent Setup Policy checks, step 1 of 3:
   `check_supply_chain.py` accepts the release gate's required-check list with
   or without `Agent Setup Policy / validate-trusted-policy`, so the next step
