@@ -661,6 +661,7 @@ class IsolationTests(unittest.TestCase):
             "modify_and_delete_in_order",
             "conditional_overwrite",
             "drift_monitoring",
+            "edge_contract_copies",
         ):
             with self.subTest(scenario=identifier):
                 start = source.index(f"def scenario_{identifier}(")
@@ -668,10 +669,15 @@ class IsolationTests(unittest.TestCase):
                 self.assertIn("ensure_deployed(harness)", body)
         # `create-and-route` seeds and applies as its own subject, and
         # `file-and-mesh-boundary` deliberately needs only the tree.
+        # Only that scenario's own function and its helper are inspected.
         start = source.index("def scenario_file_and_mesh_boundary(")
-        body = source[start : source.index("\n\n\nSCENARIOS", start)]
+        body = source[start : source.index("\n\n\ndef ", start)]
         self.assertIn("seed_repository(harness)", body)
         self.assertNotIn("ensure_deployed(harness)", body)
+        start = source.index("def _file_and_mesh_boundary(")
+        helper = source[start : source.index("\n\n\n", start)]
+        self.assertIn("harness.run(", helper)
+        self.assertNotIn("ensure_deployed(harness)", helper)
 
     def test_the_stale_write_probe_sends_if_match_to_the_admin_api(self):
         # `conditional-overwrite` certifies the gateway half of the guarantee:

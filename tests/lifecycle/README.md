@@ -121,6 +121,7 @@ python3 .github/scripts/lifecycle_result.py verify \
 | `LIFECYCLE_GATEWAY_CMD` | how to start the gateway. Left unset, the runner reads the build's own `--help`, picks the first of `serve`/`server`/`run`/`start`/`gateway` it offers, and falls back to the bare binary (a gateway configured entirely through `FERRUM_*`) |
 | `LIFECYCLE_GATEWAY_MODE` | `FERRUM_MODE` for the gateway (default `database`) |
 | `LIFECYCLE_GATEWAY_EXTERNAL` | do not start a gateway; one is already listening |
+| `LIFECYCLE_VIEWER_SECRET` | with `LIFECYCLE_GATEWAY_EXTERNAL`, that gateway's disposable `FERRUM_ADMIN_JWT_VIEWER_SECRET` (`edge-contract-copies` reads `GET /config/export` with it) |
 | `GITFORGEOPS_BINARY` | the binary under test (default `gitforgeops` on `PATH`) |
 
 If the gateway does not answer `GET /health` within 30 seconds, the run **fails**
@@ -221,9 +222,9 @@ before Edge releases it.
 | Closed Consumer projection (`src/config_export.rs`) | A consumer with every credential type compares in sync through `GET /config/export` with the viewer secret (exit 6), its fingerprints verify against a recorded baseline (exit 0), and an out-of-band change is drift (exit 2). |
 
 `run.sh` starts the gateway with a generated `FERRUM_ADMIN_JWT_VIEWER_SECRET`
-and exports it as `GITFORGEOPS_LIFECYCLE_VIEWER_SECRET`, the same way it
-handles the admin secret. A gateway started with `LIFECYCLE_GATEWAY_EXTERNAL=1`
-must have that viewer secret too, or this scenario fails.
+and exports it to the scenarios as `GITFORGEOPS_LIFECYCLE_VIEWER_SECRET`. With
+`LIFECYCLE_GATEWAY_EXTERNAL=1`, pass your gateway's disposable viewer secret as
+`LIFECYCLE_VIEWER_SECRET`; without it this scenario fails.
 
 The scenario runs last: the namespace registry row it creates stays for the
 rest of the run.

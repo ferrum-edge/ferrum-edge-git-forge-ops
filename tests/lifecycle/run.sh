@@ -48,7 +48,13 @@ FERRUM_ADMIN_JWT_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n=/+' | he
 GITFORGEOPS_LIFECYCLE_CONSUMER_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n=/+' | head -c 32)"
 # The gateway's viewer-token secret, so `edge-contract-copies` can read
 # `GET /config/export` the way `diff` does with FERRUM_ADMIN_JWT_VIEWER_SECRET.
-GITFORGEOPS_LIFECYCLE_VIEWER_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n=/+' | head -c 48)"
+# Generated for the gateway this script starts; an external gateway's own
+# disposable viewer secret comes in as LIFECYCLE_VIEWER_SECRET.
+if [ -n "${LIFECYCLE_GATEWAY_EXTERNAL:-}" ]; then
+  GITFORGEOPS_LIFECYCLE_VIEWER_SECRET="${LIFECYCLE_VIEWER_SECRET:-}"
+else
+  GITFORGEOPS_LIFECYCLE_VIEWER_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n=/+' | head -c 48)"
+fi
 export FERRUM_ADMIN_JWT_SECRET GITFORGEOPS_LIFECYCLE_CONSUMER_KEY GITFORGEOPS_LIFECYCLE_VIEWER_SECRET
 
 # The broker bundle the seeded `alloc=require` slot resolves from. 0600, inside

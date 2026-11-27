@@ -90,6 +90,9 @@ fields GitForgeOps does carry: built-in names, priorities, retired names, and re
    in `tests/unit/contracts_tests.rs`: every built-in plugin's sensitive config paths in the
    vocabulary must equal the broker rules in `src/secrets/plugin_config.rs`
    (`export_redacted_paths` and the per-plugin secret rules), in both directions, and a plugin
-   the vocabulary lists must not be missing from those rules. Until then those rules are a
-   transcription of Edge's sensitivity schema that no test compares with Edge.
+   the vocabulary lists must not be missing from those rules. The same test compares
+   `KAFKA_SAFE_PROPERTIES` with the vocabulary's Kafka safe-property allowlist in both
+   directions: a change there reclassifies `kafka_logging` producer properties without
+   changing any rule path. Until then those rules are a transcription of Edge's sensitivity
+   schema that no test compares with Edge.
 7. Open a PR and let the existing Rust CI run the contract test.

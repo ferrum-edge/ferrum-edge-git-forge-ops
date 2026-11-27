@@ -653,7 +653,16 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
                         "failure_class" => RESTORE_FAILURE_CLASSES,
                         _ => continue,
                     };
-                    for value in enum_values(schemas, property) {
+                    // A decision marker must stay a closed set: an unbounded
+                    // string could carry a value GitForgeOps never classified.
+                    let values = enum_values(schemas, property);
+                    if values.is_empty() {
+                        problems.push(format!(
+                            "POST /restore {status}: `{name}` is no longer a closed set of \
+                             values, so GitForgeOps cannot have classified every one"
+                        ));
+                    }
+                    for value in values {
                         if !allowed.contains(&value.as_str()) {
                             problems.push(format!(
                                 "POST /restore {status}: Edge documents `{name}: {value}`, which \
