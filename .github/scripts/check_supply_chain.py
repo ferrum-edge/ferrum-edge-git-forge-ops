@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import re
@@ -5654,6 +5655,10 @@ KNOWN_WORKFLOWS = frozenset({
     # actions other than `upload-sarif`. It reports no required check.
     "code-scanning.yml",
     "drift-check.yml",
+    # The Edge main early warning, moving out of validator-pin-canary.yml so
+    # pull requests that change it can run it. Fenced by
+    # `edge_main_drift_violations`.
+    "edge-main-drift.yml",
     "lifecycle.yml",
     "materialize-file.yml",
     "release.yml",
@@ -5698,6 +5703,135 @@ def _workflow_events(document: dict) -> list[str] | None:
     if isinstance(on, dict):
         return list(on)
     return None
+
+
+EDGE_MAIN_DRIFT_WORKFLOW = "edge-main-drift.yml"
+# The issue writer's exact condition, whitespace-normalized: it runs after
+# any finished check, never for a pull request, and only on the default
+# branch. GitHub compares expression strings case-insensitively, so the
+# `EDGE_MAIN_DRIFT_REF_GUARD` step repeats the branch check case-sensitively
+# before the token-bearing step.
+EDGE_MAIN_DRIFT_ISSUE_IF = (
+    "!cancelled() && needs.edge-main-drift.result != 'cancelled' && "
+    "needs.edge-main-drift.result != 'skipped' && github.event_name != 'pull_request' && "
+    "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+)
+EDGE_MAIN_DRIFT_REF_GUARD = {
+    "name": "Require protected default branch",
+    "env": {
+        "SOURCE_REF": "${{ github.ref }}",
+        "EXPECTED_REF": "refs/heads/${{ github.event.repository.default_branch }}",
+    },
+    "run": (
+        '[ "$SOURCE_REF" = "$EXPECTED_REF" ] || { '
+        'echo "::error::The Edge main drift issue may be written only from $EXPECTED_REF." '
+        "exit 1 }"
+    ),
+}
+# The reviewed report-handling step: its inputs are the check's result and
+# report and the job's own token, nothing else; its script is pinned by
+# SHA-256 so an edit to it is reviewed here, on the protected branch.
+EDGE_MAIN_DRIFT_ISSUE_STEP = {
+    "name": "Open, update or close the Edge main tracking issue",
+    "env": {
+        "GH_TOKEN": "${{ github.token }}",
+        "CHECK_RESULT": "${{ needs.edge-main-drift.result }}",
+        "OUTCOME": "${{ needs.edge-main-drift.outputs.outcome }}",
+        "EDGE_COMMIT": "${{ needs.edge-main-drift.outputs.edge-commit }}",
+        "REPORT": "${{ needs.edge-main-drift.outputs.report }}",
+    },
+    "run_sha256": "e13218132d56cb07b13fa6d8cd16138327daf68f9dd4a745ae53c8156da296e0",
+}
+
+
+def edge_main_drift_violations(text: str) -> list[str]:
+    """Fences for `edge-main-drift.yml`, which runs an unpinned Edge binary.
+
+    The job that runs the Edge `main` image (and, on a pull request, the
+    candidate's code) gets no secret: no workflow- or job-level `env`, no
+    environment, no `secrets.` reference, and only `contents: read`. It stays
+    away from the validator allowlist and caches. Only the issue job writes;
+    its condition, its case-sensitive default-branch guard and its reviewed
+    report step are pinned exactly, so it checks out and runs no code and
+    takes nothing from the check job but its result and report.
+    """
+    name = EDGE_MAIN_DRIFT_WORKFLOW
+    violations = workflow_name_violations(name, text, "Edge Main Drift")
+    try:
+        document = parse_workflow(text)
+    except WorkflowSyntaxError:
+        return violations
+    if document.get("permissions") != {"contents": "read"}:
+        violations.append(f"{name}: workflow permissions must be exactly `contents: read`")
+    for key in ("env", "defaults"):
+        if key in document:
+            violations.append(
+                f"{name}: workflow-level `{key}` is refused; every job would inherit it"
+            )
+    jobs = document.get("jobs") if isinstance(document.get("jobs"), dict) else {}
+    check = jobs.get("edge-main-drift")
+    issue = jobs.get("edge-main-drift-issue")
+    if not isinstance(check, dict) or not isinstance(issue, dict) or len(jobs) != 2:
+        return violations + [
+            f"{name}: exactly the `edge-main-drift` and `edge-main-drift-issue` jobs are allowed"
+        ]
+    for job_id, job in (("edge-main-drift", check), ("edge-main-drift-issue", issue)):
+        for key in ("environment", "env", "container", "services", "uses", "secrets"):
+            if key in job:
+                violations.append(f"{name}: the {job_id} job must not set `{key}`")
+
+    if check.get("permissions") != {"contents": "read"}:
+        violations.append(f"{name}: the edge-main-drift job must hold only `contents: read`")
+    check_text = json.dumps(check)
+    for forbidden in (
+        "secrets.",
+        "install-ferrum-edge.sh",
+        "ferrum-edge-checksums.txt",
+        "actions/cache",
+    ):
+        if forbidden in check_text:
+            violations.append(f"{name}: the edge-main-drift job must not use {forbidden!r}")
+
+    if issue.get("permissions") != {"contents": "read", "issues": "write"}:
+        violations.append(
+            f"{name}: the issue job must hold exactly `contents: read` and `issues: write`"
+        )
+    if issue.get("needs") != "edge-main-drift":
+        violations.append(f"{name}: the issue job must need exactly `edge-main-drift`")
+    if " ".join(str(issue.get("if", "")).split()) != EDGE_MAIN_DRIFT_ISSUE_IF:
+        violations.append(
+            f"{name}: the issue job condition must be exactly {EDGE_MAIN_DRIFT_ISSUE_IF!r}"
+        )
+    steps = issue.get("steps")
+    if not isinstance(steps, list) or len(steps) != 2 or not all(
+        isinstance(step, dict) for step in steps
+    ):
+        return violations + [
+            f"{name}: the issue job must run exactly the default-branch guard and the "
+            "reviewed report step"
+        ]
+    guard, report = steps
+    if (
+        set(guard) != {"name", "env", "run"}
+        or guard.get("name") != EDGE_MAIN_DRIFT_REF_GUARD["name"]
+        or guard.get("env") != EDGE_MAIN_DRIFT_REF_GUARD["env"]
+        or " ".join(str(guard.get("run", "")).split()) != EDGE_MAIN_DRIFT_REF_GUARD["run"]
+    ):
+        violations.append(
+            f"{name}: the issue job must start with the case-sensitive default-branch guard"
+        )
+    if (
+        set(report) != {"name", "env", "run"}
+        or report.get("name") != EDGE_MAIN_DRIFT_ISSUE_STEP["name"]
+        or report.get("env") != EDGE_MAIN_DRIFT_ISSUE_STEP["env"]
+        or hashlib.sha256(str(report.get("run", "")).encode("utf-8")).hexdigest()
+        != EDGE_MAIN_DRIFT_ISSUE_STEP["run_sha256"]
+    ):
+        violations.append(
+            f"{name}: the issue job's report step must be the reviewed one (name, inputs and "
+            "script pinned); change it here on the protected branch first"
+        )
+    return violations
 
 
 def workflow_allowlist_violations(workflow: str, document: dict) -> list[str]:
@@ -6958,6 +7092,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if "cargo build --release --locked" not in docker_instructions:
         violations.append("Dockerfile: Cargo release build must enforce Cargo.lock")
+
+    edge_main_drift = workflows / EDGE_MAIN_DRIFT_WORKFLOW
+    if edge_main_drift.is_file():
+        violations.extend(edge_main_drift_violations(edge_main_drift.read_text(encoding="utf-8")))
 
     rust_ci = (workflows / "rust-ci.yml").read_text(encoding="utf-8")
     if "tool: cargo-llvm-cov@0.9.0" not in rust_ci:

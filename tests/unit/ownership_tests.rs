@@ -57,7 +57,6 @@ fn proxy(id: &str, namespace: &str) -> Proxy {
         tcp_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
-        pool_max_requests_per_connection: None,
         upstream_subset: None,
         api_spec_id: None,
         websocket_idle_timeout_seconds: None,

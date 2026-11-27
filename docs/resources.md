@@ -426,37 +426,31 @@ daily canary.
 Labels are informational. The ownership ledger and API-spec rules decide
 adoption, reconciliation and deletion.
 
-## Version-aware proxy fields (`pool_max_requests_per_connection`)
+## Removed gateway fields
 
-Ferrum Edge v0.9.20 accepts and persists `Proxy.spec.pool_max_requests_per_connection`
-(a no-op field whose omission on write clears the stored value). Ferrum Edge
-v0.9.21, the pinned release, removed the field while keeping `Proxy`
-`deny_unknown_fields`
-([ferrum-edge#7218](https://github.com/ferrum-edge/ferrum-edge/issues/7218);
-caught ahead of release by the weekly Edge `main` check in `#737`).
+The minimum supported Ferrum Edge is the pinned release (`validator.version` in
+`release/baseline.json`, currently v0.9.21). Fields an older Edge accepted and
+that release removed are not modeled, so a resource file that still sets one
+is refused with an `unknown configuration field(s)` error naming it:
 
-GitForgeOps handles the field according to the paired Edge release configured
-via `edge_version` on an environment in `.gitforgeops/config.yaml` or
-`FERRUM_EDGE_VERSION` (repo config wins; unset defaults to the pinned
-`v0.9.21`, the `validator.version` in `release/baseline.json`):
+- `Proxy.spec.pool_max_requests_per_connection`: a no-op carrier Ferrum Edge
+  v0.9.21 removed ([ferrum-edge#7218](https://github.com/ferrum-edge/ferrum-edge/issues/7218)).
+- `Upstream.spec.health_checks.passive.gateway_error_codes` and
+  `split_external_local_origin_errors`: accepted through v0.9.21 and never
+  applied; Ferrum Edge 1.0.0 removes them.
 
-- **Paired with `< v0.9.21` (for example `edge_version: v0.9.20`, set
-  explicitly):**
-  `pool_max_requests_per_connection` is accepted, emitted (in validation,
-  export, file apply and API apply) and diffed verbatim. Omitting the field in
-  desired state while a live v0.9.20 proxy still sets it reports a `Modify`
-  (`1000 -> null`), matching v0.9.20's write semantics where omitting the field
-  clears it. If a document carrying the field is validated against a v0.9.21+
-  `ferrum-edge` binary without selecting a `>= v0.9.21` pairing, GitForgeOps
-  prepends `gitforgeops error [validator-pool-max-requests-per-connection]`
-  before apply with the validator path and remediation choices.
-- **Paired with `>= v0.9.21` (including unset):**
-  Proxy files carrying `pool_max_requests_per_connection` still load under
-  strict mode without migrating the tree, and GitForgeOps omits the removed
-  field from assembled desired state (validation, export, diff, file apply and
-  API apply) with a `Notice:` on stderr naming the affected proxies. Live
-  snapshots are never stripped, so a misconfigured v0.9.21 pairing aimed at a
-  v0.9.20 gateway still surfaces a real difference.
+Delete such a field from resources and overlays. A live gateway row that still
+stores one is treated by the existing rules for fields this build does not
+model:
 
-Paired fixtures with and without the field live under
-`tests/fixtures/pool-max-requests/`.
+- The two passive-health keys are nested, so the refusal is unconditional:
+  import refuses a source carrying either, and apply refuses to rewrite an
+  upstream that stores one, until the value is cleared on the gateway.
+- `pool_max_requests_per_connection` is a top-level Proxy field, so the
+  version-skew rules in [Supported fields and unknown fields](#supported-fields-and-unknown-fields) apply. By default
+  import refuses it and apply refuses to rewrite a proxy that stores it. Import
+  accepts it with `--accept-unknown-field pool_max_requests_per_connection`
+  and `FERRUM_ALLOW_UNKNOWN_FIELDS=true`, and apply rewrites such a proxy only
+  if the repository declares the field under that flag, which sends it to a
+  gateway that refuses it since v0.9.21. Clearing it on the gateway is the
+  remedy.

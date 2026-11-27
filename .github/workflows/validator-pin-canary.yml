@@ -445,6 +445,24 @@ jobs:
           done
           exit "$status"
 
+      # Edge main's openapi.yaml at the image's commit against the mirrored
+      # top-level field lists and every nested key the companion fixtures
+      # emit. The marker proves the comparison ran rather than a test filter
+      # matching nothing.
+      - name: Compare Edge main's openapi.yaml with what GitForgeOps emits
+        id: openapi
+        continue-on-error: true
+        env:
+          EDGE_COMMIT: ${{ steps.edge.outputs.commit }}
+        run: |
+          set -euo pipefail
+          spec="$RUNNER_TEMP/edge-main-openapi.yaml"
+          curl -fsS --retry 3 -o "$spec" \
+            "https://raw.githubusercontent.com/ferrum-edge/ferrum-edge/$EDGE_COMMIT/openapi.yaml"
+          EDGE_MAIN_OPENAPI="$spec" cargo test --locked --test unit_tests \
+            edge_main_openapi_tests:: -- --nocapture | tee "$RUNNER_TEMP/edge-main-openapi.log"
+          grep -q 'edge-main-openapi: compared' "$RUNNER_TEMP/edge-main-openapi.log"
+
       # The lifecycle suite's apply, diff (drift) and traffic scenarios
       # against a loopback gateway started from the Edge main binary. The
       # result file stays in the runner: only lifecycle.yml's results reach
@@ -476,6 +494,7 @@ jobs:
           DELTA: ${{ steps.edge.outputs.delta }}
           DELTA_NOTE: ${{ steps.edge.outputs.delta-note }}
           LABELS: ${{ steps.labels.outcome }}
+          OPENAPI: ${{ steps.openapi.outcome }}
           VALIDATE: ${{ steps.validate.outcome }}
           LIFECYCLE: ${{ steps.lifecycle.outcome }}
           SETUP_CHECKOUT: ${{ steps.checkout.outcome }}
@@ -500,7 +519,7 @@ jobs:
             [ "${entry#*=}" = success ] || failed_setup="$failed_setup ${entry%%=*}"
           done
           outcome=clean
-          for result in "$LABELS" "$VALIDATE" "$LIFECYCLE"; do
+          for result in "$LABELS" "$OPENAPI" "$VALIDATE" "$LIFECYCLE"; do
             [ "$result" = success ] || outcome=drift
           done
           [ -z "$failed_setup" ] || outcome=error
@@ -526,6 +545,7 @@ jobs:
             echo "| Check | Result |"
             echo "|---|---|"
             echo "| Resource labels on all four gateway resource kinds (\`check-validator-resource-labels.sh\`) | $(verdict "$LABELS") |"
+            echo "| Edge \`main\` openapi.yaml declares the mirrored fields and every nested key GitForgeOps emits (\`edge_main_openapi_tests.rs\`) | $(verdict "$OPENAPI") |"
             echo "| \`gitforgeops validate\` for every environment | $(verdict "$VALIDATE") |"
             echo "| Lifecycle suite (\`tests/lifecycle/run.sh\`: apply, diff and traffic against a real gateway) | $(verdict "$LIFECYCLE") |"
             echo
@@ -555,6 +575,18 @@ jobs:
       contents: read
       issues: write
     steps:
+      # GitHub compares the job condition case-insensitively; repeat the
+      # default-branch check case-sensitively before the token is used.
+      - name: Require protected default branch
+        env:
+          SOURCE_REF: ${{ github.ref }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          [ "$SOURCE_REF" = "$EXPECTED_REF" ] || {
+            echo "::error::The Edge main drift issue may be written only from $EXPECTED_REF."
+            exit 1
+          }
+
       - name: Open, update or close the Edge main tracking issue
         env:
           GH_TOKEN: ${{ github.token }}

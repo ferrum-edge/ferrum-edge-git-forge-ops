@@ -1103,7 +1103,7 @@ bash .github/scripts/refresh-ferrum-edge-pin.sh --newer            # that tag, o
 
 Moving the pin is one reviewed change: append the new line, then set
 `validator` and `tested_gateway` in `release/baseline.json`, the Dockerfile
-gateway stage, `DEFAULT_EDGE_VERSION` and the contracts pin to the new release
+gateway stage and the contracts pin to the new release
 (`check_release_baseline.py` refuses a partial move).
 
 **Edge 1.0.0 readiness (for the 1.0 pin change).** Already done ahead of the
@@ -1129,8 +1129,8 @@ Still for the pin change itself:
   submission to 1.0.0.
 - Edge 1.0.0 speaks ConfigSync revision 8 and refuses 0.9.21 peers, so CP and
   DP gateways in any test or acceptance setup must run the same 1.0.0 build.
-- Move the Edge pin, contracts pin, `DEFAULT_EDGE_VERSION`, release baseline
-  and product version together, as above.
+- Move the Edge pin, contracts pin, release baseline and product version
+  together, as above.
 
 `validator-pin-canary.yml` runs daily. When the pinned build no longer
 installs, the pinned binary rejects
@@ -1142,8 +1142,11 @@ pinned ferrum-edge validator digest*. Only the first two fail the run.
 
 Its weekly `edge-main-drift` job is an early warning, not a pin: it copies the
 gateway binary out of Edge's signed `main` image (Cosign-verified against
-Edge's Main Latest Image workflow), runs the label probe, `gitforgeops validate`
-for every environment and the lifecycle suite with it, and opens or closes one
+Edge's Main Latest Image workflow), runs the label probe, compares Edge
+`main`'s `openapi.yaml` with the mirrored resource fields and every nested key
+GitForgeOps emits (`tests/unit/edge_main_openapi_tests.rs`), runs
+`gitforgeops validate` for every environment and the lifecycle suite (a fresh
+throwaway database each run) with it, and opens or closes one
 issue labelled `edge-main-drift` (also opened when the check cannot run). It never reads or changes the allowlist.
 Dispatch it with `gh workflow run validator-pin-canary.yml -f check=edge-main`.
 

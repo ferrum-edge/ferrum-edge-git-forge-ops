@@ -6,10 +6,6 @@
 //!
 //! * **`validator-resource-labels`** — an Edge build predating `ferrum-edge#5483`
 //!   rejected mandatory `labels` on a gateway resource.
-//! * **`validator-pool-max-requests-per-connection`** — an Edge `>= v0.9.21`
-//!   build rejected `Proxy.pool_max_requests_per_connection`, which Edge removed
-//!   after v0.9.20 (`ferrum-edge#7218`), when the run was explicitly paired with
-//!   v0.9.20 or earlier (the default pairing is the pinned v0.9.21).
 
 use crate::diagnostics::safe;
 
@@ -23,8 +19,6 @@ const RESOURCE_SIGNATURES: &[&[&str]] = &[
 
 const LABELS_PREFIX: &str =
     "Validation error: Spec validation failed: unknown field `labels`, expected one of ";
-const POOL_MAX_PREFIX: &str = "Validation error: Spec validation failed: unknown field \
-                               `pool_max_requests_per_connection`, expected one of ";
 
 /// Recognize Edge's serde unknown-field rejection, including the expected-field
 /// signature of the matching gateway resource kind(s). A mention of the field,
@@ -135,42 +129,6 @@ fn resource_labels_diagnostic(stdout: &str, stderr: &str, binary_path: &str) -> 
     ))
 }
 
-fn pool_max_requests_diagnostic(stdout: &str, stderr: &str, binary_path: &str) -> Option<String> {
-    let stdout_rejection = unknown_resource_field_rejection(
-        stdout,
-        POOL_MAX_PREFIX,
-        "pool_max_requests_per_connection",
-        &[PROXY_SIGNATURE],
-    );
-    let stderr_rejection = unknown_resource_field_rejection(
-        stderr,
-        POOL_MAX_PREFIX,
-        "pool_max_requests_per_connection",
-        &[PROXY_SIGNATURE],
-    );
-    if stdout_rejection.is_none() && stderr_rejection.is_none() {
-        return None;
-    }
-    let header = format!(
-        "gitforgeops error [validator-pool-max-requests-per-connection]: Ferrum Edge v0.9.21 and \
-         later removed the no-op Proxy field `pool_max_requests_per_connection` \
-         (ferrum-edge#7218). Validator binary: {}. This environment is paired with an earlier \
-         Edge release; set `edge_version: v0.9.21` on it in `.gitforgeops/config.yaml` (or \
-         `FERRUM_EDGE_VERSION=v0.9.21`, or leave both unset for the pinned default) to omit \
-         the removed field automatically for v0.9.21+ targets; remove \
-         `pool_max_requests_per_connection` from proxy YAML if no v0.9.20 gateway \
-         uses it (a save omitting it clears the stored field on v0.9.20); or validate with a \
-         v0.9.20 `ferrum-edge` binary.\n",
-        safe(binary_path)
-    );
-    Some(prepend_diagnostic(
-        header,
-        stdout_rejection,
-        stderr_rejection,
-        stderr,
-    ))
-}
-
 /// Prepend an actionable compatibility error to already-scrubbed stderr,
 /// retaining Edge's original streams for debugging. Copy a stdout rejection
 /// into stderr too: plan's failure detail is read from stderr. Never inspect
@@ -182,5 +140,4 @@ pub(super) fn compatibility_diagnostic(
     binary_path: &str,
 ) -> Option<String> {
     resource_labels_diagnostic(stdout, stderr, binary_path)
-        .or_else(|| pool_max_requests_diagnostic(stdout, stderr, binary_path))
 }

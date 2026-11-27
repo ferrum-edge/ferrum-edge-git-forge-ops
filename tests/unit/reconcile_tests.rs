@@ -66,7 +66,6 @@ fn proxy(id: &str, namespace: &str) -> Proxy {
         tcp_idle_timeout_seconds: None,
         allowed_methods: None,
         allowed_ws_origins: vec![],
-        pool_max_requests_per_connection: None,
         upstream_subset: None,
         api_spec_id: None,
         websocket_idle_timeout_seconds: None,
@@ -85,7 +84,6 @@ fn env(mode: OwnershipMode, namespaces: Option<Vec<String>>) -> ResolvedEnv {
         overlay: None,
         namespace_filter: None,
         namespace_filter_is_environment_scope: false,
-        edge_version: None,
         apply_strategy: ApplyStrategy::Incremental,
         ownership: OwnershipConfig {
             mode,

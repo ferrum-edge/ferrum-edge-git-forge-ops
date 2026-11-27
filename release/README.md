@@ -48,8 +48,8 @@ source commit, release workflow and `refs/tags/v0.9.21`.
 Review the [v0.9.21 operator changes](https://github.com/ferrum-edge/ferrum-edge/blob/f9915358c8032214f4034a17c28cdf72d14006c3/docs/upgrade_guide.md#upgrading-to-0921)
 before rollout. v0.9.21 follows v0.9.20 directly and refuses many
 configurations and requests v0.9.20 accepted: the no-op
-`Proxy.pool_max_requests_per_connection` is removed (GitForgeOps omits it from
-desired state for this pairing), several deprecated plugin options and alias
+`Proxy.pool_max_requests_per_connection` is removed (GitForgeOps no longer
+models it), several deprecated plugin options and alias
 spellings are refused, `hmac_auth` requires `replay_scope`, export fingerprints
 are keyed from `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (re-baseline
 drift fingerprints once), and tokens verified by

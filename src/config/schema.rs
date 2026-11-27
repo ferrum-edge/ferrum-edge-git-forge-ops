@@ -881,9 +881,6 @@ pub struct Proxy {
     pub pool_http2_max_concurrent_streams: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_http3_connections_per_backend: Option<usize>,
-    /// Deprecated upstream carrier, still persisted — mirrored for fidelity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pool_max_requests_per_connection: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_id: Option<String>,
     /// Names a subset declared in the referenced upstream's `subsets`.

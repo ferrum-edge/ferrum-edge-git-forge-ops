@@ -1,0 +1,3 @@
+# Vendored ferrum-contracts files are checksummed byte for byte in PIN; never
+# rewrite their line endings on checkout (ferrum-contracts docs/consumer-pins.md).
+contracts/ferrum-contracts/** -text

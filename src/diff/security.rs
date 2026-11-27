@@ -657,16 +657,6 @@ fn check_plugin(plugin: &PluginConfig, findings: &mut Vec<SecurityFinding>) {
                 ),
             ));
         }
-        "hmac_auth" if cfg_bool(cfg, &["allow_unsafe_replayable_v1"]) == Some(true) => {
-            findings.push(SecurityFinding::error(
-                    "PluginConfig",
-                    id,
-                    ns,
-                    format!(
-                    "hmac_auth plugin {id} in namespace {ns} has allow_unsafe_replayable_v1: true — signatures from the v1 profile can be captured and replayed; migrate clients and remove the key"
-                ),
-            ));
-        }
         _ => {}
     }
 

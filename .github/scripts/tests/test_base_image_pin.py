@@ -248,15 +248,10 @@ class RealDockerfileTests(unittest.TestCase):
         )
         self.assertIn("dpkg --purge", instructions)
 
-    def test_the_live_dockerfile_keeps_the_libpcre2_fix_until_base_metadata_is_verified(self):
+    def test_the_live_dockerfile_pins_exactly_the_fixes_the_base_lacks(self):
         self.assertEqual(
             self.pin.versions_by_name(),
             {
-                "libpcre2-8-0": {"amd64": "10.46-1~deb13u3", "arm64": "10.46-1~deb13u3"},
-                "liblzma5": {
-                    "amd64": "5.8.1-1+deb13u2",
-                    "arm64": "5.8.1-1+deb13u2",
-                },
                 "zlib1g": {
                     "amd64": "1.3.dfsg+really1.3.1-1+deb13u1",
                     "arm64": "1.3.dfsg+really1.3.1-1+deb13u1",
@@ -272,10 +267,6 @@ class RealDockerfileTests(unittest.TestCase):
         self.assertEqual(
             {(package.name, package.target): package.digest for package in self.pin.packages},
             {
-                ("libpcre2-8-0", "amd64"): "e226f661d918f04daf38cdbc4806b7ed7d6ef95c7eb0ade692fc350e31970040",
-                ("libpcre2-8-0", "arm64"): "1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7",
-                ("liblzma5", "amd64"): "b38acab30f295bf1066a6632e31cbd0a1980f2924b38040cda131d5dea5384ec",
-                ("liblzma5", "arm64"): "88f3aa499dc30edf01b9209ab40f11e37edfbecef971f84f4721de1874ed4827",
                 ("zlib1g", "amd64"): "8c27c342230503b73dfde629642c3b352e87b554e06d60cf58772f236a305ceb",
                 ("zlib1g", "arm64"): "0e41b3d7ad8ad7fcd36dd4d61ca91a70018478fc4af652e044f4be770784ddff",
                 ("libc6", "amd64"): "b59b0625cd1a791375d40dab23a4d5d3d0641e3d0a773501becdc3725b7f99cf",
@@ -293,8 +284,6 @@ class RealDockerfileTests(unittest.TestCase):
         self.assertEqual(
             self.pin.pools,
             {
-                "libpcre2-8-0": "debian-security/pool/updates/main/p/pcre2",
-                "liblzma5": "debian-security/pool/updates/main/x/xz-utils",
                 "zlib1g": "debian-security/pool/updates/main/z/zlib",
                 # Debian 13.8 shipped the glibc fixes through the main archive.
                 "libc6": "debian/pool/main/g/glibc",

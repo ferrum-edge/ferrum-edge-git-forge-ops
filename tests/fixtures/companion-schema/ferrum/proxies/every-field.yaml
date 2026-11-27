@@ -43,7 +43,6 @@ spec:
   pool_http2_max_frame_size: 32768
   pool_http2_max_concurrent_streams: 250
   pool_http3_connections_per_backend: 2
-  pool_max_requests_per_connection: 1000
   upstream_id: every-field-upstream
   upstream_subset: canary
   circuit_breaker:

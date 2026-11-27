@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use super::edge_version::{EdgeVersion, DEFAULT_EDGE_VERSION};
 use super::env::{ApplyStrategy, EnvConfig};
 use super::repo_config::{
     EnvironmentConfig, OwnershipConfig, OwnershipMode, RepoConfig, REPO_CONFIG_PATH,
@@ -24,9 +23,6 @@ pub struct ResolvedEnv {
     /// An environment-declared filter *is* that environment's publication
     /// scope; an ad-hoc one narrows it.
     pub namespace_filter_is_environment_scope: bool,
-    /// Paired Ferrum Edge release version selected by the environment config or
-    /// `FERRUM_EDGE_VERSION`. `None` uses [`DEFAULT_EDGE_VERSION`].
-    pub edge_version: Option<EdgeVersion>,
     pub apply_strategy: ApplyStrategy,
     pub ownership: OwnershipConfig,
 }
@@ -34,12 +30,6 @@ pub struct ResolvedEnv {
 impl ResolvedEnv {
     pub fn default_env_name() -> String {
         "default".to_string()
-    }
-
-    /// Effective paired Ferrum Edge release version for this run, defaulting to
-    /// [`DEFAULT_EDGE_VERSION`] (the pinned `v0.9.21`) when unset.
-    pub fn effective_edge_version(&self) -> EdgeVersion {
-        self.edge_version.unwrap_or(DEFAULT_EDGE_VERSION)
     }
 
     /// Does this run see everything the environment publishes?
@@ -269,14 +259,12 @@ fn merge(name: String, env: &EnvironmentConfig, env_config: &EnvConfig) -> Resol
         .namespace_filter
         .clone()
         .or_else(|| env_config.namespace_filter.clone());
-    let edge_version = env.edge_version.or(env_config.edge_version);
 
     ResolvedEnv {
         name,
         overlay,
         namespace_filter,
         namespace_filter_is_environment_scope,
-        edge_version,
         apply_strategy: env.apply_strategy.clone(),
         ownership: env.ownership.clone(),
     }
@@ -296,7 +284,6 @@ fn synthetic_default(env_config: &EnvConfig, explicit_env: Option<&str>) -> Reso
         overlay: env_config.overlay.clone(),
         namespace_filter: env_config.namespace_filter.clone(),
         namespace_filter_is_environment_scope: false,
-        edge_version: env_config.edge_version,
         apply_strategy: env_config.apply_strategy.clone(),
         ownership: OwnershipConfig {
             mode: OwnershipMode::Shared,

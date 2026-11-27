@@ -71,11 +71,18 @@ fields GitForgeOps does carry: built-in names, priorities, retired names, and re
    if the tag points to an annotated tag.
 2. Download the adopted vocabularies, GitForgeOps resource schema and fixtures from that exact
    commit into the matching paths under `contracts/ferrum-contracts/`.
-3. Update `PIN` with the tag, commit SHA, and `shasum -a 256` for every vendored file.
-4. Update `edge_version` in `PIN` and the literal tag, commit and Edge version the contract test
-   asserts. The Edge version must already be in `.github/ferrum-edge-checksums.txt` and must
-   equal `validator.version` in `release/baseline.json` (move the Edge pin in the same change;
-   see [the release baseline](../release/README.md)).
+3. Rewrite `PIN` in the format ferrum-contracts defines for every consumer
+   ([consumer-pins.md](https://github.com/ferrum-edge/ferrum-contracts/blob/main/docs/consumer-pins.md#format)):
+   `tag <tag>`, `commit <sha>`, `edge_version <vX.Y.Z>`, then one `<sha256>  <path>` row per
+   vendored file (`sha256sum` text-mode lines, two spaces), sorted by path byte order. The
+   contract test parses it strictly and refuses any other line.
+4. Update `edge_version` in `PIN`, then the three literals (tag, commit, Edge version) that
+   `vendored_contract_files_match_the_pin_hashes` in `tests/unit/contracts_tests.rs` asserts;
+   no other test names the adopted pin (the parser tests use a fixed sample). The Edge version
+   must already be in `.github/ferrum-edge-checksums.txt` and must equal `validator.version` in
+   `release/baseline.json` (move the Edge pin in the same change; see
+   [the release baseline](../release/README.md)). `.gitattributes` marks the vendored tree
+   `-text`, so checkouts never rewrite the bytes `PIN` hashes.
 5. Resolve drift through the owning implementation or the upstream contract, then re-vendor; do
    not patch a shared vendored file locally.
 6. Open a PR and let the existing Rust CI run the contract test.

@@ -308,21 +308,18 @@ ferrum-edge#5483; Edge 0.9.4 and earlier reject the labels.
 
 `validate::compatibility` recognizes failed gateway validator rejections for
 unknown `labels` (prefix `Validation error: Spec validation failed:`, with one
-of the four kinds' expected-field signature) and unknown
-`pool_max_requests_per_connection` on a `Proxy` (removed in Ferrum Edge v0.9.21,
-ferrum-edge#7218). It prepends `gitforgeops error [validator-resource-labels]`
-or `gitforgeops error [validator-pool-max-requests-per-connection]` with the
-validator path (from the existing `which` lookup) and actionable remedies. No
-version probe or version gate. Original output still goes through scrubbing. All
-formats carry the message; `plan` and `review` keep their validation-blocker
-verdicts; file apply refuses before publication. Mesh and other schema errors
-are unchanged. Environments paired with `>= v0.9.21` (`edge_version` in
-`.gitforgeops/config.yaml` or `FERRUM_EDGE_VERSION`; the default is
-`DEFAULT_EDGE_VERSION`, the pinned v0.9.21, which `check_release_baseline.py`
-keeps equal to `validator.version` in `release/baseline.json`) omit
-`pool_max_requests_per_connection` from assembled desired state at the shared
-`pipeline::load_and_assemble` boundary with a stderr notice; an explicit
-`v0.9.20` pairing keeps v0.9.20 accept/emit/diff behaviour exact.
+of the four kinds' expected-field signature). It prepends
+`gitforgeops error [validator-resource-labels]` with the validator path (from
+the existing `which` lookup) and actionable remedies. No version probe or
+version gate. Original output still goes through scrubbing. All formats carry
+the message; `plan` and `review` keep their validation-blocker verdicts; file
+apply refuses before publication. Mesh and other schema errors are unchanged.
+
+The minimum supported Ferrum Edge is the pinned release (`validator.version`
+in `release/baseline.json`, v0.9.21). There is no per-environment Edge version
+selection: fields an older Edge accepted and the pinned release removed (for
+example `Proxy.pool_max_requests_per_connection`, removed in v0.9.21) are not
+modeled, so the strict loader refuses them.
 
 The installer (`install-ferrum-edge.sh`) installs exactly the release
 `release/baseline.json` pins (`validator.version` resolved through
@@ -2117,8 +2114,11 @@ Fixtures (`tests/fixtures/`):
 - `edge-openapi/resource-fields.json` lists the pinned Edge OpenAPI's top-level
   `Proxy`/`Upstream` properties. `companion_schema_tests.rs` fails when a
   writable one is not mirrored, when a mirrored field is not in the list, or
-  when the list's release is not the newest in the validator allowlist; a
-  validator pin bump regenerates it (its README says how).
+  when the list's release is not the pinned `validator.version`; a validator
+  pin bump regenerates it (its README says how). `edge_main_openapi_tests.rs`
+  compares the same lists, and every nested key the companion fixtures emit,
+  with Edge `main`'s `openapi.yaml` when `EDGE_MAIN_OPENAPI` is set (the Edge
+  Main Drift workflow sets it; it returns early otherwise).
 - `quickstart/` is the copyable half of `docs/quickstart.md` (the files the
   guide tells operators to write, plus its `.gitforgeops/config.yaml`).
   `quickstart_tests.rs` loads it strictly, applies the production overlay,

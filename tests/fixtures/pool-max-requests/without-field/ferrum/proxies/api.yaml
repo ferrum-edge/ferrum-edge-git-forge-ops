@@ -1,7 +1,0 @@
-kind: Proxy
-spec:
-  id: pool-max-proxy
-  listen_path: /pool-max
-  backend_scheme: https
-  backend_host: example.invalid
-  backend_port: 443
