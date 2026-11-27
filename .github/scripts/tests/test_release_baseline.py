@@ -100,7 +100,8 @@ class ReleaseBaselineTests(unittest.TestCase):
         issues = check_release_baseline.check(self.root)
         self.assertTrue(any("Dockerfile gateway base" in issue for issue in issues), issues)
 
-        record = self.record()
+        # Start again from the committed record: the cases above rewrote it.
+        record = json.loads(json.dumps(RECORD))
         record["validator"]["version"] = "v0.9.14"
         self.write_record(record)
         issues = check_release_baseline.check(self.root)

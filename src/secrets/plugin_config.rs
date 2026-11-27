@@ -2799,7 +2799,7 @@ mod tests {
         let components: Vec<ConfigPathComponent> = path
             .iter()
             .map(|key| {
-                let name: &str = if *key == "*" { "sample" } else { *key };
+                let name: &str = if *key == "*" { "sample" } else { key };
                 ConfigPathComponent::Key(name.to_string())
             })
             .collect();
