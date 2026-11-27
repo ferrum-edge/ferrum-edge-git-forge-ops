@@ -14,9 +14,11 @@
   <a href="https://hub.docker.com/r/ferrumedge/ferrum-edge-git-forge-ops"><img src="https://img.shields.io/docker/pulls/ferrumedge/ferrum-edge-git-forge-ops" alt="Docker Pulls" /></a>
 </p>
 
-> **Release status:** there is no supported GitForgeOps release until the
-> [release record](release/baseline.json) says `supported`. From 1.0.0 onward,
-> the CLI, configuration, state and workflow formats change only as the
+> **Release status:** a GitForgeOps release is supported only when its
+> finalized record is in
+> [`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+> on upstream `main`. From 1.0.0 onward, the CLI, configuration, state and
+> workflow formats change only as the
 > [compatibility policy](release/README.md#publishing-and-later-changes) allows.
 > See [Development status](#development-status).
 
@@ -46,24 +48,30 @@ repository shape.
 
 ## Development status
 
-First supported baseline: [v0.1.0](release/README.md). The committed
-[upstream release record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json)
-is the source of truth for status and for the exact component pairing:
+First supported baseline: [v0.1.0](release/README.md). Support is recorded on
+upstream `main`, never in a copy or in a tag's own source archive:
 
-- While its `status` is `pending`, there is no supported GitForgeOps release.
-  `main` is being prepared as the release candidate and may still change the
-  CLI, configuration and state formats without migration steps.
-- Once `status` becomes `supported`, use only the source SHA, image digest,
-  validator pin and gateway pairing in that record.
+- A GitForgeOps release is supported once its finalized record exists in
+  [`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+  (`<tag>.json`, `status` `supported`, immutable once committed). Use only the
+  source SHA, image digest, validator pin and gateway pairing in that record.
+- [`release/baseline.json`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json)
+  describes the release being prepared and stays `pending` until it is
+  published. Preparing a release never changes the record of one already
+  published. Until the first record exists there is no supported release, and
+  `main` may still change the CLI, configuration and state formats without
+  migration steps.
 
 From 1.0.0 onward, GitForgeOps versions follow semantic versioning. Within a
 major version, the CLI (commands, flags, exit codes), repository configuration
 (`.gitforgeops/*.yaml`), resource and overlay files, the state ledger and the
 bundled workflows change only compatibly. A removal or incompatible change is
 announced as a deprecation in a release note first and lands only in a new
-major version with migration steps; state ledger changes are forward-only
-migrations. Revisions from before the first supported release carry no
-compatibility or upgrade commitment. The
+major version with migration steps; the one exception is a security fix that
+cannot be made compatibly, which may ship in a minor release with an advisory
+and an upgrade note ([security policy](SECURITY.md#supported-versions)). State
+ledger changes are forward-only migrations. Revisions from before the first
+supported release carry no compatibility or upgrade commitment. The
 [release policy and adoption steps](release/README.md#publishing-and-later-changes)
 give the details.
 
@@ -293,11 +301,14 @@ environment through to a first apply and authenticated traffic.
     gh secret set SETTINGS_AUDIT_TOKEN --repo acme/gateway-config --env settings-audit
     ```
 
-11. **Own the validator pin.** `.github/ferrum-edge-checksums.txt` lists the
-    SHA-256 of every approved `ferrum-edge` build. When
-    `validator-pin-canary.yml` opens its issue, review the new build, run
-    `bash .github/scripts/refresh-ferrum-edge-pin.sh --append`, and merge,
-    keeping the previous line. See [Validator pinning](#validator-pinning).
+11. **Know the validator pin.** Every workflow installs exactly the Ferrum
+    Edge release `release/baseline.json` pins (`validator.version`), and only
+    when its SHA-256 matches both that record and
+    `.github/ferrum-edge-checksums.txt`. A new upstream release changes
+    nothing until you adopt it: `validator-pin-canary.yml` opens an issue when
+    one is published or the pinned build stops installing. Adopt a newer
+    pairing through a [template update](docs/template-updates.md). See
+    [Validator pinning](#validator-pinning).
 
 12. **Add resources and open a pull request.** Files go under
     `resources/<namespace>/{proxies,consumers,upstreams,plugins,mesh}/`, with
@@ -345,7 +356,7 @@ fragments are covered in [Writing resources](docs/resources.md).
 [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts) is Ferrum's central store for
 shared vocabularies, JSON schemas and fixtures. GitForgeOps consumes its plugin catalog,
 `provisioned-by` vocabulary and resource fixtures, and publishes its `gitforgeops-resource` schema.
-These files are pinned to `contracts-edge-0.9.20` in
+These files are pinned to `contracts-edge-0.9.21` in
 [`contracts/ferrum-contracts/PIN`](contracts/ferrum-contracts/PIN) and vendored under
 `contracts/ferrum-contracts/`.
 See the [contracts guide](docs/contracts.md) for the pin and conformance checks.
@@ -634,6 +645,7 @@ lives in [`.github/scripts/deployment_scope.py`](.github/scripts/deployment_scop
 | `.github/actions/**` | local composite actions a step runs |
 | `.github/scripts/**` | helper programs the job runs |
 | `.github/ferrum-edge-checksums.txt` | which validator build is trusted |
+| `release/baseline.json` | which validator release is installed |
 | `.github/workflows/apply-on-merge.yml` | the deployment procedure itself |
 
 The same list is the workflow's `on.push.paths` filter, and
@@ -767,7 +779,7 @@ limits are in
 [Viewer-credential drift reads](docs/reference.md#viewer-credential-drift-reads).
 Fingerprints stay comparable across gateway restarts and replicas only when
 every replica sets the same `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`
-(Ferrum Edge after v0.9.20; without it each process keys them randomly, and a
+(Ferrum Edge v0.9.21 and later; without it each process keys them randomly, and a
 changed key leaves secrets unverified, never drifted).
 The bundled `drift-check.yml` binds only the viewer secret. See
 [Scheduled monitoring](docs/reference.md#scheduled-monitoring).
@@ -1073,19 +1085,32 @@ is the allowlist, one line per approved build:
 <64 lowercase hex sha256>  ferrum-edge-linux-x86_64  # <publish timestamp> release <tag>
 ```
 
-`install-ferrum-edge.sh` resolves the latest published version release, checks
-the publisher's `.sha256`, and installs the binary only if its digest is on the
-allowlist. Nothing else can select a different binary. Keep old lines when
-adding new ones so in-flight PRs stay green.
+`install-ferrum-edge.sh` installs exactly the release
+[`release/baseline.json`](release/baseline.json) pins (`validator.version`,
+resolved by tag, never "latest"), checks the publisher's `.sha256`, and makes
+the binary executable only if its digest equals the baseline's
+`validator.sha256` and is on the allowlist. Nothing else can select a different
+binary; a newer upstream release is only reported. Keep old lines when adding
+new ones so in-flight PRs that still carry the previous baseline stay green.
 
 ```bash
-bash .github/scripts/refresh-ferrum-edge-pin.sh          # print the new line
-bash .github/scripts/refresh-ferrum-edge-pin.sh --append # append it
+bash .github/scripts/refresh-ferrum-edge-pin.sh                    # line for the pinned release
+bash .github/scripts/refresh-ferrum-edge-pin.sh --release vX.Y.Z   # line for a release you are moving to
+bash .github/scripts/refresh-ferrum-edge-pin.sh --release vX.Y.Z --append
+bash .github/scripts/refresh-ferrum-edge-pin.sh --newest           # highest published release tag
+bash .github/scripts/refresh-ferrum-edge-pin.sh --newer            # that tag, only if newer than the pin
 ```
 
-`validator-pin-canary.yml` runs daily. When the allowlist is stale, or the
-pinned binary rejects `tests/fixtures/validator-resource-labels.yaml`, it opens
-or updates one issue titled *Refresh the pinned ferrum-edge validator digest*.
+Moving the pin is one reviewed change: append the new line, then set
+`validator` and `tested_gateway` in `release/baseline.json`, the Dockerfile
+gateway stage, `DEFAULT_EDGE_VERSION` and the contracts pin to the new release
+(`check_release_baseline.py` refuses a partial move).
+
+`validator-pin-canary.yml` runs daily. When the pinned build no longer
+installs, the pinned binary rejects
+`tests/fixtures/validator-resource-labels.yaml`, or Ferrum Edge has published a
+newer release than the pin, it opens or updates one issue titled *Refresh the
+pinned ferrum-edge validator digest*. Only the first two fail the run.
 `validate-pr.yml` runs the same label check on every PR as part of
 `gitforgeops-required-static-validation`.
 

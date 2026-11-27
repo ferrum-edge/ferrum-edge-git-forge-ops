@@ -197,31 +197,20 @@ fn companion_schema_fixture_covers_every_mirrored_field() {
     }
 }
 
-/// The newest `release vX.Y.Z` noted in the validator checksum allowlist: the
-/// Edge release this repository pins.
-fn newest_allowlisted_edge_release() -> String {
-    let allowlist = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/ferrum-edge-checksums.txt"),
+/// The Ferrum Edge release this repository pins: `validator.version` in
+/// `release/baseline.json`, the release the validator installer installs
+/// (the allowlist also keeps earlier approved builds, so its newest entry is
+/// not necessarily the pin).
+fn pinned_edge_release() -> String {
+    let baseline: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("release/baseline.json"))
+            .expect("read release/baseline.json"),
     )
-    .expect("read Edge checksum allowlist");
-    allowlist
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .filter_map(|line| line.split_once('#').map(|(_, note)| note))
-        .filter_map(|note| {
-            let mut words = note.split_whitespace();
-            words.find(|word| *word == "release")?;
-            let version = words.next()?;
-            let parts: Vec<u64> = version
-                .strip_prefix('v')?
-                .split('.')
-                .map(|part| part.parse().ok())
-                .collect::<Option<_>>()?;
-            Some((parts, version.to_string()))
-        })
-        .max()
-        .map(|(_, version)| version)
-        .expect("the allowlist names at least one Edge release")
+    .expect("release/baseline.json is JSON");
+    baseline["validator"]["version"]
+        .as_str()
+        .expect("release/baseline.json names validator.version")
+        .to_string()
 }
 
 /// Fields intentionally retained in `src/config/schema.rs` after a newer Edge
@@ -230,7 +219,7 @@ fn newest_allowlisted_edge_release() -> String {
 fn version_aware_retained_fields(struct_name: &str) -> BTreeSet<String> {
     let mut retained = BTreeSet::new();
     if struct_name == "Proxy" {
-        // Retained for `< v0.9.21` pairings (default v0.9.20 baseline);
+        // Retained for explicit `< v0.9.21` pairings (the default is v0.9.21);
         // removed in Edge v0.9.21 (`ferrum-edge#7218`) and omitted from desired
         // state on `>= v0.9.21` (#739).
         retained.insert(gitforgeops::config::POOL_MAX_REQUESTS_FIELD.to_string());
@@ -254,7 +243,7 @@ fn mirrored_resource_fields_match_the_pinned_edge_openapi() {
             .expect("Edge OpenAPI field lists are JSON");
     assert_eq!(
         fixture["source"]["tag"].as_str(),
-        Some(newest_allowlisted_edge_release().as_str()),
+        Some(pinned_edge_release().as_str()),
         "tests/fixtures/edge-openapi/resource-fields.json was read from another Edge release \
          than the pinned validator; regenerate it from the new release's openapi.yaml"
     );

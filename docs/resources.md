@@ -143,20 +143,19 @@ the file and full YAML path. A typo such as `spec.plguins` therefore fails
 instead of disappearing. Deliberately opaque values are kept verbatim: plugin
 `config`, consumer credential maps, and per-item mesh objects.
 
-A few modeled fields exist only on Ferrum Edge after the pinned v0.9.20, and
-the pinned release treats them differently:
+A few modeled fields first shipped in Ferrum Edge v0.9.21, the pinned
+release. GitForgeOps and the pinned validator both handle them; an older
+gateway does not:
 
 - The plugin `trigger` predicates `external_identity` and
   `external_identity_authority`. GitForgeOps loads, imports, diffs and applies
-  them, but the pinned `ferrum-edge validate` (and a v0.9.20 gateway)
-  **rejects** them, so a repository using them needs a validator and gateway
-  that support them.
+  them, and the pinned `ferrum-edge validate` checks them. A v0.9.20 validator
+  or gateway **rejects** them.
 - The mesh list `virtual_service_http_routes`. GitForgeOps loads it, merges it
   across fragments and publishes it in the mesh document (mesh has no import or
-  diff). The v0.9.20 mesh parser **ignores** it: `ferrum-edge validate -m mesh`
-  passes without checking it, and a v0.9.20 mesh node runs without those route
-  bindings. It is only validated by a supporting validator and only takes
-  effect on a supporting mesh node.
+  diff), and the pinned `ferrum-edge validate -m mesh` checks it. The v0.9.20
+  mesh parser **ignores** it, so a v0.9.20 mesh node runs without those route
+  bindings.
 
 A gateway release that adds a field is unusable until GitForgeOps models it.
 `FERRUM_ALLOW_UNKNOWN_FIELDS=true` unblocks that for **top-level** `spec`
@@ -431,16 +430,18 @@ adoption, reconciliation and deletion.
 
 Ferrum Edge v0.9.20 accepts and persists `Proxy.spec.pool_max_requests_per_connection`
 (a no-op field whose omission on write clears the stored value). Ferrum Edge
-v0.9.21 removed the field while keeping `Proxy` `deny_unknown_fields`
+v0.9.21, the pinned release, removed the field while keeping `Proxy`
+`deny_unknown_fields`
 ([ferrum-edge#7218](https://github.com/ferrum-edge/ferrum-edge/issues/7218);
 caught ahead of release by the weekly Edge `main` check in `#737`).
 
-GitForgeOps keeps the default baseline at `v0.9.20` and handles the field
-according to the paired Edge release configured via `edge_version` on an
-environment in `.gitforgeops/config.yaml` or `FERRUM_EDGE_VERSION` (repo config
-wins; unset defaults to `v0.9.20`):
+GitForgeOps handles the field according to the paired Edge release configured
+via `edge_version` on an environment in `.gitforgeops/config.yaml` or
+`FERRUM_EDGE_VERSION` (repo config wins; unset defaults to the pinned
+`v0.9.21`, the `validator.version` in `release/baseline.json`):
 
-- **Paired with `< v0.9.21` (including `v0.9.20` and unset):**
+- **Paired with `< v0.9.21` (for example `edge_version: v0.9.20`, set
+  explicitly):**
   `pool_max_requests_per_connection` is accepted, emitted (in validation,
   export, file apply and API apply) and diffed verbatim. Omitting the field in
   desired state while a live v0.9.20 proxy still sets it reports a `Modify`
@@ -449,7 +450,7 @@ wins; unset defaults to `v0.9.20`):
   `ferrum-edge` binary without selecting a `>= v0.9.21` pairing, GitForgeOps
   prepends `gitforgeops error [validator-pool-max-requests-per-connection]`
   before apply with the validator path and remediation choices.
-- **Paired with `>= v0.9.21` (for example `edge_version: v0.9.21`):**
+- **Paired with `>= v0.9.21` (including unset):**
   Proxy files carrying `pool_max_requests_per_connection` still load under
   strict mode without migrating the tree, and GitForgeOps omits the removed
   field from assembled desired state (validation, export, diff, file apply and

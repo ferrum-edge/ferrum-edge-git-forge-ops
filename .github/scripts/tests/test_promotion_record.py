@@ -202,6 +202,21 @@ class LedgerCommitTests(unittest.TestCase):
         self.assertIn("deployment inputs changed", reasons[0])
         self.assertIn("resources/ferrum/proxies/orders.yaml", reasons[0])
 
+    def test_a_validator_pin_change_between_them_blocks(self):
+        # Staging applied and verified with one validator; a baseline-only
+        # (or allowlist-only) change selects another, so production would not
+        # run what staging qualified.
+        for path, content in (
+            ("release/baseline.json", '{"validator": {"version": "v0.9.20"}}\n'),
+            (".github/ferrum-edge-checksums.txt", "# pins\n"),
+        ):
+            with self.subTest(path=path):
+                head = self._commit({path: content})
+                reasons = self._reasons(head)
+                self.assertEqual(len(reasons), 1, reasons)
+                self.assertIn("deployment inputs changed", reasons[0])
+                self.assertIn(path, reasons[0])
+
     def test_a_revision_that_is_not_a_descendant_blocks(self):
         # A re-run of an older workflow: the record is from a revision the
         # branch has since moved past, so it is the *descendant* here.

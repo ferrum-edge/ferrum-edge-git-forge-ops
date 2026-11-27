@@ -2,13 +2,13 @@
   "$schema": "https://github.com/ferrum-edge/ferrum-contracts/schemas/vocabulary-plugin-catalog/v1.schema.json",
   "vocabulary": "plugin-catalog",
   "version": 1,
-  "edge_release": "v0.9.20",
-  "description": "Index of every built-in Ferrum Edge plugin at v0.9.20: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
+  "edge_release": "v0.9.21",
+  "description": "Index of every built-in Ferrum Edge plugin at v0.9.21: name, registration failure policy, documented priority, phases and protocol surface, and a pointer to the plugin's config schema in Edge's published openapi.yaml. Build-time custom plugins are not listed.",
   "provenance": [
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.20",
-      "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
+      "ref": "v0.9.21",
+      "commit": "f9915358c8032214f4034a17c28cdf72d14006c3",
       "path": "src/plugins/mod.rs",
       "symbols": [
         "BUILTIN_PLUGIN_REGISTRATIONS",
@@ -23,8 +23,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.20",
-      "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
+      "ref": "v0.9.21",
+      "commit": "f9915358c8032214f4034a17c28cdf72d14006c3",
       "path": "src/plugins/builtin_parity.rs",
       "symbols": [
         "BUILTIN_PLUGIN_PARITY_META",
@@ -43,8 +43,8 @@
     },
     {
       "repo": "ferrum-edge/ferrum-edge",
-      "ref": "v0.9.20",
-      "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
+      "ref": "v0.9.21",
+      "commit": "f9915358c8032214f4034a17c28cdf72d14006c3",
       "path": "openapi.yaml",
       "symbols": [
         "components.schemas.PluginConfigBase"
@@ -52,15 +52,15 @@
       "fields": [
         "config_schema"
       ],
-      "note": "v0.9.19 retains the 82 registered types, removed names and PluginConfigBase pointers. Configuration components include the production-launch plugin hardening, multi-location key_auth, SPIFFE forwarding, external-identity access rules, telemetry redaction, resource bounds and plugin association preconditions documented in the owner upgrade guide. Registration failure policy and parity metadata are transcribed from the same tag; referenced config schemas are not copied here. v0.9.20 retains the 82 registered types, removed names, registration failure policies, parity metadata and every PluginConfigBase pointer, config-required and scope conditional; src/plugins/builtin_parity.rs and the PluginConfigBase block are byte-identical to v0.9.19. Referenced configuration components close nested objects (Edge #6967 and #6972, issue #6616): MeshAuthzPolicyScope variants and target_refs attachments reject unknown members, and each attachment requires name, plus namespace on service and gateway kinds and no namespace on gateway_class; MeshAuthzConfig node_waypoint_route_upstreams entries and targets are closed; WorkloadMetricsConfig metrics, tag_overrides entries and their operation, direction_emit and tracing provider envelopes and config are closed, with operation members exclusive to their type and set_expr requiring exactly one of cel and expression. Built-in plugins now declare the always-dispatched lifecycle hooks they implement (Edge #6975, issue #6615); the catalog's active_phases already agree with every declaration and gain no field."
+      "note": "v0.9.21 retains the 82 registered types, two removed names, response-body producer and WebSocket framing membership, and every PluginConfigBase pointer, config-required and scope conditional. Registration failure policies and parity metadata are re-transcribed from the tag: http_logging, udp_logging, statsd_logging, loki_logging and ws_frame_logging move from optional_fail_open to keep_last_known_good (Edge #7369); http_logging, tcp_logging, kafka_logging, loki_logging and udp_logging add on_ws_disconnect (Edge #7369); request_transformer adds on_final_request_body_with_context and response_transformer adds finalize_client_visible_response_body (Edge #7469); and compression adds zstd to its protocol_rationale. Referenced OpenAPI config components ship the v0.9.21 removed keys, managed jwks_source, mesh_route_dispatch weighted_splits, mesh_authz node_waypoint_route_branches, plugin trigger external_identity/external_identity_authority predicates, access_control authority binding, request_mirror allow_plaintext, loopback-IP cleartext rules, chargeback 1.0e+288 bounds, OIDC canonical redirects, and A2A fail-closed classification recorded in docs/plugin-config-admission.md."
     }
   ],
   "config_schema_document": {
     "repo": "ferrum-edge/ferrum-edge",
-    "ref": "v0.9.20",
-    "commit": "e4a606a00352674daaef08636e3e359e6c48ba18",
+    "ref": "v0.9.21",
+    "commit": "f9915358c8032214f4034a17c28cdf72d14006c3",
     "path": "openapi.yaml",
-    "sha256": "8fa7232d96e1094578dee03cfa1966a4fdd9df77b8e027a9625f56ce6bfd355e",
+    "sha256": "13c21d12d3028c8044ad2f467cbca6425d9bd2f3fce787d6fe7ae78316c21bee",
     "openapi": "3.1.0",
     "note": "Each config_schema.pointer is a JSON Pointer into this exact file. The schemas are OpenAPI 3.1 (JSON Schema 2020-12 dialect) and may $ref other components in the same document. They apply to `config` only when the plugin config is enabled. They are referenced, not copied, in this release; see docs/adoption.md (follow-ups)."
   },
@@ -124,10 +124,11 @@
       "name": "http_logging",
       "classification": "public",
       "priority": 9100,
-      "failure_policy": "optional_fail_open",
+      "failure_policy": "keep_last_known_good",
       "active_phases": [
         "log",
-        "on_stream_disconnect"
+        "on_stream_disconnect",
+        "on_ws_disconnect"
       ],
       "protocols": [
         "http",
@@ -151,7 +152,8 @@
       "failure_policy": "keep_last_known_good",
       "active_phases": [
         "log",
-        "on_stream_disconnect"
+        "on_stream_disconnect",
+        "on_ws_disconnect"
       ],
       "protocols": [
         "http",
@@ -175,7 +177,8 @@
       "failure_policy": "keep_last_known_good",
       "active_phases": [
         "log",
-        "on_stream_disconnect"
+        "on_stream_disconnect",
+        "on_ws_disconnect"
       ],
       "protocols": [
         "http",
@@ -558,7 +561,7 @@
       "protocols": [
         "http"
       ],
-      "protocol_rationale": "HTTP response compression and request decompression (gzip, brotli)",
+      "protocol_rationale": "HTTP response compression and request decompression (gzip, brotli, zstd)",
       "response_body_producer": true,
       "config_schema": {
         "document": "openapi.yaml",
@@ -752,7 +755,8 @@
       "failure_policy": "keep_last_known_good",
       "active_phases": [
         "before_proxy",
-        "transform_request_body_with_context"
+        "transform_request_body_with_context",
+        "on_final_request_body_with_context"
       ],
       "protocols": [
         "http",
@@ -774,7 +778,8 @@
       "failure_policy": "keep_last_known_good",
       "active_phases": [
         "after_proxy",
-        "transform_response_body"
+        "transform_response_body",
+        "finalize_client_visible_response_body"
       ],
       "protocols": [
         "http",
@@ -1568,7 +1573,7 @@
       "name": "ws_frame_logging",
       "classification": "public",
       "priority": 9050,
-      "failure_policy": "optional_fail_open",
+      "failure_policy": "keep_last_known_good",
       "active_phases": [
         "on_ws_policy_close",
         "prepare_ws_frame_delivery",
@@ -1630,10 +1635,11 @@
       "name": "udp_logging",
       "classification": "public",
       "priority": 9160,
-      "failure_policy": "optional_fail_open",
+      "failure_policy": "keep_last_known_good",
       "active_phases": [
         "log",
-        "on_stream_disconnect"
+        "on_stream_disconnect",
+        "on_ws_disconnect"
       ],
       "protocols": [
         "http",
@@ -1654,7 +1660,7 @@
       "name": "statsd_logging",
       "classification": "public",
       "priority": 9075,
-      "failure_policy": "optional_fail_open",
+      "failure_policy": "keep_last_known_good",
       "active_phases": [
         "log",
         "on_stream_disconnect",
@@ -1679,10 +1685,11 @@
       "name": "loki_logging",
       "classification": "public",
       "priority": 9155,
-      "failure_policy": "optional_fail_open",
+      "failure_policy": "keep_last_known_good",
       "active_phases": [
         "log",
-        "on_stream_disconnect"
+        "on_stream_disconnect",
+        "on_ws_disconnect"
       ],
       "protocols": [
         "http",

@@ -1,9 +1,10 @@
 # Quickstart: one gateway, one namespace, one environment
 
 Release baseline: [v0.1.0](../release/README.md). Treat this setup as a
-supported pairing only when the [upstream record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json) `status` is
-`supported`. The record then gives the exact source revision and the
-validator/gateway pairing. Start your repository at that revision with the
+supported pairing only when that release's finalized record exists in
+[`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+on upstream `main`, where its `status` is `supported`. The record gives the
+exact source revision and the validator/gateway pairing. Start your repository at that revision with the
 [immutable adoption commands](../release/README.md#adopt-the-immutable-sourcetemplate-revision).
 GitHub's **Use this template** button copies the current default branch, which
 may be ahead of the supported baseline.
@@ -274,7 +275,7 @@ once `monitoring.unattended: true` (which must not hold
 `FERRUM_ADMIN_JWT_SECRET`). The drift check reads `GET /config/export`, which
 the gateway caps at `viewer`. Secrets come back as fingerprints the viewer key
 cannot reproduce, so `diff` reports them as unverified rather than in sync
-(`--exit-on-drift` exits `6`, a warning). On Ferrum Edge after v0.9.20, also
+(`--exit-on-drift` exits `6`, a warning). On Ferrum Edge v0.9.21 and later, also
 set one `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on every gateway
 replica (a gateway setting, not a GitHub secret): without it fingerprints
 change on every gateway restart and differ between replicas, so a fingerprint
@@ -388,15 +389,15 @@ matching private key: you decrypt with `age -d -i ~/.ssh/id_ed25519`.
 Install Rust and build this repository with `cargo build`, then run the CLI as
 `./target/debug/gitforgeops` (or install it with `cargo install --path .`).
 `validate` calls a separate Ferrum Edge validator. Use the approved Ferrum Edge
-v0.9.20 binary, either on `PATH` as `ferrum-edge` or selected with
+v0.9.21 binary, either on `PATH` as `ferrum-edge` or selected with
 `FERRUM_EDGE_BINARY_PATH=/path/to/ferrum-edge`. The approved SHA-256
-`9d357a41ae61cf85d697f01c84beff15f2b8af8bcfd70dd1c50f32397fee66ac` is the
+`06fc247a35c49c5be160e947fd8284be4c5f594d331fce71cba1b87b87acce00` is the
 digest of the Linux x86_64 asset, `ferrum-edge-linux-x86_64`, which the bundled
 workflows run and check against `.github/ferrum-edge-checksums.txt` before use.
 Other platforms have their own digests: on macOS or Linux ARM64, download the
 asset for your platform (`ferrum-edge-macos-aarch64`,
 `ferrum-edge-macos-x86_64` or `ferrum-edge-linux-aarch64`) from the
-[v0.9.20 release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.20)
+[v0.9.21 release](https://github.com/ferrum-edge/ferrum-edge/releases/tag/v0.9.21)
 and check it against that asset's published `.sha256` file, not the Linux
 x86_64 digest above.
 

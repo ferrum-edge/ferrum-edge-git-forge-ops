@@ -8,8 +8,8 @@
 //!   rejected mandatory `labels` on a gateway resource.
 //! * **`validator-pool-max-requests-per-connection`** — an Edge `>= v0.9.21`
 //!   build rejected `Proxy.pool_max_requests_per_connection`, which Edge removed
-//!   after v0.9.20 (`ferrum-edge#7218`), when the run targeted the default
-//!   v0.9.20 pairing.
+//!   after v0.9.20 (`ferrum-edge#7218`), when the run was explicitly paired with
+//!   v0.9.20 or earlier (the default pairing is the pinned v0.9.21).
 
 use crate::diagnostics::safe;
 
@@ -154,10 +154,11 @@ fn pool_max_requests_diagnostic(stdout: &str, stderr: &str, binary_path: &str) -
     let header = format!(
         "gitforgeops error [validator-pool-max-requests-per-connection]: Ferrum Edge v0.9.21 and \
          later removed the no-op Proxy field `pool_max_requests_per_connection` \
-         (ferrum-edge#7218). Validator binary: {}. Set `edge_version: v0.9.21` on this \
-         environment in `.gitforgeops/config.yaml` (or `FERRUM_EDGE_VERSION=v0.9.21`) to omit \
-         the removed field automatically for v0.9.21+ targets while keeping v0.9.20 behaviour \
-         exact; remove `pool_max_requests_per_connection` from proxy YAML if no v0.9.20 gateway \
+         (ferrum-edge#7218). Validator binary: {}. This environment is paired with an earlier \
+         Edge release; set `edge_version: v0.9.21` on it in `.gitforgeops/config.yaml` (or \
+         `FERRUM_EDGE_VERSION=v0.9.21`, or leave both unset for the pinned default) to omit \
+         the removed field automatically for v0.9.21+ targets; remove \
+         `pool_max_requests_per_connection` from proxy YAML if no v0.9.20 gateway \
          uses it (a save omitting it clears the stored field on v0.9.20); or validate with a \
          v0.9.20 `ferrum-edge` binary.\n",
         safe(binary_path)

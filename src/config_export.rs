@@ -14,7 +14,7 @@
 //! keys and `jwt` / `hmac_auth` secrets, plugin-config secrets and
 //! credential-bearing URLs, URL userinfo in a Proxy or Upstream, the Consul
 //! token — arrives as `hmac-sha256:<64 hex>`. The MAC key is derived from a
-//! gateway-side secret the reader never holds: Ferrum Edge after v0.9.20 keys
+//! gateway-side secret the reader never holds: Ferrum Edge v0.9.21 and later keys
 //! it from `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` (random per process
 //! when unset), and v0.9.20 from its primary `FERRUM_ADMIN_JWT_SECRET`; never
 //! from the viewer secret. So a viewer-credential reader **cannot compute the
@@ -32,14 +32,14 @@
 //!   compared as an ordinary value and reported when it differs. Where the
 //!   repository declares nothing there, the fingerprint stays and the
 //!   structural difference is reported.
-//! - The predicted sites also cover what Edge's projection on `main` (after
-//!   the pinned v0.9.20) withholds: the `header` / `query` / `cookie` operands
-//!   of a plugin's `trigger`, every scalar leaf of a custom plugin's config,
-//!   the built-in paths of [`export_redacted_paths`]'s export-only rules, and
-//!   TLS private-key material anywhere in a Proxy, Upstream or plugin config.
-//!   A gateway that does not fingerprint a site sends its value, which is
-//!   compared as usual, so predicting more sites than the pinned gateway
-//!   withholds never hides drift there.
+//! - The predicted sites also cover what the pinned Edge v0.9.21's projection
+//!   withholds and v0.9.20's did not: the `header` / `query` / `cookie`
+//!   operands of a plugin's `trigger`, every scalar leaf of a custom plugin's
+//!   config, the built-in paths of [`export_redacted_paths`]'s export-only
+//!   rules, and TLS private-key material anywhere in a Proxy, Upstream or
+//!   plugin config. A gateway that does not fingerprint a site sends its
+//!   value, which is compared as usual, so predicting more sites than a
+//!   gateway withholds never hides drift there.
 //! - Fingerprint equality only shows that a stored value is **unchanged
 //!   between two exports** under one gateway key. [`FingerprintBaseline`]
 //!   records an export's fingerprints; a later run compares against it and
@@ -48,8 +48,8 @@
 //!   repository, and a baseline taken from a gateway that had already
 //!   drifted carries that drift forward.
 //! - `redaction.fingerprint_key_id` changes when the gateway's fingerprint
-//!   secret rotates (`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` after
-//!   v0.9.20, `FERRUM_ADMIN_JWT_SECRET` on v0.9.20), on every restart of a
+//!   secret rotates (`FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET` on
+//!   v0.9.21 and later, `FERRUM_ADMIN_JWT_SECRET` on v0.9.20), on every restart of a
 //!   gateway that does not set it, and between replicas that do not share it.
 //!   Nothing assumes a stable key id: a baseline keeps the key id of each
 //!   namespace's export, and fingerprints under different key ids are not
@@ -663,7 +663,7 @@ fn consumer_secret_pointers(projected: &Consumer) -> BTreeSet<String> {
     pointers
 }
 
-/// Add every string Edge after v0.9.20 withholds as TLS private-key material
+/// Add every string Edge v0.9.21 and later withholds as TLS private-key material
 /// (its TLS-material sweep over whole Proxy and Upstream bodies and over
 /// plugin configs; [`crate::secrets::tls_material`] is the shared detector):
 /// one carrying a private-key PEM block anywhere, or, under a private-key
@@ -684,7 +684,7 @@ fn collect_tls_material_sites(value: &Value, root: &str, out: &mut BTreeSet<Stri
     }
 }
 
-/// Add every site of a PluginConfig `trigger` that Edge after v0.9.20
+/// Add every site of a PluginConfig `trigger` that Edge v0.9.21 and later
 /// withholds from the export (`project_plugin_trigger_with`): each operand
 /// (`exact[]` and `prefix[]` entries, `regex`) of a `header` / `query` /
 /// `cookie` predicate, anywhere in the `all` / `any` / `not` tree. Like Edge,
@@ -1205,7 +1205,7 @@ impl SecretFingerprintSummary {
                          rotates, on every restart of a gateway that does not set one, and \
                          between replicas that do not share one: set the same \
                          FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET on every gateway replica \
-                         (Ferrum Edge after v0.9.20; v0.9.20 uses FERRUM_ADMIN_JWT_SECRET), then \
+                         (Ferrum Edge v0.9.21 and later; v0.9.20 uses FERRUM_ADMIN_JWT_SECRET), then \
                          record a new baseline from a trusted state"
                     ));
                 }

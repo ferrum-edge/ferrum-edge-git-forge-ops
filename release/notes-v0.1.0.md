@@ -1,20 +1,23 @@
 # GitForgeOps v0.1.0 release notes
 
-The [baseline record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json)
-supplies publication status, exact
-revision, image digest, and lifecycle evidence. Copy this note into the GitHub
-release when that record is finalized; the committed copy remains available
-after workflow artifacts expire.
+This release's finalized support record,
+[`release/records/v0.1.0.json`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/records/v0.1.0.json)
+on upstream `main`, supplies the exact revision, image digest, validator pin,
+tested gateway and lifecycle evidence. Copy this note into the GitHub release
+when that record is committed; the committed copy remains available after
+workflow artifacts expire.
 
 ## Candidate pairing
 
-The intended GitForgeOps v0.1.0 pairing uses published Ferrum Edge v0.9.20
+The intended GitForgeOps v0.1.0 pairing uses published Ferrum Edge v0.9.21
 and its verified validator asset and multi-platform image pins. Edge published
-the release on 2026-11-03 at tag commit
-`e4a606a00352674daaef08636e3e359e6c48ba18`; its release run completed successfully.
-GitForgeOps hosted qualification against those bytes is
-still required. The record remains `pending`; a supported GitForgeOps release
-requires exact-revision lifecycle evidence and publication.
+the release on 2026-11-22 at tag commit
+`f9915358c8032214f4034a17c28cdf72d14006c3`; its release run created the release
+and passed its attestation gates, with one failed post-publication image-pull
+smoke job.
+The release gate publishes only with passing exact-revision lifecycle evidence
+against those bytes, including the human GitHub acceptance run; the record
+links that evidence.
 See the [support table](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/README.md#support-and-compatibility)
 for the precise profile and file/mesh and monitoring boundaries.
 
@@ -28,9 +31,17 @@ for later fixes.
 
 ## Changes and known limitations
 
-- First supported source/template and container pairing, conditional on the
-  record's `supported` status and passing exact-revision release gate.
-- Edge v0.9.20 follows v0.9.19 directly. Plugin configs and mesh Telemetry
+- First supported source/template and container pairing, published through
+  the exact-revision release gate.
+- Edge v0.9.21 follows v0.9.20 directly and refuses many configurations
+  v0.9.20 accepted. The no-op `Proxy.pool_max_requests_per_connection` is
+  removed (GitForgeOps omits it from desired state for this pairing), several
+  deprecated plugin options and alias spellings are refused, `hmac_auth`
+  requires `replay_scope`, and export fingerprints are keyed from
+  `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`. Review the
+  [v0.9.21 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/f9915358c8032214f4034a17c28cdf72d14006c3/docs/upgrade_guide.md#upgrading-to-0921)
+  before rollout.
+- Edge v0.9.20 followed v0.9.19 directly. Plugin configs and mesh Telemetry
   documents now reject unknown keys in nested objects, policy `targetRefs`
   attachments require `name` (and `namespace` on `service` / `gateway`), and
   the new `FERRUM_HTTP_CLIENT_WRITE_TIMEOUT_SECONDS` (default 60) closes proxy
@@ -42,15 +53,15 @@ for later fixes.
   updates and deletes require the `expected_proxy_ids` association precondition
   (ferrum-edge#6744), which GitForgeOps already sends. Review the
   [v0.9.19 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919)
-  before rollout. Exact-byte hosted qualification and the five external
-  acceptance scenarios remain required.
+  before rollout. The release gate requires exact-byte hosted qualification,
+  including the five external acceptance scenarios.
 - Edge v0.9.17, which v0.9.19 follows, carries the changes prepared for the
   unpublished v0.9.16 tag, including namespace-bounded admin tokens, stricter
   plugin and route admission, and cached admin misses that report unavailable
   rather than deleted. Review the
   [v0.9.17 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/669c574c1d1e88e84dccb26a8159939e6694644d/docs/upgrade_guide.md#upgrading-to-0917).
   GitForgeOps includes the namespace-aware client updates.
-- The candidate gateway is Ferrum Edge v0.9.20. It includes v0.9.9's request-path
+- The candidate gateway is Ferrum Edge v0.9.21. It includes v0.9.9's request-path
   hardening, which refuses non-final empty path segments and requires
   `allow_path_parameters: true` on a proxy to accept semicolon path parameters;
   review the
@@ -59,7 +70,7 @@ for later fixes.
   `allow_path_parameters` opt-in and preserves the mesh service opt-in; semicolon
   path parameters remain refused when the applicable option is absent or false.
   Run validation on a pull request before adopting this pairing.
-- Edge v0.9.20 retains v0.9.10 hardening: it refuses non-UTF-8 charsets on MCP
+- Edge v0.9.21 retains v0.9.10 hardening: it refuses non-UTF-8 charsets on MCP
   `ai_prompt_shield` and `mcp_gateway` requests, and fails closed on uninspectable
   or over-nested JSON-RPC batches (GHSA-4f9m-cfqg-fhx9, GHSA-f2jp-59r9-fp64).
 - Edge v0.9.15 introduced security changes with 26 published advisories. Review its
@@ -75,13 +86,14 @@ for later fixes.
   replacement, with original row/namespace `If-Match` tokens, opaque Basic HMACs,
   ownership and ledger fences, and no stale-token replay. Rotation checks live
   safety before broker publication and records completion only after its
-  conditional gateway write succeeds. Hosted enforcement qualification remains
-  required on the exact released bytes (#462).
+  conditional gateway write succeeds. Hosted enforcement qualification on the
+  exact released bytes is part of the release gate (#462).
 - Pin the scoped resource schema, fixtures and vocabularies to published
-  `contracts-edge-0.9.20` at `39da322083044c2e92617209e62983c92387f0ad`, retaining
+  `contracts-edge-0.9.21` at `92d8da5be93ea1ece9f47729b1f7aa10ae8a7c3f`, retaining
   strict conformance and upstream descriptions. Canonical metadata alone grants
-  no production apply or first-release acceptance. The 0.9.20 pin changes only
-  vocabulary provenance and notes; the local catalog and the conditional API
+  no production apply or first-release acceptance. The 0.9.21 pin closes the
+  resource envelope schema to match the strict loader and re-transcribes
+  vocabulary metadata; the local catalog and the conditional API
   implementation are unchanged.
 - API-mode shared ownership is the first deployment profile. File/mesh output
   is assembled and validated, with external fleet delivery required.
@@ -95,9 +107,8 @@ for later fixes.
   `--user "$(id -u):$(id -g)"` so written files stay owned by the checkout
   owner, and may need to `chown` files earlier root runs left behind.
 
-The first supported release remains blocked by #266's second human reviewer,
-state-writer GitHub App, disposable template repository and HTTPS gateway
-acceptance run, which also provisions and exercises viewer-capped drift
+First-release acceptance (#266) is a human GitHub acceptance run with a
+second reviewer, the state-writer GitHub App, a disposable template repository
+and an HTTPS gateway, which also provisions and exercises viewer-capped drift
 monitoring (#440) in that disposable repository; the upstream template has no
-gateway environment of its own. This candidate does not fill publication fields,
-publish a GitForgeOps tag or claim human acceptance.
+gateway environment of its own. The release record links the sealed result.

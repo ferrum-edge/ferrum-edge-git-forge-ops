@@ -635,7 +635,7 @@ a failure. Explicit CLI acceptance retains its documented limits.
 key as `FERRUM_ADMIN_JWT_VIEWER_SECRET` in every environment the drift matrix
 binds, and `<env>-monitor` must not hold `FERRUM_ADMIN_JWT_SECRET`; see
 [Scheduled monitoring](reference.md#scheduled-monitoring). On the gateway side,
-Ferrum Edge after v0.9.20 keys export fingerprints from
+Ferrum Edge v0.9.21 and later keys export fingerprints from
 `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`; set the same value on every
 replica so fingerprints stay stable across restarts. No GitHub Environment
 holds it.
@@ -1233,25 +1233,33 @@ The audit fails closed on missing token scope, API errors, pagination or
 response-shape changes, missing controls, and any always-on bypass that is not
 an App.
 
-## 6. Keep the validator digest allowlist fresh
+## 6. Keep the validator pin reviewed
 
-The `ferrum-edge` validator is pinned by **content**, not by a URL or version.
+The `ferrum-edge` validator is pinned by **content**, not by a URL.
+[`release/baseline.json`](../release/baseline.json) names the one release to
+install (`validator.version`, `validator.asset`, `validator.sha256`), and
 `.github/ferrum-edge-checksums.txt` lists the approved SHA-256 digests.
-`.github/scripts/install-ferrum-edge.sh` takes the newest published release
-from GitHub's `/releases/latest` endpoint (which skips drafts and
-prereleases), checks the publisher's checksum, and refuses to make the bytes
-executable unless the digest is on the list. There is no
-`FERRUM_EDGE_VERSION` variable, and `check_supply_chain.py` fails CI if a
-workflow adds one.
+`.github/scripts/install-ferrum-edge.sh` resolves exactly that release by tag
+(`/releases/tags/<tag>`; it must be published, not a draft or prerelease),
+checks the publisher's checksum, and refuses to make the bytes executable
+unless the digest equals the baseline's and is on the list. The baseline is
+read from the same tree as the allowlist the installer is given. There is no
+`FERRUM_EDGE_VERSION` workflow variable, and `check_supply_chain.py` fails CI
+if a workflow adds one.
 
-Because the pin tracks content, it goes stale whenever upstream publishes a new
-version. `validator-pin-canary.yml` runs the installer daily from the default
-branch (and on `workflow_dispatch`) and needs no configuration:
+A new upstream release therefore changes nothing by itself.
+`validator-pin-canary.yml` runs the installer daily from the default branch
+(and on `workflow_dispatch`) and needs no configuration:
 
-- On a stale pin it opens or updates one tracking issue, *Refresh the pinned
-  ferrum-edge validator digest*, with the exact allowlist line to commit and the
-  command that regenerates it.
-- Once the allowlist covers the current release again, it closes that issue.
+- When the pinned build stops installing or rejects the resource-label probe,
+  it fails and opens or updates one tracking issue, *Refresh the pinned
+  ferrum-edge validator digest*, with the pinned release's allowlist line and
+  the command that regenerates it.
+- When Ferrum Edge has published a newer release than the pin, it opens or
+  updates the same issue (without failing) with that release's candidate
+  allowlist line.
+- Once the pin installs, passes the probe and is the newest release, it closes
+  that issue.
 - It holds `contents: read` and `issues: write`, and never touches a deployment
   environment or gateway credential.
 
@@ -1264,17 +1272,19 @@ check that could not run, go to one `edge-main-drift` issue (found by its
 body marker) through a separate job that checks out and runs nothing and
 holds `issues: write`, for default-branch runs only; only a clean run closes
 it. Neither job is
-a required check, and the digest allowlist stays the only validator pin.
+a required check, and the baseline digest and allowlist stay the only validator pin.
 
-To refresh, review the upstream build and run:
+To move the pin, review the upstream build and run:
 
 ```bash
-bash .github/scripts/refresh-ferrum-edge-pin.sh --append
+bash .github/scripts/refresh-ferrum-edge-pin.sh --release vX.Y.Z --append
 ```
 
-Commit the new line through a normal reviewed PR and **keep the previous
-line**. The installer accepts any allowlisted digest, so PRs still running the
-older binary stay green.
+In the same reviewed PR, set `validator` and `tested_gateway` in
+`release/baseline.json`, the Dockerfile gateway stage, `DEFAULT_EDGE_VERSION`
+and the contracts pin to that release; `check_release_baseline.py` refuses a
+partial move. **Keep the previous allowlist line**, so PRs that still carry the
+previous baseline keep installing their pinned build.
 
 Like `drift-check.yml` and `settings-audit.yml`, the canary's schedule stops
 after 60 days without repository activity. Re-enable it from the Actions tab if
