@@ -1348,10 +1348,10 @@ fn credential_entry_shapes_follow_edge() {
             serde_json::json!({"password_hash": "hmac_sha256:00"}),
         ),
     ] {
-        assert_eq!(
-            check(credential_type, entry.clone()),
-            None,
-            "{credential_type} {entry}"
+        // Messages name only the static case, never a credential value.
+        assert!(
+            check(credential_type, entry).is_none(),
+            "an Edge-admitted {credential_type} entry was refused"
         );
     }
     for (credential_type, entry, expected) in [
@@ -1384,10 +1384,10 @@ fn credential_entry_shapes_follow_edge() {
             "remove `salt`",
         ),
     ] {
-        let error = check(credential_type, entry.clone()).expect("refused");
+        let named = check(credential_type, entry).is_some_and(|error| error.contains(expected));
         assert!(
-            error.contains(expected),
-            "{credential_type} {entry}: {error}"
+            named,
+            "the {credential_type} refusal does not say {expected:?}"
         );
     }
     let error = check(
@@ -1395,8 +1395,16 @@ fn credential_entry_shapes_follow_edge() {
         serde_json::json!({"username": "alice", "password": "p"}),
     )
     .expect("a basicauth username is refused");
-    assert!(error.contains("consumer's own `username`"), "{error}");
-    assert!(error.contains("\"app-login\""), "{error}");
+    let says_where = error.contains("consumer's own `username`");
+    let names_login = error.contains("\"app-login\"");
+    assert!(
+        says_where,
+        "the refusal does not say the login is the consumer's username"
+    );
+    assert!(
+        names_login,
+        "the refusal does not name the consumer's username"
+    );
     // Unknown types are refused elsewhere, with their own message.
     assert_eq!(check("custom", serde_json::json!({"anything": 1})), None);
 }
@@ -1420,9 +1428,8 @@ fn the_load_boundary_refuses_an_edge_refused_credential_field() {
     let error = validate_credential_entry_shapes(&gateway)
         .expect_err("a jwt key is refused")
         .to_string();
-    assert!(
-        error.contains("consumer app in namespace ferrum"),
-        "{error}"
-    );
-    assert!(error.contains("credentials.jwt[0]"), "{error}");
+    let names_consumer = error.contains("consumer app in namespace ferrum");
+    assert!(names_consumer, "the refusal does not name the consumer");
+    let names_entry = error.contains("credentials.jwt[0]");
+    assert!(names_entry, "the refusal does not name the entry");
 }

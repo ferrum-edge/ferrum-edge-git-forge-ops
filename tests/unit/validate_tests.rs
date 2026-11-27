@@ -2536,10 +2536,11 @@ esac
         let validator = capturing_validator(dir.path(), file_mode_check);
         let result =
             run_validation_for_admin_api(&config, validator.to_str().unwrap(), &report).unwrap();
+        // Messages never format the password or the validator's output.
+        let resolved = seed.is_some();
         assert!(
             result.success,
-            "{seed:?}: {}{}",
-            result.stdout, result.stderr
+            "resolved={resolved}: the admin-API validator copy was refused"
         );
         let raw = std::fs::read_to_string(dir.path().join("input.yaml")).unwrap();
         assert!(
@@ -2553,7 +2554,11 @@ esac
             .unwrap()
             .clone();
         // Edge requires exactly one of `password` / `password_hash`.
-        assert_eq!(entry.len(), 1, "{entry:?}");
+        assert_eq!(
+            entry.len(),
+            1,
+            "the validator's basicauth entry has extra fields"
+        );
         assert!(entry["password_hash"]
             .as_str()
             .unwrap()
@@ -2570,7 +2575,7 @@ esac
             run_validation_with_report(&config, validator.to_str().unwrap(), &report).unwrap();
         assert!(
             !file.success,
-            "{seed:?}: file mode must keep refusing a password"
+            "resolved={resolved}: file mode must keep refusing a password"
         );
         let captured = captured_validator_input(dir.path());
         assert!(captured.consumers[0].credentials["basicauth"][0]

@@ -2874,10 +2874,23 @@ spec:
     for command in [&["validate"][..], &["plan"], &["apply", "--auto-approve"]] {
         let output = repo.run(command, &[("FERRUM_CREDS_JSON", BASICAUTH_BUNDLE)]);
         assert!(!output.status.success(), "{command:?} must refuse");
+        // Messages stay static: the diagnostic names the consumer's username.
         let stderr = stderr(&output);
-        assert!(stderr.contains("credentials.basicauth[0]"), "{stderr}");
-        assert!(stderr.contains("consumer's own `username`"), "{stderr}");
-        assert!(stderr.contains("\"app-login\""), "{stderr}");
+        let names_entry = stderr.contains("credentials.basicauth[0]");
+        let says_where = stderr.contains("consumer's own `username`");
+        let names_login = stderr.contains("\"app-login\"");
+        assert!(
+            names_entry,
+            "{command:?}: the refusal does not name the entry"
+        );
+        assert!(
+            says_where,
+            "{command:?}: the refusal does not say where the login comes from"
+        );
+        assert!(
+            names_login,
+            "{command:?}: the refusal does not name the consumer's username"
+        );
     }
     assert!(!repo.published().exists());
 }
