@@ -1,4 +1,4 @@
-"""The Edge main early warning in validator-pin-canary.yml (ferrum-contracts#76).
+"""The Edge main early warning, edge-main-drift.yml (ferrum-contracts#76).
 
 It runs a gateway binary that is not in the reviewed digest allowlist, so the
 job that runs it must stay read-only and away from the allowlist, and the only
@@ -17,8 +17,8 @@ SPEC = importlib.util.spec_from_file_location("check_supply_chain", SCRIPT)
 check_supply_chain = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(check_supply_chain)
 
-WORKFLOW = ROOT / ".github/workflows/validator-pin-canary.yml"
-DAILY = "17 7 * * *"
+WORKFLOW = ROOT / ".github/workflows/edge-main-drift.yml"
+CANARY = ROOT / ".github/workflows/validator-pin-canary.yml"
 WEEKLY = "17 6 * * 1"
 IDENTITY = (
     "--certificate-identity https://github.com/ferrum-edge/ferrum-edge/"
@@ -32,21 +32,30 @@ class EdgeMainDriftTests(unittest.TestCase):
         self.document = check_supply_chain.parse_workflow(self.text)
         self.jobs = self.document["jobs"]
 
-    def test_the_canary_and_the_early_warning_run_on_their_own_triggers(self):
+    def test_it_runs_weekly_on_dispatch_and_on_pull_requests_that_change_it(self):
         triggers = self.document["on"]
-        self.assertEqual([entry["cron"] for entry in triggers["schedule"]], [DAILY, WEEKLY])
-        check = triggers["workflow_dispatch"]["inputs"]["check"]
-        self.assertEqual(check["options"], ["validator-pin", "edge-main"])
-        self.assertEqual(check["default"], "validator-pin")
-        canary = " ".join(self.jobs["validator-pin-canary"]["if"].split())
-        self.assertIn(f"github.event.schedule == '{DAILY}'", canary)
-        self.assertIn("inputs.check == 'validator-pin'", canary)
-        edge = " ".join(self.jobs["edge-main-drift"]["if"].split())
-        self.assertIn(f"github.event.schedule == '{WEEKLY}'", edge)
-        self.assertIn("inputs.check == 'edge-main'", edge)
-        self.assertEqual(list(self.jobs), [
-            "validator-pin-canary", "edge-main-drift", "edge-main-drift-issue",
-        ])
+        self.assertEqual([entry["cron"] for entry in triggers["schedule"]], [WEEKLY])
+        self.assertIn("workflow_dispatch", triggers)
+        self.assertEqual(
+            triggers["pull_request"]["paths"],
+            [".github/workflows/edge-main-drift.yml", "tests/unit/edge_main_openapi_tests.rs"],
+        )
+        self.assertEqual(list(self.jobs), ["edge-main-drift", "edge-main-drift-issue"])
+        self.assertNotIn("if", self.jobs["edge-main-drift"])
+        # The protected checker's fences hold for the shipped file.
+        self.assertEqual(check_supply_chain.edge_main_drift_violations(self.text), [])
+
+    def test_the_validator_pin_canary_no_longer_carries_the_early_warning(self):
+        canary = check_supply_chain.parse_workflow(CANARY.read_text(encoding="utf-8"))
+        self.assertEqual(list(canary["jobs"]), ["validator-pin-canary"])
+        self.assertNotIn("inputs.check", CANARY.read_text(encoding="utf-8"))
+
+    def test_a_pull_request_run_fails_unless_clean(self):
+        steps = {step.get("name"): step for step in self.jobs["edge-main-drift"]["steps"]}
+        gate = steps["Fail a pull-request run that did not come back clean"]
+        self.assertIn("github.event_name == 'pull_request'", gate["if"])
+        self.assertEqual(gate["env"]["OUTCOME"], "${{ steps.report.outputs.outcome }}")
+        self.assertIn('[ "$OUTCOME" != clean ]', gate["run"])
 
     def test_the_job_that_runs_edge_main_is_read_only_and_off_the_allowlist(self):
         job = self.jobs["edge-main-drift"]
@@ -103,7 +112,7 @@ class EdgeMainDriftTests(unittest.TestCase):
             name for name, job in self.jobs.items()
             if any(value == "write" for value in job.get("permissions", {}).values())
         ]
-        self.assertEqual(writers, ["validator-pin-canary", "edge-main-drift-issue"])
+        self.assertEqual(writers, ["edge-main-drift-issue"])
         run = issue["steps"][0]["run"]
         self.assertIn("labels=$label", run)
         self.assertIn("drift | error)", run)

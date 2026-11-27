@@ -1140,7 +1140,7 @@ pinned ferrum-edge validator digest*. Only the first two fail the run.
 `validate-pr.yml` runs the same label check on every PR as part of
 `gitforgeops-required-static-validation`.
 
-Its weekly `edge-main-drift` job is an early warning, not a pin: it copies the
+The weekly `edge-main-drift.yml` workflow is an early warning, not a pin: it copies the
 gateway binary out of Edge's signed `main` image (Cosign-verified against
 Edge's Main Latest Image workflow), runs the label probe, compares Edge
 `main`'s `openapi.yaml` with the mirrored resource fields and every nested key
@@ -1148,7 +1148,8 @@ GitForgeOps emits (`tests/unit/edge_main_openapi_tests.rs`), runs
 `gitforgeops validate` for every environment and the lifecycle suite (a fresh
 throwaway database each run) with it, and opens or closes one
 issue labelled `edge-main-drift` (also opened when the check cannot run). It never reads or changes the allowlist.
-Dispatch it with `gh workflow run validator-pin-canary.yml -f check=edge-main`.
+Dispatch it with `gh workflow run edge-main-drift.yml`; a pull request that changes it (or
+its `openapi.yaml` comparison test) runs it too, fails on drift and files no issue.
 
 ## Upgrading
 
