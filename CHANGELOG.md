@@ -7,6 +7,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Retiring the Agent Setup CI / Agent Setup Policy checks, step 1 of 3:
+  `check_supply_chain.py` accepts the release gate's required-check list with
+  or without `Agent Setup Policy / validate-trusted-policy`, so the next step
+  can drop it under the trusted default-branch checker.
 - `check_agent_setup.py` treats the `opus-agents` Claude mirror as optional
   instead of rejecting it, and reports a Claude mirror as unexpected only when
   no canonical `.agents/skills/` skill backs it. This lets a follow-up add the
