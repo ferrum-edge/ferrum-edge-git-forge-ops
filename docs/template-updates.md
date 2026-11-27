@@ -325,6 +325,17 @@ That restores the previous engine, workflows and validator pin. Because
 `.gitforgeops/baseline.json` is in the same commit, it also restores the
 previous baseline, so `status` shows the update as available again.
 
+**Never revert across a ledger migration.** An engine reads only its own
+`.state/<env>.json` version (the ledger's `version` field) and refuses any
+other. If the update's release notes say it migrates the ledger and an apply
+with the new engine has already written a ledger, the previous engine cannot
+read it, so a revert leaves `plan` and `apply` refusing to run. In that case
+keep the current ledger and roll forward instead: adopt the fixed release, or
+follow the recovery steps in that release's notes. If no fix exists yet, stop
+applying (do not merge deployment inputs) and report it upstream. While every
+ledger still carries the version the previous engine reads (no apply has run
+since a migrating update, or the update migrated nothing), the revert is safe.
+
 **Do not restore an old `.state/<env>.json`.** The ledger only moves forward.
 It records what this repository has applied to a live gateway, and reverting
 code does not un-apply anything. An older snapshot tells shared mode that rows
@@ -357,11 +368,15 @@ skips the job, and its settings audit requires nothing new.
 
 ## What a supported baseline means
 
-This adoption process starts at the first supported release. Upstream does not
-promise updates for a copy taken from an arbitrary pre-release revision. From
-1.0.0 onward, updates within a major version are compatible by the
-[release policy](../release/README.md#publishing-and-later-changes); a new
-major version carries migration steps in its release notes. The
+This adoption process starts at the first supported release: one with a
+finalized record in
+[`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+on upstream `main`. Upstream does not promise updates for a copy taken from an
+arbitrary pre-release revision. From 1.0.0 onward, only the newest published
+1.x release is supported, updates within a major version are compatible by the
+[release policy](../release/README.md#publishing-and-later-changes) (except a
+security fix that cannot be made compatibly, which carries an upgrade note),
+and a new major version carries migration steps in its release notes. The
 baseline you record has to be a revision upstream still has, and the further
 behind you are, the more of the comparison lands in the conflict column. Adopt
 regularly and each update stays small.

@@ -27,16 +27,20 @@ and the separate hosted qualification and first-release acceptance gates. The
 `backend-egress-policy` v2, `admin-deployment-snapshot` v2, deployment
 acknowledgement, and gateway-errors contract surfaces are not consumed here.
 
-There is no supported release until `release/baseline.json` says
-`supported`. Until then breaking changes are acceptable on `main`, without
-compatibility layers or upgrade guides for earlier unreleased revisions. From
-1.0.0 onward, follow semantic versioning: within a major version the CLI
-(commands, flags, exit codes), repository configuration, resource and overlay
-files, the state ledger and the bundled workflows change only compatibly; an
-incompatible change needs a documented deprecation first, lands only in a new
-major version with migration steps, and state ledger changes are forward-only
-migrations. Either way, update implementation, examples, fixtures, tests and
-docs together.
+A release is supported only when its finalized record exists in
+`release/records/<tag>.json` on `main` (`release/baseline.json` is the release
+being prepared). Until the first record exists, breaking changes are acceptable
+on `main`, without compatibility layers or upgrade guides for earlier
+unreleased revisions. From 1.0.0 onward, follow semantic versioning: within a
+major version the CLI (commands, flags, exit codes), repository configuration,
+resource and overlay files, the state ledger and the bundled workflows change
+only compatibly; an incompatible change needs a documented deprecation first
+and lands only in a new major version with migration steps (the one exception
+is a security fix that cannot be made compatibly, which may ship in a minor
+with an advisory and upgrade note). State ledger changes are forward-only
+migrations: an engine reads only its own ledger version, so a release that
+migrates the ledger documents that reverting past it is unsupported. Either
+way, update implementation, examples, fixtures, tests and docs together.
 
 There is no database, SQL schema or migration runner. Edit these definitions
 directly:
@@ -1966,7 +1970,9 @@ Invariants:
 - `POST_ADOPTION_CHECKS` is printed by `apply` and asserted against
   `docs/template-updates.md`.
 - Recovery is `git revert` of the adoption commit, never restoring an obsolete
-  ledger (that is a separate state-override repair).
+  ledger (that is a separate state-override repair). The loader accepts only
+  `STATE_VERSION`, so a revert is unsupported once an apply has written a
+  migrated ledger; recovery then rolls forward (`docs/template-updates.md`).
 
 ### Source layout
 

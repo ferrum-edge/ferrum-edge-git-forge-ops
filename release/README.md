@@ -175,9 +175,13 @@ versioning: patch releases carry compatible fixes, minor releases add
 compatible features or a new tested gateway pairing, and a breaking CLI,
 configuration, state or workflow change is first announced as a deprecation in
 a release note and then lands only in a new major version, with explicit
-migration steps and a new tested pairing. State ledger changes are forward-only
-migrations. Security fixes use [security advisories](../SECURITY.md) and the
-supported versions stated there.
+migration steps and a new tested pairing. The one exception is a security fix
+that cannot be made compatibly: it may ship in the next minor release with an
+advisory naming the first fixed version and an upgrade note. State ledger
+changes are forward-only migrations; a release that migrates the ledger says so
+in its notes, and its engine is the oldest one that can read the migrated
+ledger. Only the newest published 1.x release is supported
+([security policy](../SECURITY.md#supported-versions)).
 
 Existing template copies get none of these changes automatically; use
 [the downstream update procedure](../docs/template-updates.md) to review and
