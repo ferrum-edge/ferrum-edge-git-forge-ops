@@ -263,10 +263,9 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
             "id": "app", "username": "app",
             "credentials": {
                 "keyauth": [{"key": "${gh-env-secret:alloc=require}"}],
-                "basicauth": [{
-                    "username": "alice",
-                    "password_hash": "${gh-env-secret:alloc=require}"
-                }]
+                "basicauth": [{"password_hash": "${gh-env-secret:alloc=require}"}],
+                // The literal (non-secret) credential field.
+                "mtls_auth": [{"identity": "alice"}]
             }
         }
     })
@@ -305,10 +304,8 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                         "id": "app", "namespace": "ferrum", "username": "app",
                         "credentials": {
                             "keyauth": [{"key": "synthetic-key-value-0001"}],
-                            "basicauth": [{
-                                "username": "alice",
-                                "password_hash": "synthetic-hash-value-0001"
-                            }]
+                            "basicauth": [{"password_hash": "synthetic-hash-value-0001"}],
+                            "mtls_auth": [{"identity": "alice"}]
                         }
                     }],
                     "plugin_configs": [{
@@ -324,7 +321,7 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                             serde_json::json!("synthetic-different-key");
                     }
                     "literal" => {
-                        live["consumers"][0]["credentials"]["basicauth"][0]["username"] =
+                        live["consumers"][0]["credentials"]["mtls_auth"][0]["identity"] =
                             serde_json::json!("bob");
                     }
                     "extra" => {

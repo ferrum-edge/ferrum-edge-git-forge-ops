@@ -908,21 +908,14 @@ fn mesh_validation_context_is_the_documented_no_ca_opt_out() {
 }
 
 /// The gateway pass has no identity gate to relax, and a gateway document must
-/// never be graded under a relaxed mesh context. `-m file` gets only the
-/// public `basic_auth` key stand-in, which lets that plugin build; its
-/// namespace is derived separately from the document.
+/// never be graded under a relaxed mesh context. `-m file` gets no constant
+/// identity overrides; its namespace is derived separately from the document.
 #[test]
-fn gateway_validation_context_is_only_the_basic_auth_key_standin() {
-    use gitforgeops::validate::{BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN};
-
-    assert_eq!(BASIC_AUTH_HMAC_SECRET_ENV, "FERRUM_BASIC_AUTH_HMAC_SECRET");
-    // Edge refuses a key under 32 bytes.
-    assert!(BASIC_AUTH_HMAC_SECRET_STANDIN.len() >= 32);
-    assert!(BASIC_AUTH_HMAC_SECRET_STANDIN
-        .starts_with(gitforgeops::validate::VALIDATION_STANDIN_PREFIX));
-    assert_eq!(
-        validation_context_env(GATEWAY_VALIDATE_MODE),
-        vec![(BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN)]
+fn gateway_validation_context_injects_nothing() {
+    assert!(
+        validation_context_env(GATEWAY_VALIDATE_MODE).is_empty(),
+        "{:?}",
+        validation_context_env(GATEWAY_VALIDATE_MODE)
     );
     // Any mode that is not the mesh pass is treated the same way: the context
     // is an allow-list keyed on one exact mode, not a default.
@@ -2616,6 +2609,33 @@ fn admin_api_basicauth_standins_leave_an_explicit_hash_alone() {
 /// plugin to check its config and refuses without
 /// `FERRUM_BASIC_AUTH_HMAC_SECRET`. The validator child gets the public
 /// stand-in, and the parent's own value never reaches it.
+/// Only a document that declares a `basic_auth` plugin gets the key
+/// stand-in; every other gateway child environment is unchanged.
+#[cfg(unix)]
+#[test]
+fn the_basic_auth_key_standin_is_scoped_to_documents_with_a_basic_auth_plugin() {
+    use gitforgeops::validate::{
+        basic_auth_key_standin_env, BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN,
+        VALIDATION_STANDIN_PREFIX,
+    };
+
+    assert_eq!(BASIC_AUTH_HMAC_SECRET_ENV, "FERRUM_BASIC_AUTH_HMAC_SECRET");
+    // Edge refuses a key under 32 bytes.
+    assert!(BASIC_AUTH_HMAC_SECRET_STANDIN.len() >= 32);
+    assert!(BASIC_AUTH_HMAC_SECRET_STANDIN.starts_with(VALIDATION_STANDIN_PREFIX));
+    assert_eq!(
+        basic_auth_key_standin_env(&gitforgeops::config::GatewayConfig::default()),
+        None
+    );
+    let key_auth = plugin_config_for("key", "key_auth", serde_json::json!({}));
+    assert_eq!(basic_auth_key_standin_env(&key_auth), None);
+    let basic = plugin_config_for("basic", "basic_auth", serde_json::json!({}));
+    assert_eq!(
+        basic_auth_key_standin_env(&basic),
+        Some((BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN))
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_basic_auth_plugin_validates_with_the_key_standin_only() {

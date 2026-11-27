@@ -435,21 +435,16 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
 #[cfg(unix)]
 #[test]
 fn literal_identity_cli_diagnostics_remain_readable_with_a_loaded_bundle() {
-    for (consumer, identity, bundle) in [
-        (BASICAUTH_IDENTITY_CONSUMER, "alice", BASICAUTH_BUNDLE),
-        (MTLS_IDENTITY_CONSUMER, "client.example", "{}"),
-    ] {
+    // `mtls_auth[].identity` is the one credential identity field; a
+    // basicauth entry carries no username.
+    for (consumer, identity, bundle) in [(MTLS_IDENTITY_CONSUMER, "client.example", "{}")] {
         // Stale, unused identity slots must not make literal identities secret
         // by value association with the bundle. Only substituted slots count.
         let mut bundle: serde_json::Value = serde_json::from_str(bundle).unwrap();
         if bundle.get("FERRUM_CREDS_BUNDLE").is_none() {
             bundle["FERRUM_CREDS_BUNDLE"] = serde_json::json!({});
         }
-        let key = if identity == "alice" {
-            "ferrum/app/basicauth/username"
-        } else {
-            "ferrum/app/mtls_auth/identity"
-        };
+        let key = "ferrum/app/mtls_auth/identity";
         bundle["FERRUM_CREDS_BUNDLE"][key] = serde_json::json!(identity);
         let bundle = bundle.to_string();
         for mode in ["api", "file"] {
@@ -1815,13 +1810,13 @@ fn rotate_checks_target_generation_before_any_network_or_state_publication() {
         ),
         (
             "basicauth/password_hash",
-            r#"{"basicauth":[{"username":"app","password_hash":"${gh-env-secret:alloc=require}"}]}"#,
+            r#"{"basicauth":[{"password_hash":"${gh-env-secret:alloc=require}"}]}"#,
             "cannot generate a basicauth password_hash",
             "'platform/app/basicauth/password_hash'",
         ),
         (
             "basicauth/[1]/password_hash",
-            r#"{"basicauth":[{"username":"one","password_hash":"${gh-env-secret:alloc=require}"},{"username":"two","password_hash":"${gh-env-secret:alloc=require}"}]}"#,
+            r#"{"basicauth":[{"password_hash":"${gh-env-secret:alloc=require}"},{"password_hash":"${gh-env-secret:alloc=require}"}]}"#,
             "cannot generate a basicauth password_hash",
             "'platform/app/basicauth/[1]/password_hash'",
         ),
@@ -2025,16 +2020,10 @@ fn run_rotate(
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let credential = format!("{kind}/[1]/{field}");
-    // Only `basicauth` pairs its secret with a public username. Under any
-    // other kind `username` is a literal secret leaf, which the rotation's
-    // literal-credential gate would refuse before provisioning.
-    let (first, second) = if kind == "basicauth" {
-        ("\n        username: first", "\n        username: second")
-    } else {
-        ("", "")
-    };
+    // Each entry holds its one field (`CREDENTIAL_ENTRY_SHAPES`); a basicauth
+    // login is the consumer's `username`.
     let consumer = format!(
-        "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    {kind}:\n      - {field}: '${{gh-env-secret:alloc=require}}'{first}\n      - {field}: '${{gh-env-secret:alloc=require}}'{second}\n"
+        "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    {kind}:\n      - {field}: '${{gh-env-secret:alloc=require}}'\n      - {field}: '${{gh-env-secret:alloc=require}}'\n"
     );
     let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": slots }).to_string();
     let repo = Repo::with_files(&[
@@ -2098,7 +2087,7 @@ fn rotate_refuses_a_literal_sibling_credential_before_any_side_effect() {
         (
             serde_json::json!({
                 "keyauth": [{ "key": BROKERED }],
-                "basicauth": [{ "username": "public-identity", "password": LITERAL }]
+                "basicauth": [{ "password": LITERAL }]
             }),
             "Literal credential in 'basicauth[0].password'",
         ),
@@ -2143,10 +2132,6 @@ fn rotate_refuses_a_literal_sibling_credential_before_any_side_effect() {
         assert!(diagnostic.contains(finding), "{diagnostic}");
         assert!(
             diagnostic.contains("Refusing to rotate: consumer 'platform/app'"),
-            "{diagnostic}"
-        );
-        assert!(
-            !diagnostic.contains("basicauth[0].username"),
             "{diagnostic}"
         );
         let combined = format!("{}{diagnostic}", stdout(&output));

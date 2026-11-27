@@ -466,7 +466,8 @@ plugin config by building the plugin, and `basic_auth` will not build without
 `FERRUM_BASIC_AUTH_HMAC_SECRET`. The validator never inherits a `FERRUM_*`
 variable, so it gets the public constant
 `gitforgeops-validation-standin-basic-auth-hmac-key-not-a-secret` instead,
-on the validator process only. The gateway keeps its own key; GitForgeOps
+on the validator process only and only when the document declares a
+`basic_auth` plugin. The gateway keeps its own key; GitForgeOps
 never reads it.
 
 The scheme follows the field (`ldaps://`, `redis://`, `wss://` for

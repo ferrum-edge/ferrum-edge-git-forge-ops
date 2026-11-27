@@ -137,7 +137,9 @@ pub const MESH_ALLOW_NO_CA_ENV: &str = "FERRUM_MESH_ALLOW_NO_CA";
 /// The key ferrum-edge's `basic_auth` plugin needs before it can be built.
 pub const BASIC_AUTH_HMAC_SECRET_ENV: &str = "FERRUM_BASIC_AUTH_HMAC_SECRET";
 
-/// The validation-only stand-in for [`BASIC_AUTH_HMAC_SECRET_ENV`].
+/// The validation-only stand-in for [`BASIC_AUTH_HMAC_SECRET_ENV`], set on a
+/// gateway validator child only when the document declares a `basic_auth`
+/// plugin ([`basic_auth_key_standin_env`]).
 ///
 /// `ferrum-edge validate` checks a plugin config by constructing the plugin,
 /// and `basic_auth` refuses to construct without
@@ -156,11 +158,11 @@ pub const BASIC_AUTH_HMAC_SECRET_STANDIN: &str =
 /// inherited `FERRUM_*` variable.
 ///
 /// This is an allow-list of constants, not a pass-through: the parent's own
-/// `FERRUM_MESH_ALLOW_NO_CA` and `FERRUM_BASIC_AUTH_HMAC_SECRET` are scrubbed
-/// like everything else and cannot influence the child either way. Gateway
-/// validation gets no identity overrides — `-m file` has no identity gate —
-/// only [`BASIC_AUTH_HMAC_SECRET_STANDIN`]. Its `FERRUM_NAMESPACE` is set
-/// separately from the assembled document, never the parent's filter.
+/// `FERRUM_MESH_ALLOW_NO_CA` is scrubbed like everything else and cannot
+/// influence the child either way. Gateway validation gets no constant
+/// identity overrides — `-m file` has no identity gate. Its `FERRUM_NAMESPACE`
+/// is set separately from the assembled document, never the parent's filter,
+/// and [`basic_auth_key_standin_env`] depends on the document too.
 ///
 /// Nothing here reaches `apply`'s runtime settings: it is set on the
 /// `ferrum-edge validate` child process only, and the published mesh document
@@ -169,11 +171,21 @@ pub const BASIC_AUTH_HMAC_SECRET_STANDIN: &str =
 pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
     if mode == MESH_VALIDATE_MODE {
         vec![(MESH_ALLOW_NO_CA_ENV, "true")]
-    } else if mode == GATEWAY_VALIDATE_MODE {
-        vec![(BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN)]
     } else {
         Vec::new()
     }
+}
+
+/// The `basic_auth` key stand-in a gateway validator child needs for this
+/// document: [`BASIC_AUTH_HMAC_SECRET_STANDIN`] when it declares a
+/// `basic_auth` plugin, and nothing otherwise, so every other document's child
+/// environment is exactly the scrubbed one plus `FERRUM_NAMESPACE`.
+pub fn basic_auth_key_standin_env(config: &GatewayConfig) -> Option<(&'static str, &'static str)> {
+    config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.plugin_name == "basic_auth")
+        .then_some((BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN))
 }
 
 /// How long one validator invocation may run, and how much it may print on
@@ -495,6 +507,7 @@ fn run_gateway_validation(
         namespaces.push("ferrum".to_string());
     }
     let annotate_namespace = namespaces.len() > 1;
+    let basic_auth_key = basic_auth_key_standin_env(config);
     let mut combined = ValidationResult {
         success: true,
         stdout: String::new(),
@@ -515,6 +528,7 @@ fn run_gateway_validation(
             scrubber,
             Some(&namespace),
             annotate_namespace,
+            basic_auth_key,
         )?;
         if !result.success {
             combined.success = false;
@@ -560,6 +574,7 @@ pub fn run_mesh_validation(
         &SecretScrubber::default(),
         None,
         false,
+        None,
     )
 }
 
@@ -644,6 +659,7 @@ fn run_validate_pass(
     scrubber: &SecretScrubber,
     namespace: Option<&str>,
     annotate_namespace: bool,
+    standin_env: Option<(&'static str, &'static str)>,
 ) -> crate::error::Result<ValidationResult> {
     let mut command = Command::new(binary_path);
     command.args(build_validate_args_for_mode(
@@ -657,7 +673,7 @@ fn run_validate_pass(
     // Order is load-bearing: every inherited `FERRUM_*` name is removed
     // first, then this mode's own validation-only context is set, so the
     // child sees only our constants and document-derived namespace.
-    for (name, value) in validation_context_env(mode) {
+    for (name, value) in validation_context_env(mode).into_iter().chain(standin_env) {
         command.env(name, value);
     }
     if let Some(namespace) = namespace {
