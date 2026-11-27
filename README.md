@@ -1112,10 +1112,21 @@ pin: GitForgeOps no longer models the passive-health `gateway_error_codes` and
 nested Proxy/Upstream key it emits is declared by Edge 1.0.0's `openapi.yaml`.
 Still for the pin change itself:
 
-- Run lifecycle jobs against a fresh 1.0.0 database. The bundled suite creates
-  a throwaway SQLite file per run, but a gateway kept for acceptance (and any
-  `LIFECYCLE_DB_URL`) must be rebuilt: 1.0.0 refuses a database created by a
-  0.9.x release and stored documents carrying removed or unknown keys.
+- Run lifecycle jobs against a fresh 1.0.0 database, on every backend. The
+  bundled suite creates a throwaway SQLite file per run, but a gateway kept for
+  acceptance (and any `LIFECYCLE_DB_URL`) must be rebuilt. On PostgreSQL, MySQL
+  and SQLite, 1.0.0 refuses a database created by a 0.9.x release on
+  migration-history grounds. MongoDB is not refused that way, but it still
+  needs the rebuild, because stored documents carrying removed or unknown keys
+  fail 1.0.0's strict decoding.
+- Before taking the migration backup on v0.9.21, clear the removed passive
+  fields from live data. For an independently managed upstream, an Admin API
+  `PUT` of the upstream without them is enough. For an upstream an API spec
+  owns, remove both keys from the spec's `x-ferrum-upstream` extension and
+  re-submit the spec with `PUT /api-specs/{id}`. A row `PUT` leaves the stored
+  spec document unchanged, and restore copies stored spec documents without
+  re-extracting them, so the old extension would fail on the next spec
+  submission to 1.0.0.
 - Edge 1.0.0 speaks ConfigSync revision 8 and refuses 0.9.21 peers, so CP and
   DP gateways in any test or acceptance setup must run the same 1.0.0 build.
 - Move the Edge pin, contracts pin, `DEFAULT_EDGE_VERSION`, release baseline
