@@ -32,7 +32,6 @@ fn clear_env() {
         "FERRUM_FILE_OUTPUT_PATH",
         "FERRUM_MESH_FILE_OUTPUT_PATH",
         "FERRUM_EDGE_BINARY_PATH",
-        "FERRUM_EDGE_VERSION",
         "FERRUM_TLS_NO_VERIFY",
         "FERRUM_ALLOW_INSECURE_HTTP",
         // Cleared so the transport rules are exercised deterministically:
@@ -998,39 +997,6 @@ fn pr_comment_reads_github_credentials_through_env_config() {
             Some(value) => std::env::set_var(var, value),
             None => std::env::remove_var(var),
         }
-    }
-    clear_env();
-}
-
-#[test]
-fn edge_version_env_is_optional_and_strict() {
-    use gitforgeops::config::EdgeVersion;
-
-    let _guard = env_guard();
-    clear_env();
-    assert_eq!(load_env_config().unwrap().edge_version, None);
-
-    std::env::set_var("FERRUM_EDGE_VERSION", "   ");
-    assert_eq!(load_env_config().unwrap().edge_version, None);
-
-    for (raw, expected) in [
-        ("v0.9.20", EdgeVersion::new(0, 9, 20)),
-        ("0.9.20", EdgeVersion::new(0, 9, 20)),
-        ("v0.9.21", EdgeVersion::new(0, 9, 21)),
-        ("0.9.21", EdgeVersion::new(0, 9, 21)),
-    ] {
-        std::env::set_var("FERRUM_EDGE_VERSION", raw);
-        assert_eq!(
-            load_env_config().unwrap().edge_version,
-            Some(expected),
-            "{raw}"
-        );
-    }
-
-    for invalid in ["0.9", "v0.9.21-rc.1", "latest"] {
-        std::env::set_var("FERRUM_EDGE_VERSION", invalid);
-        let err = load_env_config().unwrap_err().to_string();
-        assert!(err.contains("FERRUM_EDGE_VERSION"), "{invalid}: {err}");
     }
     clear_env();
 }

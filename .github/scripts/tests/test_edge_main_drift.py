@@ -143,6 +143,79 @@ class EdgeMainDriftTests(unittest.TestCase):
         self.assertIn("the compare API call failed", resolve)
         self.assertIn('diverged) delta_note="not on this commit\'s history"', resolve)
 
+    def test_the_openapi_comparison_runs_and_is_reported(self):
+        steps = {step.get("name"): step for step in self.jobs["edge-main-drift"]["steps"]}
+        compare = steps["Compare Edge main's openapi.yaml with what GitForgeOps emits"]
+        self.assertEqual(compare["id"], "openapi")
+        self.assertEqual(compare["continue-on-error"], "true")
+        run = compare["run"]
+        # Read at the image's own commit, never at a moving branch.
+        self.assertIn("ferrum-edge/ferrum-edge/$EDGE_COMMIT/openapi.yaml", run)
+        self.assertIn('EDGE_MAIN_OPENAPI="$spec" cargo test --locked --test unit_tests', run)
+        # A filter that matched nothing would pass silently; the marker refuses it.
+        self.assertIn("grep -q 'edge-main-openapi: compared'", run)
+        report = steps["Write the report"]
+        self.assertEqual(report["env"]["OPENAPI"], "${{ steps.openapi.outcome }}")
+        self.assertIn('"$OPENAPI"', report["run"])
+
+
+MINIMAL_EDGE_MAIN_DRIFT = """name: Edge Main Drift
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+permissions:
+  contents: read
+jobs:
+  edge-main-drift:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - run: echo check
+  edge-main-drift-issue:
+    needs: edge-main-drift
+    if: >-
+      !cancelled() && github.event_name != 'pull_request' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - run: echo issue
+"""
+
+
+class EdgeMainDriftWorkflowFenceTests(unittest.TestCase):
+    """The protected checker's fences for the dedicated edge-main-drift.yml."""
+
+    def test_the_workflow_is_allowlisted(self):
+        self.assertIn("edge-main-drift.yml", check_supply_chain.KNOWN_WORKFLOWS)
+
+    def test_a_fenced_workflow_passes(self):
+        self.assertEqual(check_supply_chain.edge_main_drift_violations(MINIMAL_EDGE_MAIN_DRIFT), [])
+
+    def test_each_weakening_is_refused(self):
+        for name, before, after in (
+            ("renamed", "name: Edge Main Drift", "name: Something Else"),
+            ("writable check job", "    permissions:\n      contents: read\n    steps:\n      - run: echo check",
+             "    permissions:\n      contents: write\n    steps:\n      - run: echo check"),
+            ("issue job on pull requests", "github.event_name != 'pull_request' &&", ""),
+            ("issue job off the default branch",
+             "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)", "true"),
+            ("issue job runs code", "      - run: echo issue",
+             "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"),
+            ("check job reads secrets", "      - run: echo check", "      - run: echo ${{ secrets.TOKEN }}"),
+            ("check job installs the pinned validator", "      - run: echo check",
+             "      - run: bash .github/scripts/install-ferrum-edge.sh"),
+        ):
+            with self.subTest(name=name):
+                text = MINIMAL_EDGE_MAIN_DRIFT.replace(before, after, 1)
+                self.assertNotEqual(text, MINIMAL_EDGE_MAIN_DRIFT)
+                self.assertTrue(check_supply_chain.edge_main_drift_violations(text), name)
+
 
 if __name__ == "__main__":
     unittest.main()

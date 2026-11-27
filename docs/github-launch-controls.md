@@ -1281,8 +1281,8 @@ bash .github/scripts/refresh-ferrum-edge-pin.sh --release vX.Y.Z --append
 ```
 
 In the same reviewed PR, set `validator` and `tested_gateway` in
-`release/baseline.json`, the Dockerfile gateway stage, `DEFAULT_EDGE_VERSION`
-and the contracts pin to that release; `check_release_baseline.py` refuses a
+`release/baseline.json`, the Dockerfile gateway stage and the contracts pin to
+that release; `check_release_baseline.py` refuses a
 partial move. **Keep the previous allowlist line**, so PRs that still carry the
 previous baseline keep installing their pinned build.
 

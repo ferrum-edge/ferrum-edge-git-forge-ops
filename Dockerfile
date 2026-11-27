@@ -66,9 +66,8 @@ COPY .github/scripts/audit_settings.py .github/scripts/audit_settings.py
 RUN cargo fetch --locked
 RUN cargo build --release --locked
 
-# Debian point-release security updates for CVE-2026-103111 (HIGH),
-# DSA-6549-1 / GHSA-5qpq-xqfv-j9pg, and CVE-2026-76844 / CVE-2026-85091 (HIGH,
-# zlib), plus the glibc (libc6, libc-bin) 2.41-12+deb13u5 fixes for
+# Debian point-release security updates for CVE-2026-76844 / CVE-2026-85091
+# (HIGH, zlib), plus the glibc (libc6, libc-bin) 2.41-12+deb13u5 fixes for
 # CVE-2026-5435, CVE-2026-6238, CVE-2026-6368, CVE-2026-6791, CVE-2026-8674,
 # CVE-2026-18374, CVE-2026-19499, CVE-2026-19542, CVE-2026-77117,
 # CVE-2026-80489, CVE-2026-86805, CVE-2026-89092, CVE-2026-95818 and
@@ -93,8 +92,6 @@ RUN set -eu; \
     cd /opt/runtime-security-updates; \
     case "$arch" in \
       amd64) printf '%s  %s\n' \
-        e226f661d918f04daf38cdbc4806b7ed7d6ef95c7eb0ade692fc350e31970040 libpcre2-8-0_10.46-1~deb13u3_amd64.deb \
-        b38acab30f295bf1066a6632e31cbd0a1980f2924b38040cda131d5dea5384ec liblzma5_5.8.1-1+deb13u2_amd64.deb \
         8c27c342230503b73dfde629642c3b352e87b554e06d60cf58772f236a305ceb zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_amd64.deb \
         b59b0625cd1a791375d40dab23a4d5d3d0641e3d0a773501becdc3725b7f99cf libc6_2.41-12+deb13u5_amd64.deb \
         f30ee7381a9c6a3936165259bcd58e65f4b288e351606d200c8435724c5876dd libc-bin_2.41-12+deb13u5_amd64.deb \
@@ -103,8 +100,6 @@ RUN set -eu; \
         e7f364ab275542ba9cfdf0c6bec9276fbac3ef6fe27d3a65674bd29ba3d32096 passwd_4.17.4-2+deb13u1_amd64.deb \
         > SHA256SUMS ;; \
       arm64) printf '%s  %s\n' \
-        1a02b7129990690ea095fd35d7ace6853742923d158019e1fb4ef27efd2c51a7 libpcre2-8-0_10.46-1~deb13u3_arm64.deb \
-        88f3aa499dc30edf01b9209ab40f11e37edfbecef971f84f4721de1874ed4827 liblzma5_5.8.1-1+deb13u2_arm64.deb \
         0e41b3d7ad8ad7fcd36dd4d61ca91a70018478fc4af652e044f4be770784ddff zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_arm64.deb \
         0966fc3da1a26cc57647c68b5736f791b6e7eb498173a7993f63b6c89b4ed4f5 libc6_2.41-12+deb13u5_arm64.deb \
         889850625c686a6d0b26a8baee5fb96f33e9f3305882f3a6751bb4c9433063e1 libc-bin_2.41-12+deb13u5_arm64.deb \
@@ -117,8 +112,6 @@ RUN set -eu; \
     while read -r digest file; do \
       epoch=''; \
       case "$file" in \
-        libpcre2-8-0_*) pool=debian-security/pool/updates/main/p/pcre2 ;; \
-        liblzma5_*) pool=debian-security/pool/updates/main/x/xz-utils ;; \
         zlib1g_*) pool=debian-security/pool/updates/main/z/zlib epoch=1 ;; \
         libc6_*|libc-bin_*) pool=debian/pool/main/g/glibc ;; \
         libzstd1_*) pool=debian-security/pool/updates/main/libz/libzstd ;; \
@@ -145,9 +138,11 @@ RUN set -eu; \
 # usable /bin/sh, and several of its code paths shell out — `validate` execs
 # `ferrum-edge`, overrides inspect Git. Trixie matches
 # the glibc of the upstream ferrum-edge image so the copied binary links cleanly.
-# The pinned base already ships libpcre2-8-0 10.46-1~deb13u3 and liblzma5
-# 5.8.1-1+deb13u2, so those two .deb pins currently reinstall the same reviewed
-# versions. It still carries zlib1g 1:1.3.dfsg+really1.3.1-1+b1; the reviewed
+# The pinned base's installed package metadata (var/lib/dpkg/status, both
+# architectures) already carries libpcre2-8-0 10.46-1~deb13u3 and liblzma5
+# 5.8.1-1+deb13u2, the fixes for CVE-2026-103111 and DSA-6549-1 /
+# GHSA-5qpq-xqfv-j9pg, so those two are not pinned here. It still carries
+# zlib1g 1:1.3.dfsg+really1.3.1-1+b1; the reviewed
 # security fix is +deb13u1. It also carries libc6 and libc-bin 2.41-12+deb13u4;
 # the reviewed point-release fix is +deb13u5. It carries libzstd1
 # 1.5.7+dfsg-1; the reviewed security fix is +deb13u1. It carries login.defs

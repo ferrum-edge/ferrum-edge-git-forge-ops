@@ -336,7 +336,6 @@ spec:
   stream_proxy_protocol: true
   backend_proxy_protocol: v2
   websocket_idle_timeout_seconds: 120
-  pool_max_requests_per_connection: 1000
   api_spec_id: "spec-7"
   stream_match:
     arms:
@@ -351,7 +350,6 @@ spec:
     assert_eq!(spec.stream_proxy_protocol, Some(true));
     assert_eq!(spec.backend_proxy_protocol, Some(BackendProxyProtocol::V2));
     assert_eq!(spec.websocket_idle_timeout_seconds, Some(120));
-    assert_eq!(spec.pool_max_requests_per_connection, Some(1000));
     assert_eq!(spec.api_spec_id, Some("spec-7".to_string()));
 
     let yaml = gitforgeops::yaml::to_string(&spec).unwrap();

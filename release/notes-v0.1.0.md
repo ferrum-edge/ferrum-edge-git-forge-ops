@@ -35,7 +35,7 @@ for later fixes.
   the exact-revision release gate.
 - Edge v0.9.21 follows v0.9.20 directly and refuses many configurations
   v0.9.20 accepted. The no-op `Proxy.pool_max_requests_per_connection` is
-  removed (GitForgeOps omits it from desired state for this pairing), several
+  removed (GitForgeOps no longer models it), several
   deprecated plugin options and alias spellings are refused, `hmac_auth`
   requires `replay_scope`, and export fingerprints are keyed from
   `FERRUM_ADMIN_CONFIG_EXPORT_FINGERPRINT_SECRET`. Review the

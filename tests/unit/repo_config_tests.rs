@@ -445,7 +445,6 @@ fn resolved_env_rejects_unsafe_environment_names() {
         overlay: None,
         namespace_filter: None,
         namespace_filter_is_environment_scope: false,
-        edge_version: None,
         apply_strategy: ApplyStrategy::Incremental,
         ownership: OwnershipConfig {
             mode: OwnershipMode::Shared,
@@ -496,7 +495,6 @@ fn synthetic_default_honors_explicit_env_over_ferrum_env_var() {
             file_output_path: "./assembled/resources.yaml".to_string(),
             mesh_file_output_path: "./assembled/mesh.yaml".to_string(),
             edge_binary_path: "ferrum-edge".to_string(),
-            edge_version: None,
             tls_no_verify: false,
             allow_insecure_http: false,
             ca_cert: None,
@@ -570,7 +568,6 @@ fn resolved_env_rejects_full_replace_plus_shared_from_env_vars() {
         file_output_path: "./assembled/resources.yaml".to_string(),
         mesh_file_output_path: "./assembled/mesh.yaml".to_string(),
         edge_binary_path: "ferrum-edge".to_string(),
-        edge_version: None,
         tls_no_verify: false,
         allow_insecure_http: false,
         ca_cert: None,

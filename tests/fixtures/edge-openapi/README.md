@@ -12,10 +12,8 @@ repository pins, split into writable `properties` and `read_only` ones.
   `src/config/schema.rs`, so a gateway field the mirror does not model
   (and that import, apply and the strict loader would therefore refuse) fails
   CI instead of an operator's run; and
-* every mirrored field (except the `extra` pass-through and explicitly
-  allowlisted version-aware compatibility fields retained for older Edge
-  pairings, such as `Proxy.pool_max_requests_per_connection`) is a property of
-  the schema, so a misspelled mirror field fails too.
+* every mirrored field (except the `extra` pass-through) is a property of the
+  schema, so a misspelled or removed mirror field fails too.
 
 It also requires `source.tag` to be the pinned release
 (`validator.version` in `release/baseline.json`), so moving the validator pin

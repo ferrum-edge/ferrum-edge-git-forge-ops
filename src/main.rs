@@ -289,12 +289,6 @@ fn load_and_assemble_all(
         resolved,
         env_config,
     )?;
-    if let Some(notice) = config::format_omitted_proxy_fields_notice(
-        resolved.effective_edge_version(),
-        &assembled.omitted_proxy_fields,
-    ) {
-        eoutln!("Notice: {}", safe_line(&notice));
-    }
     Ok(assembled)
 }
 

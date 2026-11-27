@@ -5,8 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
-use super::edge_version::EdgeVersion;
-
 /// Gateway interaction mode.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -140,11 +138,6 @@ pub struct EnvConfig {
     pub mesh_file_output_path: String,
     /// Path to the `ferrum-edge` binary for validation.
     pub edge_binary_path: String,
-    /// Paired Ferrum Edge release version (`FERRUM_EDGE_VERSION`, e.g. `v0.9.21`
-    /// or `v0.9.20`), used as fallback when `.gitforgeops/config.yaml` leaves
-    /// `edge_version` unset. `None` defaults to [`super::edge_version::DEFAULT_EDGE_VERSION`]
-    /// (the pinned `v0.9.21`).
-    pub edge_version: Option<EdgeVersion>,
     /// Skip TLS certificate verification when talking to the gateway.
     ///
     /// Dev only, and independent of [`EnvConfig::allow_insecure_http`]: this
@@ -265,7 +258,6 @@ impl fmt::Debug for EnvConfig {
             .field("file_output_path", &self.file_output_path)
             .field("mesh_file_output_path", &self.mesh_file_output_path)
             .field("edge_binary_path", &self.edge_binary_path)
-            .field("edge_version", &self.edge_version)
             .field("tls_no_verify", &self.tls_no_verify)
             .field("verify_base_url", &verify_base_url)
             .field("verify_probe_consumers", &self.verify_probe_consumers)
@@ -337,7 +329,6 @@ impl Default for EnvConfig {
             file_output_path: "./assembled/resources.yaml".to_string(),
             mesh_file_output_path: DEFAULT_MESH_FILE_OUTPUT_PATH.to_string(),
             edge_binary_path: "ferrum-edge".to_string(),
-            edge_version: None,
             tls_no_verify: false,
             verify_base_url: None,
             verify_probe_consumers: None,
@@ -388,7 +379,6 @@ impl Default for EnvConfig {
 /// | `FERRUM_FILE_OUTPUT_PATH`    | `file_output_path` | `./assembled/resources.yaml`     |
 /// | `FERRUM_MESH_FILE_OUTPUT_PATH` | `mesh_file_output_path` | `./assembled/mesh.yaml`   |
 /// | `FERRUM_EDGE_BINARY_PATH`    | `edge_binary_path` | `ferrum-edge`                    |
-/// | `FERRUM_EDGE_VERSION`        | `edge_version`     | `None` (defaults to the pinned `v0.9.21`) |
 /// | `FERRUM_TLS_NO_VERIFY`       | `tls_no_verify`    | `false`                          |
 /// | `FERRUM_VERIFY_BASE_URL`     | `verify_base_url`  | unset (`verify` refuses to run declared checks); `http://` only to a literal loopback IP |
 /// | `FERRUM_VERIFY_PROBE_CONSUMERS` | `verify_probe_consumers` | unset (`verify` refuses every check that sends a slot) |
@@ -504,16 +494,6 @@ pub fn load_env_config() -> crate::error::Result<EnvConfig> {
             .unwrap_or_else(|| DEFAULT_MESH_FILE_OUTPUT_PATH.to_string()),
         edge_binary_path: non_empty_env("FERRUM_EDGE_BINARY_PATH")
             .unwrap_or_else(|| "ferrum-edge".to_string()),
-        edge_version: match non_empty_env("FERRUM_EDGE_VERSION") {
-            Some(raw) => Some(EdgeVersion::parse(&raw).map_err(|_| {
-                invalid_env(
-                    "FERRUM_EDGE_VERSION",
-                    &raw,
-                    "MAJOR.MINOR.PATCH with an optional leading 'v' (for example v0.9.20 or v0.9.21)",
-                )
-            })?),
-            None => None,
-        },
         tls_no_verify,
         allow_insecure_http,
         ca_cert: non_empty_env("FERRUM_GATEWAY_CA_CERT"),

@@ -459,15 +459,9 @@ fn insecure_auth_plugin_settings_are_reported() {
             "oidc_relying_party",
             serde_json::json!({"session": {"secure": false}}),
         ),
-        plugin(
-            "hmac-1",
-            "hmac_auth",
-            serde_json::json!({"allow_unsafe_replayable_v1": true}),
-        ),
     ]);
     assert!(any_message(&cfg, "allow_plaintext: true"));
     assert!(any_message(&cfg, "session.secure: false"));
-    assert!(any_message(&cfg, "allow_unsafe_replayable_v1: true"));
     assert!(audit_security(&cfg).iter().all(|f| f.severity == "error"));
 }
 

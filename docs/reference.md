@@ -361,7 +361,6 @@ case-insensitive), malformed numbers, zero for the timeout and TTL settings
 | `FERRUM_FILE_OUTPUT_PATH` | `./assembled/resources.yaml` | File-mode gateway document. |
 | `FERRUM_MESH_FILE_OUTPUT_PATH` | `./assembled/mesh.yaml` | Mesh document. Must not resolve to the same file as the gateway document. |
 | `FERRUM_EDGE_BINARY_PATH` | `ferrum-edge` | Validator binary. |
-| `FERRUM_EDGE_VERSION` | unset (the pinned `v0.9.21`, `validator.version` in `release/baseline.json`) | Paired Ferrum Edge release (`MAJOR.MINOR.PATCH`, optional `v` prefix) when the selected environment leaves `edge_version` unset in `.gitforgeops/config.yaml`. Controls version-aware handling of removed fields such as `Proxy.pool_max_requests_per_connection` (emitted and diffed verbatim on `< v0.9.21`; omitted from desired state with a stderr notice on `>= v0.9.21`). |
 | `FERRUM_VERIFY_BASE_URL` | — | Data-plane URL for `verify`. |
 | `FERRUM_VERIFY_PROBE_CONSUMERS` | — | Operator allowlist of probe Consumers (`<namespace>/<consumer-id>`, comma-separated). `verify` refuses every check that sends a slot while it is unset; `validate`, `plan`, `apply` and `review` check it when set. |
 | `FERRUM_VERIFY_PROBE_CONSUMERS_BOUND` | `false` | Set (`true`) only by workflow steps bound to the environment. Then an unset or blank allowlist refuses a slot-sending check in `validate`, `plan`, `apply` and `review`, as `verify` refuses it, instead of reading as "not visible". A malformed allowlist refuses any run that sends a slot, with or without this marker. |

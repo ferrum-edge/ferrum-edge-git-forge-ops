@@ -5654,6 +5654,10 @@ KNOWN_WORKFLOWS = frozenset({
     # actions other than `upload-sarif`. It reports no required check.
     "code-scanning.yml",
     "drift-check.yml",
+    # The Edge main early warning, moving out of validator-pin-canary.yml so
+    # pull requests that change it can run it. Fenced by
+    # `edge_main_drift_violations`.
+    "edge-main-drift.yml",
     "lifecycle.yml",
     "materialize-file.yml",
     "release.yml",
@@ -5698,6 +5702,64 @@ def _workflow_events(document: dict) -> list[str] | None:
     if isinstance(on, dict):
         return list(on)
     return None
+
+
+EDGE_MAIN_DRIFT_WORKFLOW = "edge-main-drift.yml"
+
+
+def edge_main_drift_violations(text: str) -> list[str]:
+    """Fences for `edge-main-drift.yml`, which runs an unpinned Edge binary.
+
+    The job that runs the Edge `main` image (and, on a pull request, the
+    candidate's code) stays read-only and away from the validator allowlist,
+    secrets and environments. Only the issue job writes, it checks out and runs
+    no code, and it never runs for a pull request or off the default branch.
+    """
+    name = EDGE_MAIN_DRIFT_WORKFLOW
+    violations = workflow_name_violations(name, text, "Edge Main Drift")
+    try:
+        document = parse_workflow(text)
+    except WorkflowSyntaxError:
+        return violations
+    if document.get("permissions") != {"contents": "read"}:
+        violations.append(f"{name}: workflow permissions must be exactly `contents: read`")
+    jobs = document.get("jobs") if isinstance(document.get("jobs"), dict) else {}
+    check = jobs.get("edge-main-drift")
+    issue = jobs.get("edge-main-drift-issue")
+    if not isinstance(check, dict) or not isinstance(issue, dict) or len(jobs) != 2:
+        return violations + [
+            f"{name}: exactly the `edge-main-drift` and `edge-main-drift-issue` jobs are allowed"
+        ]
+    check_text = json.dumps(check)
+    if check.get("permissions") != {"contents": "read"}:
+        violations.append(f"{name}: the edge-main-drift job must hold only `contents: read`")
+    if "environment" in check or "env" in check:
+        violations.append(
+            f"{name}: the edge-main-drift job must bind no environment and no job-level env"
+        )
+    for forbidden in (
+        "secrets.",
+        "install-ferrum-edge.sh",
+        "ferrum-edge-checksums.txt",
+        "actions/cache",
+    ):
+        if forbidden in check_text:
+            violations.append(f"{name}: the edge-main-drift job must not use {forbidden!r}")
+    if issue.get("permissions") != {"contents": "read", "issues": "write"}:
+        violations.append(
+            f"{name}: the issue job must hold exactly `contents: read` and `issues: write`"
+        )
+    condition = " ".join(str(issue.get("if", "")).split())
+    for required in (
+        "github.event_name != 'pull_request'",
+        "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+    ):
+        if required not in condition:
+            violations.append(f"{name}: the issue job condition must include {required!r}")
+    for step in issue.get("steps") or []:
+        if isinstance(step, dict) and "uses" in step:
+            violations.append(f"{name}: the issue job must check out and run no code")
+    return violations
 
 
 def workflow_allowlist_violations(workflow: str, document: dict) -> list[str]:
@@ -6958,6 +7020,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if "cargo build --release --locked" not in docker_instructions:
         violations.append("Dockerfile: Cargo release build must enforce Cargo.lock")
+
+    edge_main_drift = workflows / EDGE_MAIN_DRIFT_WORKFLOW
+    if edge_main_drift.is_file():
+        violations.extend(edge_main_drift_violations(edge_main_drift.read_text(encoding="utf-8")))
 
     rust_ci = (workflows / "rust-ci.yml").read_text(encoding="utf-8")
     if "tool: cargo-llvm-cov@0.9.0" not in rust_ci:

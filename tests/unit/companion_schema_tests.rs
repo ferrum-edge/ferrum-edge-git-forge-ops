@@ -213,20 +213,6 @@ fn pinned_edge_release() -> String {
         .to_string()
 }
 
-/// Fields intentionally retained in `src/config/schema.rs` after a newer Edge
-/// release removed them so older paired environments keep exact emit/diff
-/// semantics while newer pairings omit them via `adapt_gateway_for_edge_version`.
-fn version_aware_retained_fields(struct_name: &str) -> BTreeSet<String> {
-    let mut retained = BTreeSet::new();
-    if struct_name == "Proxy" {
-        // Retained for explicit `< v0.9.21` pairings (the default is v0.9.21);
-        // removed in Edge v0.9.21 (`ferrum-edge#7218`) and omitted from desired
-        // state on `>= v0.9.21` (#739).
-        retained.insert(gitforgeops::config::POOL_MAX_REQUESTS_FIELD.to_string());
-    }
-    retained
-}
-
 /// Every writable top-level `Proxy` / `Upstream` property of the pinned Edge
 /// OpenAPI must be mirrored. A gateway field the mirror lacks is refused by
 /// the strict loader, refused by import, and blocks apply on any live row that
@@ -271,21 +257,9 @@ fn mirrored_resource_fields_match_the_pinned_edge_openapi() {
             "the pinned Edge OpenAPI {struct_name} schema has writable field(s) {unmodeled:?} \
              that src/config/schema.rs does not mirror"
         );
-        let retained = version_aware_retained_fields(struct_name);
-        for field in &retained {
-            assert!(
-                mirrored.contains(field),
-                "version-aware retained {struct_name} field `{field}` is no longer mirrored in \
-                 src/config/schema.rs; remove it from `version_aware_retained_fields`"
-            );
-        }
         let unknown: Vec<&String> = mirrored
             .iter()
-            .filter(|field| {
-                !writable.contains(*field)
-                    && !read_only.contains(*field)
-                    && !retained.contains(*field)
-            })
+            .filter(|field| !writable.contains(*field) && !read_only.contains(*field))
             .collect();
         assert!(
             unknown.is_empty(),

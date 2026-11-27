@@ -1,7 +1,7 @@
 use crate::config::schema::PluginConfig;
 use crate::config::GatewayConfig;
 use crate::plugin_catalog::{
-    allows_uninspectable_body, cfg_bool, cfg_str, effective_plugins, is_ai_plugin, EnabledPlugins,
+    allows_uninspectable_body, cfg_str, effective_plugins, is_ai_plugin, EnabledPlugins,
 };
 use crate::policy::config::RequireAiGuardrailsRuleConfig;
 use crate::policy::{PolicyCheck, PolicyFinding};
@@ -36,9 +36,6 @@ impl RequireAiGuardrailsRule {
         }
         if allows_uninspectable_body(cfg) {
             return Some("fail_on_uninspectable_body: false".to_string());
-        }
-        if cfg_bool(cfg, &["privacy", "log_raw_text"]) == Some(true) {
-            return Some("privacy.log_raw_text: true".to_string());
         }
         if cfg_str(cfg, &["action"]).as_deref() == Some("warn") {
             return Some("action: warn".to_string());

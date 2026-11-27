@@ -45,7 +45,6 @@ INPUTS = (
     ".github/workflows/release.yml",
     "Dockerfile",
     "contracts/ferrum-contracts/PIN",
-    "src/config/edge_version.rs",
     "release/records/README.md",
     # Every committed release's notes; finalized records need theirs.
     *sorted(path.relative_to(ROOT).as_posix() for path in (ROOT / "release").glob("notes-*.md")),
@@ -371,13 +370,12 @@ class ReleaseBaselineTests(unittest.TestCase):
             f"FROM ferrumedge/ferrum-edge:v0.9.19@{previous_image} AS ferrum-edge\n"
         )
         # The former pairing is internally consistent (allowlist note,
-        # Dockerfile), but the contracts pin, the CLI default and the docs all
+        # Dockerfile), but the contracts pin and the docs all
         # name the current pairing, so it cannot certify a release.
         self.assertEqual(
             check_release_baseline.check(self.root),
             [
                 "contracts PIN edge_version must match the validator version",
-                "DEFAULT_EDGE_VERSION must match the validator version",
                 "release notes must name the paired Ferrum Edge version",
                 "release/README.md must name the paired Ferrum Edge version",
             ],
@@ -413,8 +411,7 @@ class ReleaseBaselineTests(unittest.TestCase):
 
     def test_every_pairing_copy_must_follow_the_baseline(self):
         for relative, needle in (
-            ("contracts/ferrum-contracts/PIN", f"edge_version={EDGE_VERSION}"),
-            ("src/config/edge_version.rs", "pub const DEFAULT_EDGE_VERSION"),
+            ("contracts/ferrum-contracts/PIN", f"edge_version {EDGE_VERSION}"),
             (NOTES, f"Ferrum Edge {EDGE_VERSION}"),
             ("release/README.md", f"Ferrum Edge {EDGE_VERSION}"),
         ):

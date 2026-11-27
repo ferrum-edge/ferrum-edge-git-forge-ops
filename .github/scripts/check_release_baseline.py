@@ -6,8 +6,8 @@ release notes file is `release/notes-<gitforgeops.tag>.md`, and the paired
 Ferrum Edge version is `validator.version`. That version must be a plain
 `vMAJOR.MINOR.PATCH` tag and must agree with every other place the pairing is
 recorded (the allowlist line approving the pinned digest, the Dockerfile
-gateway stage, the vendored contracts PIN, the CLI's `DEFAULT_EDGE_VERSION`,
-the release notes and the release README), so moving the pin is one reviewed
+gateway stage, the vendored contracts PIN, the release notes and the release
+README), so moving the pin is one reviewed
 change that cannot leave a stale copy behind.
 
 `release/baseline.json` describes the release under preparation (the
@@ -41,10 +41,6 @@ RUN_URL = re.compile(
 
 _SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 RELEASE_TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
-DEFAULT_EDGE_VERSION = re.compile(
-    r"pub const DEFAULT_EDGE_VERSION: EdgeVersion = EdgeVersion::new\("
-    r"(?P<major>[0-9]+), (?P<minor>[0-9]+), (?P<patch>[0-9]+)\);"
-)
 
 
 def notes_path(record: object) -> str | None:
@@ -172,8 +168,8 @@ def load_records(root: Path, policy: str) -> tuple[dict[str, dict], list[str]]:
 
 def pin_edge_version(pin: str) -> str | None:
     for line in pin.splitlines():
-        if line.startswith("edge_version="):
-            return line.removeprefix("edge_version=")
+        if line.startswith("edge_version "):
+            return line.removeprefix("edge_version ")
     return None
 
 
@@ -203,9 +199,6 @@ def check(root: Path, release_ref: str | None = None) -> list[str]:
         dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
         workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
         contracts_pin = (root / "contracts/ferrum-contracts/PIN").read_text(encoding="utf-8")
-        edge_version_source = (root / "src/config/edge_version.rs").read_text(
-            encoding="utf-8"
-        )
     except (OSError, ValueError) as error:
         return [f"release baseline input cannot be read: {error}"]
 
@@ -288,11 +281,6 @@ def check(root: Path, release_ref: str | None = None) -> list[str]:
                 )
         if pin_edge_version(contracts_pin) != edge_version:
             issues.append("contracts PIN edge_version must match the validator version")
-        default = DEFAULT_EDGE_VERSION.search(edge_version_source)
-        if default is None or (
-            f"v{default['major']}.{default['minor']}.{default['patch']}" != edge_version
-        ):
-            issues.append("DEFAULT_EDGE_VERSION must match the validator version")
         if f"Ferrum Edge {edge_version}" not in " ".join(notes.split()):
             issues.append("release notes must name the paired Ferrum Edge version")
         if f"Ferrum Edge {edge_version}" not in " ".join(release_readme.split()):
