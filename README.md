@@ -1084,7 +1084,8 @@ new ones so in-flight PRs that still carry the previous baseline stay green.
 bash .github/scripts/refresh-ferrum-edge-pin.sh                    # line for the pinned release
 bash .github/scripts/refresh-ferrum-edge-pin.sh --release vX.Y.Z   # line for a release you are moving to
 bash .github/scripts/refresh-ferrum-edge-pin.sh --release vX.Y.Z --append
-bash .github/scripts/refresh-ferrum-edge-pin.sh --newest           # newest published release tag
+bash .github/scripts/refresh-ferrum-edge-pin.sh --newest           # highest published release tag
+bash .github/scripts/refresh-ferrum-edge-pin.sh --newer            # that tag, only if newer than the pin
 ```
 
 Moving the pin is one reviewed change: append the new line, then set

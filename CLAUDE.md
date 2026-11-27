@@ -328,7 +328,8 @@ settings and a clean environment.
 - The daily validator-pin canary fails, and keeps its tracking issue open, when
   the pinned build no longer installs or fails label acceptance. It also keeps
   the issue open (without failing) while a newer Edge release than the pin is
-  published (`refresh-ferrum-edge-pin.sh --newest`), with that release's
+  published (`refresh-ferrum-edge-pin.sh --newer`, a numeric version comparison,
+  not GitHub's latest designation), with that release's
   candidate allowlist line.
 - `validate-pr.yml` runs the same probe, including the unconditional
   `validator-pairing` job required by `gitforgeops-required-static-validation`
