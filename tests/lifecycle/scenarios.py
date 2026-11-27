@@ -1501,7 +1501,7 @@ def _contract_credentials(harness: Harness) -> dict[str, str]:
     """Seed the contract consumer's slots in the run's broker bundle."""
     values = {
         f"{NAMESPACE}/{CONTRACT_CONSUMER}/{slot}": _disposable_secret(harness)
-        for slot in ("keyauth/key", "jwt/secret", "hmac_auth/secret", "basicauth/password")
+        for slot in ("keyauth/key", "jwt/secret", "hmac_auth/secret")
     }
     return values
 
@@ -1578,8 +1578,9 @@ def _viewer_export(harness: Harness, viewer: str, plaintext: list[str]) -> str:
 def _export_projection(harness: Harness) -> str:
     """`config_export.rs`'s closed Consumer projection against `GET /config/export`.
 
-    A consumer with every credential type (basicauth is omitted by the export,
-    mtls identities stay visible, the rest are fingerprinted) must compare in
+    A consumer with every credential type (keyauth, jwt, hmac_auth and mtls
+    from the repository, basicauth added on the gateway; the export omits
+    basicauth, shows mtls identities and fingerprints the rest) must compare in
     sync through the viewer-credential export. Its fingerprints must be in
     the recorded baseline and verify, a secret rotated on the gateway must be
     reported as a fingerprint change, and an out-of-band edit as drift.
@@ -1610,8 +1611,6 @@ def _export_projection(harness: Harness) -> str:
               - secret: "${{gh-env-secret:alloc=require}}"
             hmac_auth:
               - secret: "${{gh-env-secret:alloc=require}}"
-            basicauth:
-              - password: "${{gh-env-secret:alloc=require}}"
             mtls_auth:
               - identity: "{CONTRACT_MTLS_IDENTITY}"
     """)
@@ -1620,7 +1619,16 @@ def _export_projection(harness: Harness) -> str:
     through_export = {"FERRUM_ADMIN_JWT_VIEWER_SECRET": viewer}
     try:
         harness.run("apply", "--auto-approve")
-        _viewer_export(harness, viewer, [*seeded.values(), harness_key(harness)])
+        # basicauth is added on the gateway, the way an administrator would:
+        # the pre-apply file-mode validator refuses a plaintext `password`
+        # (see the PR's findings), and the repository's other credential
+        # types keep what the gateway has for a type the tree omits.
+        password = _disposable_secret(harness)
+        _admin(
+            harness, "PUT", f"/consumers/{CONTRACT_CONSUMER}/credentials/basicauth",
+            [{"username": "contract-basic", "password": password}], expect=(200, 202, 204),
+        )
+        _viewer_export(harness, viewer, [*seeded.values(), password, harness_key(harness)])
         first = harness.run("diff", "--exit-on-drift", expect=None, **through_export)
         if "GET /config/export" not in first.stdout + first.stderr:
             raise ScenarioFailure("diff with the viewer secret did not read GET /config/export")
