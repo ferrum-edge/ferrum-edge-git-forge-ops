@@ -143,8 +143,9 @@ REQUIRED_SCENARIOS: tuple[tuple[str, str], ...] = (
         "GitForgeOps' copies of Edge rules hold against the gateway: the "
         "JSON-object trigger rules, the derived backend scheme of a proxy that "
         "omits it, restore refusals that change nothing, a "
-        "backup import and full replacement of a registered namespace, and the "
-        "closed Consumer projection of GET /config/export.",
+        "backup import and full replacement of a registered namespace, every "
+        "brokered credential type applied and a brokered basicauth password "
+        "authenticating, and the closed Consumer projection of GET /config/export.",
     ),
 )
 

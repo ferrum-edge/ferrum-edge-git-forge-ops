@@ -141,9 +141,10 @@ pub fn validate_for_review_with_report(
     mesh: Option<&crate::config::MeshConfigSpec>,
     binary_path: &str,
     report: &crate::secrets::ResolveReport,
+    mode: &crate::config::GatewayMode,
 ) -> ReviewValidation {
     combine_validation_for_review(
-        crate::validate::run_validation_with_report(gateway, binary_path, report),
+        crate::validate::run_validation_for_mode(gateway, binary_path, report, mode),
         mesh,
         binary_path,
     )

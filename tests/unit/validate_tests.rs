@@ -287,6 +287,7 @@ fn provenance_scrubs_legacy_brokered_identities_without_hiding_literal_identitie
         None,
         validator.to_str().unwrap(),
         &report,
+        &gitforgeops::config::GatewayMode::File,
     );
     for output in [&result.stdout, &result.stderr, &review.output] {
         assert!(!output.contains("synthetic-legacy-"), "{output}");
@@ -2003,6 +2004,7 @@ fn review_validates_gateway_and_mesh_before_reporting_passed() {
             include_mesh.then_some(&mesh),
             binary.to_str().unwrap(),
             &ResolveReport::default(),
+            &gitforgeops::config::GatewayMode::Api,
         );
         assert_eq!(result.status, expected, "{}", result.output);
         assert!(result.output.contains("mode-file"));
@@ -2043,6 +2045,7 @@ fn review_validates_gateway_and_mesh_before_reporting_passed() {
         Some(&mesh),
         dir.path().join("missing-validator").to_str().unwrap(),
         &ResolveReport::default(),
+        &gitforgeops::config::GatewayMode::Api,
     );
     assert_eq!(result.status, ReviewValidationStatus::ExecutionError);
     assert!(result.execution_error.is_some());
@@ -2486,4 +2489,118 @@ exit 1
         !output.contains("MIG") && !output.contains("MII"),
         "a DER prefix reached the report"
     );
+}
+
+/// An api-mode `basicauth` password reaches the admin API in plaintext, which
+/// hashes it on write, but the pre-apply validator runs in file mode and
+/// refuses a plaintext `password`. Its copy therefore carries a
+/// `password_hash` stand-in, resolved or not, and the resolved password never
+/// reaches the validator's temp spec or its output. File mode keeps the
+/// password, which a file-mode gateway really does refuse.
+#[cfg(unix)]
+#[test]
+fn admin_api_validation_hashes_a_basicauth_password_without_writing_it() {
+    use super::resolver_fixtures::resolve_secrets;
+    use gitforgeops::validate::{run_validation_for_admin_api, run_validation_with_report};
+    use std::collections::BTreeMap;
+
+    const PASSWORD: &str = "resolved-basicauth-password-value-0123456789";
+    // Edge's file-mode rule, applied to what the validator was handed.
+    let file_mode_check = r#"
+if grep -Eq '^[ -]*password:' "$7"; then
+  echo 'error: file-mode Basic-auth credentials must use password_hash' >&2
+  exit 1
+fi
+hash=$(sed -n 's/.*[ -]password_hash: *//p' "$7" | tr -d '"' | tr -d "'")
+case "$hash" in
+  hmac_sha256:????????????????????????????????????????????????????????????????) exit 0 ;;
+  *) echo "error: basicauth password_hash must be hmac_sha256:<64 hex>" >&2; exit 1 ;;
+esac
+"#;
+    for seed in [Some(PASSWORD), None] {
+        let mut config = consumer_config(serde_json::json!({
+            "basicauth": [{"username": "app-login", "password": "${gh-env-secret:alloc=require}"}],
+        }));
+        let bundle: BTreeMap<String, String> = seed
+            .map(|value| {
+                (
+                    "ferrum/app/basicauth/password".to_string(),
+                    value.to_string(),
+                )
+            })
+            .into_iter()
+            .collect();
+        let report = resolve_secrets(&mut config, &bundle).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let validator = capturing_validator(dir.path(), file_mode_check);
+        let result =
+            run_validation_for_admin_api(&config, validator.to_str().unwrap(), &report).unwrap();
+        assert!(
+            result.success,
+            "{seed:?}: {}{}",
+            result.stdout, result.stderr
+        );
+        let raw = std::fs::read_to_string(dir.path().join("input.yaml")).unwrap();
+        assert!(
+            !raw.contains(PASSWORD),
+            "the temp spec carried the password"
+        );
+        assert!(!result.stdout.contains(PASSWORD) && !result.stderr.contains(PASSWORD));
+        let captured = captured_validator_input(dir.path());
+        let entry = captured.consumers[0].credentials["basicauth"][0]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!entry.contains_key("password"), "{entry:?}");
+        assert_eq!(entry["username"], "app-login");
+        assert!(entry["password_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("hmac_sha256:"));
+        // The caller's document is untouched: apply still sends the password.
+        assert!(config.consumers[0].credentials["basicauth"][0]
+            .get("password")
+            .is_some());
+
+        // File mode validates what a file-mode gateway would load.
+        let dir = tempfile::tempdir().unwrap();
+        let validator = capturing_validator(dir.path(), file_mode_check);
+        let file =
+            run_validation_with_report(&config, validator.to_str().unwrap(), &report).unwrap();
+        assert!(
+            !file.success,
+            "{seed:?}: file mode must keep refusing a password"
+        );
+        let captured = captured_validator_input(dir.path());
+        assert!(captured.consumers[0].credentials["basicauth"][0]
+            .get("password")
+            .is_some());
+    }
+}
+
+/// A `basicauth` entry that already names a `password_hash` keeps both fields
+/// for the validator, so a password-and-hash conflict is still refused.
+#[test]
+fn admin_api_basicauth_standins_leave_an_explicit_hash_alone() {
+    use gitforgeops::validate::with_admin_api_basicauth_standins;
+
+    let both = consumer_config(serde_json::json!({
+        "basicauth": [{"username": "app", "password": "p", "password_hash": "hmac_sha256:00"}],
+    }));
+    assert!(with_admin_api_basicauth_standins(&both).is_none());
+    let hash_only = consumer_config(serde_json::json!({
+        "basicauth": [{"username": "app", "password_hash": "hmac_sha256:00"}],
+    }));
+    assert!(with_admin_api_basicauth_standins(&hash_only).is_none());
+    let legacy = consumer_config(serde_json::json!({
+        "basicauth": {"username": "app", "password": "p"},
+    }));
+    let patched = with_admin_api_basicauth_standins(&legacy).expect("a legacy single entry");
+    let entry = &patched.consumers[0].credentials["basicauth"];
+    assert!(entry.get("password").is_none());
+    assert!(entry["password_hash"]
+        .as_str()
+        .unwrap()
+        .starts_with("hmac_sha256:"));
 }

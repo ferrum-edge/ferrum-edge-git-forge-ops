@@ -400,7 +400,7 @@ pub fn run_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config(config);
-    run_gateway_validation(config, binary_path, &scrubber, None)
+    run_gateway_validation(config, binary_path, &scrubber, None, false)
 }
 
 /// Validate a resolved snapshot using both literal-secret classification and
@@ -413,7 +413,37 @@ pub fn run_validation_with_report(
     report: &crate::secrets::ResolveReport,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config_with_report(config, report);
-    run_gateway_validation(config, binary_path, &scrubber, Some(report))
+    run_gateway_validation(config, binary_path, &scrubber, Some(report), false)
+}
+
+/// [`run_validation_with_report`] for a document `apply` sends through the
+/// admin API. The admin API hashes a plaintext `basicauth` `password` on write
+/// while the file-mode validator refuses one, so the validator's copy carries
+/// a `password_hash` stand-in instead
+/// ([`crate::validate::standin::with_admin_api_basicauth_standins`]); the
+/// resolved password never reaches the temp spec.
+pub fn run_validation_for_admin_api(
+    config: &GatewayConfig,
+    binary_path: &str,
+    report: &crate::secrets::ResolveReport,
+) -> crate::error::Result<ValidationResult> {
+    let scrubber = SecretScrubber::from_gateway_config_with_report(config, report);
+    run_gateway_validation(config, binary_path, &scrubber, Some(report), true)
+}
+
+/// Validate a resolved snapshot for the gateway mode it is published in.
+pub fn run_validation_for_mode(
+    config: &GatewayConfig,
+    binary_path: &str,
+    report: &crate::secrets::ResolveReport,
+    mode: &crate::config::GatewayMode,
+) -> crate::error::Result<ValidationResult> {
+    match mode {
+        crate::config::GatewayMode::Api => {
+            run_validation_for_admin_api(config, binary_path, report)
+        }
+        crate::config::GatewayMode::File => run_validation_with_report(config, binary_path, report),
+    }
 }
 
 fn run_gateway_validation(
@@ -421,10 +451,23 @@ fn run_gateway_validation(
     binary_path: &str,
     scrubber: &SecretScrubber,
     report: Option<&crate::secrets::ResolveReport>,
+    admin_api: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Stand-ins are fabricated here and go no further than `spec_file` below.
     let standins = crate::validate::standin::with_validation_standins_for_report(config, report);
-    let yaml = crate::yaml::to_string(standins.as_ref().unwrap_or(config))?;
+    let admin_standins = admin_api
+        .then(|| {
+            crate::validate::standin::with_admin_api_basicauth_standins(
+                standins.as_ref().unwrap_or(config),
+            )
+        })
+        .flatten();
+    let yaml = crate::yaml::to_string(
+        admin_standins
+            .as_ref()
+            .or(standins.as_ref())
+            .unwrap_or(config),
+    )?;
     let mut namespaces = collect_namespaces(config);
     if namespaces.is_empty() {
         // Empty documents still need schema/settings validation. This does

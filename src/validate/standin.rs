@@ -320,6 +320,61 @@ pub(crate) fn with_validation_standins_for_report(
     changed.then_some(patched)
 }
 
+/// The validator's copy of an admin-API document: each `basicauth` entry's
+/// `password` becomes a `password_hash` stand-in.
+///
+/// The admin API takes a plaintext `password` and hashes it on write, which is
+/// how GitForgeOps applies a brokered `basicauth/password` in api mode. The
+/// pre-apply validator runs `ferrum-edge validate -m file`, which refuses a
+/// plaintext `password` ("accepted only by Admin API writes"), so without this
+/// every api-mode repository with a basicauth password failed validation, and
+/// apply refused to run, whether or not the slot had a value. The stand-in is
+/// [`validation_standin`]'s `password_hash` shape for the password's slot:
+/// deterministic, distinct per slot, never a hash of the password, so the
+/// resolved value is never written to the validator's temp spec.
+///
+/// An entry that already carries `password_hash` is left as it is, so a
+/// password-and-hash conflict still reaches the validator. File mode does not
+/// use this: a file-mode gateway really does need the hash.
+pub fn with_admin_api_basicauth_standins(config: &GatewayConfig) -> Option<GatewayConfig> {
+    let mut patched = config.clone();
+    let mut changed = false;
+    for consumer in &mut patched.consumers {
+        let namespace = consumer.namespace.clone();
+        let consumer_id = consumer.id.clone();
+        let mut hash_entry = |entry: &mut serde_json::Map<String, serde_json::Value>,
+                              mut path: Vec<ConfigPathComponent>| {
+            if entry.contains_key(PASSWORD_HASH_LEAF)
+                || !entry
+                    .get("password")
+                    .is_some_and(serde_json::Value::is_string)
+            {
+                return;
+            }
+            path.push(ConfigPathComponent::Key("password".to_string()));
+            let slot = consumer_credential_slot(&namespace, &consumer_id, "basicauth", &path);
+            entry.remove("password");
+            entry.insert(
+                PASSWORD_HASH_LEAF.to_string(),
+                serde_json::Value::String(validation_standin(&slot, Some(PASSWORD_HASH_LEAF))),
+            );
+            changed = true;
+        };
+        match consumer.credentials.get_mut("basicauth") {
+            Some(serde_json::Value::Array(items)) => {
+                for (index, item) in items.iter_mut().enumerate() {
+                    if let Some(entry) = item.as_object_mut() {
+                        hash_entry(entry, vec![ConfigPathComponent::Index(index)]);
+                    }
+                }
+            }
+            Some(serde_json::Value::Object(entry)) => hash_entry(entry, Vec::new()),
+            _ => {}
+        }
+    }
+    changed.then_some(patched)
+}
+
 /// Replace each eligible brokered `trigger` operand
 /// ([`crate::secrets::plugin_trigger`]) with the opaque [`validation_standin`]
 /// of its trigger slot. That one form fits every operator Edge's trigger

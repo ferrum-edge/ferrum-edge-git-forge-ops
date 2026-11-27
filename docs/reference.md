@@ -452,6 +452,15 @@ gets a fake value of the right shape:
 | TLS private key (Proxy/Upstream `backend_tls_client_key_path`, `mesh_route_dispatch` `client_key_path`) | a `PRIVATE KEY` PEM block whose body is a marker and a hash, not a key |
 | `udp_logging` `dtls_key_path` | omitted with `dtls_cert_path` (Edge pairs them; an ephemeral identity is validated instead) |
 
+**An api-mode `basicauth` `password` is validated as a hash.** The admin API
+takes a plaintext password and hashes it on write, but the validator runs in
+file mode, which refuses a plaintext `password`. In api mode (`validate`,
+`plan`, review and `apply`), the validation file therefore carries a
+`password_hash` stand-in (`hmac_sha256:<64 hex>` from the slot, never from the
+password) in place of each `basicauth` `password`, resolved or not, so the
+resolved password is never written to it. File mode keeps the password, which
+a file-mode gateway refuses.
+
 The scheme follows the field (`ldaps://`, `redis://`, `wss://` for
 `ws_logging`, otherwise `https://`). The shapes follow the gateway's own
 checks: a Redis URL path must be empty, `/` or a database number, an AWS

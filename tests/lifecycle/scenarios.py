@@ -1501,7 +1501,7 @@ def _contract_credentials(harness: Harness) -> dict[str, str]:
     """Seed the contract consumer's slots in the run's broker bundle."""
     values = {
         f"{NAMESPACE}/{CONTRACT_CONSUMER}/{slot}": _disposable_secret(harness)
-        for slot in ("keyauth/key", "jwt/secret", "hmac_auth/secret")
+        for slot in ("keyauth/key", "jwt/secret", "hmac_auth/secret", "basicauth/password")
     }
     return values
 
@@ -1578,9 +1578,9 @@ def _viewer_export(harness: Harness, viewer: str, plaintext: list[str]) -> str:
 def _export_projection(harness: Harness) -> str:
     """`config_export.rs`'s closed Consumer projection against `GET /config/export`.
 
-    A consumer with every credential type (keyauth, jwt, hmac_auth and mtls
-    from the repository, basicauth added on the gateway; the export omits
-    basicauth, shows mtls identities and fingerprints the rest) must compare in
+    A consumer with every credential type, each brokered value resolved and
+    applied by GitForgeOps (the export omits basicauth, shows mtls identities
+    and fingerprints the rest), must compare in
     sync through the viewer-credential export. Its fingerprints must be in
     the recorded baseline and verify, a secret rotated on the gateway must be
     reported as a fingerprint change, and an out-of-band edit as drift.
@@ -1611,24 +1611,21 @@ def _export_projection(harness: Harness) -> str:
               - secret: "${{gh-env-secret:alloc=require}}"
             hmac_auth:
               - secret: "${{gh-env-secret:alloc=require}}"
+            basicauth:
+              - username: "{CONTRACT_BASIC_USERNAME}"
+                password: "${{gh-env-secret:alloc=require}}"
             mtls_auth:
               - identity: "{CONTRACT_MTLS_IDENTITY}"
     """)
     baseline = harness.workdir.parent / "contract-fingerprints.json"
     baseline.unlink(missing_ok=True)
     through_export = {"FERRUM_ADMIN_JWT_VIEWER_SECRET": viewer}
+    password = seeded[f"{NAMESPACE}/{CONTRACT_CONSUMER}/basicauth/password"]
     try:
+        # Every credential type the broker advertises for api mode, resolved,
+        # through the pre-apply validator and the admin API.
         harness.run("apply", "--auto-approve")
-        # basicauth is added on the gateway, the way an administrator would:
-        # the pre-apply file-mode validator refuses a plaintext `password`
-        # (see the PR's findings), and the repository's other credential
-        # types keep what the gateway has for a type the tree omits.
-        password = _disposable_secret(harness)
-        _admin(
-            harness, "PUT", f"/consumers/{CONTRACT_CONSUMER}/credentials/basicauth",
-            [{"username": "contract-basic", "password": password}], expect=(200, 202, 204),
-        )
-        _viewer_export(harness, viewer, [*seeded.values(), password, harness_key(harness)])
+        _viewer_export(harness, viewer, [*seeded.values(), harness_key(harness)])
         first = harness.run("diff", "--exit-on-drift", expect=None, **through_export)
         if "GET /config/export" not in first.stdout + first.stderr:
             raise ScenarioFailure("diff with the viewer secret did not read GET /config/export")
@@ -1681,12 +1678,60 @@ def _export_projection(harness: Harness) -> str:
                 "expects drift (2) naming /credentials/jwt/0/secret\n"
                 f"{rotated.stdout}\n{rotated.stderr}"
             )
+        _brokered_basicauth_authenticates(harness, password)
     finally:
         baseline.unlink(missing_ok=True)
         harness.remove(consumer)
         creds_path.write_text(original, encoding="utf-8")
         ensure_deployed(harness)
-    return "the viewer export withheld every secret, and its fingerprints verified and caught a rotation"
+    return (
+        "the brokered basicauth password applied and authenticated; the viewer export withheld "
+        "every secret, and its fingerprints verified and caught a rotation"
+    )
+
+
+CONTRACT_BASIC_USERNAME = "contract-basic"
+CONTRACT_BASIC_PROXY = "contract-basic-proxy"
+CONTRACT_BASIC_PLUGIN = "contract-basic-auth"
+
+
+def _brokered_basicauth_authenticates(harness: Harness, password: str) -> None:
+    """The password GitForgeOps applied through the admin API authenticates.
+
+    The gateway hashed the brokered plaintext on write; a `basic_auth`
+    instance on a throwaway route must accept it and refuse a wrong one. The
+    route is the harness's, not the subject: the credential is.
+    """
+    import base64  # noqa: PLC0415
+
+    backend = urllib.parse.urlsplit(harness.upstream_url)
+    _admin(harness, "POST", "/proxies", {
+        "id": CONTRACT_BASIC_PROXY, "listen_path": "/contract-basic",
+        "backend_scheme": "http", "backend_host": backend.hostname,
+        "backend_port": backend.port, "strip_listen_path": True, "namespace": NAMESPACE,
+    })
+    try:
+        _admin(harness, "POST", "/plugins/config", {
+            "id": CONTRACT_BASIC_PLUGIN, "plugin_name": "basic_auth", "scope": "proxy",
+            "proxy_id": CONTRACT_BASIC_PROXY, "enabled": True, "config": {},
+        })
+
+        def basic(secret: str) -> dict[str, str]:
+            token = base64.b64encode(f"{CONTRACT_BASIC_USERNAME}:{secret}".encode()).decode()
+            harness.remember_secret(token)
+            return {"Authorization": f"Basic {token}"}
+
+        harness.expect_status("/contract-basic/status/200", 200, basic(password))
+        harness.expect_status("/contract-basic/status/200", 401, basic(password + "-wrong"))
+        harness.expect_status("/contract-basic/status/200", 401)
+    finally:
+        status = __admin(
+            harness, "DELETE",
+            f"/plugins/config/{CONTRACT_BASIC_PLUGIN}?expected_proxy_ids={CONTRACT_BASIC_PROXY}",
+        )
+        if status not in (200, 202, 204, 404):
+            raise ScenarioFailure(f"cleanup: DELETE of the basic_auth plugin answered {status}")
+        _admin(harness, "DELETE", f"/proxies/{CONTRACT_BASIC_PROXY}")
 
 
 def _schemeless_http_proxies() -> list[dict]:

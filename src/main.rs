@@ -1354,10 +1354,11 @@ fn cmd_validate(
     }
     let secret_report = resolve_credentials(&mut gateway_config, &env_config, None)?;
 
-    let mut result = validate::run_validation_with_report(
+    let mut result = validate::run_validation_for_mode(
         &gateway_config,
         &env_config.edge_binary_path,
         &secret_report,
+        &env_config.gateway_mode,
     )?;
 
     // Mesh config is a second, independently-loaded document with its own
@@ -2252,10 +2253,11 @@ async fn cmd_plan(
     reportln!(json_mode);
 
     reportln!(json_mode, "=== Validation ===");
-    let val_result = validate::run_validation_with_report(
+    let val_result = validate::run_validation_for_mode(
         &desired,
         &env_config.edge_binary_path,
         &secret_report,
+        &env_config.gateway_mode,
     );
     let mut validation_ok = report_plan_validation("gateway", &val_result, json_mode);
     if let Some(mesh) = &desired_mesh {
@@ -3023,7 +3025,7 @@ async fn cmd_apply(
 
     let val_result = match env_config.gateway_mode {
         GatewayMode::File => validate::run_validation(&desired, &env_config.edge_binary_path),
-        GatewayMode::Api => validate::run_validation_with_report(
+        GatewayMode::Api => validate::run_validation_for_admin_api(
             &desired,
             &env_config.edge_binary_path,
             &secret_report,
@@ -4044,6 +4046,7 @@ async fn cmd_review(
         assembled.mesh.as_ref(),
         &env_config.edge_binary_path,
         &secret_report,
+        &env_config.gateway_mode,
     );
 
     let mut adoptions = Vec::new();
