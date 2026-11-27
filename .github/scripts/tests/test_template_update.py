@@ -1531,10 +1531,12 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "AGENTS.md").is_symlink())
         self.assertNotIn("AGENTS.md", template_update.UPSTREAM_MANAGED)
 
-    def test_the_agent_setup_and_its_validator_are_adopted_together(self):
-        # The required Agent Setup Policy check runs upstream's validator over
-        # these trees, and upstream changes both in the same commits (#702).
-        self.assertTrue(template_update.is_upstream_managed(".github/scripts/check_agent_setup.py"))
+    def test_the_agent_trees_and_their_launcher_tests_are_adopted_together(self):
+        # Upstream changes the launchers and the tests that exercise them in
+        # the same commits.
+        self.assertTrue(
+            template_update.is_upstream_managed(".github/scripts/tests/test_agent_launchers.py")
+        )
         for path in (
             ".agents/skills/_lib/resolve-agent-bin.sh",
             ".claude/rules/testing.md",

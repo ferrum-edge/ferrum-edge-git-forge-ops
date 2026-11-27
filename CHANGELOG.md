@@ -7,6 +7,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Removed the Agent Setup CI and Agent Setup Policy checks (step 3 of 3). No
+  other Ferrum repository has an agent-setup validator. Deleted
+  `agent-setup-ci.yml`, `agent-setup-policy.yml`, `check_agent_setup.py` and
+  `test_agent_setup.py`; its behavioral launcher tests (linked-worktree
+  enforcement, the dispatch lock, signal forwarding, provider scrubbing and the
+  opencode `--pure` probe) move to `tests/test_agent_launchers.py`.
+  `check_supply_chain.py` drops the agent-setup trigger pin, unsafe-checkout
+  allowance, known-workflow and `pull_request_target` entries; CODEOWNERS,
+  `.gitignore`, the template updater, the agent briefs, README, CLAUDE.md and
+  the docs drop their references. `.agents/` and `.claude/` keep their
+  CODEOWNERS routing.
 - Retiring the Agent Setup CI / Agent Setup Policy checks, step 2 of 3:
   `Agent Setup Policy / validate-trusted-policy` is no longer a launch-required
   context. It is dropped from `audit_settings.REQUIRED_STATUS_CHECKS` (and so

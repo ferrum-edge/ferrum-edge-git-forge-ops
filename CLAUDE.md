@@ -125,9 +125,8 @@ cargo fmt --all && cargo fmt --all -- --check
   - the parsed `security-cargo-audit` job and `security.yml`'s reviewed `on:`
     triggers are pinned;
   - `allow-unsafe-pr-checkout` (actions/checkout's fork-head opt-in under
-    `pull_request_target`) only on the candidate data checkouts of
-    `supply-chain-policy.yml` and `agent-setup-policy.yml`
-    (`unsafe_pr_checkout_violations`).
+    `pull_request_target`) only on the candidate data checkout of
+    `supply-chain-policy.yml` (`unsafe_pr_checkout_violations`).
 - An organization ruleset requires, by path at `main`, every workflow in
   `REQUIRED_CHECK_WORKFLOWS` (`audit_settings.REQUIRED_RULESET_WORKFLOWS`;
   [launch controls §2a](docs/github-launch-controls.md#2a-require-the-trusted-workflows-by-path)).
@@ -2152,12 +2151,8 @@ traffic. Details: `tests/lifecycle/README.md`. Invariants:
 
 ## Development Guidelines
 
-Repository-local agent skills, Claude rules and their dispatchers are guarded
-by `agent-setup-policy.yml`, which validates candidate content with trusted
-default-branch policy on every PR (read-only, stale runs cancelled per PR). The
-required check is `Agent Setup Policy / validate-trusted-policy`. The root
-orchestrator reviews the exact PR head and merges only after hosted CI passes
-and actionable review threads are resolved; no separate Code Owner or
+The root orchestrator reviews the exact PR head and merges only after hosted CI
+passes and actionable review threads are resolved; no separate Code Owner or
 maintainer approval is required. Forks do not inherit repository settings.
 
 - **No `.unwrap()` in production code paths** — use `?`, `.unwrap_or()` or an
@@ -2185,8 +2180,7 @@ maintainer approval is required. Forks do not inherit repository settings.
 1. `cargo fmt --all` clean
 2. `cargo clippy --all-targets -- -D warnings` clean
 3. `cargo test --test unit_tests` and `cargo test --lib` pass
-4. Agent/rule changes → `python3 .github/scripts/check_agent_setup.py` and
-   `python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_setup.py'`
+4. Agent launcher changes → `python3 -m unittest discover -s .github/scripts/tests -p 'test_agent_launchers.py'`
 5. No `.unwrap()` / `.expect()` in prod code
 6. New env var → `.env.example` + `env.rs` doc block
 7. Schema change → unit test in `tests/unit/schema_tests.rs`

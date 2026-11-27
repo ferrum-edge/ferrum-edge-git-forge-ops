@@ -80,11 +80,8 @@ Four of these deserve a note:
   you to replace them. Adopting upstream's copy would hand review of your
   launch-critical paths back to people outside your organization.
 - **`.agents/`, `.claude/` and `.gitignore` are upstream-managed** because
-  the required Agent Setup Policy check runs upstream's
-  `.github/scripts/check_agent_setup.py`, and upstream changes that validator
-  and the agent trees together. Adopting one without the other would fail the
-  check on every pull request. A local edit to these files shows up as an
-  ordinary conflict. `AGENTS.md` is a link to `CLAUDE.md`; the updater adopts
+  upstream changes the agent launchers and the tests that exercise them
+  together. A local edit to these files shows up as an ordinary conflict. `AGENTS.md` is a link to `CLAUDE.md`; the updater adopts
   no links, so it is not listed and `CLAUDE.md` carries its content.
 - **`README.md` is upstream-managed** because it documents the engine and
   changes with it. If you rewrote it for your team, every upstream edit shows

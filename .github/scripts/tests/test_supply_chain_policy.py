@@ -2770,28 +2770,6 @@ class SupplyChainPolicyTests(unittest.TestCase):
                     )
                 )
 
-    def test_agent_setup_policy_triggers_are_pinned_to_pull_request_target(self):
-        workflow = (ROOT / ".github/workflows/agent-setup-policy.yml").read_text(
-            encoding="utf-8"
-        )
-        self.assertEqual(
-            check_supply_chain.agent_setup_policy_trigger_violations(workflow), []
-        )
-
-        # A candidate-controlled trigger would run the pull request's own
-        # copy of the workflow and could report the required
-        # `validate-trusted-policy` context without the trusted validator.
-        added = workflow.replace("on:\n", "on:\n  pull_request:\n", 1)
-        self.assertNotEqual(added, workflow)
-        violations = check_supply_chain.agent_setup_policy_trigger_violations(added)
-        self.assertTrue(any("pull_request" in item for item in violations), violations)
-
-        narrowed = workflow.replace("      - edited\n", "", 1)
-        self.assertNotEqual(narrowed, workflow)
-        self.assertTrue(
-            check_supply_chain.agent_setup_policy_trigger_violations(narrowed)
-        )
-
     def test_security_trigger_list_is_pinned_to_the_reviewed_events(self):
         workflow = (ROOT / ".github/workflows/security.yml").read_text(
             encoding="utf-8"
@@ -3011,9 +2989,6 @@ class SupplyChainPolicyTests(unittest.TestCase):
         ".github/workflows/supply-chain-policy.yml": (
             "          path: candidate\n          persist-credentials: false\n"
         ),
-        ".github/workflows/agent-setup-policy.yml": (
-            "          path: .agent-setup-candidate\n          persist-credentials: false\n"
-        ),
     }
 
     def _opted_in(self, relative: str) -> str:
@@ -3097,10 +3072,10 @@ class SupplyChainPolicyTests(unittest.TestCase):
             ),
             [],
         )
-        agent = ".github/workflows/agent-setup-policy.yml"
-        opted_in = self._opted_in(agent)
-        candidate = self.CANDIDATE_DATA_CHECKOUTS[agent]
-        base = "          path: .agent-setup-base\n          persist-credentials: false\n"
+        policy = check_supply_chain.SUPPLY_CHAIN_POLICY_PATH
+        opted_in = self._opted_in(policy)
+        candidate = self.CANDIDATE_DATA_CHECKOUTS[policy]
+        base = "          path: base\n          persist-credentials: false\n"
         refused = {
             "another_workflow": (
                 state_guard,
@@ -3112,28 +3087,28 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 ),
             ),
             "base_checkout": (
-                agent,
+                policy,
                 opted_in.replace(candidate + self.UNSAFE_PR_CHECKOUT_LINE, candidate, 1).replace(
                     base, base + self.UNSAFE_PR_CHECKOUT_LINE, 1
                 ),
             ),
-            "both_checkouts": (agent, opted_in.replace(base, base + self.UNSAFE_PR_CHECKOUT_LINE, 1)),
+            "both_checkouts": (policy, opted_in.replace(base, base + self.UNSAFE_PR_CHECKOUT_LINE, 1)),
             "workspace_root": (
-                agent,
-                opted_in.replace("          path: .agent-setup-candidate\n", "          path: .\n", 1),
+                policy,
+                opted_in.replace("          path: candidate\n", "          path: .\n", 1),
             ),
             "persisted_credentials": (
-                agent,
+                policy,
                 opted_in.replace(
                     candidate, candidate.replace("false", "true"), 1
                 ),
             ),
             "string_value": (
-                agent,
+                policy,
                 opted_in.replace(self.UNSAFE_PR_CHECKOUT_LINE, "          allow-unsafe-pr-checkout: yes\n", 1),
             ),
             "other_case": (
-                agent,
+                policy,
                 opted_in.replace(
                     candidate + self.UNSAFE_PR_CHECKOUT_LINE,
                     candidate + "          Allow-Unsafe-PR-Checkout: true\n",
@@ -3141,7 +3116,7 @@ class SupplyChainPolicyTests(unittest.TestCase):
                 ),
             ),
             "not_checkout": (
-                agent,
+                policy,
                 opted_in.replace(
                     "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n"
                     "        with:\n          repository:",
@@ -7973,7 +7948,7 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
         self.assertNotIn("ACCEPTED_CHECKS", check_supply_chain.RELEASE_GATE_PINS)
 
     def test_the_helper_requires_exactly_the_launch_list(self):
-        # #701: the helper requires exactly the six launch contexts. Dropping
+        # #701: the helper requires exactly the five launch contexts. Dropping
         # one, or bringing back the retired `security-supply-chain-policy`, is
         # refused.
         source = (ROOT / check_supply_chain.RELEASE_GATE_HELPER).read_text(encoding="utf-8")
