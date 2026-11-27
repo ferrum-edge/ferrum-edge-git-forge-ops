@@ -360,6 +360,18 @@ jobs:
       contents: read
       issues: write
     steps:
+      # GitHub compares the job condition case-insensitively; repeat the
+      # default-branch check case-sensitively before the token is used.
+      - name: Require protected default branch
+        env:
+          SOURCE_REF: ${{ github.ref }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          [ "$SOURCE_REF" = "$EXPECTED_REF" ] || {
+            echo "::error::The Edge main drift issue may be written only from $EXPECTED_REF."
+            exit 1
+          }
+
       - name: Open, update or close the Edge main tracking issue
         env:
           GH_TOKEN: ${{ github.token }}
