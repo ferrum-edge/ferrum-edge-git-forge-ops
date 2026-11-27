@@ -21,8 +21,24 @@ informed until a fix or a documented decision is published.
 
 ## Supported versions
 
-Only the `main` branch and the most recent published release/container image
-receive security fixes.
+A GitForgeOps release is supported only when its finalized record exists in
+[`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+on upstream `main` (read it there, not in a tag's or copy's own source tree).
+Until the first record exists, only the `main` branch receives security fixes.
+
+From 1.0.0 onward, one rule applies: **only the newest published 1.x release
+is supported.** A security fix ships in the next release, and you take it by
+upgrading to that release; older releases are not patched separately.
+
+- A fix that keeps the documented behaviour compatible ships as the next patch
+  (or minor) release.
+- A fix that cannot avoid an incompatible change may ship in the next minor
+  release, as the one exception to the major-version rule in the
+  [release policy](release/README.md#publishing-and-later-changes). Its
+  advisory names the first fixed version, and its release note carries an
+  upgrade note with the operator action.
+- `main` gets every fix first, but `main` is not a release.
+- Revisions from before the first supported release are not supported.
 
 ## Scope
 

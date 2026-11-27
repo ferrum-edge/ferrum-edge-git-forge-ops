@@ -12,7 +12,7 @@ to [ferrum-edge](https://github.com/ferrum-edge/ferrum-edge): it shells out to
 `ferrum-edge validate` for schema validation and uses the admin REST API for
 live operations.
 
-## Buildout and schema policy
+## Compatibility and schema policy
 
 Shared contracts live in [ferrum-contracts](https://github.com/ferrum-edge/ferrum-contracts); see
 [README.md's Contracts section](README.md#contracts) for the vendored pin and update rule.
@@ -27,10 +27,20 @@ and the separate hosted qualification and first-release acceptance gates. The
 `backend-egress-policy` v2, `admin-deployment-snapshot` v2, deployment
 acknowledgement, and gateway-errors contract surfaces are not consumed here.
 
-GitForgeOps is in pre-launch buildout with no users. Breaking changes are
-acceptable. Update implementation, examples, fixtures, tests and docs together;
-do not add compatibility layers or upgrade guides for earlier buildout
-revisions.
+A release is supported only when its finalized record exists in
+`release/records/<tag>.json` on `main` (`release/baseline.json` is the release
+being prepared). Until the first record exists, breaking changes are acceptable
+on `main`, without compatibility layers or upgrade guides for earlier
+unreleased revisions. From 1.0.0 onward, follow semantic versioning: within a
+major version the CLI (commands, flags, exit codes), repository configuration,
+resource and overlay files, the state ledger and the bundled workflows change
+only compatibly; an incompatible change needs a documented deprecation first
+and lands only in a new major version with migration steps (the one exception
+is a security fix that cannot be made compatibly, which may ship in a minor
+with an advisory and upgrade note). State ledger changes are forward-only
+migrations: an engine reads only its own ledger version, so a release that
+migrates the ledger documents that reverting past it is unsupported. Either
+way, update implementation, examples, fixtures, tests and docs together.
 
 There is no database, SQL schema or migration runner. Edit these definitions
 directly:
@@ -39,8 +49,8 @@ directly:
 - `src/config/repo_config.rs`, `src/policy/config.rs` — repository configuration
 - `src/state.rs` — JSON ownership ledger
 
-If database persistence is ever introduced during buildout, keep one complete
-initial schema and fold later changes into it; no incremental migration files.
+If database persistence is ever introduced, start from one complete initial
+schema; from 1.0.0 onward its changes are forward-only migrations.
 
 Credential import bundles move secrets from an existing gateway into the broker.
 They are runtime artifacts and stay outside Git worktrees. The companion
@@ -1960,7 +1970,9 @@ Invariants:
 - `POST_ADOPTION_CHECKS` is printed by `apply` and asserted against
   `docs/template-updates.md`.
 - Recovery is `git revert` of the adoption commit, never restoring an obsolete
-  ledger (that is a separate state-override repair).
+  ledger (that is a separate state-override repair). The loader accepts only
+  `STATE_VERSION`, so a revert is unsupported once an apply has written a
+  migrated ledger; recovery then rolls forward (`docs/template-updates.md`).
 
 ### Source layout
 
