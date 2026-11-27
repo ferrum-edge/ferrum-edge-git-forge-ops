@@ -1,16 +1,19 @@
 # First supported baseline: GitForgeOps v0.1.0
 
-The [upstream machine-readable record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json)
-is the authority for this pairing. Its `status` is `pending` while the release
-is being prepared. **There is no supported GitForgeOps release until it says
-`supported` and its three release fields (`gitforgeops.source_sha`,
-`gitforgeops.image_digest`, `lifecycle.run_url`) are filled.** A Cargo
-version, a `main` image or a successful development run is not a published
-baseline.
+Two kinds of record live here. [`baseline.json`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json)
+describes the release being prepared; its `status` is `pending` until that
+release is published. Each published release then keeps a finalized, immutable
+support record in [`records/<tag>.json`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+with `status` `supported` and its three release fields
+(`gitforgeops.source_sha`, `gitforgeops.image_digest`, `lifecycle.run_url`)
+filled. **A GitForgeOps release is supported only when its record exists in
+`release/records/` on upstream `main`.** A Cargo version, a `main` image or a
+successful development run is not a published baseline, and preparing the
+next release never changes an existing record.
 
-The tag's own source archive contains the earlier `pending` record, because the
+A tag's own source archive cannot contain its finalized record, because the
 image digest can only be committed after the image is published. Read the
-finalized record on upstream `main` when adopting the tag. The
+records on upstream `main` when adopting a tag. The
 [release notes](notes-v0.1.0.md) are committed here so the pairing stays
 discoverable after Actions artifacts expire.
 
@@ -154,10 +157,16 @@ organization secrets; see
 [GitHub launch controls](../docs/github-launch-controls.md) for the setting
 and the migration of an existing install. It then publishes to both registries, attests provenance under
 each name, and uploads the `supply-chain-inputs` artifact with the resulting
-digest. Finalize `baseline.json` with that digest and the exact source SHA
-**after** the image exists. `release.yml` publishes only on `v*` tags, so the
+digest. **After** the image exists, finalize the release in one record-only
+commit: fill `baseline.json` with that digest, the exact source SHA and the
+lifecycle run URL, set `status` to `supported`, and add an identical copy as
+`release/records/<tag>.json`. `check_release_baseline.py` requires the two to
+match, and the protected supply-chain check refuses any later change that
+rewrites or deletes a record. `release.yml` publishes only on `v*` tags, so the
 record-only commit does not republish the image or move `latest`. Publish
-the GitHub release with the committed notes and link to this record.
+the GitHub release with the committed notes and link to the record. To prepare
+the next release, move `baseline.json` (and `Cargo.toml`) to the new version
+with `status` `pending`; the published release's record stays as it is.
 
 After the first supported baseline, announce each fix in a versioned release
 note with the affected versions, replacement source SHA, image digest, gateway
@@ -187,18 +196,17 @@ adoption scope and authority limits.
 Hosted qualification must exercise complete consumer verification, hidden
 credential conflicts, rotation conflicts before and after broker delivery, and
 the required `conditional-full-replace` lifecycle scenario against these exact
-released bytes; that scenario must not be made green by skipping it. No passing
-lifecycle evidence or first-release acceptance is recorded yet: `baseline.json`
-remains `pending`, with GitForgeOps source SHA, image digest and lifecycle URL
-unset.
+released bytes; that scenario must not be made green by skipping it. The
+release gate refuses to publish without that passing lifecycle evidence for the
+exact revision; the release's record in `release/records/` names it.
 
 Qualification must cover original-token restore, spec-owned graph and verbatim
 documents, trust preservation, ABA, empty namespaces and confirmed spec deletion;
 exact-token/body precommit retry; and no replay after ambiguous commit, audit or
 fence refusal, unsupported topology or `applied:false`. Seal the exact client SHA
 and released server bytes. Source/parser evidence alone is not enforcement.
-Issue #266 still requires a second human reviewer, the state-writer GitHub App,
-a disposable customer template repository and an HTTPS gateway acceptance run.
-That disposable repository is also where viewer-capped drift monitoring (#440)
-is provisioned and exercised, because the upstream template has no gateway
-environment. No GitForgeOps tag or supported release is established yet.
+The first-release acceptance (#266) requires a second human reviewer, the
+state-writer GitHub App, a disposable customer template repository and an HTTPS
+gateway acceptance run. That disposable repository is also where viewer-capped
+drift monitoring (#440) is provisioned and exercised, because the upstream
+template has no gateway environment.

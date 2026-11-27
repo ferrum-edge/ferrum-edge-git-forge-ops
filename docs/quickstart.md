@@ -1,9 +1,10 @@
 # Quickstart: one gateway, one namespace, one environment
 
 Release baseline: [v0.1.0](../release/README.md). Treat this setup as a
-supported pairing only when the [upstream record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json) `status` is
-`supported`. The record then gives the exact source revision and the
-validator/gateway pairing. Start your repository at that revision with the
+supported pairing only when that release's finalized record exists in
+[`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+on upstream `main`, where its `status` is `supported`. The record gives the
+exact source revision and the validator/gateway pairing. Start your repository at that revision with the
 [immutable adoption commands](../release/README.md#adopt-the-immutable-sourcetemplate-revision).
 GitHub's **Use this template** button copies the current default branch, which
 may be ahead of the supported baseline.

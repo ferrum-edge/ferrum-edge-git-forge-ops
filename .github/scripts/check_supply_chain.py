@@ -6699,6 +6699,41 @@ _SECRETS_EXPRESSION_RE = re.compile(r"\$\{\{[^}]*\bsecrets\b", re.IGNORECASE)
 _PATHS_FILTER_RE = re.compile(r"^\s+paths\s*:", re.MULTILINE)
 
 
+RELEASE_RECORDS = Path("release/records")
+
+
+def release_record_violations(base: Path, candidate: Path) -> list[str]:
+    """Finalized release records are immutable.
+
+    `release/records/<tag>.json` is the support record of a published
+    release: its source SHA, image digest, validator pin and lifecycle
+    evidence. Once a record is on the protected branch, a later change must not
+    rewrite or delete it, or the published release's support evidence would
+    change after the fact. The protected-branch checker compares every record
+    in its own tree (`base`) with the candidate byte for byte; a run whose base
+    and candidate are the same tree has nothing to compare.
+    """
+    base_records = base / RELEASE_RECORDS
+    if base.resolve() == candidate.resolve() or not base_records.is_dir():
+        return []
+    violations: list[str] = []
+    for record in sorted(base_records.glob("*.json")):
+        if not record.is_file() or record.is_symlink():
+            continue
+        relative = (RELEASE_RECORDS / record.name).as_posix()
+        target = candidate / RELEASE_RECORDS / record.name
+        if target.is_symlink() or not target.is_file():
+            violations.append(
+                f"{relative}: a finalized release record must not be removed"
+            )
+        elif target.read_bytes() != record.read_bytes():
+            violations.append(
+                f"{relative}: a finalized release record is immutable; record a "
+                "new release instead of rewriting this one"
+            )
+    return violations
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -6749,6 +6784,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {violation}", file=sys.stderr)
         return 1
     violations: list[str] = []
+    violations.extend(release_record_violations(ROOT, root))
     toolchain_path = root / "rust-toolchain.toml"
     rust_channel = read_rust_toolchain_channel(toolchain_path)
     if rust_channel is None:

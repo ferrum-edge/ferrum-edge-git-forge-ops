@@ -25,6 +25,7 @@ on:
       - 'Cargo.toml'
       - 'build.rs'
       - 'overlays/**'
+      - 'release/baseline.json'
       - 'resources/**'
       - 'rust-toolchain'
       - 'rust-toolchain.toml'

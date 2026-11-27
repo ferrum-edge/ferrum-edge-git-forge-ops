@@ -112,8 +112,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
+          # `--newer` compares versions numerically against the baseline and
+          # prints the highest published release only when it is greater.
           pinned=$(jq -er '.validator.version' release/baseline.json) || pinned=
-          if ! newest=$(bash .github/scripts/refresh-ferrum-edge-pin.sh --newest) || [ -z "$pinned" ]; then
+          if ! newest=$(bash .github/scripts/refresh-ferrum-edge-pin.sh --newer) || [ -z "$pinned" ]; then
             echo "lookup=failed" >>"$GITHUB_OUTPUT"
             echo "tag=" >>"$GITHUB_OUTPUT"
             echo "::warning::The newest published Ferrum Edge release could not be compared with the pin."
@@ -121,7 +123,7 @@ jobs:
           fi
           echo "lookup=ok" >>"$GITHUB_OUTPUT"
           echo "pinned=$pinned" >>"$GITHUB_OUTPUT"
-          if [ "$newest" = "$pinned" ]; then
+          if [ -z "$newest" ]; then
             echo "tag=" >>"$GITHUB_OUTPUT"
             exit 0
           fi

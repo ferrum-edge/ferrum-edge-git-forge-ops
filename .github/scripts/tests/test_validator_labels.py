@@ -199,7 +199,7 @@ class ValidatorLabelsTests(unittest.TestCase):
             "\n      - name:", 1
         )[0]
         self.assertIn("if: ${{ !cancelled() }}", newer)
-        self.assertIn("refresh-ferrum-edge-pin.sh --newest", newer)
+        self.assertIn("refresh-ferrum-edge-pin.sh --newer", newer)
         self.assertIn('refresh-ferrum-edge-pin.sh --release "$newest"', newer)
         self.assertIn(".validator.version", newer)
         self.assertNotIn("install-ferrum-edge.sh", newer)

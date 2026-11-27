@@ -37,6 +37,7 @@ on:
       - '.github/scripts/audit_settings.py'
       - 'contracts/**'
       - '.github/ferrum-edge-checksums.txt'
+      - 'release/baseline.json'
       - '.github/workflows/apply-on-merge.yml'
       - '.github/workflows/rotate.yml'
       - '.github/workflows/trusted-pr-review.yml'

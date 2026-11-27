@@ -22,9 +22,11 @@ PINNED_TAG = "v0.9.21"
 # Every URL the fake serves is logged so a test can prove which release was
 # resolved.
 FAKE_CURL = """#!/usr/bin/env python3
+import json
 import os
 import pathlib
 import sys
+import time
 
 argv = sys.argv[1:]
 headers = [argv[index + 1] for index, value in enumerate(argv[:-1]) if value == '-H']
@@ -38,13 +40,23 @@ url = next(arg for arg in argv if arg.startswith('https://'))
 output = pathlib.Path(argv[argv.index('--output') + 1])
 with open(os.environ['FAKE_URL_LOG'], 'a') as log:
     log.write(url + '\\n')
+with open(os.environ['FAKE_URL_LOG'] + '.argv', 'a') as log:
+    log.write(json.dumps(argv) + '\\n')
+
+informational = url.endswith('/releases/latest') or url.endswith('/releases?per_page=5')
+if informational and os.environ.get('FAKE_LATEST_STALL'):
+    # A stalled endpoint: curl gives up only when a time limit was passed.
+    if '--max-time' not in argv:
+        time.sleep(600)
+    time.sleep(0.2)
+    raise SystemExit(28)
 
 tags_prefix = 'https://api.github.com/repos/ferrum-edge/ferrum-edge/releases/tags/'
 if url.endswith('/releases/latest'):
     if os.environ.get('FAKE_LATEST_MISSING'):
         raise SystemExit(22)
     output.write_text(os.environ['FAKE_LATEST_JSON'])
-elif url.endswith('/releases?per_page=5'):
+elif url.endswith('/releases?per_page=5') or url.endswith('/releases?per_page=100'):
     payload = os.environ.get('FAKE_RELEASE_LIST_JSON')
     if payload is None:
         raise SystemExit(22)
@@ -118,6 +130,7 @@ class Harness:
         latest_json=None,
         release_list_json=None,
         latest_missing: bool = False,
+        latest_stall: bool = False,
         symlink_allowlist: bool = False,
         symlink_baseline: bool = False,
     ):
@@ -165,6 +178,8 @@ class Harness:
             environment["FAKE_RELEASE_LIST_JSON"] = json.dumps(release_list_json)
         if latest_missing:
             environment["FAKE_LATEST_MISSING"] = "1"
+        if latest_stall:
+            environment["FAKE_LATEST_STALL"] = "1"
         if github_token is not None:
             environment["GITHUB_TOKEN"] = github_token
             environment["FAKE_EXPECT_AUTH"] = f"Authorization: Bearer {github_token}"
@@ -185,6 +200,12 @@ class Harness:
     def urls(self) -> list[str]:
         return self.url_log.read_text().splitlines()
 
+    def calls(self) -> list[list[str]]:
+        argv_log = Path(f"{self.url_log}.argv")
+        if not argv_log.exists():
+            return []
+        return [json.loads(line) for line in argv_log.read_text().splitlines()]
+
     def install(self, *extra: str):
         result = subprocess.run(
             ["bash", str(INSTALLER), str(self.destination), str(self.allowlist), *extra],
@@ -192,6 +213,7 @@ class Harness:
             capture_output=True,
             env=self.environment,
             check=False,
+            timeout=120,
         )
         return result, self.destination.exists()
 
@@ -202,6 +224,7 @@ class Harness:
             capture_output=True,
             env=self.environment,
             check=False,
+            timeout=120,
         )
 
 
@@ -251,7 +274,7 @@ class InstallerTests(unittest.TestCase):
         result, installed = harness.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(installed)
-        self.assertIn("newest published Ferrum Edge release is v0.9.22", result.stderr)
+        self.assertIn("GitHub's latest Ferrum Edge release is v0.9.22", result.stderr)
         self.assertIn(f"pins {PINNED_TAG}", result.stderr)
         self.assertIn(f"from release {PINNED_TAG}", result.stdout)
         self.assertNotIn(
@@ -265,6 +288,26 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(installed)
         self.assertIn("could not be determined", result.stderr)
+
+    def test_a_stalled_latest_lookup_is_bounded_and_never_blocks_the_pin(self):
+        harness, digest = self.pinned(b"stalled lookup", latest_stall=True)
+        result, installed = harness.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(installed)
+        self.assertIn(f"sha256:{digest}", result.stdout)
+        self.assertIn("could not be determined", result.stderr)
+        informational = [
+            argv
+            for argv in harness.calls()
+            if any(
+                arg.endswith("/releases/latest") or arg.endswith("/releases?per_page=5")
+                for arg in argv
+            )
+        ]
+        self.assertEqual(len(informational), 2, informational)
+        for argv in informational:
+            self.assertIn("--max-time", argv)
+            self.assertNotIn("--retry", argv)
 
     def test_release_list_fallback_reports_the_newest_published_release(self):
         harness, _ = self.pinned(
@@ -280,7 +323,7 @@ class InstallerTests(unittest.TestCase):
         result, installed = harness.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(installed)
-        self.assertIn("newest published Ferrum Edge release is v0.9.22", result.stderr)
+        self.assertIn("GitHub's latest Ferrum Edge release is v0.9.22", result.stderr)
         self.assertNotIn("v0.9.23", result.stderr)
 
     def test_github_token_authenticates_every_request(self):
@@ -531,35 +574,90 @@ class RefreshPinTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("not a published", result.stderr)
 
-    def test_newest_prints_only_the_newest_published_tag(self):
-        harness = self.harness(
-            b"x", "0" * 64, "# empty\n", baseline(), latest_json=release(tag="v0.9.22")
-        )
-        result = harness.refresh("--newest")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "v0.9.22\n")
-        self.assertFalse(
-            any("/releases/assets/" in url for url in harness.urls()),
-            "--newest must not download any asset",
-        )
-
-    def test_newest_falls_back_to_the_published_release_list(self):
+    def newest(self, releases, *args, tag=PINNED_TAG):
         harness = self.harness(
             b"x",
             "0" * 64,
             "# empty\n",
-            baseline(),
-            latest_missing=True,
-            release_list_json=[
-                release(tag="latest", prerelease=True, published_at="2026-12-03T00:00:00Z"),
-                release(tag="v0.9.23", draft=True, published_at="2026-12-02T00:00:00Z"),
-                release(tag="v0.9.22", published_at="2026-12-01T00:00:00Z"),
-                release(tag=PINNED_TAG),
-            ],
+            baseline(tag=tag),
+            release_list_json=releases,
         )
-        result = harness.refresh("--newest")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "v0.9.22\n")
+        result = harness.refresh(*args, "--baseline", str(harness.baseline)) if "--newer" in args else harness.refresh(*args)
+        self.assertFalse(
+            any("/releases/assets/" in url for url in harness.urls()),
+            "a newest-release lookup must not download any asset",
+        )
+        self.assertFalse(
+            any(url.endswith("/releases/latest") for url in harness.urls()),
+            "GitHub's latest designation must not decide the newest release",
+        )
+        return result
+
+    def test_newest_is_the_highest_version_not_the_latest_designation(self):
+        for releases, expected in (
+            ([release(tag=PINNED_TAG), release(tag="v0.9.22")], "v0.9.22"),
+            # Numeric, not lexical: 0.10.0 > 0.9.30 > 0.9.21.
+            (
+                [release(tag="v0.9.30"), release(tag="v0.10.0"), release(tag=PINNED_TAG)],
+                "v0.10.0",
+            ),
+            ([release(tag="v0.10.0"), release(tag="v1.0.0"), release(tag="v0.99.99")], "v1.0.0"),
+            # A backport published after the newest release does not win.
+            (
+                [
+                    release(tag="v0.9.20", published_at="2026-12-09T00:00:00Z"),
+                    release(tag=PINNED_TAG, published_at="2026-11-22T06:29:03Z"),
+                ],
+                PINNED_TAG,
+            ),
+            # Drafts, prereleases, suffixed tags and releases without the asset
+            # never count.
+            (
+                [
+                    release(tag="v2.0.0", draft=True),
+                    release(tag="v1.5.0", prerelease=True),
+                    {"tag_name": "v1.4.0", "draft": False, "prerelease": False, "assets": []},
+                    release(tag="v1.3.0-rc.1"),
+                    release(tag="latest"),
+                    release(tag="v0.9.22"),
+                ],
+                "v0.9.22",
+            ),
+        ):
+            with self.subTest(expected=expected, tags=[r["tag_name"] for r in releases]):
+                result = self.newest(releases, "--newest")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, f"{expected}\n")
+
+    def test_newer_reports_only_a_numerically_greater_release(self):
+        for releases, pinned, expected in (
+            ([release(tag=PINNED_TAG)], PINNED_TAG, ""),
+            ([release(tag=PINNED_TAG), release(tag="v0.9.22")], PINNED_TAG, "v0.9.22\n"),
+            ([release(tag="v0.10.0"), release(tag=PINNED_TAG)], PINNED_TAG, "v0.10.0\n"),
+            ([release(tag="v1.0.0")], "v0.10.0", "v1.0.0\n"),
+            # An older backport designated latest is never recommended.
+            (
+                [release(tag="v0.9.20", published_at="2026-12-09T00:00:00Z"), release(tag=PINNED_TAG)],
+                PINNED_TAG,
+                "",
+            ),
+            # A pin ahead of everything published reports nothing.
+            ([release(tag="v0.9.22")], "v0.10.0", ""),
+        ):
+            with self.subTest(pinned=pinned, tags=[r["tag_name"] for r in releases]):
+                result = self.newest(releases, "--newer", tag=pinned)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected)
+
+    def test_newest_lookup_failure_fails(self):
+        harness = self.harness(b"x", "0" * 64, "# empty\n", baseline())
+        for args in (("--newest",), ("--newer", "--baseline", str(harness.baseline))):
+            with self.subTest(args=args):
+                result = harness.refresh(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Could not determine", result.stderr)
+        result = self.newest([release(tag="v1.0.0-rc.1")], "--newest")
+        self.assertNotEqual(result.returncode, 0)
 
     def test_newest_cannot_append(self):
         harness = self.harness(b"x", "0" * 64, "# empty\n", baseline())

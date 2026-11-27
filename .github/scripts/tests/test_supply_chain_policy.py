@@ -8217,6 +8217,32 @@ result=$(python3 trusted-scope/.github/scripts/changed_files.py
                 return workflow.replace(f"uses: {current_pin}", f"uses: {pin}", 1)
         self.fail("security.yml must use the reviewed cargo-audit installer pin")
 
+    def test_finalized_release_records_are_immutable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "base"
+            candidate = Path(directory) / "candidate"
+            for tree in (base, candidate):
+                (tree / "release/records").mkdir(parents=True)
+            record = '{"status": "supported"}\n'
+            (base / "release/records/v1.0.0.json").write_text(record)
+            (candidate / "release/records/v1.0.0.json").write_text(record)
+            # A new record is fine; the existing one is unchanged.
+            (candidate / "release/records/v1.0.1.json").write_text(record)
+            self.assertEqual(check_supply_chain.release_record_violations(base, candidate), [])
+            # Comparing a tree with itself (an ordinary local run) is a no-op.
+            self.assertEqual(check_supply_chain.release_record_violations(base, base), [])
+
+            (candidate / "release/records/v1.0.0.json").write_text('{"status": "pending"}\n')
+            violations = check_supply_chain.release_record_violations(base, candidate)
+            self.assertEqual(len(violations), 1, violations)
+            self.assertIn("release/records/v1.0.0.json", violations[0])
+            self.assertIn("immutable", violations[0])
+
+            (candidate / "release/records/v1.0.0.json").unlink()
+            violations = check_supply_chain.release_record_violations(base, candidate)
+            self.assertEqual(len(violations), 1, violations)
+            self.assertIn("must not be removed", violations[0])
+
     def test_installer_must_install_exactly_the_pinned_release(self):
         # Dropping any pinned-release control reverts the installer towards
         # "whatever upstream published last", which the checker refuses.

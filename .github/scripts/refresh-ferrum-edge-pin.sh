@@ -20,17 +20,23 @@ set -euo pipefail
 # then set `validator` and `tested_gateway` in release/baseline.json to that
 # version and digest in the same reviewed change.
 #
-# `--newest` prints only the tag of the newest published version release
-# (GitHub's `/releases/latest`, which skips drafts and prereleases, with the
-# version-release list as fallback) and downloads nothing. The validator pin
-# canary uses it to report a newer upstream release.
+# `--newest` prints the highest published version release: the numerically
+# greatest plain `vMAJOR.MINOR.PATCH` tag among the newest 100 releases that
+# are neither drafts nor prereleases and publish the asset. GitHub's
+# "latest" designation is not used: a release can be published without it,
+# and a backport can carry it. `--newer` prints that tag only when it is
+# numerically greater than the baseline's `validator.version`, and nothing
+# otherwise. Neither downloads an asset; both fail when the lookup fails. The
+# validator pin canary uses `--newer` to report a newer upstream release.
 #
 # Usage: refresh-ferrum-edge-pin.sh [--append] [--allowlist PATH]
 #                                   [--baseline PATH | --release vX.Y.Z]
 #        refresh-ferrum-edge-pin.sh --newest
+#        refresh-ferrum-edge-pin.sh --newer [--baseline PATH]
 
 append=false
 newest=false
+newer=false
 explicit_release=
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 allowlist=$script_dir/../ferrum-edge-checksums.txt
@@ -48,6 +54,10 @@ while [ $# -gt 0 ]; do
       ;;
     --newest)
       newest=true
+      shift
+      ;;
+    --newer)
+      newer=true
       shift
       ;;
     --allowlist)
@@ -75,7 +85,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -h | --help)
-      sed -n '4,30p' "${BASH_SOURCE[0]}"
+      sed -n '4,36p' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
@@ -85,8 +95,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ "$newest" = true ] && { [ "$append" = true ] || [ -n "$explicit_release" ]; }; then
-  echo "--newest prints a tag only; it cannot be combined with --append or --release." >&2
+if { [ "$newest" = true ] || [ "$newer" = true ]; } &&
+  { [ "$append" = true ] || [ -n "$explicit_release" ]; }; then
+  echo "--newest and --newer print a tag only; they cannot be combined with --append or --release." >&2
+  exit 1
+fi
+if [ "$newest" = true ] && [ "$newer" = true ]; then
+  echo "Choose one of --newest and --newer." >&2
   exit 1
 fi
 
@@ -107,32 +122,50 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
   curl_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
 fi
 
-if [ "$newest" = true ]; then
-  if ! curl "${curl_common[@]}" "${curl_auth[@]}" \
+# The highest published plain version release, compared numerically.
+highest_published_release() {
+  local releases_json="$tmp_dir/releases.json"
+  curl "${curl_common[@]}" "${curl_auth[@]}" \
     -H 'Accept: application/vnd.github+json' \
-    "$releases_api/latest" --output "$release_json"; then
-    echo "GitHub /releases/latest is unavailable; falling back to the published version-release list." >&2
-    releases_json="$tmp_dir/releases.json"
-    curl "${curl_common[@]}" "${curl_auth[@]}" \
-      -H 'Accept: application/vnd.github+json' \
-      "$releases_api?per_page=5" --output "$releases_json"
-    jq --arg name "$asset" '
-      [ .[]
-        | select(.draft | not)
-        | select(.prerelease | not)
-        | select([.assets[]?.name] | index($name) != null)
-      ]
-      | sort_by(.published_at)
-      | reverse
-      | .[0] // empty
-    ' "$releases_json" >"$release_json"
-  fi
-  newest_tag=$(jq -r '.tag_name // ""' "$release_json")
-  if [[ ! "$newest_tag" =~ $release_tag_pattern ]]; then
-    echo "Could not determine the newest published version release (got '${newest_tag:-<none>}')." >&2
+    "$releases_api?per_page=100" --output "$releases_json" || return 1
+  jq -r --arg name "$asset" '
+    [ .[]
+      | select(.draft | not)
+      | select(.prerelease | not)
+      | select([.assets[]?.name] | index($name) != null)
+      | .tag_name
+      | strings
+      | select(test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+    ]
+    | max_by(ltrimstr("v") | split(".") | map(tonumber))
+    // empty
+  ' "$releases_json"
+}
+
+if [ "$newest" = true ] || [ "$newer" = true ]; then
+  if ! newest_tag=$(highest_published_release) || [[ ! "$newest_tag" =~ $release_tag_pattern ]]; then
+    echo "Could not determine the highest published version release (got '${newest_tag:-<none>}')." >&2
     exit 1
   fi
-  printf '%s\n' "$newest_tag"
+  if [ "$newest" = true ]; then
+    printf '%s\n' "$newest_tag"
+    exit 0
+  fi
+  if [ ! -f "$baseline" ] || [ -L "$baseline" ]; then
+    echo "Release baseline is missing or is a symlink: $baseline" >&2
+    exit 1
+  fi
+  if ! pinned_tag=$(jq -er '.validator.version | strings' "$baseline" 2>/dev/null) ||
+    [[ ! "$pinned_tag" =~ $release_tag_pattern ]]; then
+    echo "Release baseline $baseline must pin validator.version as vMAJOR.MINOR.PATCH." >&2
+    exit 1
+  fi
+  if jq -en --arg newest "$newest_tag" --arg pinned "$pinned_tag" '
+    ($newest | ltrimstr("v") | split(".") | map(tonumber))
+      > ($pinned | ltrimstr("v") | split(".") | map(tonumber))
+  ' >/dev/null; then
+    printf '%s\n' "$newest_tag"
+  fi
   exit 0
 fi
 

@@ -55,6 +55,10 @@ is the source of truth for status and for the exact component pairing:
   validator pin and gateway pairing in that record. Earlier buildout revisions
   have no compatibility or upgrade commitment.
 
+Each published release keeps its finalized, immutable support record in
+[`release/records/`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/tree/main/release/records/)
+(`<tag>.json`); `baseline.json` describes the release being prepared.
+
 The [release policy and adoption steps](release/README.md#publishing-and-later-changes)
 apply from that baseline onward.
 
@@ -628,6 +632,7 @@ lives in [`.github/scripts/deployment_scope.py`](.github/scripts/deployment_scop
 | `.github/actions/**` | local composite actions a step runs |
 | `.github/scripts/**` | helper programs the job runs |
 | `.github/ferrum-edge-checksums.txt` | which validator build is trusted |
+| `release/baseline.json` | which validator release is installed |
 | `.github/workflows/apply-on-merge.yml` | the deployment procedure itself |
 
 The same list is the workflow's `on.push.paths` filter, and

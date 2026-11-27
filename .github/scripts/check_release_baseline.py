@@ -9,6 +9,16 @@ recorded (the allowlist line approving the pinned digest, the Dockerfile
 gateway stage, the vendored contracts PIN, the CLI's `DEFAULT_EDGE_VERSION`,
 the release notes and the release README), so moving the pin is one reviewed
 change that cannot leave a stale copy behind.
+
+`release/baseline.json` describes the release under preparation (the
+candidate, whose version is `Cargo.toml`'s). Each published release keeps a
+finalized support record in `release/records/<tag>.json`: status
+`supported`, every evidence field filled, and its release notes committed.
+Records are immutable once on the protected branch (`check_supply_chain.py`
+compares them with the base tree). A finalized candidate must equal its
+record, a `pending` candidate may not reuse a finalized tag, and the README's
+"First supported baseline" names the lowest recorded release (the candidate
+before any release is recorded).
 """
 
 from __future__ import annotations
@@ -63,6 +73,102 @@ def allowlist_releases(policy: str, digest: str, asset: str) -> list[str]:
     return releases
 
 
+RECORDS_DIR = "release/records"
+
+
+def version_key(tag: str) -> tuple[int, int, int]:
+    major, minor, patch = (int(part) for part in tag.removeprefix("v").split("."))
+    return major, minor, patch
+
+
+def finalized_record_issues(record: object, name: str, policy: str, root: Path) -> list[str]:
+    """Why `record` is not a complete support record for a published release."""
+    where = f"{RECORDS_DIR}/{name}"
+    if not isinstance(record, dict) or record.get("schema_version") != 1:
+        return [f"{where} must be a version-1 object"]
+    engine = record.get("gitforgeops")
+    validator = record.get("validator")
+    gateway = record.get("tested_gateway")
+    lifecycle = record.get("lifecycle")
+    if not all(isinstance(item, dict) for item in (engine, validator, gateway, lifecycle)):
+        return [f"{where} has an invalid component object"]
+    issues = []
+    tag = engine.get("tag")
+    version = engine.get("version")
+    if not isinstance(tag, str) or not RELEASE_TAG.fullmatch(tag) or tag != f"v{version}":
+        return [f"{where} must name a vMAJOR.MINOR.PATCH tag matching its version"]
+    if name != f"{tag}.json":
+        issues.append(f"{where} must be named {tag}.json")
+    if record.get("status") != "supported":
+        issues.append(f"{where} must be finalized with status supported")
+    if not isinstance(engine.get("source_sha"), str) or not SHA.fullmatch(engine["source_sha"]):
+        issues.append(f"{where} needs an exact source SHA")
+    if not isinstance(engine.get("image_digest"), str) or not DIGEST.fullmatch(
+        engine["image_digest"]
+    ):
+        issues.append(f"{where} needs an immutable image digest")
+    if not isinstance(lifecycle.get("run_url"), str) or not RUN_URL.fullmatch(
+        lifecycle["run_url"]
+    ):
+        issues.append(f"{where} needs a lifecycle run URL")
+    edge_version = validator.get("version")
+    pin = validator.get("sha256")
+    asset = validator.get("asset")
+    if (
+        not isinstance(edge_version, str)
+        or not RELEASE_TAG.fullmatch(edge_version)
+        or gateway.get("version") != edge_version
+        or not isinstance(pin, str)
+        or not _SHA256_HEX_RE.fullmatch(pin)
+        or gateway.get("binary_sha256") != pin
+        or not isinstance(asset, str)
+        or not any(
+            line.split("#", 1)[0].strip() == f"{pin}  {asset}" for line in policy.splitlines()
+        )
+    ):
+        issues.append(f"{where} must name one allowlisted validator and matching tested gateway")
+    if gateway.get("image") != "docker.io/ferrumedge/ferrum-edge" or not (
+        isinstance(gateway.get("image_digest"), str) and DIGEST.fullmatch(gateway["image_digest"])
+    ):
+        issues.append(f"{where} must name the tested gateway image digest")
+    notes = root / f"release/notes-{tag}.md"
+    try:
+        notes_text = notes.read_text(encoding="utf-8")
+    except OSError:
+        issues.append(f"{where}: release notes release/notes-{tag}.md must stay committed")
+    else:
+        if f"# GitForgeOps {tag} release notes" not in notes_text:
+            issues.append(f"release/notes-{tag}.md must name {tag}")
+    return issues
+
+
+def load_records(root: Path, policy: str) -> tuple[dict[str, dict], list[str]]:
+    """The finalized support records, keyed by release tag."""
+    directory = root / RECORDS_DIR
+    if not directory.exists():
+        return {}, []
+    if directory.is_symlink() or not directory.is_dir():
+        return {}, [f"{RECORDS_DIR} must be a directory"]
+    records: dict[str, dict] = {}
+    issues: list[str] = []
+    for path in sorted(directory.iterdir()):
+        if path.name == "README.md":
+            continue
+        if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+            issues.append(f"{RECORDS_DIR}/{path.name} is not a release record (<tag>.json)")
+            continue
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            issues.append(f"{RECORDS_DIR}/{path.name} cannot be read: {error}")
+            continue
+        problems = finalized_record_issues(record, path.name, policy, root)
+        issues.extend(problems)
+        if not problems:
+            records[record["gitforgeops"]["tag"]] = record
+    return records, issues
+
+
 def pin_edge_version(pin: str) -> str | None:
     for line in pin.splitlines():
         if line.startswith("edge_version="):
@@ -104,17 +210,21 @@ def check(root: Path) -> list[str]:
     version = cargo.get("package", {}).get("version")
     if engine.get("version") != version or engine.get("tag") != f"v{version}":
         issues.append("GitForgeOps release version and tag must match Cargo.toml")
-    if f"First supported baseline: [v{version}](release/README.md)" not in readme:
-        issues.append("README Development status must link to the recorded version")
+    records, record_issues = load_records(root, policy)
+    issues.extend(record_issues)
+    # The first supported baseline is a milestone, not the candidate: once a
+    # release is recorded it stays the lowest recorded version.
+    first = min(records, key=version_key) if records else f"v{version}"
+    if f"First supported baseline: [{first}](release/README.md)" not in readme:
+        issues.append(
+            f"README Development status must link to the first supported baseline {first}"
+        )
+    if RECORDS_DIR + "/" not in readme:
+        issues.append("README Development status must point to the finalized release records")
     if f"Release baseline: [v{version}](../release/README.md)" not in quickstart:
         issues.append("quickstart must link to the recorded version")
     if f"# GitForgeOps v{version} release notes" not in notes:
         issues.append("release notes must name the recorded version")
-    if (
-        "`status` is `pending`" not in readme
-        or "`status` becomes `supported`" not in readme
-    ):
-        issues.append("README Development status must explain pending and supported states")
     if "`status` is `supported`" not in " ".join(quickstart.split()):
         issues.append("quickstart must require a supported release record")
 
@@ -186,9 +296,15 @@ def check(root: Path) -> list[str]:
     source_sha = engine.get("source_sha")
     artifact_digest = engine.get("image_digest")
     run_url = lifecycle.get("run_url")
+    candidate_tag = engine.get("tag")
     if status == "pending":
         if any(value is not None for value in (source_sha, artifact_digest, run_url)):
             issues.append("pending release must leave source, image, and evidence slots empty")
+        if candidate_tag in records:
+            issues.append(
+                f"{RECORDS_DIR}/{candidate_tag}.json is already finalized; prepare a new "
+                "version instead of reopening a published one"
+            )
     elif status == "supported":
         if not isinstance(source_sha, str) or not SHA.fullmatch(source_sha):
             issues.append("supported release needs an exact source SHA")
@@ -196,6 +312,11 @@ def check(root: Path) -> list[str]:
             issues.append("supported release needs an immutable image digest")
         if not isinstance(run_url, str) or not RUN_URL.fullmatch(run_url):
             issues.append("supported release needs a lifecycle run URL")
+        if records.get(candidate_tag) != record:
+            issues.append(
+                f"a supported baseline must be finalized as {RECORDS_DIR}/{candidate_tag}.json "
+                "with identical content"
+            )
     else:
         issues.append("release status must be pending or supported")
 

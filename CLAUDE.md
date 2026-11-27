@@ -97,7 +97,8 @@ cargo fmt --all && cargo fmt --all -- --check
   toolchain/lint config, `Dockerfile`) or a non-Rust file the unit suite reads
   or the binary embeds (`docs/quickstart.md`, `.gitforgeops/*.example.yaml`,
   `.github/scripts/audit_settings.py`, `contracts/`,
-  `.github/ferrum-edge-checksums.txt`, `apply-on-merge.yml`, `rotate.yml`,
+  `.github/ferrum-edge-checksums.txt`, `release/baseline.json`,
+  `apply-on-merge.yml`, `rotate.yml`,
   `trusted-pr-review.yml`).
 - Unit tests never read the customer-owned `resources/` tree. Shipped-example
   checks use `tests/fixtures/shipped-examples/`; upstream,
@@ -2141,6 +2142,13 @@ traffic. Details: `tests/lifecycle/README.md`. Invariants:
   unsealed (cancelled) record, a `skipped` scenario or a stale record is a
   refusal. `--gateway-allowlist` binds the gateway build to the revision's own
   checksum allowlist.
+- `release/baseline.json` is the release under preparation;
+  `release/records/<tag>.json` is each published release's finalized support
+  record (identical to the finalized baseline, `status` `supported`).
+  `check_release_baseline.py` validates both and ties the README's "First
+  supported baseline" to the lowest record; `check_supply_chain.py`
+  (`release_record_violations`) refuses a change that rewrites or deletes a
+  record already on the protected branch.
 - Not a per-PR required check: it needs a gateway build, and an often-red check
   trains people to override it.
 - `partial-failure-recovery` runs in CI through `tests/lifecycle/fault_proxy.py`,

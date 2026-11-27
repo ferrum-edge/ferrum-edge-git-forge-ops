@@ -1,10 +1,11 @@
 # GitForgeOps v0.1.0 release notes
 
-The [baseline record](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/baseline.json)
-supplies publication status, exact
-revision, image digest, and lifecycle evidence. Copy this note into the GitHub
-release when that record is finalized; the committed copy remains available
-after workflow artifacts expire.
+This release's finalized support record,
+[`release/records/v0.1.0.json`](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/records/v0.1.0.json)
+on upstream `main`, supplies the exact revision, image digest, validator pin,
+tested gateway and lifecycle evidence. Copy this note into the GitHub release
+when that record is committed; the committed copy remains available after
+workflow artifacts expire.
 
 ## Candidate pairing
 
@@ -14,9 +15,9 @@ the release on 2026-11-22 at tag commit
 `f9915358c8032214f4034a17c28cdf72d14006c3`; its release run created the release
 and passed its attestation gates, with one failed post-publication image-pull
 smoke job.
-GitForgeOps hosted qualification against those bytes is
-still required. The record remains `pending`; a supported GitForgeOps release
-requires exact-revision lifecycle evidence and publication.
+The release gate publishes only with passing exact-revision lifecycle evidence
+against those bytes, including the human GitHub acceptance run; the record
+links that evidence.
 See the [support table](https://github.com/ferrum-edge/ferrum-edge-git-forge-ops/blob/main/release/README.md#support-and-compatibility)
 for the precise profile and file/mesh and monitoring boundaries.
 
@@ -30,8 +31,8 @@ for later fixes.
 
 ## Changes and known limitations
 
-- First supported source/template and container pairing, conditional on the
-  record's `supported` status and passing exact-revision release gate.
+- First supported source/template and container pairing, published through
+  the exact-revision release gate.
 - Edge v0.9.21 follows v0.9.20 directly and refuses many configurations
   v0.9.20 accepted. The no-op `Proxy.pool_max_requests_per_connection` is
   removed (GitForgeOps omits it from desired state for this pairing), several
@@ -52,8 +53,8 @@ for later fixes.
   updates and deletes require the `expected_proxy_ids` association precondition
   (ferrum-edge#6744), which GitForgeOps already sends. Review the
   [v0.9.19 upgrade guide](https://github.com/ferrum-edge/ferrum-edge/blob/510ce7121c3d9754110d330a30a3bd9b7a7b278e/docs/upgrade_guide.md#upgrading-to-0919)
-  before rollout. Exact-byte hosted qualification and the five external
-  acceptance scenarios remain required.
+  before rollout. The release gate requires exact-byte hosted qualification,
+  including the five external acceptance scenarios.
 - Edge v0.9.17, which v0.9.19 follows, carries the changes prepared for the
   unpublished v0.9.16 tag, including namespace-bounded admin tokens, stricter
   plugin and route admission, and cached admin misses that report unavailable
@@ -85,8 +86,8 @@ for later fixes.
   replacement, with original row/namespace `If-Match` tokens, opaque Basic HMACs,
   ownership and ledger fences, and no stale-token replay. Rotation checks live
   safety before broker publication and records completion only after its
-  conditional gateway write succeeds. Hosted enforcement qualification remains
-  required on the exact released bytes (#462).
+  conditional gateway write succeeds. Hosted enforcement qualification on the
+  exact released bytes is part of the release gate (#462).
 - Pin the scoped resource schema, fixtures and vocabularies to published
   `contracts-edge-0.9.21` at `92d8da5be93ea1ece9f47729b1f7aa10ae8a7c3f`, retaining
   strict conformance and upstream descriptions. Canonical metadata alone grants
@@ -106,9 +107,8 @@ for later fixes.
   `--user "$(id -u):$(id -g)"` so written files stay owned by the checkout
   owner, and may need to `chown` files earlier root runs left behind.
 
-The first supported release remains blocked by #266's second human reviewer,
-state-writer GitHub App, disposable template repository and HTTPS gateway
-acceptance run, which also provisions and exercises viewer-capped drift
+First-release acceptance (#266) is a human GitHub acceptance run with a
+second reviewer, the state-writer GitHub App, a disposable template repository
+and an HTTPS gateway, which also provisions and exercises viewer-capped drift
 monitoring (#440) in that disposable repository; the upstream template has no
-gateway environment of its own. This candidate does not fill publication fields,
-publish a GitForgeOps tag or claim human acceptance.
+gateway environment of its own. The release record links the sealed result.

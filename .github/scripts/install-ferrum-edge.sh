@@ -30,11 +30,12 @@ set -euo pipefail
 # come from the same tree (the protected default branch for privileged
 # workflows, the candidate for pull-request validation).
 #
-# Separately, and only to inform, the newest published version release is
-# looked up (GitHub's `/releases/latest`, which skips drafts and prereleases,
-# with the version-release list as fallback) and reported when it differs from
-# the pin. That lookup never selects which bytes are installed, and its failure
-# does not fail the install.
+# Separately, and only to inform, GitHub's latest release is looked up
+# (`/releases/latest`, which skips drafts and prereleases, with the
+# version-release list as fallback) and reported when it differs from the pin.
+# That lookup never selects which bytes are installed, runs without retries
+# under a short time limit, and its failure or stall does not fail the install.
+# The validator pin canary does the authoritative newer-release comparison.
 #
 # Usage: install-ferrum-edge.sh [destination] [allowlist] [baseline]
 
@@ -143,19 +144,27 @@ curl_auth=()
 if [ -n "${GITHUB_TOKEN:-}" ]; then
   curl_auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
 fi
+# The informational lookup gets no retries and a hard per-request limit, so a
+# stalled endpoint cannot delay the pinned install by more than a few seconds.
+curl_probe=(
+  --proto '=https' --tlsv1.2 --fail --silent --show-error --location
+  --connect-timeout 3 --max-time 8
+  -H 'X-GitHub-Api-Version: 2022-11-28'
+  -H 'User-Agent: gitforgeops-validator-installer'
+)
 
-# Informational only: report a newer published version release. GitHub's
+# Informational only: report GitHub's latest version release. GitHub's
 # `/releases/latest` skips drafts and prereleases; the release list, filtered
 # the same way and ordered by published_at, is the fallback. Nothing below
 # reads this result to choose bytes.
 newest_tag=
-if curl "${curl_common[@]}" "${curl_auth[@]}" \
+if curl "${curl_probe[@]}" "${curl_auth[@]}" \
   -H 'Accept: application/vnd.github+json' \
   "$releases_api/latest" --output "$newest_json" 2>/dev/null; then
   newest_tag=$(jq -r '.tag_name // ""' "$newest_json" 2>/dev/null || true)
 else
   releases_json="$tmp_dir/releases.json"
-  if curl "${curl_common[@]}" "${curl_auth[@]}" \
+  if curl "${curl_probe[@]}" "${curl_auth[@]}" \
     -H 'Accept: application/vnd.github+json' \
     "$releases_api?per_page=5" --output "$releases_json" 2>/dev/null; then
     newest_tag=$(jq -r --arg name "$asset" '
@@ -171,9 +180,9 @@ else
   fi
 fi
 if [ -z "$newest_tag" ]; then
-  echo "Note: the newest published Ferrum Edge release could not be determined; installing the pinned $pinned_tag." >&2
+  echo "Note: GitHub's latest Ferrum Edge release could not be determined; installing the pinned $pinned_tag." >&2
 elif [ "$newest_tag" != "$pinned_tag" ]; then
-  echo "Note: the newest published Ferrum Edge release is $newest_tag; release/baseline.json pins $pinned_tag, which is what is installed." >&2
+  echo "Note: GitHub's latest Ferrum Edge release is $newest_tag; release/baseline.json pins $pinned_tag, which is what is installed." >&2
 fi
 
 # Resolve exactly the pinned version release.

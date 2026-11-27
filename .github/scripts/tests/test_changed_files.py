@@ -162,6 +162,8 @@ class ChangedFilesTests(unittest.TestCase):
             "contracts/ferrum-contracts/PIN",
             "contracts/ferrum-contracts/vocabularies/plugin-catalog.json",
             ".github/ferrum-edge-checksums.txt",
+            # The resource-field parity test reads the pinned Edge version.
+            "release/baseline.json",
             ".github/workflows/apply-on-merge.yml",
             ".github/workflows/rotate.yml",
             ".github/workflows/trusted-pr-review.yml",
@@ -179,6 +181,8 @@ class ChangedFilesTests(unittest.TestCase):
             "resources/ferrum/proxies/_example.yaml",
             "docs/contracts.md",
             "nested/contracts/PIN",
+            "release/README.md",
+            "nested/release/baseline.json",
         ):
             with self.subTest(path=path):
                 result = changed_files.analyze([[{"filename": path}]], 1, "rust")
@@ -196,6 +200,7 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertIn(".github/scripts/audit_settings.py", entries)
         self.assertIn("contracts/**", entries)
         self.assertIn(".github/ferrum-edge-checksums.txt", entries)
+        self.assertIn("release/baseline.json", entries)
         self.assertIn(".github/workflows/apply-on-merge.yml", entries)
         self.assertIn(".github/workflows/rotate.yml", entries)
         self.assertIn(".github/workflows/trusted-pr-review.yml", entries)
