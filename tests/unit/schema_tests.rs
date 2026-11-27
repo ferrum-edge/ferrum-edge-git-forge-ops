@@ -536,8 +536,6 @@ spec:
   health_checks:
     passive:
       max_ejection_percent: 40
-      gateway_error_codes: [502, 504]
-      split_external_local_origin_errors: true
 "#;
     let spec = match gitforgeops::yaml::from_str::<Resource>(yaml).unwrap() {
         Resource::Upstream { spec } => spec,
@@ -555,8 +553,11 @@ spec:
         .passive
         .expect("passive preserved");
     assert_eq!(passive.max_ejection_percent, Some(40));
-    assert_eq!(passive.gateway_error_codes, Some(vec![502, 504]));
-    assert_eq!(passive.split_external_local_origin_errors, Some(true));
+    assert!(!round.contains("gateway_error_codes"), "{round}");
+    assert!(
+        !round.contains("split_external_local_origin_errors"),
+        "{round}"
+    );
 }
 
 #[test]

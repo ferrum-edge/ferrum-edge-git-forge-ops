@@ -352,10 +352,10 @@ pub struct PassiveHealthCheck {
     /// `None` means no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ejection_percent: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gateway_error_codes: Option<Vec<u16>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub split_external_local_origin_errors: Option<bool>,
+    // `gateway_error_codes` and `split_external_local_origin_errors` were
+    // accepted by Ferrum Edge through v0.9.21 and never applied; Edge 1.0.0
+    // removes them and refuses either key. They are not modeled, so the
+    // strict loader refuses a repository document that still sets them.
     /// Count `unhealthy_threshold` against the consecutive failure streak
     /// instead of the sliding window (Istio `consecutive5xxErrors`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
