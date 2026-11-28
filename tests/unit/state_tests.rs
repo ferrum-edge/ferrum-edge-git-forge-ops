@@ -1441,91 +1441,99 @@ fn state_refuses_unparsable_pending_create_keys_on_load_and_save() {
 #[test]
 fn state_validates_basicauth_bindings_on_load_and_save() {
     let dir = TempDir::new().unwrap();
-    with_cwd(dir.path(), || {
-        std::fs::create_dir_all(".state").unwrap();
-        let valid_hash =
-            "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$0123456789abcdef0123456789abcdef0123456789a";
-        let valid_tag =
-            gitforgeops::diff::basicauth_password_binding("ferrum", "app", 0, "pw", valid_hash);
+    let state_dir = dir.path().join(".state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let edge_gateway_hash = format!("hmac_sha256:{}", "0123456789abcdef".repeat(4));
+    let argon2_hash =
+        "$argon2id$v=19$m=19456,t=2,p=1$YWJjZGVmZ2hpamtsbW5vcA$0123456789abcdef0123456789abcdef0123456789a";
+    let valid_tag =
+        gitforgeops::diff::basicauth_password_binding("ferrum", "app", 0, "pw", &edge_gateway_hash);
 
-        let invalid_cases: Vec<(&str, String, Vec<String>)> = vec![
-            (
-                "non-consumer-key",
-                state_key("ferrum", "Proxy", "p1"),
-                vec![valid_tag.clone()],
-            ),
-            (
-                "raw-gateway-hash",
-                state_key("ferrum", "Consumer", "app"),
-                vec![valid_hash.to_string()],
-            ),
-            (
-                "empty-vector",
-                state_key("ferrum", "Consumer", "app"),
-                vec![],
-            ),
-            (
-                "all-empty-sentinels",
-                state_key("ferrum", "Consumer", "app"),
-                vec![String::new()],
-            ),
-            (
-                "wrong-version",
-                state_key("ferrum", "Consumer", "app"),
-                vec![format!("hmac_sha256_binding:v2:{}", "a".repeat(64))],
-            ),
-            (
-                "short-hex",
-                state_key("ferrum", "Consumer", "app"),
-                vec![format!("hmac_sha256_binding:v1:{}", "a".repeat(63))],
-            ),
-            (
-                "uppercase-hex",
-                state_key("ferrum", "Consumer", "app"),
-                vec![format!("hmac_sha256_binding:v1:{}", "A".repeat(64))],
-            ),
-        ];
+    let invalid_cases: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "non-consumer-key",
+            state_key("ferrum", "Proxy", "p1"),
+            vec![valid_tag.clone()],
+        ),
+        (
+            "raw-gateway-hmac-hash",
+            state_key("ferrum", "Consumer", "app"),
+            vec![edge_gateway_hash],
+        ),
+        (
+            "raw-argon2-hash",
+            state_key("ferrum", "Consumer", "app"),
+            vec![argon2_hash.to_string()],
+        ),
+        (
+            "empty-vector",
+            state_key("ferrum", "Consumer", "app"),
+            vec![],
+        ),
+        (
+            "all-empty-sentinels",
+            state_key("ferrum", "Consumer", "app"),
+            vec![String::new()],
+        ),
+        (
+            "wrong-version",
+            state_key("ferrum", "Consumer", "app"),
+            vec![format!("hmac_sha256_binding:v2:{}", "a".repeat(64))],
+        ),
+        (
+            "short-hex",
+            state_key("ferrum", "Consumer", "app"),
+            vec![format!("hmac_sha256_binding:v1:{}", "a".repeat(63))],
+        ),
+        (
+            "uppercase-hex",
+            state_key("ferrum", "Consumer", "app"),
+            vec![format!("hmac_sha256_binding:v1:{}", "A".repeat(64))],
+        ),
+    ];
 
-        for (label, key, values) in invalid_cases {
-            let mut bad = StateFile {
-                environment: format!("save-{label}"),
-                ..StateFile::default()
-            };
-            bad.basicauth_bindings.insert(key.clone(), values.clone());
-            assert!(
-                bad.save().is_err(),
-                "save must reject invalid basicauth binding case `{label}`"
-            );
-            assert!(!std::path::Path::new(&format!(".state/save-{label}.json")).exists());
-
-            let env_name = format!("load-{label}");
-            let disk = serde_json::json!({
-                "version": 3,
-                "environment": env_name,
-                "resources": {},
-                "basicauth_bindings": { key: values }
-            });
-            std::fs::write(
-                format!(".state/{env_name}.json"),
-                serde_json::to_string(&disk).unwrap(),
-            )
-            .unwrap();
-            assert!(
-                StateFile::load(&env_name).is_err(),
-                "load must reject invalid basicauth binding case `{label}`"
-            );
-        }
-
-        let mut valid = StateFile {
-            environment: "valid-bindings".to_string(),
+    for (label, key, values) in invalid_cases {
+        let mut bad = StateFile {
+            environment: format!("save-{label}"),
             ..StateFile::default()
         };
-        valid.basicauth_bindings.insert(
-            state_key("ferrum", "Consumer", "app"),
-            vec![valid_tag, String::new()],
+        bad.basicauth_bindings.insert(key.clone(), values.clone());
+        assert!(
+            bad.save_in_dir(dir.path()).is_err(),
+            "save must reject invalid basicauth binding case `{label}`"
         );
-        valid.save().expect("valid basicauth binding state saves");
-        let reloaded = StateFile::load("valid-bindings").expect("valid state reloads");
-        assert_eq!(reloaded.basicauth_bindings, valid.basicauth_bindings);
-    });
+        assert!(!state_dir.join(format!("save-{label}.json")).exists());
+
+        let env_name = format!("load-{label}");
+        let disk = serde_json::json!({
+            "version": 3,
+            "environment": env_name,
+            "resources": {},
+            "basicauth_bindings": { key: values }
+        });
+        std::fs::write(
+            state_dir.join(format!("{env_name}.json")),
+            serde_json::to_string(&disk).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            StateFile::load_in_dir(dir.path(), &env_name).is_err(),
+            "load must reject invalid basicauth binding case `{label}`"
+        );
+    }
+
+    let mut valid = StateFile {
+        environment: "valid-bindings".to_string(),
+        ..StateFile::default()
+    };
+    valid.basicauth_bindings.insert(
+        state_key("ferrum", "Consumer", "app"),
+        vec![valid_tag, String::new()],
+    );
+    valid
+        .save_in_dir(dir.path())
+        .expect("valid basicauth binding state saves");
+    let reloaded =
+        StateFile::load_in_dir(dir.path(), "valid-bindings").expect("valid state reloads");
+    assert_eq!(reloaded.basicauth_bindings, valid.basicauth_bindings);
 }

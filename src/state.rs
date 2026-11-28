@@ -224,37 +224,47 @@ impl Drop for StateLock {
 
 /// Inspect the directory entry itself: following a symlink here would let an
 /// unprotected repository path supply the shared-mode ownership ledger.
-fn state_directory_exists() -> crate::error::Result<bool> {
-    match std::fs::symlink_metadata(STATE_DIR) {
+fn state_directory_exists_at(state_dir: &Path) -> crate::error::Result<bool> {
+    match std::fs::symlink_metadata(state_dir) {
         Ok(metadata) if metadata.is_dir() => Ok(true),
         Ok(_) => Err(crate::error::Error::Config(format!(
-            "{STATE_DIR} must be a real directory; symlinks and non-directories are refused"
+            "{} must be a real directory; symlinks and non-directories are refused",
+            state_dir.display()
         ))),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(crate::error::Error::Io(source)),
     }
 }
 
-fn ensure_state_directory() -> crate::error::Result<()> {
-    if !state_directory_exists()? {
-        match std::fs::create_dir(STATE_DIR) {
+fn state_directory_exists() -> crate::error::Result<bool> {
+    state_directory_exists_at(Path::new(STATE_DIR))
+}
+
+fn ensure_state_directory_at(state_dir: &Path) -> crate::error::Result<()> {
+    if !state_directory_exists_at(state_dir)? {
+        match std::fs::create_dir(state_dir) {
             Ok(()) => {}
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => return Err(crate::error::Error::Io(source)),
         }
     }
-    if !state_directory_exists()? {
+    if !state_directory_exists_at(state_dir)? {
         return Err(crate::error::Error::Config(format!(
-            "{STATE_DIR} disappeared while preparing the state directory"
+            "{} disappeared while preparing the state directory",
+            state_dir.display()
         )));
     }
     Ok(())
 }
 
+fn ensure_state_directory() -> crate::error::Result<()> {
+    ensure_state_directory_at(Path::new(STATE_DIR))
+}
+
 /// Call only with a direct child of `.state`, after validating the environment
 /// name. No intermediate path component beneath `.state` is permitted.
-fn state_file_exists(path: &Path) -> crate::error::Result<bool> {
-    if !state_directory_exists()? {
+fn state_file_exists_at(state_dir: &Path, path: &Path) -> crate::error::Result<bool> {
+    if !state_directory_exists_at(state_dir)? {
         return Ok(false);
     }
     match std::fs::symlink_metadata(path) {
@@ -266,6 +276,10 @@ fn state_file_exists(path: &Path) -> crate::error::Result<bool> {
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(crate::error::Error::Io(source)),
     }
+}
+
+fn state_file_exists(path: &Path) -> crate::error::Result<bool> {
+    state_file_exists_at(Path::new(STATE_DIR), path)
 }
 
 fn default_shard_count() -> u32 {
@@ -332,9 +346,16 @@ impl StateFile {
     }
 
     pub fn load(environment: &str) -> crate::error::Result<Self> {
+        Self::load_in_dir(Path::new("."), environment)
+    }
+
+    /// Load a state file from `<base_dir>/.state/<environment>.json` without
+    /// mutating process-wide CWD.
+    pub fn load_in_dir(base_dir: &Path, environment: &str) -> crate::error::Result<Self> {
         validate_env_name_is_safe_path_component(environment)?;
-        let path = Self::path_for(environment);
-        if !state_file_exists(&path)? {
+        let state_dir = base_dir.join(STATE_DIR);
+        let path = state_dir.join(format!("{environment}.json"));
+        if !state_file_exists_at(&state_dir, &path)? {
             return Ok(Self {
                 environment: environment.to_string(),
                 ..Self::default()
@@ -394,11 +415,18 @@ impl StateFile {
     }
 
     pub fn save(&self) -> crate::error::Result<()> {
+        self.save_in_dir(Path::new("."))
+    }
+
+    /// Save this state file under `<base_dir>/.state/<environment>.json` without
+    /// mutating process-wide CWD.
+    pub fn save_in_dir(&self, base_dir: &Path) -> crate::error::Result<()> {
         validate_env_name_is_safe_path_component(&self.environment)?;
         self.validate_resource_keys()?;
-        ensure_state_directory()?;
-        let path = Self::path_for(&self.environment);
-        state_file_exists(&path)?;
+        let state_dir = base_dir.join(STATE_DIR);
+        ensure_state_directory_at(&state_dir)?;
+        let path = state_dir.join(format!("{}.json", self.environment));
+        state_file_exists_at(&state_dir, &path)?;
         let tmp_path = path.with_extension(format!(
             "json.tmp.{}.{}",
             std::process::id(),
@@ -423,15 +451,15 @@ impl StateFile {
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
             drop(file);
-            state_file_exists(&path)?;
+            state_file_exists_at(&state_dir, &path)?;
             std::fs::rename(&tmp_path, &path)?;
-            if let Ok(dir) = std::fs::File::open(STATE_DIR) {
+            if let Ok(dir) = std::fs::File::open(&state_dir) {
                 let _ = dir.sync_all();
             }
             Ok(())
         })();
 
-        if write_result.is_err() && matches!(state_directory_exists(), Ok(true)) {
+        if write_result.is_err() && matches!(state_directory_exists_at(&state_dir), Ok(true)) {
             let _ = std::fs::remove_file(&tmp_path);
         }
 
