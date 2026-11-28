@@ -120,6 +120,11 @@ pub struct ApplyResult {
     /// namespace's desired state is now live and state.resources for that
     /// namespace can be rebuilt from desired without per-op tracking.
     pub fully_replaced_namespaces: Vec<String>,
+    /// Committed `updated_at` receipts returned by `POST /consumers` or
+    /// `PUT /consumers/{id}` during incremental apply, keyed by `(namespace, id)`,
+    /// so post-write `basicauth` binding refreshes only certify rows attributable
+    /// to this run's acknowledged write.
+    pub written_consumer_updated_at: BTreeMap<(String, String), String>,
 }
 
 impl ApplyResult {
@@ -841,6 +846,9 @@ async fn apply_prepared(
         aggregate
             .fully_replaced_namespaces
             .extend(namespace_result.fully_replaced_namespaces);
+        aggregate
+            .written_consumer_updated_at
+            .extend(namespace_result.written_consumer_updated_at);
         aggregate.errors.extend(
             namespace_result
                 .errors
@@ -1827,8 +1835,18 @@ async fn apply_incremental(
     // The batch path replaces the per-resource loop, not the adoption step
     // below it: a namespace whose *diff* is pure adds can still hold declared
     // rows that already match live and have never been claimed.
+    let batch_has_plaintext_basicauth = diffs.iter().any(|d| {
+        d.kind == "Consumer"
+            && index
+                .consumers
+                .get(&(namespace, d.id.as_str()))
+                .is_some_and(|c| crate::diff::consumer_has_plaintext_basicauth(c))
+    });
     let mut batched_result = None;
-    if !diffs.is_empty() && diffs.iter().all(|d| matches!(d.action, DiffAction::Add)) {
+    if !diffs.is_empty()
+        && !batch_has_plaintext_basicauth
+        && diffs.iter().all(|d| matches!(d.action, DiffAction::Add))
+    {
         match try_batch_create(&diffs, &index, client, namespace, options).await? {
             Some(batched) => batched_result = Some(batched),
             // 501: standalone-MongoDB gateway with no multi-document
@@ -2131,6 +2149,16 @@ async fn apply_incremental(
                         if op == OpOutcome::AlreadyGone {
                             result.deletes_missing += 1;
                         }
+                    }
+                }
+                if diff.kind == "Consumer"
+                    && matches!(diff.action, DiffAction::Add | DiffAction::Modify)
+                {
+                    if let OpOutcome::Applied(Some(updated_at)) = &op {
+                        result.written_consumer_updated_at.insert(
+                            (diff.namespace.clone(), diff.id.clone()),
+                            updated_at.clone(),
+                        );
                     }
                 }
                 // Track per-op success so cmd_apply updates state.resources
@@ -3311,7 +3339,7 @@ async fn adopt_matching_rows(
             .update_if_match(client, namespace, &etag, expected.as_ref())
             .await
         {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(crate::error::Error::StalePlan(_)) => {
                 skip_adoption(result, namespace, &changed);
                 if kind == "Consumer" {
@@ -3407,9 +3435,9 @@ fn fail_adoption(
 }
 
 /// What a single successful admin call actually did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OpOutcome {
-    Applied,
+    Applied(Option<String>),
     /// Plugin writes already established the desired proxy associations.
     Unchanged,
     /// A DELETE the gateway answered 404 — tolerated, but counted.
@@ -3419,15 +3447,15 @@ enum OpOutcome {
 impl From<DeleteOutcome> for OpOutcome {
     fn from(outcome: DeleteOutcome) -> Self {
         match outcome {
-            DeleteOutcome::Deleted => OpOutcome::Applied,
+            DeleteOutcome::Deleted => OpOutcome::Applied(None),
             DeleteOutcome::NotFound => OpOutcome::AlreadyGone,
         }
     }
 }
 
-/// `map` adaptor for the create/update calls, which return `()` on success.
-fn applied(_: ()) -> OpOutcome {
-    OpOutcome::Applied
+/// `map` adaptor for create/update calls returning an optional `updated_at` receipt.
+fn applied(updated_at: Option<String>) -> OpOutcome {
+    OpOutcome::Applied(updated_at)
 }
 
 /// `(namespace, id)`-keyed view over one gateway document, per kind.
@@ -3552,12 +3580,29 @@ impl<'a> CreateResource<'a> {
         }
     }
 
-    async fn create(self, client: &AdminClient, namespace: &str) -> crate::error::Result<()> {
+    async fn create(
+        self,
+        client: &AdminClient,
+        namespace: &str,
+    ) -> crate::error::Result<Option<String>> {
         match self {
-            Self::Proxy(resource) => client.create_proxy(resource, namespace).await,
-            Self::Consumer(resource) => client.create_consumer(resource, namespace).await,
-            Self::Upstream(resource) => client.create_upstream(resource, namespace).await,
-            Self::PluginConfig(resource) => client.create_plugin_config(resource, namespace).await,
+            Self::Proxy(resource) => {
+                client.create_proxy(resource, namespace).await?;
+                Ok(None)
+            }
+            Self::Consumer(resource) => {
+                client
+                    .create_consumer_with_updated_at(resource, namespace)
+                    .await
+            }
+            Self::Upstream(resource) => {
+                client.create_upstream(resource, namespace).await?;
+                Ok(None)
+            }
+            Self::PluginConfig(resource) => {
+                client.create_plugin_config(resource, namespace).await?;
+                Ok(None)
+            }
         }
     }
 
@@ -3576,7 +3621,7 @@ impl<'a> CreateResource<'a> {
         namespace: &str,
         etag: &str,
         expected_proxy_ids: Option<&BTreeSet<String>>,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<Option<String>> {
         let (kind, id) = (self.kind(), self.id());
         if kind == "PluginConfig" && expected_proxy_ids.is_none() {
             return Err(crate::error::Error::Config(format!(
@@ -3587,31 +3632,42 @@ impl<'a> CreateResource<'a> {
         let outcome = match self {
             Self::Proxy(row) => {
                 client
-                    .update_if_match(kind, id, row, namespace, etag, None)
+                    .update_if_match_with_updated_at(kind, id, row, namespace, etag, None)
                     .await
             }
             Self::Consumer(row) => {
                 client
-                    .update_if_match(kind, id, row, namespace, etag, None)
+                    .update_if_match_with_updated_at(kind, id, row, namespace, etag, None)
                     .await
             }
             Self::Upstream(row) => {
                 client
-                    .update_if_match(kind, id, row, namespace, etag, None)
+                    .update_if_match_with_updated_at(kind, id, row, namespace, etag, None)
                     .await
             }
             Self::PluginConfig(row) => {
                 client
-                    .update_if_match(kind, id, row, namespace, etag, expected_proxy_ids)
+                    .update_if_match_with_updated_at(
+                        kind,
+                        id,
+                        row,
+                        namespace,
+                        etag,
+                        expected_proxy_ids,
+                    )
                     .await
             }
         };
         let refusal = match outcome? {
-            ConditionalUpdate::Applied => return Ok(()),
-            ConditionalUpdate::Refused(refusal) => refusal,
+            (ConditionalUpdate::Applied, updated_at) => {
+                return Ok(matches!(self, Self::Consumer(_))
+                    .then_some(updated_at)
+                    .flatten());
+            }
+            (ConditionalUpdate::Refused(refusal), _) => refusal,
         };
         if refusal.after_retry && self.wrote_itself(client, namespace).await {
-            return Ok(());
+            return Ok(None);
         }
         Err(crate::error::Error::StalePlan(refusal.message))
     }
@@ -3836,9 +3892,9 @@ async fn create_with_reconciliation(
     client: &AdminClient,
     namespace: &str,
     resource: CreateResource<'_>,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<Option<String>> {
     match resource.create(client, namespace).await {
-        Ok(()) => Ok(()),
+        Ok(updated_at) => Ok(updated_at),
         Err(error) if create_outcome_is_ambiguous(&error) => {
             let original = error.to_string();
             // The tagged read comes first, so the ownership assertion below is
@@ -3905,7 +3961,7 @@ async fn create_with_reconciliation(
                     };
                     let expected = (resource.kind() == "PluginConfig")
                         .then(|| live.referencing_proxy_ids(namespace, resource.id()));
-                    verified
+                    let updated_at = verified
                         .update_if_match(client, namespace, &etag, expected.as_ref())
                         .await
                         .map_err(|assertion| {
@@ -3921,7 +3977,7 @@ async fn create_with_reconciliation(
                         safe(resource.kind()),
                         safe(resource.id()),
                     );
-                    Ok(())
+                    Ok(updated_at)
                 }
                 // Proven not to have committed. Ordinary failure: report it,
                 // keep reconciling everything else, retry next run.
@@ -4763,14 +4819,21 @@ async fn create_individually(
 
 fn record_create(
     result: &mut ApplyResult,
-    outcome: crate::error::Result<()>,
+    outcome: crate::error::Result<Option<String>>,
     kind: &str,
     id: &str,
     namespace: &str,
 ) {
     match outcome {
-        Ok(()) => {
+        Ok(updated_at) => {
             result.created += 1;
+            if kind == "Consumer" {
+                if let Some(ts) = updated_at {
+                    result
+                        .written_consumer_updated_at
+                        .insert((namespace.to_string(), id.to_string()), ts);
+                }
+            }
             result.applied_incremental.push(AppliedOp {
                 kind: kind.to_string(),
                 namespace: namespace.to_string(),

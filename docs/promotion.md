@@ -137,8 +137,7 @@ exits 1 before the bundle is read or any request is sent:
   `<namespace>/<consumer-id>/<credential-type>/<field>`, with a built-in
   credential type. Plugin-config (`@plugin/<plugin_name>`), service-discovery
   (`@service-discovery`) and backend TLS key (`@proxy`, `@upstream`) slots,
-  identity fields (`basicauth` `username`,
-  `mtls_auth` `identity`) and unknown types are refused at load.
+  the `mtls_auth` `identity` field and unknown types are refused at load.
 - The check's method is `GET` or `HEAD`, so a probe credential is never spent
   on a side effect. Also refused at load.
 - **The operator lists the Consumer** in the `FERRUM_VERIFY_PROBE_CONSUMERS`

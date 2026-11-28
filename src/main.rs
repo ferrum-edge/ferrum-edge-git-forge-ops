@@ -1354,10 +1354,11 @@ fn cmd_validate(
     }
     let secret_report = resolve_credentials(&mut gateway_config, &env_config, None)?;
 
-    let mut result = validate::run_validation_with_report(
+    let mut result = validate::run_validation_for_mode(
         &gateway_config,
         &env_config.edge_binary_path,
         &secret_report,
+        &env_config.gateway_mode,
     )?;
 
     // Mesh config is a second, independently-loaded document with its own
@@ -1889,6 +1890,13 @@ async fn cmd_diff(
     if cached_namespaces.is_empty() {
         for pair in &mut namespace_pairs {
             diff::mask_indeterminate_secret_values(&desired, &mut pair.actual, &secret_report);
+            if !read_export {
+                diff::align_verified_basicauth_bindings(
+                    &desired,
+                    &mut pair.actual,
+                    &state.basicauth_bindings,
+                );
+            }
         }
         if let Some(note) = secret_report.unresolved_comparison_note() {
             eoutln!("Note: {}", safe_block(note));
@@ -2252,10 +2260,11 @@ async fn cmd_plan(
     reportln!(json_mode);
 
     reportln!(json_mode, "=== Validation ===");
-    let val_result = validate::run_validation_with_report(
+    let val_result = validate::run_validation_for_mode(
         &desired,
         &env_config.edge_binary_path,
         &secret_report,
+        &env_config.gateway_mode,
     );
     let mut validation_ok = report_plan_validation("gateway", &val_result, json_mode);
     if let Some(mesh) = &desired_mesh {
@@ -2362,6 +2371,11 @@ async fn cmd_plan(
                             &desired,
                             &mut pair.actual,
                             &secret_report,
+                        );
+                        diff::align_verified_basicauth_bindings(
+                            &desired,
+                            &mut pair.actual,
+                            &state.basicauth_bindings,
                         );
                     }
                     let (mut d, b, u, s) = compute_namespace_diffs(
@@ -2598,8 +2612,8 @@ async fn cmd_plan(
                 json_mode,
                 "\n{} error-severity finding(s) block apply. Consumer credentials belong in the \
                  broker as ${{gh-env-secret:...}} placeholders; a literal value in repository YAML \
-                 is a committed secret. Identity halves (basicauth username, mtls_auth identity) \
-                 are not secrets and are not reported here.",
+                 is a committed secret. Identities (an mtls_auth identity) are not secrets and \
+                 are not reported here.",
                 gate.count
             );
         }
@@ -3023,7 +3037,7 @@ async fn cmd_apply(
 
     let val_result = match env_config.gateway_mode {
         GatewayMode::File => validate::run_validation(&desired, &env_config.edge_binary_path),
-        GatewayMode::Api => validate::run_validation_with_report(
+        GatewayMode::Api => validate::run_validation_for_admin_api(
             &desired,
             &env_config.edge_binary_path,
             &secret_report,
@@ -3096,6 +3110,8 @@ async fn cmd_apply(
     // changing anything.
     let mut adopted_ops: Vec<apply::AppliedOp> = Vec::new();
     let mut fully_replaced: Vec<String> = Vec::new();
+    let mut verified_basicauth_bindings: BTreeMap<(String, String), Option<Vec<String>>> =
+        BTreeMap::new();
 
     // Set by the file-mode arm below: mesh is file-only, and an api-mode
     // apply neither publishes nor retracts the document.
@@ -3120,10 +3136,17 @@ async fn cmd_apply(
 
             if !auto_approve {
                 let managed = previously_managed(&resolved, &state);
-                let namespace_pairs =
+                let mut namespace_pairs =
                     load_namespace_pairs_for(&client, &desired, &namespaces).await?;
                 if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                     return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
+                }
+                for pair in &mut namespace_pairs {
+                    diff::align_verified_basicauth_bindings(
+                        &desired,
+                        &mut pair.actual,
+                        &state.basicauth_bindings,
+                    );
                 }
                 let (mut diffs, _, unmanaged, spec_owned) = compute_namespace_diffs(
                     &namespace_pairs,
@@ -3311,14 +3334,23 @@ async fn cmd_apply(
                     } else {
                         client.get_backup_snapshot_for_mutation(namespace).await?
                     };
+                let mut diff_actual = snapshot.config.clone();
+                diff::align_verified_basicauth_bindings(
+                    &desired,
+                    &mut diff_actual,
+                    &state.basicauth_bindings,
+                );
                 if matches!(resolved.apply_strategy, config::ApplyStrategy::Incremental) {
                     let targets = apply::api_target::consumer_evidence_targets(
                         &desired,
-                        &snapshot.config,
+                        &diff_actual,
                         namespace,
                         scope,
                         &evidence_options,
                     )?;
+                    // Capture evidence against the unmodified archival snapshot so
+                    // sibling edits on a Consumer with a verified Basic password
+                    // never trip StalePlan.
                     client
                         .capture_consumer_evidence(&mut snapshot, namespace, &targets)
                         .await?;
@@ -3326,7 +3358,7 @@ async fn cmd_apply(
                 namespace_pairs.push(NamespaceSnapshot {
                     namespace: namespace.clone(),
                     desired: config::filter_config_by_namespace(&desired, namespace),
-                    actual: snapshot.config,
+                    actual: diff_actual,
                     extras: snapshot.extras,
                     cached: snapshot.cached,
                 });
@@ -3649,6 +3681,90 @@ async fn cmd_apply(
             successful_ops = std::mem::take(&mut raw.applied_incremental);
             adopted_ops = std::mem::take(&mut raw.adopted);
             fully_replaced = std::mem::take(&mut raw.fully_replaced_namespaces);
+            let written_consumer_updated_at = std::mem::take(&mut raw.written_consumer_updated_at);
+
+            // Certify fresh cryptographic basicauth bindings ONLY for incremental
+            // Consumer creates/updates whose post-write verification row matches
+            // the exact `updated_at` returned by our acknowledged write and every
+            // non-basicauth field of `desired`. If verification fails, shows an
+            // intervening revision, or lacks a write receipt (e.g. full_replace
+            // `/restore`, which returns counts only), clear stale bindings
+            // fail-closed so the next admin comparison surfaces drift.
+            for op in &successful_ops {
+                if op.kind != "Consumer"
+                    || !matches!(op.action, diff::DiffAction::Add | diff::DiffAction::Modify)
+                {
+                    continue;
+                }
+                let key = (op.namespace.clone(), op.id.clone());
+                let Some(desired_consumer) = desired
+                    .consumers
+                    .iter()
+                    .find(|c| c.namespace == op.namespace && c.id == op.id)
+                else {
+                    verified_basicauth_bindings.insert(key, None);
+                    continue;
+                };
+                if !diff::consumer_has_plaintext_basicauth(desired_consumer) {
+                    verified_basicauth_bindings.insert(key, None);
+                    continue;
+                }
+                let Some(expected_updated_at) = written_consumer_updated_at.get(&key) else {
+                    verified_basicauth_bindings.insert(key, None);
+                    continue;
+                };
+                match client
+                    .get_consumer_verification(&op.id, &op.namespace)
+                    .await
+                {
+                    Ok(Some(evidence)) => {
+                        let updated_at_matches = evidence
+                            .row
+                            .get("updated_at")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(expected_updated_at.as_str());
+                        let live_consumer = if updated_at_matches {
+                            serde_json::from_value::<config::schema::Consumer>(evidence.row).ok()
+                        } else {
+                            None
+                        };
+                        match live_consumer {
+                            Some(live)
+                                if diff::consumer_matches_desired_except_basicauth(
+                                    desired_consumer,
+                                    &live,
+                                ) =>
+                            {
+                                let bindings = diff::compute_consumer_basicauth_bindings(
+                                    desired_consumer,
+                                    &live,
+                                );
+                                verified_basicauth_bindings.insert(key, bindings);
+                            }
+                            _ => {
+                                eoutln!(
+                                    "Warning: consumer '{}/{}' changed before post-write basicauth verification; clearing stored binding so the next diff/apply treats it as drift.",
+                                    safe(&op.namespace),
+                                    safe(&op.id)
+                                );
+                                verified_basicauth_bindings.insert(key, None);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        verified_basicauth_bindings.insert(key, None);
+                    }
+                    Err(err) => {
+                        eoutln!(
+                            "Warning: could not verify basicauth password binding for '{}/{}': {}. Clearing stored binding so the next diff/apply treats it as drift.",
+                            safe(&op.namespace),
+                            safe(&op.id),
+                            safe_line(err.to_string())
+                        );
+                        verified_basicauth_bindings.insert(key, None);
+                    }
+                }
+            }
 
             // Defer propagation: record state for the successful portion
             // first, then surface the failure summary at the end of cmd_apply.
@@ -3818,6 +3934,9 @@ async fn cmd_apply(
             // covered it and a later removal from the repository pruned nothing.
             for op in &adopted_ops {
                 state.record_op(op, &desired_keys)?;
+            }
+            for ((ns, id), bindings) in verified_basicauth_bindings {
+                state.set_consumer_basicauth_bindings(&ns, &id, bindings);
             }
             state.stamp_last_applied_if_clean(deferred_apply_error.is_none());
         }
@@ -4044,6 +4163,7 @@ async fn cmd_review(
         assembled.mesh.as_ref(),
         &env_config.edge_binary_path,
         &secret_report,
+        &env_config.gateway_mode,
     );
 
     let mut adoptions = Vec::new();
@@ -4093,6 +4213,11 @@ async fn cmd_review(
                                     &desired,
                                     &mut pair.actual,
                                     &secret_report,
+                                );
+                                diff::align_verified_basicauth_bindings(
+                                    &desired,
+                                    &mut pair.actual,
+                                    &state.basicauth_bindings,
                                 );
                             }
                             let (mut d, b, u, s) = compute_namespace_diffs(
@@ -4945,8 +5070,10 @@ async fn cmd_rotate(
     let rotated_value = updated_bundle
         .get(&slot)
         .ok_or("rotated slot missing from committed bundle")?;
+    let basicauth_index = prepared_rotation.basicauth_index();
+    let pre_rotate_token = prepared_rotation.pre_rotate_token().to_string();
     let push_status = prepared_rotation
-        .publish(&gateway_client, rotated_value)
+        .publish_with_updated_at(&gateway_client, rotated_value)
         .await;
 
     // Persist rotation state ONLY on full success. Saving before the gateway
@@ -4956,7 +5083,7 @@ async fn cmd_rotate(
     // the next successful `gitforgeops apply` (which picks up the fresh
     // bundle value naturally) or re-rotate will record accurate metadata.
     match push_status {
-        Ok(()) => {
+        Ok(written_updated_at) => {
             state.credential_shard_count = shard_count;
             state.record_credential(
                 &slot,
@@ -4964,6 +5091,57 @@ async fn cmd_rotate(
                 outcome.delivered.as_ref().map(|d| d.login.as_str()),
                 std::env::var("GITHUB_RUN_ID").ok().as_deref(),
             );
+            if let Some(rot_idx) = basicauth_index {
+                let mut refreshed = false;
+                if let Some(expected_updated_at) = written_updated_at.as_deref() {
+                    match gateway_client.get_consumer_verification(consumer, ns).await {
+                        Ok(Some(evidence)) => {
+                            let updated_at_matches = evidence
+                                .row
+                                .get("updated_at")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(expected_updated_at);
+                            if updated_at_matches && evidence.token.as_str() != pre_rotate_token {
+                                if let Ok(live) =
+                                    serde_json::from_value::<config::schema::Consumer>(evidence.row)
+                                {
+                                    if let Some((total_len, live_hash)) =
+                                        diff::extract_basicauth_password_hash_at(&live, rot_idx)
+                                    {
+                                        let binding = diff::basicauth_password_binding(
+                                            ns,
+                                            consumer,
+                                            rot_idx,
+                                            rotated_value,
+                                            live_hash,
+                                        );
+                                        state.update_consumer_basicauth_binding_at_index(
+                                            ns,
+                                            consumer,
+                                            rot_idx,
+                                            total_len,
+                                            Some(binding),
+                                        );
+                                        refreshed = true;
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eoutln!(
+                                "Warning: rotated basicauth password on gateway, but could not verify post-write hash for '{}/{}': {}. Clearing that slot's binding so the next admin diff/apply treats it as drift.",
+                                safe(ns),
+                                safe(consumer),
+                                safe_line(err.to_string())
+                            );
+                        }
+                        Ok(None) => {}
+                    }
+                }
+                if !refreshed {
+                    state.clear_consumer_basicauth_binding_at_index(ns, consumer, rot_idx);
+                }
+            }
             state.save()?;
             outln!("Rotated slot {} in shard {}", safe(&slot), outcome.shard);
             outln!(

@@ -68,6 +68,9 @@ pub fn load_and_assemble(
     // instead of waiting for post-merge API apply to discover it.
     crate::apply::validate_no_desired_spec_tags(&gateway_config)?;
     crate::secrets::resolver::validate_identity_placeholders(&gateway_config)?;
+    // Edge refuses a credential entry field it does not admit (a basicauth
+    // `username`, a jwt `key`, ...); refuse it here with the reason.
+    config::schema::validate_credential_entry_shapes(&gateway_config)?;
     Ok(AssembledOutput {
         gateway: gateway_config,
         mesh: assembled.mesh,

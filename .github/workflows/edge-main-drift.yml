@@ -9,17 +9,20 @@ name: Edge Main Drift
 #
 # * resource-label compatibility of the Edge `main` validator;
 # * Edge `main`'s openapi.yaml against the mirrored resource fields
-#   (tests/fixtures/edge-openapi/resource-fields.json) and every nested key the
-#   companion fixtures emit (tests/unit/edge_main_openapi_tests.rs);
+#   (tests/fixtures/edge-openapi/resource-fields.json), every nested key the
+#   companion fixtures emit, and GitForgeOps' copies of the backup, restore and
+#   export envelopes (tests/unit/edge_main_openapi_tests.rs);
 # * `gitforgeops validate` for every environment;
-# * the lifecycle suite (tests/lifecycle/run.sh: apply, diff and traffic),
-#   which starts the Edge `main` gateway on a fresh throwaway SQLite database
-#   each run.
+# * the lifecycle suite (tests/lifecycle/run.sh: apply, diff and traffic, and
+#   `edge-contract-copies`, which runs each copy of an Edge rule against the
+#   gateway), which starts the Edge `main` gateway on a fresh throwaway SQLite
+#   database each run.
 #
 # It is never a required check and qualifies nothing. A scheduled or
 # dispatched run on the default branch opens, updates or closes one issue
-# labelled `edge-main-drift`; pull requests that change this workflow or its
-# comparison test run the checks without touching the issue, and their
+# labelled `edge-main-drift`; pull requests that change this workflow, its
+# comparison test or the lifecycle suite run the checks without touching the
+# issue, and their
 # verdict is in the step summary and the job result.
 on:
   schedule:
@@ -29,6 +32,7 @@ on:
     paths:
       - '.github/workflows/edge-main-drift.yml'
       - 'tests/unit/edge_main_openapi_tests.rs'
+      - 'tests/lifecycle/**'
 
 permissions:
   contents: read
@@ -219,9 +223,10 @@ jobs:
           exit "$status"
 
       # Edge main's openapi.yaml at the image's commit against the mirrored
-      # top-level field lists and every nested key the companion fixtures
-      # emit. The marker proves the comparison ran rather than a test filter
-      # matching nothing.
+      # top-level field lists, every nested key the companion fixtures emit,
+      # and the backup, restore and export envelope copies. Both tests print
+      # the marker, which proves each comparison ran rather than a test filter
+      # matching fewer of them.
       - name: Compare Edge main's openapi.yaml with what GitForgeOps emits
         id: openapi
         continue-on-error: true
@@ -234,7 +239,7 @@ jobs:
             "https://raw.githubusercontent.com/ferrum-edge/ferrum-edge/$EDGE_COMMIT/openapi.yaml"
           EDGE_MAIN_OPENAPI="$spec" cargo test --locked --test unit_tests \
             edge_main_openapi_tests:: -- --nocapture | tee "$RUNNER_TEMP/edge-main-openapi.log"
-          grep -q 'edge-main-openapi: compared' "$RUNNER_TEMP/edge-main-openapi.log"
+          [ "$(grep -c 'edge-main-openapi: compared' "$RUNNER_TEMP/edge-main-openapi.log")" -eq 2 ]
 
       # The lifecycle suite's apply, diff (drift) and traffic scenarios
       # against a loopback gateway started from the Edge main binary. The
@@ -318,9 +323,9 @@ jobs:
             echo "| Check | Result |"
             echo "|---|---|"
             echo "| Resource labels on all four gateway resource kinds (\`check-validator-resource-labels.sh\`) | $(verdict "$LABELS") |"
-            echo "| Edge \`main\` openapi.yaml declares the mirrored fields and every nested key GitForgeOps emits (\`edge_main_openapi_tests.rs\`) | $(verdict "$OPENAPI") |"
+            echo "| Edge \`main\` openapi.yaml declares the mirrored fields, every nested key GitForgeOps emits, and the backup, restore and export envelopes GitForgeOps copies (\`edge_main_openapi_tests.rs\`) | $(verdict "$OPENAPI") |"
             echo "| \`gitforgeops validate\` for every environment | $(verdict "$VALIDATE") |"
-            echo "| Lifecycle suite (\`tests/lifecycle/run.sh\`: apply, diff and traffic against a real gateway) | $(verdict "$LIFECYCLE") |"
+            echo "| Lifecycle suite (\`tests/lifecycle/run.sh\`: apply, diff, traffic and the Edge contract copies against a real gateway) | $(verdict "$LIFECYCLE") |"
             echo
             echo "The run log has each failure. A clean scheduled run closes this issue."
           } > "$report"

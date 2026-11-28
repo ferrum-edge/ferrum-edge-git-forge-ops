@@ -38,7 +38,11 @@ class EdgeMainDriftTests(unittest.TestCase):
         self.assertIn("workflow_dispatch", triggers)
         self.assertEqual(
             triggers["pull_request"]["paths"],
-            [".github/workflows/edge-main-drift.yml", "tests/unit/edge_main_openapi_tests.rs"],
+            [
+                ".github/workflows/edge-main-drift.yml",
+                "tests/unit/edge_main_openapi_tests.rs",
+                "tests/lifecycle/**",
+            ],
         )
         self.assertEqual(list(self.jobs), ["edge-main-drift", "edge-main-drift-issue"])
         self.assertNotIn("if", self.jobs["edge-main-drift"])
@@ -167,7 +171,8 @@ class EdgeMainDriftTests(unittest.TestCase):
         self.assertIn("ferrum-edge/ferrum-edge/$EDGE_COMMIT/openapi.yaml", run)
         self.assertIn('EDGE_MAIN_OPENAPI="$spec" cargo test --locked --test unit_tests', run)
         # A filter that matched nothing would pass silently; the marker refuses it.
-        self.assertIn("grep -q 'edge-main-openapi: compared'", run)
+        self.assertIn("grep -c 'edge-main-openapi: compared'", run)
+        self.assertIn('-eq 2 ]', run)
         report = steps["Write the report"]
         self.assertEqual(report["env"]["OPENAPI"], "${{ steps.openapi.outcome }}")
         self.assertIn('"$OPENAPI"', report["run"])

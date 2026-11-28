@@ -287,6 +287,7 @@ fn provenance_scrubs_legacy_brokered_identities_without_hiding_literal_identitie
         None,
         validator.to_str().unwrap(),
         &report,
+        &gitforgeops::config::GatewayMode::File,
     );
     for output in [&result.stdout, &result.stderr, &review.output] {
         assert!(!output.contains("synthetic-legacy-"), "{output}");
@@ -2003,6 +2004,7 @@ fn review_validates_gateway_and_mesh_before_reporting_passed() {
             include_mesh.then_some(&mesh),
             binary.to_str().unwrap(),
             &ResolveReport::default(),
+            &gitforgeops::config::GatewayMode::Api,
         );
         assert_eq!(result.status, expected, "{}", result.output);
         assert!(result.output.contains("mode-file"));
@@ -2043,6 +2045,7 @@ fn review_validates_gateway_and_mesh_before_reporting_passed() {
         Some(&mesh),
         dir.path().join("missing-validator").to_str().unwrap(),
         &ResolveReport::default(),
+        &gitforgeops::config::GatewayMode::Api,
     );
     assert_eq!(result.status, ReviewValidationStatus::ExecutionError);
     assert!(result.execution_error.is_some());
@@ -2486,4 +2489,230 @@ exit 1
         !output.contains("MIG") && !output.contains("MII"),
         "a DER prefix reached the report"
     );
+}
+
+/// An api-mode `basicauth` password reaches the admin API in plaintext, which
+/// hashes it on write, but the pre-apply validator runs in file mode and
+/// refuses a plaintext `password`. Its copy therefore carries a
+/// `password_hash` stand-in, resolved or not, and the resolved password never
+/// reaches the validator's temp spec or its output. File mode keeps the
+/// password, which a file-mode gateway really does refuse.
+#[cfg(unix)]
+#[test]
+fn admin_api_validation_hashes_a_basicauth_password_without_writing_it() {
+    use super::resolver_fixtures::resolve_secrets;
+    use gitforgeops::validate::{run_validation_for_admin_api, run_validation_with_report};
+    use std::collections::BTreeMap;
+
+    const PASSWORD: &str = "resolved-basicauth-password-value-0123456789";
+    // Edge's file-mode rule, applied to what the validator was handed.
+    let file_mode_check = r#"
+if grep -Eq '^[ -]*password:' "$7"; then
+  echo 'error: file-mode Basic-auth credentials must use password_hash' >&2
+  exit 1
+fi
+hash=$(sed -n 's/.*[ -]password_hash: *//p' "$7" | tr -d '"' | tr -d "'")
+case "$hash" in
+  hmac_sha256:????????????????????????????????????????????????????????????????) exit 0 ;;
+  *) echo "error: basicauth password_hash must be hmac_sha256:<64 hex>" >&2; exit 1 ;;
+esac
+"#;
+    for seed in [Some(PASSWORD), None] {
+        let mut config = consumer_config(serde_json::json!({
+            "basicauth": [{"password": "${gh-env-secret:alloc=require}"}],
+        }));
+        let bundle: BTreeMap<String, String> = seed
+            .map(|value| {
+                (
+                    "ferrum/app/basicauth/password".to_string(),
+                    value.to_string(),
+                )
+            })
+            .into_iter()
+            .collect();
+        let report = resolve_secrets(&mut config, &bundle).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let validator = capturing_validator(dir.path(), file_mode_check);
+        let result =
+            run_validation_for_admin_api(&config, validator.to_str().unwrap(), &report).unwrap();
+        // Messages never format the password or the validator's output.
+        let resolved = seed.is_some();
+        assert!(
+            result.success,
+            "resolved={resolved}: the admin-API validator copy was refused"
+        );
+        let raw = std::fs::read_to_string(dir.path().join("input.yaml")).unwrap();
+        assert!(
+            !raw.contains(PASSWORD),
+            "the temp spec carried the password"
+        );
+        assert!(!result.stdout.contains(PASSWORD) && !result.stderr.contains(PASSWORD));
+        let captured = captured_validator_input(dir.path());
+        let entry = captured.consumers[0].credentials["basicauth"][0]
+            .as_object()
+            .unwrap()
+            .clone();
+        // Edge requires exactly one of `password` / `password_hash`.
+        assert_eq!(
+            entry.len(),
+            1,
+            "the validator's basicauth entry has extra fields"
+        );
+        assert!(entry["password_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("hmac_sha256:"));
+        // The caller's document is untouched: apply still sends the password.
+        assert!(config.consumers[0].credentials["basicauth"][0]
+            .get("password")
+            .is_some());
+
+        // File mode validates what a file-mode gateway would load.
+        let dir = tempfile::tempdir().unwrap();
+        let validator = capturing_validator(dir.path(), file_mode_check);
+        let file =
+            run_validation_with_report(&config, validator.to_str().unwrap(), &report).unwrap();
+        assert!(
+            !file.success,
+            "resolved={resolved}: file mode must keep refusing a password"
+        );
+        let captured = captured_validator_input(dir.path());
+        assert!(captured.consumers[0].credentials["basicauth"][0]
+            .get("password")
+            .is_some());
+    }
+}
+
+/// Resolved API-mode `basicauth` passwords that violate Edge's admission rules
+/// (over 4,096 characters or containing ASCII control characters) fail
+/// preflight validation without printing or writing the secret value.
+#[cfg(unix)]
+#[test]
+fn admin_api_validation_rejects_invalid_resolved_basicauth_passwords_without_leaking() {
+    use super::resolver_fixtures::resolve_secrets;
+    use gitforgeops::validate::run_validation_for_admin_api;
+    use std::collections::BTreeMap;
+
+    let too_long = format!("synthetic-too-long-{}", "a".repeat(4096));
+    let with_ctrl = "synthetic-ctrl-\x07-password-0123456789".to_string();
+
+    for (password, expected_reason) in [
+        (too_long, "must not exceed 4096 characters"),
+        (with_ctrl, "must not contain control characters"),
+    ] {
+        let mut config = consumer_config(serde_json::json!({
+            "basicauth": [{"password": "${gh-env-secret:alloc=require}"}],
+        }));
+        let bundle = BTreeMap::from([(
+            "ferrum/app/basicauth/password".to_string(),
+            password.clone(),
+        )]);
+        let report = resolve_secrets(&mut config, &bundle).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let validator = capturing_validator(dir.path(), "exit 0");
+        let result =
+            run_validation_for_admin_api(&config, validator.to_str().unwrap(), &report).unwrap();
+        assert!(
+            !result.success,
+            "invalid resolved basicauth password must fail preflight"
+        );
+        assert!(
+            result.stderr.contains("ferrum/app/basicauth/password"),
+            "diagnostic must name the slot: {}",
+            result.stderr
+        );
+        assert!(
+            result.stderr.contains(expected_reason),
+            "diagnostic must name the violation ({expected_reason}): {}",
+            result.stderr
+        );
+        assert!(
+            !result.stdout.contains(&password) && !result.stderr.contains(&password),
+            "diagnostic must never print the password value"
+        );
+        let raw = std::fs::read_to_string(dir.path().join("input.yaml")).unwrap();
+        assert!(
+            !raw.contains(&password),
+            "temp spec must never contain the resolved password"
+        );
+    }
+}
+
+/// A `basicauth` entry that already names a `password_hash` keeps both fields
+/// for the validator, so a password-and-hash conflict is still refused.
+#[test]
+fn admin_api_basicauth_standins_leave_an_explicit_hash_alone() {
+    use gitforgeops::validate::with_admin_api_basicauth_standins;
+
+    let both = consumer_config(serde_json::json!({
+        "basicauth": [{"password": "p", "password_hash": "hmac_sha256:00"}],
+    }));
+    assert!(with_admin_api_basicauth_standins(&both).is_none());
+    let hash_only = consumer_config(serde_json::json!({
+        "basicauth": [{"password_hash": "hmac_sha256:00"}],
+    }));
+    assert!(with_admin_api_basicauth_standins(&hash_only).is_none());
+    let legacy = consumer_config(serde_json::json!({
+        "basicauth": {"password": "p"},
+    }));
+    let patched = with_admin_api_basicauth_standins(&legacy).expect("a legacy single entry");
+    let entry = &patched.consumers[0].credentials["basicauth"];
+    assert!(entry.get("password").is_none());
+    assert!(entry["password_hash"]
+        .as_str()
+        .unwrap()
+        .starts_with("hmac_sha256:"));
+}
+
+/// A repository declaring a `basic_auth` plugin validates: Edge builds the
+/// plugin to check its config and refuses without
+/// `FERRUM_BASIC_AUTH_HMAC_SECRET`. The validator child gets the public
+/// stand-in, and the parent's own value never reaches it.
+/// Only a document that declares a `basic_auth` plugin gets the key
+/// stand-in; every other gateway child environment is unchanged.
+#[cfg(unix)]
+#[test]
+fn the_basic_auth_key_standin_is_scoped_to_documents_with_a_basic_auth_plugin() {
+    use gitforgeops::validate::{
+        basic_auth_key_standin_env, BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN,
+        VALIDATION_STANDIN_PREFIX,
+    };
+
+    assert_eq!(BASIC_AUTH_HMAC_SECRET_ENV, "FERRUM_BASIC_AUTH_HMAC_SECRET");
+    // Edge refuses a key under 32 bytes.
+    assert!(BASIC_AUTH_HMAC_SECRET_STANDIN.len() >= 32);
+    assert!(BASIC_AUTH_HMAC_SECRET_STANDIN.starts_with(VALIDATION_STANDIN_PREFIX));
+    assert_eq!(
+        basic_auth_key_standin_env(&gitforgeops::config::GatewayConfig::default()),
+        None
+    );
+    let key_auth = plugin_config_for("key", "key_auth", serde_json::json!({}));
+    assert_eq!(basic_auth_key_standin_env(&key_auth), None);
+    let basic = plugin_config_for("basic", "basic_auth", serde_json::json!({}));
+    assert_eq!(
+        basic_auth_key_standin_env(&basic),
+        Some((BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_basic_auth_plugin_validates_with_the_key_standin_only() {
+    use gitforgeops::validate::BASIC_AUTH_HMAC_SECRET_STANDIN;
+
+    let config = plugin_config_for("basic", "basic_auth", serde_json::json!({}));
+    let dir = tempfile::tempdir().unwrap();
+    // Edge's construction rule, applied to the child's environment.
+    let validator = echo_validator(
+        dir.path(),
+        "basic-auth-validator",
+        &format!(
+            "#!/bin/sh\nif [ \"$FERRUM_BASIC_AUTH_HMAC_SECRET\" != \"{BASIC_AUTH_HMAC_SECRET_STANDIN}\" ]; then\n  \
+             echo 'basic_auth: FERRUM_BASIC_AUTH_HMAC_SECRET must be set' >&2\n  exit 1\nfi\nexit 0\n"
+        ),
+    );
+    let result = run_validation(&config, validator.to_str().unwrap()).unwrap();
+    assert!(result.success, "{}{}", result.stdout, result.stderr);
 }

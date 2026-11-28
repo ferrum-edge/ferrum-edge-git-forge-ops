@@ -1406,8 +1406,11 @@ rules come back as `ImportResult::unbrokered_plugin_config`.
   `authorization_header`). `export_redacted_paths` adds every
   matched site, whatever its length or JSON type, for `/config/export`
   substitution.
-- `basicauth[].username` and `mtls_auth[].identity` are never brokered
-  (`resolver::is_identity_credential_leaf`).
+- `mtls_auth[].identity` is never brokered
+  (`resolver::is_identity_credential_leaf`). A `basicauth` entry has no
+  `username` (Edge keys basicauth on the consumer's `username`);
+  `config::schema::validate_credential_entry_shapes` refuses one at load,
+  with every other entry field Edge refuses (`CREDENTIAL_ENTRY_SHAPES`).
 
 #### Policy overrides
 

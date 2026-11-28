@@ -263,10 +263,9 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
             "id": "app", "username": "app",
             "credentials": {
                 "keyauth": [{"key": "${gh-env-secret:alloc=require}"}],
-                "basicauth": [{
-                    "username": "alice",
-                    "password_hash": "${gh-env-secret:alloc=require}"
-                }]
+                "basicauth": [{"password_hash": "${gh-env-secret:alloc=require}"}],
+                // The literal (non-secret) credential field.
+                "mtls_auth": [{"identity": "alice"}]
             }
         }
     })
@@ -305,10 +304,8 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                         "id": "app", "namespace": "ferrum", "username": "app",
                         "credentials": {
                             "keyauth": [{"key": "synthetic-key-value-0001"}],
-                            "basicauth": [{
-                                "username": "alice",
-                                "password_hash": "synthetic-hash-value-0001"
-                            }]
+                            "basicauth": [{"password_hash": "synthetic-hash-value-0001"}],
+                            "mtls_auth": [{"identity": "alice"}]
                         }
                     }],
                     "plugin_configs": [{
@@ -324,7 +321,7 @@ fn unresolved_leaf_cli_matrix_preserves_real_drift_and_read_only_behavior() {
                             serde_json::json!("synthetic-different-key");
                     }
                     "literal" => {
-                        live["consumers"][0]["credentials"]["basicauth"][0]["username"] =
+                        live["consumers"][0]["credentials"]["mtls_auth"][0]["identity"] =
                             serde_json::json!("bob");
                     }
                     "extra" => {
@@ -2020,4 +2017,202 @@ fn diff_tolerates_short_live_settings_only_heuristics_flag() {
     assert_eq!(output.status.code(), Some(0), "{shown}");
     assert!(!shown.contains("shorter than 8 bytes"), "{shown}");
     assert!(!shown.contains(KEY), "{shown}");
+}
+
+#[test]
+fn admin_diff_uses_cryptographic_basicauth_bindings_and_catches_reseed_and_oob_drift() {
+    use gitforgeops::config::schema::Consumer;
+    use gitforgeops::config::GatewayConfig;
+    use gitforgeops::diff::{
+        align_verified_basicauth_bindings, compute_consumer_basicauth_bindings, compute_diff,
+        mask_indeterminate_secret_values, state_key,
+    };
+    use gitforgeops::secrets::report_secrets_lenient;
+    use gitforgeops::state::StateFile;
+    use std::collections::BTreeMap;
+
+    let valid_hash = format!("hmac_sha256:{}", "a".repeat(64));
+    let other_hash = format!("hmac_sha256:{}", "b".repeat(64));
+    let consumer_with = |creds: serde_json::Value| {
+        let mut cfg = GatewayConfig::default();
+        let consumer: Consumer = serde_json::from_value(serde_json::json!({
+            "id": "app",
+            "namespace": "ferrum",
+            "username": "app",
+            "credentials": creds,
+        }))
+        .unwrap();
+        cfg.consumers.push(consumer);
+        cfg
+    };
+
+    let desired = consumer_with(serde_json::json!({
+        "basicauth": [{"password": "resolved-plaintext-password-012345"}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    let live = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": valid_hash}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+
+    // Without a recorded binding, raw diff reports drift (fail-closed).
+    assert_eq!(
+        compute_diff(&desired, &live).unwrap().len(),
+        1,
+        "missing basicauth binding must surface drift"
+    );
+
+    // Record the non-secret cryptographic binding from the applied (desired, live) pair.
+    let key = gitforgeops::diff::resource_diff::state_key("ferrum", "Consumer", "app");
+    let binding = compute_consumer_basicauth_bindings(&desired.consumers[0], &live.consumers[0])
+        .expect("valid plaintext/hash pair produces a binding");
+    assert!(!binding[0].contains("resolved-plaintext-password-012345"));
+    assert!(!binding[0].contains(&valid_hash));
+    let mut bindings = BTreeMap::new();
+    bindings.insert(key, binding);
+
+    // Matching (desired password, live hash, recorded binding) converges cleanly.
+    let mut aligned_live = live.clone();
+    align_verified_basicauth_bindings(&desired, &mut aligned_live, &bindings);
+    assert!(
+        compute_diff(&desired, &aligned_live).unwrap().is_empty(),
+        "verified basicauth binding should converge cleanly"
+    );
+
+    // Reseeding / changing the desired password (e.g. failed rotation push) breaks
+    // the binding and MUST surface drift so incremental apply pushes the new password.
+    let desired_reseeded = consumer_with(serde_json::json!({
+        "basicauth": [{"password": "reseeded-new-password-987654321"}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    let mut live_after_reseed = live.clone();
+    align_verified_basicauth_bindings(&desired_reseeded, &mut live_after_reseed, &bindings);
+    assert_eq!(
+        compute_diff(&desired_reseeded, &live_after_reseed)
+            .unwrap()
+            .len(),
+        1,
+        "reseeded desired password must surface drift even with an old binding"
+    );
+
+    // Out-of-band gateway password change alters the live hash and breaks the binding.
+    let mut live_oob = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": other_hash}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    align_verified_basicauth_bindings(&desired, &mut live_oob, &bindings);
+    assert_eq!(
+        compute_diff(&desired, &live_oob).unwrap().len(),
+        1,
+        "out-of-band live password_hash change must surface drift"
+    );
+
+    // Sibling credential change stays visible even when basicauth binding matches.
+    let mut live_key_changed = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": valid_hash}],
+        "keyauth": [{"key": "synthetic-different-key-9999"}],
+    }));
+    align_verified_basicauth_bindings(&desired, &mut live_key_changed, &bindings);
+    assert_eq!(compute_diff(&desired, &live_key_changed).unwrap().len(), 1);
+
+    // Malformed live hash never aligns and cannot produce a binding.
+    let mut live_bad_hash = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": "hmac_sha256:not-64-hex"}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    assert!(compute_consumer_basicauth_bindings(
+        &desired.consumers[0],
+        &live_bad_hash.consumers[0]
+    )
+    .is_none());
+    align_verified_basicauth_bindings(&desired, &mut live_bad_hash, &bindings);
+    assert_eq!(compute_diff(&desired, &live_bad_hash).unwrap().len(), 1);
+
+    // Entry count change stays visible as drift.
+    let mut live_extra_entry = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": valid_hash}, {"password_hash": other_hash}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    align_verified_basicauth_bindings(&desired, &mut live_extra_entry, &bindings);
+    assert_eq!(compute_diff(&desired, &live_extra_entry).unwrap().len(), 1);
+
+    // Explicit desired password_hash is still compared verbatim.
+    let desired_hash = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": other_hash}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    assert_eq!(compute_diff(&desired_hash, &live).unwrap().len(), 1);
+
+    // Unresolved broker placeholder is masked against a valid live hash when no bundle is loaded.
+    let desired_unresolved = consumer_with(serde_json::json!({
+        "basicauth": [{"password": "${gh-env-secret:alloc=require}"}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    let report = report_secrets_lenient(&desired_unresolved, &BTreeMap::new()).unwrap();
+    let mut masked_live = live.clone();
+    mask_indeterminate_secret_values(&desired_unresolved, &mut masked_live, &report);
+    assert!(
+        compute_diff(&desired_unresolved, &masked_live)
+            .unwrap()
+            .is_empty(),
+        "unresolved brokered basicauth password should be masked against valid live hash"
+    );
+
+    // Single-slot rotation update preserves untouched sibling indices even when
+    // collection lengths differ, and failed verification leaves unrelated sibling
+    // bindings intact (including when the rotated index is beyond the old ledger).
+    let mut state = StateFile::default();
+    let sib0 = gitforgeops::diff::basicauth_password_binding(
+        "ferrum",
+        "app",
+        0,
+        "slot0-password",
+        &valid_hash,
+    );
+    let sib1_new = gitforgeops::diff::basicauth_password_binding(
+        "ferrum",
+        "app",
+        1,
+        "slot1-rotated",
+        &other_hash,
+    );
+    // Old ledger has 1 slot; gateway appended a 2nd entry and we rotate index 1.
+    state.set_consumer_basicauth_bindings("ferrum", "app", Some(vec![sib0.clone()]));
+    // Failed verification at index 1 (beyond old vec) must not discard sib0.
+    state.clear_consumer_basicauth_binding_at_index("ferrum", "app", 1);
+    assert_eq!(
+        state
+            .basicauth_bindings
+            .get(&state_key("ferrum", "Consumer", "app")),
+        Some(&vec![sib0.clone()])
+    );
+    // Verified rotate at index 1 with live total_len=2 preserves sib0 and stores sib1_new.
+    state.update_consumer_basicauth_binding_at_index("ferrum", "app", 1, 2, Some(sib1_new.clone()));
+    assert_eq!(
+        state
+            .basicauth_bindings
+            .get(&state_key("ferrum", "Consumer", "app")),
+        Some(&vec![sib0.clone(), sib1_new.clone()])
+    );
+    // Failed verification at index 1 clears only index 1 and keeps sib0.
+    state.update_consumer_basicauth_binding_at_index("ferrum", "app", 1, 2, None);
+    assert_eq!(
+        state
+            .basicauth_bindings
+            .get(&state_key("ferrum", "Consumer", "app")),
+        Some(&vec![sib0.clone(), String::new()])
+    );
+    // Shrunk live collection (3 -> 2) rotating index 1 still preserves surviving sib0.
+    state.set_consumer_basicauth_bindings(
+        "ferrum",
+        "app",
+        Some(vec![sib0.clone(), String::new(), sib1_new.clone()]),
+    );
+    state.update_consumer_basicauth_binding_at_index("ferrum", "app", 1, 2, Some(sib1_new.clone()));
+    assert_eq!(
+        state
+            .basicauth_bindings
+            .get(&state_key("ferrum", "Consumer", "app")),
+        Some(&vec![sib0, sib1_new])
+    );
 }

@@ -1143,13 +1143,17 @@ pinned ferrum-edge validator digest*. Only the first two fail the run.
 The weekly `edge-main-drift.yml` workflow is an early warning, not a pin: it copies the
 gateway binary out of Edge's signed `main` image (Cosign-verified against
 Edge's Main Latest Image workflow), runs the label probe, compares Edge
-`main`'s `openapi.yaml` with the mirrored resource fields and every nested key
-GitForgeOps emits (`tests/unit/edge_main_openapi_tests.rs`), runs
+`main`'s `openapi.yaml` with the mirrored resource fields, every nested key
+GitForgeOps emits and GitForgeOps' copies of the backup, restore and export
+envelopes (`tests/unit/edge_main_openapi_tests.rs`), runs
 `gitforgeops validate` for every environment and the lifecycle suite (a fresh
-throwaway database each run) with it, and opens or closes one
+throwaway database each run, including `edge-contract-copies`, which runs each
+copied Edge rule against the gateway) with it, and opens or closes one
 issue labelled `edge-main-drift` (also opened when the check cannot run). It never reads or changes the allowlist.
-Dispatch it with `gh workflow run edge-main-drift.yml`; a pull request that changes it (or
-its `openapi.yaml` comparison test) runs it too, fails on drift and files no issue.
+Dispatch it with `gh workflow run edge-main-drift.yml`; a pull request that changes it,
+its `openapi.yaml` comparison test or the lifecycle suite runs it too, fails on drift and
+files no issue. The nightly lifecycle workflow runs the same `openapi.yaml` comparison
+against the pinned release.
 
 ## Upgrading
 

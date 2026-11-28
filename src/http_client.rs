@@ -1320,6 +1320,17 @@ impl AdminClient {
         consumer: &Consumer,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let _ = self
+            .create_consumer_with_updated_at(consumer, namespace)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_consumer_with_updated_at(
+        &self,
+        consumer: &Consumer,
+        namespace: &str,
+    ) -> crate::error::Result<Option<String>> {
         let target = self.authorized("/consumers")?;
         let resp = self
             .send_with_retry(RequestKind::NonIdempotentMutation, |bearer| {
@@ -1331,7 +1342,8 @@ impl AdminClient {
             .await?;
         self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
             .await
-            .map_err(conditional::withhold_error)
+            .map_err(conditional::withhold_error)?;
+        Ok(response_updated_at(&resp.body))
     }
 
     pub async fn create_upstream(
@@ -1464,6 +1476,28 @@ impl AdminClient {
         etag: &str,
         expected_proxy_ids: Option<&BTreeSet<String>>,
     ) -> crate::error::Result<ConditionalUpdate> {
+        let (outcome, _) = self
+            .update_if_match_with_updated_at(
+                kind,
+                id,
+                resource,
+                namespace,
+                etag,
+                expected_proxy_ids,
+            )
+            .await?;
+        Ok(outcome)
+    }
+
+    pub async fn update_if_match_with_updated_at<T: Serialize>(
+        &self,
+        kind: &str,
+        id: &str,
+        resource: &T,
+        namespace: &str,
+        etag: &str,
+        expected_proxy_ids: Option<&BTreeSet<String>>,
+    ) -> crate::error::Result<(ConditionalUpdate, Option<String>)> {
         let mut path = resource_path(kind, id)?;
         if let Some(expected) = expected_proxy_ids {
             path = format!(
@@ -1490,10 +1524,13 @@ impl AdminClient {
                     )));
                 }
             }
-            return Ok(ConditionalUpdate::Refused(PreconditionRefusal {
-                after_retry: resp.retried,
-                message: precondition_failed_message("PUT", &path, resp.retried),
-            }));
+            return Ok((
+                ConditionalUpdate::Refused(PreconditionRefusal {
+                    after_retry: resp.retried,
+                    message: precondition_failed_message("PUT", &path, resp.retried),
+                }),
+                None,
+            ));
         }
         self.check_mutation(&resp, RequestKind::Mutation)
             .await
@@ -1504,7 +1541,7 @@ impl AdminClient {
                     error
                 }
             })?;
-        Ok(ConditionalUpdate::Applied)
+        Ok((ConditionalUpdate::Applied, response_updated_at(&resp.body)))
     }
 
     /// Whether the gateway issues the strong `ETag` every conditional
@@ -1927,6 +1964,15 @@ enum RetryPolicy {
     Health,
 }
 
+fn response_updated_at(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("updated_at")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// A fully-read response. The body is buffered eagerly so the retry classifier
 /// can inspect it before deciding whether to re-send.
 #[derive(Clone)]
@@ -1978,7 +2024,9 @@ pub struct ApiErrorBody {
     /// `config_rejected` | `reload_timeout` | `sequence_unavailable`.
     #[serde(default)]
     pub reason: Option<String>,
-    /// `/restore` only: `completed` | `incomplete` | `not_needed` | `unknown_outcome`.
+    /// `/restore` only: `completed` | `incomplete` | `not_needed` | `unknown_outcome`,
+    /// and on a 503 from Edge 1.0 `not_needed_after_intervening_write` |
+    /// `skipped_after_intervening_write` | `unknown_clear_outcome`.
     #[serde(default)]
     pub rollback: Option<String>,
     /// `/restore` only: `connectivity` | `data_integrity`.
@@ -2052,8 +2100,9 @@ pub enum RetryDecision {
 ///
 /// - `applied: false` ⇒ the write is durably committed but not live. Retrying
 ///   re-applies it (and a create answers 409 on the second attempt).
-/// - `/restore` 500 with `rollback: incomplete | unknown_outcome` ⇒ the
-///   namespace may be half-restored; a retry re-runs a destructive replace.
+/// - `/restore` 500 or 503 with `rollback: incomplete | unknown_outcome |
+///   skipped_after_intervening_write | unknown_clear_outcome` ⇒ the namespace
+///   may be half-restored; a retry re-runs a destructive replace.
 /// - `/restore` 503 with `failure_class: connectivity` ⇒ nothing was written,
 ///   safe to retry.
 pub fn classify_retry(status: u16, body: &ApiErrorBody, kind: RequestKind) -> RetryDecision {
@@ -2093,8 +2142,29 @@ pub fn classify_retry(status: u16, body: &ApiErrorBody, kind: RequestKind) -> Re
     }
 }
 
+/// `rollback` values after which the namespace may be partly cleared or
+/// partly restored. Edge 1.0 adds the two `503` values: another writer took
+/// the namespace lease before the rollback (`skipped_after_intervening_write`),
+/// or the clear's commit outcome is unknown (`unknown_clear_outcome`); Edge
+/// keeps the namespace admission guard held and asks for manual recovery.
 fn rollback_needs_manual_recovery(rollback: Option<&str>) -> bool {
-    matches!(rollback, Some("incomplete") | Some("unknown_outcome"))
+    matches!(
+        rollback,
+        Some("incomplete")
+            | Some("unknown_outcome")
+            | Some("skipped_after_intervening_write")
+            | Some("unknown_clear_outcome")
+    )
+}
+
+/// `rollback` values proving the prior configuration is intact: rolled back
+/// (`completed`) or never deleted (`not_needed`, and Edge 1.0's
+/// `not_needed_after_intervening_write`, a definitive atomic clear abort).
+fn rollback_left_prior_state(rollback: Option<&str>) -> bool {
+    matches!(
+        rollback,
+        Some("completed") | Some("not_needed") | Some("not_needed_after_intervening_write")
+    )
 }
 
 // GitForgeOps' own next step for the three `/restore` failures that have one.
@@ -2340,7 +2410,7 @@ pub fn map_api_error_with_redirect_base(
     // Only `post_restore` sends this kind, and it withholds the gateway's text,
     // so the variant carries the tool's own remedy alone.
     if kind == RequestKind::Restore
-        && status == 500
+        && matches!(status, 500 | 503)
         && rollback_needs_manual_recovery(parsed.rollback.as_deref())
     {
         return crate::error::Error::RestoreNeedsManualRecovery(
@@ -2366,10 +2436,7 @@ pub fn map_api_error_with_redirect_base(
     if kind == RequestKind::Restore
         && (matches!(status, 408 | 429) || (500..=599).contains(&status))
         && !(status == 503 && parsed.failure_class.as_deref() == Some("connectivity"))
-        && !matches!(
-            parsed.rollback.as_deref(),
-            Some("completed") | Some("not_needed")
-        )
+        && !rollback_left_prior_state(parsed.rollback.as_deref())
     {
         return crate::error::Error::AmbiguousMutation(format!(
             "POST /restore returned HTTP {status} without proving a pre-commit rejection or completed rollback. The namespace may already have been replaced; inspect it with `gitforgeops diff` before retrying. Gateway said: {message}"
@@ -2597,6 +2664,43 @@ pub enum SealStrictness {
     Advisory,
 }
 
+/// Top-level fields of a `GET /backup` body this build understands.
+///
+/// Pinned to ferrum-edge's `BackupPayload` (`src/admin/backup.rs`), which is
+/// constructed in exactly one place (`src/admin/mod.rs`, the `GET /backup`
+/// handler) and serializes these eleven fields — `gateway_trust_bundles` and
+/// `api_specs` being `Option`, so they are absent on filtered and
+/// cached-fallback exports. `conditional` (the twelfth gateway field, on
+/// `?conditional=true` only) is lifted out first by
+/// [`conditional::conditional_backup`], whose own list is
+/// [`conditional::CONDITIONAL_BACKUP_FIELDS`].
+///
+/// `resource_counts` is *not* a gateway field: it is gitforgeops' own
+/// file-mode anti-truncation seal (`apply::file_target`), allow-listed so a
+/// round-trip through a locally exported document is not misread as an unknown
+/// section.
+///
+/// Deliberately fail-closed: anything else stops full replace
+/// (`ensure_restore_sections_supported`) rather than being silently dropped
+/// from a `/restore` body that would then delete it. Update this list in step
+/// with the companion, never by widening it to whatever a gateway happens to
+/// send. The Edge Main Drift and lifecycle workflows compare it with Edge's
+/// `BackupResponse` schema (`tests/unit/edge_main_openapi_tests.rs`).
+pub const BACKUP_TOP_LEVEL_FIELDS: &[&str] = &[
+    "version",
+    "proxies",
+    "consumers",
+    "plugin_configs",
+    "upstreams",
+    "api_specs",
+    "gateway_trust_bundles",
+    "ferrum_version",
+    "exported_at",
+    "source",
+    "counts",
+    "resource_counts",
+];
+
 /// The full `BackupResponse` envelope.
 #[derive(Clone, Default)]
 pub struct BackupSnapshot {
@@ -2759,40 +2863,9 @@ impl BackupSnapshot {
         let mut resource_counts = None;
         let mut unsupported_sections = Vec::new();
         if let Some(map) = value.as_object_mut() {
-            // Pinned to ferrum-edge's `BackupPayload` (`src/admin/backup.rs`),
-            // which is constructed in exactly one place
-            // (`src/admin/mod.rs`, the `GET /backup` handler) and serializes
-            // these eleven fields — `gateway_trust_bundles` and `api_specs`
-            // being `Option`, so they are absent on filtered and
-            // cached-fallback exports.
-            //
-            // `resource_counts` is the twelfth and is *not* a gateway section:
-            // it is gitforgeops' own file-mode anti-truncation seal
-            // (`apply::file_target`), allow-listed so a round-trip through a
-            // locally exported document is not misread as an unknown section.
-            //
-            // Deliberately fail-closed: anything else here stops full replace
-            // (`ensure_restore_sections_supported`) rather than being silently
-            // dropped from a `/restore` body that would then delete it. Update
-            // this list in step with the companion, never by widening it to
-            // whatever a gateway happens to send.
-            const KNOWN_TOP_LEVEL: &[&str] = &[
-                "version",
-                "proxies",
-                "consumers",
-                "plugin_configs",
-                "upstreams",
-                "api_specs",
-                "gateway_trust_bundles",
-                "ferrum_version",
-                "exported_at",
-                "source",
-                "counts",
-                "resource_counts",
-            ];
             unsupported_sections = map
                 .keys()
-                .filter(|key| !KNOWN_TOP_LEVEL.contains(&key.as_str()))
+                .filter(|key| !BACKUP_TOP_LEVEL_FIELDS.contains(&key.as_str()))
                 .cloned()
                 .collect();
             unsupported_sections.sort();

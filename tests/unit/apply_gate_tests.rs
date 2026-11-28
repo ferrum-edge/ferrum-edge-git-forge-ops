@@ -435,21 +435,16 @@ fn api_apply_rechecks_policy_after_resolution_without_leaking_the_resolved_value
 #[cfg(unix)]
 #[test]
 fn literal_identity_cli_diagnostics_remain_readable_with_a_loaded_bundle() {
-    for (consumer, identity, bundle) in [
-        (BASICAUTH_IDENTITY_CONSUMER, "alice", BASICAUTH_BUNDLE),
-        (MTLS_IDENTITY_CONSUMER, "client.example", "{}"),
-    ] {
+    // `mtls_auth[].identity` is the one credential identity field; a
+    // basicauth entry carries no username.
+    for (consumer, identity, bundle) in [(MTLS_IDENTITY_CONSUMER, "client.example", "{}")] {
         // Stale, unused identity slots must not make literal identities secret
         // by value association with the bundle. Only substituted slots count.
         let mut bundle: serde_json::Value = serde_json::from_str(bundle).unwrap();
         if bundle.get("FERRUM_CREDS_BUNDLE").is_none() {
             bundle["FERRUM_CREDS_BUNDLE"] = serde_json::json!({});
         }
-        let key = if identity == "alice" {
-            "ferrum/app/basicauth/username"
-        } else {
-            "ferrum/app/mtls_auth/identity"
-        };
+        let key = "ferrum/app/mtls_auth/identity";
         bundle["FERRUM_CREDS_BUNDLE"][key] = serde_json::json!(identity);
         let bundle = bundle.to_string();
         for mode in ["api", "file"] {
@@ -1179,16 +1174,15 @@ spec:
       - identity: client.example
 "#;
 
-/// The issue-128 Basic-auth consumer as `import` writes it: a legible
-/// username beside a brokered secret half.
+/// The issue-128 Basic-auth consumer: the login is the consumer's own
+/// `username`, beside a brokered hash.
 const BASICAUTH_IDENTITY_CONSUMER: &str = r#"kind: Consumer
 spec:
   id: "app"
   username: "app"
   credentials:
     basicauth:
-      - username: alice
-        password_hash: "${gh-env-secret:alloc=require}"
+      - password_hash: "${gh-env-secret:alloc=require}"
 "#;
 
 /// Bundle seeding the Basic-auth consumer's one brokered slot.
@@ -1203,8 +1197,7 @@ spec:
   username: "app"
   credentials:
     basicauth:
-      - username: alice
-        password_hash: "hmac_sha256:0123456789abcdef"
+      - password_hash: "hmac_sha256:0123456789abcdef"
 "#;
 
 #[test]
@@ -1216,7 +1209,7 @@ fn apply_accepts_credential_identity_fields_without_an_override() {
     for (name, consumer, bundle) in [
         ("mtls_auth identity", MTLS_IDENTITY_CONSUMER, None),
         (
-            "basicauth username",
+            "basicauth hash",
             BASICAUTH_IDENTITY_CONSUMER,
             Some(BASICAUTH_BUNDLE),
         ),
@@ -1255,8 +1248,7 @@ fn apply_accepts_credential_identity_fields_without_an_override() {
 
 #[test]
 fn apply_still_refuses_a_committed_secret_beside_an_identity() {
-    // The exemption is per-leaf. A Basic-auth consumer whose username is
-    // legible and whose hash is committed is still a committed secret.
+    // A Basic-auth consumer whose hash is committed is a committed secret.
     let repo = Repo::with_consumer(BASICAUTH_LITERAL_HASH_CONSUMER);
 
     let output = repo.run(&["apply", "--auto-approve"], &[]);
@@ -1271,10 +1263,6 @@ fn apply_still_refuses_a_committed_secret_beside_an_identity() {
     assert!(
         stderr.contains("basicauth[0].password_hash"),
         "the refusal must name the secret leaf: {stderr}"
-    );
-    assert!(
-        !stderr.contains("basicauth[0].username"),
-        "the identity half must not be reported: {stderr}"
     );
     assert!(
         !repo.published().exists(),
@@ -1822,13 +1810,13 @@ fn rotate_checks_target_generation_before_any_network_or_state_publication() {
         ),
         (
             "basicauth/password_hash",
-            r#"{"basicauth":[{"username":"app","password_hash":"${gh-env-secret:alloc=require}"}]}"#,
+            r#"{"basicauth":[{"password_hash":"${gh-env-secret:alloc=require}"}]}"#,
             "cannot generate a basicauth password_hash",
             "'platform/app/basicauth/password_hash'",
         ),
         (
             "basicauth/[1]/password_hash",
-            r#"{"basicauth":[{"username":"one","password_hash":"${gh-env-secret:alloc=require}"},{"username":"two","password_hash":"${gh-env-secret:alloc=require}"}]}"#,
+            r#"{"basicauth":[{"password_hash":"${gh-env-secret:alloc=require}"},{"password_hash":"${gh-env-secret:alloc=require}"}]}"#,
             "cannot generate a basicauth password_hash",
             "'platform/app/basicauth/[1]/password_hash'",
         ),
@@ -2032,16 +2020,10 @@ fn run_rotate(
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let credential = format!("{kind}/[1]/{field}");
-    // Only `basicauth` pairs its secret with a public username. Under any
-    // other kind `username` is a literal secret leaf, which the rotation's
-    // literal-credential gate would refuse before provisioning.
-    let (first, second) = if kind == "basicauth" {
-        ("\n        username: first", "\n        username: second")
-    } else {
-        ("", "")
-    };
+    // Each entry holds its one field (`CREDENTIAL_ENTRY_SHAPES`); a basicauth
+    // login is the consumer's `username`.
     let consumer = format!(
-        "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    {kind}:\n      - {field}: '${{gh-env-secret:alloc=require}}'{first}\n      - {field}: '${{gh-env-secret:alloc=require}}'{second}\n"
+        "kind: Consumer\nspec:\n  id: app\n  username: app\n  credentials:\n    {kind}:\n      - {field}: '${{gh-env-secret:alloc=require}}'\n      - {field}: '${{gh-env-secret:alloc=require}}'\n"
     );
     let bundle = serde_json::json!({ "FERRUM_CREDS_BUNDLE": slots }).to_string();
     let repo = Repo::with_files(&[
@@ -2105,7 +2087,7 @@ fn rotate_refuses_a_literal_sibling_credential_before_any_side_effect() {
         (
             serde_json::json!({
                 "keyauth": [{ "key": BROKERED }],
-                "basicauth": [{ "username": "public-identity", "password": LITERAL }]
+                "basicauth": [{ "password": LITERAL }]
             }),
             "Literal credential in 'basicauth[0].password'",
         ),
@@ -2150,10 +2132,6 @@ fn rotate_refuses_a_literal_sibling_credential_before_any_side_effect() {
         assert!(diagnostic.contains(finding), "{diagnostic}");
         assert!(
             diagnostic.contains("Refusing to rotate: consumer 'platform/app'"),
-            "{diagnostic}"
-        );
-        assert!(
-            !diagnostic.contains("basicauth[0].username"),
             "{diagnostic}"
         );
         let combined = format!("{}{diagnostic}", stdout(&output));
@@ -2876,4 +2854,43 @@ fn rotate_and_export_refuse_a_malformed_recipient_first() {
         }
         assert!(!output_path.exists(), "{login:?}");
     }
+}
+
+#[test]
+fn a_basicauth_username_is_refused_with_where_the_login_comes_from() {
+    // Ferrum Edge keys basicauth on the consumer's own `username`, and an
+    // entry holds exactly one of `password` / `password_hash`.
+    let repo = Repo::with_consumer(
+        r#"kind: Consumer
+spec:
+  id: "app"
+  username: "app-login"
+  credentials:
+    basicauth:
+      - username: alice
+        password_hash: "${gh-env-secret:alloc=require}"
+"#,
+    );
+    for command in [&["validate"][..], &["plan"], &["apply", "--auto-approve"]] {
+        let output = repo.run(command, &[("FERRUM_CREDS_JSON", BASICAUTH_BUNDLE)]);
+        assert!(!output.status.success(), "{command:?} must refuse");
+        // Messages stay static: the diagnostic names the consumer's username.
+        let stderr = stderr(&output);
+        let names_entry = stderr.contains("credentials.basicauth[0]");
+        let says_where = stderr.contains("consumer's own `username`");
+        let names_login = stderr.contains("\"app-login\"");
+        assert!(
+            names_entry,
+            "{command:?}: the refusal does not name the entry"
+        );
+        assert!(
+            says_where,
+            "{command:?}: the refusal does not say where the login comes from"
+        );
+        assert!(
+            names_login,
+            "{command:?}: the refusal does not name the consumer's username"
+        );
+    }
+    assert!(!repo.published().exists());
 }

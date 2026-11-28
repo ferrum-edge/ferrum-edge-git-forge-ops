@@ -134,6 +134,25 @@ where
 /// malformed policy or schema is still rejected.
 pub const MESH_ALLOW_NO_CA_ENV: &str = "FERRUM_MESH_ALLOW_NO_CA";
 
+/// The key ferrum-edge's `basic_auth` plugin needs before it can be built.
+pub const BASIC_AUTH_HMAC_SECRET_ENV: &str = "FERRUM_BASIC_AUTH_HMAC_SECRET";
+
+/// The validation-only stand-in for [`BASIC_AUTH_HMAC_SECRET_ENV`], set on a
+/// gateway validator child only when the document declares a `basic_auth`
+/// plugin ([`basic_auth_key_standin_env`]).
+///
+/// `ferrum-edge validate` checks a plugin config by constructing the plugin,
+/// and `basic_auth` refuses to construct without
+/// `FERRUM_BASIC_AUTH_HMAC_SECRET` (at least 32 bytes). GitForgeOps scrubs
+/// every inherited `FERRUM_*` variable from the validator, and never holds the
+/// gateway's key anyway, so without this every repository declaring a
+/// `basic_auth` plugin failed `validate`, `plan`, review and `apply`. The
+/// stand-in only lets the plugin build: it is a public constant, never a
+/// gateway's key, and is set on the validator child alone. The validator's
+/// `password_hash` check is a format check that does not use the key.
+pub const BASIC_AUTH_HMAC_SECRET_STANDIN: &str =
+    "gitforgeops-validation-standin-basic-auth-hmac-key-not-a-secret";
+
 /// The explicit, trusted validation-only context for a validator child in
 /// `mode`, applied **after** [`scrubbed_env_names`] has removed every
 /// inherited `FERRUM_*` variable.
@@ -142,7 +161,8 @@ pub const MESH_ALLOW_NO_CA_ENV: &str = "FERRUM_MESH_ALLOW_NO_CA";
 /// `FERRUM_MESH_ALLOW_NO_CA` is scrubbed like everything else and cannot
 /// influence the child either way. Gateway validation gets no constant
 /// identity overrides — `-m file` has no identity gate. Its `FERRUM_NAMESPACE`
-/// is set separately from the assembled document, never the parent's filter.
+/// is set separately from the assembled document, never the parent's filter,
+/// and [`basic_auth_key_standin_env`] depends on the document too.
 ///
 /// Nothing here reaches `apply`'s runtime settings: it is set on the
 /// `ferrum-edge validate` child process only, and the published mesh document
@@ -154,6 +174,18 @@ pub fn validation_context_env(mode: &str) -> Vec<(&'static str, &'static str)> {
     } else {
         Vec::new()
     }
+}
+
+/// The `basic_auth` key stand-in a gateway validator child needs for this
+/// document: [`BASIC_AUTH_HMAC_SECRET_STANDIN`] when it declares a
+/// `basic_auth` plugin, and nothing otherwise, so every other document's child
+/// environment is exactly the scrubbed one plus `FERRUM_NAMESPACE`.
+pub fn basic_auth_key_standin_env(config: &GatewayConfig) -> Option<(&'static str, &'static str)> {
+    config
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.plugin_name == "basic_auth")
+        .then_some((BASIC_AUTH_HMAC_SECRET_ENV, BASIC_AUTH_HMAC_SECRET_STANDIN))
 }
 
 /// How long one validator invocation may run, and how much it may print on
@@ -400,7 +432,7 @@ pub fn run_validation(
     binary_path: &str,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config(config);
-    run_gateway_validation(config, binary_path, &scrubber, None)
+    run_gateway_validation(config, binary_path, &scrubber, None, false)
 }
 
 /// Validate a resolved snapshot using both literal-secret classification and
@@ -413,7 +445,37 @@ pub fn run_validation_with_report(
     report: &crate::secrets::ResolveReport,
 ) -> crate::error::Result<ValidationResult> {
     let scrubber = SecretScrubber::from_gateway_config_with_report(config, report);
-    run_gateway_validation(config, binary_path, &scrubber, Some(report))
+    run_gateway_validation(config, binary_path, &scrubber, Some(report), false)
+}
+
+/// [`run_validation_with_report`] for a document `apply` sends through the
+/// admin API. The admin API hashes a plaintext `basicauth` `password` on write
+/// while the file-mode validator refuses one, so the validator's copy carries
+/// a `password_hash` stand-in instead
+/// ([`crate::validate::standin::with_admin_api_basicauth_standins`]); the
+/// resolved password never reaches the temp spec.
+pub fn run_validation_for_admin_api(
+    config: &GatewayConfig,
+    binary_path: &str,
+    report: &crate::secrets::ResolveReport,
+) -> crate::error::Result<ValidationResult> {
+    let scrubber = SecretScrubber::from_gateway_config_with_report(config, report);
+    run_gateway_validation(config, binary_path, &scrubber, Some(report), true)
+}
+
+/// Validate a resolved snapshot for the gateway mode it is published in.
+pub fn run_validation_for_mode(
+    config: &GatewayConfig,
+    binary_path: &str,
+    report: &crate::secrets::ResolveReport,
+    mode: &crate::config::GatewayMode,
+) -> crate::error::Result<ValidationResult> {
+    match mode {
+        crate::config::GatewayMode::Api => {
+            run_validation_for_admin_api(config, binary_path, report)
+        }
+        crate::config::GatewayMode::File => run_validation_with_report(config, binary_path, report),
+    }
 }
 
 fn run_gateway_validation(
@@ -421,10 +483,28 @@ fn run_gateway_validation(
     binary_path: &str,
     scrubber: &SecretScrubber,
     report: Option<&crate::secrets::ResolveReport>,
+    admin_api: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Stand-ins are fabricated here and go no further than `spec_file` below.
+    let basicauth_password_errors = if admin_api {
+        crate::validate::standin::validate_admin_api_basicauth_passwords(config, report)
+    } else {
+        Vec::new()
+    };
     let standins = crate::validate::standin::with_validation_standins_for_report(config, report);
-    let yaml = crate::yaml::to_string(standins.as_ref().unwrap_or(config))?;
+    let admin_standins = admin_api
+        .then(|| {
+            crate::validate::standin::with_admin_api_basicauth_standins(
+                standins.as_ref().unwrap_or(config),
+            )
+        })
+        .flatten();
+    let yaml = crate::yaml::to_string(
+        admin_standins
+            .as_ref()
+            .or(standins.as_ref())
+            .unwrap_or(config),
+    )?;
     let mut namespaces = collect_namespaces(config);
     if namespaces.is_empty() {
         // Empty documents still need schema/settings validation. This does
@@ -432,6 +512,7 @@ fn run_gateway_validation(
         namespaces.push("ferrum".to_string());
     }
     let annotate_namespace = namespaces.len() > 1;
+    let basic_auth_key = basic_auth_key_standin_env(config);
     let mut combined = ValidationResult {
         success: true,
         stdout: String::new(),
@@ -452,6 +533,7 @@ fn run_gateway_validation(
             scrubber,
             Some(&namespace),
             annotate_namespace,
+            basic_auth_key,
         )?;
         if !result.success {
             combined.success = false;
@@ -459,6 +541,17 @@ fn run_gateway_validation(
         }
         combined.stdout.push_str(&result.stdout);
         combined.stderr.push_str(&result.stderr);
+    }
+    if !basicauth_password_errors.is_empty() {
+        combined.success = false;
+        if combined.exit_code == 0 {
+            combined.exit_code = 1;
+        }
+        for (slot, reason) in basicauth_password_errors {
+            combined.stderr.push_str(&format!(
+                "error: consumer basicauth slot '{slot}': {reason}\n"
+            ));
+        }
     }
     Ok(combined)
 }
@@ -497,6 +590,7 @@ pub fn run_mesh_validation(
         &SecretScrubber::default(),
         None,
         false,
+        None,
     )
 }
 
@@ -581,6 +675,7 @@ fn run_validate_pass(
     scrubber: &SecretScrubber,
     namespace: Option<&str>,
     annotate_namespace: bool,
+    standin_env: Option<(&'static str, &'static str)>,
 ) -> crate::error::Result<ValidationResult> {
     let mut command = Command::new(binary_path);
     command.args(build_validate_args_for_mode(
@@ -594,7 +689,7 @@ fn run_validate_pass(
     // Order is load-bearing: every inherited `FERRUM_*` name is removed
     // first, then this mode's own validation-only context is set, so the
     // child sees only our constants and document-derived namespace.
-    for (name, value) in validation_context_env(mode) {
+    for (name, value) in validation_context_env(mode).into_iter().chain(standin_env) {
         command.env(name, value);
     }
     if let Some(namespace) = namespace {

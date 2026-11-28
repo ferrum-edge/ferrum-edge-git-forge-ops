@@ -425,7 +425,7 @@ Every resolved or literal credential, sensitive plugin-config value, plugin
 trigger `header`/`query`/`cookie` operand (of at least 8 bytes; `diff` and
 `plan` redact shorter ones by position), modeled service-discovery secret and
 inline TLS private key, plus its base64 and percent-encoded forms, is
-replaced with `[REDACTED]`. Identities (`basicauth` usernames, `mtls_auth`
+replaced with `[REDACTED]`. Identities (consumer usernames, `mtls_auth`
 identities) stay readable. The whole stream is withheld instead when:
 
 - a secret is shorter than 8 bytes;
@@ -451,6 +451,41 @@ gets a fake value of the right shape:
 | `oauth2_introspection` / `oidc_relying_party` `client_auth.private_key_pem` | a throwaway PKCS#8 key for the sibling `private_key_jwt_alg` |
 | TLS private key (Proxy/Upstream `backend_tls_client_key_path`, `mesh_route_dispatch` `client_key_path`) | a `PRIVATE KEY` PEM block whose body is a marker and a hash, not a key |
 | `udp_logging` `dtls_key_path` | omitted with `dtls_cert_path` (Edge pairs them; an ephemeral identity is validated instead) |
+
+**An api-mode `basicauth` `password` is validated as a hash.** The admin API
+takes a plaintext password and hashes it on write, but the validator runs in
+file mode, which refuses a plaintext `password`. In api mode (`validate`,
+`plan`, review and `apply`), resolved `basicauth` passwords are checked against
+Edge's admission rules (non-empty, at most 4,096 characters, no ASCII control
+characters below `0x20` other than tab/LF/CR) without printing the value, and
+the validation file carries a `password_hash` stand-in (`hmac_sha256:<64 hex>`
+from the slot, never from the password) in place of each `basicauth` `password`,
+resolved or not, so the resolved password is never written to it. File mode
+keeps the password, which a file-mode gateway refuses. After an API-mode
+incremental `apply` or `rotate` commits a Consumer with plaintext `basicauth`
+passwords, GitForgeOps verifies the Consumer's `GET /consumers/{id}/verification`
+row matches the write response's `updated_at` (and, for `rotate`, updates only
+the rotated slot index while verifying the `ETag` moved) and records a
+non-secret cryptographic binding (`HMAC-SHA256(key = live password_hash,
+domain || namespace || consumer || index || desired_password)`) in
+`.state/<env>.json` without ever storing the plaintext password, the gateway
+hash, or reading `FERRUM_BASIC_AUTH_HMAC_SECRET`. If post-write verification
+fails or shows an intervening revision, or after `full_replace` (`POST /restore`
+returns counts only without a per-row revision receipt), bindings are cleared
+fail-closed so the next admin comparison surfaces drift. On subsequent admin
+`GET /backup` comparisons (`diff`, `plan`, `review`, `apply`), an entry
+converges only when that binding verifies; reseeding the bundle, recovering
+from a failed rotation push, or editing the Consumer out-of-band on the gateway
+breaks the binding and surfaces drift immediately.
+
+**A `basic_auth` plugin is validated with a stand-in key.** Edge checks a
+plugin config by building the plugin, and `basic_auth` will not build without
+`FERRUM_BASIC_AUTH_HMAC_SECRET`. The validator never inherits a `FERRUM_*`
+variable, so it gets the public constant
+`gitforgeops-validation-standin-basic-auth-hmac-key-not-a-secret` instead,
+on the validator process only and only when the document declares a
+`basic_auth` plugin. The gateway keeps its own key; GitForgeOps
+never reads it.
 
 The scheme follows the field (`ldaps://`, `redis://`, `wss://` for
 `ws_logging`, otherwise `https://`). The shapes follow the gateway's own
@@ -495,8 +530,10 @@ settings: import keeps them, the literal-secret check passes them, and they
 are not scrubbed from validator output. Any other value is still treated as a
 possible secret.
 
-Resolved values are always validated unchanged. Stand-ins are never exported,
-applied, delivered or stored.
+Resolved values are validated unchanged, except that api-mode `basicauth`
+passwords are checked against Edge's password admission rules and replaced by a
+`password_hash` stand-in in the file-mode validator's temp spec. Stand-ins are
+never exported, applied, delivered or stored.
 
 **Workflow-command injection is blocked.** Resource ids, namespaces and
 gateway responses can be attacker-controlled. All diagnostics pass through one

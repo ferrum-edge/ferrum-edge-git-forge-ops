@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::config::schema::{Consumer, PassthroughFields, PluginConfig, Upstream};
 use crate::config::GatewayConfig;
@@ -43,6 +43,15 @@ pub fn mask_indeterminate_secret_values(
         {
             for (credential_type, desired_value) in &expected.credentials {
                 if let Some(live_value) = live.credentials.get_mut(credential_type) {
+                    if credential_type == "basicauth" {
+                        mask_unresolved_basicauth_passwords(
+                            &expected.namespace,
+                            &expected.id,
+                            desired_value,
+                            live_value,
+                            &unresolved,
+                        );
+                    }
                     mask_unresolved_leaves(
                         desired_value,
                         live_value,
@@ -658,6 +667,10 @@ pub fn state_key_namespace(key: &str) -> Option<String> {
     parse_state_key(key).map(|(namespace, _kind, _id)| decode_state_key_component(namespace))
 }
 
+pub fn state_key_kind(key: &str) -> Option<&str> {
+    parse_state_key(key).map(|(_namespace, kind, _id)| kind)
+}
+
 const STATE_KEY_PREFIX: &str = "__gitforgeops_state_key_v2";
 const STATE_KEY_KINDS: [&str; 4] = ["Proxy", "Consumer", "Upstream", "PluginConfig"];
 
@@ -864,6 +877,331 @@ fn diff_collection<T: serde::Serialize + PassthroughFields>(
 /// gateway re-adds its own field) and `drift-check --exit-on-drift` would never
 /// go green again. Same rule as unmanaged resources: what the repo never
 /// claimed, the repo does not reconcile.
+/// Whether `value` has Ferrum Edge's `basicauth` `password_hash` format
+/// (`hmac_sha256:<64 lowercase hex>`).
+fn is_valid_basicauth_password_hash(value: &str) -> bool {
+    value.strip_prefix("hmac_sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn plaintext_basicauth_password(entry: &serde_json::Value) -> Option<&str> {
+    let map = entry.as_object()?;
+    if map.len() != 1 {
+        return None;
+    }
+    map.get("password").and_then(serde_json::Value::as_str)
+}
+
+fn hashed_basicauth_password_hash(entry: &serde_json::Value) -> Option<&str> {
+    let map = entry.as_object()?;
+    if map.len() != 1 {
+        return None;
+    }
+    map.get("password_hash")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| is_valid_basicauth_password_hash(value))
+}
+
+/// Mask unresolved brokered `basicauth` `password` placeholders against valid
+/// live `password_hash` entries so `diff` / `plan` / `review` without a bundle
+/// do not report false drift on an unresolved slot while keeping shape, count,
+/// malformed hashes, and resolved passwords authoritative.
+fn mask_unresolved_basicauth_passwords(
+    namespace: &str,
+    id: &str,
+    desired_basic: &serde_json::Value,
+    live_basic: &mut serde_json::Value,
+    unresolved: &HashSet<&str>,
+) {
+    match (desired_basic, live_basic) {
+        (serde_json::Value::Array(d_entries), serde_json::Value::Array(a_entries))
+            if d_entries.len() == a_entries.len() =>
+        {
+            for (index, (d_entry, a_entry)) in
+                d_entries.iter().zip(a_entries.iter_mut()).enumerate()
+            {
+                let slot = consumer_credential_slot(
+                    namespace,
+                    id,
+                    "basicauth",
+                    &[
+                        ConfigPathComponent::Index(index),
+                        ConfigPathComponent::Key("password".to_string()),
+                    ],
+                );
+                if unresolved.contains(slot.as_str())
+                    && plaintext_basicauth_password(d_entry).is_some()
+                    && hashed_basicauth_password_hash(a_entry).is_some()
+                {
+                    *a_entry = d_entry.clone();
+                }
+            }
+        }
+        (d_entry @ serde_json::Value::Object(_), a_entry @ serde_json::Value::Object(_)) => {
+            let slot = consumer_credential_slot(
+                namespace,
+                id,
+                "basicauth",
+                &[ConfigPathComponent::Key("password".to_string())],
+            );
+            if unresolved.contains(slot.as_str())
+                && plaintext_basicauth_password(d_entry).is_some()
+                && hashed_basicauth_password_hash(a_entry).is_some()
+            {
+                *a_entry = d_entry.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Derive the non-secret cryptographic binding stored in `.state/<env>.json`
+/// for one API-mode Consumer `basicauth` `password` entry.
+///
+/// The MAC is keyed by the gateway's own stored `password_hash` and covers the
+/// namespace, consumer id, entry index, and desired plaintext password. Neither
+/// the plaintext password nor the gateway hash is ever written to state, and
+/// GitForgeOps never reads `FERRUM_BASIC_AUTH_HMAC_SECRET`. Changing either the
+/// desired password (bundle reseed / failed rotation push) or the live gateway
+/// hash (out-of-band edit) breaks the binding and surfaces drift immediately.
+pub fn basicauth_password_binding(
+    namespace: &str,
+    id: &str,
+    index: usize,
+    desired_password: &str,
+    live_password_hash: &str,
+) -> String {
+    use aws_lc_rs::hmac;
+
+    let key = hmac::Key::new(hmac::HMAC_SHA256, live_password_hash.as_bytes());
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(b"gitforgeops:basicauth-binding:v1\0");
+    ctx.update(namespace.as_bytes());
+    ctx.update(b"\0");
+    ctx.update(id.as_bytes());
+    ctx.update(b"\0");
+    ctx.update(index.to_string().as_bytes());
+    ctx.update(b"\0");
+    ctx.update(desired_password.as_bytes());
+    let tag = ctx.sign();
+    let mut out = String::with_capacity("hmac_sha256_binding:v1:".len() + tag.as_ref().len() * 2);
+    out.push_str("hmac_sha256_binding:v1:");
+    for byte in tag.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Whether `value` is a valid versioned `basicauth` binding tag
+/// (`hmac_sha256_binding:v1:<64 lowercase hex>`).
+pub fn is_valid_basicauth_binding_tag(value: &str) -> bool {
+    value
+        .strip_prefix("hmac_sha256_binding:v1:")
+        .is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// Extract the `(collection_len, live_password_hash)` at `index` from a live
+/// Consumer's `basicauth` credentials. Returns `None` if the entry is absent
+/// or does not carry a valid `hmac_sha256:<64 hex>` hash.
+pub fn extract_basicauth_password_hash_at(
+    consumer: &Consumer,
+    index: usize,
+) -> Option<(usize, &str)> {
+    match consumer.credentials.get("basicauth")? {
+        serde_json::Value::Array(entries) => {
+            let hash = hashed_basicauth_password_hash(entries.get(index)?)?;
+            Some((entries.len(), hash))
+        }
+        entry @ serde_json::Value::Object(_) if index == 0 => {
+            let hash = hashed_basicauth_password_hash(entry)?;
+            Some((1, hash))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `live` matches `desired` on every field except `created_at`,
+/// `updated_at`, and `credentials.basicauth`. Used before certifying a
+/// post-write `basicauth` binding so a concurrent edit to any other field
+/// refuses certification.
+pub fn consumer_matches_desired_except_basicauth(desired: &Consumer, live: &Consumer) -> bool {
+    let mut desired_copy = desired.clone();
+    let mut live_copy = live.clone();
+    desired_copy.credentials.remove("basicauth");
+    live_copy.credentials.remove("basicauth");
+    compare_fields("Consumer", &desired_copy, &live_copy).is_empty()
+}
+
+/// Whether `consumer` declares at least one plaintext `basicauth` `password`
+/// entry (`{"password": <string>}`).
+pub fn consumer_has_plaintext_basicauth(consumer: &Consumer) -> bool {
+    match consumer.credentials.get("basicauth") {
+        Some(serde_json::Value::Array(entries)) => entries
+            .iter()
+            .any(|entry| plaintext_basicauth_password(entry).is_some()),
+        Some(entry @ serde_json::Value::Object(_)) => plaintext_basicauth_password(entry).is_some(),
+        _ => false,
+    }
+}
+
+/// Compute per-entry cryptographic bindings for a Consumer's plaintext
+/// `basicauth` passwords against its live gateway `password_hash` entries.
+///
+/// Returns `None` when the Consumer has no plaintext `basicauth` entries, when
+/// the desired/live shapes or lengths differ, or when any plaintext entry is
+/// not paired with a valid live `hmac_sha256:<64 hex>` hash.
+pub fn compute_consumer_basicauth_bindings(
+    desired: &Consumer,
+    live: &Consumer,
+) -> Option<Vec<String>> {
+    let desired_basic = desired.credentials.get("basicauth")?;
+    let live_basic = live.credentials.get("basicauth")?;
+    match (desired_basic, live_basic) {
+        (serde_json::Value::Array(d_entries), serde_json::Value::Array(a_entries))
+            if d_entries.len() == a_entries.len() =>
+        {
+            let mut bindings = Vec::with_capacity(d_entries.len());
+            let mut has_plaintext = false;
+            for (index, (d_entry, a_entry)) in d_entries.iter().zip(a_entries.iter()).enumerate() {
+                if let Some(password) = plaintext_basicauth_password(d_entry) {
+                    let live_hash = hashed_basicauth_password_hash(a_entry)?;
+                    bindings.push(basicauth_password_binding(
+                        &desired.namespace,
+                        &desired.id,
+                        index,
+                        password,
+                        live_hash,
+                    ));
+                    has_plaintext = true;
+                } else {
+                    bindings.push(String::new());
+                }
+            }
+            has_plaintext.then_some(bindings)
+        }
+        (d_entry @ serde_json::Value::Object(_), a_entry @ serde_json::Value::Object(_)) => {
+            let password = plaintext_basicauth_password(d_entry)?;
+            let live_hash = hashed_basicauth_password_hash(a_entry)?;
+            Some(vec![basicauth_password_binding(
+                &desired.namespace,
+                &desired.id,
+                0,
+                password,
+                live_hash,
+            )])
+        }
+        _ => None,
+    }
+}
+
+fn binding_matches(expected: &str, recorded: &str) -> bool {
+    !recorded.is_empty()
+        && aws_lc_rs::constant_time::verify_slices_are_equal(
+            expected.as_bytes(),
+            recorded.as_bytes(),
+        )
+        .is_ok()
+}
+
+/// Align API-mode `basicauth` plaintext `password` entries on `actual` ONLY
+/// when `.state/<env>.json` carries a matching cryptographic binding for the
+/// exact `(namespace, id, index, desired_password, live_password_hash)` tuple.
+///
+/// Missing bindings, changed desired passwords (bundle reseed or failed
+/// rotation push), changed live hashes (out-of-band gateway edits), malformed
+/// hashes, length changes, and explicit `password_hash` declarations are never
+/// aligned and surface as drift / updates.
+pub fn align_verified_basicauth_bindings(
+    desired: &GatewayConfig,
+    actual: &mut GatewayConfig,
+    bindings: &BTreeMap<String, Vec<String>>,
+) {
+    if bindings.is_empty() {
+        return;
+    }
+    let mut desired_consumers: HashMap<(&str, &str), &Consumer> =
+        HashMap::with_capacity(desired.consumers.len());
+    for consumer in &desired.consumers {
+        desired_consumers
+            .entry((consumer.namespace.as_str(), consumer.id.as_str()))
+            .or_insert(consumer);
+    }
+    for live in &mut actual.consumers {
+        let Some(expected) = desired_consumers.get(&(live.namespace.as_str(), live.id.as_str()))
+        else {
+            continue;
+        };
+        let key = state_key(&live.namespace, "Consumer", &live.id);
+        let Some(recorded) = bindings.get(&key) else {
+            continue;
+        };
+        let (Some(desired_basic), Some(actual_basic)) = (
+            expected.credentials.get("basicauth"),
+            live.credentials.get_mut("basicauth"),
+        ) else {
+            continue;
+        };
+        match (desired_basic, actual_basic) {
+            (serde_json::Value::Array(d_entries), serde_json::Value::Array(a_entries))
+                if d_entries.len() == a_entries.len() && d_entries.len() == recorded.len() =>
+            {
+                for (index, ((d_entry, a_entry), rec)) in d_entries
+                    .iter()
+                    .zip(a_entries.iter_mut())
+                    .zip(recorded.iter())
+                    .enumerate()
+                {
+                    if let (Some(password), Some(live_hash)) = (
+                        plaintext_basicauth_password(d_entry),
+                        hashed_basicauth_password_hash(a_entry),
+                    ) {
+                        let expected_binding = basicauth_password_binding(
+                            &expected.namespace,
+                            &expected.id,
+                            index,
+                            password,
+                            live_hash,
+                        );
+                        if binding_matches(&expected_binding, rec) {
+                            *a_entry = d_entry.clone();
+                        }
+                    }
+                }
+            }
+            (d_entry @ serde_json::Value::Object(_), a_entry @ serde_json::Value::Object(_))
+                if recorded.len() == 1 =>
+            {
+                if let (Some(password), Some(live_hash)) = (
+                    plaintext_basicauth_password(d_entry),
+                    hashed_basicauth_password_hash(a_entry),
+                ) {
+                    let expected_binding = basicauth_password_binding(
+                        &expected.namespace,
+                        &expected.id,
+                        0,
+                        password,
+                        live_hash,
+                    );
+                    if binding_matches(&expected_binding, &recorded[0]) {
+                        *a_entry = d_entry.clone();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn compare_fields<T: serde::Serialize + PassthroughFields>(
     kind: &str,
     desired: &T,

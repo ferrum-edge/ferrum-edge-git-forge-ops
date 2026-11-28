@@ -758,9 +758,9 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
     let backup_path = source_dir.path().join("backup.yaml");
     let mut config = make_test_config();
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
-        "keyauth": [{"key": "first-live-key"}, {"key": "second-live-key"}],
+        "keyauth": [{"key": "first-live-key", "nested": {"token": "keyauth-nested-token"}}, {"key": "second-live-key"}],
         "jwt": [{"secret": "live-jwt-secret-that-is-long-enough"}],
-        "hmac_auth": [{"nested": {"token": "hmac-nested-token"}}]
+        "hmac_auth": [{"secret": "live-hmac-secret-that-is-long-enough"}]
     }))
     .unwrap();
     let original_credentials = config.consumers[0].credentials.clone();
@@ -778,7 +778,7 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
     )
     .unwrap();
 
-    assert_eq!(result.redacted_credential_values, 4);
+    assert_eq!(result.redacted_credential_values, 5);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -799,8 +799,8 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
         merged,
         std::collections::BTreeMap::from([
             (
-                "ferrum/consumer-test/hmac_auth/nested/token".to_string(),
-                "hmac-nested-token".to_string(),
+                "ferrum/consumer-test/hmac_auth/secret".to_string(),
+                "live-hmac-secret-that-is-long-enough".to_string(),
             ),
             (
                 "ferrum/consumer-test/jwt/secret".to_string(),
@@ -813,6 +813,10 @@ fn file_import_writes_a_private_migration_bundle_that_round_trips_exactly() {
             (
                 "ferrum/consumer-test/keyauth/key".to_string(),
                 "first-live-key".to_string(),
+            ),
+            (
+                "ferrum/consumer-test/keyauth/nested/token".to_string(),
+                "keyauth-nested-token".to_string(),
             ),
         ])
     );
@@ -1202,7 +1206,7 @@ fn credential_migration_bundle_shards_by_exact_encoded_json_size() {
     let values = (0..12)
         .map(|index| {
             serde_json::json!({
-                "token": format!("{}-{index}", "\"".repeat(4_000))
+                "secret": format!("{}-{index}", "\"".repeat(4_000))
             })
         })
         .collect::<Vec<_>>();
@@ -1256,7 +1260,7 @@ fn credential_migration_bundle_refuses_unbound_shards_before_publication() {
         let values = (0..count)
             .map(|index| {
                 serde_json::json!({
-                    "token": format!("{}-{index}", "x".repeat(BUNDLE_SOFT_LIMIT_BYTES / 2))
+                    "secret": format!("{}-{index}", "x".repeat(BUNDLE_SOFT_LIMIT_BYTES / 2))
                 })
             })
             .collect::<Vec<_>>();
@@ -1469,7 +1473,7 @@ fn imported_resource_yaml_is_byte_deterministic() {
     // byte comparison exercises.
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
         "mtls_auth": [{"identity": "z"}],
-        "basicauth": [{"username": "a", "password": "x"}]
+        "basicauth": [{"password": "x"}]
     }))
     .unwrap();
     let left = tempfile::tempdir().unwrap();
@@ -1676,11 +1680,10 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = make_test_config();
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
-        "keyauth": [{"key": "live-key"}, {"key": "second-key"}],
+        "keyauth": [{"key": "live-key", "nested": {"token": "keyauth-nested-token"}}, {"key": "second-key"}],
         "jwt": [{"secret": "live-jwt-secret-that-is-long-enough"}],
         "hmac_auth": [{
             "secret": "live-hmac-secret-that-is-long-enough",
-            "nested": {"token": "hmac-nested-token"},
         }],
         "mtls_auth": [{"identity": "CN=production-client"}],
         "basicauth": [{"password_hash": "hmac_sha256:live-hash"}]
@@ -1701,7 +1704,7 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
         "live-jwt-secret-that-is-long-enough",
         "live-hmac-secret-that-is-long-enough",
         "hmac_sha256:live-hash",
-        "hmac-nested-token",
+        "keyauth-nested-token",
     ] {
         assert!(
             !consumer.contains(secret),
@@ -1729,7 +1732,7 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
             "live-jwt-secret-that-is-long-enough",
             "live-hmac-secret-that-is-long-enough",
             "hmac_sha256:live-hash",
-            "hmac-nested-token",
+            "keyauth-nested-token",
         ] {
             assert!(
                 !bytes
@@ -1743,15 +1746,16 @@ fn import_replaces_every_string_credential_leaf_before_writing() {
     assert!(notice.contains("6 credential value(s)"), "{notice}");
 }
 
-/// F5: `basicauth[].username` is the login name the caller presents, not a
-/// secret. Brokering it would demand a hand-seeded slot for a public value.
+/// F5: `mtls_auth[].identity` is a certificate subject, not a secret.
+/// Brokering it would demand a hand-seeded slot for a public value.
 #[test]
 fn import_keeps_consumer_identity_fields_out_of_the_broker() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = make_test_config();
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
-        "basicauth": [{"username": "service-account-alpha", "password_hash": "hmac_sha256:live"}],
-        "mtls_auth": [{"identity": "CN=production-client", "ca_pin": "live-pin-value"}]
+        "basicauth": [{"password_hash": "hmac_sha256:live"}],
+        "mtls_auth": [{"identity": "CN=production-client"}],
+        "keyauth": [{"key": "live-key-value"}]
     }))
     .unwrap();
 
@@ -1760,10 +1764,48 @@ fn import_keeps_consumer_identity_fields_out_of_the_broker() {
     assert_eq!(result.redacted_credential_values, 2);
     let consumer =
         std::fs::read_to_string(tmp.path().join("ferrum/consumers/consumer-test.yaml")).unwrap();
-    assert!(consumer.contains("service-account-alpha"), "{consumer}");
     assert!(consumer.contains("CN=production-client"), "{consumer}");
     assert!(!consumer.contains("hmac_sha256:live"), "{consumer}");
-    assert!(!consumer.contains("live-pin-value"), "{consumer}");
+    assert!(!consumer.contains("live-key-value"), "{consumer}");
+}
+
+#[test]
+fn import_from_file_rejects_legacy_basicauth_username_before_publishing() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let backup_path = source_dir.path().join("backup.yaml");
+    let mut config = make_test_config();
+    config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
+        "basicauth": [{"username": "legacy-user", "password": "legacy-secret-password-value"}]
+    }))
+    .unwrap();
+    std::fs::write(&backup_path, gitforgeops::yaml::to_string(&config).unwrap()).unwrap();
+
+    let destination_parent = tempfile::tempdir().unwrap();
+    let output = destination_parent.path().join("resources");
+    let bundle_path = destination_parent.path().join("credential-migration.json");
+    let error = gitforgeops::import::from_file::import_from_file(
+        &backup_path,
+        &output,
+        Some(&bundle_path),
+        &strict_passthrough(),
+        &[],
+    )
+    .expect_err("legacy basicauth username must be refused before publishing")
+    .to_string();
+
+    assert!(error.contains("credentials.basicauth[0]"), "{error}");
+    assert!(
+        error.contains("`username` is not a basicauth entry field"),
+        "{error}"
+    );
+    assert!(
+        !output.exists(),
+        "import must not publish any tree on failure"
+    );
+    assert!(
+        !bundle_path.exists(),
+        "import must not write a credential bundle on failure"
+    );
 }
 
 #[test]
@@ -1771,9 +1813,9 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
     let tmp = tempfile::tempdir().unwrap();
     let mut config = make_test_config();
     config.consumers[0].credentials = serde_json::from_value(serde_json::json!({
-        "keyauth": [{"key": "first-value"}, {"key": "second-value"}],
+        "keyauth": [{"key": "first-value", "nested": {"token": "keyauth-nested-secret"}}, {"key": "second-value"}],
         "jwt": [{"secret": "jwt-secret"}],
-        "hmac_auth": [{"nested": {"token": "hmac-nested-secret"}}]
+        "hmac_auth": [{"secret": "hmac-secret"}]
     }))
     .unwrap();
     let original_credentials = config.consumers[0].credentials.clone();
@@ -1795,10 +1837,11 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
     assert_eq!(
         slots,
         std::collections::BTreeSet::from([
-            "ferrum/consumer-test/hmac_auth/nested/token",
+            "ferrum/consumer-test/hmac_auth/secret",
             "ferrum/consumer-test/jwt/secret",
             "ferrum/consumer-test/keyauth/[1]/key",
             "ferrum/consumer-test/keyauth/key",
+            "ferrum/consumer-test/keyauth/nested/token",
         ])
     );
 
@@ -1806,6 +1849,10 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
         (
             "ferrum/consumer-test/keyauth/key".to_string(),
             "first-value".to_string(),
+        ),
+        (
+            "ferrum/consumer-test/keyauth/nested/token".to_string(),
+            "keyauth-nested-secret".to_string(),
         ),
         (
             "ferrum/consumer-test/keyauth/[1]/key".to_string(),
@@ -1816,8 +1863,8 @@ fn imported_placeholders_derive_the_expected_broker_slots() {
             "jwt-secret".to_string(),
         ),
         (
-            "ferrum/consumer-test/hmac_auth/nested/token".to_string(),
-            "hmac-nested-secret".to_string(),
+            "ferrum/consumer-test/hmac_auth/secret".to_string(),
+            "hmac-secret".to_string(),
         ),
     ]);
     let mut round_tripped = assembled.gateway;
@@ -1839,7 +1886,7 @@ fn unsafe_credential_shape_fails_before_publishing_any_files() {
     let mut config = make_test_config();
     config.consumers[0]
         .credentials
-        .insert("hmac_auth".to_string(), serde_json::json!({"token": 1234}));
+        .insert("hmac_auth".to_string(), serde_json::json!({"secret": 1234}));
 
     let error = split_config(&config, tmp.path()).unwrap_err().to_string();
     assert!(error.contains("non-string leaf"), "{error}");

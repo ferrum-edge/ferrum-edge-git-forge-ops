@@ -128,6 +128,33 @@ jobs:
           path: lifecycle-result.json
           retention-days: 90
 
+      # The comparison the Edge Main Drift workflow runs against Edge `main`,
+      # here against the pinned release: its openapi.yaml (the commit and
+      # SHA-256 tests/fixtures/edge-openapi/resource-fields.json records)
+      # against GitForgeOps' copies of the gateway's fields and its backup,
+      # restore and export envelopes (tests/unit/edge_main_openapi_tests.rs).
+      # After the record is published, so a difference fails the job without
+      # touching the sealed result. Both tests print the marker, so a filter
+      # matching fewer of them cannot pass.
+      - name: Compare the pinned Edge release's openapi.yaml with GitForgeOps' copies
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          fixture=tests/fixtures/edge-openapi/resource-fields.json
+          commit=$(jq -r '.source.commit' "$fixture")
+          digest=$(jq -r '.source.sha256' "$fixture")
+          [[ "$commit" =~ ^[0-9a-f]{40}$ && "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::$fixture must record the pinned openapi.yaml commit and SHA-256."
+            exit 1
+          }
+          spec="$RUNNER_TEMP/edge-openapi.yaml"
+          curl -fsS --retry 3 -o "$spec" \
+            "https://raw.githubusercontent.com/ferrum-edge/ferrum-edge/$commit/openapi.yaml"
+          echo "$digest  $spec" | sha256sum -c -
+          EDGE_MAIN_OPENAPI="$spec" cargo test --locked --test unit_tests \
+            edge_main_openapi_tests:: -- --nocapture | tee "$RUNNER_TEMP/edge-openapi.log"
+          [ "$(grep -c 'edge-main-openapi: compared' "$RUNNER_TEMP/edge-openapi.log")" -eq 2 ]
+
       # Fail the job after the record exists. A run that stops before
       # publishing is indistinguishable from one that never started, and the
       # gate has to be able to tell those apart.

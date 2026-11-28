@@ -200,6 +200,13 @@ pub struct StateFile {
     /// not where it lives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh_document_path: Option<String>,
+    /// Non-secret cryptographic bindings (`HMAC-SHA256(key = live password_hash,
+    /// msg = domain || namespace || id || index || desired_password)`) for
+    /// API-mode Consumer `basicauth[].password` entries recorded from
+    /// mutation-attributed verification reads after apply/rotate. Never holds
+    /// plaintext passwords, gateway hashes, or unkeyed credential hashes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub basicauth_bindings: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -217,37 +224,47 @@ impl Drop for StateLock {
 
 /// Inspect the directory entry itself: following a symlink here would let an
 /// unprotected repository path supply the shared-mode ownership ledger.
-fn state_directory_exists() -> crate::error::Result<bool> {
-    match std::fs::symlink_metadata(STATE_DIR) {
+fn state_directory_exists_at(state_dir: &Path) -> crate::error::Result<bool> {
+    match std::fs::symlink_metadata(state_dir) {
         Ok(metadata) if metadata.is_dir() => Ok(true),
         Ok(_) => Err(crate::error::Error::Config(format!(
-            "{STATE_DIR} must be a real directory; symlinks and non-directories are refused"
+            "{} must be a real directory; symlinks and non-directories are refused",
+            state_dir.display()
         ))),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(crate::error::Error::Io(source)),
     }
 }
 
-fn ensure_state_directory() -> crate::error::Result<()> {
-    if !state_directory_exists()? {
-        match std::fs::create_dir(STATE_DIR) {
+fn state_directory_exists() -> crate::error::Result<bool> {
+    state_directory_exists_at(Path::new(STATE_DIR))
+}
+
+fn ensure_state_directory_at(state_dir: &Path) -> crate::error::Result<()> {
+    if !state_directory_exists_at(state_dir)? {
+        match std::fs::create_dir(state_dir) {
             Ok(()) => {}
             Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => return Err(crate::error::Error::Io(source)),
         }
     }
-    if !state_directory_exists()? {
+    if !state_directory_exists_at(state_dir)? {
         return Err(crate::error::Error::Config(format!(
-            "{STATE_DIR} disappeared while preparing the state directory"
+            "{} disappeared while preparing the state directory",
+            state_dir.display()
         )));
     }
     Ok(())
 }
 
+fn ensure_state_directory() -> crate::error::Result<()> {
+    ensure_state_directory_at(Path::new(STATE_DIR))
+}
+
 /// Call only with a direct child of `.state`, after validating the environment
 /// name. No intermediate path component beneath `.state` is permitted.
-fn state_file_exists(path: &Path) -> crate::error::Result<bool> {
-    if !state_directory_exists()? {
+fn state_file_exists_at(state_dir: &Path, path: &Path) -> crate::error::Result<bool> {
+    if !state_directory_exists_at(state_dir)? {
         return Ok(false);
     }
     match std::fs::symlink_metadata(path) {
@@ -259,6 +276,10 @@ fn state_file_exists(path: &Path) -> crate::error::Result<bool> {
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(source) => Err(crate::error::Error::Io(source)),
     }
+}
+
+fn state_file_exists(path: &Path) -> crate::error::Result<bool> {
+    state_file_exists_at(Path::new(STATE_DIR), path)
 }
 
 fn default_shard_count() -> u32 {
@@ -278,6 +299,7 @@ impl Default for StateFile {
             credential_shard_count: default_shard_count(),
             overrides: Vec::new(),
             mesh_document_path: None,
+            basicauth_bindings: BTreeMap::new(),
         }
     }
 }
@@ -324,9 +346,16 @@ impl StateFile {
     }
 
     pub fn load(environment: &str) -> crate::error::Result<Self> {
+        Self::load_in_dir(Path::new("."), environment)
+    }
+
+    /// Load a state file from `<base_dir>/.state/<environment>.json` without
+    /// mutating process-wide CWD.
+    pub fn load_in_dir(base_dir: &Path, environment: &str) -> crate::error::Result<Self> {
         validate_env_name_is_safe_path_component(environment)?;
-        let path = Self::path_for(environment);
-        if !state_file_exists(&path)? {
+        let state_dir = base_dir.join(STATE_DIR);
+        let path = state_dir.join(format!("{environment}.json"));
+        if !state_file_exists_at(&state_dir, &path)? {
             return Ok(Self {
                 environment: environment.to_string(),
                 ..Self::default()
@@ -361,15 +390,43 @@ impl StateFile {
                 )));
             }
         }
+        for (key, entries) in &self.basicauth_bindings {
+            if state_key_namespace(key).is_none()
+                || crate::diff::state_key_kind(key) != Some("Consumer")
+            {
+                return Err(crate::error::Error::Config(format!(
+                    "state file basicauth_bindings contains invalid Consumer key {key:?}; expected __gitforgeops_state_key_v2:<namespace>:Consumer:<id>"
+                )));
+            }
+            if entries.is_empty() || entries.iter().all(String::is_empty) {
+                return Err(crate::error::Error::Config(format!(
+                    "state file basicauth_bindings entry for {key:?} must contain at least one versioned binding tag"
+                )));
+            }
+            for tag in entries {
+                if !tag.is_empty() && !crate::diff::is_valid_basicauth_binding_tag(tag) {
+                    return Err(crate::error::Error::Config(format!(
+                        "state file basicauth_bindings entry for {key:?} contains an invalid tag; expected hmac_sha256_binding:v1:<64 lowercase hex> or empty sentinel"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
     pub fn save(&self) -> crate::error::Result<()> {
+        self.save_in_dir(Path::new("."))
+    }
+
+    /// Save this state file under `<base_dir>/.state/<environment>.json` without
+    /// mutating process-wide CWD.
+    pub fn save_in_dir(&self, base_dir: &Path) -> crate::error::Result<()> {
         validate_env_name_is_safe_path_component(&self.environment)?;
         self.validate_resource_keys()?;
-        ensure_state_directory()?;
-        let path = Self::path_for(&self.environment);
-        state_file_exists(&path)?;
+        let state_dir = base_dir.join(STATE_DIR);
+        ensure_state_directory_at(&state_dir)?;
+        let path = state_dir.join(format!("{}.json", self.environment));
+        state_file_exists_at(&state_dir, &path)?;
         let tmp_path = path.with_extension(format!(
             "json.tmp.{}.{}",
             std::process::id(),
@@ -394,15 +451,15 @@ impl StateFile {
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
             drop(file);
-            state_file_exists(&path)?;
+            state_file_exists_at(&state_dir, &path)?;
             std::fs::rename(&tmp_path, &path)?;
-            if let Ok(dir) = std::fs::File::open(STATE_DIR) {
+            if let Ok(dir) = std::fs::File::open(&state_dir) {
                 let _ = dir.sync_all();
             }
             Ok(())
         })();
 
-        if write_result.is_err() && matches!(state_directory_exists(), Ok(true)) {
+        if write_result.is_err() && matches!(state_directory_exists_at(&state_dir), Ok(true)) {
             let _ = std::fs::remove_file(&tmp_path);
         }
 
@@ -440,6 +497,11 @@ impl StateFile {
                 .unwrap_or(false)
         });
         self.pending_creates.retain(|key| {
+            state_key_namespace(key)
+                .map(|ns| !scope.contains(ns.as_str()))
+                .unwrap_or(false)
+        });
+        self.basicauth_bindings.retain(|key, _| {
             state_key_namespace(key)
                 .map(|ns| !scope.contains(ns.as_str()))
                 .unwrap_or(false)
@@ -504,6 +566,7 @@ impl StateFile {
             DiffAction::Delete => {
                 self.resources.remove(&key);
                 self.pending_creates.remove(&key);
+                self.basicauth_bindings.remove(&key);
             }
             DiffAction::Add | DiffAction::Modify => {
                 if desired.contains(&key) {
@@ -693,6 +756,16 @@ impl StateFile {
                     .or_insert_with(|| ResourceKeys::from_config(actual))
                     .contains(key)
         });
+        let resources = &self.resources;
+        self.basicauth_bindings.retain(|key, _| {
+            let Some(namespace) = state_key_namespace(key) else {
+                return true;
+            };
+            if !actual_by_namespace.contains_key(&namespace) {
+                return true;
+            }
+            resources.contains_key(key)
+        });
         before.saturating_sub(self.resources.len())
     }
 
@@ -707,6 +780,11 @@ impl StateFile {
                 .unwrap_or(false)
         });
         self.pending_creates.retain(|key| {
+            state_key_namespace(key)
+                .map(|ns| ns != namespace)
+                .unwrap_or(false)
+        });
+        self.basicauth_bindings.retain(|key, _| {
             state_key_namespace(key)
                 .map(|ns| ns != namespace)
                 .unwrap_or(false)
@@ -851,6 +929,75 @@ impl StateFile {
     /// just wrote as somebody else's file.
     pub fn record_mesh_publication(&mut self, output_path: &str) {
         self.mesh_document_path = Some(output_path.to_string());
+    }
+
+    pub fn set_consumer_basicauth_bindings(
+        &mut self,
+        namespace: &str,
+        id: &str,
+        bindings: Option<Vec<String>>,
+    ) {
+        let key = state_key(namespace, "Consumer", id);
+        match bindings {
+            Some(values) if !values.is_empty() && values.iter().any(|v| !v.is_empty()) => {
+                self.basicauth_bindings.insert(key, values);
+            }
+            _ => {
+                self.basicauth_bindings.remove(&key);
+            }
+        }
+    }
+
+    /// Update a single `basicauth` array slot binding without certifying or
+    /// discarding untouched sibling indices (used by `rotate`). Even if the
+    /// live `basicauth` array length differs from the previously recorded
+    /// ledger vector (e.g. an entry was appended or removed on the gateway),
+    /// bindings at surviving sibling indices are preserved and re-checked on
+    /// every subsequent comparison.
+    pub fn update_consumer_basicauth_binding_at_index(
+        &mut self,
+        namespace: &str,
+        id: &str,
+        index: usize,
+        total_len: usize,
+        binding: Option<String>,
+    ) {
+        let Some(tag) = binding else {
+            self.clear_consumer_basicauth_binding_at_index(namespace, id, index);
+            return;
+        };
+        if total_len == 0 || index >= total_len {
+            return;
+        }
+        let key = state_key(namespace, "Consumer", id);
+        let mut entries = self.basicauth_bindings.remove(&key).unwrap_or_default();
+        entries.resize(total_len, String::new());
+        entries[index] = tag;
+        if entries.iter().any(|v| !v.is_empty()) {
+            self.basicauth_bindings.insert(key, entries);
+        }
+    }
+
+    /// Clear a single `basicauth` array slot binding when rotation verification
+    /// fails, preserving all surviving sibling bindings and leaving the ledger
+    /// untouched when there is no stale tag at `index` to clear.
+    pub fn clear_consumer_basicauth_binding_at_index(
+        &mut self,
+        namespace: &str,
+        id: &str,
+        index: usize,
+    ) {
+        let key = state_key(namespace, "Consumer", id);
+        let Some(existing) = self.basicauth_bindings.get_mut(&key) else {
+            return;
+        };
+        if index >= existing.len() {
+            return;
+        }
+        existing[index].clear();
+        if existing.iter().all(String::is_empty) {
+            self.basicauth_bindings.remove(&key);
+        }
     }
 
     pub fn previously_managed_keys(&self) -> std::collections::HashSet<String> {

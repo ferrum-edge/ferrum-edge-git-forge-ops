@@ -330,8 +330,9 @@ class CoverageTests(unittest.TestCase):
     """The declared scenarios are the product's promises, enumerated."""
 
     def test_every_acceptance_scenario_from_the_issue_is_declared(self):
-        # One id per acceptance bullet in #263, plus the promotion path #268
-        # asks this suite to exercise. Adding a fail-closed gate to `apply`
+        # One id per acceptance bullet in #263, the promotion path #268 asks
+        # this suite to exercise, and the Edge contract copies that the
+        # Edge Main Drift workflow runs against Edge `main`. Adding a fail-closed gate to `apply`
         # without adding a scenario here narrows what the suite certifies
         # without narrowing what ships.
         self.assertEqual(
@@ -350,6 +351,7 @@ class CoverageTests(unittest.TestCase):
                 "staged-promotion",
                 "drift-monitoring",
                 "file-and-mesh-boundary",
+                "edge-contract-copies",
             },
         )
 

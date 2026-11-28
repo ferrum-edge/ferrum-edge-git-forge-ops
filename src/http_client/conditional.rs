@@ -302,7 +302,24 @@ impl PreparedConsumerRotation {
         })
     }
 
+    pub fn basicauth_index(&self) -> Option<usize> {
+        (self.kind == "basicauth").then_some(self.index)
+    }
+
+    pub fn pre_rotate_token(&self) -> &str {
+        self.evidence.token.as_str()
+    }
+
     pub async fn publish(self, client: &super::AdminClient, value: &str) -> Result<()> {
+        let _ = self.publish_with_updated_at(client, value).await?;
+        Ok(())
+    }
+
+    pub async fn publish_with_updated_at(
+        self,
+        client: &super::AdminClient,
+        value: &str,
+    ) -> Result<Option<String>> {
         let namespace = self.evidence.row["namespace"]
             .as_str()
             .ok_or_else(invalid)?
@@ -324,7 +341,7 @@ impl PreparedConsumerRotation {
         // have it removed like any resolved secret.
         crate::display::register_values("the rotated credential", [value])?;
         match client
-            .update_if_match(
+            .update_if_match_with_updated_at(
                 "Consumer",
                 &id,
                 &row,
@@ -334,8 +351,8 @@ impl PreparedConsumerRotation {
             )
             .await?
         {
-            super::ConditionalUpdate::Applied => Ok(()),
-            super::ConditionalUpdate::Refused(_) => Err(Error::StalePlan(
+            (super::ConditionalUpdate::Applied, updated_at) => Ok(updated_at),
+            (super::ConditionalUpdate::Refused(_), _) => Err(Error::StalePlan(
                 "conditional rotation publication refused after delivery; broker and gateway \
                  may diverge. Reconcile the delivered credential with a fresh apply; rotation \
                  completion was not recorded"
@@ -357,6 +374,26 @@ impl fmt::Debug for ConditionalMetadata {
     }
 }
 
+/// Every field a `GET /backup?conditional=true` body may carry. Any other
+/// field refuses the snapshot, so a section this build cannot carry through
+/// `POST /restore` never authorizes a conditional replacement. The Edge Main
+/// Drift and lifecycle workflows compare it with Edge's `BackupResponse`
+/// schema (`tests/unit/edge_main_openapi_tests.rs`).
+pub const CONDITIONAL_BACKUP_FIELDS: &[&str] = &[
+    "version",
+    "ferrum_version",
+    "exported_at",
+    "source",
+    "counts",
+    "proxies",
+    "consumers",
+    "upstreams",
+    "plugin_configs",
+    "api_specs",
+    "gateway_trust_bundles",
+    "conditional",
+];
+
 pub fn conditional_backup(
     body: &str,
     namespace: &str,
@@ -373,21 +410,9 @@ pub fn conditional_backup(
             "cached namespace evidence cannot authorize a conditional operation".to_string(),
         ));
     }
-    const FIELDS: &[&str] = &[
-        "version",
-        "ferrum_version",
-        "exported_at",
-        "source",
-        "counts",
-        "proxies",
-        "consumers",
-        "upstreams",
-        "plugin_configs",
-        "api_specs",
-        "gateway_trust_bundles",
-        "conditional",
-    ];
-    if root.keys().any(|key| !FIELDS.contains(&key.as_str()))
+    if root
+        .keys()
+        .any(|key| !CONDITIONAL_BACKUP_FIELDS.contains(&key.as_str()))
         || root.get("version").and_then(Value::as_str) != Some("1")
         || root.get("source").and_then(Value::as_str) != Some("database")
         || ["version", "ferrum_version", "exported_at"]
@@ -715,6 +740,20 @@ pub(super) fn withhold_restore_error(error: Error) -> Error {
     }
 }
 
+/// The sections of a `POST /restore` success's `restored` count seal; a
+/// conditional restore accepts the response only when it carries exactly these
+/// and each matches the request. The Edge Main Drift and lifecycle workflows
+/// compare it with Edge's `RestoreResponse` schema
+/// (`tests/unit/edge_main_openapi_tests.rs`).
+pub const RESTORE_SEAL_SECTIONS: &[&str] = &[
+    "proxies",
+    "consumers",
+    "upstreams",
+    "plugin_configs",
+    "api_specs",
+    "gateway_trust_bundles",
+];
+
 pub(super) fn require_restore_seal(response: &str, request: &Value) -> Result<()> {
     let response = parse_sensitive(response).map_err(|_| {
         Error::AmbiguousMutation(
@@ -724,17 +763,8 @@ pub(super) fn require_restore_seal(response: &str, request: &Value) -> Result<()
     let seal = response.get("restored").and_then(Value::as_object);
     let valid = response.as_object().is_some_and(|root| root.len() == 1)
         && seal.is_some_and(|seal| {
-            seal.len() == 6
-                && [
-                    "proxies",
-                    "consumers",
-                    "upstreams",
-                    "plugin_configs",
-                    "api_specs",
-                    "gateway_trust_bundles",
-                ]
-                .iter()
-                .all(|section| {
+            seal.len() == RESTORE_SEAL_SECTIONS.len()
+                && RESTORE_SEAL_SECTIONS.iter().all(|section| {
                     let rows = if *section == "api_specs" {
                         &request[*section]["items"]
                     } else {
