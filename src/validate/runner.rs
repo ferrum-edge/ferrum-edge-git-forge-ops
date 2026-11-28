@@ -486,6 +486,11 @@ fn run_gateway_validation(
     admin_api: bool,
 ) -> crate::error::Result<ValidationResult> {
     // Stand-ins are fabricated here and go no further than `spec_file` below.
+    let basicauth_password_errors = if admin_api {
+        crate::validate::standin::validate_admin_api_basicauth_passwords(config, report)
+    } else {
+        Vec::new()
+    };
     let standins = crate::validate::standin::with_validation_standins_for_report(config, report);
     let admin_standins = admin_api
         .then(|| {
@@ -536,6 +541,17 @@ fn run_gateway_validation(
         }
         combined.stdout.push_str(&result.stdout);
         combined.stderr.push_str(&result.stderr);
+    }
+    if !basicauth_password_errors.is_empty() {
+        combined.success = false;
+        if combined.exit_code == 0 {
+            combined.exit_code = 1;
+        }
+        for (slot, reason) in basicauth_password_errors {
+            combined.stderr.push_str(&format!(
+                "error: consumer basicauth slot '{slot}': {reason}\n"
+            ));
+        }
     }
     Ok(combined)
 }

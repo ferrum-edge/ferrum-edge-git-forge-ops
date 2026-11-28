@@ -455,11 +455,20 @@ gets a fake value of the right shape:
 **An api-mode `basicauth` `password` is validated as a hash.** The admin API
 takes a plaintext password and hashes it on write, but the validator runs in
 file mode, which refuses a plaintext `password`. In api mode (`validate`,
-`plan`, review and `apply`), the validation file therefore carries a
-`password_hash` stand-in (`hmac_sha256:<64 hex>` from the slot, never from the
-password) in place of each `basicauth` `password`, resolved or not, so the
-resolved password is never written to it. File mode keeps the password, which
-a file-mode gateway refuses.
+`plan`, review and `apply`), resolved `basicauth` passwords are checked against
+Edge's admission rules (non-empty, at most 4,096 characters, no ASCII control
+characters below `0x20` other than tab/LF/CR) without printing the value, and
+the validation file carries a `password_hash` stand-in (`hmac_sha256:<64 hex>`
+from the slot, never from the password) in place of each `basicauth` `password`,
+resolved or not, so the resolved password is never written to it. File mode
+keeps the password, which a file-mode gateway refuses. On admin `GET /backup`
+comparisons (`diff`, `plan`, `review`, incremental `apply`), an exact
+`{"password": ...}` entry is matched by presence against a valid live
+`{"password_hash": "hmac_sha256:<64 hex>"}` at the same position because
+GitForgeOps never reads `FERRUM_BASIC_AUTH_HMAC_SECRET`; use
+`gitforgeops rotate` (or `full_replace`) to push a rotated password and viewer
+`GET /config/export` with `--fingerprint-baseline` to detect out-of-band
+gateway changes.
 
 **A `basic_auth` plugin is validated with a stand-in key.** Edge checks a
 plugin config by building the plugin, and `basic_auth` will not build without
@@ -513,8 +522,10 @@ settings: import keeps them, the literal-secret check passes them, and they
 are not scrubbed from validator output. Any other value is still treated as a
 possible secret.
 
-Resolved values are always validated unchanged. Stand-ins are never exported,
-applied, delivered or stored.
+Resolved values are validated unchanged, except that api-mode `basicauth`
+passwords are checked against Edge's password admission rules and replaced by a
+`password_hash` stand-in in the file-mode validator's temp spec. Stand-ins are
+never exported, applied, delivered or stored.
 
 **Workflow-command injection is blocked.** Resource ids, namespaces and
 gateway responses can be attacker-controlled. All diagnostics pass through one

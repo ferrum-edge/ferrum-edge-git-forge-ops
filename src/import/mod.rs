@@ -583,6 +583,7 @@ pub(crate) fn split_config_with_inventory(
     let mut safe_config = config.clone();
     reject_import_passthrough_fields(&safe_config, passthrough_policy)?;
     reject_import_unknown_credential_types(&safe_config)?;
+    crate::config::schema::validate_credential_entry_shapes(&safe_config)?;
     reject_import_trigger_placeholders(&safe_config)?;
     if inventory.live_source {
         reject_live_marker_trigger_operands(&safe_config)?;

@@ -864,6 +864,133 @@ fn diff_collection<T: serde::Serialize + PassthroughFields>(
 /// gateway re-adds its own field) and `drift-check --exit-on-drift` would never
 /// go green again. Same rule as unmanaged resources: what the repo never
 /// claimed, the repo does not reconcile.
+/// Whether `value` has Ferrum Edge's `basicauth` `password_hash` format
+/// (`hmac_sha256:<64 lowercase hex>`).
+fn is_valid_basicauth_password_hash(value: &str) -> bool {
+    value.strip_prefix("hmac_sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn is_plaintext_basicauth_entry(entry: &serde_json::Value) -> bool {
+    entry.as_object().is_some_and(|map| {
+        map.len() == 1
+            && map
+                .get("password")
+                .is_some_and(serde_json::Value::is_string)
+    })
+}
+
+fn is_hashed_basicauth_entry(entry: &serde_json::Value) -> bool {
+    entry.as_object().is_some_and(|map| {
+        map.len() == 1
+            && map
+                .get("password_hash")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_valid_basicauth_password_hash)
+    })
+}
+
+/// Align API-mode `basicauth` plaintext `password` entries against the gateway's
+/// stored `password_hash` (`hmac_sha256:<64 lowercase hex>`).
+///
+/// Edge strips `password` on Admin API write and hashes it with
+/// `FERRUM_BASIC_AUTH_HMAC_SECRET`, a gateway-only key GitForgeOps never reads
+/// and never derives from the admin JWT secret. Comparing the two objects raw
+/// would report permanent drift on every admin `diff` and plan a Consumer update
+/// on every unchanged incremental `apply`.
+///
+/// Only an exact 1-field `{"password": <string>}` paired positionally with an
+/// exact 1-field valid `{"password_hash": "hmac_sha256:<64 lowercase hex>"}` in
+/// same-length `basicauth` collections is aligned. Length changes, added or
+/// removed `basicauth` sections, explicit `password_hash` declarations, malformed
+/// live hashes, extra keys, and every other credential type or Consumer field
+/// remain compared verbatim.
+fn align_opaque_basicauth_hashes(
+    desired_val: &serde_json::Value,
+    actual_val: &mut serde_json::Value,
+) {
+    let Some(desired_basic) = desired_val
+        .get("credentials")
+        .and_then(|creds| creds.get("basicauth"))
+    else {
+        return;
+    };
+    let Some(actual_basic) = actual_val
+        .get_mut("credentials")
+        .and_then(|creds| creds.get_mut("basicauth"))
+    else {
+        return;
+    };
+    match (desired_basic, actual_basic) {
+        (serde_json::Value::Array(d_entries), serde_json::Value::Array(a_entries))
+            if d_entries.len() == a_entries.len() =>
+        {
+            for (d_entry, a_entry) in d_entries.iter().zip(a_entries.iter_mut()) {
+                if is_plaintext_basicauth_entry(d_entry) && is_hashed_basicauth_entry(a_entry) {
+                    *a_entry = d_entry.clone();
+                }
+            }
+        }
+        (d_entry @ serde_json::Value::Object(_), a_entry @ serde_json::Value::Object(_)) => {
+            if is_plaintext_basicauth_entry(d_entry) && is_hashed_basicauth_entry(a_entry) {
+                *a_entry = d_entry.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Count desired Consumer `basicauth` plaintext `password` entries paired with
+/// an opaque gateway `password_hash` on `actual` so admin `diff` / `plan` /
+/// `review` can tell the operator those entries were matched by presence only.
+pub fn count_opaque_basicauth_passwords(desired: &GatewayConfig, actual: &GatewayConfig) -> usize {
+    let actual_consumers: HashMap<(&str, &str), &Consumer> = actual
+        .consumers
+        .iter()
+        .map(|consumer| {
+            (
+                (consumer.namespace.as_str(), consumer.id.as_str()),
+                consumer,
+            )
+        })
+        .collect();
+    let mut count = 0usize;
+    for consumer in &desired.consumers {
+        let Some(live) = actual_consumers.get(&(consumer.namespace.as_str(), consumer.id.as_str()))
+        else {
+            continue;
+        };
+        let (Some(desired_basic), Some(actual_basic)) = (
+            consumer.credentials.get("basicauth"),
+            live.credentials.get("basicauth"),
+        ) else {
+            continue;
+        };
+        match (desired_basic, actual_basic) {
+            (serde_json::Value::Array(d_entries), serde_json::Value::Array(a_entries))
+                if d_entries.len() == a_entries.len() =>
+            {
+                for (d_entry, a_entry) in d_entries.iter().zip(a_entries.iter()) {
+                    if is_plaintext_basicauth_entry(d_entry) && is_hashed_basicauth_entry(a_entry) {
+                        count += 1;
+                    }
+                }
+            }
+            (d_entry @ serde_json::Value::Object(_), a_entry @ serde_json::Value::Object(_)) => {
+                if is_plaintext_basicauth_entry(d_entry) && is_hashed_basicauth_entry(a_entry) {
+                    count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
 pub(crate) fn compare_fields<T: serde::Serialize + PassthroughFields>(
     kind: &str,
     desired: &T,
@@ -880,6 +1007,9 @@ pub(crate) fn compare_fields<T: serde::Serialize + PassthroughFields>(
     });
     normalize_associations_for_comparison(kind, &mut desired_val);
     normalize_associations_for_comparison(kind, &mut actual_val);
+    if kind == "Consumer" {
+        align_opaque_basicauth_hashes(&desired_val, &mut actual_val);
+    }
 
     let mut changes = Vec::new();
     if desired_val == actual_val {

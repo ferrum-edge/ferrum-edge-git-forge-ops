@@ -2584,6 +2584,62 @@ esac
     }
 }
 
+/// Resolved API-mode `basicauth` passwords that violate Edge's admission rules
+/// (over 4,096 characters or containing ASCII control characters) fail
+/// preflight validation without printing or writing the secret value.
+#[cfg(unix)]
+#[test]
+fn admin_api_validation_rejects_invalid_resolved_basicauth_passwords_without_leaking() {
+    use super::resolver_fixtures::resolve_secrets;
+    use gitforgeops::validate::run_validation_for_admin_api;
+    use std::collections::BTreeMap;
+
+    let too_long = format!("synthetic-too-long-{}", "a".repeat(4096));
+    let with_ctrl = "synthetic-ctrl-\x07-password-0123456789".to_string();
+
+    for (password, expected_reason) in [
+        (too_long, "must not exceed 4096 characters"),
+        (with_ctrl, "must not contain control characters"),
+    ] {
+        let mut config = consumer_config(serde_json::json!({
+            "basicauth": [{"password": "${gh-env-secret:alloc=require}"}],
+        }));
+        let bundle = BTreeMap::from([(
+            "ferrum/app/basicauth/password".to_string(),
+            password.clone(),
+        )]);
+        let report = resolve_secrets(&mut config, &bundle).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let validator = capturing_validator(dir.path(), "exit 0");
+        let result =
+            run_validation_for_admin_api(&config, validator.to_str().unwrap(), &report).unwrap();
+        assert!(
+            !result.success,
+            "invalid resolved basicauth password must fail preflight"
+        );
+        assert!(
+            result.stderr.contains("ferrum/app/basicauth/password"),
+            "diagnostic must name the slot: {}",
+            result.stderr
+        );
+        assert!(
+            result.stderr.contains(expected_reason),
+            "diagnostic must name the violation ({expected_reason}): {}",
+            result.stderr
+        );
+        assert!(
+            !result.stdout.contains(&password) && !result.stderr.contains(&password),
+            "diagnostic must never print the password value"
+        );
+        let raw = std::fs::read_to_string(dir.path().join("input.yaml")).unwrap();
+        assert!(
+            !raw.contains(&password),
+            "temp spec must never contain the resolved password"
+        );
+    }
+}
+
 /// A `basicauth` entry that already names a `password_hash` keeps both fields
 /// for the validator, so a password-and-hash conflict is still refused.
 #[test]

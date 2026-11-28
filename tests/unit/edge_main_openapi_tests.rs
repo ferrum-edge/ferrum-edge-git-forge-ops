@@ -455,12 +455,6 @@ fn declared_names(schemas: &Map<String, Value>, schema: &Value) -> BTreeSet<Stri
     shape(schemas, schema, 0).properties.into_keys().collect()
 }
 
-fn named<'a>(schemas: &'a Map<String, Value>, name: &str) -> &'a Value {
-    schemas
-        .get(name)
-        .unwrap_or_else(|| panic!("openapi.yaml has no {name} schema"))
-}
-
 fn strings(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| value.to_string()).collect()
 }
@@ -484,21 +478,80 @@ fn compare_sets(
     }
 }
 
-/// `enum` / `const` values of a string property, if it restricts them.
-fn enum_values(schemas: &Map<String, Value>, property: &Value) -> BTreeSet<String> {
+/// Resolve the `application/json` response schema of an operation directly from `paths`.
+fn operation_response_json_schema<'a>(
+    spec: &'a Value,
+    path: &str,
+    method: &str,
+    status: &str,
+) -> &'a Value {
+    let response = spec
+        .get("paths")
+        .and_then(|paths| paths.get(path))
+        .and_then(|item| item.get(method))
+        .and_then(|op| op.get("responses"))
+        .and_then(|responses| responses.get(status))
+        .unwrap_or_else(|| panic!("openapi.yaml has no {method} {path} {status} response"));
+    let response = resolve_local(spec, response);
+    response
+        .pointer("/content/application~1json/schema")
+        .unwrap_or_else(|| {
+            panic!("openapi.yaml {method} {path} {status} response has no application/json schema")
+        })
+}
+
+/// Resolve the `application/json` requestBody schema of an operation directly from `paths`.
+fn operation_request_json_schema<'a>(spec: &'a Value, path: &str, method: &str) -> &'a Value {
+    let request_body = spec
+        .get("paths")
+        .and_then(|paths| paths.get(path))
+        .and_then(|item| item.get(method))
+        .and_then(|op| op.get("requestBody"))
+        .unwrap_or_else(|| panic!("openapi.yaml has no {method} {path} requestBody"));
+    let request_body = resolve_local(spec, request_body);
+    request_body
+        .pointer("/content/application~1json/schema")
+        .unwrap_or_else(|| {
+            panic!("openapi.yaml {method} {path} requestBody has no application/json schema")
+        })
+}
+
+/// `enum` / `const` values of a string property, recording a problem if the
+/// schema declares any non-string `type`, `const`, or `enum` member.
+fn string_enum_values(
+    schemas: &Map<String, Value>,
+    property: &Value,
+    context: &str,
+    problems: &mut Vec<String>,
+) -> BTreeSet<String> {
     let property = resolve(schemas, property);
-    let mut values = BTreeSet::new();
-    if let Some(constant) = property.get("const").and_then(Value::as_str) {
-        values.insert(constant.to_string());
+    if property.get("type").and_then(Value::as_str) != Some("string") {
+        problems.push(format!(
+            "{context}: expected wire type \"string\", Edge documents {:?}",
+            property.get("type")
+        ));
     }
-    for value in property
-        .get("enum")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let Some(value) = value.as_str() {
-            values.insert(value.to_string());
+    let mut values = BTreeSet::new();
+    if let Some(constant) = property.get("const") {
+        match constant.as_str() {
+            Some(s) => {
+                values.insert(s.to_string());
+            }
+            None => problems.push(format!(
+                "{context}: Edge documents non-string const {constant}"
+            )),
+        }
+    }
+    if let Some(array) = property.get("enum").and_then(Value::as_array) {
+        for value in array {
+            match value.as_str() {
+                Some(s) => {
+                    values.insert(s.to_string());
+                }
+                None => problems.push(format!(
+                    "{context}: Edge documents non-string enum value {value}"
+                )),
+            }
         }
     }
     values
@@ -544,12 +597,17 @@ fn gitforgeops_export_projection() -> BTreeMap<String, BTreeSet<String>> {
 }
 
 /// `config::schema::CREDENTIAL_ENTRY_SHAPES` against each credential type's
-/// entry schema under `ConsumerCredentialsInput`: the fields it declares,
-/// which are required, whether it is closed, and its one-of alternatives.
-fn credential_entry_shape_problems(schemas: &Map<String, Value>, problems: &mut Vec<String>) {
+/// entry schema under the `POST /consumers` credentials input schema: the
+/// fields it declares, which are required, whether it is closed, and its
+/// one-of alternatives.
+fn credential_entry_shape_problems(
+    schemas: &Map<String, Value>,
+    credentials_input: &Value,
+    problems: &mut Vec<String>,
+) {
     use gitforgeops::config::schema::{CredentialEntryShape, CREDENTIAL_ENTRY_SHAPES};
 
-    let input = shape(schemas, named(schemas, "ConsumerCredentialsInput"), 0);
+    let input = shape(schemas, credentials_input, 0);
     for (credential_type, modeled) in CREDENTIAL_ENTRY_SHAPES {
         let Some(items) = input
             .properties
@@ -637,54 +695,83 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
         .expect("openapi.yaml has components.schemas");
     let mut problems = Vec::new();
 
-    // `GET /backup`: the plain decode's allow-list (without GitForgeOps' own
-    // `resource_counts`, plus the `conditional` metadata it lifts out first)
-    // and the conditional decode's allow-list.
-    let backup = declared_names(schemas, named(schemas, "BackupResponse"));
+    // `GET /backup`: resolve directly from the operation's 200 response schema.
+    let backup_schema = operation_response_json_schema(&spec, "/backup", "get", "200");
+    let backup_shape = shape(schemas, backup_schema, 0);
+    let backup: BTreeSet<String> = backup_shape.properties.keys().cloned().collect();
     let mut plain: BTreeSet<String> = strings(BACKUP_TOP_LEVEL_FIELDS);
     plain.remove("resource_counts");
     plain.insert("conditional".to_string());
     compare_sets(
         &mut problems,
-        "BackupResponse (GET /backup decode)",
+        "GET /backup 200 (plain decode)",
         &backup,
         &plain,
     );
     compare_sets(
         &mut problems,
-        "BackupResponse (GET /backup?conditional=true decode)",
+        "GET /backup 200 (conditional=true decode)",
         &backup,
         &strings(CONDITIONAL_BACKUP_FIELDS),
     );
-    let api_specs = named(schemas, "ApiSpecsBackupSection");
-    compare_sets(
-        &mut problems,
-        "ApiSpecsBackupSection",
-        &declared_names(schemas, api_specs),
-        &strings(&["items", "section_version"]),
-    );
-    if let Some(version) = shape(schemas, api_specs, 0)
-        .properties
-        .get("section_version")
-    {
-        for value in enum_values(schemas, version) {
-            if value != "2" {
-                problems.push(format!(
-                    "ApiSpecsBackupSection.section_version: Edge allows {value:?}; the \
-                     conditional decode accepts only \"2\""
-                ));
+    match backup_shape.properties.get("api_specs") {
+        Some(api_specs) => {
+            let api_specs_shape = shape(schemas, api_specs, 0);
+            compare_sets(
+                &mut problems,
+                "GET /backup 200.api_specs",
+                &api_specs_shape.properties.keys().cloned().collect(),
+                &strings(&["items", "section_version"]),
+            );
+            match api_specs_shape.properties.get("section_version") {
+                Some(version) => {
+                    let version_schema = resolve(schemas, version);
+                    let values = string_enum_values(
+                        schemas,
+                        version_schema,
+                        "GET /backup 200.api_specs.section_version",
+                        &mut problems,
+                    );
+                    for value in values {
+                        if value != "2" {
+                            problems.push(format!(
+                                "GET /backup 200.api_specs.section_version: Edge allows {value:?}; \
+                                 the conditional decode accepts only \"2\""
+                            ));
+                        }
+                    }
+                    if let Some(example) = version_schema.get("example") {
+                        if example.as_str() != Some("2") {
+                            problems.push(format!(
+                                "GET /backup 200.api_specs.section_version: Edge documents example \
+                                 {example}; the conditional decode accepts only \"2\""
+                            ));
+                        }
+                    }
+                }
+                None => problems.push(
+                    "GET /backup 200.api_specs: Edge no longer documents `section_version`"
+                        .to_string(),
+                ),
             }
         }
+        None => problems.push("GET /backup 200: Edge no longer documents `api_specs`".to_string()),
     }
-    compare_sets(
-        &mut problems,
-        "ConditionalBackupMetadata",
-        &declared_names(schemas, named(schemas, "ConditionalBackupMetadata")),
-        &strings(&["namespace_etag", "row_etags"]),
-    );
+    match backup_shape.properties.get("conditional") {
+        Some(conditional) => compare_sets(
+            &mut problems,
+            "GET /backup 200.conditional",
+            &declared_names(schemas, conditional),
+            &strings(&["namespace_etag", "row_etags"]),
+        ),
+        None => {
+            problems.push("GET /backup 200: Edge no longer documents `conditional`".to_string())
+        }
+    }
 
-    // `POST /restore`: what `build_restore_body` sends plus what it never sends.
-    let restore = declared_names(schemas, named(schemas, "RestoreRequest"));
+    // `POST /restore`: resolve request and 200 response directly from `paths`.
+    let restore_req_schema = operation_request_json_schema(&spec, "/restore", "post");
+    let restore = declared_names(schemas, restore_req_schema);
     let sent = serde_json::to_value(GatewayConfig::default()).expect("serialize GatewayConfig");
     let mut handled: BTreeSet<String> = sent
         .as_object()
@@ -694,18 +781,24 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
         .collect();
     handled.insert("api_specs".to_string());
     handled.extend(strings(RESTORE_FIELDS_NEVER_SENT));
-    compare_sets(&mut problems, "RestoreRequest", &restore, &handled);
+    compare_sets(
+        &mut problems,
+        "POST /restore requestBody",
+        &restore,
+        &handled,
+    );
 
     // The success response's count seal (`conditional::RESTORE_SEAL_SECTIONS`).
-    let restore_response = shape(schemas, named(schemas, "RestoreResponse"), 0);
+    let restore_resp_schema = operation_response_json_schema(&spec, "/restore", "post", "200");
+    let restore_response = shape(schemas, restore_resp_schema, 0);
     match restore_response.properties.get("restored") {
         Some(seal) => compare_sets(
             &mut problems,
-            "RestoreResponse.restored (count seal)",
+            "POST /restore 200.restored (count seal)",
             &declared_names(schemas, seal),
             &strings(RESTORE_SEAL_SECTIONS),
         ),
-        None => problems.push("RestoreResponse: Edge no longer documents `restored`".to_string()),
+        None => problems.push("POST /restore 200: Edge no longer documents `restored`".to_string()),
     }
 
     // `/restore` responses, status by status.
@@ -729,9 +822,15 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
                         "failure_class" => RESTORE_FAILURE_CLASSES,
                         _ => continue,
                     };
-                    // A decision marker must stay a closed set: an unbounded
-                    // string could carry a value GitForgeOps never classified.
-                    let values = enum_values(schemas, property);
+                    // A decision marker must stay a closed set of strings: an
+                    // unbounded or non-string value could carry a variant
+                    // GitForgeOps never classified.
+                    let values = string_enum_values(
+                        schemas,
+                        property,
+                        &format!("POST /restore {status}.{name}"),
+                        &mut problems,
+                    );
                     if values.is_empty() {
                         problems.push(format!(
                             "POST /restore {status}: `{name}` is no longer a closed set of \
@@ -777,15 +876,15 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
         }
     }
 
-    // `GET /config/export` and its closed Consumer projection.
-    let export_schema = named(schemas, "ConfigExportResponse");
+    // `GET /config/export` and its closed Consumer projection, resolved from `paths`.
+    let export_schema = operation_response_json_schema(&spec, "/config/export", "get", "200");
     let mut export_fields = strings(EXPORT_FIELDS_READ);
     export_fields.extend(strings(EXPORT_FIELDS_IGNORED));
     export_fields.extend(SECTIONS.iter().map(|(section, _)| section.to_string()));
     let export = shape(schemas, export_schema, 0);
     compare_sets(
         &mut problems,
-        "ConfigExportResponse",
+        "GET /config/export 200",
         &export.properties.keys().cloned().collect(),
         &export_fields,
     );
@@ -793,7 +892,7 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
         let redaction = shape(schemas, redaction, 0);
         compare_sets(
             &mut problems,
-            "ConfigExportResponse.redaction",
+            "GET /config/export 200.redaction",
             &redaction.properties.keys().cloned().collect(),
             &strings(EXPORT_REDACTION_FIELDS),
         );
@@ -802,10 +901,15 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
             ("fingerprint_prefix", FINGERPRINT_PREFIX),
         ] {
             if let Some(property) = redaction.properties.get(field) {
-                let values = enum_values(schemas, property);
+                let values = string_enum_values(
+                    schemas,
+                    property,
+                    &format!("GET /config/export 200.redaction.{field}"),
+                    &mut problems,
+                );
                 if values != BTreeSet::from([expected.to_string()]) {
                     problems.push(format!(
-                        "ConfigExportResponse.redaction.{field}: Edge documents {values:?}, \
+                        "GET /config/export 200.redaction.{field}: Edge documents {values:?}, \
                          GitForgeOps understands only {expected:?}"
                     ));
                 }
@@ -815,7 +919,7 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
     if let Some(counts) = export.properties.get("counts") {
         compare_sets(
             &mut problems,
-            "ConfigExportResponse.counts",
+            "GET /config/export 200.counts",
             &declared_names(schemas, counts),
             &SECTIONS
                 .iter()
@@ -823,19 +927,41 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
                 .collect(),
         );
     }
-    let consumer_export = declared_names(schemas, named(schemas, "ConsumerExport"));
+    let consumer_export_schema = export
+        .properties
+        .get("consumers")
+        .and_then(|consumers| shape(schemas, consumers, 0).items);
+    let Some(consumer_export_schema) = consumer_export_schema else {
+        problems.push("GET /config/export 200.consumers: not an array of consumers".to_string());
+        panic!(
+            "Ferrum Edge's openapi.yaml differs from GitForgeOps' backup, restore and export \
+             copies:\n{}",
+            problems.join("\n")
+        );
+    };
+    let consumer_export_shape = shape(schemas, consumer_export_schema, 0);
+    let consumer_export: BTreeSet<String> =
+        consumer_export_shape.properties.keys().cloned().collect();
     for field in [HIDDEN_CREDENTIALS_FIELD, "credentials"] {
         if !consumer_export.contains(field) {
             problems.push(format!(
-                "ConsumerExport: GitForgeOps reads `{field}`, which Edge no longer documents"
+                "GET /config/export 200.consumers[]: GitForgeOps reads `{field}`, which Edge no \
+                 longer documents"
             ));
         }
     }
-    let fingerprinted = shape(
-        schemas,
-        named(schemas, "ConsumerCredentialsFingerprinted"),
-        0,
-    );
+    let Some(fingerprinted_schema) = consumer_export_shape.properties.get("credentials") else {
+        problems.push(
+            "GET /config/export 200.consumers[].credentials: missing credentials schema"
+                .to_string(),
+        );
+        panic!(
+            "Ferrum Edge's openapi.yaml differs from GitForgeOps' backup, restore and export \
+             copies:\n{}",
+            problems.join("\n")
+        );
+    };
+    let fingerprinted = shape(schemas, fingerprinted_schema, 0);
     if fingerprinted.additional != Some(&Value::Bool(false)) {
         problems.push(
             "ConsumerCredentialsFingerprinted: Edge no longer omits unknown credential types; \
@@ -889,13 +1015,24 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
              FINGERPRINTED_CREDENTIAL_FIELDS lists {fingerprint_fields:?}"
         ));
     }
-    compare_sets(
-        &mut problems,
-        "ConsumerCredentialsInput (credential types)",
-        &declared_names(schemas, named(schemas, "ConsumerCredentialsInput")),
-        &strings(&KNOWN_CREDENTIAL_TYPES),
-    );
-    credential_entry_shape_problems(schemas, &mut problems);
+    let consumer_create_schema = operation_request_json_schema(&spec, "/consumers", "post");
+    match shape(schemas, consumer_create_schema, 0)
+        .properties
+        .get("credentials")
+    {
+        Some(credentials_input) => {
+            compare_sets(
+                &mut problems,
+                "POST /consumers requestBody.credentials (credential types)",
+                &declared_names(schemas, credentials_input),
+                &strings(&KNOWN_CREDENTIAL_TYPES),
+            );
+            credential_entry_shape_problems(schemas, credentials_input, &mut problems);
+        }
+        None => problems.push(
+            "POST /consumers requestBody: Edge no longer documents `credentials`".to_string(),
+        ),
+    }
 
     println!(
         "{COMPARED_MARKER} envelopes ({} difference(s))",

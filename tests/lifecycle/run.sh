@@ -45,7 +45,13 @@ command -v "${FERRUM_EDGE_BINARY_PATH:-ferrum-edge}" >/dev/null || {
 }
 
 # Disposable credentials. Generated per run, never persisted, never reused.
-FERRUM_ADMIN_JWT_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n=/+' | head -c 48)"
+# With LIFECYCLE_GATEWAY_EXTERNAL=1, keep a caller-supplied admin JWT secret
+# instead of overwriting it so the harness authenticates to the external gateway.
+if [ -n "${LIFECYCLE_GATEWAY_EXTERNAL:-}" ]; then
+  FERRUM_ADMIN_JWT_SECRET="${FERRUM_ADMIN_JWT_SECRET:-$(head -c 48 /dev/urandom | base64 | tr -d '\n=/+' | head -c 48)}"
+else
+  FERRUM_ADMIN_JWT_SECRET="$(head -c 48 /dev/urandom | base64 | tr -d '\n=/+' | head -c 48)"
+fi
 GITFORGEOPS_LIFECYCLE_CONSUMER_KEY="$(head -c 32 /dev/urandom | base64 | tr -d '\n=/+' | head -c 32)"
 # The gateway's viewer-token secret, so `edge-contract-copies` can read
 # `GET /config/export` the way `diff` does with FERRUM_ADMIN_JWT_VIEWER_SECRET.

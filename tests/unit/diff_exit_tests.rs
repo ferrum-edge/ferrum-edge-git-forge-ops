@@ -2018,3 +2018,72 @@ fn diff_tolerates_short_live_settings_only_heuristics_flag() {
     assert!(!shown.contains("shorter than 8 bytes"), "{shown}");
     assert!(!shown.contains(KEY), "{shown}");
 }
+
+#[test]
+fn admin_diff_converges_basicauth_password_against_live_hash_while_preserving_real_drift() {
+    use gitforgeops::config::schema::Consumer;
+    use gitforgeops::config::GatewayConfig;
+    use gitforgeops::diff::{compute_diff, count_opaque_basicauth_passwords};
+
+    let valid_hash = format!("hmac_sha256:{}", "a".repeat(64));
+    let other_hash = format!("hmac_sha256:{}", "b".repeat(64));
+    let consumer_with = |creds: serde_json::Value| {
+        let mut cfg = GatewayConfig::default();
+        let consumer: Consumer = serde_json::from_value(serde_json::json!({
+            "id": "app",
+            "namespace": "ferrum",
+            "username": "app",
+            "credentials": creds,
+        }))
+        .unwrap();
+        cfg.consumers.push(consumer);
+        cfg
+    };
+
+    // Exact 1-key plaintext password converges against a valid gateway-keyed hash.
+    let desired = consumer_with(serde_json::json!({
+        "basicauth": [{"password": "resolved-plaintext-password-012345"}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    let live = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": valid_hash}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    assert!(
+        compute_diff(&desired, &live).unwrap().is_empty(),
+        "plaintext basicauth password should converge against valid live password_hash"
+    );
+    assert_eq!(count_opaque_basicauth_passwords(&desired, &live), 1);
+
+    // Sibling credential change stays visible.
+    let live_key_changed = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": valid_hash}],
+        "keyauth": [{"key": "synthetic-different-key-9999"}],
+    }));
+    assert_eq!(compute_diff(&desired, &live_key_changed).unwrap().len(), 1);
+
+    // Malformed live hash stays visible as drift.
+    let live_bad_hash = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": "hmac_sha256:not-64-hex"}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    assert_eq!(compute_diff(&desired, &live_bad_hash).unwrap().len(), 1);
+    assert_eq!(
+        count_opaque_basicauth_passwords(&desired, &live_bad_hash),
+        0
+    );
+
+    // Entry count change stays visible as drift.
+    let live_extra_entry = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": valid_hash}, {"password_hash": other_hash}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    assert_eq!(compute_diff(&desired, &live_extra_entry).unwrap().len(), 1);
+
+    // Explicit desired password_hash is still compared verbatim.
+    let desired_hash = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": other_hash}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    assert_eq!(compute_diff(&desired_hash, &live).unwrap().len(), 1);
+}

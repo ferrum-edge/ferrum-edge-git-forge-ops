@@ -320,6 +320,81 @@ pub(crate) fn with_validation_standins_for_report(
     changed.then_some(patched)
 }
 
+/// Edge's maximum character count for a Consumer credential value
+/// (`MAX_CREDENTIAL_VALUE_LENGTH` in Edge's `src/config/types.rs`).
+const MAX_BASICAUTH_PASSWORD_CHARS: usize = 4096;
+
+/// Edge's control-character check (`contains_control_chars` in Edge's
+/// `src/config/types.rs`): rejects ASCII control bytes below 0x20 except tab,
+/// LF and CR.
+fn contains_basicauth_control_chars(value: &str) -> bool {
+    value
+        .bytes()
+        .any(|byte| byte < 0x20 && byte != b'\t' && byte != b'\n' && byte != b'\r')
+}
+
+/// Validate resolved (or literal) API-mode `basicauth` plaintext `password`
+/// values against Ferrum Edge's admission rules before
+/// [`with_admin_api_basicauth_standins`] replaces them with a `password_hash`
+/// stand-in for the file-mode validator.
+///
+/// Without this check, a resolved `alloc=require` bundle value over 4,096
+/// characters or containing an ASCII control character would pass preflight
+/// validation and fail only on the Admin API write. Returns `(slot, violation)`
+/// pairs and never includes the password value.
+pub fn validate_admin_api_basicauth_passwords(
+    config: &GatewayConfig,
+    report: Option<&ResolveReport>,
+) -> Vec<(String, &'static str)> {
+    let unresolved: BTreeSet<&str> = report
+        .into_iter()
+        .flat_map(|r| r.results.iter())
+        .filter(|result| result.status != SlotStatus::Resolved)
+        .map(|result| result.slot.as_str())
+        .collect();
+    let mut violations = Vec::new();
+    for consumer in &config.consumers {
+        let mut check_entry = |entry: &serde_json::Map<String, serde_json::Value>,
+                               mut path: Vec<ConfigPathComponent>| {
+            if entry.contains_key(PASSWORD_HASH_LEAF) {
+                return;
+            }
+            let Some(password) = entry.get("password").and_then(serde_json::Value::as_str) else {
+                return;
+            };
+            path.push(ConfigPathComponent::Key("password".to_string()));
+            let slot =
+                consumer_credential_slot(&consumer.namespace, &consumer.id, "basicauth", &path);
+            let is_unresolved = match report {
+                Some(_) => unresolved.contains(slot.as_str()),
+                None => matches!(parse_placeholder(password), Some(Ok(_))),
+            };
+            if is_unresolved {
+                return;
+            }
+            if password.is_empty() {
+                violations.push((slot, "password must not be empty"));
+            } else if password.chars().count() > MAX_BASICAUTH_PASSWORD_CHARS {
+                violations.push((slot, "password must not exceed 4096 characters"));
+            } else if contains_basicauth_control_chars(password) {
+                violations.push((slot, "password must not contain control characters"));
+            }
+        };
+        match consumer.credentials.get("basicauth") {
+            Some(serde_json::Value::Array(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    if let Some(entry) = item.as_object() {
+                        check_entry(entry, vec![ConfigPathComponent::Index(index)]);
+                    }
+                }
+            }
+            Some(serde_json::Value::Object(entry)) => check_entry(entry, Vec::new()),
+            _ => {}
+        }
+    }
+    violations
+}
+
 /// The validator's copy of an admin-API document: each `basicauth` entry's
 /// `password` becomes a `password_hash` stand-in.
 ///

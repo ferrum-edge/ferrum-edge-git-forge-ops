@@ -1894,6 +1894,17 @@ async fn cmd_diff(
         if let Some(note) = secret_report.unresolved_comparison_note() {
             eoutln!("Note: {}", safe_block(note));
         }
+        if !read_export {
+            let opaque_basicauth: usize = namespace_pairs
+                .iter()
+                .map(|pair| diff::count_opaque_basicauth_passwords(&desired, &pair.actual))
+                .sum();
+            if opaque_basicauth > 0 {
+                eoutln!(
+                    "Note: {opaque_basicauth} Consumer basicauth password entry/entries were matched by presence only against Edge's keyed password_hash on GET /backup (GitForgeOps never reads FERRUM_BASIC_AUTH_HMAC_SECRET). Use 'gitforgeops rotate' (or apply_strategy: full_replace) to push a rotated password, and viewer GET /config/export with --fingerprint-baseline to detect out-of-band gateway changes."
+                );
+            }
+        }
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
         &namespace_pairs,

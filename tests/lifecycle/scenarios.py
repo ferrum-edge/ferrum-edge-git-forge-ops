@@ -1627,6 +1627,18 @@ def _export_projection(harness: Harness) -> str:
         # and the admin API.
         harness.run("validate")
         harness.run("apply", "--auto-approve")
+        # Ordinary admin comparison (`GET /backup`) and an unchanged second
+        # incremental apply must converge even though Edge stores `basicauth`
+        # as a gateway-keyed `password_hash`.
+        admin_diff = harness.run("diff", "--exit-on-drift", expect=0)
+        if "GET /config/export" in admin_diff.stdout + admin_diff.stderr:
+            raise ScenarioFailure("admin diff unexpectedly read GET /config/export")
+        second_apply = harness.run("apply", "--auto-approve")
+        if "Consumer" in second_apply.stdout and "updated" in second_apply.stdout.lower():
+            raise ScenarioFailure(
+                "unchanged second apply unexpectedly updated the contract consumer:\n"
+                f"{second_apply.stdout}\n{second_apply.stderr}"
+            )
         _viewer_export(harness, viewer, [*seeded.values(), harness_key(harness)])
         first = harness.run("diff", "--exit-on-drift", expect=None, **through_export)
         if "GET /config/export" not in first.stdout + first.stderr:
