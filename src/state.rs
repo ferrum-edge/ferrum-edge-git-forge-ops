@@ -920,8 +920,12 @@ impl StateFile {
         }
     }
 
-    /// Update or clear a single `basicauth` array slot binding without
-    /// certifying or disturbing untouched sibling indices (used by `rotate`).
+    /// Update a single `basicauth` array slot binding without certifying or
+    /// discarding untouched sibling indices (used by `rotate`). Even if the
+    /// live `basicauth` array length differs from the previously recorded
+    /// ledger vector (e.g. an entry was appended or removed on the gateway),
+    /// bindings at surviving sibling indices are preserved and re-checked on
+    /// every subsequent comparison.
     pub fn update_consumer_basicauth_binding_at_index(
         &mut self,
         namespace: &str,
@@ -930,66 +934,41 @@ impl StateFile {
         total_len: usize,
         binding: Option<String>,
     ) {
-        let key = state_key(namespace, "Consumer", id);
+        let Some(tag) = binding else {
+            self.clear_consumer_basicauth_binding_at_index(namespace, id, index);
+            return;
+        };
         if total_len == 0 || index >= total_len {
-            self.basicauth_bindings.remove(&key);
             return;
         }
-        let mut entries = match self.basicauth_bindings.get(&key) {
-            Some(existing) if existing.len() == total_len => existing.clone(),
-            _ => vec![String::new(); total_len],
-        };
-        entries[index] = binding.unwrap_or_default();
-        if entries.iter().all(String::is_empty) {
-            self.basicauth_bindings.remove(&key);
-        } else {
+        let key = state_key(namespace, "Consumer", id);
+        let mut entries = self.basicauth_bindings.remove(&key).unwrap_or_default();
+        entries.resize(total_len, String::new());
+        entries[index] = tag;
+        if entries.iter().any(|v| !v.is_empty()) {
             self.basicauth_bindings.insert(key, entries);
         }
     }
 
-    /// Record or clear `basicauth_bindings` in `namespace` from the post-apply
-    /// live gateway backup. When `consumer_ids` is `None` (atomic full replace),
-    /// refreshes every Consumer in `namespace`; when `Some(ids)` (incremental
-    /// apply or rotation), refreshes only those Consumer IDs.
-    pub fn record_basicauth_bindings_for_namespace(
+    /// Clear a single `basicauth` array slot binding when rotation verification
+    /// fails, preserving all surviving sibling bindings and leaving the ledger
+    /// untouched when there is no stale tag at `index` to clear.
+    pub fn clear_consumer_basicauth_binding_at_index(
         &mut self,
         namespace: &str,
-        desired: &GatewayConfig,
-        live: &GatewayConfig,
-        consumer_ids: Option<&HashSet<String>>,
+        id: &str,
+        index: usize,
     ) {
-        if consumer_ids.is_none() {
-            self.basicauth_bindings.retain(|key, _| {
-                state_key_namespace(key)
-                    .map(|ns| ns != namespace)
-                    .unwrap_or(false)
-            });
-        }
-        let live_consumers: HashMap<&str, &crate::config::schema::Consumer> = live
-            .consumers
-            .iter()
-            .filter(|c| c.namespace == namespace)
-            .map(|c| (c.id.as_str(), c))
-            .collect();
-        let desired_consumers: HashMap<&str, &crate::config::schema::Consumer> = desired
-            .consumers
-            .iter()
-            .filter(|c| c.namespace == namespace)
-            .map(|c| (c.id.as_str(), c))
-            .collect();
-        let target_ids: Vec<String> = match consumer_ids {
-            Some(ids) => ids.iter().cloned().collect(),
-            None => desired_consumers
-                .keys()
-                .map(|id| (*id).to_string())
-                .collect(),
+        let key = state_key(namespace, "Consumer", id);
+        let Some(existing) = self.basicauth_bindings.get_mut(&key) else {
+            return;
         };
-        for id in target_ids {
-            let bindings = desired_consumers
-                .get(id.as_str())
-                .zip(live_consumers.get(id.as_str()))
-                .and_then(|(d, l)| crate::diff::compute_consumer_basicauth_bindings(d, l));
-            self.set_consumer_basicauth_bindings(namespace, &id, bindings);
+        if index >= existing.len() {
+            return;
+        }
+        existing[index].clear();
+        if existing.iter().all(String::is_empty) {
+            self.basicauth_bindings.remove(&key);
         }
     }
 

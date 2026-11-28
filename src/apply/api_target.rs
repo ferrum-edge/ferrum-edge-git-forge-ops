@@ -3435,7 +3435,7 @@ fn fail_adoption(
 }
 
 /// What a single successful admin call actually did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OpOutcome {
     Applied(Option<String>),
     /// Plugin writes already established the desired proxy associations.

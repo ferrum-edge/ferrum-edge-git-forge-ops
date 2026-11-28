@@ -1964,9 +1964,6 @@ enum RetryPolicy {
     Health,
 }
 
-/// A fully-read response. The body is buffered eagerly so the retry classifier
-/// can inspect it before deciding whether to re-send.
-#[derive(Clone)]
 fn response_updated_at(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     value
@@ -1976,6 +1973,9 @@ fn response_updated_at(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A fully-read response. The body is buffered eagerly so the retry classifier
+/// can inspect it before deciding whether to re-send.
+#[derive(Clone)]
 struct RawResponse {
     status: u16,
     body: String,

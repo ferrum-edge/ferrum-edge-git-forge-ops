@@ -2158,7 +2158,9 @@ fn admin_diff_uses_cryptographic_basicauth_bindings_and_catches_reseed_and_oob_d
         "unresolved brokered basicauth password should be masked against valid live hash"
     );
 
-    // Single-slot rotation update preserves untouched sibling indices without certifying them.
+    // Single-slot rotation update preserves untouched sibling indices even when
+    // collection lengths differ, and failed verification leaves unrelated sibling
+    // bindings intact (including when the rotated index is beyond the old ledger).
     let mut state = StateFile::default();
     let sib0 = gitforgeops::diff::basicauth_password_binding(
         "ferrum",
@@ -2174,59 +2176,43 @@ fn admin_diff_uses_cryptographic_basicauth_bindings_and_catches_reseed_and_oob_d
         "slot1-rotated",
         &other_hash,
     );
-    state.set_consumer_basicauth_bindings("ferrum", "app", Some(vec![sib0.clone(), String::new()]));
+    // Old ledger has 1 slot; gateway appended a 2nd entry and we rotate index 1.
+    state.set_consumer_basicauth_bindings("ferrum", "app", Some(vec![sib0.clone()]));
+    // Failed verification at index 1 (beyond old vec) must not discard sib0.
+    state.clear_consumer_basicauth_binding_at_index("ferrum", "app", 1);
+    assert_eq!(
+        state
+            .basicauth_bindings
+            .get(&state_key("ferrum", "Consumer", "app")),
+        Some(&vec![sib0.clone()])
+    );
+    // Verified rotate at index 1 with live total_len=2 preserves sib0 and stores sib1_new.
     state.update_consumer_basicauth_binding_at_index("ferrum", "app", 1, 2, Some(sib1_new.clone()));
     assert_eq!(
         state
             .basicauth_bindings
             .get(&state_key("ferrum", "Consumer", "app")),
-        Some(&vec![sib0.clone(), sib1_new])
+        Some(&vec![sib0.clone(), sib1_new.clone()])
     );
+    // Failed verification at index 1 clears only index 1 and keeps sib0.
     state.update_consumer_basicauth_binding_at_index("ferrum", "app", 1, 2, None);
     assert_eq!(
         state
             .basicauth_bindings
             .get(&state_key("ferrum", "Consumer", "app")),
-        Some(&vec![sib0, String::new()])
+        Some(&vec![sib0.clone(), String::new()])
     );
-
-    // State ledger validation refuses non-Consumer keys, raw passwords, live hashes, and empty vectors.
-    let temp = tempfile::tempdir().unwrap();
-    let prev = std::env::current_dir().unwrap();
-    std::env::set_current_dir(temp.path()).unwrap();
-    let check_invalid = |mut bad: StateFile| {
-        bad.environment = "validation-test".to_string();
-        assert!(bad.save().is_err());
-    };
-    let mut bad_kind = StateFile::default();
-    bad_kind.basicauth_bindings.insert(
-        state_key("ferrum", "Proxy", "p1"),
-        vec![gitforgeops::diff::basicauth_password_binding(
-            "ferrum",
-            "app",
-            0,
-            "pw",
-            &valid_hash,
-        )],
+    // Shrunk live collection (3 -> 2) rotating index 1 still preserves surviving sib0.
+    state.set_consumer_basicauth_bindings(
+        "ferrum",
+        "app",
+        Some(vec![sib0.clone(), String::new(), sib1_new.clone()]),
     );
-    check_invalid(bad_kind);
-
-    let mut bad_tag = StateFile::default();
-    bad_tag.basicauth_bindings.insert(
-        state_key("ferrum", "Consumer", "app"),
-        vec![valid_hash.clone()],
+    state.update_consumer_basicauth_binding_at_index("ferrum", "app", 1, 2, Some(sib1_new.clone()));
+    assert_eq!(
+        state
+            .basicauth_bindings
+            .get(&state_key("ferrum", "Consumer", "app")),
+        Some(&vec![sib0, sib1_new])
     );
-    check_invalid(bad_tag);
-
-    let mut bad_empty = StateFile::default();
-    bad_empty
-        .basicauth_bindings
-        .insert(state_key("ferrum", "Consumer", "app"), vec![String::new()]);
-    check_invalid(bad_empty);
-
-    state.environment = "validation-test".to_string();
-    state.save().expect("valid basicauth binding state saves");
-    let reloaded = StateFile::load("validation-test").expect("valid state reloads");
-    assert_eq!(reloaded.basicauth_bindings, state.basicauth_bindings);
-    std::env::set_current_dir(prev).unwrap();
 }

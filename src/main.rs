@@ -3718,19 +3718,22 @@ async fn cmd_apply(
                     .await
                 {
                     Ok(Some(evidence)) => {
-                        let live_updated_at = evidence
+                        let updated_at_matches = evidence
                             .row
                             .get("updated_at")
-                            .and_then(serde_json::Value::as_str);
-                        let live_consumer =
-                            serde_json::from_value::<config::schema::Consumer>(evidence.row);
+                            .and_then(serde_json::Value::as_str)
+                            == Some(expected_updated_at.as_str());
+                        let live_consumer = if updated_at_matches {
+                            serde_json::from_value::<config::schema::Consumer>(evidence.row).ok()
+                        } else {
+                            None
+                        };
                         match live_consumer {
-                            Ok(live)
-                                if live_updated_at == Some(expected_updated_at.as_str())
-                                    && diff::consumer_matches_desired_except_basicauth(
-                                        desired_consumer,
-                                        &live,
-                                    ) =>
+                            Some(live)
+                                if diff::consumer_matches_desired_except_basicauth(
+                                    desired_consumer,
+                                    &live,
+                                ) =>
                             {
                                 let bindings = diff::compute_consumer_basicauth_bindings(
                                     desired_consumer,
@@ -5090,24 +5093,21 @@ async fn cmd_rotate(
             );
             if let Some(rot_idx) = basicauth_index {
                 let mut refreshed = false;
-                let mut known_len: Option<usize> = None;
                 if let Some(expected_updated_at) = written_updated_at.as_deref() {
                     match gateway_client.get_consumer_verification(consumer, ns).await {
                         Ok(Some(evidence)) => {
-                            let live_updated_at = evidence
+                            let updated_at_matches = evidence
                                 .row
                                 .get("updated_at")
-                                .and_then(serde_json::Value::as_str);
-                            if live_updated_at == Some(expected_updated_at)
-                                && evidence.token.as_str() != pre_rotate_token
-                            {
+                                .and_then(serde_json::Value::as_str)
+                                == Some(expected_updated_at);
+                            if updated_at_matches && evidence.token.as_str() != pre_rotate_token {
                                 if let Ok(live) =
                                     serde_json::from_value::<config::schema::Consumer>(evidence.row)
                                 {
                                     if let Some((total_len, live_hash)) =
                                         diff::extract_basicauth_password_hash_at(&live, rot_idx)
                                     {
-                                        known_len = Some(total_len);
                                         let binding = diff::basicauth_password_binding(
                                             ns,
                                             consumer,
@@ -5139,16 +5139,7 @@ async fn cmd_rotate(
                     }
                 }
                 if !refreshed {
-                    let key = diff::state_key(ns, "Consumer", consumer);
-                    let total_len =
-                        known_len.or_else(|| state.basicauth_bindings.get(&key).map(Vec::len));
-                    if let Some(len) = total_len {
-                        state.update_consumer_basicauth_binding_at_index(
-                            ns, consumer, rot_idx, len, None,
-                        );
-                    } else {
-                        state.set_consumer_basicauth_bindings(ns, consumer, None);
-                    }
+                    state.clear_consumer_basicauth_binding_at_index(ns, consumer, rot_idx);
                 }
             }
             state.save()?;
