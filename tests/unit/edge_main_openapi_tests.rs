@@ -677,6 +677,58 @@ fn credential_entry_shape_problems(
     }
 }
 
+fn check_api_specs_section_schema(
+    schemas: &Map<String, Value>,
+    parent_shape: &Shape<'_>,
+    parent_label: &str,
+    problems: &mut Vec<String>,
+) {
+    match parent_shape.properties.get("api_specs") {
+        Some(api_specs) => {
+            let api_specs_shape = shape(schemas, api_specs, 0);
+            compare_sets(
+                problems,
+                &format!("{parent_label}.api_specs"),
+                &api_specs_shape.properties.keys().cloned().collect(),
+                &strings(&["items", "section_version"]),
+            );
+            match api_specs_shape.properties.get("section_version") {
+                Some(version) => {
+                    let version_schema = resolve(schemas, version);
+                    let values = string_enum_values(
+                        schemas,
+                        version_schema,
+                        &format!("{parent_label}.api_specs.section_version"),
+                        problems,
+                    );
+                    for value in values {
+                        if value != "2" {
+                            problems.push(format!(
+                                "{parent_label}.api_specs.section_version: Edge allows {value:?}; \
+                                 GitForgeOps expects only \"2\""
+                            ));
+                        }
+                    }
+                    if let Some(example) = version_schema.get("example") {
+                        if example.as_str() != Some("2") {
+                            problems.push(format!(
+                                "{parent_label}.api_specs.section_version: Edge documents example \
+                                 {example}; GitForgeOps expects only \"2\""
+                            ));
+                        }
+                    }
+                }
+                None => problems.push(format!(
+                    "{parent_label}.api_specs: Edge no longer documents `section_version`"
+                )),
+            }
+        }
+        None => problems.push(format!(
+            "{parent_label}: Edge no longer documents `api_specs`"
+        )),
+    }
+}
+
 #[test]
 fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
     use gitforgeops::config::schema::{GatewayConfig, KNOWN_CREDENTIAL_TYPES};
@@ -714,49 +766,7 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
         &backup,
         &strings(CONDITIONAL_BACKUP_FIELDS),
     );
-    match backup_shape.properties.get("api_specs") {
-        Some(api_specs) => {
-            let api_specs_shape = shape(schemas, api_specs, 0);
-            compare_sets(
-                &mut problems,
-                "GET /backup 200.api_specs",
-                &api_specs_shape.properties.keys().cloned().collect(),
-                &strings(&["items", "section_version"]),
-            );
-            match api_specs_shape.properties.get("section_version") {
-                Some(version) => {
-                    let version_schema = resolve(schemas, version);
-                    let values = string_enum_values(
-                        schemas,
-                        version_schema,
-                        "GET /backup 200.api_specs.section_version",
-                        &mut problems,
-                    );
-                    for value in values {
-                        if value != "2" {
-                            problems.push(format!(
-                                "GET /backup 200.api_specs.section_version: Edge allows {value:?}; \
-                                 the conditional decode accepts only \"2\""
-                            ));
-                        }
-                    }
-                    if let Some(example) = version_schema.get("example") {
-                        if example.as_str() != Some("2") {
-                            problems.push(format!(
-                                "GET /backup 200.api_specs.section_version: Edge documents example \
-                                 {example}; the conditional decode accepts only \"2\""
-                            ));
-                        }
-                    }
-                }
-                None => problems.push(
-                    "GET /backup 200.api_specs: Edge no longer documents `section_version`"
-                        .to_string(),
-                ),
-            }
-        }
-        None => problems.push("GET /backup 200: Edge no longer documents `api_specs`".to_string()),
-    }
+    check_api_specs_section_schema(schemas, &backup_shape, "GET /backup 200", &mut problems);
     match backup_shape.properties.get("conditional") {
         Some(conditional) => compare_sets(
             &mut problems,
@@ -771,7 +781,8 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
 
     // `POST /restore`: resolve request and 200 response directly from `paths`.
     let restore_req_schema = operation_request_json_schema(&spec, "/restore", "post");
-    let restore = declared_names(schemas, restore_req_schema);
+    let restore_req_shape = shape(schemas, restore_req_schema, 0);
+    let restore: BTreeSet<String> = restore_req_shape.properties.keys().cloned().collect();
     let sent = serde_json::to_value(GatewayConfig::default()).expect("serialize GatewayConfig");
     let mut handled: BTreeSet<String> = sent
         .as_object()
@@ -786,6 +797,12 @@ fn edge_main_openapi_matches_the_backup_restore_and_export_copies() {
         "POST /restore requestBody",
         &restore,
         &handled,
+    );
+    check_api_specs_section_schema(
+        schemas,
+        &restore_req_shape,
+        "POST /restore requestBody",
+        &mut problems,
     );
 
     // The success response's count seal (`conditional::RESTORE_SEAL_SECTIONS`).

@@ -1634,9 +1634,12 @@ def _export_projection(harness: Harness) -> str:
         if "GET /config/export" in admin_diff.stdout + admin_diff.stderr:
             raise ScenarioFailure("admin diff unexpectedly read GET /config/export")
         second_apply = harness.run("apply", "--auto-approve")
-        if "Consumer" in second_apply.stdout and "updated" in second_apply.stdout.lower():
+        if (
+            "No changes to apply." not in second_apply.stdout
+            and "Applied: 0 created, 0 updated, 0 deleted" not in second_apply.stdout
+        ):
             raise ScenarioFailure(
-                "unchanged second apply unexpectedly updated the contract consumer:\n"
+                "unchanged second apply unexpectedly mutated gateway resources:\n"
                 f"{second_apply.stdout}\n{second_apply.stderr}"
             )
         _viewer_export(harness, viewer, [*seeded.values(), harness_key(harness)])
@@ -1693,6 +1696,26 @@ def _export_projection(harness: Harness) -> str:
                 f"{rotated.stdout}\n{rotated.stderr}"
             )
         _brokered_basicauth_authenticates(harness, password)
+        # Reseeding the basicauth password in the bundle must break the
+        # cryptographic state binding, surface drift on admin `diff`, push the
+        # new password on incremental `apply`, and authenticate the new value.
+        password2 = _disposable_secret(harness)
+        creds["FERRUM_CREDS_BUNDLE"][f"{NAMESPACE}/{CONTRACT_CONSUMER}/basicauth/password"] = password2
+        creds_path.write_text(json.dumps(creds), encoding="utf-8")
+        reseed_diff = harness.run("diff", "--exit-on-drift", expect=2)
+        if CONTRACT_CONSUMER not in reseed_diff.stdout:
+            raise ScenarioFailure(
+                "reseeded basicauth password did not report Consumer drift:\n"
+                f"{reseed_diff.stdout}\n{reseed_diff.stderr}"
+            )
+        reseed_apply = harness.run("apply", "--auto-approve")
+        if "Applied: 0 created, 1 updated, 0 deleted" not in reseed_apply.stdout:
+            raise ScenarioFailure(
+                "incremental apply after basicauth reseed did not update the Consumer:\n"
+                f"{reseed_apply.stdout}\n{reseed_apply.stderr}"
+            )
+        harness.run("diff", "--exit-on-drift", expect=0)
+        _brokered_basicauth_authenticates(harness, password2)
     finally:
         baseline.unlink(missing_ok=True)
         harness.remove(consumer)

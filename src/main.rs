@@ -1890,20 +1890,16 @@ async fn cmd_diff(
     if cached_namespaces.is_empty() {
         for pair in &mut namespace_pairs {
             diff::mask_indeterminate_secret_values(&desired, &mut pair.actual, &secret_report);
+            if !read_export {
+                diff::align_verified_basicauth_bindings(
+                    &desired,
+                    &mut pair.actual,
+                    &state.basicauth_bindings,
+                );
+            }
         }
         if let Some(note) = secret_report.unresolved_comparison_note() {
             eoutln!("Note: {}", safe_block(note));
-        }
-        if !read_export {
-            let opaque_basicauth: usize = namespace_pairs
-                .iter()
-                .map(|pair| diff::count_opaque_basicauth_passwords(&desired, &pair.actual))
-                .sum();
-            if opaque_basicauth > 0 {
-                eoutln!(
-                    "Note: {opaque_basicauth} Consumer basicauth password entry/entries were matched by presence only against Edge's keyed password_hash on GET /backup (GitForgeOps never reads FERRUM_BASIC_AUTH_HMAC_SECRET). Use 'gitforgeops rotate' (or apply_strategy: full_replace) to push a rotated password, and viewer GET /config/export with --fingerprint-baseline to detect out-of-band gateway changes."
-                );
-            }
         }
     }
     let (diffs, _breaking, unmanaged, spec_owned) = compute_namespace_diffs(
@@ -2375,6 +2371,11 @@ async fn cmd_plan(
                             &desired,
                             &mut pair.actual,
                             &secret_report,
+                        );
+                        diff::align_verified_basicauth_bindings(
+                            &desired,
+                            &mut pair.actual,
+                            &state.basicauth_bindings,
                         );
                     }
                     let (mut d, b, u, s) = compute_namespace_diffs(
@@ -3109,6 +3110,8 @@ async fn cmd_apply(
     // changing anything.
     let mut adopted_ops: Vec<apply::AppliedOp> = Vec::new();
     let mut fully_replaced: Vec<String> = Vec::new();
+    let mut post_apply_live: BTreeMap<String, GatewayConfig> = BTreeMap::new();
+    let mut basicauth_refresh_targets: BTreeMap<String, Option<HashSet<String>>> = BTreeMap::new();
 
     // Set by the file-mode arm below: mesh is file-only, and an api-mode
     // apply neither publishes nor retracts the document.
@@ -3133,10 +3136,17 @@ async fn cmd_apply(
 
             if !auto_approve {
                 let managed = previously_managed(&resolved, &state);
-                let namespace_pairs =
+                let mut namespace_pairs =
                     load_namespace_pairs_for(&client, &desired, &namespaces).await?;
                 if let Some(message) = apply::stale_view_block(client.served_from_cache()) {
                     return Err(gitforgeops::error::Error::StaleGatewayView(message).into());
+                }
+                for pair in &mut namespace_pairs {
+                    diff::align_verified_basicauth_bindings(
+                        &desired,
+                        &mut pair.actual,
+                        &state.basicauth_bindings,
+                    );
                 }
                 let (mut diffs, _, unmanaged, spec_owned) = compute_namespace_diffs(
                     &namespace_pairs,
@@ -3324,6 +3334,11 @@ async fn cmd_apply(
                     } else {
                         client.get_backup_snapshot_for_mutation(namespace).await?
                     };
+                diff::align_verified_basicauth_bindings(
+                    &desired,
+                    &mut snapshot.config,
+                    &state.basicauth_bindings,
+                );
                 if matches!(resolved.apply_strategy, config::ApplyStrategy::Incremental) {
                     let targets = apply::api_target::consumer_evidence_targets(
                         &desired,
@@ -3663,6 +3678,48 @@ async fn cmd_apply(
             adopted_ops = std::mem::take(&mut raw.adopted);
             fully_replaced = std::mem::take(&mut raw.fully_replaced_namespaces);
 
+            // Identify namespaces whose applied Consumers need fresh cryptographic
+            // basicauth bindings from the post-apply gateway hashes. Only namespaces
+            // that actually have touched plaintext-basicauth Consumers trigger a
+            // post-apply read; Consumers that stopped using plaintext basicauth are
+            // still recorded as targets so their old binding is cleared.
+            for ns in &fully_replaced {
+                basicauth_refresh_targets.insert(ns.clone(), None);
+            }
+            for op in successful_ops.iter().chain(adopted_ops.iter()) {
+                if op.kind == "Consumer"
+                    && matches!(op.action, diff::DiffAction::Add | diff::DiffAction::Modify)
+                {
+                    let entry = basicauth_refresh_targets
+                        .entry(op.namespace.clone())
+                        .or_insert_with(|| Some(HashSet::new()));
+                    if let Some(ids) = entry {
+                        ids.insert(op.id.clone());
+                    }
+                }
+            }
+            for (ns, target_ids) in &basicauth_refresh_targets {
+                let needs_read = desired.consumers.iter().any(|c| {
+                    c.namespace == *ns
+                        && diff::consumer_has_plaintext_basicauth(c)
+                        && target_ids.as_ref().is_none_or(|ids| ids.contains(&c.id))
+                });
+                if needs_read {
+                    match client.get_complete_backup(ns).await {
+                        Ok(live) => {
+                            post_apply_live.insert(ns.clone(), live);
+                        }
+                        Err(err) => {
+                            eoutln!(
+                                "Warning: could not refresh basicauth password bindings for namespace '{}': {}. Previous bindings for updated consumers will be cleared so the next diff/apply treats them as drift.",
+                                safe(ns),
+                                safe_line(err.to_string())
+                            );
+                        }
+                    }
+                }
+            }
+
             // Defer propagation: record state for the successful portion
             // first, then surface the failure summary at the end of cmd_apply.
             // This is the *only* path a failure takes now — apply_api reports
@@ -3831,6 +3888,20 @@ async fn cmd_apply(
             // covered it and a later removal from the repository pruned nothing.
             for op in &adopted_ops {
                 state.record_op(op, &desired_keys)?;
+            }
+            for (ns, target_ids) in &basicauth_refresh_targets {
+                if let Some(live) = post_apply_live.get(ns) {
+                    state.record_basicauth_bindings_for_namespace(
+                        ns,
+                        &desired,
+                        live,
+                        target_ids.as_ref(),
+                    );
+                } else if let Some(ids) = target_ids {
+                    for id in ids {
+                        state.set_consumer_basicauth_bindings(ns, id, None);
+                    }
+                }
             }
             state.stamp_last_applied_if_clean(deferred_apply_error.is_none());
         }
@@ -4107,6 +4178,11 @@ async fn cmd_review(
                                     &desired,
                                     &mut pair.actual,
                                     &secret_report,
+                                );
+                                diff::align_verified_basicauth_bindings(
+                                    &desired,
+                                    &mut pair.actual,
+                                    &state.basicauth_bindings,
                                 );
                             }
                             let (mut d, b, u, s) = compute_namespace_diffs(
@@ -4978,6 +5054,38 @@ async fn cmd_rotate(
                 outcome.delivered.as_ref().map(|d| d.login.as_str()),
                 std::env::var("GITHUB_RUN_ID").ok().as_deref(),
             );
+            if credential.starts_with("basicauth") {
+                state.set_consumer_basicauth_bindings(ns, consumer, None);
+                let mut rotated_desired = desired_for_check.clone();
+                if secrets::resolve_secrets_with_options(
+                    &mut rotated_desired,
+                    &updated_bundle,
+                    resolve_options,
+                )
+                .is_ok()
+                {
+                    match gateway_client.get_complete_backup(ns).await {
+                        Ok(live) => {
+                            let mut ids = HashSet::new();
+                            ids.insert(consumer.to_string());
+                            state.record_basicauth_bindings_for_namespace(
+                                ns,
+                                &rotated_desired,
+                                &live,
+                                Some(&ids),
+                            );
+                        }
+                        Err(err) => {
+                            eoutln!(
+                                "Warning: rotated basicauth password on gateway, but could not refresh state binding for '{}/{}': {}. The next admin diff/apply will treat it as drift until refreshed.",
+                                safe(ns),
+                                safe(consumer),
+                                safe_line(err.to_string())
+                            );
+                        }
+                    }
+                }
+            }
             state.save()?;
             outln!("Rotated slot {} in shard {}", safe(&slot), outcome.shard);
             outln!(

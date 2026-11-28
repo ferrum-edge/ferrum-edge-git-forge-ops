@@ -200,6 +200,12 @@ pub struct StateFile {
     /// not where it lives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh_document_path: Option<String>,
+    /// Non-secret cryptographic bindings (`HMAC-SHA256(key = live password_hash,
+    /// msg = domain || password)`) for API-mode Consumer `basicauth[].password`
+    /// entries recorded on successful apply/rotate. Never holds plaintext
+    /// passwords or gateway hashes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub basicauth_bindings: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -278,6 +284,7 @@ impl Default for StateFile {
             credential_shard_count: default_shard_count(),
             overrides: Vec::new(),
             mesh_document_path: None,
+            basicauth_bindings: BTreeMap::new(),
         }
     }
 }
@@ -354,7 +361,12 @@ impl StateFile {
     }
 
     fn validate_resource_keys(&self) -> crate::error::Result<()> {
-        for key in self.resources.keys().chain(self.pending_creates.iter()) {
+        for key in self
+            .resources
+            .keys()
+            .chain(self.pending_creates.iter())
+            .chain(self.basicauth_bindings.keys())
+        {
             if state_key_namespace(key).is_none() {
                 return Err(crate::error::Error::Config(format!(
                     "state file contains invalid resource key {key:?}; expected __gitforgeops_state_key_v2:<namespace>:<kind>:<id>"
@@ -444,6 +456,11 @@ impl StateFile {
                 .map(|ns| !scope.contains(ns.as_str()))
                 .unwrap_or(false)
         });
+        self.basicauth_bindings.retain(|key, _| {
+            state_key_namespace(key)
+                .map(|ns| !scope.contains(ns.as_str()))
+                .unwrap_or(false)
+        });
 
         for proxy in &config.proxies {
             if !scope.contains(proxy.namespace.as_str()) {
@@ -504,6 +521,7 @@ impl StateFile {
             DiffAction::Delete => {
                 self.resources.remove(&key);
                 self.pending_creates.remove(&key);
+                self.basicauth_bindings.remove(&key);
             }
             DiffAction::Add | DiffAction::Modify => {
                 if desired.contains(&key) {
@@ -693,6 +711,16 @@ impl StateFile {
                     .or_insert_with(|| ResourceKeys::from_config(actual))
                     .contains(key)
         });
+        let resources = &self.resources;
+        self.basicauth_bindings.retain(|key, _| {
+            let Some(namespace) = state_key_namespace(key) else {
+                return true;
+            };
+            if !actual_by_namespace.contains_key(&namespace) {
+                return true;
+            }
+            resources.contains_key(key)
+        });
         before.saturating_sub(self.resources.len())
     }
 
@@ -707,6 +735,11 @@ impl StateFile {
                 .unwrap_or(false)
         });
         self.pending_creates.retain(|key| {
+            state_key_namespace(key)
+                .map(|ns| ns != namespace)
+                .unwrap_or(false)
+        });
+        self.basicauth_bindings.retain(|key, _| {
             state_key_namespace(key)
                 .map(|ns| ns != namespace)
                 .unwrap_or(false)
@@ -851,6 +884,69 @@ impl StateFile {
     /// just wrote as somebody else's file.
     pub fn record_mesh_publication(&mut self, output_path: &str) {
         self.mesh_document_path = Some(output_path.to_string());
+    }
+
+    pub fn set_consumer_basicauth_bindings(
+        &mut self,
+        namespace: &str,
+        id: &str,
+        bindings: Option<Vec<String>>,
+    ) {
+        let key = state_key(namespace, "Consumer", id);
+        match bindings {
+            Some(values) if !values.is_empty() => {
+                self.basicauth_bindings.insert(key, values);
+            }
+            _ => {
+                self.basicauth_bindings.remove(&key);
+            }
+        }
+    }
+
+    /// Record or clear `basicauth_bindings` in `namespace` from the post-apply
+    /// live gateway backup. When `consumer_ids` is `None` (atomic full replace),
+    /// refreshes every Consumer in `namespace`; when `Some(ids)` (incremental
+    /// apply or rotation), refreshes only those Consumer IDs.
+    pub fn record_basicauth_bindings_for_namespace(
+        &mut self,
+        namespace: &str,
+        desired: &GatewayConfig,
+        live: &GatewayConfig,
+        consumer_ids: Option<&HashSet<String>>,
+    ) {
+        if consumer_ids.is_none() {
+            self.basicauth_bindings.retain(|key, _| {
+                state_key_namespace(key)
+                    .map(|ns| ns != namespace)
+                    .unwrap_or(false)
+            });
+        }
+        let live_consumers: HashMap<&str, &crate::config::schema::Consumer> = live
+            .consumers
+            .iter()
+            .filter(|c| c.namespace == namespace)
+            .map(|c| (c.id.as_str(), c))
+            .collect();
+        let desired_consumers: HashMap<&str, &crate::config::schema::Consumer> = desired
+            .consumers
+            .iter()
+            .filter(|c| c.namespace == namespace)
+            .map(|c| (c.id.as_str(), c))
+            .collect();
+        let target_ids: Vec<String> = match consumer_ids {
+            Some(ids) => ids.iter().cloned().collect(),
+            None => desired_consumers
+                .keys()
+                .map(|id| (*id).to_string())
+                .collect(),
+        };
+        for id in target_ids {
+            let bindings = desired_consumers
+                .get(id.as_str())
+                .zip(live_consumers.get(id.as_str()))
+                .and_then(|(d, l)| crate::diff::compute_consumer_basicauth_bindings(d, l));
+            self.set_consumer_basicauth_bindings(namespace, &id, bindings);
+        }
     }
 
     pub fn previously_managed_keys(&self) -> std::collections::HashSet<String> {

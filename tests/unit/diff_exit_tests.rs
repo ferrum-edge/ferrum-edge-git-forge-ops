@@ -2020,10 +2020,15 @@ fn diff_tolerates_short_live_settings_only_heuristics_flag() {
 }
 
 #[test]
-fn admin_diff_converges_basicauth_password_against_live_hash_while_preserving_real_drift() {
+fn admin_diff_uses_cryptographic_basicauth_bindings_and_catches_reseed_and_oob_drift() {
     use gitforgeops::config::schema::Consumer;
     use gitforgeops::config::GatewayConfig;
-    use gitforgeops::diff::{compute_diff, count_opaque_basicauth_passwords};
+    use gitforgeops::diff::{
+        align_verified_basicauth_bindings, compute_consumer_basicauth_bindings, compute_diff,
+        mask_indeterminate_secret_values,
+    };
+    use gitforgeops::secrets::report_secrets;
+    use std::collections::BTreeMap;
 
     let valid_hash = format!("hmac_sha256:{}", "a".repeat(64));
     let other_hash = format!("hmac_sha256:{}", "b".repeat(64));
@@ -2040,7 +2045,6 @@ fn admin_diff_converges_basicauth_password_against_live_hash_while_preserving_re
         cfg
     };
 
-    // Exact 1-key plaintext password converges against a valid gateway-keyed hash.
     let desired = consumer_with(serde_json::json!({
         "basicauth": [{"password": "resolved-plaintext-password-012345"}],
         "keyauth": [{"key": "synthetic-key-value-0001"}],
@@ -2049,35 +2053,86 @@ fn admin_diff_converges_basicauth_password_against_live_hash_while_preserving_re
         "basicauth": [{"password_hash": valid_hash}],
         "keyauth": [{"key": "synthetic-key-value-0001"}],
     }));
-    assert!(
-        compute_diff(&desired, &live).unwrap().is_empty(),
-        "plaintext basicauth password should converge against valid live password_hash"
-    );
-    assert_eq!(count_opaque_basicauth_passwords(&desired, &live), 1);
 
-    // Sibling credential change stays visible.
-    let live_key_changed = consumer_with(serde_json::json!({
+    // Without a recorded binding, raw diff reports drift (fail-closed).
+    assert_eq!(
+        compute_diff(&desired, &live).unwrap().len(),
+        1,
+        "missing basicauth binding must surface drift"
+    );
+
+    // Record the non-secret cryptographic binding from the applied (desired, live) pair.
+    let key = gitforgeops::diff::resource_diff::state_key("ferrum", "Consumer", "app");
+    let binding = compute_consumer_basicauth_bindings(&desired.consumers[0], &live.consumers[0])
+        .expect("valid plaintext/hash pair produces a binding");
+    assert!(!binding[0].contains("resolved-plaintext-password-012345"));
+    assert!(!binding[0].contains(&valid_hash));
+    let mut bindings = BTreeMap::new();
+    bindings.insert(key, binding);
+
+    // Matching (desired password, live hash, recorded binding) converges cleanly.
+    let mut aligned_live = live.clone();
+    align_verified_basicauth_bindings(&desired, &mut aligned_live, &bindings);
+    assert!(
+        compute_diff(&desired, &aligned_live).unwrap().is_empty(),
+        "verified basicauth binding should converge cleanly"
+    );
+
+    // Reseeding / changing the desired password (e.g. failed rotation push) breaks
+    // the binding and MUST surface drift so incremental apply pushes the new password.
+    let desired_reseeded = consumer_with(serde_json::json!({
+        "basicauth": [{"password": "reseeded-new-password-987654321"}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    let mut live_after_reseed = live.clone();
+    align_verified_basicauth_bindings(&desired_reseeded, &mut live_after_reseed, &bindings);
+    assert_eq!(
+        compute_diff(&desired_reseeded, &live_after_reseed)
+            .unwrap()
+            .len(),
+        1,
+        "reseeded desired password must surface drift even with an old binding"
+    );
+
+    // Out-of-band gateway password change alters the live hash and breaks the binding.
+    let mut live_oob = consumer_with(serde_json::json!({
+        "basicauth": [{"password_hash": other_hash}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    align_verified_basicauth_bindings(&desired, &mut live_oob, &bindings);
+    assert_eq!(
+        compute_diff(&desired, &live_oob).unwrap().len(),
+        1,
+        "out-of-band live password_hash change must surface drift"
+    );
+
+    // Sibling credential change stays visible even when basicauth binding matches.
+    let mut live_key_changed = consumer_with(serde_json::json!({
         "basicauth": [{"password_hash": valid_hash}],
         "keyauth": [{"key": "synthetic-different-key-9999"}],
     }));
+    align_verified_basicauth_bindings(&desired, &mut live_key_changed, &bindings);
     assert_eq!(compute_diff(&desired, &live_key_changed).unwrap().len(), 1);
 
-    // Malformed live hash stays visible as drift.
-    let live_bad_hash = consumer_with(serde_json::json!({
+    // Malformed live hash never aligns and cannot produce a binding.
+    let mut live_bad_hash = consumer_with(serde_json::json!({
         "basicauth": [{"password_hash": "hmac_sha256:not-64-hex"}],
         "keyauth": [{"key": "synthetic-key-value-0001"}],
     }));
+    assert!(compute_consumer_basicauth_bindings(
+        &desired.consumers[0],
+        &live_bad_hash.consumers[0]
+    )
+    .is_none());
+    align_verified_basicauth_bindings(&desired, &mut live_bad_hash, &bindings);
     assert_eq!(compute_diff(&desired, &live_bad_hash).unwrap().len(), 1);
-    assert_eq!(
-        count_opaque_basicauth_passwords(&desired, &live_bad_hash),
-        0
-    );
 
     // Entry count change stays visible as drift.
-    let live_extra_entry = consumer_with(serde_json::json!({
+    let mut live_extra_entry = consumer_with(serde_json::json!({
         "basicauth": [{"password_hash": valid_hash}, {"password_hash": other_hash}],
         "keyauth": [{"key": "synthetic-key-value-0001"}],
     }));
+    align_verified_basicauth_bindings(&desired, &mut live_extra_entry, &bindings);
     assert_eq!(compute_diff(&desired, &live_extra_entry).unwrap().len(), 1);
 
     // Explicit desired password_hash is still compared verbatim.
@@ -2086,4 +2141,19 @@ fn admin_diff_converges_basicauth_password_against_live_hash_while_preserving_re
         "keyauth": [{"key": "synthetic-key-value-0001"}],
     }));
     assert_eq!(compute_diff(&desired_hash, &live).unwrap().len(), 1);
+
+    // Unresolved broker placeholder is masked against a valid live hash when no bundle is loaded.
+    let desired_unresolved = consumer_with(serde_json::json!({
+        "basicauth": [{"password": "${gh-env-secret:alloc=require}"}],
+        "keyauth": [{"key": "synthetic-key-value-0001"}],
+    }));
+    let report = report_secrets(&desired_unresolved, &BTreeMap::new()).unwrap();
+    let mut masked_live = live.clone();
+    mask_indeterminate_secret_values(&desired_unresolved, &mut masked_live, &report);
+    assert!(
+        compute_diff(&desired_unresolved, &masked_live)
+            .unwrap()
+            .is_empty(),
+        "unresolved brokered basicauth password should be masked against valid live hash"
+    );
 }
