@@ -657,5 +657,9 @@ production credentials.
 `.state/<env>.json` records, per slot: `last_rotated`, `delivered_to`,
 `delivered_run_id`, and for slots `apply` allocated, `allocation_commit` and
 `allocation_recipient` (cleared by `rotate`). CI commits the ledger, so
-`git log .state/<env>.json` is the delivery history. The ledger holds no
-credential-derived hashes.
+`git log .state/<env>.json` is the delivery history. The ledger never stores
+plaintext credentials, gateway `password_hash` values, or unkeyed credential
+hashes; for API-mode Consumer `basicauth[].password` entries it stores only a
+non-secret domain-separated `HMAC-SHA256` binding keyed by the gateway's stored
+`password_hash` so admin comparisons can detect reseeds and out-of-band gateway
+edits without reading `FERRUM_BASIC_AUTH_HMAC_SECRET`.

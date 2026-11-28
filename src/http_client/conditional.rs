@@ -302,7 +302,24 @@ impl PreparedConsumerRotation {
         })
     }
 
+    pub fn basicauth_index(&self) -> Option<usize> {
+        (self.kind == "basicauth").then_some(self.index)
+    }
+
+    pub fn pre_rotate_token(&self) -> &str {
+        self.evidence.token.as_str()
+    }
+
     pub async fn publish(self, client: &super::AdminClient, value: &str) -> Result<()> {
+        let _ = self.publish_with_updated_at(client, value).await?;
+        Ok(())
+    }
+
+    pub async fn publish_with_updated_at(
+        self,
+        client: &super::AdminClient,
+        value: &str,
+    ) -> Result<Option<String>> {
         let namespace = self.evidence.row["namespace"]
             .as_str()
             .ok_or_else(invalid)?
@@ -324,7 +341,7 @@ impl PreparedConsumerRotation {
         // have it removed like any resolved secret.
         crate::display::register_values("the rotated credential", [value])?;
         match client
-            .update_if_match(
+            .update_if_match_with_updated_at(
                 "Consumer",
                 &id,
                 &row,
@@ -334,8 +351,8 @@ impl PreparedConsumerRotation {
             )
             .await?
         {
-            super::ConditionalUpdate::Applied => Ok(()),
-            super::ConditionalUpdate::Refused(_) => Err(Error::StalePlan(
+            (super::ConditionalUpdate::Applied, updated_at) => Ok(updated_at),
+            (super::ConditionalUpdate::Refused(_), _) => Err(Error::StalePlan(
                 "conditional rotation publication refused after delivery; broker and gateway \
                  may diverge. Reconcile the delivered credential with a fresh apply; rotation \
                  completion was not recorded"

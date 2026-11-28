@@ -201,9 +201,10 @@ pub struct StateFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh_document_path: Option<String>,
     /// Non-secret cryptographic bindings (`HMAC-SHA256(key = live password_hash,
-    /// msg = domain || password)`) for API-mode Consumer `basicauth[].password`
-    /// entries recorded on successful apply/rotate. Never holds plaintext
-    /// passwords or gateway hashes.
+    /// msg = domain || namespace || id || index || desired_password)`) for
+    /// API-mode Consumer `basicauth[].password` entries recorded from
+    /// mutation-attributed verification reads after apply/rotate. Never holds
+    /// plaintext passwords, gateway hashes, or unkeyed credential hashes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub basicauth_bindings: BTreeMap<String, Vec<String>>,
 }
@@ -361,16 +362,32 @@ impl StateFile {
     }
 
     fn validate_resource_keys(&self) -> crate::error::Result<()> {
-        for key in self
-            .resources
-            .keys()
-            .chain(self.pending_creates.iter())
-            .chain(self.basicauth_bindings.keys())
-        {
+        for key in self.resources.keys().chain(self.pending_creates.iter()) {
             if state_key_namespace(key).is_none() {
                 return Err(crate::error::Error::Config(format!(
                     "state file contains invalid resource key {key:?}; expected __gitforgeops_state_key_v2:<namespace>:<kind>:<id>"
                 )));
+            }
+        }
+        for (key, entries) in &self.basicauth_bindings {
+            if state_key_namespace(key).is_none()
+                || crate::diff::state_key_kind(key) != Some("Consumer")
+            {
+                return Err(crate::error::Error::Config(format!(
+                    "state file basicauth_bindings contains invalid Consumer key {key:?}; expected __gitforgeops_state_key_v2:<namespace>:Consumer:<id>"
+                )));
+            }
+            if entries.is_empty() || entries.iter().all(String::is_empty) {
+                return Err(crate::error::Error::Config(format!(
+                    "state file basicauth_bindings entry for {key:?} must contain at least one versioned binding tag"
+                )));
+            }
+            for tag in entries {
+                if !tag.is_empty() && !crate::diff::is_valid_basicauth_binding_tag(tag) {
+                    return Err(crate::error::Error::Config(format!(
+                        "state file basicauth_bindings entry for {key:?} contains an invalid tag; expected hmac_sha256_binding:v1:<64 lowercase hex> or empty sentinel"
+                    )));
+                }
             }
         }
         Ok(())
@@ -894,12 +911,39 @@ impl StateFile {
     ) {
         let key = state_key(namespace, "Consumer", id);
         match bindings {
-            Some(values) if !values.is_empty() => {
+            Some(values) if !values.is_empty() && values.iter().any(|v| !v.is_empty()) => {
                 self.basicauth_bindings.insert(key, values);
             }
             _ => {
                 self.basicauth_bindings.remove(&key);
             }
+        }
+    }
+
+    /// Update or clear a single `basicauth` array slot binding without
+    /// certifying or disturbing untouched sibling indices (used by `rotate`).
+    pub fn update_consumer_basicauth_binding_at_index(
+        &mut self,
+        namespace: &str,
+        id: &str,
+        index: usize,
+        total_len: usize,
+        binding: Option<String>,
+    ) {
+        let key = state_key(namespace, "Consumer", id);
+        if total_len == 0 || index >= total_len {
+            self.basicauth_bindings.remove(&key);
+            return;
+        }
+        let mut entries = match self.basicauth_bindings.get(&key) {
+            Some(existing) if existing.len() == total_len => existing.clone(),
+            _ => vec![String::new(); total_len],
+        };
+        entries[index] = binding.unwrap_or_default();
+        if entries.iter().all(String::is_empty) {
+            self.basicauth_bindings.remove(&key);
+        } else {
+            self.basicauth_bindings.insert(key, entries);
         }
     }
 

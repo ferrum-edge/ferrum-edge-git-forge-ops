@@ -1320,6 +1320,17 @@ impl AdminClient {
         consumer: &Consumer,
         namespace: &str,
     ) -> crate::error::Result<()> {
+        let _ = self
+            .create_consumer_with_updated_at(consumer, namespace)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_consumer_with_updated_at(
+        &self,
+        consumer: &Consumer,
+        namespace: &str,
+    ) -> crate::error::Result<Option<String>> {
         let target = self.authorized("/consumers")?;
         let resp = self
             .send_with_retry(RequestKind::NonIdempotentMutation, |bearer| {
@@ -1331,7 +1342,8 @@ impl AdminClient {
             .await?;
         self.check_mutation(&resp, RequestKind::NonIdempotentMutation)
             .await
-            .map_err(conditional::withhold_error)
+            .map_err(conditional::withhold_error)?;
+        Ok(response_updated_at(&resp.body))
     }
 
     pub async fn create_upstream(
@@ -1464,6 +1476,28 @@ impl AdminClient {
         etag: &str,
         expected_proxy_ids: Option<&BTreeSet<String>>,
     ) -> crate::error::Result<ConditionalUpdate> {
+        let (outcome, _) = self
+            .update_if_match_with_updated_at(
+                kind,
+                id,
+                resource,
+                namespace,
+                etag,
+                expected_proxy_ids,
+            )
+            .await?;
+        Ok(outcome)
+    }
+
+    pub async fn update_if_match_with_updated_at<T: Serialize>(
+        &self,
+        kind: &str,
+        id: &str,
+        resource: &T,
+        namespace: &str,
+        etag: &str,
+        expected_proxy_ids: Option<&BTreeSet<String>>,
+    ) -> crate::error::Result<(ConditionalUpdate, Option<String>)> {
         let mut path = resource_path(kind, id)?;
         if let Some(expected) = expected_proxy_ids {
             path = format!(
@@ -1490,10 +1524,13 @@ impl AdminClient {
                     )));
                 }
             }
-            return Ok(ConditionalUpdate::Refused(PreconditionRefusal {
-                after_retry: resp.retried,
-                message: precondition_failed_message("PUT", &path, resp.retried),
-            }));
+            return Ok((
+                ConditionalUpdate::Refused(PreconditionRefusal {
+                    after_retry: resp.retried,
+                    message: precondition_failed_message("PUT", &path, resp.retried),
+                }),
+                None,
+            ));
         }
         self.check_mutation(&resp, RequestKind::Mutation)
             .await
@@ -1504,7 +1541,7 @@ impl AdminClient {
                     error
                 }
             })?;
-        Ok(ConditionalUpdate::Applied)
+        Ok((ConditionalUpdate::Applied, response_updated_at(&resp.body)))
     }
 
     /// Whether the gateway issues the strong `ETag` every conditional
@@ -1930,6 +1967,15 @@ enum RetryPolicy {
 /// A fully-read response. The body is buffered eagerly so the retry classifier
 /// can inspect it before deciding whether to re-send.
 #[derive(Clone)]
+fn response_updated_at(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("updated_at")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 struct RawResponse {
     status: u16,
     body: String,

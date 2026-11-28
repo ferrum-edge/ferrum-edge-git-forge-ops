@@ -2025,9 +2025,10 @@ fn admin_diff_uses_cryptographic_basicauth_bindings_and_catches_reseed_and_oob_d
     use gitforgeops::config::GatewayConfig;
     use gitforgeops::diff::{
         align_verified_basicauth_bindings, compute_consumer_basicauth_bindings, compute_diff,
-        mask_indeterminate_secret_values,
+        mask_indeterminate_secret_values, state_key,
     };
-    use gitforgeops::secrets::report_secrets;
+    use gitforgeops::secrets::report_secrets_lenient;
+    use gitforgeops::state::StateFile;
     use std::collections::BTreeMap;
 
     let valid_hash = format!("hmac_sha256:{}", "a".repeat(64));
@@ -2147,7 +2148,7 @@ fn admin_diff_uses_cryptographic_basicauth_bindings_and_catches_reseed_and_oob_d
         "basicauth": [{"password": "${gh-env-secret:alloc=require}"}],
         "keyauth": [{"key": "synthetic-key-value-0001"}],
     }));
-    let report = report_secrets(&desired_unresolved, &BTreeMap::new()).unwrap();
+    let report = report_secrets_lenient(&desired_unresolved, &BTreeMap::new()).unwrap();
     let mut masked_live = live.clone();
     mask_indeterminate_secret_values(&desired_unresolved, &mut masked_live, &report);
     assert!(
@@ -2156,4 +2157,76 @@ fn admin_diff_uses_cryptographic_basicauth_bindings_and_catches_reseed_and_oob_d
             .is_empty(),
         "unresolved brokered basicauth password should be masked against valid live hash"
     );
+
+    // Single-slot rotation update preserves untouched sibling indices without certifying them.
+    let mut state = StateFile::default();
+    let sib0 = gitforgeops::diff::basicauth_password_binding(
+        "ferrum",
+        "app",
+        0,
+        "slot0-password",
+        &valid_hash,
+    );
+    let sib1_new = gitforgeops::diff::basicauth_password_binding(
+        "ferrum",
+        "app",
+        1,
+        "slot1-rotated",
+        &other_hash,
+    );
+    state.set_consumer_basicauth_bindings("ferrum", "app", Some(vec![sib0.clone(), String::new()]));
+    state.update_consumer_basicauth_binding_at_index("ferrum", "app", 1, 2, Some(sib1_new.clone()));
+    assert_eq!(
+        state
+            .basicauth_bindings
+            .get(&state_key("ferrum", "Consumer", "app")),
+        Some(&vec![sib0.clone(), sib1_new])
+    );
+    state.update_consumer_basicauth_binding_at_index("ferrum", "app", 1, 2, None);
+    assert_eq!(
+        state
+            .basicauth_bindings
+            .get(&state_key("ferrum", "Consumer", "app")),
+        Some(&vec![sib0, String::new()])
+    );
+
+    // State ledger validation refuses non-Consumer keys, raw passwords, live hashes, and empty vectors.
+    let temp = tempfile::tempdir().unwrap();
+    let prev = std::env::current_dir().unwrap();
+    std::env::set_current_dir(temp.path()).unwrap();
+    let check_invalid = |mut bad: StateFile| {
+        bad.environment = "validation-test".to_string();
+        assert!(bad.save().is_err());
+    };
+    let mut bad_kind = StateFile::default();
+    bad_kind.basicauth_bindings.insert(
+        state_key("ferrum", "Proxy", "p1"),
+        vec![gitforgeops::diff::basicauth_password_binding(
+            "ferrum",
+            "app",
+            0,
+            "pw",
+            &valid_hash,
+        )],
+    );
+    check_invalid(bad_kind);
+
+    let mut bad_tag = StateFile::default();
+    bad_tag.basicauth_bindings.insert(
+        state_key("ferrum", "Consumer", "app"),
+        vec![valid_hash.clone()],
+    );
+    check_invalid(bad_tag);
+
+    let mut bad_empty = StateFile::default();
+    bad_empty
+        .basicauth_bindings
+        .insert(state_key("ferrum", "Consumer", "app"), vec![String::new()]);
+    check_invalid(bad_empty);
+
+    state.environment = "validation-test".to_string();
+    state.save().expect("valid basicauth binding state saves");
+    let reloaded = StateFile::load("validation-test").expect("valid state reloads");
+    assert_eq!(reloaded.basicauth_bindings, state.basicauth_bindings);
+    std::env::set_current_dir(prev).unwrap();
 }

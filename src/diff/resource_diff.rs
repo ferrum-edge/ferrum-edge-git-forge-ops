@@ -667,6 +667,10 @@ pub fn state_key_namespace(key: &str) -> Option<String> {
     parse_state_key(key).map(|(namespace, _kind, _id)| decode_state_key_component(namespace))
 }
 
+pub fn state_key_kind(key: &str) -> Option<&str> {
+    parse_state_key(key).map(|(_namespace, kind, _id)| kind)
+}
+
 const STATE_KEY_PREFIX: &str = "__gitforgeops_state_key_v2";
 const STATE_KEY_KINDS: [&str; 4] = ["Proxy", "Consumer", "Upstream", "PluginConfig"];
 
@@ -991,6 +995,51 @@ pub fn basicauth_password_binding(
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// Whether `value` is a valid versioned `basicauth` binding tag
+/// (`hmac_sha256_binding:v1:<64 lowercase hex>`).
+pub fn is_valid_basicauth_binding_tag(value: &str) -> bool {
+    value
+        .strip_prefix("hmac_sha256_binding:v1:")
+        .is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// Extract the `(collection_len, live_password_hash)` at `index` from a live
+/// Consumer's `basicauth` credentials. Returns `None` if the entry is absent
+/// or does not carry a valid `hmac_sha256:<64 hex>` hash.
+pub fn extract_basicauth_password_hash_at(
+    consumer: &Consumer,
+    index: usize,
+) -> Option<(usize, &str)> {
+    match consumer.credentials.get("basicauth")? {
+        serde_json::Value::Array(entries) => {
+            let hash = hashed_basicauth_password_hash(entries.get(index)?)?;
+            Some((entries.len(), hash))
+        }
+        entry @ serde_json::Value::Object(_) if index == 0 => {
+            let hash = hashed_basicauth_password_hash(entry)?;
+            Some((1, hash))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `live` matches `desired` on every field except `created_at`,
+/// `updated_at`, and `credentials.basicauth`. Used before certifying a
+/// post-write `basicauth` binding so a concurrent edit to any other field
+/// refuses certification.
+pub fn consumer_matches_desired_except_basicauth(desired: &Consumer, live: &Consumer) -> bool {
+    let mut desired_copy = desired.clone();
+    let mut live_copy = live.clone();
+    desired_copy.credentials.remove("basicauth");
+    live_copy.credentials.remove("basicauth");
+    compare_fields("Consumer", &desired_copy, &live_copy).is_empty()
 }
 
 /// Whether `consumer` declares at least one plaintext `basicauth` `password`

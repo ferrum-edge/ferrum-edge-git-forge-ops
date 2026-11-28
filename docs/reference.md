@@ -462,12 +462,17 @@ the validation file carries a `password_hash` stand-in (`hmac_sha256:<64 hex>`
 from the slot, never from the password) in place of each `basicauth` `password`,
 resolved or not, so the resolved password is never written to it. File mode
 keeps the password, which a file-mode gateway refuses. After an API-mode
-`apply` or `rotate` commits a Consumer with plaintext `basicauth` passwords,
-GitForgeOps reads back the gateway's stored `password_hash` and records a
+incremental `apply` or `rotate` commits a Consumer with plaintext `basicauth`
+passwords, GitForgeOps verifies the Consumer's `GET /consumers/{id}/verification`
+row matches the write response's `updated_at` (and, for `rotate`, updates only
+the rotated slot index while verifying the `ETag` moved) and records a
 non-secret cryptographic binding (`HMAC-SHA256(key = live password_hash,
 domain || namespace || consumer || index || desired_password)`) in
 `.state/<env>.json` without ever storing the plaintext password, the gateway
-hash, or reading `FERRUM_BASIC_AUTH_HMAC_SECRET`. On subsequent admin
+hash, or reading `FERRUM_BASIC_AUTH_HMAC_SECRET`. If post-write verification
+fails or shows an intervening revision, or after `full_replace` (`POST /restore`
+returns counts only without a per-row revision receipt), bindings are cleared
+fail-closed so the next admin comparison surfaces drift. On subsequent admin
 `GET /backup` comparisons (`diff`, `plan`, `review`, `apply`), an entry
 converges only when that binding verifies; reseeding the bundle, recovering
 from a failed rotation push, or editing the Consumer out-of-band on the gateway

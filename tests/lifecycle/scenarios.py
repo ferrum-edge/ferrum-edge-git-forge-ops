@@ -1637,9 +1637,9 @@ def _export_projection(harness: Harness) -> str:
         if (
             "No changes to apply." not in second_apply.stdout
             and "Applied: 0 created, 0 updated, 0 deleted" not in second_apply.stdout
-        ):
+        ) or "adopted" in second_apply.stdout.lower():
             raise ScenarioFailure(
-                "unchanged second apply unexpectedly mutated gateway resources:\n"
+                "unchanged second apply unexpectedly mutated or adopted gateway resources:\n"
                 f"{second_apply.stdout}\n{second_apply.stderr}"
             )
         _viewer_export(harness, viewer, [*seeded.values(), harness_key(harness)])
@@ -1696,6 +1696,11 @@ def _export_projection(harness: Harness) -> str:
                 f"{rotated.stdout}\n{rotated.stderr}"
             )
         _brokered_basicauth_authenticates(harness, password)
+        # Reconcile the earlier out-of-band JWT mutation first and prove admin
+        # diff is completely clean (exit 0) so the Basic reseed check below
+        # isolates Basic password drift alone.
+        ensure_deployed(harness)
+        harness.run("diff", "--exit-on-drift", expect=0)
         # Reseeding the basicauth password in the bundle must break the
         # cryptographic state binding, surface drift on admin `diff`, push the
         # new password on incremental `apply`, and authenticate the new value.
